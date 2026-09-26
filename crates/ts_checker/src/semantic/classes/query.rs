@@ -308,7 +308,7 @@ pub(in crate::semantic) fn plan_selected_class_member(
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let owner = record.parent().ok_or_else(invalid)?;
     let class = plan_class_query(store, host, owner)?;
-    class_query_shell_state(store, &class)?;
+    class_query_shell_state(store, host, &class)?;
     let declaration = record.value_declaration().ok_or_else(|| {
         unsupported(ClassUnsupported::Member {
             node: class.declaration,
@@ -335,6 +335,41 @@ pub(in crate::semantic) fn plan_selected_class_member(
     }
     let owner_record = store.symbol(owner).ok_or_else(invalid)?;
     let exports = owner_record.exports().ok_or_else(invalid)?;
+    if let Some(provenance) = store.source_class_provenance_for_symbol(owner)
+        && let Some((index, method)) = provenance
+            .prepared
+            .plan
+            .methods
+            .iter()
+            .enumerate()
+            .find(|(_, method)| method.method.declaration == declaration)
+        && !method.method.type_parameters.is_empty()
+    {
+        super::validate_source_class_header(store, host, provenance)?;
+        let (value, signature) = provenance.prepared.methods[index];
+        if super::source_class_generic_method_callee(
+            store,
+            signature,
+            provenance.prepared.plan.array_targets,
+        )? != Some(value)
+        {
+            return Err(invalid());
+        }
+        let returned = store
+            .signature(signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .ok_or_else(|| {
+                unsupported(ClassUnsupported::Member {
+                    node: declaration,
+                    kind: SyntaxKind::MethodDeclaration,
+                })
+            })?;
+        return Ok(ClassSelectedMemberPlan {
+            class,
+            member: SelectedMember::Method(method.method.clone()),
+            type_: returned,
+        });
+    }
     let (member, type_) = match preflight_node(store, host, declaration)?.kind {
         SyntaxKind::PropertyDeclaration => {
             let property = plan_property(
@@ -487,6 +522,24 @@ pub(in crate::semantic) fn selected_class_method_return_type(
     let SelectedMember::Method(method) = &plan.member else {
         return Ok(None);
     };
+    if !method.type_parameters.is_empty() {
+        let signature = store
+            .signature_links(method.declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+        let provenance = store
+            .source_class_provenance_for_symbol(plan.class.symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+        if super::source_class_generic_method_callee(
+            store,
+            signature,
+            provenance.prepared.plan.array_targets,
+        )? != Some(type_)
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+        return Ok(Some(plan.type_));
+    }
     if !method.parameters.is_empty() || method.rest_parameter.is_some() {
         return Ok(None);
     }

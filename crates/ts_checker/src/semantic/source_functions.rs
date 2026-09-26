@@ -3,7 +3,7 @@
 //! Callable construction belongs to `source_callables`; source checking owns
 //! statement order and body execution. This module only proves the exact
 //! top-level or nested function value symbol (including direct-export routing)
-//! and the hoisted identifier route used by source expressions.
+//! and the identifier route for hoisted functions and lexical expression names.
 
 use std::collections::HashSet;
 
@@ -263,7 +263,8 @@ pub(super) fn plan_nested_function(
     Ok(function)
 }
 
-/// Resolves one identifier as a precollected, hoisted source function.
+/// Resolves one identifier as an available source function.
+/// Named expression owners are available only while their own body is planned.
 ///
 /// The caller invokes this only after the independent variable planner has
 /// resolved the same identifier and rejected its routed target specifically as
@@ -326,6 +327,7 @@ pub(super) fn plan_function_identifier_read(
             valid_source_function_declaration_owner_shape(store, routed.target, *declaration)
         });
     if record.flags() != SymbolFlags::FUNCTION && merged_declaration.is_none() {
+        observe_non_function_identifier(store, host, node, name, routed);
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
                 node,
@@ -371,8 +373,11 @@ pub(super) fn plan_function_identifier_read(
             .into());
         }
         validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
-    } else if declarations.len() >= 2 && routed.export_local.is_none() {
+    } else if declarations.len() >= 2 {
         validate_function_overload_read_target(store, node, name, routed.target, declarations)?;
+        if let Some(local) = routed.export_local {
+            validate_export_local(store, local, declarations[0], routed.target, name)?;
+        }
         for declaration in declarations {
             if declaration.file != node.file || declaration.arena != node.arena {
                 return Err(SourceFunctionPlanError::Unsupported(
@@ -383,16 +388,16 @@ pub(super) fn plan_function_identifier_read(
                 ));
             }
             validate_function_read_declaration_symbol(bound, store, *declaration, routed.target)?;
-            if bound.local_symbol(*declaration).is_some() {
+            if bound.local_symbol(*declaration) != routed.export_local {
                 return Err(SourceFunctionInvariant::LocalExportSymbolMismatch {
                     declaration: *declaration,
-                    expected: None,
+                    expected: routed.export_local,
                     actual: bound.local_symbol(*declaration),
                 }
                 .into());
             }
         }
-        validate_target_parent(bound, store, routed.target, false)?;
+        validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
     } else {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonUniqueDeclaration {
@@ -420,6 +425,100 @@ pub(super) fn plan_function_identifier_read(
         resolved_symbol: routed.resolved,
         value_symbol: routed.target,
     })
+}
+
+/// Records stored owner metadata only after the identifier route has failed.
+fn observe_non_function_identifier(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    routed: RoutedValueSymbol,
+) {
+    use std::io::Write as _;
+
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let Some(owner) = store.symbol(routed.target) else {
+        return;
+    };
+    let describe_declaration = |declaration: NodeRef| {
+        (
+            declaration,
+            host.node(declaration).map(|record| (record.kind, record.range)),
+            host.bound_file(declaration)
+                .and_then(|bound| bound.symbol(declaration)),
+        )
+    };
+    let declarations = owner.declarations();
+    let declaration_rows: [_; 3] = std::array::from_fn(|index| {
+        declarations
+            .and_then(|declarations| declarations.get(index))
+            .copied()
+            .map(describe_declaration)
+    });
+    let links = store.value_symbol_links(routed.target);
+    let source_owner = links.and_then(|links| links.target).and_then(|symbol| {
+        store.symbol(symbol).map(|record| {
+            (
+                symbol,
+                record.flags(),
+                record.check_flags(),
+                record.value_declaration().map(describe_declaration),
+            )
+        })
+    });
+    let type_state = links.and_then(|links| links.resolved_type).and_then(|type_| {
+        store.type_payload(type_).map(|record| {
+            (
+                type_,
+                record.data().kind(),
+                record.flags(),
+                record.object_flags(),
+                record.symbol(),
+                record.data().structured().map(|data| {
+                    (
+                        data.members,
+                        data.properties.as_ref().map(Vec::len),
+                        data.signatures.as_ref().map(Vec::len),
+                        data.call_signature_count,
+                        data.index_infos.as_ref().map(Vec::len),
+                    )
+                }),
+            )
+        })
+    });
+    let owner_name = owner.name().as_bytes();
+    let mut buffer = [0_u8; 4096];
+    let mut output = &mut buffer[..4000];
+    let truncated = write!(
+        output,
+        "non_function_identifier node={node:?} syntax={:?} name_bytes={:?} name_len={} route={routed:?} owner_name_bytes={:?} owner_name_len={} flags={:?} checks={:?} parent={:?} export={:?} owner_tables={:?} node_links={:?} declaration_count={:?} declarations_truncated={} declaration_node_syntax_binder={declaration_rows:?} value_declaration={:?} value_links={links:?} source_owner={source_owner:?} type_kind_flags_owner_members={type_state:?}",
+        host.node(node).map(|record| (record.kind, record.range)),
+        &name.as_bytes()[..name.len().min(64)],
+        name.len(),
+        &owner_name[..owner_name.len().min(64)],
+        owner_name.len(),
+        owner.flags(),
+        owner.check_flags(),
+        owner.parent(),
+        owner.export_symbol(),
+        (owner.members(), owner.exports()),
+        store.symbol_node_links(node),
+        declarations.map(<[_]>::len),
+        declarations.is_some_and(|declarations| declarations.len() > declaration_rows.len()),
+        owner.value_declaration().map(describe_declaration),
+    )
+    .is_err();
+    let used = 4000 - output.len();
+    let suffix = if truncated {
+        b" record_truncated=1\n"
+    } else {
+        b" record_truncated=0\n"
+    };
+    buffer[used..used + suffix.len()].copy_from_slice(suffix);
+    let _ = std::io::stderr().write_all(&buffer[..used + suffix.len()]);
 }
 
 fn validate_function_read_declaration_symbol(
@@ -466,6 +565,9 @@ fn validate_function_overload_read_target(
         || record.members().is_some()
         || record.exports().is_some()
         || record.parent().is_some()
+            && store
+                .source_exported_overload_local(symbol, declarations)
+                .is_none()
         || record.export_symbol().is_some()
         || declarations.len() < 2
         || declarations.iter().any(|declaration| {
@@ -498,6 +600,11 @@ fn route_value_symbol(
         if record.flags() != SymbolFlags::EXPORT_VALUE
             || record.check_flags() != CheckFlags::NONE
             || !matches!(record.declarations(), Some([_]))
+                && !record.export_symbol().is_some_and(|target| {
+                    record.declarations().is_some_and(|declarations| {
+                        store.source_exported_overload_local(target, declarations) == Some(resolved)
+                    })
+                })
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()
@@ -808,6 +915,10 @@ fn validate_export_local(
         || record.check_flags() != CheckFlags::NONE
         || record.name().as_bytes() != name.as_bytes()
         || record.declarations() != Some(&[declaration])
+            && !record.declarations().is_some_and(|declarations| {
+                declarations.contains(&declaration)
+                    && store.source_exported_overload_local(target, declarations) == Some(local)
+            })
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()

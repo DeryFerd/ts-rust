@@ -8,6 +8,8 @@
 //! the binder's anonymous FUNCTION owner and preserve the export route when
 //! present. Direct default exports retain their PROPERTY export owner separately
 //! from the anonymous FUNCTION owner. Publication remains deferred to source dispatch.
+//! Checked local let/const declarations reuse the contextual proof and also admit
+//! one call statement through the existing function-body checker.
 
 use std::collections::HashSet;
 
@@ -30,9 +32,10 @@ use super::{
         SourceCallableUnsupported, plan_source_callable,
         source_arrow_owner_expando_exports_are_valid,
     },
+    source_statements::SourceLocalDeclarationSyntax,
     variables::{
-        VariableBindingKind, VariableInvariant, VariablePlanError, VariableUnsupported,
-        plan_top_level_variable,
+        PlannedObjectBindingElement, VariableBindingKind, VariableInvariant, VariablePlanError,
+        VariableUnsupported, plan_function_object_parameter_bindings, plan_top_level_variable,
     },
 };
 
@@ -64,12 +67,13 @@ pub(super) enum SourceContextualParameterRequest {
     RestTail { start: usize },
 }
 
-/// One identifier parameter and its binder-owned value symbol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One parameter and its separate binder-owned parameter and object leaf symbols.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceContextualParameterPlan {
     pub(super) declaration: NodeRef,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    pub(super) object_bindings: Option<Vec<PlannedObjectBindingElement>>,
     pub(super) annotation: Option<NodeRef>,
     pub(super) optional: bool,
     pub(super) rest: bool,
@@ -87,6 +91,11 @@ pub(super) enum SourceContextualReturnOrigin {
         expression: NodeRef,
     },
     InferredReturnExpression {
+        block: NodeRef,
+        statement: NodeRef,
+        expression: NodeRef,
+    },
+    InferredCallStatement {
         block: NodeRef,
         statement: NodeRef,
         expression: NodeRef,
@@ -182,6 +191,9 @@ pub(super) enum SourceArrowBodyPlan {
         block: NodeRef,
     },
     LinearBlock {
+        block: NodeRef,
+    },
+    StatementBlock {
         block: NodeRef,
     },
     ForOfBlock {
@@ -478,15 +490,22 @@ fn plan_contextual_target_syntax_shape(
     host: &DeclaredTypeHost<'_>,
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<(SourceContextualSignatureShape, NodeRef), SourceContextualArrowError> {
-    let (function, alias) =
-        contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
+) -> Result<(SourceContextualSignatureShape, NodeRef, Vec<NodeRef>), SourceContextualArrowError> {
+    let (function, alias) = contextual_function_type_syntax(
+        store, host, type_node, None, &mut HashSet::new(), array_targets,
+    )?;
     let function_record = preflight_node(store, host, function)?;
-    let (parameter_count, return_type) = match function_record.kind {
+    let (parameter_types, return_type) = match function_record.kind {
         SyntaxKind::FunctionType => {
             let plan = plan_function_type(store, host, function, alias, false, array_targets)
                 .map_err(|error| contextual_target_plan_error(error, type_node))?;
-            (plan.parameters.len(), plan.return_type)
+            (
+                plan.parameters
+                    .iter()
+                    .map(|parameter| parameter.type_node)
+                    .collect::<Vec<_>>(),
+                plan.return_type,
+            )
         }
         SyntaxKind::TypeLiteral | SyntaxKind::InterfaceDeclaration => {
             contextual_declared_call_signature_shape(store, host, function, type_node)?
@@ -525,10 +544,11 @@ fn plan_contextual_target_syntax_shape(
         SourceContextualSignatureShape {
             call_signature_count: 1,
             type_parameter_count: 0,
-            parameter_count,
+            parameter_count: parameter_types.len(),
             has_effective_rest: false,
         },
         return_type,
+        parameter_types,
     ))
 }
 
@@ -538,7 +558,7 @@ fn contextual_declared_call_signature_shape(
     host: &DeclaredTypeHost<'_>,
     owner: NodeRef,
     target: NodeRef,
-) -> Result<(usize, NodeRef), SourceContextualArrowError> {
+) -> Result<(Vec<NodeRef>, NodeRef), SourceContextualArrowError> {
     let record = preflight_node(store, host, owner)?;
     let (members, expected_owner_flags) = match &record.data {
         NodeData::TypeLiteralNode(literal) if record.kind == SyntaxKind::TypeLiteral => {
@@ -624,6 +644,7 @@ fn contextual_declared_call_signature_shape(
             SourceContextualArrowInvariant::InvalidVariableType(return_type),
         ));
     }
+    let mut parameter_types = Vec::with_capacity(call.parameters.nodes.len());
     for parameter in &call.parameters.nodes {
         let parameter = NodeRef::new(signature.arena, signature.file, *parameter);
         let parameter_record = preflight_node(store, host, parameter)?;
@@ -649,8 +670,21 @@ fn contextual_declared_call_signature_shape(
                 SourceContextualArrowUnsupported::ContextualTargetSyntax(parameter),
             ));
         }
+        let annotation = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            data.type_.expect("the parameter annotation was checked"),
+        );
+        preflight_contextual_child(
+            store,
+            host,
+            parameter,
+            annotation,
+            SourceContextualArrowInvariant::InvalidVariableType(annotation),
+        )?;
+        parameter_types.push(annotation);
     }
-    Ok((call.parameters.nodes.len(), return_type))
+    Ok((parameter_types, return_type))
 }
 
 fn contextual_declared_expando_exports_are_exact(
@@ -739,6 +773,7 @@ fn contextual_function_type_syntax(
     node: NodeRef,
     alias: Option<SemanticSymbolId>,
     active_aliases: &mut HashSet<SemanticSymbolId>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(NodeRef, Option<SemanticSymbolId>), SourceContextualArrowError> {
     let record = preflight_node(store, host, node)?;
     match (&record.kind, &record.data) {
@@ -767,7 +802,9 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(child),
                 ));
             }
-            contextual_function_type_syntax(store, host, child, alias, active_aliases)
+            contextual_function_type_syntax(
+                store, host, child, alias, active_aliases, array_targets,
+            )
         }
         (SyntaxKind::TypeReference, NodeData::TypeReferenceNode(reference)) => {
             if reference.type_arguments.is_some() {
@@ -791,28 +828,40 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(name),
                 ));
             }
-            let (arena, bound) = host.source(node).ok_or_else(|| {
-                contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
-            })?;
-            let mut callback_host = host.name_resolver_host(store)?;
-            let mut resolver =
-                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
-                    .map_err(DeclaredTypeError::from)?;
-            let symbol = match resolver.resolve(
-                Some(CanonicalResolutionLocation::Bound(name)),
-                &identifier.text,
-                SymbolFlags::TYPE,
-                None,
-                true,
-                false,
-            ) {
-                Ok(Some(symbol)) => symbol,
-                Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
-                    return Err(contextual_unsupported(
-                        SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
-                    ));
+            let imported = super::source_imports::plan_source_named_type_import_target(
+                store, host, node, array_targets,
+            )
+            .map_err(|error| super::type_nodes::property_type_import_error(node, error))?;
+            let symbol = if let Some(imported) = imported {
+                imported.target_symbol
+            } else {
+                let (arena, bound) = host.source(node).ok_or_else(|| {
+                    contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
+                })?;
+                let mut callback_host = host.name_resolver_host(store)?;
+                let mut resolver = CanonicalNameResolver::new(
+                    arena,
+                    bound,
+                    store.symbol_store(),
+                    &mut callback_host,
+                )
+                .map_err(DeclaredTypeError::from)?;
+                match resolver.resolve(
+                    Some(CanonicalResolutionLocation::Bound(name)),
+                    &identifier.text,
+                    SymbolFlags::TYPE,
+                    None,
+                    true,
+                    false,
+                ) {
+                    Ok(Some(symbol)) => symbol,
+                    Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                        return Err(contextual_unsupported(
+                            SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                        ));
+                    }
+                    Err(error) => return Err(DeclaredTypeError::from(error).into()),
                 }
-                Err(error) => return Err(DeclaredTypeError::from(error).into()),
             };
             let Some(symbol) = store.get_merged_symbol(symbol) else {
                 return Err(contextual_invariant(
@@ -873,8 +922,9 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(body),
                 ));
             }
-            let alias_target =
-                contextual_function_type_syntax(store, host, body, Some(symbol), active_aliases);
+            let alias_target = contextual_function_type_syntax(
+                store, host, body, Some(symbol), active_aliases, array_targets,
+            );
             active_aliases.remove(&symbol);
             alias_target
         }
@@ -896,6 +946,7 @@ fn contextual_function_type_syntax(
                     constituent,
                     None,
                     active_aliases,
+                    array_targets,
                 ) {
                     Ok(found) if callable.replace(found).is_some() => {
                         return Err(contextual_unsupported(
@@ -929,6 +980,122 @@ pub(super) fn plan_contextual_source_arrow(
     host: &DeclaredTypeHost<'_>,
     variable_declaration: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
+    plan_contextual_source_arrow_worker(store, host, variable_declaration, array_targets, None)
+}
+
+/// Reuses the annotation proof for a checked local declaration, without changing top-level admission.
+pub(super) fn plan_local_contextual_source_arrow(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    local: &SourceLocalDeclarationSyntax,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
+    let plan = plan_contextual_source_arrow_worker(
+        store,
+        host,
+        local.declaration,
+        array_targets,
+        Some(local),
+    )?;
+    if plan.variable_name != local.name
+        || plan.variable_symbol != local.symbol
+        || Some(plan.contextual_type.type_node) != local.type_node
+        || Some(plan.declaration) != local.initializer
+    {
+        return Err(contextual_invariant(
+            SourceContextualArrowInvariant::InvalidVariableDeclaration(local.declaration),
+        ));
+    }
+    let bound = host.bound_file(local.declaration).ok_or_else(|| {
+        contextual_invariant(SourceContextualArrowInvariant::InvalidVariableDeclaration(
+            local.declaration,
+        ))
+    })?;
+    let scope = bound.container(local.declaration);
+    let symbol = store.symbol(local.symbol);
+    if scope.is_none()
+        || bound.block_scope_container(local.declaration) != scope
+        || scope
+            .and_then(|scope| bound.locals(scope))
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| symbol.and_then(|symbol| table.get(symbol.name())))
+            != Some(local.symbol)
+    {
+        return Err(contextual_invariant(
+            SourceContextualArrowInvariant::InvalidVariableDeclaration(local.declaration),
+        ));
+    }
+    if let Some(parameter) = plan
+        .parameters
+        .iter()
+        .find(|parameter| parameter.object_bindings.is_some())
+    {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::DestructuredParameter(parameter.declaration),
+        ));
+    }
+    Ok(plan)
+}
+
+/// Rebuilds the local proof from actual source nodes for a checked header or warm query.
+pub(super) fn replan_local_contextual_source_arrow(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
+    let invalid = || {
+        contextual_invariant(SourceContextualArrowInvariant::InvalidVariableDeclaration(
+            declaration,
+        ))
+    };
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(invalid());
+    };
+    let list = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let list_record = preflight_node(store, host, list)?;
+    let statement = list_record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let binding = arrow_binding_kind(list_record.flags.0).ok_or_else(invalid)?;
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let symbol = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    plan_local_contextual_source_arrow(
+        store,
+        host,
+        &SourceLocalDeclarationSyntax {
+            statement,
+            list,
+            declaration,
+            name: NodeRef::new(declaration.arena, declaration.file, variable.name),
+            symbol,
+            binding,
+            type_node: variable
+                .type_
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node)),
+            initializer: variable
+                .initializer
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node)),
+        },
+        array_targets,
+    )
+}
+
+fn plan_contextual_source_arrow_worker(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    variable_declaration: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+    local: Option<&SourceLocalDeclarationSyntax>,
 ) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
     let declaration_record = preflight_node(store, host, variable_declaration)?;
     let NodeData::VariableDeclaration(declaration) = &declaration_record.data else {
@@ -1040,7 +1207,43 @@ pub(super) fn plan_contextual_source_arrow(
         contextual_invariant(SourceContextualArrowInvariant::InvalidSourceFile(statement))
     })?;
     let source = bound.source_file();
-    if statement_record.parent != Some(source.node) {
+    if let Some(local) = local {
+        let container = bound.container(variable_declaration).ok_or_else(|| {
+            contextual_unsupported(SourceContextualArrowUnsupported::NestedDeclaration(
+                statement,
+            ))
+        })?;
+        let container_record = preflight_node(store, host, container)?;
+        let NodeData::FunctionDeclaration(function) = &container_record.data else {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::NestedDeclaration(statement),
+            ));
+        };
+        let body = function
+            .body
+            .map(|node| NodeRef::new(container.arena, container.file, node));
+        let body_record = body
+            .map(|body| preflight_node(store, host, body))
+            .transpose()?;
+        if local.statement != statement
+            || local.list != list
+            || local.binding != binding
+            || !matches!(binding, VariableBindingKind::Let | VariableBindingKind::Const)
+            || exported
+            || container_record.kind != SyntaxKind::FunctionDeclaration
+            || statement_record.parent != body.map(|body| body.node)
+            || body_record.is_none_or(|record| {
+                record.kind != SyntaxKind::Block
+                    || record.parent != Some(container.node)
+                    || !matches!(&record.data, NodeData::Block(block)
+                        if block.statements.nodes.iter().filter(|node| **node == statement.node).count() == 1)
+            })
+        {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::NestedDeclaration(statement),
+            ));
+        }
+    } else if statement_record.parent != Some(source.node) {
         return Err(contextual_unsupported(
             SourceContextualArrowUnsupported::NestedDeclaration(statement),
         ));
@@ -1053,13 +1256,14 @@ pub(super) fn plan_contextual_source_arrow(
     };
     if source_record.kind != SyntaxKind::SourceFile
         || !range_contains(source_record.range, statement_record.range)
-        || source_data
-            .statements
-            .nodes
-            .iter()
-            .filter(|node| **node == statement.node)
-            .count()
-            != 1
+        || local.is_none()
+            && source_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|node| **node == statement.node)
+                .count()
+                != 1
     {
         return Err(contextual_invariant(
             SourceContextualArrowInvariant::InvalidSourceFile(source),
@@ -1107,7 +1311,7 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidVariableType(type_node),
         ));
     }
-    let (contextual_signature_shape, contextual_return_type) =
+    let (contextual_signature_shape, contextual_return_type, contextual_parameter_types) =
         plan_contextual_target_syntax_shape(store, host, type_node, array_targets)?;
 
     let Some(initializer_id) = declaration.initializer else {
@@ -1301,22 +1505,63 @@ pub(super) fn plan_contextual_source_arrow(
 
         let name = NodeRef::new(parameter.arena, parameter.file, data.name);
         let name_record = preflight_node(store, host, name)?;
-        let NodeData::Identifier(parameter_identifier) = &name_record.data else {
-            return Err(contextual_unsupported(
-                SourceContextualArrowUnsupported::DestructuredParameter(parameter),
-            ));
+        let (parameter_name, object_bindings) = match &name_record.data {
+            NodeData::Identifier(identifier) => {
+                if name_record.kind != SyntaxKind::Identifier || identifier.flow_node.is_some() {
+                    return Err(contextual_invariant(
+                        SourceContextualArrowInvariant::InvalidParameter(parameter),
+                    ));
+                }
+                (identifier.text.clone(), None)
+            }
+            NodeData::BindingPattern(_) if name_record.kind == SyntaxKind::ObjectBindingPattern => {
+                let Some(context) = contextual_parameter_types.get(index) else {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                    ));
+                };
+                // Object bindings need a real positional object context. Primitive,
+                // union, and exhausted-context bindings remain outside this slice.
+                if !matches!(
+                    preflight_node(store, host, *context)?.kind,
+                    SyntaxKind::TypeLiteral
+                        | SyntaxKind::TypeReference
+                        | SyntaxKind::ParenthesizedType
+                ) {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                    ));
+                }
+                let (arena, bound) = host.source(initializer).ok_or_else(|| {
+                    contextual_invariant(SourceContextualArrowInvariant::InvalidParameter(
+                        parameter,
+                    ))
+                })?;
+                let bindings = plan_function_object_parameter_bindings(
+                    arena,
+                    bound,
+                    store,
+                    initializer,
+                    parameter,
+                )
+                .map_err(map_contextual_variable_error)?;
+                (format!("__{index}"), Some(bindings))
+            }
+            _ => {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                ));
+            }
         };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.parent != Some(parameter.node)
+        if name_record.parent != Some(parameter.node)
             || name_record.flags.0 != 0
-            || parameter_identifier.flow_node.is_some()
             || !range_contains(parameter_record.range, name_record.range)
         {
             return Err(contextual_invariant(
                 SourceContextualArrowInvariant::InvalidParameter(parameter),
             ));
         }
-        if parameter_identifier.text == "this" {
+        if parameter_name == "this" {
             return Err(contextual_unsupported(
                 SourceContextualArrowUnsupported::DestructuredParameter(parameter),
             ));
@@ -1435,7 +1680,7 @@ pub(super) fn plan_contextual_source_arrow(
         if symbol != raw_symbol
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
-            || symbol_record.name().as_bytes() != parameter_identifier.text.as_bytes()
+            || symbol_record.name().as_bytes() != parameter_name.as_bytes()
             || symbol_record.declarations() != Some(&[parameter])
             || symbol_record.value_declaration() != Some(parameter)
             || symbol_record.members().is_some()
@@ -1451,6 +1696,7 @@ pub(super) fn plan_contextual_source_arrow(
             declaration: parameter,
             name,
             symbol,
+            object_bindings,
             annotation,
             optional,
             rest,
@@ -1495,6 +1741,39 @@ pub(super) fn plan_contextual_source_arrow(
                     ));
                 }
                 SourceContextualReturnOrigin::InferredEmptyBody { block: body }
+            }
+            [statement]
+                if local.is_some()
+                    && host
+                        .node(NodeRef::new(body.arena, body.file, *statement))
+                        .is_some_and(|record| record.kind == SyntaxKind::ExpressionStatement) =>
+            {
+                let statement = NodeRef::new(body.arena, body.file, *statement);
+                let statement_record = preflight_node(store, host, statement)?;
+                let NodeData::ExpressionStatement(data) = &statement_record.data else {
+                    return Err(contextual_invariant(
+                        SourceContextualArrowInvariant::InvalidBody(statement),
+                    ));
+                };
+                let expression = NodeRef::new(body.arena, body.file, data.expression);
+                let expression_record = preflight_node(store, host, expression)?;
+                if statement_record.parent != Some(body.node)
+                    || statement_record.flags.0 != 0
+                    || data.flow_node.is_some()
+                    || !range_contains(body_record.range, statement_record.range)
+                    || expression_record.parent != Some(statement.node)
+                    || expression_record.kind != SyntaxKind::CallExpression
+                    || !range_contains(statement_record.range, expression_record.range)
+                {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::NonEmptyBody(body),
+                    ));
+                }
+                SourceContextualReturnOrigin::InferredCallStatement {
+                    block: body,
+                    statement,
+                    expression,
+                }
             }
             [statement] => {
                 let statement = NodeRef::new(body.arena, body.file, *statement);
@@ -2257,6 +2536,28 @@ fn plan_body(
         }
         return Ok(SourceArrowBodyPlan::ForOfBlock { block: body });
     }
+    let contains_object_binding = block.statements.nodes.iter().any(|statement| {
+        let statement = NodeRef::new(body.arena, body.file, *statement);
+        let Some(NodeData::VariableStatement(variable)) = host.node(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let list = NodeRef::new(body.arena, body.file, variable.declaration_list);
+        let Some(NodeData::VariableDeclarationList(list)) = host.node(list).map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let declaration = NodeRef::new(body.arena, body.file, *declaration);
+            let Some(NodeData::VariableDeclaration(variable)) =
+                host.node(declaration).map(|node| &node.data)
+            else {
+                return false;
+            };
+            store.source_node_kind(NodeRef::new(body.arena, body.file, variable.name))
+                == Some(SyntaxKind::ObjectBindingPattern)
+        })
+    });
     let linear_statement = |statement| {
         let statement = NodeRef::new(body.arena, body.file, statement);
         let Some(record) = host.node(statement) else {
@@ -2264,6 +2565,10 @@ fn plan_body(
         };
         if record.kind == SyntaxKind::VariableStatement {
             return true;
+        }
+        if record.kind == SyntaxKind::EmptyStatement {
+            return matches!(&record.data, NodeData::EmptyStatement(empty) if empty.flow_node.is_none())
+                && record.flags.0 == 0;
         }
         let NodeData::ExpressionStatement(statement) = &record.data else {
             return false;
@@ -2279,8 +2584,10 @@ fn plan_body(
             NodeData::CallExpression(_) => record.kind == SyntaxKind::CallExpression,
             NodeData::BinaryExpression(binary) => {
                 record.kind == SyntaxKind::BinaryExpression
-                    && store.source_node_kind(NodeRef::new(body.arena, body.file, binary.left))
-                        == Some(SyntaxKind::Identifier)
+                    && matches!(
+                        store.source_node_kind(NodeRef::new(body.arena, body.file, binary.left)),
+                        Some(SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression)
+                    )
                     && store.source_node_kind(NodeRef::new(
                         body.arena,
                         body.file,
@@ -2291,6 +2598,7 @@ fn plan_body(
         }
     };
     if synchronous_typescript
+        && !contains_object_binding
         && block
             .statements
             .nodes
@@ -2318,6 +2626,32 @@ fn plan_body(
             }
         }
         return Ok(SourceArrowBodyPlan::LinearBlock { block: body });
+    }
+    if synchronous_typescript
+        && (contains_object_binding
+            || block.statements.nodes.iter().any(|statement| {
+                matches!(
+                    store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
+                    Some(
+                        SyntaxKind::IfStatement | SyntaxKind::Block | SyntaxKind::ForStatement
+                            | SyntaxKind::TryStatement | SyntaxKind::ThrowStatement
+                    )
+                )
+            }))
+        && let Some((arena, bound)) = host.source(callable.declaration)
+    {
+        match super::source_statements::plan_source_callable_statement_list_syntax(
+            arena, bound, store, callable,
+        ) {
+            Ok(_) => return Ok(SourceArrowBodyPlan::StatementBlock { block: body }),
+            Err(super::source_statements::SourceFunctionStatementsError::Unsupported(_)) => {
+                return Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)));
+            }
+            Err(super::source_statements::SourceFunctionStatementsError::Variable(error)) => {
+                return Err(map_variable_error(error));
+            }
+            Err(_) => return Err(invariant(SourceArrowInvariant::InvalidBody(body))),
+        }
     }
     match block.statements.nodes.as_slice() {
         [] => Ok(SourceArrowBodyPlan::EmptyBlock { block: body }),
@@ -5390,11 +5724,49 @@ mod tests {
         assert!(rest.callable.parameters[1].rest);
 
         let predicate = Fixture::new("const f = (x: unknown): x is string => true;");
-        assert!(matches!(
-            predicate.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::TypePredicate(_))
-            ))
-        ));
+        let plan = predicate.plan(0).unwrap();
+        assert_eq!(plan.callable.family, SourceCallableFamily::ArrowFunction);
+        assert_ne!(plan.variable_symbol, plan.callable.owner_symbol);
+        assert_eq!(
+            predicate.bound.symbol(plan.callable.declaration),
+            Some(plan.callable.owner_symbol),
+        );
+        let written = plan.callable.return_type.type_node().unwrap();
+        let narrowing = plan.callable.type_predicate.unwrap();
+        assert_eq!(narrowing.owner, plan.callable.declaration);
+        assert_eq!(narrowing.node, written);
+        assert_eq!(plan.callable.return_type.annotation_identity(), Some((written, false)));
+        assert_eq!(narrowing.parameter_index, 0);
+        assert_eq!(
+            narrowing.parameter_symbol,
+            Some(plan.callable.parameters[0].symbol)
+        );
+        assert_eq!(
+            predicate.bound.symbol(plan.callable.parameters[0].declaration),
+            narrowing.parameter_symbol,
+        );
+        assert_eq!(
+            narrowing.kind,
+            super::super::signatures::TypePredicateKind::Identifier,
+        );
+        let host = predicate.host();
+        let NodeData::TypePredicateNode(annotation) = &host.node(written).unwrap().data
+        else {
+            panic!("the return plan must retain the written predicate");
+        };
+        assert!(annotation.asserts_modifier.is_none());
+        assert_eq!(annotation.type_, narrowing.narrowed_type.map(|node| node.node));
+        assert_eq!(
+            predicate
+                .host()
+                .node(narrowing.narrowed_type.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::StringKeyword,
+        );
+        let SourceArrowBodyPlan::ConciseExpression { expression } = plan.body else {
+            panic!("the predicate must retain its boolean expression body");
+        };
+        assert_eq!(predicate.host().node(expression).unwrap().kind, SyntaxKind::TrueKeyword);
     }
 }

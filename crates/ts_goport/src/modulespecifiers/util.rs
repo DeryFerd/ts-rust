@@ -1,0 +1,379 @@
+//! Port of modulespecifiers/util.go.
+
+use crate::prelude::*;
+
+use super::deps;
+use super::specifiers::{get_all_module_paths, get_info, try_get_module_name_as_node_module};
+use super::tspath;
+use super::types::*;
+
+// Go: modulespecifiers/util.go:29 comparePathsByRedirect
+pub(crate) fn compare_paths_by_redirect(
+    a: &ModulePath,
+    b: &ModulePath,
+    use_case_sensitive_file_names: bool,
+) -> i32 {
+    // Redirects sort first, matching Strada's compareBooleans(b.isRedirect, a.isRedirect).
+    let c = deps::compare_booleans(b.is_redirect, a.is_redirect);
+    if c != 0 {
+        return c;
+    }
+    let c = tspath::compare_number_of_directory_separators(&a.file_name, &b.file_name);
+    if c != 0 {
+        return c;
+    }
+    // Strada relies on Map insertion order to break remaining ties deterministically;
+    // Go maps are unordered, so compare paths to keep the ordering stable.
+    tspath::compare_paths(
+        &a.file_name,
+        &b.file_name,
+        &tspath::ComparePathsOptions {
+            use_case_sensitive_file_names,
+            ..Default::default()
+        },
+    )
+}
+
+// Go: modulespecifiers/util.go:42 PathIsBareSpecifier
+pub fn path_is_bare_specifier(path: &str) -> bool {
+    !tspath::path_is_absolute(path) && !tspath::path_is_relative(path)
+}
+
+// Go: modulespecifiers/util.go:46 IsExcludedByRegex
+pub fn is_excluded_by_regex(module_specifier: &str, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    // PORT: Go compiles each pattern with `stringToRegex` (a regexp, with an
+    // optional /.../i form) and tests `module_specifier`. This crate has no
+    // regex engine. The declaration emitter always passes no excludes.
+    let _ = module_specifier;
+    unported!("stringToRegex")
+}
+
+// Go: modulespecifiers/util.go:130 ensurePathIsNonModuleName
+/// Ensures a path is either absolute (prefixed with `/` or `c:`) or dot-relative (prefixed
+/// with `./` or `../`) so as not to be confused with an unprefixed module name.
+pub(crate) fn ensure_path_is_non_module_name(path: &str) -> String {
+    if path_is_bare_specifier(path) {
+        return format!("./{path}");
+    }
+    path.to_string()
+}
+
+// Go: modulespecifiers/util.go:137 GetJSExtensionForDeclarationFileExtension
+pub fn get_js_extension_for_declaration_file_extension(ext: &str) -> String {
+    match ext {
+        tspath::EXTENSION_DTS => tspath::EXTENSION_JS.to_string(),
+        tspath::EXTENSION_DMTS => tspath::EXTENSION_MJS.to_string(),
+        tspath::EXTENSION_DCTS => tspath::EXTENSION_CJS.to_string(),
+        // .d.json.ts and the like
+        _ => ext[".d".len()..ext.len() - tspath::EXTENSION_TS.len()].to_string(),
+    }
+}
+
+// Go: modulespecifiers/util.go:153 TryGetRealFileNameForNonJSDeclarationFileName
+/// Remaps files like `foo.d.json.ts` or `foo.module.d.css.ts` back to their
+/// real non-JS names.
+pub fn try_get_real_file_name_for_non_js_declaration_file_name(file_name: &str) -> String {
+    let base_name = tspath::get_base_file_name(file_name);
+    // Ends with .ts, contains ".d.", and is NOT a standard .d.ts file
+    if !file_name.ends_with(tspath::EXTENSION_TS)
+        || !base_name.contains(".d.")
+        || base_name.ends_with(tspath::EXTENSION_DTS)
+    {
+        return String::new();
+    }
+    let no_extension = tspath::remove_extension(file_name, tspath::EXTENSION_TS);
+    // PORT: Go slices from LastIndex, which is -1 (whole string) when there
+    // is no dot. A ".d." is present, so there is always a dot.
+    let last_dot_index = no_extension.rfind('.').unwrap_or(0);
+    let ext = &no_extension[last_dot_index..];
+    let before = no_extension
+        .split_once(".d.")
+        .map_or(no_extension, |(before, _)| before);
+    format!("{before}{ext}")
+}
+
+// Go: modulespecifiers/util.go:168 getJSExtensionForFile
+pub(crate) fn get_js_extension_for_file(
+    file_name: &str,
+    options: &CompilerOptions,
+) -> &'static str {
+    let result = deps::try_get_js_extension_for_file(file_name, options);
+    if result.is_empty() {
+        panic!(
+            "Extension {} is unsupported:: FileName:: {}",
+            extension_from_path(file_name),
+            file_name
+        );
+    }
+    result
+}
+
+// Go: modulespecifiers/util.go:180 extensionFromPath
+/// Gets the extension from a path. Path must have a valid extension.
+fn extension_from_path(path: &str) -> &'static str {
+    let ext = tspath::try_get_extension_from_path(path);
+    if ext.is_empty() {
+        panic!("File {path} has unknown extension.");
+    }
+    ext
+}
+
+// Go: modulespecifiers/util.go:188 tryGetAnyFileFromPath
+pub(crate) fn try_get_any_file_from_path(
+    host: &dyn ModuleSpecifierGenerationHost,
+    path: &str,
+) -> bool {
+    // !!! TODO: shouldn't this use readdir instead of fileexists for perf?
+    // We check all js, `node` and `json` extensions in addition to TS, since node module resolution would also choose those over the directory
+    // PORT: Go builds the groups with tsoptions.GetSupportedExtensions
+    // (AllowJs plus the `node` and `json` extra extensions). Neither extra
+    // has a deferred or JS script kind, so Go drops both and the result is
+    // tspath.AllSupportedExtensions.
+    let ext_groups = tspath::ALL_SUPPORTED_EXTENSIONS;
+    for exts in ext_groups {
+        for e in exts.iter() {
+            let full_path = format!("{path}{e}");
+            if host.file_exists(&tspath::get_normalized_absolute_path(
+                &full_path,
+                &host.get_current_directory(),
+            )) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Go: modulespecifiers/util.go:219 getPathsRelativeToRootDirs
+pub(crate) fn get_paths_relative_to_root_dirs(
+    path: &str,
+    root_dirs: &[String],
+    use_case_sensitive_file_names: bool,
+) -> Vec<String> {
+    let mut results = Vec::new();
+    for root_dir in root_dirs {
+        let relative_path =
+            get_relative_path_if_in_same_volume(path, root_dir, use_case_sensitive_file_names);
+        if !is_path_relative_to_parent(&relative_path) {
+            results.push(relative_path);
+        }
+    }
+    results
+}
+
+// Go: modulespecifiers/util.go:230 isPathRelativeToParent
+pub(crate) fn is_path_relative_to_parent(path: &str) -> bool {
+    path.starts_with("..")
+}
+
+// Go: modulespecifiers/util.go:234 getRelativePathIfInSameVolume
+pub(crate) fn get_relative_path_if_in_same_volume(
+    path: &str,
+    directory_path: &str,
+    use_case_sensitive_file_names: bool,
+) -> String {
+    let relative_path = tspath::get_relative_path_to_directory_or_url(
+        directory_path,
+        path,
+        false,
+        &tspath::ComparePathsOptions {
+            use_case_sensitive_file_names,
+            current_directory: directory_path.to_string(),
+        },
+    );
+    if tspath::is_rooted_disk_path(&relative_path) {
+        return String::new();
+    }
+    relative_path
+}
+
+// Go: modulespecifiers/util.go:245 packageJsonPathsAreEqual
+pub(crate) fn package_json_paths_are_equal(
+    a: &str,
+    b: &str,
+    options: &tspath::ComparePathsOptions,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    tspath::compare_paths(a, b, options) == 0
+}
+
+// Go: modulespecifiers/util.go:255 prefersTsExtension
+pub(crate) fn prefers_ts_extension(allowed_endings: &[ModuleSpecifierEnding]) -> bool {
+    let js_priority = index_of(allowed_endings, ModuleSpecifierEnding::JsExtension);
+    let ts_priority = index_of(allowed_endings, ModuleSpecifierEnding::TsExtension);
+    if ts_priority > -1 {
+        return ts_priority < js_priority;
+    }
+    false
+}
+
+/// Go `slices.Index`: the first index of `value`, or -1.
+pub(crate) fn index_of(endings: &[ModuleSpecifierEnding], value: ModuleSpecifierEnding) -> isize {
+    endings
+        .iter()
+        .position(|e| *e == value)
+        .map_or(-1, |i| i as isize)
+}
+
+// Go: modulespecifiers/util.go:264 replaceFirstStar
+pub(crate) fn replace_first_star(s: &str, replacement: &str) -> String {
+    s.replacen('*', replacement, 1)
+}
+
+// Go: modulespecifiers/util.go:268 NodeModulePathParts
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeModulePathParts {
+    pub top_level_node_modules_index: isize,
+    pub top_level_package_name_index: isize,
+    pub package_root_index: isize,
+    pub file_name_index: isize,
+}
+
+// Go: modulespecifiers/util.go:275 nodeModulesPathParseState
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NodeModulesPathParseState {
+    BeforeNodeModules,
+    NodeModules,
+    Scope,
+    PackageContent,
+}
+
+// Go: modulespecifiers/util.go:284 GetNodeModulePathParts
+pub fn get_node_module_path_parts(full_path: &str) -> Option<NodeModulePathParts> {
+    // If fullPath can't be valid module file within node_modules, returns undefined.
+    // Example of expected pattern: /base/path/node_modules/[@scope/otherpackage/@otherscope/node_modules/]package/[subdirectory/]file.js
+    // Returns indices:                       ^            ^                                                      ^             ^
+    use NodeModulesPathParseState::*;
+
+    let mut top_level_node_modules_index: isize = 0;
+    let mut top_level_package_name_index: isize = 0;
+    let mut package_root_index: isize = 0;
+
+    let mut part_start: isize = 0;
+    let mut part_end: isize = 0;
+    let mut state = BeforeNodeModules;
+
+    let bytes = full_path.as_bytes();
+    while part_end >= 0 {
+        part_start = part_end;
+        part_end = deps::index_after(full_path, "/", (part_start + 1) as usize);
+        match state {
+            BeforeNodeModules => {
+                if full_path[part_start as usize..].starts_with("/node_modules/") {
+                    top_level_node_modules_index = part_start;
+                    top_level_package_name_index = part_end;
+                    state = NodeModules;
+                }
+            }
+            NodeModules | Scope => {
+                if state == NodeModules && bytes[(part_start + 1) as usize] == b'@' {
+                    state = Scope;
+                } else {
+                    package_root_index = part_end;
+                    state = PackageContent;
+                }
+            }
+            PackageContent => {
+                if full_path[part_start as usize..].starts_with("/node_modules/") {
+                    state = NodeModules;
+                } else {
+                    state = PackageContent;
+                }
+            }
+        }
+    }
+
+    let file_name_index = part_start;
+
+    if state > NodeModules {
+        return Some(NodeModulePathParts {
+            top_level_node_modules_index,
+            top_level_package_name_index,
+            package_root_index,
+            file_name_index,
+        });
+    }
+    None
+}
+
+// Go: modulespecifiers/util.go:339 GetNodeModulesPackageName
+pub fn get_node_modules_package_name(
+    compiler_options: &CompilerOptions,
+    importing_source_file: Node, // !!! | FutureSourceFile
+    node_modules_file_name: &str,
+    host: &dyn ModuleSpecifierGenerationHost,
+    preferences: &UserPreferences,
+    options: ModuleSpecifierOptions,
+) -> String {
+    let info = get_info(&importing_source_file.file_name(), host);
+    let module_paths = get_all_module_paths(
+        &info,
+        node_modules_file_name,
+        host,
+        compiler_options,
+        preferences,
+        options,
+    );
+    for module_path in &module_paths {
+        let result = try_get_module_name_as_node_module(
+            module_path,
+            &info,
+            &importing_source_file,
+            host,
+            compiler_options,
+            preferences,
+            true, /*packageNameOnly*/
+            options.override_import_mode,
+        );
+        if !result.is_empty() {
+            return result;
+        }
+    }
+    String::new()
+}
+
+// Go: modulespecifiers/util.go:357 allKeysStartWithDot
+pub(crate) fn all_keys_start_with_dot(
+    obj: &IndexMap<String, super::packagejson::ExportsOrImports>,
+) -> bool {
+    obj.keys().all(|k| k.starts_with('.'))
+}
+
+// Go: modulespecifiers/util.go:366 GetPackageNameFromDirectory
+pub fn get_package_name_from_directory(file_or_directory_path: &str) -> String {
+    let Some(idx) = file_or_directory_path.rfind("/node_modules/") else {
+        return String::new();
+    };
+
+    let basename = &file_or_directory_path[idx + "/node_modules/".len()..];
+    // PORT: Go indexes basename[0] and panics on an empty basename.
+    if basename.as_bytes()[0] == b'.' {
+        return String::new();
+    }
+
+    let Some(next_slash) = basename.find('/') else {
+        return basename.to_string();
+    };
+
+    if basename.as_bytes()[0] != b'@' || next_slash == basename.len() - 1 {
+        return basename[..next_slash].to_string();
+    }
+
+    let Some(second_slash) = basename[next_slash + 1..].find('/') else {
+        return basename.to_string();
+    };
+
+    basename[..next_slash + 1 + second_slash].to_string()
+}
+
+// Go: modulespecifiers/util.go:393 ProcessEntrypointEnding
+// PORT: not ported. It takes a `module.ResolvedEntrypoint`, which only the
+// language service auto-import code produces.

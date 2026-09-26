@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
-use ts_binder::{EscapedName, EscapedNameRef, SemanticSymbolId, SymbolFlags};
+use ts_binder::{EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId,
@@ -27,11 +27,11 @@ use super::{
     instantiated_members::{GenericInterfaceMemberError, validated_generic_interface_type_edges},
     keyof_types::validate_generic_keyof_index_type,
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
-    object_members::PlannedProperty,
+    object_members::{PlannedProperty, PropertyObjectError, object_literal_state},
     relater::ResolvedDeclaredPropertyObject,
     source::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, PlannedObjectMember,
-        SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax,
+        SourceCheckError, SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -67,6 +67,10 @@ pub(super) enum PreparedExpression {
     Template(Option<TypeId>),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
+    ConstArray {
+        elements: Vec<PreparedExpression>,
+        readonly: bool,
+    },
     Object(Vec<PreparedObjectMember>),
     Property(Box<PreparedExpression>),
     Arrow(Option<TypeId>),
@@ -74,6 +78,10 @@ pub(super) enum PreparedExpression {
     Conditional {
         contextual_type: Option<TypeId>,
         mutable_result: bool,
+    },
+    ComputedPropertyValue {
+        contextual_type: Option<TypeId>,
+        readonly: bool,
     },
 }
 
@@ -457,12 +465,13 @@ fn preflight_contextual_type_graph(
         if flags == TypeFlags::TYPE_PARAMETER
             && cached_ordinary_type_parameter_owner(store, contextual_type).is_some()
         {
-            return validate_contextual_union(store, global_types, contextual_type);
+            return validate_contextual_union(store, global_types, contextual_type)
+                .map_err(Into::into);
         }
         if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
-        validate_contextual_union(store, global_types, contextual_type)
+        validate_contextual_union(store, global_types, contextual_type).map_err(Into::into)
     })();
     assert!(visiting.remove(&contextual_type));
     if result.is_ok() {
@@ -511,6 +520,7 @@ fn prepare_expression(
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::ImportMeta(_) => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
         }
@@ -559,13 +569,15 @@ fn prepare_expression(
             contextual_type,
             location,
         )?),
-        PlannedExpressionKind::Boolean(_) => PreparedExpression::Literal(literal_treatment(
-            store,
-            global_types,
-            LiteralKind::Boolean,
-            contextual_type,
-            location,
-        )?),
+        PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::LogicalNot(_) => {
+            PreparedExpression::Literal(literal_treatment(
+                store,
+                global_types,
+                LiteralKind::Boolean,
+                contextual_type,
+                location,
+            )?)
+        }
         PlannedExpressionKind::Parenthesized(inner) => {
             PreparedExpression::Parenthesized(Box::new(prepare_expression(
                 store,
@@ -583,6 +595,13 @@ fn prepare_expression(
             mutable_result: location == ExpressionLocation::Mutable,
         },
         PlannedExpressionKind::Array(elements) => {
+            // Source-free contextual plans keep the ordinary array path.
+            let const_context = host.node(expression.node).is_some()
+                && super::type_nodes::source_expression_has_const_assertion_context(
+                    store,
+                    host,
+                    expression.node,
+                )?;
             let element_context = match (global_types, contextual_type) {
                 (Some(global_types), Some(contextual_type)) => {
                     store.canonical_array_element_type(global_types, contextual_type)?
@@ -681,10 +700,25 @@ fn prepare_expression(
                     state,
                     element,
                     positional_context.or(element_context),
-                    ExpressionLocation::Mutable,
+                    if const_context {
+                        ExpressionLocation::Cached
+                    } else {
+                        ExpressionLocation::Mutable
+                    },
                 )?);
             }
-            PreparedExpression::Array(prepared)
+            if const_context {
+                PreparedExpression::ConstArray {
+                    elements: prepared,
+                    readonly: !const_array_context_is_mutable(
+                        store,
+                        global_types,
+                        contextual_type,
+                    )?,
+                }
+            } else {
+                PreparedExpression::Array(prepared)
+            }
         }
         PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
@@ -697,36 +731,91 @@ fn prepare_expression(
                 properties,
                 state.current_flow_types,
             )?;
+            let computed_without_context =
+                contextual_type.is_none() && plan.has_source_computed_properties();
+            if computed_without_context {
+                object_literal_state(store, plan).map_err(|error| {
+                    let error = match error {
+                        PropertyObjectError::Capacity(node) => {
+                            SourceObjectLiteralError::Capacity(node)
+                        }
+                        PropertyObjectError::InvalidCachedTypeLiteral { node, type_ } => {
+                            SourceObjectLiteralError::InvalidCache {
+                                node,
+                                type_: Some(type_),
+                            }
+                        }
+                        PropertyObjectError::InvalidObjectLiteral(node)
+                        | PropertyObjectError::InvalidTypeLiteral(node)
+                        | PropertyObjectError::UnsupportedMember { node, .. } => {
+                            SourceObjectLiteralError::InvalidCache { node, type_: None }
+                        }
+                        PropertyObjectError::InvalidInterface { declaration, .. } => {
+                            SourceObjectLiteralError::InvalidCache {
+                                node: declaration,
+                                type_: None,
+                            }
+                        }
+                        PropertyObjectError::InvalidInterfaceSymbol(_)
+                        | PropertyObjectError::InvalidCachedInterface { .. } => {
+                            unreachable!(
+                                "object-literal execution cannot produce an interface cache error"
+                            )
+                        }
+                    };
+                    SourceCheckError::ObjectLiteral(error)
+                })?;
+            }
             let mut prepared = Vec::with_capacity(properties.len());
             for (property, member) in plan.properties.iter().zip(properties) {
                 let Some(expression) = member.eager_expression() else {
                     prepared.push(PreparedObjectMember::Getter);
                     continue;
                 };
-                let name = property
-                    .name
-                    .as_utf8()
-                    .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
-                let property_context = contextual_property_type(
-                    store,
-                    &contextual,
-                    name,
-                    expression,
-                    state.current_flow_types,
-                )?;
-                prepared.push(PreparedObjectMember::Eager(prepare_expression(
-                    store,
-                    host,
-                    global_types,
-                    state,
-                    expression,
-                    property_context,
-                    if property.readonly {
-                        ExpressionLocation::Readonly
-                    } else {
-                        ExpressionLocation::Mutable
-                    },
-                )?));
+                let property_context = if computed_without_context
+                    && property.name.as_ref() == InternalSymbolName::Computed.as_ref()
+                {
+                    None
+                } else {
+                    let name = property
+                        .name
+                        .as_utf8()
+                        .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
+                    contextual_property_type(
+                        store,
+                        &contextual,
+                        name,
+                        expression,
+                        state.current_flow_types,
+                    )?
+                };
+                let value = if computed_without_context
+                    && matches!(
+                        &expression.kind,
+                        PlannedExpressionKind::Binary(_) | PlannedExpressionKind::Call(_)
+                    )
+                {
+                    // Check these values through source checking after the computed-key pass.
+                    PreparedExpression::ComputedPropertyValue {
+                        contextual_type: property_context,
+                        readonly: property.readonly,
+                    }
+                } else {
+                    prepare_expression(
+                        store,
+                        host,
+                        global_types,
+                        state,
+                        expression,
+                        property_context,
+                        if property.readonly {
+                            ExpressionLocation::Readonly
+                        } else {
+                            ExpressionLocation::Mutable
+                        },
+                    )?
+                };
+                prepared.push(PreparedObjectMember::Eager(value));
             }
             PreparedExpression::Object(prepared)
         }
@@ -771,6 +860,43 @@ fn prepare_expression(
         }
     };
     Ok(prepared)
+}
+
+/// Const arrays keep literal elements but can receive a mutable array or tuple context.
+fn const_array_context_is_mutable(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    contextual_type: Option<TypeId>,
+) -> Result<bool, SourceCheckError> {
+    let mut pending = contextual_type.into_iter().collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if let TypeData::Union(union) = record.data() {
+            validate_contextual_union(store, global_types, type_)?;
+            pending.extend_from_slice(&union.union.types);
+            continue;
+        }
+        if let Some(tuple) = store
+            .canonical_tuple_shape(type_)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_))?
+            && !tuple.is_readonly()
+        {
+            return Ok(true);
+        }
+        if let Some(global_types) = global_types
+            && let Some(array) = store.canonical_array_reference(global_types, type_)?
+            && !array.readonly
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn contextual_objects(
@@ -1535,6 +1661,13 @@ pub(super) fn source_keyof_contextual_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_parameter: TypeId,
 ) -> Result<Option<SourceGenericConstraint>, SourceCheckError> {
+    source_keyof_contextual_type_parameter_worker(store, type_parameter).map_err(Into::into)
+}
+
+fn source_keyof_contextual_type_parameter_worker(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+) -> Result<Option<SourceGenericConstraint>, RelationUnavailable> {
     let record = store
         .type_payload(type_parameter)
         .ok_or(RelationUnavailable::Type(type_parameter))?;
@@ -1544,10 +1677,10 @@ pub(super) fn source_keyof_contextual_type_parameter(
     let Some(proof) = source_generic_type_parameter_constraint(store, type_parameter).map_err(
         |error| match error {
             GenericCallVectorError::Unsupported(_) => {
-                RelationUnavailable::UnsupportedStructuredType(type_parameter).into()
+                RelationUnavailable::UnsupportedStructuredType(type_parameter)
             }
-            GenericCallVectorError::Relation(error) => SourceCheckError::from(error),
-            _ => RelationUnavailable::MalformedStructuredType(type_parameter).into(),
+            GenericCallVectorError::Relation(error) => error,
+            _ => RelationUnavailable::MalformedStructuredType(type_parameter),
         },
     )?
     else {
@@ -1576,7 +1709,7 @@ fn is_literal_of_contextual_type(
     kind: LiteralKind,
     contextual_type: Option<TypeId>,
     visited: &mut HashSet<TypeId>,
-) -> Result<bool, SourceCheckError> {
+) -> Result<bool, RelationUnavailable> {
     let Some(contextual_type) = contextual_type else {
         return Ok(false);
     };
@@ -1589,7 +1722,7 @@ fn is_literal_of_contextual_type(
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         let flags = record.flags();
         if flags == TypeFlags::TYPE_PARAMETER
-            && source_keyof_contextual_type_parameter(store, contextual_type)?.is_some()
+            && source_keyof_contextual_type_parameter_worker(store, contextual_type)?.is_some()
         {
             return Ok(matches!(kind, LiteralKind::String | LiteralKind::Number));
         }
@@ -1650,7 +1783,11 @@ fn is_literal_of_contextual_type(
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
         if flags.intersects(TypeFlags::FRESHABLE) {
-            store.validate_union_constituent(contextual_type)?;
+            store
+                .validate_union_constituent(contextual_type)
+                .map_err(|error| {
+                    super::relater::union_validation_unavailable(contextual_type, error)
+                })?;
         }
         Ok(match kind {
             LiteralKind::String => flags.intersects(TypeFlags::STRING_LITERAL),
@@ -1666,7 +1803,7 @@ fn is_literal_of_contextual_type(
 fn validate_contextual_template(
     store: &CanonicalTypeMapperStore,
     contextual_type: TypeId,
-) -> Result<Vec<TypeId>, SourceCheckError> {
+) -> Result<Vec<TypeId>, RelationUnavailable> {
     let record = store
         .type_payload(contextual_type)
         .ok_or(RelationUnavailable::Type(contextual_type))?;
@@ -1690,16 +1827,71 @@ fn validate_contextual_union(
     store: &CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     union: TypeId,
-) -> Result<(), SourceCheckError> {
+) -> Result<(), RelationUnavailable> {
     let result = match global_types {
         Some(global_types) => {
             store.validate_union_constituent_with_global_types(global_types, union)
         }
         None => store.validate_union_constituent(union),
     };
-    result
-        .map_err(|error| super::relater::union_validation_unavailable(union, error))
-        .map_err(Into::into)
+    result.map_err(|error| super::relater::union_validation_unavailable(union, error))
+}
+
+/// Checks the literal kind, not its value, against the mapped argument context.
+pub(super) fn is_literal_type_of_contextual_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    candidate: TypeId,
+    contextual_type: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    if !store
+        .type_payload(candidate)
+        .ok_or(RelationUnavailable::Type(candidate))?
+        .flags()
+        .intersects(TypeFlags::LITERAL | TypeFlags::UNION)
+    {
+        return Ok(false);
+    }
+    match global_types {
+        Some(globals) => store.validate_union_constituent_with_global_types(globals, candidate),
+        None => store.validate_union_constituent(candidate),
+    }
+    .map_err(|error| super::relater::union_validation_unavailable(candidate, error))?;
+    let mut pending = vec![candidate];
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if let TypeData::Union(union) = record.data() {
+            pending.extend_from_slice(&union.union.types);
+            continue;
+        }
+        let kind = if record.flags().intersects(TypeFlags::STRING_LITERAL) {
+            LiteralKind::String
+        } else if record.flags().intersects(TypeFlags::NUMBER_LITERAL) {
+            LiteralKind::Number
+        } else if record.flags().intersects(TypeFlags::BIG_INT_LITERAL) {
+            LiteralKind::BigInt
+        } else if record.flags().intersects(TypeFlags::BOOLEAN_LITERAL) {
+            LiteralKind::Boolean
+        } else {
+            continue;
+        };
+        if is_literal_of_contextual_type(
+            store,
+            global_types,
+            kind,
+            Some(contextual_type),
+            &mut HashSet::new(),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Initialized arrows receive their callable context without its optional undefined branch.
@@ -2984,7 +3176,7 @@ mod tests {
             );
             assert!(matches!(is_literal_of_contextual_type(
                 store, None, LiteralKind::String, Some(target), &mut visited,
-            ), Err(SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedIntersection(type_))) if type_ == target));
+            ), Err(RelationUnavailable::MalformedIntersection(type_)) if type_ == target));
             assert!(visited.is_empty());
             assert_eq!(
                 (
@@ -3065,9 +3257,7 @@ mod tests {
                 Some(deferred),
                 &mut HashSet::new(),
             ),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::UnresolvedStructuredMembers(deferred),
-            )),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(deferred)),
         );
         assert_eq!(
             (
@@ -3198,9 +3388,7 @@ mod tests {
                     Some(target),
                     &mut HashSet::new(),
                 ),
-                Err(SourceCheckError::RelationUnavailable(
-                    RelationUnavailable::MalformedIntersection(target),
-                )),
+                Err(RelationUnavailable::MalformedIntersection(target)),
             );
             assert_eq!(
                 (
@@ -4581,15 +4769,11 @@ mod tests {
 
         assert_eq!(
             validate_contextual_union(&store, None, containing_object),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::UnsupportedUnionConstituent(object)
-            ))
+            Err(RelationUnavailable::UnsupportedUnionConstituent(object))
         );
         assert_eq!(
             validate_contextual_union(&store, None, claiming_object),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::MalformedUnion(claiming_object)
-            ))
+            Err(RelationUnavailable::MalformedUnion(claiming_object))
         );
         assert_eq!(
             (

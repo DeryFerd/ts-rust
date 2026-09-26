@@ -12,11 +12,17 @@
 //! Static blocks retain their outer start and receiver-specific property keys.
 //! Field initializers retain their own flow containers. Local destructuring
 //! assignments do not initialize class fields.
+//! Private destructuring leaves use the real field assignment and source property.
+//! Source-file field reads use checked own-field writes and real binder references.
+//! Unknown flow effects and affected computed or binding reads stay unsupported.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+
+mod references;
+mod discriminants;
 
 use ts_ast::{
     FlowFlags, FlowNode, FlowNodeArena, FlowNodeId, FlowNodePayload, FlowRef, NodeArena,
@@ -24,30 +30,53 @@ use ts_ast::{
 };
 use ts_binder::{
     BoundFile, BoundFlowGraph, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags,
-    InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
-    array_types::ArrayTypeError,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, EffectsSignatureState,
+    RelationUnavailable, SignatureId, SymbolNodeLinks, TypeId, TypeNodeLinks, TypePredicateId,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
+    callable_sets::{
+        CallableSetProjection, StoredCallableSetValidation,
+        validate_stored_callable_set_with_array_targets,
+    },
     classes::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassMemberOrigin, ClassMemberSource,
         ClassPropertySide, class_body_identities, class_member_source,
     },
-    logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
-    source::CheckedClassPropertyAssignment,
+    instantiate::InstantiationSession,
+    logical_operators::{
+        LogicalBinaryError, TruthinessAssumption, base_type_of_literal_type, narrow_by_truthiness,
+        narrow_by_truthiness_with_session,
+    },
+    relation::RelationKind,
+    signatures::TypePredicateKind,
+    source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead, SourceCheckError},
+    source_calls::{
+        CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
+        resolve_source_call_effects_signature, source_class_method_effect_target,
+    },
     source_properties::{
-        ClassAccessContext, SourceClassPropertyWritePlan, SourcePropertyError,
+        ClassAccessContext, ClassPropertyTruthinessSource, OwnClassPropertyWritePlan,
+        SourceClassPropertyWritePlan, SourcePropertyError, class_destructuring_write_assignment,
+        plan_class_destructuring_property_write, plan_class_property_truthiness,
         plan_class_property_write, validate_class_property_write_access,
+        validate_own_class_property_write_target,
     },
     source_statements::{
-        SourceLinearLogicalStatementSyntax, plan_source_linear_logical_statement_syntax,
+        SourceCallableCatchBindingSyntax, SourceCallableStatementListSyntax,
+        SourceCallableStatementSyntax, SourceCapturedIterationStatementSyntax,
+        SourceLinearFunctionStatementSyntax, SourceLinearLogicalStatementSyntax,
+        SourceLocalDeclarationSyntax, plan_source_callable_statement_list_syntax,
+        plan_source_for_statement_syntax, plan_source_linear_logical_statement_syntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
+    variables::{VariableBindingKind, plan_top_level_variable},
 };
 
 const FLOW_DEPTH_LIMIT: usize = 2_000;
@@ -55,23 +84,588 @@ const FLOW_METADATA_BITS: u32 = FlowFlags::REFERENCED.bits() | FlowFlags::SHARED
 
 pub(super) type SourceFlowTypes = HashMap<SemanticSymbolId, TypeId>;
 
+pub(super) struct SourceFlowContext<'call, 'source> {
+    pub(super) host: &'call DeclaredTypeHost<'source>,
+    pub(super) globals: &'call CanonicalGlobalTypes,
+    pub(super) options: CanonicalCheckerOptions,
+    pub(super) diagnostics: &'call mut super::CanonicalCheckerDiagnostics,
+}
+
+impl<'source> SourceFlowContext<'_, 'source> {
+    fn reborrow(&mut self) -> SourceFlowContext<'_, 'source> {
+        SourceFlowContext {
+            host: self.host,
+            globals: self.globals,
+            options: self.options,
+            diagnostics: self.diagnostics,
+        }
+    }
+
+    fn comparable(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        session: &mut InstantiationSession,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, SourceCheckError> {
+        super::source::source_type_is_related_to(
+            store, self.host, self.globals, self.options, session, self.diagnostics,
+            source, target, RelationKind::Comparable,
+        )
+    }
+}
+
+/// One flow query borrows the source caller. Frames and caches never retain it.
+pub(super) struct SourceFlowCaller<'a, 'env> {
+    pub(super) session: &'a mut InstantiationSession,
+    pub(super) context: SourceFlowContext<'a, 'env>,
+}
+
+fn source_flow_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    types: &[TypeId],
+    caller: &mut Option<SourceFlowCaller<'_, '_>>,
+) -> Result<TypeId, LiteralTypeCacheError> {
+    match caller {
+        Some(caller) => store.expression_union_type_with_global_types_and_session(
+            globals, types, UnionReduction::Literal, caller.session,
+        ),
+        None => store.expression_union_type_with_global_types(globals, types, UnionReduction::Literal),
+    }
+}
+
+/// Checked source writes for one source-check invocation, keyed by their real targets.
+#[derive(Default)]
+pub(super) struct OwnClassPropertyFlow {
+    assignments: HashMap<NodeRef, CompletedOwnClassPropertyWrite>,
+}
+
+struct CompletedOwnClassPropertyWrite {
+    plan: OwnClassPropertyWritePlan,
+    receiver_type: TypeId,
+    declared_type: TypeId,
+    assigned_type: TypeId,
+    flow_type: TypeId,
+}
+
+impl CompletedOwnClassPropertyWrite {
+    fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+    ) -> Result<(), SourceFlowError> {
+        let assignment = self.plan.assignment();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(assignment.left);
+        let checked = validate_own_class_property_write_target(
+            store,
+            host,
+            options,
+            &self.plan,
+            self.receiver_type,
+        )
+        .map_err(|_| invalid())?;
+        if checked.declared_type != self.declared_type
+            || store.type_node_links(assignment.expression)
+                != Some(&super::TypeNodeLinks {
+                    resolved_type: Some(self.assigned_type),
+                    ..super::TypeNodeLinks::default()
+                })
+            || store.type_payload(self.flow_type).is_none()
+        {
+            return Err(invalid().into());
+        }
+        Ok(())
+    }
+}
+
+impl OwnClassPropertyFlow {
+    pub(super) fn matching_receiver_symbol(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        receiver: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+        if self.assignments.is_empty() {
+            return Ok(None);
+        }
+        let bound = host
+            .bound_file(receiver)
+            .ok_or(SourceFlowInvariant::ForeignNode(receiver))?;
+        let symbol = own_class_flow_reference_symbol(store, host, bound, receiver)?;
+        Ok(symbol.filter(|symbol| {
+            self.assignments
+                .values()
+                .any(|write| write.plan.assignment().receiver_symbol == *symbol)
+        }))
+    }
+
+    pub(super) fn has_reference(&self, receiver: SemanticSymbolId, name: &str) -> bool {
+        self.assignments.values().any(|write| {
+            write.plan.assignment().receiver_symbol == receiver && write.plan.name() == name
+        })
+    }
+
+    pub(super) fn has_checked_reference(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        receiver: SemanticSymbolId,
+        name: Option<&str>,
+    ) -> Result<bool, SourceFlowError> {
+        let mut affected = false;
+        for write in self.assignments.values().filter(|write| {
+            write.plan.assignment().receiver_symbol == receiver
+                && name.is_none_or(|name| write.plan.name() == name)
+        }) {
+            write.validate(store, host, options)?;
+            affected = true;
+        }
+        Ok(affected)
+    }
+
+    /// Computed reads need their own reference proof before they can use checked writes.
+    pub(super) fn has_unproved_element_read(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        plan: &super::source_elements::SourceElementPlan,
+    ) -> Result<bool, SourceFlowError> {
+        let Some(receiver_symbol) =
+            self.matching_receiver_symbol(store, host, plan.receiver.node)?
+        else {
+            return Ok(false);
+        };
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(plan.node);
+        let (arena, bound) = host.source(plan.node).ok_or_else(invalid)?;
+        own_class_flow_node(store, host, plan.node)?;
+        let syntax =
+            super::source_elements::plan_direct_source_element_syntax(arena, store, plan.node)
+                .map_err(|_| invalid())?;
+        if syntax.receiver() != plan.receiver.node
+            || syntax.index() != plan.index.node
+            || own_class_flow_symbol(store, host, bound, plan.receiver.node)? != receiver_symbol
+        {
+            return Err(invalid().into());
+        }
+        let name = match &own_class_flow_node(store, host, plan.index.node)?.data {
+            NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
+            NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.as_str()),
+            _ => None,
+        };
+        let affected = self.has_checked_reference(store, host, options, receiver_symbol, name)?;
+        if affected
+            && (store
+                .type_node_links(plan.node)
+                .is_some_and(|links| links != &super::TypeNodeLinks::default())
+                || store
+                    .symbol_node_links(plan.node)
+                    .is_some_and(|links| links != &super::SymbolNodeLinks::default()))
+        {
+            return Err(invalid().into());
+        }
+        Ok(affected)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Retain the result checked with the source caller's session.
+    pub(super) fn complete_assignment(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        plan: &OwnClassPropertyWritePlan,
+        receiver_type: TypeId,
+        assigned_type: TypeId,
+        flow_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let assignment = plan.assignment();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(assignment.left);
+        let checked =
+            validate_own_class_property_write_target(store, host, options, plan, receiver_type)
+                .map_err(|_| invalid())?;
+        let bound = host.bound_file(assignment.left).ok_or_else(invalid)?;
+        if bound.flow_container(assignment.left) != Some(bound.source_file())
+            || bound.flow_at(assignment.left).is_none()
+            || store.type_node_links(assignment.expression)
+                != Some(&super::TypeNodeLinks {
+                    resolved_type: Some(assigned_type),
+                    ..super::TypeNodeLinks::default()
+                })
+            || store.type_payload(flow_type).is_none()
+            || self.assignments.contains_key(&assignment.left)
+        {
+            return Err(invalid().into());
+        }
+        self.assignments.insert(
+            assignment.left,
+            CompletedOwnClassPropertyWrite {
+                plan: plan.clone(),
+                receiver_type,
+                declared_type: checked.declared_type,
+                assigned_type,
+                flow_type,
+            },
+        );
+        Ok(())
+    }
+
+    /// Uses the actual source flow chain. Other instances of the same class do not match.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn read_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        access: NodeRef,
+        receiver_symbol: SemanticSymbolId,
+        receiver_type: TypeId,
+        member: SemanticSymbolId,
+        declared_type: TypeId,
+    ) -> Result<Option<TypeId>, SourceFlowError> {
+        if !self.assignments.values().any(|write| {
+            write.plan.assignment().receiver_symbol == receiver_symbol
+                && write.plan.member_source().symbol == member
+        }) {
+            return Ok(None);
+        }
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
+        let bound = host.bound_file(access).ok_or_else(invalid)?;
+        let container = bound.source_file();
+        if bound.flow_container(access) != Some(container) {
+            return Ok(None);
+        }
+        let graph = bound.flow_graph();
+        if graph.container_is_complete(container) != Some(true) {
+            return Err(SourceFlowUnsupported::IncompleteContainer(container).into());
+        }
+        let start = graph
+            .container_start(container)
+            .ok_or(SourceFlowInvariant::MissingStart(container))?;
+        preflight_start_payload(graph, container, start)?;
+        let record = own_class_flow_node(store, host, access)?;
+        if is_property_assignment_target(host, access) {
+            return Err(invalid().into());
+        }
+        let NodeData::PropertyAccessExpression(property) = &record.data else {
+            return Err(invalid().into());
+        };
+        let receiver = NodeRef::new(access.arena, access.file, property.expression);
+        let name = NodeRef::new(access.arena, access.file, property.name);
+        let NodeData::Identifier(name) = &own_class_flow_node(store, host, name)?.data else {
+            return Err(invalid().into());
+        };
+        if own_class_flow_symbol(store, host, bound, receiver)? != receiver_symbol {
+            return Err(invalid().into());
+        }
+        let mut current = bound
+            .flow_at(access)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(access))?;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(SourceFlowInvariant::Cycle(current).into());
+            }
+            if visited.len() > FLOW_DEPTH_LIMIT {
+                return Err(SourceFlowInvariant::DepthLimit(current).into());
+            }
+            let node = flow_node(graph, current)?;
+            match source_flow_kind(current, node.flags)? {
+                SourceFlowKind::Start => {
+                    if current != start {
+                        return Err(SourceFlowInvariant::InvalidStart(current).into());
+                    }
+                    preflight_start_payload(graph, container, current)?;
+                    return Ok(Some(declared_type));
+                }
+                SourceFlowKind::Assignment => {
+                    let antecedent = linear_antecedent(current, &node)?;
+                    flow_node(graph, antecedent)?;
+                    if antecedent == current {
+                        return Err(SourceFlowInvariant::Cycle(current).into());
+                    }
+                    let target = ast_payload(current, &node)?;
+                    validate_bound_node(bound, graph, target)?;
+                    let target_node = own_class_flow_node(store, host, target)?;
+                    if let Some(write) = self.assignments.get(&target) {
+                        let assignment = write.plan.assignment();
+                        if assignment.left != target
+                            || bound.flow_container(target) != Some(container)
+                        {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
+                        }
+                        write.validate(store, host, options)?;
+                        if assignment.receiver_symbol == receiver_symbol
+                            && write.plan.member_source().symbol == member
+                        {
+                            if write.receiver_type != receiver_type
+                                || write.declared_type != declared_type
+                            {
+                                return Err(invalid().into());
+                            }
+                            return Ok(Some(write.flow_type));
+                        }
+                    } else {
+                        match &target_node.data {
+                            NodeData::VariableDeclaration(_) => {
+                                let symbol = bound
+                                    .symbol(target)
+                                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                                    .ok_or_else(invalid)?;
+                                if symbol == receiver_symbol {
+                                    return Ok(Some(declared_type));
+                                }
+                            }
+                            NodeData::Identifier(_) => {
+                                if own_class_flow_symbol(store, host, bound, target)?
+                                    == receiver_symbol
+                                {
+                                    return Ok(Some(declared_type));
+                                }
+                            }
+                            NodeData::PropertyAccessExpression(property) => {
+                                let receiver =
+                                    NodeRef::new(target.arena, target.file, property.expression);
+                                let property_name =
+                                    NodeRef::new(target.arena, target.file, property.name);
+                                let NodeData::Identifier(property_name) =
+                                    &own_class_flow_node(store, host, property_name)?.data
+                                else {
+                                    return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+                                };
+                                if own_class_flow_symbol(store, host, bound, receiver)?
+                                    == receiver_symbol
+                                    && property_name.text == name.text
+                                {
+                                    return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+                                }
+                            }
+                            _ => return Err(SourceFlowUnsupported::PropertyWrite(target).into()),
+                        }
+                    }
+                    current = antecedent;
+                }
+                SourceFlowKind::Unreachable => {
+                    validate_unreachable_node(graph, current, &node)?;
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+                SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+                    for &antecedent in label_antecedents(current, &node)? {
+                        flow_node(graph, antecedent)?;
+                    }
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+                SourceFlowKind::Call
+                | SourceFlowKind::ArrayMutation
+                | SourceFlowKind::TrueCondition
+                | SourceFlowKind::FalseCondition => {
+                    let payload = ast_payload(current, &node)?;
+                    validate_bound_node(bound, graph, payload)?;
+                    own_class_flow_node(store, host, payload)?;
+                    flow_node(graph, linear_antecedent(current, &node)?)?;
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+}
+
+fn own_class_flow_node<'host>(
+    store: &CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<&'host ts_ast::Node, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::ForeignNode(node);
+    let record = super::declared::preflight_node(store, host, node).map_err(|_| invalid())?;
+    let parent = record
+        .parent
+        .map_or(super::store::SourceNodeParent::Root, |parent| {
+            super::store::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+        });
+    if store.source_node_kind(node) != Some(record.kind)
+        || store.source_node_parent(node) != Some(parent)
+    {
+        return Err(invalid().into());
+    }
+    Ok(record)
+}
+
+fn own_class_flow_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, SourceFlowError> {
+    own_class_flow_reference_symbol(store, host, bound, node)?
+        .ok_or_else(|| SourceFlowUnsupported::PropertyWrite(node).into())
+}
+
+/// Match the reference wrappers used by Go without reading any annotation type.
+#[allow(clippy::too_many_lines)] // Keep each source edge and the final symbol proof in one walk.
+fn own_class_flow_reference_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    mut node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(node) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(SourceFlowInvariant::InvalidClassProperty(node).into());
+        }
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(node);
+        let record = own_class_flow_node(store, host, node)?;
+        let child = match &record.data {
+            NodeData::Identifier(_) => break,
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::NonNullExpression(wrapper)
+                if record.kind == SyntaxKind::NonNullExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::SatisfiesExpression(wrapper)
+                if record.kind == SyntaxKind::SatisfiesExpression =>
+            {
+                let annotation = NodeRef::new(node.arena, node.file, wrapper.type_);
+                if own_class_flow_node(store, host, annotation)?.parent != Some(node.node) {
+                    return Err(invalid().into());
+                }
+                wrapper.expression
+            }
+            NodeData::BinaryExpression(binary) if record.kind == SyntaxKind::BinaryExpression => {
+                let operator = NodeRef::new(node.arena, node.file, binary.operator_token);
+                let operator = own_class_flow_node(store, host, operator)?;
+                if operator.kind != SyntaxKind::CommaToken {
+                    return Ok(None);
+                }
+                let left = NodeRef::new(node.arena, node.file, binary.left);
+                if operator.parent != Some(node.node)
+                    || operator.flags.0 != 0
+                    || !matches!(operator.data, NodeData::Token(_))
+                    || binary.facts != 0
+                    || binary.symbol.is_some()
+                    || binary.type_.is_some()
+                    || binary.modifiers.is_some()
+                    || own_class_flow_node(store, host, left)?.parent != Some(node.node)
+                {
+                    return Err(invalid().into());
+                }
+                binary.right
+            }
+            _ => return Ok(None),
+        };
+        let child = NodeRef::new(node.arena, node.file, child);
+        let child_record = own_class_flow_node(store, host, child)?;
+        if record.flags.0 != 0
+            || child_record.parent != Some(node.node)
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        node = child;
+    }
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(node);
+    let record = own_class_flow_node(store, host, node)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(SourceFlowUnsupported::PropertyWrite(node).into());
+    };
+    let (arena, actual_bound) = host.source(node).ok_or_else(invalid)?;
+    if actual_bound.source_file() != bound.source_file()
+        || record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+    {
+        return Err(invalid().into());
+    }
+    let mut callback = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback)
+            .map_err(|_| invalid())?;
+    let symbol = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?;
+    let Some(symbol) = symbol else {
+        if store
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| {
+                store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| cached != bootstrap.unknown_symbol)
+            })
+        {
+            return Err(invalid().into());
+        }
+        return Ok(None);
+    };
+    if store
+        .symbol_node_links(node)
+        .and_then(|links| links.resolved_symbol)
+        .is_some_and(|cached| cached != symbol)
+    {
+        return Err(invalid().into());
+    }
+    let symbol = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::export_symbol)
+        .unwrap_or(symbol);
+    store
+        .get_merged_symbol(symbol)
+        .map(Some)
+        .ok_or_else(|| invalid().into())
+}
+
 /// One immutable map of current invocation-local symbol types.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SourceFlowSnapshot(Arc<SourceFlowTypes>);
+pub(super) struct SourceFlowSnapshot {
+    types: Arc<SourceFlowTypes>,
+    reachable: bool,
+    incomplete: bool,
+}
 
 impl SourceFlowSnapshot {
     fn new(types: SourceFlowTypes) -> Self {
-        Self(Arc::new(types))
+        Self {
+            types: Arc::new(types),
+            reachable: true,
+            incomplete: false,
+        }
     }
 
     #[must_use]
     pub(super) fn types(&self) -> &SourceFlowTypes {
-        self.0.as_ref()
+        self.types.as_ref()
     }
 
     #[must_use]
     pub(super) fn type_of(&self, symbol: SemanticSymbolId) -> Option<TypeId> {
-        self.0.get(&symbol).copied()
+        self.types.get(&symbol).copied()
     }
 
     fn with_type(&self, symbol: SemanticSymbolId, type_: TypeId) -> Self {
@@ -80,16 +674,146 @@ impl SourceFlowSnapshot {
         }
         let mut updated = self.types().clone();
         updated.insert(symbol, type_);
-        Self::new(updated)
+        Self {
+            types: Arc::new(updated),
+            reachable: self.reachable,
+            incomplete: self.incomplete,
+        }
     }
 }
 
-/// A direct identifier whose current type is narrowed on an `if` edge.
+/// An update target and the declaration found through the lexical resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceFlowUpdate {
+    pub(super) target: NodeRef,
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) readonly: bool,
+}
+
+/// A call fact keeps the checked effects signature and its actual argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceFlowCallEffect {
+    Unchanged,
+    Assertion {
+        signature: SignatureId,
+        argument: NodeRef,
+        symbol: SemanticSymbolId,
+    },
+    AssertionNoReference {
+        signature: SignatureId,
+        argument: Option<NodeRef>,
+    },
+    AssertionFalse {
+        signature: SignatureId,
+        argument: NodeRef,
+    },
+    Never(SignatureId),
+}
+
+/// A source statement uses its real entry and following source-file flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceFlowRegion {
+    statement: NodeRef,
+    entry_node: NodeRef,
+    entry: FlowRef,
+    exit: FlowRef,
+    unreachable_incrementor: Option<NodeRef>,
+}
+
+/// An identifier narrowed on an `if` edge, including enclosing `!` operators.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceTruthinessCondition {
     /// The exact AST payload carried by both binder condition nodes.
     pub(super) expression: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    pub(super) negated: bool,
+}
+
+/// The left operand of an authenticated `??` or `??=` uses presence, not truthiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceNullishCondition {
+    pub(super) expression: NodeRef,
+    pub(super) symbol: Option<SemanticSymbolId>,
+}
+
+/// A planned expression condition still needs its source and retained-edge proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassExpressionCondition {
+    pub(super) owner: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) kind: SourceClassExpressionConditionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceClassExpressionConditionKind {
+    Nullish(SemanticSymbolId),
+    Truthiness(SemanticSymbolId, bool),
+    Call,
+    Reference,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceClassExpressionConditionProof {
+    source: SourceClassExpressionCondition,
+    /// Only edges reachable from this body's read points and effective exit.
+    edges: u8,
+}
+
+/// A checked nullish write keeps its real target and declaration separate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceFlowNullishAssignment {
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) declaration: Option<NodeRef>,
+    pub(super) symbol: Option<SemanticSymbolId>,
+    pub(super) readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceNullishAssignmentProof {
+    assignment: SourceFlowNullishAssignment,
+    receiver: Option<SemanticSymbolId>,
+    flow: Option<FlowRef>,
+    revision: NodeArenaRevision,
+}
+
+/// One ordinary member write retains its source nodes and binder assignment edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceMemberAssignmentProof {
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) right: NodeRef,
+    receiver_symbol: SemanticSymbolId,
+    container: NodeRef,
+    flow: FlowRef,
+    revision: NodeArenaRevision,
+}
+
+/// A direct current-class field on the binder's real condition edges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPropertyTruthinessCondition {
+    pub(super) expression: NodeRef,
+    pub(super) access: NodeRef,
+    pub(super) negated: bool,
+}
+
+/// A direct own-field comparison with the canonical global undefined value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPropertyEqualityCondition {
+    pub(super) expression: NodeRef,
+    pub(super) access: NodeRef,
+    pub(super) value: NodeRef,
+    pub(super) comparison: SourceTypeofComparison,
+}
+
+/// A predicate call and the exact current-class field passed to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPropertyPredicateCondition {
+    pub(super) expression: NodeRef,
+    pub(super) call: NodeRef,
+    pub(super) access: NodeRef,
     pub(super) negated: bool,
 }
 
@@ -134,32 +858,72 @@ pub(super) struct SourceEqualityCondition {
     pub(super) discriminant: Option<NodeRef>,
 }
 
-/// One cold-proven condition executable by the invocation-local flow frame.
+/// The exact operands of a checked property or class membership condition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceInCondition {
+    pub(super) expression: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) key: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+}
+
+/// A source condition. Expression candidates need preflight before execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
+    ClassExpression(SourceClassExpressionCondition),
+    Reference(NodeRef),
     Unchanged(NodeRef),
+    Nullish(SourceNullishCondition),
     Truthiness(SourceTruthinessCondition),
+    ClassPropertyTruthiness(SourceClassPropertyTruthinessCondition),
+    ClassPropertyEquality(SourceClassPropertyEqualityCondition),
+    ClassPropertyPredicate(SourceClassPropertyPredicateCondition),
     Typeof(SourceTypeofCondition),
     Equality(SourceEqualityCondition),
+    In(SourceInCondition),
+    InstanceOf(SourceInCondition),
 }
 
 impl SourceFlowCondition {
-    const fn expression(self) -> NodeRef {
+    pub(super) const fn expression(self) -> NodeRef {
         match self {
+            Self::ClassExpression(condition) => condition.expression,
+            Self::Reference(expression) => expression,
             Self::Unchanged(expression) => expression,
+            Self::Nullish(condition) => condition.expression,
             Self::Truthiness(condition) => condition.expression,
+            Self::ClassPropertyTruthiness(condition) => condition.expression,
+            Self::ClassPropertyEquality(condition) => condition.expression,
+            Self::ClassPropertyPredicate(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.expression,
         }
     }
 
     const fn symbol(self) -> Option<SemanticSymbolId> {
         Some(match self {
-            Self::Unchanged(_) => return None,
+            Self::ClassExpression(_) => panic!("class expression conditions need preflight"),
+            Self::Unchanged(_)
+            | Self::Reference(_)
+            | Self::ClassPropertyTruthiness(_)
+            | Self::ClassPropertyEquality(_)
+            | Self::ClassPropertyPredicate(_) => return None,
+            Self::Nullish(condition) => return condition.symbol,
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
             Self::Equality(condition) => condition.symbol,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.symbol,
         })
+    }
+
+    pub(super) const fn class_property_access(self) -> Option<NodeRef> {
+        match self {
+            Self::ClassPropertyTruthiness(condition) => Some(condition.access),
+            Self::ClassPropertyEquality(condition) => Some(condition.access),
+            Self::ClassPropertyPredicate(condition) => Some(condition.access),
+            _ => None,
+        }
     }
 }
 
@@ -346,11 +1110,19 @@ pub(super) fn plan_source_captured_local(
         return Ok(None);
     }
     let writer = host.node(writing_callable).ok_or_else(invalid)?;
-    let NodeData::ArrowFunction(arrow) = &writer.data else {
-        return Ok(None);
-    };
-    if arrow.modifiers.is_some() || arrow.asterisk_token.is_some() {
-        return Ok(None);
+    match &writer.data {
+        NodeData::ArrowFunction(arrow)
+            if arrow.modifiers.is_none() && arrow.asterisk_token.is_none() => {}
+        NodeData::MethodDeclaration(method)
+            if method.modifiers.is_none()
+                && method.asterisk_token.is_none()
+                && method.type_parameters.is_none()
+                && method.postfix_token.is_none()
+                && writer
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression) => {}
+        _ => return Ok(None),
     }
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
     if owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE {
@@ -392,10 +1164,16 @@ pub(super) fn plan_source_captured_local(
     {
         return Ok(None);
     }
-    if !source_captured_arrow_is_stored(store, host, writing_callable)? {
-        return Ok(None);
+    if writer.kind == SyntaxKind::MethodDeclaration {
+        validate_source_object_method_owner(arena, bound, store, host, writing_callable)
+            .map_err(|_| invalid())?;
+    } else {
+        if !source_captured_arrow_is_stored(store, host, writing_callable)? {
+            return Ok(None);
+        }
+        validate_source_arrow_owner(arena, bound, store, writing_callable)
+            .map_err(|_| invalid())?;
     }
-    validate_source_arrow_owner(arena, bound, store, writing_callable).map_err(|_| invalid())?;
     validate_captured_declaring_owner(arena, bound, store, host, declaring_callable)
         .map_err(|_| invalid())?;
     let statement = NodeRef::new(
@@ -594,6 +1372,18 @@ fn source_captured_arrow_is_stored(
                     store, host, arrow,
                 )
                 .map(|symbol| symbol.is_some())
+                .map_err(|_| invalid().into());
+            }
+            NodeData::CallExpression(_) if current == arrow => {
+                return super::source_callables::source_direct_call_argument_arrow_is_exact(
+                    store, host, arrow,
+                )
+                .map_err(|_| invalid().into());
+            }
+            NodeData::NewExpression(_) if current == arrow => {
+                return super::source_callables::source_promise_constructor_argument_arrow_is_exact(
+                    store, host, arrow,
+                )
                 .map_err(|_| invalid().into());
             }
             _ => return Ok(false),
@@ -806,12 +1596,207 @@ fn validate_source_arrow_owner(
     Ok(body)
 }
 
+/// Proves the source owner without requiring a caller's statement-list plan.
+fn validate_source_function_expression_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    container: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(container);
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(container.node).ok_or_else(invalid)?;
+    let NodeData::FunctionExpression(function) = &record.data else {
+        return Err(invalid().into());
+    };
+    let body = NodeRef::new(container.arena, container.file, function.body);
+    let body_record = arena.get(body.node).ok_or_else(invalid)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invalid().into());
+    };
+    let owner_symbol = bound.symbol(container).ok_or_else(invalid)?;
+    let owner = store.symbol(owner_symbol).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::FunctionExpression
+        || store.source_node_kind(container) != Some(SyntaxKind::FunctionExpression)
+        || record.flags.0 != 0
+        || function.asterisk_token.is_some()
+        || function.modifiers.is_some()
+        || function.full_signature.is_some()
+        || function.next_container.is_some()
+        || function.symbol.is_some()
+        || function.flow_node.is_some()
+        || function.end_flow_node.is_some()
+        || function.return_flow_node.is_some()
+        || function.facts != 0
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(container.node)
+        || body_record.range.start < record.range.start
+        || body_record.range.end > record.range.end
+        || !bound.contains(body)
+        || store.source_node_parent(body) != Some(super::store::SourceNodeParent::Parent(container))
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(&[container])
+        || owner.value_declaration() != Some(container)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || bound.local_symbol(container).is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+    {
+        return Err(invalid().into());
+    }
+    if let Some(name) = function.name {
+        let name = NodeRef::new(container.arena, container.file, name);
+        let name_record = arena.get(name.node).ok_or_else(invalid)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid().into());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(container.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end > record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || !bound.contains(name)
+            || store.source_child_with_kind(container, SyntaxKind::Identifier) != Some(name)
+            || store.source_identifier_text(name) != Some(identifier.text.as_str())
+            || owner.name().as_bytes() != identifier.text.as_bytes()
+        {
+            return Err(invalid().into());
+        }
+    } else if owner.name() != InternalSymbolName::Function.as_ref()
+        || store
+            .source_child_with_kind(container, SyntaxKind::Identifier)
+            .is_some()
+    {
+        return Err(invalid().into());
+    }
+    let start = bound
+        .flow_graph()
+        .container_start(container)
+        .ok_or_else(invalid)?;
+    if preflight_start_payload(bound.flow_graph(), container, start)? != Some(container) {
+        return Err(invalid().into());
+    }
+    Ok(body)
+}
+
+/// Reuses the object's member proof and retains the method's actual body and flow start.
+fn validate_source_object_method_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(container);
+    let owner =
+        super::source_callables::source_object_literal_method_symbol(store, host, container)
+            .ok_or_else(invalid)?;
+    let record = host.node(container).ok_or_else(invalid)?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return Err(invalid().into());
+    };
+    let body = NodeRef::new(
+        container.arena,
+        container.file,
+        method.body.ok_or_else(invalid)?,
+    );
+    let body_record = host.node(body).ok_or_else(invalid)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invalid().into());
+    };
+    if !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || bound.node_arena_revision() != arena.revision()
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        || bound.symbol(container) != Some(owner)
+        || bound.local_symbol(container).is_some()
+        || record.flags.0 != 0
+        || method.modifiers.is_some()
+        || method.asterisk_token.is_some()
+        || method.type_parameters.is_some()
+        || method.postfix_token.is_some()
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(container.node)
+        || body_record.range.start < record.range.start
+        || body_record.range.end > record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+    {
+        return Err(invalid().into());
+    }
+    let start = bound
+        .flow_graph()
+        .container_start(container)
+        .ok_or_else(invalid)?;
+    if preflight_start_payload(bound.flow_graph(), container, start)? != Some(container) {
+        return Err(invalid().into());
+    }
+    Ok(body)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowArrayMutation {
     pub(super) call: NodeRef,
     pub(super) receiver: NodeRef,
     pub(super) declaration: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+}
+
+/// An indexed write keeps both binder edges, without assigning the receiver binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceElementAssignmentProof {
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) index: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    container: NodeRef,
+    assignment: Option<FlowRef>,
+    mutation: FlowRef,
+    revision: NodeArenaRevision,
+}
+
+impl SourceElementAssignmentProof {
+    pub(super) fn targets(self) -> impl Iterator<Item = NodeRef> {
+        [self.assignment.map(|_| self.target), Some(self.expression)]
+            .into_iter()
+            .flatten()
+    }
+
+    fn flow_at(self, node: NodeRef) -> Option<FlowRef> {
+        if node == self.expression {
+            Some(self.mutation)
+        } else if node == self.target {
+            self.assignment
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -850,9 +1835,22 @@ fn validate_retained_captured_origin(
     container: NodeRef,
     assignment: SourceFlowAssignment,
     origin: SourceCapturedFlowOrigin,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
 ) -> Result<(), SourceFlowError> {
     let local = origin.local();
     let invalid = || SourceFlowInvariant::InvalidCapturedLocal(local.target);
+    let scope = match statement_list {
+        Some(syntax) => match origin {
+            SourceCapturedFlowOrigin::Assignment(assignment) => {
+                syntax.statement_scope(assignment.statement)
+            }
+            SourceCapturedFlowOrigin::ArrayMutation(mutation) => {
+                syntax.expression_scope(mutation.mutation.call)
+            }
+        }
+        .ok_or_else(invalid)?,
+        None => container,
+    };
     if assignment != origin.assignment()
         || local.writing_callable != container
         || local.declaring_callable == container
@@ -873,7 +1871,7 @@ fn validate_retained_captured_origin(
         || bound.container(local.target) != Some(container)
         || bound.flow_container(local.target) != Some(container)
         || bound.container(assignment.declaration) != Some(container)
-        || bound.block_scope_container(assignment.declaration) != Some(container)
+        || bound.block_scope_container(assignment.declaration) != Some(scope)
     {
         return Err(invalid().into());
     }
@@ -898,13 +1896,53 @@ fn validate_captured_flow_origin(
     host: &DeclaredTypeHost<'_>,
     container: NodeRef,
     origin: SourceCapturedFlowOrigin,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
 ) -> Result<(), SourceFlowError> {
     validate_source_captured_local(store, host, &origin.local())?;
-    validate_retained_captured_origin(bound, container, origin.assignment(), origin)?;
+    validate_retained_captured_origin(
+        bound,
+        container,
+        origin.assignment(),
+        origin,
+        statement_list,
+    )?;
     match origin {
         SourceCapturedFlowOrigin::Assignment(assignment) => {
             let invalid = || SourceFlowInvariant::InvalidCapturedLocal(assignment.local.target);
-            validate_arrow_statement(arena, bound, store, container, assignment.statement)?;
+            match statement_list {
+                Some(syntax) => validate_statement_list_expression(
+                    arena,
+                    bound,
+                    syntax,
+                    assignment.statement,
+                    assignment.expression,
+                )?,
+                None => {
+                    if arena
+                        .get(container.node)
+                        .is_some_and(|record| record.kind == SyntaxKind::MethodDeclaration)
+                    {
+                        let body = validate_source_object_method_owner(
+                            arena, bound, store, host, container,
+                        )?;
+                        validate_callable_expression_statement(
+                            arena,
+                            bound,
+                            container,
+                            body,
+                            assignment.statement,
+                        )?;
+                    } else {
+                        validate_arrow_statement(
+                            arena,
+                            bound,
+                            store,
+                            container,
+                            assignment.statement,
+                        )?;
+                    }
+                }
+            }
             let target = arena
                 .get(assignment.local.target.node)
                 .ok_or_else(invalid)?;
@@ -946,7 +1984,16 @@ fn validate_captured_flow_origin(
         SourceCapturedFlowOrigin::ArrayMutation(captured) => {
             let mutation = captured.mutation;
             let invalid = || SourceFlowInvariant::InvalidArrayMutation(mutation.call);
-            validate_linear_direct_call(arena, bound, store, container, mutation.call)?;
+            if arena
+                .get(container.node)
+                .is_none_or(|record| record.kind != SyntaxKind::ArrowFunction)
+            {
+                return Err(invalid().into());
+            }
+            match statement_list {
+                Some(syntax) => validate_statement_list_call(arena, bound, syntax, mutation.call)?,
+                None => validate_linear_direct_call(arena, bound, store, container, mutation.call)?,
+            };
             if mutation.receiver != captured.local.target
                 || mutation.declaration != captured.local.declaration
                 || mutation.symbol != captured.local.symbol
@@ -1012,14 +2059,22 @@ pub(super) struct SourceFlowPlan {
     points: HashMap<NodeRef, FlowRef>,
     point_order: Vec<NodeRef>,
     conditions: HashMap<NodeRef, SourceFlowCondition>,
+    class_expression_conditions: HashMap<NodeRef, SourceClassExpressionConditionProof>,
     assignments: HashMap<NodeRef, SourceFlowAssignment>,
     assignment_order: Vec<NodeRef>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     captured_origins: HashMap<NodeRef, SourceCapturedFlowOrigin>,
+    statement_list: Option<SourceCallableStatementListSyntax>,
     calls: HashMap<NodeRef, NodeRef>,
     logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+    region: Option<SourceFlowRegion>,
+    updates: HashMap<NodeRef, SourceFlowUpdate>,
+    nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
+    element_assignments: HashMap<NodeRef, SourceElementAssignmentProof>,
+    nullish_calls: HashMap<NodeRef, FlowRef>,
 }
 
 /// The detached logical join proves both condition edges, but is not an exit.
@@ -1081,12 +2136,192 @@ struct ClassPropertyFlowQuery<'query> {
     initial: ClassPropertyFlowState,
 }
 
+/// Initialization queries cannot allocate types or borrow a new caller.
+enum ClassPropertyFlowTypes<'a, 'env> {
+    Initialization(&'a CanonicalTypeMapperStore),
+    Read {
+        store: &'a mut CanonicalTypeMapperStore,
+        globals: Option<&'a CanonicalGlobalTypes>,
+        session: Option<&'a mut InstantiationSession>,
+    },
+    SourceRead {
+        store: &'a mut CanonicalTypeMapperStore,
+        globals: Option<&'a CanonicalGlobalTypes>,
+        session: Option<&'a mut InstantiationSession>,
+        context: SourceFlowContext<'a, 'env>,
+    },
+}
+
+struct ClassPropertyFlowReadTypes<'a, 'env> {
+    store: &'a mut CanonicalTypeMapperStore,
+    globals: Option<&'a CanonicalGlobalTypes>,
+    session: Option<&'a mut InstantiationSession>,
+    context: Option<SourceFlowContext<'a, 'env>>,
+}
+
+impl<'a, 'env> ClassPropertyFlowTypes<'a, 'env> {
+    fn with_source(
+        store: &'a mut CanonicalTypeMapperStore,
+        globals: Option<&'a CanonicalGlobalTypes>,
+        session: Option<&'a mut InstantiationSession>,
+        context: Option<SourceFlowContext<'a, 'env>>,
+    ) -> Self {
+        match context {
+            Some(context) => Self::SourceRead { store, globals, session, context },
+            None => Self::Read { store, globals, session },
+        }
+    }
+
+    fn read_types(&mut self) -> Option<ClassPropertyFlowReadTypes<'_, 'env>> {
+        match self {
+            Self::Initialization(_) => None,
+            Self::Read { store, globals, session } => Some(ClassPropertyFlowReadTypes {
+                store, globals: *globals, session: session.as_deref_mut(), context: None,
+            }),
+            Self::SourceRead { store, globals, session, context } => Some(ClassPropertyFlowReadTypes {
+                store, globals: *globals, session: session.as_deref_mut(), context: Some(context.reborrow()),
+            }),
+        }
+    }
+
+    fn store(&self) -> &CanonicalTypeMapperStore {
+        match self {
+            Self::Initialization(store) => store,
+            Self::Read { store, .. } | Self::SourceRead { store, .. } => store,
+        }
+    }
+
+    fn narrow(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        condition: NodeRef,
+        type_: TypeId,
+        assumption: TruthinessAssumption,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Some(ClassPropertyFlowReadTypes {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+            ..
+        }) = self.read_types()
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        narrow_by_truthiness_with_session(store, globals, type_, assumption, session)
+            .map_err(|error| SourceFlowError::Narrowing { condition, error })
+    }
+
+    fn narrow_equality(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        type_: TypeId,
+        value: TypeId,
+        require_match: bool,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Some(ClassPropertyFlowReadTypes {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+            mut context,
+        }) = self.read_types()
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        narrow_by_equality_worker(
+            store,
+            globals,
+            type_,
+            value,
+            true,
+            require_match,
+            None,
+            Some(session),
+            context.as_mut(),
+        )
+        .map_err(|error| match error {
+            SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
+            SourceEqualityNarrowingError::Union(error) => SourceFlowError::Join { flow, error },
+            error => SourceFlowInvariant::EqualityNarrowing(error).into(),
+        })
+    }
+
+    fn narrow_predicate(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        condition: NodeRef,
+        current: TypeId,
+        predicate: TypeId,
+        assume_true: bool,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Some(ClassPropertyFlowReadTypes {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+            ..
+        }) = self.read_types()
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        narrow_class_property_predicate_type(
+            store, globals, session, flow, condition, current, predicate, assume_true,
+        )
+    }
+
+    fn join(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        types: &[TypeId],
+        declared: TypeId,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Some(ClassPropertyFlowReadTypes {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+            context,
+        }) = self.read_types()
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        // Source reads checked every branch before this join. Reusing their
+        // shared type does not construct a union or read its members.
+        if context.is_some()
+            && store.type_payload(declared).is_some()
+            && let Some(&first) = types.first()
+            && store.type_payload(first).is_some()
+            && types.iter().all(|&type_| type_ == first)
+        {
+            return Ok(first);
+        }
+        store
+            .validate_union_constituent_with_global_types(globals, declared)
+            .map_err(|error| SourceFlowError::Join { flow, error })?;
+        let joined = store
+            .expression_union_type_with_global_types_and_session(
+                globals,
+                types,
+                UnionReduction::Literal,
+                session,
+            )
+            .map_err(|error| SourceFlowError::Join { flow, error })?;
+        Ok(SourceFlowFrame::preferred_join_identity(
+            store,
+            joined,
+            &[declared],
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowUnsupported {
     IncompleteContainer(NodeRef),
     FlowKind { flow: FlowRef, flags: FlowFlags },
     Call(NodeRef),
     PropertyWrite(NodeRef),
+    InNarrowing { condition: NodeRef, type_: TypeId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1139,6 +2374,9 @@ pub(super) enum SourceFlowInvariant {
     InvalidCapturedLocal(NodeRef),
     InvalidArrayMutation(NodeRef),
     InvalidCall(NodeRef),
+    InvalidSourceRegion(NodeRef),
+    InvalidUpdate(NodeRef),
+    InvalidCallEffect(NodeRef),
     InvalidLogicalStatement(NodeRef),
     InvalidDeclarationUse(NodeRef),
     InvalidClassBody(NodeRef),
@@ -1153,7 +2391,9 @@ pub(super) enum SourceFlowInvariant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowError {
+    Source(SourceCheckError),
     Array(ArrayTypeError),
+    Relation(RelationUnavailable),
     Unsupported(SourceFlowUnsupported),
     Invariant(SourceFlowInvariant),
     Narrowing {
@@ -1181,6 +2421,7 @@ pub(super) enum SourceTypeofNarrowingError {
 /// Invalid equality operands or unavailable authenticated discriminant values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceEqualityNarrowingError {
+    Source(SourceCheckError),
     MissingBootstrap,
     InvalidType(TypeId),
     MissingValue(NodeRef),
@@ -1225,6 +2466,8 @@ enum SourceFlowKind {
 enum SourceFlowAssignmentState {
     Pending,
     Resolved(TypeId),
+    Update,
+    ReadonlyUpdate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1243,14 +2486,89 @@ struct SourceFlowCoverage {
 }
 
 #[derive(Default)]
+struct SourceFlowActivePath {
+    members: HashSet<FlowRef>,
+    nodes: Vec<FlowRef>,
+}
+
+impl SourceFlowActivePath {
+    fn validate_cycle(
+        &self,
+        nodes: &ts_ast::FlowNodeArena,
+        flow: FlowRef,
+    ) -> Result<(), SourceFlowError> {
+        let Some(start) = self.nodes.iter().position(|active| *active == flow) else {
+            return Err(SourceFlowInvariant::Cycle(flow).into());
+        };
+        // A backedge can return to a call or update inside a valid loop.
+        // Only a loop label in this closed segment can justify the repeat.
+        for active in &self.nodes[start..] {
+            if !active.is_for(nodes.node_arena(), nodes.file()) {
+                return Err(SourceFlowInvariant::ForeignFlow(*active).into());
+            }
+            let node = nodes
+                .get(*active)
+                .ok_or(SourceFlowInvariant::MissingFlowNode(*active))?;
+            if source_flow_kind(*active, node.flags)? == SourceFlowKind::LoopLabel {
+                label_antecedents(*active, node)?;
+                return Ok(());
+            }
+        }
+        Err(SourceFlowInvariant::Cycle(flow).into())
+    }
+}
+
+#[derive(Default)]
 struct SourceFlowEffects {
+    class_expression_conditions: HashMap<NodeRef, SourceClassExpressionConditionProof>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     captured_origins: HashMap<NodeRef, SourceCapturedFlowOrigin>,
+    statement_list: Option<SourceCallableStatementListSyntax>,
     calls: HashMap<NodeRef, NodeRef>,
     logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
     start_container: Option<NodeRef>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+    region: Option<SourceFlowRegion>,
+    updates: HashMap<NodeRef, SourceFlowUpdate>,
+    nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
+    element_assignments: HashMap<NodeRef, SourceElementAssignmentProof>,
+    nullish_calls: HashMap<NodeRef, FlowRef>,
+    region_points: HashMap<NodeRef, FlowRef>,
+}
+
+fn prepare_element_assignment(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    proof: SourceElementAssignmentProof,
+    effects: &mut SourceFlowEffects,
+    assignments: &mut Vec<SourceFlowAssignment>,
+) -> Result<(), SourceFlowError> {
+    if proof.container != container
+        || source_element_assignment_proof(store, host, proof.expression)? != Some(proof)
+        || effects
+            .element_assignments
+            .insert(proof.expression, proof)
+            .is_some()
+    {
+        return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+    }
+    for target in proof.targets() {
+        if effects
+            .assignment_declarations
+            .insert(target, proof.declaration)
+            .is_some()
+        {
+            return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
+        }
+        assignments.push(SourceFlowAssignment {
+            declaration: target,
+            symbol: proof.symbol,
+        });
+    }
+    Ok(())
 }
 
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
@@ -1523,6 +2841,483 @@ fn source_node_is_descendant_of(
 }
 
 impl SourceFlowPlan {
+    pub(super) fn statement_list_is_exact(
+        &self,
+        syntax: &SourceCallableStatementListSyntax,
+    ) -> bool {
+        self.container == syntax.callable.declaration
+            && self.statement_list.as_ref() == Some(syntax)
+    }
+
+    /// Retains the same flow with an authenticated callable annotation context.
+    pub(super) fn with_function_expression_statement_list_context(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        callable: &super::source_callables::SourceCallablePlan,
+    ) -> Result<(SourceCallableStatementListSyntax, Self), SourceFlowError> {
+        let declaration = syntax.callable.declaration;
+        let invalid = || SourceFlowInvariant::InvalidCall(declaration);
+        let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+        let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+        if !self.statement_list_is_exact(syntax)
+            || callable.declaration != declaration
+            || bound.symbol(declaration) != Some(callable.owner_symbol)
+            || arena.get(declaration.node).is_none_or(|record| {
+                !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression)
+                        if function.body == callable.body.node
+                ) && !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::ArrowFunction(function), SyntaxKind::ArrowFunction)
+                        if function.body == callable.body.node
+                )
+            })
+        {
+            return Err(invalid().into());
+        }
+        let target = callable
+            .contextual_function_expression_target()
+            .ok_or_else(invalid)?;
+        let mut contextual_callable = syntax.callable.clone();
+        if !super::source_callables::apply_function_expression_context(
+            store,
+            host,
+            &mut contextual_callable,
+            target,
+        )
+        .map_err(|_| invalid())?
+            || contextual_callable != *callable
+        {
+            return Err(invalid().into());
+        }
+        let mut syntax = syntax.clone();
+        syntax.callable = contextual_callable;
+        validate_statement_list_source(arena, bound, store, host, &syntax)?;
+        let mut flow = self.clone();
+        flow.statement_list = Some(syntax.clone());
+        Ok((syntax, flow))
+    }
+
+    /// Adds exact statement scopes to the existing callable flow worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_statement_list_with_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            syntax,
+            points,
+            conditions,
+            logical_conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            captures,
+            array_mutations,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_statement_list_with_updates(
+            arena,
+            bound,
+            store,
+            host,
+            syntax,
+            points,
+            conditions,
+            logical_conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            captures,
+            std::iter::empty(),
+            array_mutations,
+            nullish_assignments,
+            std::iter::empty(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list_with_updates(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+    ) -> Result<Self, SourceFlowError> {
+        validate_statement_list_source(arena, bound, store, host, syntax)?;
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
+        let container = syntax.callable.declaration;
+        let points = points.into_iter().collect::<Vec<_>>();
+        let mut conditions = conditions.into_iter().collect::<Vec<_>>();
+        conditions.extend(retained_linear_truthiness_conditions(
+            arena,
+            bound,
+            container,
+            &points,
+            logical_conditions,
+        )?);
+        let mut assignments = assignments.into_iter().collect::<Vec<_>>();
+        let mut effects = SourceFlowEffects {
+            statement_list: Some(syntax.clone()),
+            ..SourceFlowEffects::default()
+        };
+        for expression in syntax.expression_statements() {
+            if let Some(proof) = source_element_assignment_proof(store, host, expression)? {
+                if syntax.expression_scope(expression) != bound.block_scope_container(expression) {
+                    return Err(SourceFlowInvariant::InvalidArrayMutation(expression).into());
+                }
+                prepare_element_assignment(
+                    store, host, container, proof, &mut effects, &mut assignments,
+                )?;
+            }
+            if let Some(proof) = source_member_assignment_proof(store, host, expression)? {
+                if proof.container != container
+                    || syntax.expression_scope(expression)
+                        != bound.block_scope_container(expression)
+                    || effects
+                        .member_assignments
+                        .insert(proof.target, proof)
+                        .is_some()
+                {
+                    return Err(SourceFlowInvariant::InvalidParameterAssignment(expression).into());
+                }
+            }
+        }
+        for update in updates {
+            validate_callable_update(arena, bound, store, host, syntax, update)?;
+            if effects.updates.insert(update.target, update).is_some()
+                || effects
+                    .assignment_declarations
+                    .insert(update.target, update.declaration)
+                    .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(update.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: update.target,
+                symbol: update.symbol,
+            });
+        }
+        if syntax
+            .counted_for_loops()
+            .iter()
+            .any(|iteration| !effects.updates.contains_key(&iteration.update_target))
+        {
+            return Err(SourceFlowInvariant::InvalidUpdate(syntax.callable.declaration).into());
+        }
+        for assignment in parameter_assignments {
+            validate_parameter_assignment_in_list(
+                arena,
+                bound,
+                store,
+                Some(host),
+                container,
+                assignment,
+                Some(syntax),
+            )?;
+            if effects
+                .assignment_declarations
+                .insert(assignment.target, assignment.parameter)
+                .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(assignment.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: assignment.target,
+                symbol: assignment.symbol,
+            });
+        }
+        for origin in captures
+            .into_iter()
+            .map(SourceCapturedFlowOrigin::Assignment)
+            .chain(
+                captured_array_mutations
+                    .into_iter()
+                    .map(SourceCapturedFlowOrigin::ArrayMutation),
+            )
+        {
+            validate_captured_flow_origin(
+                arena,
+                bound,
+                store,
+                host,
+                container,
+                origin,
+                Some(syntax),
+            )?;
+            let assignment = origin.assignment();
+            if effects
+                .assignment_declarations
+                .contains_key(&assignment.declaration)
+                || effects
+                    .captured_origins
+                    .insert(assignment.declaration, origin)
+                    .is_some()
+            {
+                return Err(
+                    SourceFlowInvariant::DuplicateAssignment(assignment.declaration).into(),
+                );
+            }
+            assignments.push(assignment);
+        }
+        for mutation in array_mutations {
+            validate_array_mutation_in_list(arena, bound, container, mutation, Some(syntax))?;
+            if effects.captured_origins.contains_key(&mutation.call)
+                || effects
+                    .assignment_declarations
+                    .insert(mutation.call, mutation.declaration)
+                    .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(mutation.call).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: mutation.call,
+                symbol: mutation.symbol,
+            });
+        }
+        for call in calls {
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_statement_list_call(arena, bound, syntax, call)?,
+            };
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        for origin in effects.captured_origins.values() {
+            if let SourceCapturedFlowOrigin::ArrayMutation(mutation) = origin
+                && !effects.calls.contains_key(&mutation.mutation.call)
+            {
+                return Err(
+                    SourceFlowInvariant::InvalidArrayMutation(mutation.mutation.call).into(),
+                );
+            }
+        }
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            nullish_assignments,
+            &mut assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
+        Self::preflight_with_effects(
+            bound,
+            container,
+            matches!(
+                syntax.callable.family,
+                super::source_callables::SourceCallableFamily::ArrowFunction
+                    | super::source_callables::SourceCallableFamily::ObjectLiteralMethod
+            )
+            .then_some(container),
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
+    }
+
+    pub(super) fn contains_call(&self, call: NodeRef) -> bool {
+        self.calls.contains_key(&call)
+    }
+
+    pub(super) fn contains_condition_value(&self, value: NodeRef) -> bool {
+        self.conditions.values().any(|condition| {
+            matches!(condition,
+            SourceFlowCondition::Equality(condition) if condition.value == value)
+        })
+    }
+
+    /// Proves an ordinary source statement against the existing source-file graph.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_source_statement(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        statement: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+        calls: impl IntoIterator<Item = NodeRef>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_source_statement_with_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            statement,
+            points,
+            conditions,
+            assignments,
+            updates,
+            calls,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_source_statement_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        statement: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
+        let region = if nullish_assignments.is_empty() {
+            source_statement_flow_region(arena, bound, store, statement)?
+        } else {
+            source_nullish_statement_flow_region(arena, bound, statement, &nullish_assignments)?
+        };
+        let container = bound.source_file();
+        let mut effects = SourceFlowEffects {
+            region: Some(region),
+            ..SourceFlowEffects::default()
+        };
+        let points = points.into_iter().collect::<Vec<_>>();
+        for point in &points {
+            let flow = source_region_point_flow(arena, bound, *point, Some(region))?;
+            if effects.region_points.insert(*point, flow).is_some() {
+                return Err(SourceFlowInvariant::DuplicatePoint(*point).into());
+            }
+        }
+        let mut assignments = assignments.into_iter().collect::<Vec<_>>();
+        let retained_conditions = bound
+            .flow_graph()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.flags
+                    .intersects(FlowFlags::TRUE_CONDITION | FlowFlags::FALSE_CONDITION)
+            })
+            .filter_map(|node| match node.payload.as_ref() {
+                Some(FlowNodePayload::Ast(node)) => Some(*node),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut conditions = conditions
+            .into_iter()
+            .filter(|condition| retained_conditions.contains(&condition.expression()))
+            .collect::<Vec<_>>();
+        for update in updates {
+            validate_source_update(arena, bound, store, host, update)?;
+            if effects.updates.insert(update.target, update).is_some()
+                || effects
+                    .assignment_declarations
+                    .insert(update.target, update.declaration)
+                    .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(update.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: update.target,
+                symbol: update.symbol,
+            });
+        }
+        for call in calls {
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_source_statement_call(arena, bound, call)?,
+            };
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            nullish_assignments,
+            &mut assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
+        Self::preflight_with_effects(
+            bound,
+            container,
+            None,
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
+    }
+
     pub(super) fn has_reachable_end(&self) -> bool {
         self.end.is_some()
     }
@@ -1624,7 +3419,20 @@ impl SourceFlowPlan {
                     .and_then(|point| bound.flow_container(*point))
             })
             .unwrap_or(body.declaration);
+        let conditions = conditions.into_iter().collect::<Vec<_>>();
+        let (conditions, expression_conditions) = prepare_class_expression_conditions(
+            arena, bound, store, host, body, container, &points, conditions,
+        )?;
+        for condition in &conditions {
+            if let Some(access) = condition.class_property_access() {
+                validate_class_property_flow_condition(store, host, bound, body, *condition)?;
+                if !points.contains(&access) {
+                    return Err(SourceFlowInvariant::MissingFlowPoint(access).into());
+                }
+            }
+        }
         let mut effects = SourceFlowEffects {
+            class_expression_conditions: expression_conditions,
             class_body: Some(body.clone()),
             start_container: matches!(body.kind, ClassBodyKind::StaticBlock)
                 .then(|| class_control_flow_container(host, body.declaration))
@@ -1841,6 +3649,8 @@ impl SourceFlowPlan {
             logical_statements,
             [],
             [],
+            [],
+            [],
         )
     }
 
@@ -1874,6 +3684,8 @@ impl SourceFlowPlan {
             logical_statements,
             captured_assignments,
             captured_array_mutations,
+            [],
+            [],
         )
     }
 
@@ -1952,6 +3764,8 @@ impl SourceFlowPlan {
             logical_statements,
             captured_assignments,
             captured_array_mutations,
+            [],
+            [],
         )
     }
 
@@ -1983,6 +3797,81 @@ impl SourceFlowPlan {
             logical_statements,
             [],
             [],
+            [],
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+        captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_with_element_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            points,
+            conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            logical_statements,
+            captured_assignments,
+            captured_array_mutations,
+            nullish_assignments,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_element_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+        captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        element_assignments: impl IntoIterator<Item = SourceElementAssignmentProof>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_effects(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            points,
+            conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            logical_statements,
+            captured_assignments,
+            captured_array_mutations,
+            nullish_assignments,
+            element_assignments,
         )
     }
 
@@ -2001,6 +3890,8 @@ impl SourceFlowPlan {
         logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
         captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
         captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        element_assignments: impl IntoIterator<Item = SourceElementAssignmentProof>,
     ) -> Result<Self, SourceFlowError> {
         if bound.node_arena_id() != arena.id()
             || bound.node_arena_revision() != arena.revision()
@@ -2009,10 +3900,17 @@ impl SourceFlowPlan {
             return Err(SourceFlowInvariant::ForeignNode(container).into());
         }
 
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
         let mut planned_assignments = assignments.into_iter().collect::<Vec<_>>();
         let mut effects = SourceFlowEffects::default();
+        for proof in element_assignments {
+            let host = host.ok_or(SourceFlowInvariant::InvalidArrayMutation(proof.expression))?;
+            prepare_element_assignment(
+                store, host, container, proof, &mut effects, &mut planned_assignments,
+            )?;
+        }
         for assignment in parameter_assignments {
-            validate_parameter_assignment(arena, bound, store, container, assignment)?;
+            validate_parameter_assignment(arena, bound, store, host, container, assignment)?;
             if effects
                 .assignment_declarations
                 .insert(assignment.target, assignment.parameter)
@@ -2037,7 +3935,7 @@ impl SourceFlowPlan {
             let host = host.ok_or(SourceFlowInvariant::InvalidCapturedLocal(
                 origin.local().target,
             ))?;
-            validate_captured_flow_origin(arena, bound, store, host, container, origin)?;
+            validate_captured_flow_origin(arena, bound, store, host, container, origin, None)?;
             let assignment = origin.assignment();
             if effects
                 .assignment_declarations
@@ -2054,7 +3952,17 @@ impl SourceFlowPlan {
             planned_assignments.push(assignment);
         }
         for call in calls {
-            let statement = validate_linear_direct_call(arena, bound, store, container, call)?;
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_linear_direct_call(arena, bound, store, container, call)?,
+            };
             if effects.calls.insert(call, statement).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCall(call).into());
             }
@@ -2133,11 +4041,26 @@ impl SourceFlowPlan {
             conditions = retained;
         }
 
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            nullish_assignments,
+            &mut planned_assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
         let expected_start_payload = arena
             .get(container.node)
             .is_some_and(|record| {
                 record.kind == SyntaxKind::ArrowFunction
                     && matches!(record.data, NodeData::ArrowFunction(_))
+                    || record.kind == SyntaxKind::MethodDeclaration
+                        && bound.symbol(container).is_some_and(|owner| {
+                            store.source_object_literal_method_owner_is_exact(container, owner)
+                        })
             })
             .then_some(container);
         Self::preflight_with_effects(
@@ -2175,6 +4098,31 @@ impl SourceFlowPlan {
         for condition in conditions {
             let expression = condition.expression();
             validate_bound_node(bound, graph, expression)?;
+            if matches!(condition, SourceFlowCondition::ClassExpression(_)) {
+                return Err(SourceFlowInvariant::UnknownCondition(expression).into());
+            }
+            if condition.class_property_access().is_some() && effects.class_body.is_none()
+            {
+                return Err(SourceFlowInvariant::InvalidClassProperty(expression).into());
+            }
+            if let SourceFlowCondition::Nullish(condition) = condition
+                && !effects
+                    .class_expression_conditions
+                    .get(&expression)
+                    .is_some_and(|proof| {
+                        matches!(proof.source.kind, SourceClassExpressionConditionKind::Nullish(symbol)
+                            if condition.symbol == Some(symbol))
+                    })
+                && effects
+                    .nullish_assignments
+                    .get(&expression)
+                    .is_none_or(|proof| {
+                        proof.assignment.target != expression
+                            || proof.assignment.symbol != condition.symbol
+                    })
+            {
+                return Err(SourceFlowInvariant::UnknownCondition(expression).into());
+            }
             if planned_conditions.insert(expression, condition).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCondition(expression).into());
             }
@@ -2193,7 +4141,13 @@ impl SourceFlowPlan {
                         SourceFlowInvariant::DuplicateAssignment(assignment.declaration).into(),
                     );
                 }
-                validate_retained_captured_origin(bound, container, assignment, *origin)?;
+                validate_retained_captured_origin(
+                    bound,
+                    container,
+                    assignment,
+                    *origin,
+                    effects.statement_list.as_ref(),
+                )?;
             } else if let Some(parameter) =
                 effects.assignment_declarations.get(&assignment.declaration)
             {
@@ -2228,6 +4182,14 @@ impl SourceFlowPlan {
         let mut planned_points = HashMap::new();
         let mut point_order = Vec::new();
         for point in points {
+            if let Some(flow) = effects.region_points.get(&point).copied() {
+                validate_bound_node(bound, graph, point)?;
+                if planned_points.insert(point, flow).is_some() {
+                    return Err(SourceFlowInvariant::DuplicatePoint(point).into());
+                }
+                point_order.push(point);
+                continue;
+            }
             insert_flow_point(
                 bound,
                 graph,
@@ -2266,7 +4228,10 @@ impl SourceFlowPlan {
                         .ok_or(SourceFlowInvariant::InvalidClassBody(body.declaration))?,
                 )
             }
-            _ => graph.container_end(container),
+            _ => effects
+                .region
+                .map(|region| region.exit)
+                .or_else(|| graph.container_end(container)),
         };
         let plan = Self {
             container,
@@ -2277,14 +4242,22 @@ impl SourceFlowPlan {
             points: planned_points,
             point_order,
             conditions: planned_conditions,
+            class_expression_conditions: effects.class_expression_conditions,
             assignments: planned_assignments,
             assignment_order,
             assignment_declarations: effects.assignment_declarations,
             captured_origins: effects.captured_origins,
+            statement_list: effects.statement_list,
             calls: effects.calls,
             logical_statements: effects.logical_statements,
             class_body: effects.class_body,
             property_assignments: effects.property_assignments,
+            region: effects.region,
+            updates: effects.updates,
+            nullish_assignments: effects.nullish_assignments,
+            member_assignments: effects.member_assignments,
+            element_assignments: effects.element_assignments,
+            nullish_calls: effects.nullish_calls,
         };
         plan.validate_flow_paths(bound)?;
         Ok(plan)
@@ -2311,6 +4284,116 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        for proof in self.element_assignments.values() {
+            if source_element_assignment_proof(store, host, proof.expression)? != Some(*proof) {
+                return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+            }
+        }
+        for proof in self.member_assignments.values() {
+            if source_member_assignment_proof(store, host, proof.expression)? != Some(*proof) {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(proof.target).into());
+            }
+        }
+        if !self.nullish_assignments.is_empty() {
+            let (arena, _) = host
+                .source(self.container)
+                .ok_or(SourceFlowInvariant::ForeignNode(self.container))?;
+            for proof in self.nullish_assignments.values() {
+                if source_nullish_assignment_proof(
+                    arena,
+                    bound,
+                    store,
+                    host,
+                    self.container,
+                    proof.assignment,
+                )? != *proof
+                {
+                    return Err(SourceFlowInvariant::InvalidParameterAssignment(
+                        proof.assignment.target,
+                    )
+                    .into());
+                }
+            }
+            let assignments = self
+                .nullish_assignments
+                .values()
+                .map(|proof| proof.assignment)
+                .collect::<Vec<_>>();
+            for (call, antecedent) in &self.nullish_calls {
+                let (statement, actual) =
+                    validate_nullish_call(arena, bound, self.container, *call, &assignments)?
+                        .ok_or(SourceFlowInvariant::InvalidCall(*call))?;
+                if actual != *antecedent || self.calls.get(call) != Some(&statement) {
+                    return Err(SourceFlowInvariant::InvalidCall(*call).into());
+                }
+            }
+        }
+        if let Some(syntax) = &self.statement_list {
+            let (arena, _) = host
+                .source(self.container)
+                .ok_or(SourceFlowInvariant::ForeignNode(self.container))?;
+            validate_statement_list_source(arena, bound, store, host, syntax)?;
+            if syntax.callable.declaration != self.container {
+                return Err(SourceFlowInvariant::ForeignNode(self.container).into());
+            }
+            for (&target, &declaration) in &self.assignment_declarations {
+                if !self.nullish_assignments.contains_key(&target)
+                    && !self.updates.contains_key(&target)
+                    && arena
+                        .get(target.node)
+                        .is_some_and(|record| record.kind == SyntaxKind::Identifier)
+                    && arena.get(declaration.node).is_some_and(|record| {
+                        record.kind == SyntaxKind::BindingElement
+                            || matches!(&record.data, NodeData::VariableDeclaration(variable) if variable.initializer.is_some())
+                    })
+                {
+                    let symbol = self
+                        .assignments
+                        .get(&target)
+                        .ok_or(SourceFlowInvariant::UnknownAssignment(target))?
+                        .symbol;
+                    validate_initialized_local_assignment(
+                        arena,
+                        bound,
+                        store,
+                        host,
+                        self.container,
+                        SourceFlowParameterAssignment {
+                            target,
+                            parameter: declaration,
+                            symbol,
+                        },
+                        syntax,
+                    )?;
+                }
+            }
+        }
+        if let Some(region) = self.region {
+            let (arena, _) = host
+                .source(region.statement)
+                .ok_or(SourceFlowInvariant::InvalidSourceRegion(region.statement))?;
+            let actual = if self.nullish_assignments.is_empty() {
+                source_statement_flow_region(arena, bound, store, region.statement)?
+            } else {
+                let assignments = self
+                    .nullish_assignments
+                    .values()
+                    .map(|proof| proof.assignment)
+                    .collect::<Vec<_>>();
+                source_nullish_statement_flow_region(arena, bound, region.statement, &assignments)?
+            };
+            if actual != region {
+                return Err(SourceFlowInvariant::InvalidSourceRegion(region.statement).into());
+            }
+            for (point, expected) in &self.points {
+                if source_region_point_flow(arena, bound, *point, Some(region))? != *expected {
+                    return Err(SourceFlowInvariant::MissingFlowPoint(*point).into());
+                }
+            }
+            for update in self.updates.values() {
+                validate_source_update(arena, bound, store, host, *update)?;
+            }
+        }
         if self.captured_origins.is_empty() {
             return self.frame(bound, base);
         }
@@ -2322,8 +4405,22 @@ impl SourceFlowPlan {
                 .assignments
                 .get(&target)
                 .ok_or(SourceFlowInvariant::UnknownAssignment(target))?;
-            validate_retained_captured_origin(bound, self.container, *assignment, *origin)?;
-            validate_captured_flow_origin(arena, bound, store, host, self.container, *origin)?;
+            validate_retained_captured_origin(
+                bound,
+                self.container,
+                *assignment,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
+            validate_captured_flow_origin(
+                arena,
+                bound,
+                store,
+                host,
+                self.container,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
         }
         self.frame_with_validated_captures(bound, base)
     }
@@ -2335,6 +4432,35 @@ impl SourceFlowPlan {
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, self.container)?;
+        for proof in self.element_assignments.values() {
+            if bound.node_arena_revision() != proof.revision || proof.container != self.container {
+                return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+            }
+        }
+        for proof in self.nullish_assignments.values() {
+            if bound.node_arena_revision() != proof.revision {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(
+                    proof.assignment.target,
+                )
+                .into());
+            }
+        }
+        for proof in self.member_assignments.values() {
+            if bound.node_arena_revision() != proof.revision
+                || proof.container != self.container
+            {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(proof.target).into());
+            }
+        }
+        if let Some(region) = self.region
+            && (bound.flow_at(region.entry_node).or_else(|| {
+                (bound.flow_graph().is_unreachable(region.entry_node) == Some(true))
+                    .then(|| bound.flow_graph().nodes().unreachable())
+            }) != Some(region.entry)
+                || bound.flow_container(region.statement) != Some(self.container))
+        {
+            return Err(SourceFlowInvariant::InvalidSourceRegion(region.statement).into());
+        }
         let actual = graph
             .container_start(self.start_container)
             .ok_or(SourceFlowInvariant::MissingStart(self.start_container))?;
@@ -2387,7 +4513,13 @@ impl SourceFlowPlan {
             if self.assignment_declarations.contains_key(&target) {
                 return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
             }
-            validate_retained_captured_origin(bound, self.container, *assignment, *origin)?;
+            validate_retained_captured_origin(
+                bound,
+                self.container,
+                *assignment,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
             if !base.contains_key(&assignment.symbol) {
                 return Err(SourceFlowInvariant::MissingCurrentType(assignment.symbol).into());
             }
@@ -2430,20 +4562,54 @@ impl SourceFlowPlan {
                 self.validate_flow_paths(bound)?;
             }
         }
+        if !self.nullish_assignments.is_empty() {
+            self.validate_flow_paths(bound)?;
+        }
+        if self
+            .statement_list
+            .as_ref()
+            .is_some_and(|syntax| syntax.contains_for_of() || syntax.contains_counted_for())
+        {
+            self.validate_flow_paths(bound)?;
+        }
         Ok(SourceFlowFrame {
             plan: self,
             bound,
             graph,
+            declared_types: base.clone(),
             base: SourceFlowSnapshot::new(base),
             assignment_states: self
                 .assignments
                 .keys()
                 .copied()
-                .map(|declaration| (declaration, SourceFlowAssignmentState::Pending))
+                .map(|declaration| {
+                    let state = match self.updates.get(&declaration) {
+                        Some(update) if update.readonly => {
+                            SourceFlowAssignmentState::ReadonlyUpdate
+                        }
+                        Some(_) => SourceFlowAssignmentState::Update,
+                        None if self
+                            .nullish_assignments
+                            .get(&declaration)
+                            .is_some_and(|proof| proof.assignment.readonly) =>
+                        {
+                            SourceFlowAssignmentState::ReadonlyUpdate
+                        }
+                        None => SourceFlowAssignmentState::Pending,
+                    };
+                    (declaration, state)
+                })
                 .collect(),
+            completed_callable_updates: HashSet::new(),
+            completed_expression_calls: HashSet::new(),
+            call_effects: HashMap::new(),
+            condition_values: HashMap::new(),
+            reference_conditions: HashMap::new(),
+            in_conditions: HashMap::new(),
             memo: HashMap::new(),
             visiting: HashSet::new(),
             loop_snapshots: HashMap::new(),
+            reference: None,
         })
     }
 
@@ -2458,7 +4624,12 @@ impl SourceFlowPlan {
         for (&target, &declaration) in &self.assignment_declarations {
             let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
             let assignment = self.assignments.get(&target).ok_or_else(invalid)?;
-            if host.node(target).ok_or_else(invalid)?.kind == SyntaxKind::CallExpression {
+            if host.node(target).ok_or_else(invalid)?.kind == SyntaxKind::CallExpression
+                || self
+                    .element_assignments
+                    .values()
+                    .any(|proof| proof.flow_at(target).is_some())
+            {
                 continue;
             }
             assignments.push(SourceFlowParameterAssignment {
@@ -2481,7 +4652,7 @@ impl SourceFlowPlan {
 
     fn validate_flow_paths(&self, bound: &BoundFile) -> Result<(), SourceFlowError> {
         let mut validated = HashSet::new();
-        let mut visiting = HashSet::new();
+        let mut visiting = SourceFlowActivePath::default();
         let mut coverage = SourceFlowCoverage::default();
         for point in &self.point_order {
             let flow = *self
@@ -2508,6 +4679,23 @@ impl SourceFlowPlan {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*declaration).into());
             }
         }
+        for (target, proof) in &self.nullish_assignments {
+            if proof.flow.is_some() && !coverage.assignments.contains(target) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
+            }
+        }
+        for target in self.member_assignments.keys() {
+            if !coverage.assignments.contains(target) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
+            }
+        }
+        for proof in self.element_assignments.values() {
+            if !coverage.assignments.contains(&proof.expression)
+                || proof.assignment.is_some() && !coverage.assignments.contains(&proof.target)
+            {
+                return Err(SourceFlowInvariant::UnreachedAssignment(proof.expression).into());
+            }
+        }
         for (target, assignment) in &self.property_assignments {
             if assignment.write.is_some() && !coverage.assignments.contains(target) {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
@@ -2520,12 +4708,18 @@ impl SourceFlowPlan {
         }
         for (condition, planned) in &self.conditions {
             let Some(edges) = coverage.condition_edges.get(condition).copied() else {
-                if matches!(planned, SourceFlowCondition::Unchanged(_)) {
+                if matches!(planned, SourceFlowCondition::Unchanged(_))
+                    && !self.class_expression_conditions.contains_key(condition)
+                {
                     continue;
                 }
                 return Err(SourceFlowInvariant::UnreachedCondition(*condition).into());
             };
-            if edges != BOTH_CONDITION_EDGES {
+            let expected = self
+                .class_expression_conditions
+                .get(condition)
+                .map_or(BOTH_CONDITION_EDGES, |proof| proof.edges);
+            if edges != expected {
                 return Err(SourceFlowInvariant::MissingConditionEdge {
                     condition: *condition,
                     true_edge: edges & TRUE_CONDITION_EDGE != 0,
@@ -2543,26 +4737,29 @@ impl SourceFlowPlan {
         flow: FlowRef,
         depth: usize,
         validated: &mut HashSet<FlowRef>,
-        visiting: &mut HashSet<FlowRef>,
+        visiting: &mut SourceFlowActivePath,
         coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let graph = bound.flow_graph();
+        if self.region.is_some_and(|region| region.entry == flow) {
+            flow_node(graph, flow)?;
+            return Ok(());
+        }
         if validated.contains(&flow) {
             return Ok(());
         }
         if depth > FLOW_DEPTH_LIMIT {
             return Err(SourceFlowInvariant::DepthLimit(flow).into());
         }
-        if !visiting.insert(flow) {
-            let node = flow_node(graph, flow)?;
-            return if source_flow_kind(flow, node.flags)? == SourceFlowKind::LoopLabel {
-                Ok(())
-            } else {
-                Err(SourceFlowInvariant::Cycle(flow).into())
-            };
+        if !visiting.members.insert(flow) {
+            let _ = flow_node(graph, flow)?;
+            return visiting.validate_cycle(graph.nodes(), flow);
         }
+        visiting.nodes.push(flow);
         let result = self.validate_flow_uncached(bound, flow, depth, validated, visiting, coverage);
-        let removed = visiting.remove(&flow);
+        let last = visiting.nodes.pop();
+        debug_assert_eq!(last, Some(flow));
+        let removed = visiting.members.remove(&flow);
         debug_assert!(removed);
         if result.is_ok() {
             validated.insert(flow);
@@ -2576,7 +4773,7 @@ impl SourceFlowPlan {
         flow: FlowRef,
         depth: usize,
         validated: &mut HashSet<FlowRef>,
-        visiting: &mut HashSet<FlowRef>,
+        visiting: &mut SourceFlowActivePath,
         coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let graph = bound.flow_graph();
@@ -2587,11 +4784,22 @@ impl SourceFlowPlan {
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if let Some(expected) = self
+                    .element_assignments
+                    .values()
+                    .find_map(|proof| proof.flow_at(declaration))
+                {
+                    if expected != flow {
+                        return Err(SourceFlowInvariant::InvalidPayload(flow).into());
+                    }
+                }
                 if let Some(origin) = self.captured_origins.get(&declaration) {
                     validate_captured_origin_flow_node(*origin, flow, &node)?;
                 }
                 if !self.assignments.contains_key(&declaration)
                     && !self.property_assignments.contains_key(&declaration)
+                    && !self.nullish_assignments.contains_key(&declaration)
+                    && !self.member_assignments.contains_key(&declaration)
                 {
                     if source_flow_kind(flow, node.flags)? == SourceFlowKind::ArrayMutation {
                         return Err(SourceFlowUnsupported::FlowKind {
@@ -2601,6 +4809,16 @@ impl SourceFlowPlan {
                         .into());
                     }
                     return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+                }
+                if let Some(proof) = self.nullish_assignments.get(&declaration)
+                    && proof.flow != Some(flow)
+                {
+                    return Err(SourceFlowInvariant::InvalidPayload(flow).into());
+                }
+                if let Some(proof) = self.member_assignments.get(&declaration)
+                    && proof.flow != flow
+                {
+                    return Err(SourceFlowInvariant::InvalidPayload(flow).into());
                 }
                 coverage.assignments.insert(declaration);
                 self.validate_flow(bound, antecedent, depth + 1, validated, visiting, coverage)
@@ -2660,10 +4878,33 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     bound: &'graph BoundFile,
     graph: &'graph BoundFlowGraph,
     base: SourceFlowSnapshot,
+    declared_types: SourceFlowTypes,
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
-    memo: HashMap<FlowRef, SourceFlowSnapshot>,
-    visiting: HashSet<FlowRef>,
-    loop_snapshots: HashMap<FlowRef, SourceFlowSnapshot>,
+    completed_callable_updates: HashSet<NodeRef>,
+    completed_expression_calls: HashSet<NodeRef>,
+    call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
+    condition_values: HashMap<NodeRef, TypeId>,
+    reference_conditions: HashMap<NodeRef, references::CheckedReferenceCondition>,
+    in_conditions: HashMap<NodeRef, CompletedInCondition>,
+    memo: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
+    visiting: HashSet<(FlowRef, Option<SemanticSymbolId>)>,
+    loop_snapshots: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
+    reference: Option<SemanticSymbolId>,
+}
+
+/// Membership results checked with the source caller's instantiation session.
+struct CompletedInCondition {
+    input: TypeId,
+    key: TypeId,
+    when_true: TypeId,
+    when_false: TypeId,
+}
+
+/// Restores the catch entry without reverting writes to outer variables.
+pub(super) struct SourceCatchFlowScope {
+    symbol: SemanticSymbolId,
+    base: Option<TypeId>,
+    declared: Option<TypeId>,
 }
 
 /// Keeps class initialization queries tied to one prepared body and binder graph.
@@ -2673,6 +4914,48 @@ pub(super) struct ClassInitializationFrame<'plan, 'graph> {
     flow: SourceFlowFrame<'plan, 'graph>,
     completed_calls: HashSet<NodeRef>,
     property_assignments: HashMap<NodeRef, CheckedClassPropertyAssignment>,
+    property_conditions: HashMap<NodeRef, CompletedClassPropertyCondition>,
+    predicate_conditions: HashMap<NodeRef, CompletedClassPropertyPredicate>,
+    ordinary_calls: HashMap<NodeRef, CompletedClassOrdinaryCall>,
+}
+
+#[derive(Clone)]
+struct CompletedClassPropertyCondition {
+    condition: SourceFlowCondition,
+    source: ClassPropertyTruthinessSource,
+    member: ClassMemberSource,
+    access: ClassBodyAccessToken,
+    flow: FlowRef,
+    edges: [FlowRef; 2],
+    type_: TypeId,
+}
+
+struct CompletedClassPropertyPredicate {
+    condition: SourceClassPropertyPredicateCondition,
+    source: ClassPropertyTruthinessSource,
+    member: ClassMemberSource,
+    access: ClassBodyAccessToken,
+    flow: FlowRef,
+    edges: [FlowRef; 2],
+    argument_type: TypeId,
+    callee: NodeRef,
+    callee_type: TypeId,
+    callee_read: PlannedIdentifierRead,
+    signature: SignatureId,
+    predicate: TypePredicateId,
+    predicate_type: TypeId,
+    return_type: TypeId,
+    arrays: CanonicalArrayTargets,
+}
+
+struct CompletedClassOrdinaryCall {
+    plan: SourceCallPlan,
+    access: ClassBodyAccessToken,
+    callee_type: TypeId,
+    callee_symbol: Option<SymbolNodeLinks>,
+    signature: SignatureId,
+    return_type: TypeId,
+    arrays: CanonicalArrayTargets,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2712,17 +4995,823 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         if plan.class_body.as_ref() != Some(body) {
             return Err(SourceFlowInvariant::InvalidClassBody(body.declaration).into());
         }
+        plan.validate_flow_paths(bound)?;
         Ok(Self {
             access,
             body,
             flow: plan.frame(bound, base)?,
             completed_calls: HashSet::new(),
             property_assignments: HashMap::new(),
+            property_conditions: HashMap::new(),
+            predicate_conditions: HashMap::new(),
+            ordinary_calls: HashMap::new(),
         })
     }
 
     pub(super) const fn access_token(&self) -> &ClassBodyAccessToken {
         &self.access
+    }
+
+    pub(super) const fn body_declaration(&self) -> NodeRef {
+        self.body.declaration
+    }
+
+    pub(super) fn has_property_conditions(&self) -> bool {
+        self.flow
+            .plan
+            .conditions
+            .values()
+            .any(|condition| condition.class_property_access().is_some()
+                || matches!(condition, SourceFlowCondition::Reference(_)))
+    }
+
+    pub(super) fn is_expression_condition_call(&self, call: NodeRef) -> bool {
+        self.flow
+            .plan
+            .class_expression_conditions
+            .get(&call)
+            .is_some_and(|proof| {
+                proof.source.kind == SourceClassExpressionConditionKind::Call
+                    && self.flow.plan.conditions.get(&call)
+                        == Some(&SourceFlowCondition::Unchanged(call))
+            })
+    }
+
+    pub(super) fn has_property_equality_condition(&self, expression: NodeRef) -> bool {
+        matches!(
+            self.flow.plan.conditions.get(&expression),
+            Some(SourceFlowCondition::ClassPropertyEquality(_))
+        )
+    }
+
+    pub(super) fn is_predicate_condition_call(&self, call: NodeRef) -> bool {
+        self.flow.plan.conditions.values().any(|condition| {
+            matches!(condition, SourceFlowCondition::ClassPropertyPredicate(condition)
+                if condition.call == call)
+        })
+    }
+
+    /// Records the ordinary read after the source checker accepts its condition.
+    pub(super) fn complete_property_condition(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        condition: SourceClassPropertyTruthinessCondition,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        self.complete_class_property_condition(
+            store,
+            host,
+            SourceFlowCondition::ClassPropertyTruthiness(condition),
+            raw,
+            result,
+        )
+    }
+
+    pub(super) fn complete_property_equality_condition(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        condition: SourceClassPropertyEqualityCondition,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        self.complete_class_property_condition(
+            store,
+            host,
+            SourceFlowCondition::ClassPropertyEquality(condition),
+            raw,
+            result,
+        )
+    }
+
+    fn complete_class_property_condition(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        condition: SourceFlowCondition,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let expression = condition.expression();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(expression);
+        let access = condition.class_property_access().ok_or_else(invalid)?;
+        if raw != result || self.property_conditions.contains_key(&expression) {
+            return Err(invalid().into());
+        }
+        let (source, edges) = validate_class_property_flow_condition(
+            store, host, self.flow.bound, self.body, condition,
+        )?;
+        let type_ = if matches!(condition, SourceFlowCondition::ClassPropertyEquality(_)) {
+            if store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| raw != bootstrap.boolean_type)
+            {
+                return Err(invalid().into());
+            }
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?
+        } else {
+            raw
+        };
+        let member = class_member_source(store, host, source.member).map_err(|_| invalid())?;
+        let flow = self
+            .flow
+            .plan
+            .points
+            .get(&access)
+            .copied()
+            .ok_or_else(invalid)?;
+        let completed = CompletedClassPropertyCondition {
+            condition,
+            source,
+            member,
+            access: self.access.clone(),
+            flow,
+            edges,
+            type_,
+        };
+        self.validate_property_condition(store, host, &completed)?;
+        self.property_conditions
+            .insert(expression, completed);
+        Ok(())
+    }
+
+    fn validate_property_condition(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        completed: &CompletedClassPropertyCondition,
+    ) -> Result<(), SourceFlowError> {
+        let condition = completed.condition;
+        let expression = condition.expression();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(expression);
+        let access = condition.class_property_access().ok_or_else(invalid)?;
+        let identities = class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        let receiver_symbol = store
+            .type_payload(identities.this_type)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let (source, edges) = validate_class_property_flow_condition(
+            store, host, self.flow.bound, self.body, condition,
+        )?;
+        if completed.access != self.access
+            || self.flow.plan.conditions.get(&expression) != Some(&condition)
+            || source != completed.source
+            || edges != completed.edges
+            || class_member_source(store, host, completed.source.member).map_err(|_| invalid())?
+                != completed.member
+            || completed.member.declaring_class != identities.class_symbol
+            || completed.member.declaration != completed.source.declaration
+            || completed.member.side != ClassPropertySide::Instance
+            || !matches!(completed.member.origin, ClassMemberOrigin::Field { .. })
+            || self.flow.plan.points.get(&access) != Some(&completed.flow)
+            || self.flow.bound.flow_at(access) != Some(completed.flow)
+            || self.flow.bound.flow_container(access) != Some(self.body.declaration)
+            || store.type_payload(completed.type_).is_none()
+            || store.type_node_links(access)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.type_),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(access)
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(completed.member.symbol),
+                })
+            || store.type_node_links(completed.source.context.receiver())
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(identities.this_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(completed.source.context.receiver())
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(receiver_symbol),
+                })
+        {
+            return Err(invalid().into());
+        }
+        if let SourceFlowCondition::ClassPropertyEquality(condition) = condition {
+            let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+            if store.type_node_links(expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.boolean_type),
+                    ..TypeNodeLinks::default()
+                })
+                || store.type_node_links(condition.value)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.undefined_widening_type),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(invalid().into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Retains the checked predicate and the field read for both condition edges.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn complete_predicate_condition(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        condition: SourceClassPropertyPredicateCondition,
+        plan: &SourceCallPlan,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+        if raw != result
+            || plan.node != condition.call
+            || plan.arguments.len() != 1
+            || plan.arguments[0].node != condition.access
+            || self
+                .predicate_conditions
+                .contains_key(&condition.expression)
+        {
+            return Err(invalid().into());
+        }
+        let PlannedExpressionKind::Identifier(callee_read) = &plan.callee.kind else {
+            return Err(invalid().into());
+        };
+        let (source, edges) = validate_class_property_predicate_condition(
+            store,
+            host,
+            self.flow.bound,
+            self.body,
+            condition,
+        )?;
+        let member = class_member_source(store, host, source.member).map_err(|_| invalid())?;
+        let signature = store
+            .signature_links(condition.call)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        let predicate = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_type_predicate)
+            .ok_or(SourceFlowUnsupported::Call(condition.call))?;
+        let predicate_type = store
+            .type_predicate(predicate)
+            .and_then(super::signatures::TypePredicate::type_id)
+            .ok_or(SourceFlowUnsupported::Call(condition.call))?;
+        let callee_type = store
+            .type_node_links(plan.callee.node)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        let effects = resolve_source_call_effects_signature(store, plan, Some(callee_type))
+            .map_err(|error| match error {
+                super::source::SourceCheckError::Unsupported(_) => {
+                    SourceFlowError::Unsupported(SourceFlowUnsupported::Call(condition.call))
+                }
+                _ => SourceFlowError::Invariant(invalid()),
+            })?;
+        if effects != EffectsSignatureState::Resolved(signature) {
+            return Err(invalid().into());
+        }
+        let completed = CompletedClassPropertyPredicate {
+            condition,
+            source,
+            member,
+            access: self.access.clone(),
+            flow: *self
+                .flow
+                .plan
+                .points
+                .get(&condition.access)
+                .ok_or_else(invalid)?,
+            edges,
+            argument_type: store
+                .type_node_links(condition.access)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?,
+            callee: plan.callee.node,
+            callee_type,
+            callee_read: *callee_read,
+            signature,
+            predicate,
+            predicate_type,
+            return_type: result,
+            arrays: CanonicalArrayTargets::from_global_types(globals),
+        };
+        self.validate_predicate_condition(store, host, &completed)?;
+        self.predicate_conditions
+            .insert(condition.expression, completed);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // The call and field retain one shared source proof.
+    fn validate_predicate_condition(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        completed: &CompletedClassPropertyPredicate,
+    ) -> Result<(), SourceFlowError> {
+        let condition = completed.condition;
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+        let unsupported =
+            || SourceFlowError::Unsupported(SourceFlowUnsupported::Call(condition.call));
+        let identities = class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        let receiver_symbol = store
+            .type_payload(identities.this_type)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let (source, edges) = validate_class_property_predicate_condition(
+            store,
+            host,
+            self.flow.bound,
+            self.body,
+            condition,
+        )?;
+        let (arena, _) = host.source(condition.call).ok_or_else(invalid)?;
+        let syntax =
+            plan_direct_source_call_syntax(arena, store, condition.call).map_err(|_| invalid())?;
+        let links = store.signature_links(condition.call).ok_or_else(invalid)?;
+        if completed.access != self.access
+            || self.flow.plan.conditions.get(&condition.expression)
+                != Some(&SourceFlowCondition::ClassPropertyPredicate(condition))
+            || source != completed.source
+            || edges != completed.edges
+            || class_member_source(store, host, source.member).map_err(|_| invalid())?
+                != completed.member
+            || completed.member.declaring_class != identities.class_symbol
+            || completed.member.declaration != source.declaration
+            || completed.member.side != ClassPropertySide::Instance
+            || !matches!(completed.member.origin, ClassMemberOrigin::Field { .. })
+            || self.flow.plan.points.get(&condition.access) != Some(&completed.flow)
+            || self.flow.bound.flow_at(condition.access) != Some(completed.flow)
+            || syntax.callee() != completed.callee
+            || syntax.arguments() != [condition.access]
+            || links.resolved_signature.signature() != Some(completed.signature)
+            || links.effects_signature != EffectsSignatureState::Resolved(completed.signature)
+            || store.type_node_links(condition.call)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.return_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.type_node_links(completed.callee)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.callee_type),
+                    ..TypeNodeLinks::default()
+                })
+            || own_class_flow_reference_symbol(store, host, self.flow.bound, completed.callee)
+                .map_err(|_| invalid())?
+                != Some(completed.callee_read.value_symbol)
+            // Source checking publishes identifier links after it checks class bodies.
+            || store
+                .symbol_node_links(completed.callee)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|symbol| symbol != completed.callee_read.resolved_symbol)
+            || store.type_node_links(condition.access)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.argument_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(condition.access)
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(completed.member.symbol),
+                })
+            || store.type_node_links(source.context.receiver())
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(identities.this_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(source.context.receiver())
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(receiver_symbol),
+                })
+        {
+            return Err(invalid().into());
+        }
+        let projection = match validate_stored_callable_set_with_array_targets(
+            store,
+            completed.callee_type,
+            Some(completed.arrays),
+        ) {
+            StoredCallableSetValidation::Valid { projection, .. } => projection,
+            StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
+            _ => return Err(unsupported()),
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Err(unsupported());
+        };
+        let signature = store.signature(completed.signature).ok_or_else(invalid)?;
+        let predicate = store
+            .type_predicate(completed.predicate)
+            .ok_or_else(invalid)?;
+        let declaration = signature.declaration().ok_or_else(unsupported)?;
+        let declaration_record = class_flow_source_node(store, host, declaration)?;
+        let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
+            return Err(unsupported());
+        };
+        let annotation = function
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(unsupported)?;
+        let annotation_record = class_flow_source_node(store, host, annotation)?;
+        if !projection.construct_signatures.is_empty()
+            || !signature.type_parameters().is_empty()
+            || signature.parameters().len() != 1
+            || signature.this_parameter().is_some()
+            || signature.has_rest_parameter()
+            || signature.target().is_some()
+            || signature.mapper().is_some()
+            || signature.composite().is_some()
+            || predicate.kind() != TypePredicateKind::Identifier
+            || predicate.parameter_index() != 0
+            || annotation_record.kind != SyntaxKind::TypePredicate
+        {
+            return Err(unsupported());
+        }
+        if projection.owner != completed.callee_type
+            || callable.signature != completed.signature
+            || callable.return_type != Some(completed.return_type)
+            || signature.resolved_return_type() != Some(completed.return_type)
+            || signature.resolved_type_predicate() != Some(completed.predicate)
+            || predicate.type_id() != Some(completed.predicate_type)
+            || annotation_record.parent != Some(declaration.node)
+            || store
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                != Some(completed.signature)
+            || store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.boolean_type)
+                != Some(completed.return_type)
+        {
+            return Err(invalid().into());
+        }
+        for type_ in [completed.argument_type, completed.predicate_type] {
+            store
+                .validate_union_constituent_with_array_targets(completed.arrays, type_)
+                .map_err(|_| invalid())?;
+            class_predicate_scalar_leaves(store, condition.call, type_)?;
+        }
+        Ok(())
+    }
+
+    /// An ordinary call keeps property facts only after its real signature is known.
+    pub(super) fn complete_non_effecting_call(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        plan: &SourceCallPlan,
+        callee: TypeId,
+        checked: &CheckedSourceCall,
+    ) -> Result<(), SourceFlowError> {
+        if !self.has_property_conditions()
+            && !self.flow.plan.conditions.contains_key(&plan.node)
+            && !self.flow.plan.class_expression_conditions.contains_key(&plan.node)
+        {
+            return Ok(());
+        }
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(plan.node);
+        if class_call_flow_container(store, host, plan.node)? != self.body.declaration {
+            if self.flow.plan.conditions.contains_key(&plan.node)
+                || self.flow.plan.class_expression_conditions.contains_key(&plan.node)
+                || self.flow.plan.calls.contains_key(&plan.node)
+                || self.ordinary_calls.contains_key(&plan.node)
+                || self.completed_calls.contains(&plan.node)
+                || self.flow.completed_expression_calls.contains(&plan.node)
+            {
+                return Err(invalid().into());
+            }
+            // Deferred arrows use the class token, but keep their own call effects.
+            return Ok(());
+        }
+        if self.ordinary_call_flow(store, host, plan)?.is_none() {
+            return Ok(());
+        }
+        let signature = store
+            .signature_links(plan.node)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        let completed = CompletedClassOrdinaryCall {
+            plan: plan.clone(),
+            access: self.access.clone(),
+            callee_type: callee,
+            callee_symbol: store.symbol_node_links(plan.callee.node).cloned(),
+            signature,
+            return_type: checked.return_type,
+            arrays: CanonicalArrayTargets::from_global_types(globals),
+        };
+        if self.ordinary_calls.contains_key(&plan.node) {
+            return Err(invalid().into());
+        }
+        self.validate_non_effecting_call(store, host, &completed)?;
+        self.ordinary_calls.insert(plan.node, completed);
+        if self.is_expression_condition_call(plan.node) {
+            self.flow.completed_expression_calls.insert(plan.node);
+            self.flow.memo.clear();
+        }
+        Ok(())
+    }
+
+    /// Value calls need normal type checking, but only binder calls and retained
+    /// call conditions need a separate flow-effect record.
+    fn ordinary_call_flow(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        call_plan: &SourceCallPlan,
+    ) -> Result<Option<NodeRef>, SourceFlowError> {
+        let call = call_plan.node;
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(call);
+        let (arena, bound) = host.source(call).ok_or_else(invalid)?;
+        class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        if bound.source_file() != self.flow.bound.source_file()
+            || bound.node_arena_revision() != self.flow.bound.node_arena_revision()
+            || class_call_flow_container(store, host, call)? != self.body.declaration
+        {
+            return Err(invalid().into());
+        }
+        let mut statement = None;
+        for (index, node) in self.flow.graph.nodes().iter().enumerate() {
+            if !node.flags.contains(FlowFlags::CALL)
+                || node.payload != Some(FlowNodePayload::Ast(call))
+            {
+                continue;
+            }
+            let flow = self.flow.graph.nodes()
+                .flow_ref(FlowNodeId(index.try_into().map_err(|_| invalid())?))
+                .ok_or_else(invalid)?;
+            if source_flow_kind(flow, node.flags)? != SourceFlowKind::Call
+                || statement.is_some()
+            {
+                return Err(invalid().into());
+            }
+            let antecedent = linear_antecedent(flow, node)?;
+            flow_node(self.flow.graph, antecedent)?;
+            let planned = self.flow.plan.calls.get(&call).copied().ok_or_else(invalid)?;
+            let actual =
+                validate_class_body_call(arena, bound, self.body, self.flow.plan.container, call)?;
+            if planned != actual {
+                return Err(invalid().into());
+            }
+            validate_planned_call_container(bound, self.flow.plan, call, actual, antecedent)?;
+            statement = Some(actual);
+        }
+        if statement.is_none() && self.flow.plan.calls.contains_key(&call) {
+            return Err(invalid().into());
+        }
+        if let Some(proof) = self.flow.plan.class_expression_conditions.get(&call) {
+            if !self.is_expression_condition_call(call)
+                || validate_class_expression_condition(arena, bound, store, host, self.body, proof.source)?
+                    != SourceFlowCondition::Unchanged(call)
+            {
+                return Err(invalid().into());
+            }
+            statement = statement.or(Some(proof.source.owner));
+        } else if self.flow.plan.conditions.contains_key(&call) {
+            // Plain class if-calls already have a checked source plan. They do
+            // not need an effect signature when no property fact is queried.
+            let (_, access) = super::source::zero_argument_class_call_target(call_plan)
+                .ok_or_else(invalid)?;
+            let source = class_flow_source_node(store, host, call).map_err(|_| invalid())?;
+            let owner = source.parent
+                .map(|node| NodeRef::new(call.arena, call.file, node))
+                .ok_or_else(invalid)?;
+            let statement = class_flow_source_node(store, host, owner).map_err(|_| invalid())?;
+            if self.has_property_conditions()
+                || self.flow.plan.conditions.get(&call) != Some(&SourceFlowCondition::Unchanged(call))
+                || access.class_symbol() != self.body.class_symbol
+                || access.class_declaration() != self.body.class_declaration
+                || access.body_declaration() != self.body.declaration
+                || statement.kind != SyntaxKind::IfStatement
+                || statement.flags.0 != 0
+                || !source_node_is_descendant_of(arena, owner, self.body.body.node)
+                || !matches!(&statement.data, NodeData::IfStatement(branch)
+                    if branch.expression == call.node && branch.flow_node.is_none() && branch.facts == 0)
+            {
+                return Err(invalid().into());
+            }
+        }
+        if statement.is_none()
+            && (self.ordinary_calls.contains_key(&call)
+                || self.completed_calls.contains(&call)
+                || self.flow.completed_expression_calls.contains(&call))
+        {
+            return Err(invalid().into());
+        }
+        Ok(statement)
+    }
+
+    fn validate_non_effecting_call(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        completed: &CompletedClassOrdinaryCall,
+    ) -> Result<(), SourceFlowError> {
+        let call = completed.plan.node;
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(call);
+        let unsupported = || SourceFlowError::Unsupported(SourceFlowUnsupported::Call(call));
+        let statement = self.ordinary_call_flow(store, host, &completed.plan)?.ok_or_else(invalid)?;
+        let (arena, _) = host.source(call).ok_or_else(invalid)?;
+        let expression_condition = self.is_expression_condition_call(call);
+        let syntax = plan_direct_source_call_syntax(arena, store, call).map_err(|_| invalid())?;
+        let source = class_flow_source_node(store, host, call).map_err(|_| invalid())?;
+        let NodeData::CallExpression(data) = &source.data else {
+            return Err(invalid().into());
+        };
+        if data.type_arguments.is_some() {
+            return Err(unsupported());
+        }
+        let signature_links = store.signature_links(call).ok_or_else(invalid)?;
+        if completed.access != self.access
+            || !expression_condition && self.flow.plan.calls.get(&call) != Some(&statement)
+            || syntax.callee() != completed.plan.callee.node
+            || !syntax.arguments().iter().copied().eq(completed
+                .plan
+                .arguments
+                .iter()
+                .map(|argument| argument.node))
+            || signature_links.resolved_signature.signature() != Some(completed.signature)
+            || signature_links.effects_signature != EffectsSignatureState::Unresolved
+            || store.symbol_node_links(completed.plan.callee.node) != completed.callee_symbol.as_ref()
+            || store.type_node_links(call)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.return_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.type_node_links(completed.plan.callee.node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.callee_type),
+                    ..TypeNodeLinks::default()
+                })
+        {
+            return Err(invalid().into());
+        }
+        if let PlannedExpressionKind::Identifier(read) = &completed.plan.callee.kind {
+            // Identifier links publish after the source body. Prove the live
+            // binding without forcing that later cache publication here.
+            let callee = completed.plan.callee.node;
+            let source = class_flow_source_node(store, host, callee).map_err(|_| invalid())?;
+            let NodeData::Identifier(identifier) = &source.data else {
+                return Err(invalid().into());
+            };
+            let (arena, bound) = host.source(callee).ok_or_else(invalid)?;
+            if source.kind != SyntaxKind::Identifier || source.flags.0 != 0
+                || identifier.flow_node.is_some()
+                || bound.source_file() != self.flow.bound.source_file()
+                || bound.node_arena_revision() != self.flow.bound.node_arena_revision()
+            {
+                return Err(invalid().into());
+            }
+            let imported = read.kind == super::source::PlannedIdentifierReadKind::Import;
+            let mut meaning = SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE;
+            if imported {
+                meaning |= SymbolFlags::ALIAS;
+            }
+            let mut callback = host.name_resolver_host(store).map_err(|_| invalid())?;
+            let mut resolver = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback)
+                .map_err(|_| invalid())?;
+            let resolved = resolver.resolve(
+                Some(CanonicalResolutionLocation::Bound(callee)),
+                &identifier.text, meaning, None, false, false,
+            ).map_err(|_| invalid())?.ok_or_else(invalid)?;
+            let symbol = store.symbol(resolved).ok_or_else(invalid)?;
+            let value = if imported {
+                if !symbol.flags().contains(SymbolFlags::ALIAS) {
+                    return Err(invalid().into());
+                }
+                resolved
+            } else if read.kind == super::source::PlannedIdentifierReadKind::Arguments {
+                if store.get_merged_symbol(resolved) != Some(resolved) {
+                    return Err(invalid().into());
+                }
+                resolved
+            } else {
+                let target = if symbol.flags().intersects(SymbolFlags::EXPORT_VALUE) {
+                    symbol.export_symbol().ok_or_else(invalid)?
+                } else {
+                    resolved
+                };
+                store.get_merged_symbol(target).ok_or_else(invalid)?
+            };
+            if resolved != read.resolved_symbol || value != read.value_symbol
+                || completed.callee_symbol.as_ref().and_then(|links| links.resolved_symbol)
+                    .is_some_and(|cached| cached != resolved)
+            {
+                return Err(invalid().into());
+            }
+        } else if completed.callee_symbol.is_none() {
+            return Err(invalid().into());
+        }
+        let class_method = matches!(
+            &completed.plan.callee.unparenthesized().kind,
+            PlannedExpressionKind::Property(property)
+                if property.class_access_context().is_some()
+                    && completed.callee_symbol.as_ref().and_then(|links| links.resolved_symbol).is_some_and(|member| {
+                        store.symbol(member).is_some_and(|symbol| {
+                            symbol.flags().contains(SymbolFlags::METHOD)
+                        }) && class_member_source(store, host, member)
+                            .is_ok_and(|source| source.origin == ClassMemberOrigin::Method)
+                    })
+        );
+        let projection = if class_method {
+            let target = source_class_method_effect_target(
+                store,
+                host,
+                &completed.plan,
+                completed.callee_type,
+                &completed.access,
+            )
+            .map_err(|_| invalid())?;
+            let call_signatures = target.overloads().map_or_else(
+                || vec![target.callable().clone()],
+                |overloads| overloads.signatures.clone(),
+            );
+            for callable in &call_signatures {
+                for edge in callable
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(callable.rest_parameter)
+                    .chain(callable.return_type)
+                {
+                    store
+                        .validate_cached_array_capability_with_pending_functions(
+                            Some(completed.arrays),
+                            edge,
+                            &[],
+                        )
+                        .map_err(|_| invalid())?;
+                }
+            }
+            CallableSetProjection {
+                owner: completed.callee_type,
+                call_signatures: call_signatures.into_boxed_slice(),
+                construct_signatures: Box::new([]),
+            }
+        } else {
+            match validate_stored_callable_set_with_array_targets(
+                store,
+                completed.callee_type,
+                Some(completed.arrays),
+            ) {
+                StoredCallableSetValidation::Valid { projection, .. } => projection,
+                StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
+                StoredCallableSetValidation::NotCallable
+                | StoredCallableSetValidation::Pending { .. } => return Err(unsupported()),
+            }
+        };
+        if projection.owner != completed.callee_type
+            || !projection.construct_signatures.is_empty()
+            || !projection.call_signatures.iter().any(|callable| {
+                callable.signature == completed.signature
+                    && callable.return_type == Some(completed.return_type)
+            })
+        {
+            return Err(invalid().into());
+        }
+        // A missing predicate cache alone is not a proof of an ordinary call.
+        // Each visible signature must retain an explicit non-predicate return.
+        for callable in &projection.call_signatures {
+            let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+            let declaration = signature.declaration().ok_or_else(unsupported)?;
+            let node = class_flow_source_node(store, host, declaration).map_err(|_| invalid())?;
+            let annotation = match &node.data {
+                NodeData::FunctionDeclaration(function) => function.type_,
+                NodeData::MethodDeclaration(method) => method.type_,
+                NodeData::MethodSignatureDeclaration(method) => method.type_,
+                NodeData::FunctionTypeNode(function) => function.type_,
+                NodeData::CallSignatureDeclaration(signature) => signature.type_,
+                _ => return Err(unsupported()),
+            }
+            .ok_or_else(unsupported)?;
+            let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+            let annotation =
+                class_flow_source_node(store, host, annotation).map_err(|_| invalid())?;
+            let return_type = signature.resolved_return_type().ok_or_else(unsupported)?;
+            let returned = store.type_payload(return_type).ok_or_else(invalid)?;
+            if annotation.parent != Some(declaration.node)
+                || store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    != Some(callable.signature)
+                || callable.return_type != Some(return_type)
+            {
+                return Err(invalid().into());
+            }
+            if annotation.kind == SyntaxKind::TypePredicate
+                || signature.resolved_type_predicate().is_some()
+                || returned.flags().intersects(TypeFlags::NEVER)
+                || !signature.type_parameters().is_empty()
+                || signature.target().is_some()
+                || signature.mapper().is_some()
+                || signature.composite().is_some()
+            {
+                return Err(unsupported());
+            }
+            store
+                .validate_union_constituent_with_array_targets(completed.arrays, return_type)
+                .map_err(|_| invalid())?;
+        }
+        Ok(())
     }
 
     /// A deferred capture keeps narrowing only after its last enclosing write.
@@ -2745,6 +5834,70 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         node: NodeRef,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         self.flow.snapshot_at(store, globals, node)
+    }
+
+    pub(super) fn snapshot_at_with_source(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        caller: SourceFlowCaller<'_, '_>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        for completed in self.flow.reference_conditions.values() {
+            completed.validate(store, host, self.flow.bound, self.body)?;
+        }
+        // Source proofs belong to this call, not to an earlier snapshot query.
+        let saved_memo = std::mem::take(&mut self.flow.memo);
+        let result = self.flow.snapshot_at_worker(store, globals, node, &mut Some(caller));
+        self.flow.memo = saved_memo;
+        result
+    }
+
+    pub(super) fn set_declared_entry_types(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        declared: &SourceFlowTypes,
+    ) -> Result<(), SourceFlowError> {
+        let mut entries = SourceFlowTypes::new();
+        for &symbol in self.flow.base.types().keys() {
+            let type_ = declared.get(&symbol).copied()
+                .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+            if store.symbol(symbol).is_none() || store.type_payload(type_).is_none() {
+                return Err(SourceFlowInvariant::MissingCurrentType(symbol).into());
+            }
+            entries.insert(symbol, type_);
+        }
+        self.flow.declared_types = entries;
+        self.flow.memo.clear();
+        Ok(())
+    }
+
+    pub(super) fn complete_declaration(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+        current_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        class_body_identities(store, host, &self.access)
+            .map_err(|_| SourceFlowInvariant::InvalidClassBody(self.body.declaration))?;
+        if self.flow.bound.symbol(declaration) != Some(symbol)
+            || !matches!(host.node(declaration).map(|node| &node.data), Some(NodeData::VariableDeclaration(_)))
+            || store.type_payload(declared_type).is_none()
+            || store.type_payload(current_type).is_none()
+        {
+            return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+        }
+        if self.flow.declared_types.contains_key(&symbol) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into());
+        }
+        self.flow.complete_assignment(declaration, symbol, current_type)?;
+        self.flow.declared_types.insert(symbol, declared_type);
+        self.flow.memo.clear();
+        Ok(())
     }
 
     pub(super) fn complete_assignment(
@@ -2842,10 +5995,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         if target.access_token() != &self.access
             || store.type_payload(assignment.assigned_type()).is_none()
             || store.type_payload(assignment.flow_type()).is_none()
-            || store
-                .type_node_links(plan.node())
-                .and_then(|links| links.resolved_type)
-                != Some(assignment.assigned_type())
+            || !assignment.source_is_exact(store, host, false)
             || class_member_source(store, host, plan.member()).map_err(|_| invalid())?
                 != *target.member_source()
         {
@@ -2954,6 +6104,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Keep the caller-free entry for existing private source checks.
     pub(super) fn property_read(
         &mut self,
         store: &mut CanonicalTypeMapperStore,
@@ -2963,6 +6114,79 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         member: &ClassMemberSource,
         declared_type: TypeId,
         options: CanonicalCheckerOptions,
+    ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
+        self.property_read_worker(
+            store,
+            host,
+            context,
+            access,
+            member,
+            declared_type,
+            options,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn property_read_with_session(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: Option<&CanonicalGlobalTypes>,
+        context: &ClassAccessContext,
+        access: NodeRef,
+        member: &ClassMemberSource,
+        declared_type: TypeId,
+        options: CanonicalCheckerOptions,
+        session: &mut InstantiationSession,
+    ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
+        self.property_read_worker(
+            store,
+            host,
+            context,
+            access,
+            member,
+            declared_type,
+            options,
+            globals,
+            Some(session),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn property_read_with_source(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: Option<&CanonicalGlobalTypes>,
+        context: &ClassAccessContext,
+        access: NodeRef,
+        member: &ClassMemberSource,
+        declared_type: TypeId,
+        options: CanonicalCheckerOptions,
+        session: &mut InstantiationSession,
+        source_context: SourceFlowContext<'_, '_>,
+    ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
+        self.property_read_worker(
+            store, host, context, access, member, declared_type, options,
+            globals, Some(session), Some(source_context),
+        )
+    }
+
+    fn property_read_worker(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        context: &ClassAccessContext,
+        access: NodeRef,
+        member: &ClassMemberSource,
+        declared_type: TypeId,
+        options: CanonicalCheckerOptions,
+        globals: Option<&CanonicalGlobalTypes>,
+        session: Option<&mut InstantiationSession>,
+        source_context: Option<SourceFlowContext<'_, '_>>,
     ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
         let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
         class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
@@ -3038,7 +6262,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 _ => false,
             };
         let state = self.property_state_at(
-            store,
+            &mut ClassPropertyFlowTypes::with_source(store, globals, session, source_context),
             host,
             flow,
             &ClassPropertyFlowQuery {
@@ -3109,7 +6333,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             name: name.clone(),
         };
         self.property_state_at(
-            store,
+            &mut ClassPropertyFlowTypes::Initialization(store),
             host,
             flow,
             &ClassPropertyFlowQuery {
@@ -3128,7 +6352,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
 
     fn property_state_at(
         &self,
-        store: &CanonicalTypeMapperStore,
+        types: &mut ClassPropertyFlowTypes<'_, '_>,
         host: &DeclaredTypeHost<'_>,
         flow: FlowRef,
         query: &ClassPropertyFlowQuery<'_>,
@@ -3172,11 +6396,8 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                                 .initial
                                 .type_
                                 .is_some_and(|declared| declared != checked.target().read_type())
-                            || store
-                                .type_node_links(assignment.expression)
-                                .and_then(|links| links.resolved_type)
-                                != Some(checked.assigned_type())
-                            || store.type_payload(checked.flow_type()).is_none()
+                            || !checked.source_is_exact(types.store(), host, true)
+                            || types.store().type_payload(checked.flow_type()).is_none()
                         {
                             return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
                         }
@@ -3185,7 +6406,8 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                             initialized: true,
                         })
                     } else {
-                        if store
+                        if types
+                            .store()
                             .type_node_links(assignment.expression)
                             .and_then(|links| links.resolved_type)
                             .is_none()
@@ -3199,7 +6421,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     }
                 } else {
                     self.property_state_at(
-                        store,
+                        types,
                         host,
                         linear_antecedent(flow, &node)?,
                         query,
@@ -3210,16 +6432,26 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             }
             SourceFlowKind::Call => {
                 let call = ast_payload(flow, &node)?;
-                if let Some(NodeData::CallExpression(data)) = host.node(call).map(|node| &node.data)
-                    && host
-                        .node(NodeRef::new(call.arena, call.file, data.expression))
-                        .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword)
-                    && !self.completed_calls.contains(&call)
+                let is_super = if let Some(NodeData::CallExpression(data)) =
+                    host.node(call).map(|node| &node.data)
                 {
+                    host.node(NodeRef::new(call.arena, call.file, data.expression))
+                        .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword)
+                } else {
+                    return Err(SourceFlowInvariant::InvalidCall(call).into());
+                };
+                if is_super && !self.completed_calls.contains(&call) {
                     return Err(SourceFlowInvariant::InvalidCall(call).into());
                 }
+                if !is_super && self.has_property_conditions() {
+                    let completed = self
+                        .ordinary_calls
+                        .get(&call)
+                        .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?;
+                    self.validate_non_effecting_call(types.store(), host, completed)?;
+                }
                 self.property_state_at(
-                    store,
+                    types,
                     host,
                     linear_antecedent(flow, &node)?,
                     query,
@@ -3227,19 +6459,23 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     depth + 1,
                 )
             }
-            SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+            kind @ (SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel) => {
                 let mut result: Option<ClassPropertyFlowState> = None;
+                let mut branch_types = Vec::new();
+                let can_join =
+                    self.has_property_conditions() && kind == SourceFlowKind::BranchLabel;
                 for antecedent in label_antecedents(flow, &node)? {
                     let state = self.property_state_at(
-                        store,
+                        types,
                         host,
                         *antecedent,
                         query,
                         visiting,
                         depth + 1,
                     )?;
+                    branch_types.extend(state.type_);
                     if let Some(prior) = &mut result {
-                        if prior.type_ != state.type_ {
+                        if prior.type_ != state.type_ && !can_join {
                             return Err(SourceFlowUnsupported::FlowKind {
                                 flow,
                                 flags: node.flags,
@@ -3251,31 +6487,180 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                         result = Some(state);
                     }
                 }
+                if can_join
+                    && let Some(state) = &mut result
+                    && let Some(declared) = query.initial.type_
+                {
+                    state.type_ = Some(types.join(flow, node.flags, &branch_types, declared)?);
+                }
                 Ok(result.unwrap_or(ClassPropertyFlowState {
                     initialized: true,
                     ..query.initial
                 }))
             }
-            SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
-                let condition = ast_payload(flow, &node)?;
+            kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
+                let expression = ast_payload(flow, &node)?;
+                let condition = self
+                    .flow
+                    .plan
+                    .conditions
+                    .get(&expression)
+                    .ok_or(SourceFlowInvariant::UnknownCondition(expression))?;
                 if !matches!(
-                    self.flow.plan.conditions.get(&condition),
-                    Some(SourceFlowCondition::Truthiness(_))
-                ) {
+                    condition,
+                    SourceFlowCondition::Truthiness(_)
+                        | SourceFlowCondition::Reference(_)
+                        | SourceFlowCondition::ClassPropertyTruthiness(_)
+                        | SourceFlowCondition::ClassPropertyEquality(_)
+                        | SourceFlowCondition::ClassPropertyPredicate(_)
+                ) && !self
+                    .flow
+                    .plan
+                    .class_expression_conditions
+                    .get(&expression)
+                    .is_some_and(|proof| {
+                        matches!(proof.source.kind, SourceClassExpressionConditionKind::Nullish(_))
+                            || proof.source.kind == SourceClassExpressionConditionKind::Call
+                                && self.flow.completed_expression_calls.contains(&expression)
+                    })
+                {
                     return Err(SourceFlowUnsupported::FlowKind {
                         flow,
                         flags: node.flags,
                     }
                     .into());
                 }
-                self.property_state_at(
-                    store,
+                if self.is_expression_condition_call(expression) {
+                    let completed = self
+                        .ordinary_calls
+                        .get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    self.validate_non_effecting_call(types.store(), host, completed)?;
+                }
+                let mut state = self.property_state_at(
+                    types,
                     host,
                     linear_antecedent(flow, &node)?,
                     query,
                     visiting,
                     depth + 1,
-                )
+                )?;
+                if matches!(condition, SourceFlowCondition::Reference(_)) {
+                    let completed = self.flow.reference_conditions.get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    completed.validate(types.store(), host, self.flow.bound, self.body)?;
+                    if let Some(current) = state.type_ {
+                        state.type_ = Some(completed.narrow(
+                            types,
+                            flow,
+                            node.flags,
+                            &references::ReferenceKey::class_property(query.reference),
+                            query.initial.type_,
+                            current,
+                            kind == SourceFlowKind::TrueCondition,
+                        )?);
+                    }
+                }
+                if !matches!(condition, SourceFlowCondition::ClassPropertyPredicate(_))
+                    && let Some(access) = condition.class_property_access()
+                {
+                    let completed = self
+                        .property_conditions
+                        .get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    self.validate_property_condition(types.store(), host, completed)?;
+                    let edge = usize::from(kind == SourceFlowKind::FalseCondition);
+                    if completed.edges[edge] != flow {
+                        return Err(
+                            SourceFlowInvariant::InvalidClassProperty(access).into()
+                        );
+                    }
+                    let reference = ClassPropertyFlowReference {
+                        receiver: ClassPropertyFlowReceiver::This(
+                            completed.source.context.class_declaration(),
+                        ),
+                        name: completed.source.name().to_owned(),
+                    };
+                    if query.reference == &reference
+                        && query.member == &completed.member
+                        && let Some(current) = state.type_
+                    {
+                        if current != completed.type_ {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(access).into());
+                        }
+                        state.type_ = Some(match condition {
+                            SourceFlowCondition::ClassPropertyTruthiness(condition) => {
+                                let truthy =
+                                    (kind == SourceFlowKind::TrueCondition) != condition.negated;
+                                types.narrow(
+                                    flow,
+                                    node.flags,
+                                    expression,
+                                    current,
+                                    if truthy {
+                                        TruthinessAssumption::Truthy
+                                    } else {
+                                        TruthinessAssumption::Falsy
+                                    },
+                                )?
+                            }
+                            SourceFlowCondition::ClassPropertyEquality(condition) => {
+                                let value = types
+                                    .store()
+                                    .type_node_links(condition.value)
+                                    .and_then(|links| links.resolved_type)
+                                    .ok_or(SourceFlowInvariant::InvalidClassProperty(access))?;
+                                types.narrow_equality(
+                                    flow,
+                                    node.flags,
+                                    current,
+                                    value,
+                                    (kind == SourceFlowKind::TrueCondition)
+                                        == matches!(
+                                            condition.comparison,
+                                            SourceTypeofComparison::Equal
+                                        ),
+                                )?
+                            }
+                            _ => unreachable!("the condition has a class property access"),
+                        });
+                    }
+                }
+                if let SourceFlowCondition::ClassPropertyPredicate(condition) = condition {
+                    let completed = self
+                        .predicate_conditions
+                        .get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    self.validate_predicate_condition(types.store(), host, completed)?;
+                    let edge = usize::from(kind == SourceFlowKind::FalseCondition);
+                    if completed.edges[edge] != flow {
+                        return Err(SourceFlowInvariant::InvalidCallEffect(condition.call).into());
+                    }
+                    let reference = ClassPropertyFlowReference {
+                        receiver: ClassPropertyFlowReceiver::This(
+                            completed.source.context.class_declaration(),
+                        ),
+                        name: completed.source.name().to_owned(),
+                    };
+                    if query.reference == &reference
+                        && query.member == &completed.member
+                        && let Some(current) = state.type_
+                    {
+                        if current != completed.argument_type {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(condition.access)
+                                .into());
+                        }
+                        state.type_ = Some(types.narrow_predicate(
+                            flow,
+                            node.flags,
+                            condition.call,
+                            current,
+                            completed.predicate_type,
+                            (kind == SourceFlowKind::TrueCondition) != condition.negated,
+                        )?);
+                    }
+                }
+                Ok(state)
             }
         };
         visiting.remove(&flow);
@@ -3320,6 +6705,435 @@ fn class_type_has_uninitialized_value(
 }
 
 impl SourceFlowFrame<'_, '_> {
+    pub(super) fn contains_call(&self, call: NodeRef) -> bool {
+        self.plan.contains_call(call)
+    }
+
+    pub(super) fn enter_catch_binding(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        binding: &SourceCallableCatchBindingSyntax,
+        declared_type: TypeId,
+    ) -> Result<SourceCatchFlowScope, SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(binding.declaration);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        if !syntax.catch_bindings().contains(&binding)
+            || self.bound.symbol(binding.declaration) != Some(binding.symbol)
+            || self.bound.container(binding.declaration) != Some(self.plan.container)
+            || self.bound.block_scope_container(binding.declaration) != Some(binding.clause)
+            || !self.plan.points.contains_key(&binding.clause)
+            || !self.plan.points.contains_key(&binding.name)
+            || (self.plan.assignments.contains_key(&binding.declaration)
+                != binding.initializer.is_some())
+            || store.type_payload(declared_type).is_none()
+            || self.base.type_of(binding.symbol).is_some()
+            || self.declared_types.contains_key(&binding.symbol)
+        {
+            return Err(invalid().into());
+        }
+        let scope = SourceCatchFlowScope {
+            symbol: binding.symbol,
+            base: self.base.type_of(binding.symbol),
+            declared: self.declared_types.insert(binding.symbol, declared_type),
+        };
+        self.base = self.base.with_type(binding.symbol, declared_type);
+        self.memo.clear();
+        Ok(scope)
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Consume the token to prevent a second restore.
+    pub(super) fn restore_catch_binding(&mut self, scope: SourceCatchFlowScope) {
+        let types = Arc::make_mut(&mut self.base.types);
+        match scope.base {
+            Some(type_) => {
+                types.insert(scope.symbol, type_);
+            }
+            None => {
+                types.remove(&scope.symbol);
+            }
+        }
+        match scope.declared {
+            Some(type_) => {
+                self.declared_types.insert(scope.symbol, type_);
+            }
+            None => {
+                self.declared_types.remove(&scope.symbol);
+            }
+        }
+        self.memo.clear();
+    }
+
+    fn catch_symbol_is_inactive(&self, symbol: SemanticSymbolId) -> bool {
+        !self.declared_types.contains_key(&symbol)
+            && self.plan.statement_list.as_ref().is_some_and(|syntax| {
+                syntax
+                    .catch_bindings()
+                    .iter()
+                    .any(|binding| binding.symbol == symbol)
+            })
+    }
+
+    fn uses_callable_loop_queries(&self) -> bool {
+        self.plan
+            .statement_list
+            .as_ref()
+            .is_some_and(|syntax| syntax.contains_for_of() || syntax.contains_counted_for())
+    }
+
+    fn callable_for_of_symbol_is_visible(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        point: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, SourceFlowError> {
+        let record = store
+            .symbol(symbol)
+            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+        let Some(declaration) = record.value_declaration() else {
+            return Ok(true);
+        };
+        if !record.flags().intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+            || self.bound.container(declaration) != Some(self.plan.container)
+        {
+            return Ok(true);
+        }
+        let expected = self
+            .bound
+            .block_scope_container(declaration)
+            .ok_or(SourceFlowInvariant::InvalidParameterAssignment(declaration))?;
+        let mut scope = self.bound.block_scope_container(point);
+        let mut seen = HashSet::new();
+        while let Some(current) = scope {
+            if current == expected {
+                return Ok(true);
+            }
+            if current == self.plan.container {
+                return Ok(false);
+            }
+            if !seen.insert(current) {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into());
+            }
+            scope = self.bound.block_scope_container(current);
+        }
+        Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into())
+    }
+
+    /// Query existing visible entries separately so unrelated pending loop locals are not demands.
+    fn snapshot_callable_for_of_at(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        point: NodeRef,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let mut symbols = self.base.types().keys().copied().collect::<Vec<_>>();
+        for (declaration, state) in &self.assignment_states {
+            if matches!(state, SourceFlowAssignmentState::Resolved(_)) {
+                symbols.push(
+                    self.plan
+                        .assignments
+                        .get(declaration)
+                        .ok_or(SourceFlowInvariant::UnknownAssignment(*declaration))?
+                        .symbol,
+                );
+            }
+        }
+        symbols.sort_unstable();
+        symbols.dedup();
+        let mut visible = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            if self.callable_for_of_symbol_is_visible(store, point, symbol)? {
+                visible.push(symbol);
+            }
+        }
+        let flow = *self.plan.points.get(&point)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(point))?;
+        let snapshot = self.snapshot_for_symbols_with_caller(
+            store, globals, flow, visible.iter().copied(), caller,
+        )?;
+        let types = snapshot
+            .types()
+            .iter()
+            .filter(|(symbol, _)| visible.binary_search(symbol).is_ok())
+            .map(|(&symbol, &type_)| (symbol, type_))
+            .collect();
+        Ok(SourceFlowSnapshot {
+            types: Arc::new(types),
+            ..snapshot
+        })
+    }
+
+    /// Keeps a local's declared type and initial flow type without an assignment node.
+    pub(super) fn enter_uninitialized_local(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+        initial_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(declaration);
+        let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+        let (name, _) = annotated_uninitialized_local(
+            arena,
+            self.bound,
+            store,
+            self.plan.container,
+            declaration,
+            symbol,
+        )?;
+        if self.plan.region.is_some()
+            || self.plan.class_body.is_some()
+            || !self.plan.points.contains_key(&name)
+            || self.plan.assignments.contains_key(&declaration)
+            || store.type_payload(declared_type).is_none()
+            || store.type_payload(initial_type).is_none()
+            || self.declared_types.contains_key(&symbol)
+            || self.base.type_of(symbol).is_some()
+        {
+            return Err(invalid().into());
+        }
+        self.declared_types.insert(symbol, declared_type);
+        self.base = self.base.with_type(symbol, initial_type);
+        self.memo.clear();
+        Ok(())
+    }
+
+    pub(super) fn set_source_declared_entry_types(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        types: &SourceFlowTypes,
+    ) -> Result<(), SourceFlowError> {
+        if self.plan.region.is_none() {
+            return Err(SourceFlowInvariant::InvalidSourceRegion(self.plan.container).into());
+        }
+        for (&symbol, &type_) in types {
+            if self.base.type_of(symbol).is_some() {
+                if store.symbol(symbol).is_none() || store.type_payload(type_).is_none() {
+                    return Err(SourceFlowInvariant::MissingCurrentType(symbol).into());
+                }
+                self.declared_types.insert(symbol, type_);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete_condition_value(
+        &mut self,
+        node: NodeRef,
+        type_: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        if !self.plan.conditions.values().any(|condition| {
+            matches!(condition, SourceFlowCondition::Equality(condition) if condition.value == node)
+        }) || self.condition_values.insert(node, type_).is_some() {
+            return Err(SourceFlowInvariant::UnknownCondition(node).into());
+        }
+        if self.uses_callable_loop_queries() {
+            self.memo.clear();
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keep the binder proof and the source caller together.
+    pub(super) fn complete_in_condition(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+        condition: SourceInCondition,
+        input: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::UnknownCondition(condition.expression);
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let instanceof = match self.plan.conditions.get(&condition.expression) {
+            Some(SourceFlowCondition::In(actual)) if *actual == condition => false,
+            Some(SourceFlowCondition::InstanceOf(actual)) if *actual == condition => true,
+            _ => return Err(invalid().into()),
+        };
+        if self.in_conditions.contains_key(&condition.expression)
+            || store.type_node_links(condition.expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.boolean_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store
+                .type_node_links(condition.receiver)
+                .and_then(|links| links.resolved_type)
+                != Some(input)
+            || own_class_flow_reference_symbol(store, host, self.bound, condition.receiver)?
+                != Some(condition.symbol)
+        {
+            return Err(invalid().into());
+        }
+        let key = store
+            .type_node_links(condition.key)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        let [when_true, when_false] = if instanceof {
+            narrow_source_instanceof_type(
+                store, host, globals, session, condition.expression, input, key,
+            )?
+        } else {
+            narrow_source_in_type(store, globals, session, condition.expression, input, key)?
+        };
+        self.in_conditions.insert(
+            condition.expression,
+            CompletedInCondition {
+                input,
+                key,
+                when_true,
+                when_false,
+            },
+        );
+        self.memo.clear();
+        Ok(())
+    }
+
+    pub(super) fn complete_source_declaration(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+        current_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        if self.plan.region.is_none()
+            || self.bound.symbol(declaration) != Some(symbol)
+            || self.bound.container(declaration) != Some(self.plan.container)
+        {
+            return Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into());
+        }
+        let record = host
+            .node(declaration)
+            .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+        };
+        if self.declared_types.insert(symbol, declared_type).is_some() {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into());
+        }
+        if self.plan.assignments.contains_key(&declaration) {
+            self.complete_assignment(declaration, symbol, current_type)?;
+        } else if variable.initializer.is_none() {
+            self.base = self.base.with_type(symbol, current_type);
+        } else {
+            let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+            if self.plan.points.get(&name).copied() != Some(self.graph.nodes().unreachable()) {
+                return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+            }
+        }
+        self.memo.clear();
+        Ok(())
+    }
+
+    /// Queries only the requested references. Unrelated pending writes are not demands.
+    pub(super) fn snapshot_for_symbols_at(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let flow = *self
+            .plan
+            .points
+            .get(&node)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(node))?;
+        self.snapshot_for_symbols(store, globals, flow, symbols)
+    }
+
+    pub(super) fn snapshot_for_symbols_at_end(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let flow = self
+            .plan
+            .end
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(self.plan.container))?;
+        self.snapshot_for_symbols(store, globals, flow, symbols)
+    }
+
+    fn snapshot_for_symbols(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.snapshot_for_symbols_with_caller(store, globals, flow, symbols, &mut None)
+    }
+
+    fn snapshot_for_symbols_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let mut result = self.base.clone();
+        for symbol in symbols {
+            let previous = self.reference.replace(symbol);
+            let snapshot = self.resolve_flow_with_caller(store, globals, flow, 0, caller);
+            self.reference = previous;
+            let snapshot = snapshot?;
+            if snapshot.incomplete {
+                return Err(SourceFlowInvariant::Cycle(flow).into());
+            }
+            let type_ = (if snapshot.reachable {
+                snapshot.type_of(symbol)
+            } else {
+                self.declared_types
+                    .get(&symbol)
+                    .copied()
+                    .or_else(|| snapshot.type_of(symbol))
+            })
+            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+            result = result.with_type(
+                symbol,
+                Self::finalize_flow_type(store, globals, flow, type_)?,
+            );
+            result.reachable &= snapshot.reachable;
+        }
+        Ok(result)
+    }
+
+    /// Effects signatures are resolved without publishing a provisional argument type.
+    pub(super) fn complete_call_effect(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        call: NodeRef,
+        effect: SourceFlowCallEffect,
+    ) -> Result<(), SourceFlowError> {
+        if !self.plan.calls.contains_key(&call) || self.call_effects.contains_key(&call) {
+            return Err(SourceFlowInvariant::InvalidCallEffect(call).into());
+        }
+        validate_source_call_effect(store, host, self.bound, call, effect)?;
+        self.call_effects.insert(call, effect);
+        if self.plan.nullish_calls.contains_key(&call) {
+            self.memo.clear();
+        }
+        Ok(())
+    }
+
+    fn query_base(&self) -> SourceFlowSnapshot {
+        match self.reference {
+            Some(symbol) => SourceFlowSnapshot::new(
+                self.base
+                    .type_of(symbol)
+                    .map(|type_| (symbol, type_))
+                    .into_iter()
+                    .collect(),
+            ),
+            None => self.base.clone(),
+        }
+    }
+
     /// Returns the immutable current-type map at one cold-preflighted AST
     /// point, memoizing completed flow nodes for the rest of this invocation.
     pub(super) fn snapshot_at(
@@ -3328,13 +7142,26 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         node: NodeRef,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.snapshot_at_worker(store, globals, node, &mut None)
+    }
+
+    fn snapshot_at_worker(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        if self.uses_callable_loop_queries() {
+            return self.snapshot_callable_for_of_at(store, globals, node, caller);
+        }
         let flow = self
             .plan
             .points
             .get(&node)
             .copied()
             .ok_or(SourceFlowInvariant::MissingFlowPoint(node))?;
-        let snapshot = self.resolve_flow(store, globals, flow, 0)?;
+        let snapshot = self.resolve_flow_with_caller(store, globals, flow, 0, caller)?;
         let mut finalized = None;
         for (&symbol, &type_) in snapshot.types() {
             let value = Self::finalize_flow_type(store, globals, flow, type_)?;
@@ -3425,12 +7252,129 @@ impl SourceFlowFrame<'_, '_> {
         match state {
             SourceFlowAssignmentState::Pending => {
                 *state = SourceFlowAssignmentState::Resolved(current_type);
+                if self.plan.nullish_assignments.contains_key(&declaration) {
+                    self.memo.clear();
+                }
+                if self.uses_callable_loop_queries() {
+                    self.memo.clear();
+                }
                 Ok(())
             }
-            SourceFlowAssignmentState::Resolved(_) => {
+            SourceFlowAssignmentState::Resolved(_)
+            | SourceFlowAssignmentState::Update
+            | SourceFlowAssignmentState::ReadonlyUpdate => {
                 Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into())
             }
         }
+    }
+
+    /// Updates use the retained antecedent type. Completion proves that the header was checked.
+    pub(super) fn complete_callable_update(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        expression: NodeRef,
+        update: SourceFlowUpdate,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        let (arena, _) = host.source(self.plan.container).ok_or_else(invalid)?;
+        if validate_callable_update(arena, self.bound, store, host, syntax, update)? != expression
+            || self.plan.updates.get(&update.target) != Some(&update)
+            || self.plan.assignment_declarations.get(&update.target) != Some(&update.declaration)
+            || !matches!(
+                self.assignment_states.get(&update.target),
+                Some(SourceFlowAssignmentState::Update)
+            )
+            || [expression, update.target].into_iter().any(|node| {
+                store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            })
+        {
+            return Err(invalid().into());
+        }
+        if !self.completed_callable_updates.insert(update.target) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(update.target).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_callable_updates(&self) -> Result<(), SourceFlowError> {
+        for target in self.plan.updates.keys() {
+            if !self.completed_callable_updates.contains(target) {
+                return Err(SourceFlowInvariant::InvalidUpdate(*target).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Compound writes widen the real antecedent, not the checked result type.
+    pub(super) fn complete_compound_assignment(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        assignment: SourceFlowParameterAssignment,
+        expression: NodeRef,
+        operator: SyntaxKind,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        let (arena, _) = host.source(self.plan.container).ok_or_else(invalid)?;
+        if !expression.is_for(arena.id(), self.bound.file_id()) || !self.bound.contains(expression)
+        {
+            return Err(invalid().into());
+        }
+        validate_statement_list_source(arena, self.bound, store, host, syntax)?;
+        validate_parameter_assignment_in_list(
+            arena,
+            self.bound,
+            store,
+            Some(host),
+            self.plan.container,
+            assignment,
+            Some(syntax),
+        )?;
+        let planned = self
+            .plan
+            .assignments
+            .get(&assignment.target)
+            .ok_or_else(invalid)?;
+        let record = host.node(expression).ok_or_else(invalid)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(invalid().into());
+        };
+        let right = NodeRef::new(expression.arena, expression.file, binary.right);
+        if planned.declaration != assignment.target
+            || planned.symbol != assignment.symbol
+            || self.plan.assignment_declarations.get(&assignment.target)
+                != Some(&assignment.parameter)
+            || host.node(assignment.target).and_then(|node| node.parent) != Some(expression.node)
+            || arena.get(binary.operator_token).map(|node| node.kind) != Some(operator)
+            || super::primitive_operators::compound_assignment_binary_operator(operator).is_none()
+            || host.node(right).and_then(|node| node.parent) != Some(expression.node)
+            || [assignment.target, right, expression]
+                .into_iter()
+                .any(|node| {
+                    store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                })
+        {
+            return Err(invalid().into());
+        }
+        let state = self
+            .assignment_states
+            .get_mut(&assignment.target)
+            .ok_or_else(invalid)?;
+        if !matches!(state, SourceFlowAssignmentState::Pending) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(assignment.target).into());
+        }
+        *state = SourceFlowAssignmentState::Update;
+        self.memo.clear();
+        Ok(())
     }
 
     fn resolve_flow(
@@ -3440,25 +7384,47 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
-        if let Some(snapshot) = self.loop_snapshots.get(&flow) {
-            return Ok(snapshot.clone());
+        self.resolve_flow_with_caller(store, globals, flow, depth, &mut None)
+    }
+
+    fn resolve_flow_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let key = (flow, self.reference);
+        if self.plan.region.is_some_and(|region| region.entry == flow) {
+            let mut snapshot = self.query_base();
+            if flow == self.graph.nodes().unreachable() {
+                snapshot.reachable = false;
+            }
+            return Ok(snapshot);
         }
-        if let Some(snapshot) = self.memo.get(&flow) {
+        if let Some(snapshot) = self.loop_snapshots.get(&key) {
+            let mut snapshot = snapshot.clone();
+            snapshot.incomplete = true;
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = self.memo.get(&key) {
             return Ok(snapshot.clone());
         }
         if depth > FLOW_DEPTH_LIMIT {
             return Err(SourceFlowInvariant::DepthLimit(flow).into());
         }
-        if !self.visiting.insert(flow) {
+        if !self.visiting.insert(key) {
             return Err(SourceFlowInvariant::Cycle(flow).into());
         }
-        let result = self.resolve_flow_uncached(store, globals, flow, depth);
-        let removed = self.visiting.remove(&flow);
+        let result = self.resolve_flow_uncached(store, globals, flow, depth, caller);
+        let removed = self.visiting.remove(&key);
         debug_assert!(removed);
         if let Ok(snapshot) = &result
             && self.loop_snapshots.is_empty()
+            && !snapshot.incomplete
         {
-            self.memo.insert(flow, snapshot.clone());
+            self.memo.insert(key, snapshot.clone());
         }
         result
     }
@@ -3469,31 +7435,122 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         flow: FlowRef,
         depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let node = flow_node(self.graph, flow)?;
         match source_flow_kind(flow, node.flags)? {
             SourceFlowKind::Unreachable => {
                 validate_unreachable_node(self.graph, flow, &node)?;
-                Ok(self.base.clone())
+                if self.plan.region.is_none() {
+                    return Ok(self.base.clone());
+                }
+                let mut snapshot = match self.reference {
+                    Some(symbol) => SourceFlowSnapshot::new(
+                        self.declared_types
+                            .get(&symbol)
+                            .copied()
+                            .map(|type_| (symbol, type_))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    None => self.base.clone(),
+                };
+                snapshot.reachable = false;
+                Ok(snapshot)
             }
             SourceFlowKind::Start => {
                 validate_start_node(self.plan, flow, &node)?;
-                Ok(self.base.clone())
+                Ok(self.query_base())
             }
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if let Some(proof) = self.plan.member_assignments.get(&declaration).copied() {
+                    let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                    if !prior.reachable
+                        || self.reference.is_some_and(|symbol| symbol != proof.receiver_symbol)
+                    {
+                        return Ok(prior);
+                    }
+                    let declared = self
+                        .declared_types
+                        .get(&proof.receiver_symbol)
+                        .copied()
+                        .ok_or(SourceFlowInvariant::MissingCurrentType(proof.receiver_symbol))?;
+                    return Ok(prior.with_type(proof.receiver_symbol, declared));
+                }
+                if let Some(proof) = self.plan.nullish_assignments.get(&declaration).copied()
+                    && proof.assignment.symbol.is_none()
+                {
+                    let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                    if proof.assignment.readonly || !prior.reachable {
+                        return Ok(prior);
+                    }
+                    let Some(receiver) = proof.receiver else {
+                        return Ok(prior);
+                    };
+                    if self.reference.is_some_and(|symbol| symbol != receiver) {
+                        return Ok(prior);
+                    }
+                    let declared = self
+                        .declared_types
+                        .get(&receiver)
+                        .copied()
+                        .ok_or(SourceFlowInvariant::MissingCurrentType(receiver))?;
+                    // A real member write invalidates receiver refinements only on its branch.
+                    return Ok(prior.with_type(receiver, declared));
+                }
                 if self.plan.property_assignments.contains_key(&declaration) {
-                    return self.resolve_flow(store, globals, antecedent, depth + 1);
+                    return self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller);
                 }
                 let assignment = *self
                     .plan
                     .assignments
                     .get(&declaration)
                     .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
-                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                if self.uses_callable_loop_queries()
+                    && self.reference == Some(assignment.symbol)
+                    && source_flow_kind(flow, node.flags)? == SourceFlowKind::Assignment
+                    && let Some(SourceFlowAssignmentState::Resolved(current_type)) =
+                        self.assignment_states.get(&declaration)
+                {
+                    // This source path rejects unreachable statements and effect-changing calls.
+                    // A checked simple assignment already has its assignment-reduced current type.
+                    if source_flow_kind(antecedent, flow_node(self.graph, antecedent)?.flags)?
+                        == SourceFlowKind::Unreachable
+                    {
+                        return Err(
+                            SourceFlowInvariant::InvalidParameterAssignment(declaration).into()
+                        );
+                    }
+                    return Ok(self.query_base().with_type(assignment.symbol, *current_type));
+                }
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                if self
+                    .reference
+                    .is_some_and(|symbol| symbol != assignment.symbol)
+                    || !prior.reachable
+                    || self.catch_symbol_is_inactive(assignment.symbol)
+                {
+                    return Ok(prior);
+                }
                 let current_type = match self.assignment_states.get(&declaration) {
                     Some(SourceFlowAssignmentState::Resolved(type_)) => *type_,
+                    Some(SourceFlowAssignmentState::ReadonlyUpdate) => return Ok(prior),
+                    Some(SourceFlowAssignmentState::Update) => {
+                        let current = prior
+                            .type_of(assignment.symbol)
+                            .ok_or(SourceFlowInvariant::MissingCurrentType(assignment.symbol))?;
+                        store
+                            .validate_union_constituent_with_global_types(globals, current)
+                            .map_err(|error| SourceFlowError::Join { flow, error })?;
+                        base_type_of_literal_type(store, Some(globals), current).map_err(
+                            |error| SourceFlowError::Narrowing {
+                                condition: declaration,
+                                error,
+                            },
+                        )?
+                    }
                     Some(SourceFlowAssignmentState::Pending) => {
                         return Err(SourceFlowInvariant::PendingAssignment(declaration).into());
                     }
@@ -3515,7 +7572,62 @@ impl SourceFlowFrame<'_, '_> {
                 validate_planned_call_container(
                     self.bound, self.plan, call, statement, antecedent,
                 )?;
-                self.resolve_flow(store, globals, antecedent, depth + 1)
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                let Some(effect) = self.call_effects.get(&call).copied() else {
+                    return if self.plan.region.is_some()
+                        || self.plan.nullish_calls.contains_key(&call)
+                    {
+                        Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+                    } else {
+                        Ok(prior)
+                    };
+                };
+                if !prior.reachable {
+                    return Ok(prior);
+                }
+                match effect {
+                    SourceFlowCallEffect::Unchanged
+                    | SourceFlowCallEffect::AssertionNoReference { .. } => Ok(prior),
+                    SourceFlowCallEffect::Never(_)
+                    | SourceFlowCallEffect::AssertionFalse { .. } => {
+                        let mut result = prior;
+                        result.reachable = false;
+                        Ok(result)
+                    }
+                    SourceFlowCallEffect::Assertion {
+                        signature, symbol, ..
+                    } => {
+                        if self.reference.is_some_and(|reference| reference != symbol) {
+                            return Ok(prior);
+                        }
+                        let current = prior
+                            .type_of(symbol)
+                            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+                        let predicate = store
+                            .signature(signature)
+                            .and_then(super::signatures::Signature::resolved_type_predicate)
+                            .and_then(|predicate| store.type_predicate(predicate))
+                            .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?;
+                        let narrowed = match predicate.type_id() {
+                            Some(asserted) => narrow_source_assertion_type(
+                                store, globals, flow, call, current, asserted,
+                            )?,
+                            None => narrow_by_truthiness(
+                                store,
+                                Some(globals),
+                                current,
+                                TruthinessAssumption::Truthy,
+                            )
+                            .map_err(|error| {
+                                SourceFlowError::Narrowing {
+                                    condition: call,
+                                    error,
+                                }
+                            })?,
+                        };
+                        Ok(prior.with_type(symbol, narrowed))
+                    }
+                }
             }
             kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
                 let antecedent = linear_antecedent(flow, &node)?;
@@ -3525,13 +7637,41 @@ impl SourceFlowFrame<'_, '_> {
                     .conditions
                     .get(&condition_node)
                     .ok_or(SourceFlowInvariant::UnknownCondition(condition_node))?;
-                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                if self
+                    .plan
+                    .class_expression_conditions
+                    .get(&condition_node)
+                    .is_some_and(|proof| {
+                        proof.source.kind == SourceClassExpressionConditionKind::Call
+                    })
+                    && !self.completed_expression_calls.contains(&condition_node)
+                {
+                    return Err(SourceFlowInvariant::UnreachedCondition(condition_node).into());
+                }
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                if matches!(condition, SourceFlowCondition::Reference(_)) {
+                    let completed = self.reference_conditions.get(&condition_node)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(condition_node))?;
+                    return completed.narrow_snapshot(
+                        store, globals, flow, node.flags, prior, &self.declared_types,
+                        self.reference, kind == SourceFlowKind::TrueCondition, caller,
+                    );
+                }
                 let Some(symbol) = condition.symbol() else {
                     return Ok(prior);
                 };
+                if self.reference.is_some_and(|reference| reference != symbol)
+                    || !prior.reachable
+                    || self.catch_symbol_is_inactive(symbol)
+                {
+                    return Ok(prior);
+                }
                 let current = prior
                     .type_of(symbol)
                     .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+                if store.intrinsic_bootstrap().is_some_and(|bootstrap| current == bootstrap.never_type) {
+                    return Ok(prior);
+                }
                 let assume_true = match kind {
                     SourceFlowKind::TrueCondition => true,
                     SourceFlowKind::FalseCondition => false,
@@ -3544,7 +7684,28 @@ impl SourceFlowFrame<'_, '_> {
                     | SourceFlowKind::LoopLabel => unreachable!(),
                 };
                 let narrowed = match condition {
-                    SourceFlowCondition::Unchanged(_) => unreachable!(),
+                    SourceFlowCondition::ClassExpression(_)
+                    | SourceFlowCondition::Reference(_)
+                    | SourceFlowCondition::Unchanged(_)
+                    | SourceFlowCondition::ClassPropertyTruthiness(_)
+                    | SourceFlowCondition::ClassPropertyEquality(_)
+                    | SourceFlowCondition::ClassPropertyPredicate(_) => unreachable!(),
+                    SourceFlowCondition::Nullish(_) => {
+                        let null = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceFlowInvariant::EqualityNarrowing(
+                                SourceEqualityNarrowingError::MissingBootstrap,
+                            ))?
+                            .null_type;
+                        narrow_by_equality(store, globals, current, null, false, !assume_true, None)
+                            .map_err(|error| match error {
+                                SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
+                                SourceEqualityNarrowingError::Union(error) => {
+                                    SourceFlowError::Join { flow, error }
+                                }
+                                error => SourceFlowInvariant::EqualityNarrowing(error).into(),
+                            })?
+                    }
                     SourceFlowCondition::Truthiness(condition) => narrow_by_truthiness(
                         store,
                         Some(globals),
@@ -3576,9 +7737,15 @@ impl SourceFlowFrame<'_, '_> {
                         }
                     })?,
                     SourceFlowCondition::Equality(condition) => {
-                        let value = store
-                            .type_node_links(condition.value)
-                            .and_then(|links| links.resolved_type)
+                        let value = self
+                            .condition_values
+                            .get(&condition.value)
+                            .copied()
+                            .or_else(|| {
+                                store
+                                    .type_node_links(condition.value)
+                                    .and_then(|links| links.resolved_type)
+                            })
                             .ok_or(SourceFlowError::Invariant(
                                 SourceFlowInvariant::EqualityNarrowing(
                                     SourceEqualityNarrowingError::MissingValue(condition.value),
@@ -3603,17 +7770,33 @@ impl SourceFlowFrame<'_, '_> {
                                     error,
                                 ))
                             })?;
-                        narrow_by_equality(
-                            store,
-                            globals,
-                            current,
-                            value,
-                            condition.strict,
-                            assume_true
-                                == matches!(condition.comparison, SourceTypeofComparison::Equal),
-                            discriminant.as_deref(),
-                        )
+                        let require_match = assume_true
+                            == matches!(condition.comparison, SourceTypeofComparison::Equal);
+                        let narrowed = if let (Some(caller), Some(access), Some(name)) = (
+                            caller.as_mut(), condition.discriminant, discriminant.as_deref(),
+                        ) {
+                            let declared = self.declared_types.get(&symbol).copied()
+                                .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+                            if caller.context.discriminant_property_access(
+                                store, caller.session, access, declared, current, name,
+                            ).map_err(SourceFlowError::Source)? {
+                                caller.context.narrow_discriminant_equality(
+                                    store, caller.session, access, current, name, value, condition.strict, require_match,
+                                )
+                            } else { Ok(current) }
+                        } else {
+                            let (session, context) = match caller.as_mut() {
+                                Some(caller) => (Some(&mut *caller.session), Some(&mut caller.context)),
+                                None => (None, None),
+                            };
+                            narrow_by_equality_worker(
+                                store, globals, current, value, condition.strict, require_match,
+                                discriminant.as_deref(), session, context,
+                            )
+                        };
+                        narrowed
                         .map_err(|error| match error {
+                                SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
                             SourceEqualityNarrowingError::Union(error) => {
                                 SourceFlowError::Join { flow, error }
                             }
@@ -3622,14 +7805,42 @@ impl SourceFlowFrame<'_, '_> {
                             ),
                         })?
                     }
+                    SourceFlowCondition::In(condition)
+                    | SourceFlowCondition::InstanceOf(condition) => {
+                        let completed = self.in_conditions.get(&condition.expression).ok_or(
+                            SourceFlowInvariant::UnreachedCondition(condition.expression),
+                        )?;
+                        if completed.input != current {
+                            return Err(SourceFlowUnsupported::InNarrowing {
+                                condition: condition.expression,
+                                type_: current,
+                            }
+                            .into());
+                        }
+                        if store
+                            .type_node_links(condition.key)
+                            .and_then(|links| links.resolved_type)
+                            != Some(completed.key)
+                        {
+                            return Err(SourceFlowInvariant::UnknownCondition(
+                                condition.expression,
+                            )
+                            .into());
+                        }
+                        if assume_true {
+                            completed.when_true
+                        } else {
+                            completed.when_false
+                        }
+                    }
                 };
                 Ok(prior.with_type(symbol, narrowed))
             }
             SourceFlowKind::BranchLabel => {
-                self.resolve_branch_label(store, globals, flow, &node, depth)
+                self.resolve_branch_label(store, globals, flow, &node, depth, caller)
             }
             SourceFlowKind::LoopLabel => {
-                self.resolve_loop_label(store, globals, flow, &node, depth)
+                self.resolve_loop_label_with_caller(store, globals, flow, &node, depth, caller)
             }
         }
     }
@@ -3641,12 +7852,13 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         node: &FlowNode,
         depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
-        let mut joined = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        let mut joined = self.resolve_flow_with_caller(store, globals, antecedents[0], depth + 1, caller)?;
         for antecedent in &antecedents[1..] {
-            let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
-            joined = self.join_snapshots(store, globals, flow, &joined, &next)?;
+            let next = self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller)?;
+            joined = self.join_snapshots_with_caller(store, globals, flow, &joined, &next, caller)?;
         }
         Ok(joined)
     }
@@ -3659,32 +7871,79 @@ impl SourceFlowFrame<'_, '_> {
         node: &FlowNode,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.resolve_loop_label_with_caller(store, globals, flow, node, depth, &mut None)
+    }
+
+    fn resolve_loop_label_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        node: &FlowNode,
+        depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
-        let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
-        let previous = self.loop_snapshots.insert(flow, current.clone());
+        let mut current = self.resolve_flow_with_caller(store, globals, antecedents[0], depth + 1, caller)?;
+        let declared = self
+            .reference
+            .filter(|_| self.uses_callable_loop_queries())
+            .and_then(|symbol| {
+                self.declared_types
+                    .get(&symbol)
+                    .copied()
+                    .map(|type_| (symbol, type_))
+            });
+        if declared.is_some_and(|(symbol, type_)| current.type_of(symbol) == Some(type_)) {
+            return Ok(current);
+        }
+        let first_incomplete = current.incomplete;
+        let key = (flow, self.reference);
+        let previous = self.loop_snapshots.insert(key, current.clone());
         debug_assert!(previous.is_none());
 
         let result = (|| {
             for antecedent in &antecedents[1..] {
-                let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
-                current = self.join_snapshots(store, globals, flow, &current, &next)?;
-                self.loop_snapshots.insert(flow, current.clone());
+                let reference_loop = self.reference.is_some()
+                    && (self.plan.region.is_some() || self.uses_callable_loop_queries());
+                let next = if reference_loop {
+                    // The backedge can repeat the demand's prefix before reaching this loop.
+                    let outer_visiting = std::mem::take(&mut self.visiting);
+                    let result = self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller);
+                    self.visiting = outer_visiting;
+                    result
+                } else {
+                    self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller)
+                }?;
+                current = self.join_snapshots_with_caller(store, globals, flow, &current, &next, caller)?;
+                self.loop_snapshots.insert(key, current.clone());
+                if declared.is_some_and(|(symbol, type_)| current.type_of(symbol) == Some(type_)) {
+                    break;
+                }
             }
+            current.incomplete = first_incomplete;
             Ok(current)
         })();
-        let removed = self.loop_snapshots.remove(&flow);
+        let removed = self.loop_snapshots.remove(&key);
         debug_assert!(removed.is_some());
         result
     }
 
-    fn join_snapshots(
+    fn join_snapshots_with_caller(
         &self,
         store: &mut CanonicalTypeMapperStore,
         globals: &CanonicalGlobalTypes,
         flow: FlowRef,
         then_snapshot: &SourceFlowSnapshot,
         else_snapshot: &SourceFlowSnapshot,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        if !then_snapshot.reachable {
+            return Ok(else_snapshot.clone());
+        }
+        if !else_snapshot.reachable {
+            return Ok(then_snapshot.clone());
+        }
         let mut symbols = then_snapshot
             .types()
             .keys()
@@ -3712,33 +7971,21 @@ impl SourceFlowFrame<'_, '_> {
             }) {
                 let left = store.evolving_array_element_type(then_type)?;
                 let right = store.evolving_array_element_type(else_type)?;
-                let element = store
-                    .expression_union_type_with_global_types(
-                        globals,
-                        &[left, right],
-                        UnionReduction::Literal,
-                    )
+                let element = source_flow_union_type(store, globals, &[left, right], caller)
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
                 store.create_evolving_array_type(element)?
-            } else if let Some(candidate) = candidates
-                .iter()
-                .copied()
-                .find(|candidate| *candidate == then_type || *candidate == else_type)
-            {
-                candidate
             } else {
-                let anonymous = store
-                    .expression_union_type_with_global_types(
-                        globals,
-                        &[then_type, else_type],
-                        UnionReduction::Literal,
-                    )
+                let anonymous = source_flow_union_type(
+                    store, globals, &[then_type, else_type], caller,
+                )
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
                 Self::preferred_join_identity(store, anonymous, &candidates)
             };
             joined.insert(symbol, joined_type);
         }
-        Ok(SourceFlowSnapshot::new(joined))
+        let mut result = SourceFlowSnapshot::new(joined);
+        result.incomplete = then_snapshot.incomplete || else_snapshot.incomplete;
+        Ok(result)
     }
 
     fn join_identity_candidates(&self, symbol: SemanticSymbolId) -> Vec<TypeId> {
@@ -3776,6 +8023,170 @@ impl SourceFlowFrame<'_, '_> {
             .find(|candidate| union_constituents(store, *candidate) == Some(anonymous_types))
             .unwrap_or(anonymous)
     }
+}
+
+fn class_predicate_scalar_leaves(
+    store: &CanonicalTypeMapperStore,
+    call: NodeRef,
+    type_: TypeId,
+) -> Result<Vec<TypeId>, SourceFlowError> {
+    let mut leaves = Vec::new();
+    collect_source_equality_leaves(store, type_, &mut leaves, &mut HashSet::new())
+        .map_err(SourceFlowInvariant::EqualityNarrowing)?;
+    for &leaf in &leaves {
+        let flags = store
+            .type_payload(leaf)
+            .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?
+            .flags();
+        if !flags.intersects(
+            TypeFlags::STRING
+                | TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BOOLEAN
+                | TypeFlags::BOOLEAN_LITERAL
+                | TypeFlags::BIG_INT
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::UNIQUE_ES_SYMBOL
+                | TypeFlags::NULLABLE
+                | TypeFlags::NEVER,
+        ) || flags.intersects(TypeFlags::ENUM | TypeFlags::ENUM_LITERAL) {
+            return Err(SourceFlowUnsupported::Call(call).into());
+        }
+    }
+    Ok(leaves)
+}
+
+/// Uses the predicate's canonical target, including the complement on a false edge.
+#[allow(clippy::too_many_arguments)]
+fn narrow_class_property_predicate_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    flow: FlowRef,
+    call: NodeRef,
+    current: TypeId,
+    predicate: TypeId,
+    assume_true: bool,
+) -> Result<TypeId, SourceFlowError> {
+    let current_leaves = class_predicate_scalar_leaves(store, call, current)?;
+    let predicate_leaves = class_predicate_scalar_leaves(store, call, predicate)?;
+    let mut positive = Vec::new();
+    for candidate in predicate_leaves {
+        for &leaf in &current_leaves {
+            for (source, target) in [(leaf, candidate), (candidate, leaf)] {
+                if store
+                    .is_type_related_to_with_session(
+                        source,
+                        target,
+                        RelationKind::Subtype,
+                        Some(globals),
+                        None,
+                        session,
+                    )
+                    .map_err(SourceFlowError::Relation)?
+                {
+                    positive.push(source);
+                    break;
+                }
+            }
+        }
+    }
+    let positive = store
+        .expression_union_type_with_global_types_and_session(
+            globals,
+            &positive,
+            UnionReduction::Subtype,
+            session,
+        )
+        .map_err(|error| SourceFlowError::Join { flow, error })?;
+    if assume_true {
+        return Ok(positive);
+    }
+    let mut negative = Vec::new();
+    for leaf in current_leaves {
+        if !store
+            .is_type_related_to_with_session(
+                leaf,
+                positive,
+                RelationKind::Subtype,
+                Some(globals),
+                None,
+                session,
+            )
+            .map_err(SourceFlowError::Relation)?
+        {
+            negative.push(leaf);
+        }
+    }
+    store
+        .expression_union_type_with_global_types_and_session(
+            globals,
+            &negative,
+            UnionReduction::Subtype,
+            session,
+        )
+        .map_err(|error| SourceFlowError::Join { flow, error })
+}
+
+fn narrow_source_assertion_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    flow: FlowRef,
+    call: NodeRef,
+    current: TypeId,
+    asserted: TypeId,
+) -> Result<TypeId, SourceFlowError> {
+    let record = store
+        .type_payload(current)
+        .ok_or(SourceFlowError::Relation(RelationUnavailable::Type(
+            current,
+        )))?;
+    if record.flags().intersects(TypeFlags::ANY)
+        && (asserted == globals.object_type || asserted == globals.function_type)
+    {
+        return Ok(current);
+    }
+    if record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
+        return Ok(asserted);
+    }
+    if matches!(record.data(), TypeData::Union(_)) {
+        let mut constituents = Vec::new();
+        collect_source_equality_leaves(store, current, &mut constituents, &mut HashSet::new())
+            .map_err(SourceFlowInvariant::EqualityNarrowing)?;
+        let narrowed = constituents
+            .into_iter()
+            .map(|type_| narrow_source_assertion_type(store, globals, flow, call, type_, asserted))
+            .collect::<Result<Vec<_>, _>>()?;
+        return store
+            .expression_union_type_with_global_types(globals, &narrowed, UnionReduction::Subtype)
+            .map_err(|error| SourceFlowError::Join { flow, error });
+    }
+    if store
+        .is_type_assignable_to_with_global_types(current, asserted, globals)
+        .map_err(SourceFlowError::Relation)?
+    {
+        return Ok(current);
+    }
+    if store
+        .is_type_assignable_to_with_global_types(asserted, current, globals)
+        .map_err(SourceFlowError::Relation)?
+    {
+        return Ok(asserted);
+    }
+    store
+        .canonical_intersection_type(&[current, asserted], None)
+        .map_err(|error| {
+            use super::intersection_types::IntersectionTypeError;
+            match error {
+                IntersectionTypeError::UnsupportedConstituent(_)
+                | IntersectionTypeError::UnsupportedPropertyType(_) => {
+                    SourceFlowUnsupported::Call(call).into()
+                }
+                _ => SourceFlowInvariant::InvalidCallEffect(call).into(),
+            }
+        })
 }
 
 /// Confirms that `typeof` can classify canonical top types, authenticated
@@ -3879,6 +8290,227 @@ enum SourceEqualityValueKind {
     Literal(TypeId),
 }
 
+/// Follows only completed, non-generic class base identities.
+fn source_class_derives_from(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    condition: NodeRef,
+    mut source: TypeId,
+    target: TypeId,
+) -> Result<bool, SourceFlowError> {
+    let mut visited = HashSet::new();
+    loop {
+        if source == target {
+            return Ok(true);
+        }
+        if !visited.insert(source) {
+            return Err(SourceFlowInvariant::UnknownCondition(condition).into());
+        }
+        let members = super::in_operators::instanceof_class_members(store, host, source, false)
+            .map_err(SourceFlowError::Relation)?
+            .ok_or(SourceFlowUnsupported::InNarrowing {
+                condition,
+                type_: source,
+            })?;
+        let Some(base) = members.base() else {
+            return Ok(false);
+        };
+        if base.applied_instance_type() != base.instance_type() {
+            return Err(SourceFlowUnsupported::InNarrowing {
+                condition,
+                type_: source,
+            }
+            .into());
+        }
+        source = base.instance_type();
+    }
+}
+
+/// Uses class base identities, as the native instanceof flow check does.
+fn narrow_source_instanceof_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    condition: NodeRef,
+    input: TypeId,
+    constructor: TypeId,
+) -> Result<[TypeId; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(condition);
+    let unavailable = |type_| SourceFlowUnsupported::InNarrowing { condition, type_ };
+    let cache_error = |error| SourceFlowError::Narrowing {
+        condition,
+        error: LogicalBinaryError::Literal(error),
+    };
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(cache_error)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let (any, error, unknown, never) = (
+        bootstrap.any_type,
+        bootstrap.error_type,
+        bootstrap.unknown_type,
+        bootstrap.never_type,
+    );
+    let members = super::in_operators::instanceof_class_members(store, host, constructor, true)
+        .map_err(SourceFlowError::Relation)?
+        .ok_or_else(|| unavailable(constructor))?;
+    let instance = members.shells().instance_type();
+    if input == any || input == error || input == unknown {
+        return Ok([instance, input]);
+    }
+    if input == never {
+        return Ok([input, input]);
+    }
+    let (leaves, has_origin) = match store.type_payload(input).ok_or_else(invalid)?.data() {
+        TypeData::Union(union) => (union.union.types.clone(), union.origin.is_some()),
+        _ => (vec![input], false),
+    };
+    let mut present = Vec::with_capacity(leaves.len());
+    let mut absent = Vec::with_capacity(leaves.len());
+    for &leaf in &leaves {
+        let flags = store.type_payload(leaf).ok_or_else(invalid)?.flags();
+        if flags.intersects(TypeFlags::PRIMITIVE) {
+            absent.push(leaf);
+            continue;
+        }
+        let derived = source_class_derives_from(store, host, condition, leaf, instance)?;
+        if derived {
+            present.push(leaf);
+        } else if source_class_derives_from(store, host, condition, instance, leaf)?
+            && !present.contains(&instance)
+        {
+            present.push(instance);
+        }
+        if !derived {
+            absent.push(leaf);
+        }
+    }
+    if present.is_empty() {
+        // Unrelated object types need the native intersection result.
+        return Err(unavailable(input).into());
+    }
+    if has_origin && (present != leaves || absent != leaves) {
+        return Err(unavailable(input).into());
+    }
+    let mut branches = [input, input];
+    for (branch, retained) in branches.iter_mut().zip([present, absent]) {
+        if retained == leaves {
+            continue;
+        }
+        *branch = match retained.as_slice() {
+            [] => never,
+            [only] => *only,
+            _ => store
+                .expression_union_type_with_global_types_and_session(
+                    globals,
+                    &retained,
+                    UnionReduction::Literal,
+                    session,
+                )
+                .map_err(cache_error)?,
+        };
+    }
+    Ok(branches)
+}
+
+/// Checks both membership edges before the flow frame records either result.
+fn narrow_source_in_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    condition: NodeRef,
+    input: TypeId,
+    key: TypeId,
+) -> Result<[TypeId; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(condition);
+    let unavailable = |type_| SourceFlowUnsupported::InNarrowing { condition, type_ };
+    let cache_error = |error| SourceFlowError::Narrowing {
+        condition,
+        error: LogicalBinaryError::Literal(error),
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let (any, error, never) = (
+        bootstrap.any_type,
+        bootstrap.error_type,
+        bootstrap.never_type,
+    );
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(cache_error)?;
+    store
+        .validate_union_constituent_with_global_types(globals, key)
+        .map_err(cache_error)?;
+    let key_record = store.type_payload(key).ok_or_else(invalid)?;
+    let name = match key_record.data() {
+        TypeData::Literal(literal) => match &literal.value {
+            LiteralValue::String(value)
+                if key_record.flags().intersects(TypeFlags::STRING_LITERAL) =>
+            {
+                EscapedName::source(value)
+            }
+            LiteralValue::Number(value)
+                if key_record.flags().intersects(TypeFlags::NUMBER_LITERAL) =>
+            {
+                EscapedName::source(&value.to_string())
+            }
+            _ => return Ok([input, input]),
+        },
+        TypeData::UniqueEsSymbol(_) => return Err(unavailable(key).into()),
+        _ => return Ok([input, input]),
+    };
+    if input == any || input == error || input == never {
+        return Ok([input, input]);
+    }
+    let (leaves, has_origin) = match store.type_payload(input).ok_or_else(invalid)?.data() {
+        TypeData::Union(union) => (union.union.types.clone(), union.origin.is_some()),
+        _ => (vec![input], false),
+    };
+    let mut present = Vec::with_capacity(leaves.len());
+    let mut absent = Vec::with_capacity(leaves.len());
+    for &leaf in &leaves {
+        if store.type_payload(leaf).ok_or_else(invalid)?.flags() != TypeFlags::OBJECT {
+            return Err(unavailable(leaf).into());
+        }
+        let [can_be_present, can_be_absent] = store
+            .in_operator_property_presence(leaf, name.as_ref(), globals, session)
+            .map_err(SourceFlowError::Relation)?;
+        if can_be_present {
+            present.push(leaf);
+        }
+        if can_be_absent {
+            absent.push(leaf);
+        }
+    }
+    if present.is_empty() {
+        // Unknown properties need the real Record<K, unknown> intersection.
+        return Err(unavailable(input).into());
+    }
+    if has_origin && (present != leaves || absent != leaves) {
+        // A changed subset must retain the source union's nested alias origin.
+        return Err(unavailable(input).into());
+    }
+    let mut branches = [input, input];
+    for (branch, retained) in branches.iter_mut().zip([present, absent]) {
+        if retained == leaves {
+            continue;
+        }
+        *branch = match retained.as_slice() {
+            [] => never,
+            [only] => *only,
+            _ => store
+                .expression_union_type_with_global_types_and_session(
+                    globals,
+                    &retained,
+                    UnionReduction::Literal,
+                    session,
+                )
+                .map_err(cache_error)?,
+        };
+    }
+    Ok(branches)
+}
+
 /// Narrows exact nullable or literal comparisons without synthesizing facts.
 pub(super) fn narrow_by_equality(
     store: &mut CanonicalTypeMapperStore,
@@ -3888,6 +8520,31 @@ pub(super) fn narrow_by_equality(
     strict: bool,
     require_match: bool,
     discriminant: Option<&str>,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
+    narrow_by_equality_worker(
+        store,
+        globals,
+        input,
+        value,
+        strict,
+        require_match,
+        discriminant,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Class reads keep the existing source caller's session.
+fn narrow_by_equality_worker(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    strict: bool,
+    require_match: bool,
+    discriminant: Option<&str>,
+    mut session: Option<&mut InstantiationSession>,
+    mut context: Option<&mut SourceFlowContext<'_, '_>>,
 ) -> Result<TypeId, SourceEqualityNarrowingError> {
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -3901,6 +8558,20 @@ pub(super) fn narrow_by_equality(
         bootstrap.never_type,
         bootstrap.options.strict_null_checks,
     );
+    if input == any && session.is_some() && context.is_some() {
+        return Ok(input);
+    }
+    if discriminant.is_none()
+        && session.is_some()
+        && context.is_some()
+        && source_equality_is_object_value(store, value)?
+    {
+        if let (Some(session), Some(context)) = (session.as_deref_mut(), context.as_deref_mut()) {
+            return narrow_by_object_equality(
+                store, globals, input, value, strict, require_match, session, context,
+            );
+        }
+    }
     let value_kind = source_equality_value_kind(store, value)?;
     if !strict_null_checks
         && matches!(
@@ -3910,12 +8581,15 @@ pub(super) fn narrow_by_equality(
     {
         return Ok(input);
     }
-    if !strict && matches!(value_kind, SourceEqualityValueKind::Literal(_)) {
-        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
-    }
-
     let mut leaves = Vec::new();
-    collect_source_equality_leaves(store, input, &mut leaves, &mut HashSet::new())?;
+    if !strict && matches!(value_kind, SourceEqualityValueKind::Literal(_)) {
+        if discriminant.is_some() {
+            return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+        }
+        collect_source_loose_numeric_equality_leaves(store, globals, input, value, &mut leaves)?;
+    } else {
+        collect_source_equality_leaves(store, input, &mut leaves, &mut HashSet::new())?;
+    }
     let mut retained = Vec::with_capacity(leaves.len());
     for leaf in &leaves {
         let flags = store
@@ -3943,17 +8617,24 @@ pub(super) fn narrow_by_equality(
                 .map_err(SourceEqualityNarrowingError::Relation)?
                 .ok_or(SourceEqualityNarrowingError::UnsupportedType(*leaf))?;
             let property_type = if property.optional && strict_null_checks {
-                store
-                    .expression_union_type_with_global_types(
+                match session.as_deref_mut() {
+                    Some(session) => store.expression_union_type_with_global_types_and_session(
                         globals,
                         &[property.type_, undefined],
                         UnionReduction::Literal,
-                    )
-                    .map_err(SourceEqualityNarrowingError::Union)?
+                        session,
+                    ),
+                    None => store.expression_union_type_with_global_types(
+                        globals,
+                        &[property.type_, undefined],
+                        UnionReduction::Literal,
+                    ),
+                }
+                .map_err(SourceEqualityNarrowingError::Union)?
             } else {
                 property.type_
             };
-            let narrowed = narrow_by_equality(
+            let narrowed = narrow_by_equality_worker(
                 store,
                 globals,
                 property_type,
@@ -3961,6 +8642,8 @@ pub(super) fn narrow_by_equality(
                 strict,
                 require_match,
                 None,
+                session.as_deref_mut(),
+                context.as_deref_mut(),
             )?;
             if narrowed != never {
                 retained.push(*leaf);
@@ -4068,10 +8751,204 @@ pub(super) fn narrow_by_equality(
     match retained.as_slice() {
         [] => Ok(never),
         [only] => Ok(*only),
+        _ => match session {
+            Some(session) => store.expression_union_type_with_global_types_and_session(
+                globals,
+                &retained,
+                UnionReduction::Literal,
+                session,
+            ),
+            None => store.expression_union_type_with_global_types(
+                globals,
+                &retained,
+                UnionReduction::Literal,
+            ),
+        }
+        .map_err(SourceEqualityNarrowingError::Union),
+    }
+}
+
+/// Object equality filters comparable input types. It does not replace them with the value type.
+#[allow(clippy::too_many_arguments)]
+fn narrow_by_object_equality(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    strict: bool,
+    require_match: bool,
+    session: &mut InstantiationSession,
+    context: &mut SourceFlowContext<'_, '_>,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
+    // Callers replay the checked source condition before narrowing. Validate union
+    // identity here without forcing unrelated object members or function returns.
+    for type_ in [input, value] {
+        let record = store
+            .type_payload(type_)
+            .ok_or(SourceEqualityNarrowingError::InvalidType(type_))?;
+        if record.flags().intersects(TypeFlags::UNION) || matches!(record.data(), TypeData::Union(_)) {
+            store.validate_union_query_metadata(type_)
+                .map_err(SourceEqualityNarrowingError::Union)?;
+        }
+    }
+    if !require_match {
+        return Ok(input);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceEqualityNarrowingError::MissingBootstrap)?;
+    let (unknown, non_primitive, any_function) = (
+        bootstrap.unknown_type,
+        bootstrap.non_primitive_type,
+        bootstrap.any_function_type,
+    );
+    let leaves = match store.type_payload(input).map(TypeRecord::data) {
+        Some(TypeData::Union(union)) => union.union.types.clone(),
+        Some(_) => vec![input],
+        None => return Err(SourceEqualityNarrowingError::InvalidType(input)),
+    };
+    if strict && store.type_payload(value).is_some_and(|record| {
+        record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE)
+    }) {
+        let mut has_empty = input == unknown;
+        for leaf in &leaves {
+            has_empty |= source_equality_empty_object(store, *leaf, any_function)?;
+        }
+        if has_empty {
+            return if value == non_primitive
+                || source_equality_empty_object(store, value, any_function)?
+            {
+                Ok(value)
+            } else {
+                Ok(non_primitive)
+            };
+        }
+    }
+    let mut retained = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        if context.comparable(store, session, *leaf, value).map_err(SourceEqualityNarrowingError::Source)?
+            || context.comparable(store, session, value, *leaf).map_err(SourceEqualityNarrowingError::Source)?
+        {
+            retained.push(*leaf);
+        }
+    }
+    filter_source_union_result(store, globals, input, &leaves, retained, session)
+}
+
+fn filter_source_union_result(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    leaves: &[TypeId],
+    mut retained: Vec<TypeId>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
+    if retained.as_slice() == leaves {
+        return Ok(input);
+    }
+    let never = store.intrinsic_bootstrap()
+        .ok_or(SourceEqualityNarrowingError::MissingBootstrap)?.never_type;
+    let origin = match store.type_payload(input).map(TypeRecord::data) {
+        Some(TypeData::Union(union)) => union.origin,
+        Some(_) => None,
+        None => return Err(SourceEqualityNarrowingError::InvalidType(input)),
+    };
+    if let Some(origin) = origin {
+        store.validate_union_origin_members(input, origin, leaves)
+            .map_err(SourceEqualityNarrowingError::Union)?;
+        if let Some(TypeData::Union(union)) = store.type_payload(origin).map(TypeRecord::data) {
+            let entries = union.union.types.clone();
+            let mut filtered_origin = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let record = store
+                    .type_payload(*entry)
+                    .ok_or(SourceEqualityNarrowingError::InvalidType(*entry))?;
+                if record.flags().intersects(TypeFlags::UNION) || retained.contains(entry) {
+                    filtered_origin.push(*entry);
+                }
+            }
+            if entries.len() - filtered_origin.len() == leaves.len() - retained.len() {
+                retained = filtered_origin;
+            }
+        }
+    }
+    match retained.as_slice() {
+        [] => Ok(never),
+        [only] => Ok(*only),
         _ => store
-            .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
+            .expression_union_type_with_global_types_and_session(
+                globals, &retained, UnionReduction::None, session,
+            )
             .map_err(SourceEqualityNarrowingError::Union),
     }
+}
+
+fn source_equality_is_object_value(
+    store: &CanonicalTypeMapperStore,
+    value: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    let record = store.type_payload(value)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(value))?;
+    if let TypeData::Union(union) = record.data() {
+        store.validate_union_query_metadata(value)
+            .map_err(SourceEqualityNarrowingError::Union)?;
+        return Ok(union.union.types.iter().all(|type_| {
+            store.type_payload(*type_).is_some_and(|record| {
+                record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE)
+            })
+        }));
+    }
+    Ok(record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE))
+}
+
+fn source_equality_empty_object(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    any_function: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    if let Some(source) = super::object_aliases::source_property_object_projection(store, type_)
+        .map_err(SourceEqualityNarrowingError::Relation)?
+    {
+        return Ok(source.properties().is_empty());
+    }
+    store.is_empty_anonymous_object_type(type_, any_function)
+        .map_err(SourceEqualityNarrowingError::Relation)
+}
+
+/// Same-domain numbers need no loose-equality coercion. Check every input before filtering.
+fn collect_source_loose_numeric_equality_leaves(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    leaves: &mut Vec<TypeId>,
+) -> Result<(), SourceEqualityNarrowingError> {
+    let numeric_literal = |record: &TypeRecord| {
+        record.flags() == TypeFlags::NUMBER_LITERAL
+            && matches!(record.data(), TypeData::Literal(literal)
+                if matches!(&literal.value, LiteralValue::Number(_)))
+    };
+    if !store.type_payload(value).is_some_and(numeric_literal) {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+    collect_source_equality_leaves(store, input, leaves, &mut HashSet::new())?;
+    if leaves.is_empty()
+        || !leaves.iter().all(|leaf| {
+            store.type_payload(*leaf).is_some_and(|record| {
+                numeric_literal(record)
+                    || record.flags() == TypeFlags::NUMBER
+                        && matches!(record.data(), TypeData::Intrinsic(_))
+            })
+        })
+    {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+    store
+        .validate_union_constituent_with_global_types(globals, value)
+        .map_err(SourceEqualityNarrowingError::Union)?;
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(SourceEqualityNarrowingError::Union)
 }
 
 fn source_equality_value_kind(
@@ -4561,6 +9438,677 @@ fn source_typeof_object_is_function(
     Ok(false)
 }
 
+fn source_region_point_flow(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    point: NodeRef,
+    region: Option<SourceFlowRegion>,
+) -> Result<FlowRef, SourceFlowError> {
+    validate_bound_node(bound, bound.flow_graph(), point)?;
+    if let Some(region) = region
+        && point == region.statement
+        && region.entry_node != point
+        && source_node_is_descendant_of(arena, region.entry_node, point.node)
+        && bound.flow_at(region.entry_node) == Some(region.entry)
+        && bound.flow_container(region.entry_node) == Some(bound.source_file())
+    {
+        return Ok(region.entry);
+    }
+    if let Some(flow) = bound.flow_at(point) {
+        if bound.flow_container(point) != Some(bound.source_file()) {
+            return Err(SourceFlowInvariant::MissingFlowPoint(point).into());
+        }
+        return Ok(flow);
+    }
+    let mut current = point;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if region.is_some_and(|region| region.unreachable_incrementor == Some(current))
+            && bound.container(point) == Some(bound.source_file())
+        {
+            return Ok(bound.flow_graph().nodes().unreachable());
+        }
+        if bound.flow_graph().is_unreachable(current) == Some(true)
+            && bound.flow_container(current) == Some(bound.source_file())
+        {
+            return Ok(bound.flow_graph().nodes().unreachable());
+        }
+        let Some(parent) = arena.get(current.node).and_then(|record| record.parent) else {
+            break;
+        };
+        current = NodeRef::new(point.arena, point.file, parent);
+    }
+    Err(SourceFlowInvariant::MissingFlowPoint(point).into())
+}
+
+fn source_nullish_statement_flow_region(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+) -> Result<SourceFlowRegion, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let source = bound.source_file();
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !statement.is_for(arena.id(), bound.file_id())
+        || bound.flow_container(statement) != Some(source)
+        || assignments.is_empty()
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(statement.node).ok_or_else(invalid)?;
+    if record.parent != Some(source.node)
+        || !matches!(
+            record.kind,
+            SyntaxKind::ExpressionStatement | SyntaxKind::VariableStatement
+        )
+        || assignments.iter().any(|assignment| {
+            !source_node_is_descendant_of(arena, assignment.expression, statement.node)
+        })
+    {
+        return Err(invalid().into());
+    }
+    let NodeData::SourceFile(file) = &arena.get(source.node).ok_or_else(invalid)?.data else {
+        return Err(invalid().into());
+    };
+    let index = file
+        .statements
+        .nodes
+        .iter()
+        .position(|node| *node == statement.node)
+        .ok_or_else(invalid)?;
+    let entry = source_following_statement_entry(arena, bound, statement)?.ok_or_else(invalid)?;
+    let entry_node = arena
+        .iter()
+        .find_map(|(id, _)| {
+            let node = NodeRef::new(arena.id(), bound.file_id(), id);
+            (source_node_is_descendant_of(arena, node, statement.node)
+                && bound.flow_container(node) == Some(source)
+                && bound.flow_at(node) == Some(entry))
+            .then_some(node)
+        })
+        .ok_or_else(invalid)?;
+    let mut exit = None;
+    for following in &file.statements.nodes[index + 1..] {
+        exit = source_following_statement_entry(
+            arena,
+            bound,
+            NodeRef::new(arena.id(), bound.file_id(), *following),
+        )?;
+        if exit.is_some() {
+            break;
+        }
+    }
+    Ok(SourceFlowRegion {
+        statement,
+        entry_node,
+        entry,
+        exit: exit
+            .or_else(|| bound.flow_graph().container_end(source))
+            .ok_or_else(invalid)?,
+        unreachable_incrementor: None,
+    })
+}
+
+fn source_statement_flow_region(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<SourceFlowRegion, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let source = bound.source_file();
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !statement.is_for(arena.id(), bound.file_id())
+        || bound.flow_container(statement) != Some(source)
+    {
+        return Err(invalid().into());
+    }
+    let NodeData::SourceFile(file) = &arena.get(source.node).ok_or_else(invalid)?.data else {
+        return Err(invalid().into());
+    };
+    let index = file
+        .statements
+        .nodes
+        .iter()
+        .position(|node| *node == statement.node)
+        .ok_or_else(invalid)?;
+    let entry = source_region_point_flow(arena, bound, statement, None)?;
+    let syntax =
+        plan_source_for_statement_syntax(arena, bound, store, statement).map_err(|_| invalid())?;
+    let literal_false_body = syntax.control.condition.is_some_and(|condition| {
+        arena
+            .get(condition.node)
+            .is_some_and(|record| record.kind == SyntaxKind::FalseKeyword)
+    });
+    let has_reachable_continue = syntax
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            SourceCapturedIterationStatementSyntax::ConditionalJump { jump, .. } => Some(*jump),
+            _ => None,
+        })
+        .chain(syntax.terminal_jump)
+        .any(|jump| {
+            arena
+                .get(jump.node)
+                .is_some_and(|record| record.kind == SyntaxKind::ContinueStatement)
+                && bound.flow_at(jump).is_some()
+        });
+    let ends_with_break = syntax.terminal_jump.is_some_and(|jump| {
+        arena.get(jump.node).is_some_and(|record| record.kind == SyntaxKind::BreakStatement)
+    }) || syntax.statements.iter().any(|statement| {
+        matches!(statement, SourceCapturedIterationStatementSyntax::ConditionalJump { condition, jump }
+            if arena.get(condition.node).is_some_and(|record| record.kind == SyntaxKind::TrueKeyword)
+            && arena.get(jump.node).is_some_and(|record| record.kind == SyntaxKind::BreakStatement))
+    });
+    // The syntax proof owns these jumps. A terminal break and no live continue
+    // leave the binder's pre-incrementor join with no reachable antecedent.
+    let unreachable_incrementor = syntax
+        .control
+        .incrementor
+        .filter(|_| literal_false_body || ends_with_break && !has_reachable_continue);
+    let mut exit = None;
+    for following in &file.statements.nodes[index + 1..] {
+        let node = NodeRef::new(arena.id(), bound.file_id(), *following);
+        exit = source_following_statement_entry(arena, bound, node)?;
+        if exit.is_some() {
+            break;
+        }
+    }
+    let exit = exit
+        .or_else(|| bound.flow_graph().container_end(source))
+        .ok_or_else(invalid)?;
+    Ok(SourceFlowRegion {
+        statement,
+        entry_node: statement,
+        entry,
+        exit,
+        unreachable_incrementor,
+    })
+}
+
+/// Finds an entry before the next declaration can evaluate a key or initializer.
+fn source_following_statement_entry(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+) -> Result<Option<FlowRef>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let mut pending = vec![statement];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(invalid().into());
+        }
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        let record = arena.get(node.node).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::FunctionDeclaration
+                | SyntaxKind::InterfaceDeclaration
+                | SyntaxKind::TypeAliasDeclaration
+                | SyntaxKind::EmptyStatement
+        ) {
+            continue;
+        }
+        if bound.flow_container(node) == Some(bound.source_file()) {
+            if let Some(flow) = bound.flow_at(node) {
+                return Ok(Some(flow));
+            }
+            if bound.flow_graph().is_unreachable(node) == Some(true) {
+                return Ok(Some(bound.flow_graph().nodes().unreachable()));
+            }
+        }
+        match &record.data {
+            NodeData::Block(block) => {
+                pending.extend(
+                    block
+                        .statements
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|node| NodeRef::new(statement.arena, statement.file, *node)),
+                );
+            }
+            NodeData::ClassDeclaration(class) => {
+                if class.modifiers.as_ref().is_some_and(|modifiers| {
+                    modifiers.list.nodes.iter().any(|modifier| {
+                        arena
+                            .get(*modifier)
+                            .is_none_or(|record| !matches!(record.data, NodeData::Token(_)))
+                    })
+                }) {
+                    return Err(invalid().into());
+                }
+                let name = class.name.ok_or_else(invalid)?;
+                if arena.get(name).is_none_or(|record| {
+                    record.kind != SyntaxKind::Identifier || record.parent != Some(node.node)
+                }) {
+                    return Err(invalid().into());
+                }
+                return source_region_point_flow(
+                    arena,
+                    bound,
+                    NodeRef::new(node.arena, node.file, name),
+                    None,
+                )
+                .map(Some);
+            }
+            NodeData::EnumDeclaration(enumeration) => {
+                let name = enumeration.name;
+                if arena.get(name).is_none_or(|record| {
+                    record.kind != SyntaxKind::Identifier || record.parent != Some(node.node)
+                }) {
+                    return Err(invalid().into());
+                }
+                return source_region_point_flow(
+                    arena,
+                    bound,
+                    NodeRef::new(node.arena, node.file, name),
+                    None,
+                )
+                .map(Some);
+            }
+            _ => return Err(invalid().into()),
+        }
+    }
+    Ok(None)
+}
+
+fn validate_source_reference(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceFlowError> {
+    validate_reference_in_container(arena, bound, store, host, bound.source_file(), node, symbol)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_reference_in_container(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(node);
+    let record = host.node(node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid().into());
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || bound.flow_container(node) != Some(container)
+        || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != symbol))
+    {
+        return Err(invalid().into());
+    }
+    let mut callback_host = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|_| invalid())?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(node)),
+                &identifier.text,
+                SymbolFlags::VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(|_| invalid())?;
+    if resolved != Some(symbol) {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_source_update(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    update: SourceFlowUpdate,
+) -> Result<(), SourceFlowError> {
+    validate_update_in_container(arena, bound, store, host, bound.source_file(), update)
+}
+
+fn validate_update_in_container(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    update: SourceFlowUpdate,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+    validate_reference_in_container(
+        arena, bound, store, host, container, update.target, update.symbol,
+    )?;
+    let declaration = host.node(update.declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &declaration.data else {
+        return Err(invalid().into());
+    };
+    let list = declaration
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return Err(invalid().into());
+    };
+    let target = host.node(update.target).ok_or_else(invalid)?;
+    let expression = target
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let (operand, operator) = match &expression.data {
+        NodeData::PrefixUnaryExpression(unary)
+            if expression.kind == SyntaxKind::PrefixUnaryExpression =>
+        {
+            (unary.operand, unary.operator)
+        }
+        NodeData::PostfixUnaryExpression(unary)
+            if expression.kind == SyntaxKind::PostfixUnaryExpression =>
+        {
+            (unary.operand, unary.operator)
+        }
+        _ => return Err(invalid().into()),
+    };
+    if declaration.kind != SyntaxKind::VariableDeclaration
+        || arena
+            .get(variable.name)
+            .is_none_or(|name| name.kind != SyntaxKind::Identifier)
+        || bound.symbol(update.declaration) != Some(update.symbol)
+        || store
+            .symbol(update.symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            != Some(update.declaration)
+        || list.kind != SyntaxKind::VariableDeclarationList
+        || !matches!(list.flags.0, 0..=2)
+        || !declarations
+            .declarations
+            .nodes
+            .contains(&update.declaration.node)
+        || update.readonly != (list.flags.0 == 2)
+        || operand != update.target.node
+        || !matches!(
+            operator,
+            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+        )
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+/// Header updates have a loop parent, not an expression-statement parent.
+fn validate_callable_update(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    syntax: &SourceCallableStatementListSyntax,
+    update: SourceFlowUpdate,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+    let loops = syntax.counted_for_loops();
+    let iteration = loops
+        .iter()
+        .find(|iteration| iteration.update_target == update.target)
+        .ok_or_else(invalid)?;
+    let control = &iteration.control;
+    let initializer = iteration.initializer;
+    let incrementor = control.incrementor.ok_or_else(invalid)?;
+    let record = host.node(control.statement).ok_or_else(invalid)?;
+    let NodeData::ForStatement(statement) = &record.data else {
+        return Err(invalid().into());
+    };
+    let container = syntax.callable.declaration;
+    if record.kind != SyntaxKind::ForStatement
+        || record.flags.0 != 0
+        || statement.initializer != control.initializer.map(|node| node.node)
+        || statement.condition != control.condition.map(|node| node.node)
+        || statement.incrementor != Some(incrementor.node)
+        || statement.statement != control.body.node
+        || update.readonly
+        || initializer.binding != VariableBindingKind::Let
+        || initializer.declaration != update.declaration
+        || initializer.symbol != update.symbol
+        || initializer.initializer.is_none()
+        || host.node(incrementor).and_then(|node| node.parent) != Some(control.statement.node)
+        || host.node(update.target).and_then(|node| node.parent) != Some(incrementor.node)
+        || [
+            control.statement,
+            incrementor,
+            update.target,
+            update.declaration,
+        ]
+        .into_iter()
+        .any(|node| bound.container(node) != Some(container))
+        || [incrementor, update.target, update.declaration]
+            .into_iter()
+            .any(|node| bound.block_scope_container(node) != Some(control.statement))
+    {
+        return Err(invalid().into());
+    }
+    validate_update_in_container(arena, bound, store, host, container, update)?;
+    Ok(incrementor)
+}
+
+fn validate_source_statement_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    call: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    if !call.is_for(arena.id(), bound.file_id())
+        || !bound.contains(call)
+        || bound.container(call) != Some(bound.source_file())
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(call.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    let statement = NodeRef::new(call.arena, call.file, record.parent.ok_or_else(invalid)?);
+    let statement_record = arena.get(statement.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || data.question_dot_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || !matches!(&statement_record.data, NodeData::ExpressionStatement(expression) if expression.expression == call.node && expression.flow_node.is_none())
+        || bound.flow_container(statement) != Some(bound.source_file())
+        || bound.block_scope_container(call) != bound.block_scope_container(statement)
+        || arena.get(data.expression).is_none_or(|callee| {
+            !matches!(
+                callee.kind,
+                SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+            ) || callee.parent != Some(call.node)
+        })
+    {
+        return Err(invalid().into());
+    }
+    Ok(statement)
+}
+
+fn validate_source_call_effect(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    call: NodeRef,
+    effect: SourceFlowCallEffect,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCallEffect(call);
+    let cached = store
+        .signature_links(call)
+        .map(|links| links.effects_signature)
+        .ok_or_else(invalid)?;
+    let signature = match effect {
+        SourceFlowCallEffect::Unchanged => {
+            let no_effect = cached == EffectsSignatureState::NoEffects
+                || cached
+                    .signature()
+                    .and_then(|signature| store.signature(signature))
+                    .is_some_and(|signature| {
+                        signature
+                            .resolved_type_predicate()
+                            .and_then(|predicate| store.type_predicate(predicate))
+                            .is_some_and(|predicate| {
+                                matches!(
+                                    predicate.kind(),
+                                    TypePredicateKind::Identifier | TypePredicateKind::This
+                                )
+                            })
+                            && signature
+                                .resolved_return_type()
+                                .and_then(|type_| store.type_payload(type_))
+                                .is_some_and(|record| !record.flags().intersects(TypeFlags::NEVER))
+                    });
+            return if no_effect {
+                Ok(())
+            } else {
+                Err(invalid().into())
+            };
+        }
+        SourceFlowCallEffect::Never(signature)
+        | SourceFlowCallEffect::Assertion { signature, .. }
+        | SourceFlowCallEffect::AssertionNoReference { signature, .. }
+        | SourceFlowCallEffect::AssertionFalse { signature, .. } => signature,
+    };
+    if cached != EffectsSignatureState::Resolved(signature) {
+        return Err(invalid().into());
+    }
+    let signature = store.signature(signature).ok_or_else(invalid)?;
+    match effect {
+        SourceFlowCallEffect::Unchanged => unreachable!(),
+        SourceFlowCallEffect::Never(_) => {
+            if signature
+                .resolved_return_type()
+                .and_then(|type_| store.type_payload(type_))
+                .is_none_or(|record| !record.flags().intersects(TypeFlags::NEVER))
+            {
+                return Err(invalid().into());
+            }
+        }
+        SourceFlowCallEffect::Assertion {
+            argument, symbol, ..
+        } => {
+            let predicate = signature
+                .resolved_type_predicate()
+                .and_then(|predicate| store.type_predicate(predicate))
+                .ok_or_else(invalid)?;
+            let NodeData::CallExpression(data) = &host.node(call).ok_or_else(invalid)?.data else {
+                return Err(invalid().into());
+            };
+            let index = usize::try_from(predicate.parameter_index()).map_err(|_| invalid())?;
+            let mut actual_argument = data
+                .arguments
+                .nodes
+                .get(index)
+                .copied()
+                .ok_or_else(invalid)?;
+            let mut visited = HashSet::new();
+            while visited.insert(actual_argument) {
+                let node = NodeRef::new(call.arena, call.file, actual_argument);
+                let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+                    host.node(node).map(|record| &record.data)
+                else {
+                    break;
+                };
+                actual_argument = parenthesized.expression;
+            }
+            if predicate.kind() != TypePredicateKind::AssertsIdentifier
+                || actual_argument != argument.node
+            {
+                return Err(invalid().into());
+            }
+            let (arena, actual_bound) = host.source(call).ok_or_else(invalid)?;
+            if actual_bound.node_arena_revision() != bound.node_arena_revision() {
+                return Err(invalid().into());
+            }
+            validate_source_reference(arena, bound, store, host, argument, symbol)
+                .map_err(|_| invalid())?;
+        }
+        SourceFlowCallEffect::AssertionNoReference { .. }
+        | SourceFlowCallEffect::AssertionFalse { .. } => {
+            let predicate = signature
+                .resolved_type_predicate()
+                .and_then(|predicate| store.type_predicate(predicate))
+                .ok_or_else(invalid)?;
+            if predicate.kind() != TypePredicateKind::AssertsIdentifier {
+                return Err(invalid().into());
+            }
+            let NodeData::CallExpression(data) = &host.node(call).ok_or_else(invalid)?.data else {
+                return Err(invalid().into());
+            };
+            let index = usize::try_from(predicate.parameter_index()).map_err(|_| invalid())?;
+            let actual = data
+                .arguments
+                .nodes
+                .get(index)
+                .map(|node| NodeRef::new(call.arena, call.file, *node));
+            let actual = actual
+                .map(|mut node| {
+                    let mut visited = HashSet::new();
+                    loop {
+                        if !visited.insert(node) {
+                            return Err(invalid());
+                        }
+                        match &host.node(node).ok_or_else(invalid)?.data {
+                            NodeData::ParenthesizedExpression(inner) => {
+                                node.node = inner.expression;
+                            }
+                            _ => return Ok(node),
+                        }
+                    }
+                })
+                .transpose()?;
+            let expected = match effect {
+                SourceFlowCallEffect::AssertionNoReference { argument, .. } => argument,
+                SourceFlowCallEffect::AssertionFalse { argument, .. } => Some(argument),
+                _ => unreachable!(),
+            };
+            if actual != expected {
+                return Err(invalid().into());
+            }
+            if let Some(argument) = actual {
+                let record = host.node(argument).ok_or_else(invalid)?;
+                if matches!(effect, SourceFlowCallEffect::AssertionFalse { .. }) {
+                    if record.kind != SyntaxKind::FalseKeyword || predicate.type_id().is_some() {
+                        return Err(invalid().into());
+                    }
+                } else if !(matches!(
+                    record.kind,
+                    SyntaxKind::StringLiteral
+                        | SyntaxKind::NumericLiteral
+                        | SyntaxKind::BigIntLiteral
+                        | SyntaxKind::TrueKeyword
+                        | SyntaxKind::NullKeyword
+                ) || record.kind == SyntaxKind::FalseKeyword
+                    && predicate.type_id().is_some())
+                {
+                    return Err(SourceFlowUnsupported::Call(call).into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), SourceFlowError> {
     if !container.is_for(graph.node_arena_id(), graph.file_id()) {
         return Err(SourceFlowInvariant::ForeignNode(container).into());
@@ -4570,6 +10118,821 @@ fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), 
         Some(false) => Err(SourceFlowUnsupported::IncompleteContainer(container).into()),
         None => Err(SourceFlowInvariant::MissingContainer(container).into()),
     }
+}
+
+/// Rechecks source and binder ownership before a nullish write enters flow.
+pub(super) fn validate_source_nullish_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowNullishAssignment,
+) -> Result<(), SourceFlowError> {
+    source_nullish_assignment_proof(arena, bound, store, host, container, assignment).map(|_| ())
+}
+
+/// Proves a direct callable-owned indexed write and its actual binder edges.
+#[allow(clippy::too_many_lines)]
+pub(super) fn source_element_assignment_proof(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SourceElementAssignmentProof>, SourceFlowError> {
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or(SourceFlowInvariant::ForeignNode(expression))?;
+    let record = own_class_flow_node(store, host, expression)?;
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return Ok(None);
+    };
+    let reference = |node| NodeRef::new(expression.arena, expression.file, node);
+    let target = reference(binary.left);
+    let target_record = own_class_flow_node(store, host, target)?;
+    if !matches!(target_record.data, NodeData::ElementAccessExpression(_)) {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidArrayMutation(expression);
+    let operator = reference(binary.operator_token);
+    let operator_record = own_class_flow_node(store, host, operator)?;
+    if operator_record.kind != SyntaxKind::EqualsToken {
+        return Ok(None);
+    }
+    let syntax = super::source_elements::plan_direct_source_element_write_syntax(
+        arena,
+        store,
+        target,
+        expression,
+    )
+    .map_err(|_| SourceFlowUnsupported::PropertyWrite(target))?;
+    let receiver = syntax.receiver();
+    let index = syntax.index();
+    let right = reference(binary.right);
+    let statement = record.parent.map(reference).ok_or_else(invalid)?;
+    let statement_record = own_class_flow_node(store, host, statement)?;
+    let container = bound.container(statement).ok_or_else(invalid)?;
+    let body = statement_record.parent.map(reference).ok_or_else(invalid)?;
+    let body_record = own_class_flow_node(store, host, body)?;
+    let owner = own_class_flow_node(store, host, container)?;
+    let owns_body = match &owner.data {
+        NodeData::FunctionDeclaration(data) => data.body == Some(body.node),
+        NodeData::ArrowFunction(data) => data.body == body.node,
+        NodeData::MethodDeclaration(data) => {
+            data.body == Some(body.node)
+                && bound.symbol(container).is_some_and(|symbol| {
+                    store.source_object_literal_method_owner_is_exact(container, symbol)
+                })
+        }
+        _ => false,
+    };
+    let receiver_record = own_class_flow_node(store, host, receiver)?;
+    let index_record = own_class_flow_node(store, host, index)?;
+    let right_record = own_class_flow_node(store, host, right)?;
+    if !owns_body
+        || body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(container.node)
+        || !matches!(&body_record.data, NodeData::Block(block)
+            if block.statements.nodes.contains(&statement.node))
+        || record.kind != SyntaxKind::BinaryExpression
+        || record.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::ExpressionStatement(data)
+            if data.expression == expression.node && data.flow_node.is_none())
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || !matches!(&receiver_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || operator_record.parent != Some(expression.node)
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || right_record.parent != Some(expression.node)
+        || record.range.start > target_record.range.start
+        || target_record.range.end > operator_record.range.start
+        || operator_record.range.end > right_record.range.start
+        || right_record.range.end > record.range.end
+        || target_record.range.start > receiver_record.range.start
+        || receiver_record.range.end > index_record.range.start
+        || index_record.range.end > target_record.range.end
+        || arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || bound.flow_graph().container_is_complete(container) != Some(true)
+        || bound.symbol(container).is_none()
+        || bound.symbol(container) != store.source_declaration_symbol(container)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    for node in [statement, expression, target, receiver, index, operator, right] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.container(node) != Some(container)
+            || bound.block_scope_container(node) != Some(container)
+        {
+            return Err(invalid().into());
+        }
+    }
+    let symbol = own_class_flow_symbol(store, host, bound, receiver)?;
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let declaration = owner.value_declaration().ok_or_else(invalid)?;
+    if !owner.flags().intersects(SymbolFlags::VARIABLE)
+        || bound.container(declaration) != Some(container)
+        || bound.symbol(declaration) != Some(symbol)
+        || !matches!(
+            own_class_flow_node(store, host, declaration)?.kind,
+            SyntaxKind::VariableDeclaration | SyntaxKind::Parameter
+        )
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    let mut assignment = None;
+    let mut mutation = None;
+    for (position, node) in bound.flow_graph().nodes().iter().enumerate() {
+        let expected = if node.payload == Some(FlowNodePayload::Ast(target))
+            && node.flags.intersects(FlowFlags::ASSIGNMENT)
+        {
+            Some((SourceFlowKind::Assignment, &mut assignment))
+        } else if node.payload == Some(FlowNodePayload::Ast(expression))
+            && node.flags.intersects(FlowFlags::ARRAY_MUTATION)
+        {
+            Some((SourceFlowKind::ArrayMutation, &mut mutation))
+        } else {
+            None
+        };
+        if let Some((kind, slot)) = expected {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(position).map_err(|_| invalid())?),
+            );
+            if slot.replace(flow).is_some() || source_flow_kind(flow, node.flags)? != kind {
+                return Err(invalid().into());
+            }
+            linear_antecedent(flow, node)?;
+        }
+    }
+    let mutation = mutation.ok_or_else(invalid)?;
+    let preceding = linear_antecedent(mutation, &flow_node(bound.flow_graph(), mutation)?)?;
+    if assignment.is_some_and(|assignment| assignment != preceding) {
+        return Err(invalid().into());
+    }
+    Ok(Some(SourceElementAssignmentProof {
+        statement,
+        expression,
+        target,
+        receiver,
+        index,
+        right,
+        symbol,
+        declaration,
+        container,
+        assignment,
+        mutation,
+        revision: arena.revision(),
+    }))
+}
+
+#[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
+pub(super) fn source_member_assignment_proof(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SourceMemberAssignmentProof>, SourceFlowError> {
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or(SourceFlowInvariant::ForeignNode(expression))?;
+    let record = own_class_flow_node(store, host, expression)?;
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return Ok(None);
+    };
+    let reference = |node| NodeRef::new(expression.arena, expression.file, node);
+    let target = reference(binary.left);
+    let target_record = own_class_flow_node(store, host, target)?;
+    let NodeData::PropertyAccessExpression(property) = &target_record.data else {
+        return Ok(None);
+    };
+    let operator = reference(binary.operator_token);
+    let operator_record = own_class_flow_node(store, host, operator)?;
+    if operator_record.kind != SyntaxKind::EqualsToken {
+        return Ok(None);
+    }
+    let Some(statement) = record.parent.map(reference) else {
+        return Ok(None);
+    };
+    let statement_record = own_class_flow_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+        return Ok(None);
+    };
+    let Some(container) = bound.container(statement) else {
+        return Err(SourceFlowInvariant::ForeignNode(statement).into());
+    };
+    if own_class_flow_node(store, host, container)?.kind != SyntaxKind::ArrowFunction {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
+    let receiver = reference(property.expression);
+    let name = reference(property.name);
+    let right = reference(binary.right);
+    let receiver_record = own_class_flow_node(store, host, receiver)?;
+    let name_record = own_class_flow_node(store, host, name)?;
+    let right_record = own_class_flow_node(store, host, right)?;
+    if record.kind != SyntaxKind::BinaryExpression
+        || record.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_data.expression != expression.node
+        || statement_data.flow_node.is_some()
+        || target_record.kind != SyntaxKind::PropertyAccessExpression
+        || target_record.flags.0 != 0
+        || target_record.parent != Some(expression.node)
+        || property.question_dot_token.is_some()
+        || property.flow_node.is_some()
+        || property.facts != 0
+        || receiver_record.kind != SyntaxKind::Identifier
+        || !matches!(&receiver_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || receiver_record.parent != Some(target.node)
+        || receiver_record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || !matches!(&name_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || name_record.parent != Some(target.node)
+        || name_record.flags.0 != 0
+        || operator_record.parent != Some(expression.node)
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || right_record.parent != Some(expression.node)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || bound.flow_graph().container_is_complete(container) != Some(true)
+        || bound.symbol(container) != store.source_declaration_symbol(container)
+        || bound.symbol(container).is_none()
+        || record.range.start > target_record.range.start
+        || target_record.range.end > operator_record.range.start
+        || operator_record.range.end > right_record.range.start
+        || right_record.range.end > record.range.end
+        || target_record.range.start > receiver_record.range.start
+        || receiver_record.range.end > name_record.range.start
+        || name_record.range.end > target_record.range.end
+    {
+        return Err(invalid().into());
+    }
+    let scope = bound.block_scope_container(statement);
+    for node in [statement, expression, target, receiver, name, operator, right] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.container(node) != Some(container) || bound.block_scope_container(node) != scope {
+            return Err(invalid().into());
+        }
+    }
+    validate_nullish_structural_owner(arena, bound, container, expression)?;
+    validate_node_container(bound, bound.flow_graph(), container, target)?;
+    let receiver_symbol = own_class_flow_symbol(store, host, bound, receiver)?;
+    let symbol = store.symbol(receiver_symbol).ok_or_else(invalid)?;
+    let declaration = symbol.value_declaration().ok_or_else(invalid)?;
+    if !symbol.flags().intersects(SymbolFlags::VARIABLE)
+        || bound.container(declaration) != Some(container)
+        || bound.symbol(declaration) != Some(receiver_symbol)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    let mut assignment_flow = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::ASSIGNMENT)
+            && node.payload == Some(FlowNodePayload::Ast(target))
+        {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if assignment_flow.replace(flow).is_some()
+                || source_flow_kind(flow, node.flags)? != SourceFlowKind::Assignment
+            {
+                return Err(invalid().into());
+            }
+            linear_antecedent(flow, node)?;
+        }
+    }
+    Ok(Some(SourceMemberAssignmentProof {
+        expression,
+        target,
+        receiver,
+        right,
+        receiver_symbol,
+        container,
+        flow: assignment_flow.ok_or_else(invalid)?,
+        revision: arena.revision(),
+    }))
+}
+
+#[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
+fn source_nullish_assignment_proof(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowNullishAssignment,
+) -> Result<SourceNullishAssignmentProof, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !container.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    for node in [assignment.expression, assignment.target] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.container(node) != Some(container) {
+            return Err(invalid().into());
+        }
+    }
+    validate_nullish_structural_owner(arena, bound, container, assignment.expression)
+        .map_err(|_| invalid())?;
+    let expression = arena.get(assignment.expression.node).ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let right = arena.get(binary.right).ok_or_else(invalid)?;
+    if expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || target.parent != Some(assignment.expression.node)
+        || target.flags.0 != 0
+        || operator.kind != SyntaxKind::QuestionQuestionEqualsToken
+        || operator.parent != Some(assignment.expression.node)
+        || operator.flags.0 != 0
+        || !matches!(operator.data, NodeData::Token(_))
+        || right.parent != Some(assignment.expression.node)
+        || expression.range.start > target.range.start
+        || target.range.end > operator.range.start
+        || operator.range.end > right.range.start
+        || right.range.end > expression.range.end
+    {
+        return Err(invalid().into());
+    }
+
+    let receiver = match (&target.data, assignment.declaration, assignment.symbol) {
+        (NodeData::Identifier(_), Some(declaration), Some(symbol))
+            if target.kind == SyntaxKind::Identifier =>
+        {
+            validate_bound_node(bound, bound.flow_graph(), declaration)?;
+            if bound.container(declaration) != Some(container)
+                || bound.symbol(declaration) != Some(symbol)
+                || store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    != Some(declaration)
+                || own_class_flow_symbol(store, host, bound, assignment.target)? != symbol
+            {
+                return Err(invalid().into());
+            }
+            let record = arena.get(declaration.node).ok_or_else(invalid)?;
+            let (name, readonly) = match &record.data {
+                NodeData::VariableDeclaration(variable)
+                    if record.kind == SyntaxKind::VariableDeclaration =>
+                {
+                    let list = record
+                        .parent
+                        .and_then(|node| arena.get(node))
+                        .ok_or_else(invalid)?;
+                    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+                        return Err(invalid().into());
+                    };
+                    if list.kind != SyntaxKind::VariableDeclarationList
+                        || !matches!(list.flags.0, 0..=2)
+                        || declarations
+                            .declarations
+                            .nodes
+                            .iter()
+                            .filter(|node| **node == declaration.node)
+                            .count()
+                            != 1
+                    {
+                        return Err(invalid().into());
+                    }
+                    (variable.name, list.flags.0 == 2)
+                }
+                NodeData::ParameterDeclaration(parameter)
+                    if record.kind == SyntaxKind::Parameter
+                        && record.parent == Some(container.node) =>
+                {
+                    (parameter.name, false)
+                }
+                _ => return Err(invalid().into()),
+            };
+            if assignment.readonly != readonly
+                || arena.get(name).is_none_or(|name| {
+                    name.kind != SyntaxKind::Identifier || name.parent != Some(declaration.node)
+                })
+            {
+                return Err(invalid().into());
+            }
+            None
+        }
+        (NodeData::PropertyAccessExpression(_), None, None)
+        | (NodeData::ElementAccessExpression(_), None, None) => {
+            nullish_member_receiver(arena, bound, store, host, container, assignment.target)?
+        }
+        _ => return Err(invalid().into()),
+    };
+    if assignment.symbol.is_some() || receiver.is_some() {
+        validate_node_container(bound, bound.flow_graph(), container, assignment.target)?;
+        if bound.flow_at(assignment.target).is_none() {
+            return Err(invalid().into());
+        }
+    } else {
+        validate_nullish_structural_owner(arena, bound, container, assignment.target)
+            .map_err(|_| invalid())?;
+    }
+    let mut flow = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::ASSIGNMENT)
+            && node.payload == Some(FlowNodePayload::Ast(assignment.target))
+        {
+            let actual = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if flow.replace(actual).is_some()
+                || source_flow_kind(actual, node.flags)? != SourceFlowKind::Assignment
+            {
+                return Err(invalid().into());
+            }
+            linear_antecedent(actual, node)?;
+        }
+    }
+    if flow.is_none() && assignment.symbol.is_some() {
+        return Err(invalid().into());
+    }
+    if flow.is_some() && assignment.symbol.is_none() && receiver.is_none() {
+        return Err(SourceFlowUnsupported::PropertyWrite(assignment.target).into());
+    }
+    Ok(SourceNullishAssignmentProof {
+        assignment,
+        receiver,
+        flow,
+        revision: arena.revision(),
+    })
+}
+
+/// Structural nodes use a real enclosing flow point, not a fabricated node entry.
+fn validate_nullish_structural_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    node: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(node);
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !container.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    let graph = bound.flow_graph();
+    let scope = bound.block_scope_container(node);
+    let mut current = node;
+    let mut visited = HashSet::new();
+    while visited.insert(current) && visited.len() <= FLOW_DEPTH_LIMIT {
+        validate_bound_node(bound, graph, current)?;
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        if bound.container(current) != Some(container)
+            || bound.block_scope_container(current) != scope
+        {
+            return Err(invalid().into());
+        }
+        if bound.flow_container(current).is_some() {
+            validate_node_container(bound, graph, container, current)?;
+            let flow = bound.flow_at(current).ok_or_else(invalid)?;
+            flow_node(graph, flow)?;
+            return Ok(());
+        }
+        if !matches!(
+            record.kind,
+            SyntaxKind::BinaryExpression
+                | SyntaxKind::CallExpression
+                | SyntaxKind::PropertyAccessExpression
+                | SyntaxKind::ElementAccessExpression
+                | SyntaxKind::ParenthesizedExpression
+                | SyntaxKind::VariableDeclaration
+                | SyntaxKind::VariableDeclarationList
+        ) {
+            return Err(invalid().into());
+        }
+        let parent = NodeRef::new(node.arena, node.file, record.parent.ok_or_else(invalid)?);
+        let parent_record = arena.get(parent.node).ok_or_else(invalid)?;
+        let child_matches = match &parent_record.data {
+            NodeData::BinaryExpression(binary)
+                if parent_record.kind == SyntaxKind::BinaryExpression =>
+            {
+                binary.left == current.node || binary.right == current.node
+            }
+            NodeData::CallExpression(call) if parent_record.kind == SyntaxKind::CallExpression => {
+                call.expression == current.node
+                    || call
+                        .arguments
+                        .nodes
+                        .iter()
+                        .filter(|child| **child == current.node)
+                        .count()
+                        == 1
+            }
+            NodeData::PropertyAccessExpression(access)
+                if parent_record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                access.expression == current.node
+            }
+            NodeData::ElementAccessExpression(access)
+                if parent_record.kind == SyntaxKind::ElementAccessExpression =>
+            {
+                access.expression == current.node || access.argument_expression == current.node
+            }
+            NodeData::ParenthesizedExpression(wrapper)
+                if parent_record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression == current.node
+            }
+            NodeData::VariableDeclaration(variable)
+                if parent_record.kind == SyntaxKind::VariableDeclaration =>
+            {
+                variable.initializer == Some(current.node)
+            }
+            NodeData::VariableDeclarationList(list)
+                if parent_record.kind == SyntaxKind::VariableDeclarationList =>
+            {
+                list.declarations
+                    .nodes
+                    .iter()
+                    .filter(|child| **child == current.node)
+                    .count()
+                    == 1
+            }
+            NodeData::VariableStatement(statement)
+                if parent_record.kind == SyntaxKind::VariableStatement =>
+            {
+                statement.declaration_list == current.node
+            }
+            NodeData::ExpressionStatement(statement)
+                if parent_record.kind == SyntaxKind::ExpressionStatement =>
+            {
+                statement.expression == current.node
+            }
+            NodeData::ReturnStatement(statement)
+                if parent_record.kind == SyntaxKind::ReturnStatement =>
+            {
+                statement.expression == Some(current.node)
+            }
+            _ => false,
+        };
+        if !child_matches
+            || record.range.start < parent_record.range.start
+            || record.range.end > parent_record.range.end
+        {
+            return Err(invalid().into());
+        }
+        current = parent;
+    }
+    Err(invalid().into())
+}
+
+fn nullish_member_receiver(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    target: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+    let invalid = || SourceFlowUnsupported::PropertyWrite(target);
+    let mut current = target;
+    let mut visited = HashSet::new();
+    while visited.insert(current) && visited.len() <= FLOW_DEPTH_LIMIT {
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        let receiver = match &record.data {
+            NodeData::PropertyAccessExpression(access)
+                if record.kind == SyntaxKind::PropertyAccessExpression
+                    && access.question_dot_token.is_none() =>
+            {
+                access.expression
+            }
+            NodeData::ElementAccessExpression(access)
+                if record.kind == SyntaxKind::ElementAccessExpression
+                    && access.question_dot_token.is_none() =>
+            {
+                access.expression
+            }
+            NodeData::Identifier(_) if record.kind == SyntaxKind::Identifier => {
+                let symbol = own_class_flow_symbol(store, host, bound, current)?;
+                let declaration = store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .ok_or_else(invalid)?;
+                if bound.container(declaration) != Some(container) {
+                    return Err(invalid().into());
+                }
+                return Ok(Some(symbol));
+            }
+            NodeData::CallExpression(_) if record.kind == SyntaxKind::CallExpression => {
+                return Ok(None);
+            }
+            _ => return Err(invalid().into()),
+        };
+        let receiver = NodeRef::new(target.arena, target.file, receiver);
+        if arena
+            .get(receiver.node)
+            .is_none_or(|record| record.parent != Some(current.node))
+        {
+            return Err(invalid().into());
+        }
+        validate_nullish_structural_owner(arena, bound, container, receiver)
+            .map_err(|_| invalid())?;
+        current = receiver;
+    }
+    Err(invalid().into())
+}
+
+fn validate_nullish_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    call: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+) -> Result<Option<(NodeRef, FlowRef)>, SourceFlowError> {
+    if !assignments
+        .iter()
+        .any(|assignment| source_node_is_descendant_of(arena, call, assignment.expression.node))
+    {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    validate_bound_node(bound, bound.flow_graph(), call)?;
+    let record = arena.get(call.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || data.question_dot_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || bound.container(call) != Some(container)
+        || arena.get(data.expression).is_none_or(|callee| {
+            callee.parent != Some(call.node)
+                || !matches!(
+                    callee.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                )
+        })
+    {
+        return Err(invalid().into());
+    }
+    validate_nullish_structural_owner(arena, bound, container, call).map_err(|_| invalid())?;
+    let mut statement = call;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(statement) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let record = arena.get(statement.node).ok_or_else(invalid)?;
+        if bound.container(statement) != Some(container)
+            || bound
+                .flow_container(statement)
+                .is_some_and(|owner| owner != container)
+            || bound.block_scope_container(statement) != bound.block_scope_container(call)
+        {
+            return Err(invalid().into());
+        }
+        if matches!(
+            record.kind,
+            SyntaxKind::ExpressionStatement
+                | SyntaxKind::VariableStatement
+                | SyntaxKind::ReturnStatement
+        ) {
+            break;
+        }
+        statement = NodeRef::new(call.arena, call.file, record.parent.ok_or_else(invalid)?);
+    }
+    let mut antecedent = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::CALL)
+            && node.payload == Some(FlowNodePayload::Ast(call))
+        {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if source_flow_kind(flow, node.flags)? != SourceFlowKind::Call
+                || antecedent.replace(linear_antecedent(flow, node)?).is_some()
+            {
+                return Err(invalid().into());
+            }
+        }
+    }
+    Ok(Some((statement, antecedent.ok_or_else(invalid)?)))
+}
+
+fn prepare_nullish_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    call: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+    effects: &mut SourceFlowEffects,
+) -> Result<Option<NodeRef>, SourceFlowError> {
+    let Some((statement, antecedent)) =
+        validate_nullish_call(arena, bound, container, call, assignments)?
+    else {
+        return Ok(None);
+    };
+    if effects.nullish_calls.insert(call, antecedent).is_some() {
+        return Err(SourceFlowInvariant::DuplicateCall(call).into());
+    }
+    Ok(Some(statement))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_nullish_assignments(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    container: NodeRef,
+    nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    assignments: &mut Vec<SourceFlowAssignment>,
+    conditions: &mut Vec<SourceFlowCondition>,
+    effects: &mut SourceFlowEffects,
+) -> Result<(), SourceFlowError> {
+    for assignment in nullish_assignments {
+        let host = host.ok_or(SourceFlowInvariant::InvalidParameterAssignment(
+            assignment.target,
+        ))?;
+        let proof =
+            source_nullish_assignment_proof(arena, bound, store, host, container, assignment)?;
+        if effects
+            .nullish_assignments
+            .insert(assignment.target, proof)
+            .is_some()
+            || effects
+                .assignment_declarations
+                .contains_key(&assignment.target)
+            || effects.captured_origins.contains_key(&assignment.target)
+            || effects
+                .property_assignments
+                .contains_key(&assignment.target)
+        {
+            return Err(SourceFlowInvariant::DuplicateAssignment(assignment.target).into());
+        }
+        if let (Some(declaration), Some(symbol)) = (assignment.declaration, assignment.symbol) {
+            effects
+                .assignment_declarations
+                .insert(assignment.target, declaration);
+            assignments.push(SourceFlowAssignment {
+                declaration: assignment.target,
+                symbol,
+            });
+        }
+        for condition in [
+            SourceFlowCondition::Nullish(SourceNullishCondition {
+                expression: assignment.target,
+                symbol: assignment.symbol,
+            }),
+            match assignment.symbol.filter(|_| !assignment.readonly) {
+                Some(symbol) => SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                    expression: assignment.expression,
+                    symbol,
+                    negated: false,
+                }),
+                None => SourceFlowCondition::Unchanged(assignment.expression),
+            },
+        ] {
+            if bound.flow_graph().nodes().iter().any(|node| {
+                node.flags
+                    .intersects(FlowFlags::TRUE_CONDITION | FlowFlags::FALSE_CONDITION)
+                    && node.payload == Some(FlowNodePayload::Ast(condition.expression()))
+            }) {
+                conditions.push(condition);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parameter_assignment_declaration_and_name(
@@ -4748,13 +11111,626 @@ fn validate_class_local_assignment(
     Ok(())
 }
 
-fn validate_parameter_assignment(
+/// Rechecks the real declaration and mutable binding used by a local flow entry.
+fn annotated_uninitialized_local(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     container: NodeRef,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(NodeRef, NodeRef), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(declaration);
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || !declaration.is_for(arena.id(), bound.file_id())
+        || !bound.contains(declaration)
+        || bound.container(declaration) != Some(container)
+    {
+        return Err(invalid().into());
+    }
+    let reference = |node| NodeRef::new(declaration.arena, declaration.file, node);
+    let callable = arena.get(container.node).ok_or_else(invalid)?;
+    let body = match &callable.data {
+        NodeData::FunctionDeclaration(function)
+            if callable.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function.body.map(reference).ok_or_else(invalid)?
+        }
+        NodeData::FunctionExpression(_) if callable.kind == SyntaxKind::FunctionExpression => {
+            validate_source_function_expression_owner(arena, bound, store, container)
+                .map_err(|_| invalid())?
+        }
+        NodeData::ArrowFunction(_) if callable.kind == SyntaxKind::ArrowFunction => {
+            validate_source_arrow_owner(arena, bound, store, container)?
+        }
+        NodeData::MethodDeclaration(method)
+            if callable.kind == SyntaxKind::MethodDeclaration
+                && bound.symbol(container).is_some_and(|owner| {
+                    store.source_object_literal_method_owner_is_exact(container, owner)
+                }) =>
+        {
+            method.body.map(reference).ok_or_else(invalid)?
+        }
+        _ => return Err(invalid().into()),
+    };
+    let body_record = arena.get(body.node).ok_or_else(invalid)?;
+    if body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(container.node)
+        || !matches!(body_record.data, NodeData::Block(_))
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(invalid().into());
+    };
+    let name = reference(variable.name);
+    let name_record = arena.get(name.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid().into());
+    };
+    let annotation = variable
+        .type_
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let list = record
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return Err(invalid().into());
+    };
+    let binding = match list.flags.0 {
+        0 => VariableBindingKind::Var,
+        1 => VariableBindingKind::Let,
+        _ => return Err(invalid().into()),
+    };
+    let statement = list.parent.map(reference).ok_or_else(invalid)?;
+    let statement_record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(invalid().into());
+    };
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    let locals_scope = if binding == VariableBindingKind::Var {
+        container
+    } else {
+        scope
+    };
+    if record.kind != SyntaxKind::VariableDeclaration
+        || record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || annotation.parent != Some(declaration.node)
+        || list.kind != SyntaxKind::VariableDeclarationList
+        || declarations
+            .declarations
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || Some(statement_data.declaration_list) != record.parent
+        || statement_data.modifiers.is_some()
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || !source_node_is_descendant_of(arena, statement, body.node)
+        || bound.block_scope_container(name) != Some(scope)
+        || bound.block_scope_container(statement) != Some(scope)
+        || bound
+            .locals(locals_scope)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&identifier.text))
+            != Some(symbol)
+        || plan_top_level_variable(
+            bound,
+            store,
+            declaration,
+            name,
+            &identifier.text,
+            binding,
+            false,
+        )
+        .map_err(|_| invalid())?
+            != symbol
+    {
+        return Err(invalid().into());
+    }
+    Ok((name, body))
+}
+
+/// Reads the written type only after matching the local and its actual bound read.
+pub(super) fn annotated_uninitialized_local_read_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    read: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<NodeRef>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(read);
+    let (arena, bound) = host.source(read).ok_or_else(invalid)?;
+    let declaration = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    let container = bound.container(declaration).ok_or_else(invalid)?;
+    if container == bound.source_file() {
+        return Ok(None);
+    }
+    if bound.container(read) != Some(container)
+        || bound.flow_container(read) != Some(container)
+        || own_class_flow_symbol(store, host, bound, read)? != symbol
+    {
+        return Err(invalid().into());
+    }
+    annotated_uninitialized_local(arena, bound, store, container, declaration, symbol)?;
+    let NodeData::VariableDeclaration(variable) =
+        &arena.get(declaration.node).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid().into());
+    };
+    variable
+        .type_
+        .map(|node| Some(NodeRef::new(declaration.arena, declaration.file, node)))
+        .ok_or_else(|| invalid().into())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep the local, scope and actual write proof together.
+fn validate_annotated_local_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    let (name, body) = annotated_uninitialized_local(
+        arena,
+        bound,
+        store,
+        container,
+        assignment.parameter,
+        assignment.symbol,
+    )?;
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &target.data else {
+        return Err(invalid().into());
+    };
+    let expression = target
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let statement = expression
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::ExpressionStatement(statement_data) = &statement.data else {
+        return Err(invalid().into());
+    };
+    let statement_ref = NodeRef::new(
+        container.arena,
+        container.file,
+        expression.parent.ok_or_else(invalid)?,
+    );
+    let scope = if let Some(syntax) = statement_list {
+        let expression_ref = NodeRef::new(
+            container.arena,
+            container.file,
+            target.parent.ok_or_else(invalid)?,
+        );
+        validate_statement_list_expression(arena, bound, syntax, statement_ref, expression_ref)?;
+        if syntax.callable.declaration != container || syntax.callable.body != body {
+            return Err(invalid().into());
+        }
+        syntax
+            .linear_statement_scope(statement_ref)
+            .or_else(|| syntax.for_of_statement_scope(statement_ref))
+            .ok_or_else(invalid)?
+    } else {
+        if statement.parent != Some(body.node) {
+            return Err(invalid().into());
+        }
+        container
+    };
+    let resolved_symbol = if statement_list.is_some() {
+        Some(
+            own_class_flow_symbol(store, host.ok_or_else(invalid)?, bound, assignment.target)
+                .map_err(|_| invalid())?,
+        )
+    } else {
+        bound
+            .locals(container)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&identifier.text))
+    };
+    if !assignment.target.is_for(arena.id(), bound.file_id())
+        || !bound.contains(assignment.target)
+        || bound.container(assignment.target) != Some(container)
+        || bound.block_scope_container(assignment.target) != Some(scope)
+        || bound.flow_container(assignment.target) != Some(container)
+        || resolved_symbol != Some(assignment.symbol)
+        || target.kind != SyntaxKind::Identifier
+        || target.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || arena.get(name.node).is_none_or(|record| {
+            !matches!(&record.data, NodeData::Identifier(name) if name.text == identifier.text)
+        })
+        || expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+        || operator.kind != SyntaxKind::EqualsToken
+        || operator.flags.0 != 0
+        || operator.parent != target.parent
+        || !matches!(operator.data, NodeData::Token(_))
+        || arena.get(binary.right).is_none_or(|right| right.parent != target.parent)
+        || statement.kind != SyntaxKind::ExpressionStatement
+        || statement.flags.0 != 0
+        || Some(statement_data.expression) != target.parent
+        || statement_data.flow_node.is_some()
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_statement_list_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    syntax: &SourceCallableStatementListSyntax,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(syntax.callable.declaration);
+    let callable = super::source_callables::plan_source_callable(
+        store,
+        host,
+        syntax.callable.declaration,
+        syntax.callable.owner_symbol,
+        syntax.callable.array_targets,
+    )
+    .map_err(|_| invalid())?;
+    if callable != syntax.callable {
+        return Err(invalid().into());
+    }
+    let actual = plan_source_callable_statement_list_syntax(arena, bound, store, &syntax.callable)
+        .map_err(|_| invalid())?;
+    if actual != *syntax {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_statement_list_expression(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    syntax: &SourceCallableStatementListSyntax,
+    statement: NodeRef,
+    expression: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(expression);
+    let scope = syntax.statement_scope(statement).ok_or_else(invalid)?;
+    let container = syntax.callable.declaration;
+    if syntax.expression_scope(expression) != Some(scope)
+        || [statement, expression, scope, container]
+            .into_iter()
+            .any(|node| !node.is_for(arena.id(), bound.file_id()) || !bound.contains(node))
+        || bound.container(statement) != Some(container)
+        || bound.container(expression) != Some(container)
+        || bound.block_scope_container(statement) != Some(scope)
+        || bound.block_scope_container(expression) != Some(scope)
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::ExpressionStatement(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    let expression_record = arena.get(expression.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::ExpressionStatement
+        || record.flags.0 != 0
+        || data.expression != expression.node
+        || data.flow_node.is_some()
+        || expression_record.parent != Some(statement.node)
+        || expression_record.flags.0 != 0
+        || expression_record.range.start < record.range.start
+        || expression_record.range.end > record.range.end
+    {
+        return Err(invalid().into());
+    }
+    validate_node_container(bound, bound.flow_graph(), container, statement)
+}
+
+fn validate_statement_list_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    syntax: &SourceCallableStatementListSyntax,
+    expression: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(expression);
+    let record = arena.get(expression.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(call) = &record.data else {
+        return Err(invalid().into());
+    };
+    let callee = arena.get(call.expression).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.facts != 0
+        || !matches!(
+            callee.kind,
+            SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+        )
+        || callee.parent != Some(expression.node)
+        || callee.range.start < record.range.start
+        || callee.range.end > record.range.end
+    {
+        return Err(invalid().into());
+    }
+    let statement = NodeRef::new(
+        expression.arena,
+        expression.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    validate_statement_list_expression(arena, bound, syntax, statement, expression)?;
+    Ok(statement)
+}
+fn validate_parameter_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    container: NodeRef,
     assignment: SourceFlowParameterAssignment,
 ) -> Result<(), SourceFlowError> {
+    validate_parameter_assignment_in_list(arena, bound, store, host, container, assignment, None)
+}
+
+fn initialized_statement_local(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    syntax: &SourceCallableStatementListSyntax,
+    declaration: NodeRef,
+) -> Result<Option<(NodeRef, SemanticSymbolId)>, SourceFlowError> {
+    let mut pending = syntax.statements.iter().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            SourceCallableStatementSyntax::Leaf(SourceLinearFunctionStatementSyntax::Local(
+                local,
+            )) if local.declaration == declaration && local.initializer.is_some() => {
+                return Ok(Some((local.name, local.symbol)));
+            }
+            SourceCallableStatementSyntax::ObjectBinding(binding)
+                if arena.get(declaration.node).is_some_and(|record| {
+                    record.kind == SyntaxKind::BindingElement
+                        && record.parent == Some(binding.pattern.node)
+                }) =>
+            {
+                let invalid = || SourceFlowInvariant::InvalidParameterAssignment(declaration);
+                let (kind, element) = super::variables::plan_callable_object_binding_element(
+                    arena,
+                    bound,
+                    store,
+                    declaration,
+                    syntax.callable.declaration,
+                )
+                .map_err(|_| invalid())?;
+                if kind != binding.binding
+                    || bound.block_scope_container(declaration) != Some(binding.block_scope)
+                {
+                    return Err(invalid().into());
+                }
+                return Ok(Some((element.name, element.symbol)));
+            }
+            SourceCallableStatementSyntax::Block { statements, .. } => {
+                pending.extend(statements);
+            }
+            SourceCallableStatementSyntax::If(branch) => {
+                pending.extend(&branch.then_statements);
+                pending.extend(&branch.else_statements);
+            }
+            SourceCallableStatementSyntax::ForOf(iteration) => {
+                pending.extend(&iteration.statements);
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn initialized_local_write_statement(
+    syntax: &SourceCallableStatementListSyntax,
+    wanted: NodeRef,
+) -> bool {
+    let mut pending = syntax.statements.iter().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            SourceCallableStatementSyntax::Leaf(
+                SourceLinearFunctionStatementSyntax::Expression { statement, .. },
+            ) if *statement == wanted => return true,
+            SourceCallableStatementSyntax::Block { statements, .. } => {
+                pending.extend(statements);
+            }
+            SourceCallableStatementSyntax::If(branch) => {
+                pending.extend(&branch.then_statements);
+                pending.extend(&branch.else_statements);
+            }
+            SourceCallableStatementSyntax::ForOf(iteration) => {
+                pending.extend(&iteration.statements);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn validate_initialized_local_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+    syntax: &SourceCallableStatementListSyntax,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    let (name, symbol) =
+        initialized_statement_local(arena, bound, store, syntax, assignment.parameter)?
+            .ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || syntax.callable.declaration != container
+        || symbol != assignment.symbol
+        || [
+            container,
+            assignment.target,
+            assignment.parameter,
+            name,
+        ]
+        .into_iter()
+        .any(|node| !node.is_for(arena.id(), bound.file_id()) || !bound.contains(node))
+        || bound.symbol(assignment.parameter) != Some(assignment.symbol)
+        || bound.container(assignment.parameter) != Some(container)
+        || bound.container(assignment.target) != Some(container)
+        || bound.flow_container(assignment.target) != Some(container)
+        || own_class_flow_symbol(store, host, bound, assignment.target).map_err(|_| invalid())?
+            != assignment.symbol
+    {
+        return Err(invalid().into());
+    }
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &target.data else {
+        return Err(invalid().into());
+    };
+    let expression_ref = NodeRef::new(
+        container.arena,
+        container.file,
+        target.parent.ok_or_else(invalid)?,
+    );
+    let expression = arena.get(expression_ref.node).ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let statement = NodeRef::new(
+        container.arena,
+        container.file,
+        expression.parent.ok_or_else(invalid)?,
+    );
+    validate_statement_list_expression(arena, bound, syntax, statement, expression_ref)?;
+    if !initialized_local_write_statement(syntax, statement)
+        || bound.block_scope_container(assignment.target) != syntax.statement_scope(statement)
+        || target.kind != SyntaxKind::Identifier
+        || target.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || arena.get(name.node).is_none_or(|record| {
+            !matches!(&record.data, NodeData::Identifier(name) if name.text == identifier.text)
+        })
+        || expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+        || operator.kind != SyntaxKind::EqualsToken
+        || operator.flags.0 != 0
+        || operator.parent != Some(expression_ref.node)
+        || !matches!(operator.data, NodeData::Token(_))
+        || target.range.start < expression.range.start
+        || target.range.end > expression.range.end
+        || operator.range.start < target.range.end
+        || operator.range.end > expression.range.end
+        || arena.get(binary.right).is_none_or(|right| {
+            right.parent != Some(expression_ref.node)
+                || right.range.start < operator.range.end
+                || right.range.end > expression.range.end
+        })
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_parameter_assignment_in_list(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
+) -> Result<(), SourceFlowError> {
+    if arena
+        .get(assignment.parameter.node)
+        .is_some_and(|record| record.kind == SyntaxKind::BindingElement)
+    {
+        return validate_initialized_local_assignment(
+            arena,
+            bound,
+            store,
+            host.ok_or(SourceFlowInvariant::InvalidParameterAssignment(assignment.target))?,
+            container,
+            assignment,
+            statement_list.ok_or(SourceFlowInvariant::InvalidParameterAssignment(
+                assignment.target,
+            ))?,
+        );
+    }
+    if arena
+        .get(assignment.parameter.node)
+        .is_some_and(|record| record.kind == SyntaxKind::VariableDeclaration)
+    {
+        if arena.get(assignment.parameter.node).is_some_and(|record| {
+            matches!(&record.data, NodeData::VariableDeclaration(variable) if variable.initializer.is_some())
+        }) {
+            return validate_initialized_local_assignment(
+                arena,
+                bound,
+                store,
+                host.ok_or(SourceFlowInvariant::InvalidParameterAssignment(assignment.target))?,
+                container,
+                assignment,
+                statement_list.ok_or(SourceFlowInvariant::InvalidParameterAssignment(
+                    assignment.target,
+                ))?,
+            );
+        }
+        return validate_annotated_local_assignment(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            assignment,
+            statement_list,
+        );
+    }
     let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
     if !assignment.target.is_for(arena.id(), bound.file_id())
         || !assignment.parameter.is_for(arena.id(), bound.file_id())
@@ -4763,15 +11739,45 @@ fn validate_parameter_assignment(
         || bound.symbol(assignment.parameter) != Some(assignment.symbol)
         || bound.container(assignment.parameter) != Some(container)
         || bound.container(assignment.target) != Some(container)
-        || bound.block_scope_container(assignment.target) != Some(container)
+        || statement_list.is_none()
+            && bound.block_scope_container(assignment.target) != Some(container)
         || bound.flow_container(assignment.target) != Some(container)
     {
         return Err(invalid().into());
     }
 
     let function = arena.get(container.node).ok_or_else(invalid)?;
-    let NodeData::FunctionDeclaration(function_data) = &function.data else {
-        return Err(invalid().into());
+    let (parameters, function_body) = match &function.data {
+        NodeData::FunctionDeclaration(function_data)
+            if function.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            (&function_data.parameters, function_data.body)
+        }
+        NodeData::FunctionExpression(function_data)
+            if function.kind == SyntaxKind::FunctionExpression
+                && statement_list.is_some_and(|syntax| {
+                    syntax.callable.declaration == container
+                        && syntax.callable.family
+                            == super::source_callables::SourceCallableFamily::ArrowFunction
+                        && syntax.callable.body.node == function_data.body
+                        && bound.symbol(container) == Some(syntax.callable.owner_symbol)
+                }) =>
+        {
+            (&function_data.parameters, Some(function_data.body))
+        }
+        NodeData::MethodDeclaration(method)
+            if function.kind == SyntaxKind::MethodDeclaration
+                && method.asterisk_token.is_none()
+                && method.modifiers.is_none()
+                && method.type_parameters.is_none()
+                && method.postfix_token.is_none()
+                && bound.symbol(container).is_some_and(|owner| {
+                    store.source_object_literal_method_owner_is_exact(container, owner)
+                }) =>
+        {
+            (&method.parameters, method.body)
+        }
+        _ => return Err(invalid().into()),
     };
     let (parameter_declaration, parameter_name) = parameter_assignment_declaration_and_name(
         arena,
@@ -4790,11 +11796,11 @@ fn validate_parameter_assignment(
     let NodeData::Identifier(target_identifier) = &target.data else {
         return Err(invalid().into());
     };
-    if function.kind != SyntaxKind::FunctionDeclaration
-        || parameter.kind != SyntaxKind::Parameter
+    if parameter.kind != SyntaxKind::Parameter
         || parameter.parent != Some(container.node)
-        || function_data
-            .parameters
+        || function.kind == SyntaxKind::MethodDeclaration
+            && parameter_declaration != assignment.parameter
+        || parameters
             .nodes
             .iter()
             .filter(|node| **node == parameter_declaration.node)
@@ -4819,6 +11825,13 @@ fn validate_parameter_assignment(
         return Err(invalid().into());
     };
     let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let compound = statement_list.is_some()
+        && matches!(
+            function.kind,
+            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression
+        )
+        && parameter_declaration == assignment.parameter
+        && super::primitive_operators::compound_assignment_binary_operator(operator.kind).is_some();
     if expression.kind != SyntaxKind::BinaryExpression
         || expression.flags.0 != 0
         || binary.left != assignment.target.node
@@ -4826,7 +11839,7 @@ fn validate_parameter_assignment(
         || binary.type_.is_some()
         || binary.facts != 0
         || binary.modifiers.is_some()
-        || operator.kind != SyntaxKind::EqualsToken
+        || operator.kind != SyntaxKind::EqualsToken && !compound
         || operator.flags.0 != 0
         || operator.parent != target.parent
         || !matches!(operator.data, NodeData::Token(_))
@@ -4849,11 +11862,31 @@ fn validate_parameter_assignment(
         || statement.flags.0 != 0
         || statement_data.expression != target.parent.ok_or_else(invalid)?
         || statement_data.flow_node.is_some()
-        || body.kind != SyntaxKind::Block
-        || body.parent != Some(container.node)
-        || function_data.body != statement.parent
+        || statement_list.is_none()
+            && (body.kind != SyntaxKind::Block
+                || body.parent != Some(container.node)
+                || function_body != statement.parent)
     {
         return Err(invalid().into());
+    }
+    if let Some(syntax) = statement_list {
+        let expression_ref = NodeRef::new(
+            container.arena,
+            container.file,
+            target.parent.ok_or_else(invalid)?,
+        );
+        let statement_ref = NodeRef::new(
+            container.arena,
+            container.file,
+            expression.parent.ok_or_else(invalid)?,
+        );
+        validate_statement_list_expression(arena, bound, syntax, statement_ref, expression_ref)?;
+        if function_body != Some(syntax.callable.body.node)
+            || bound.block_scope_container(assignment.target)
+                != syntax.statement_scope(statement_ref)
+        {
+            return Err(invalid().into());
+        }
     }
     Ok(())
 }
@@ -4865,8 +11898,18 @@ fn validate_arrow_statement(
     container: NodeRef,
     statement: NodeRef,
 ) -> Result<(), SourceFlowError> {
-    let invalid = || SourceFlowInvariant::InvalidCall(statement);
     let body = validate_source_arrow_owner(arena, bound, store, container)?;
+    validate_callable_expression_statement(arena, bound, container, body, statement)
+}
+
+fn validate_callable_expression_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(statement);
     if !statement.is_for(arena.id(), bound.file_id())
         || !bound.contains(statement)
         || bound.container(statement) != Some(container)
@@ -4998,10 +12041,24 @@ fn validate_direct_call(
     let body_id = statement.parent.ok_or_else(invalid)?;
     let body = arena.get(body_id).ok_or_else(invalid)?;
     let function = arena.get(container.node).ok_or_else(invalid)?;
-    let NodeData::FunctionDeclaration(function_data) = &function.data else {
-        return Err(invalid().into());
-    };
-    let function_body = function_data.body.ok_or_else(invalid)?;
+    let function_body = match &function.data {
+        NodeData::FunctionDeclaration(function_data)
+            if function.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function_data.body
+        }
+        NodeData::MethodDeclaration(method)
+            if function.kind == SyntaxKind::MethodDeclaration
+                && function
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression) =>
+        {
+            method.body
+        }
+        _ => return Err(invalid().into()),
+    }
+    .ok_or_else(invalid)?;
     let scope = if body_id == function_body {
         container
     } else {
@@ -5013,7 +12070,6 @@ fn validate_direct_call(
         || statement_data.expression != expression.node
         || statement_data.flow_node.is_some()
         || body.kind != SyntaxKind::Block
-        || function.kind != SyntaxKind::FunctionDeclaration
         || arena.get(function_body).is_none_or(|body| {
             body.kind != SyntaxKind::Block || body.parent != Some(container.node)
         })
@@ -5033,8 +12089,21 @@ fn validate_array_mutation(
     container: NodeRef,
     mutation: SourceFlowArrayMutation,
 ) -> Result<(), SourceFlowError> {
+    validate_array_mutation_in_list(arena, bound, container, mutation, None)
+}
+
+fn validate_array_mutation_in_list(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    mutation: SourceFlowArrayMutation,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
+) -> Result<(), SourceFlowError> {
     let invalid = || SourceFlowInvariant::InvalidArrayMutation(mutation.call);
-    validate_direct_call(arena, bound, container, mutation.call)?;
+    match statement_list {
+        Some(syntax) => validate_statement_list_call(arena, bound, syntax, mutation.call)?,
+        None => validate_direct_call(arena, bound, container, mutation.call)?,
+    };
     if bound.symbol(mutation.declaration) != Some(mutation.symbol)
         || bound.container(mutation.declaration) != Some(container)
         || bound.container(mutation.receiver) != Some(container)
@@ -5106,6 +12175,23 @@ fn validate_planned_call_container(
     statement: NodeRef,
     antecedent: FlowRef,
 ) -> Result<(), SourceFlowError> {
+    if let Some(expected) = plan.nullish_calls.get(&call) {
+        if *expected != antecedent
+            || !bound.contains(call)
+            || bound.container(call) != Some(plan.container)
+            || bound
+                .flow_container(call)
+                .is_some_and(|owner| owner != plan.container)
+            || bound.container(statement) != Some(plan.container)
+            || bound.flow_container(statement) != Some(plan.container)
+            || bound.flow_at(statement).is_none()
+            || bound.block_scope_container(call) != bound.block_scope_container(statement)
+            || plan.calls.get(&call) != Some(&statement)
+        {
+            return Err(SourceFlowInvariant::InvalidCall(call).into());
+        }
+        return Ok(());
+    }
     let Some(body) = plan.class_body.as_ref() else {
         return validate_call_container(bound, plan.container, call, statement, antecedent);
     };
@@ -5117,6 +12203,440 @@ fn validate_planned_call_container(
         return Err(SourceFlowInvariant::InvalidCall(call).into());
     }
     Ok(())
+}
+
+fn class_flow_source_node<'host>(
+    store: &CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<&'host ts_ast::Node, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(node);
+    let record = super::declared::preflight_node(store, host, node).map_err(|_| invalid())?;
+    let parent = record
+        .parent
+        .map_or(super::store::SourceNodeParent::Root, |parent| {
+            super::store::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+        });
+    if store.source_node_kind(node) != Some(record.kind)
+        || store.source_node_parent(node) != Some(parent)
+    {
+        return Err(invalid().into());
+    }
+    Ok(record)
+}
+
+fn validate_class_property_flow_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceFlowCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    match condition {
+        SourceFlowCondition::ClassPropertyTruthiness(condition) => {
+            validate_class_property_condition(store, host, bound, body, condition)
+        }
+        SourceFlowCondition::ClassPropertyEquality(condition) => {
+            validate_class_property_equality_condition(store, host, bound, body, condition)
+        }
+        SourceFlowCondition::ClassPropertyPredicate(condition) => {
+            validate_class_property_predicate_condition(store, host, bound, body, condition)
+        }
+        _ => Err(SourceFlowInvariant::InvalidClassProperty(condition.expression()).into()),
+    }
+}
+
+/// Equality keeps the ordinary field proof and resolves undefined at its written location.
+pub(super) fn validate_class_property_equality_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceClassPropertyEqualityCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(condition.access);
+    let (arena, binding) = host.source(condition.expression).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || binding.source_file() != bound.source_file()
+        || !condition.access.is_for(arena.id(), bound.file_id())
+        || !condition.value.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    let root = class_flow_source_node(store, host, condition.expression)?;
+    let NodeData::BinaryExpression(binary) = &root.data else {
+        return Err(invalid().into());
+    };
+    let operator = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        binary.operator_token,
+    );
+    let operator_record = class_flow_source_node(store, host, operator)?;
+    let expected_operator = match condition.comparison {
+        SourceTypeofComparison::Equal => SyntaxKind::EqualsEqualsEqualsToken,
+        SourceTypeofComparison::NotEqual => SyntaxKind::ExclamationEqualsEqualsToken,
+    };
+    let operands_match = [binary.left, binary.right] == [condition.access.node, condition.value.node]
+        || [binary.left, binary.right] == [condition.value.node, condition.access.node];
+    let access = class_flow_source_node(store, host, condition.access)?;
+    let value = class_flow_source_node(store, host, condition.value)?;
+    let (left, right) = if binary.left == condition.access.node {
+        (access, value)
+    } else {
+        (value, access)
+    };
+    if root.kind != SyntaxKind::BinaryExpression
+        || root.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || !operands_match
+        || access.parent != Some(condition.expression.node)
+        || value.parent != Some(condition.expression.node)
+        || value.kind != SyntaxKind::Identifier
+        || value.flags.0 != 0
+        || !matches!(&value.data, NodeData::Identifier(identifier)
+            if identifier.text == "undefined" && identifier.flow_node.is_none())
+        || operator_record.parent != Some(condition.expression.node)
+        || operator_record.kind != expected_operator
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || left.range.start < root.range.start
+        || left.range.end > operator_record.range.start
+        || operator_record.range.end > right.range.start
+        || right.range.end > root.range.end
+    {
+        return Err(invalid().into());
+    }
+    let statement = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        root.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = class_flow_source_node(store, host, statement)?;
+    if statement_record.kind != SyntaxKind::IfStatement
+        || statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::IfStatement(branch)
+            if branch.expression == condition.expression.node && branch.facts == 0 && branch.flow_node.is_none())
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let undefined = store
+        .intrinsic_bootstrap()
+        .ok_or_else(invalid)?
+        .undefined_symbol;
+    let mut callbacks = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let resolved = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callbacks)
+        .map_err(|_| invalid())?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(condition.value)),
+            "undefined",
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?;
+    if resolved.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(undefined) {
+        return Err(invalid().into());
+    }
+    let source = plan_class_property_truthiness(store, host, body, condition.access)
+        .map_err(|_| invalid())?;
+    let edges = class_property_condition_edges(bound, condition.expression, condition.access)?;
+    Ok((source, edges))
+}
+
+fn validate_class_property_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceClassPropertyTruthinessCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(condition.access);
+    let (arena, binding) = host.source(condition.expression).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || binding.source_file() != bound.source_file()
+        || !condition.access.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    let root = class_flow_source_node(store, host, condition.expression)?;
+    let statement = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        root.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = class_flow_source_node(store, host, statement)?;
+    if statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::IfStatement(branch)
+            if branch.expression == condition.expression.node && branch.facts == 0 && branch.flow_node.is_none())
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let mut current = condition.expression;
+    let mut negated = false;
+    let mut visited = HashSet::new();
+    while current != condition.access {
+        if !visited.insert(current) {
+            return Err(invalid().into());
+        }
+        let record = class_flow_source_node(store, host, current)?;
+        if record.flags.0 != 0 {
+            return Err(invalid().into());
+        }
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                parenthesized.expression
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if record.kind == SyntaxKind::PrefixUnaryExpression
+                    && prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                negated = !negated;
+                prefix.operand
+            }
+            _ => return Err(invalid().into()),
+        };
+        let child = NodeRef::new(current.arena, current.file, child);
+        if class_flow_source_node(store, host, child)?.parent != Some(current.node) {
+            return Err(invalid().into());
+        }
+        current = child;
+    }
+    if negated != condition.negated {
+        return Err(invalid().into());
+    }
+    let source = plan_class_property_truthiness(store, host, body, condition.access)
+        .map_err(|_| invalid())?;
+    let edges = class_property_condition_edges(bound, condition.expression, condition.access)?;
+    Ok((source, edges))
+}
+
+fn class_property_condition_edges(
+    bound: &BoundFile,
+    expression: NodeRef,
+    access: NodeRef,
+) -> Result<[FlowRef; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
+    let entry = bound.flow_at(access).ok_or_else(invalid)?;
+    let mut edges = 0;
+    let mut edge_flows = [None, None];
+    for (index, row) in bound.flow_graph().nodes().iter().enumerate() {
+        if row.payload != Some(FlowNodePayload::Ast(expression)) {
+            continue;
+        }
+        let flow = FlowRef::new(
+            bound.node_arena_id(),
+            bound.file_id(),
+            FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+        );
+        let edge = match source_flow_kind(flow, row.flags)? {
+            SourceFlowKind::TrueCondition => TRUE_CONDITION_EDGE,
+            SourceFlowKind::FalseCondition => FALSE_CONDITION_EDGE,
+            _ => return Err(invalid().into()),
+        };
+        if edges & edge != 0 || linear_antecedent(flow, row)? != entry {
+            return Err(invalid().into());
+        }
+        edges |= edge;
+        edge_flows[usize::from(edge == FALSE_CONDITION_EDGE)] = Some(flow);
+    }
+    if edges != BOTH_CONDITION_EDGES {
+        return Err(SourceFlowInvariant::MissingConditionEdge {
+            condition: expression,
+            true_edge: edges & TRUE_CONDITION_EDGE != 0,
+            false_edge: edges & FALSE_CONDITION_EDGE != 0,
+        }
+        .into());
+    }
+    Ok([
+        edge_flows[0].ok_or_else(invalid)?,
+        edge_flows[1].ok_or_else(invalid)?,
+    ])
+}
+
+#[allow(clippy::too_many_lines)] // The call and both binder edges share one source proof.
+fn validate_class_property_predicate_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceClassPropertyPredicateCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+    let (arena, binding) = host.source(condition.expression).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || binding.source_file() != bound.source_file()
+        || !condition.call.is_for(arena.id(), bound.file_id())
+        || !condition.access.is_for(arena.id(), bound.file_id())
+        || bound.container(condition.call) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let root = class_flow_source_node(store, host, condition.expression)?;
+    let statement = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        root.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = class_flow_source_node(store, host, statement)?;
+    if statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::IfStatement(branch)
+            if branch.expression == condition.expression.node && branch.facts == 0 && branch.flow_node.is_none())
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let mut current = condition.expression;
+    let mut negated = false;
+    let mut visited = HashSet::new();
+    while current != condition.call {
+        if !visited.insert(current) {
+            return Err(invalid().into());
+        }
+        let record = class_flow_source_node(store, host, current)?;
+        if record.flags.0 != 0 {
+            return Err(invalid().into());
+        }
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                parenthesized.expression
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if record.kind == SyntaxKind::PrefixUnaryExpression
+                    && prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                negated = !negated;
+                prefix.operand
+            }
+            _ => return Err(invalid().into()),
+        };
+        let child = NodeRef::new(current.arena, current.file, child);
+        if class_flow_source_node(store, host, child)?.parent != Some(current.node) {
+            return Err(invalid().into());
+        }
+        current = child;
+    }
+    if negated != condition.negated {
+        return Err(invalid().into());
+    }
+    let call_record = class_flow_source_node(store, host, condition.call)?;
+    let NodeData::CallExpression(call) = &call_record.data else {
+        return Err(invalid().into());
+    };
+    let syntax =
+        plan_direct_source_call_syntax(arena, store, condition.call).map_err(|_| invalid())?;
+    if call.type_arguments.is_some()
+        || syntax.arguments() != [condition.access]
+        || class_flow_source_node(store, host, syntax.callee())?.kind != SyntaxKind::Identifier
+    {
+        return Err(SourceFlowUnsupported::Call(condition.call).into());
+    }
+    let source = plan_class_property_truthiness(store, host, body, condition.access)
+        .map_err(|_| invalid())?;
+    let entry = bound.flow_at(condition.access).ok_or_else(invalid)?;
+    let mut edge_flows = [None, None];
+    for (index, row) in bound.flow_graph().nodes().iter().enumerate() {
+        if row.payload != Some(FlowNodePayload::Ast(condition.expression)) {
+            continue;
+        }
+        let flow = FlowRef::new(
+            arena.id(),
+            bound.file_id(),
+            FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+        );
+        let edge = match source_flow_kind(flow, row.flags)? {
+            SourceFlowKind::TrueCondition => 0,
+            SourceFlowKind::FalseCondition => 1,
+            _ => return Err(invalid().into()),
+        };
+        if edge_flows[edge].replace(flow).is_some() || linear_antecedent(flow, row)? != entry {
+            return Err(invalid().into());
+        }
+    }
+    let [Some(true_edge), Some(false_edge)] = edge_flows else {
+        return Err(SourceFlowInvariant::MissingConditionEdge {
+            condition: condition.expression,
+            true_edge: edge_flows[0].is_some(),
+            false_edge: edge_flows[1].is_some(),
+        }
+        .into());
+    };
+    Ok((source, [true_edge, false_edge]))
+}
+
+/// Calls use the recorded flow of their actual callee, not a call-node flow record.
+fn class_call_flow_container(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    let (arena, bound) = host.source(call).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !call.is_for(arena.id(), bound.file_id())
+        || !bound.contains(call)
+    {
+        return Err(invalid().into());
+    }
+    let syntax = plan_direct_source_call_syntax(arena, store, call).map_err(|_| invalid())?;
+    let mut parent = call;
+    let mut current = syntax.callee();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let parent_record = class_flow_source_node(store, host, parent).map_err(|_| invalid())?;
+        let record = class_flow_source_node(store, host, current).map_err(|_| invalid())?;
+        if record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || record.range.start < parent_record.range.start
+            || record.range.end > parent_record.range.end
+        {
+            return Err(invalid().into());
+        }
+        if let Some(container) = bound.flow_container(current) {
+            let flow = bound.flow_at(current).ok_or_else(invalid)?;
+            flow_node(bound.flow_graph(), flow)?;
+            validate_container(bound.flow_graph(), container)?;
+            return Ok(container);
+        }
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::PropertyAccessExpression(property)
+                if record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                property.expression
+            }
+            NodeData::CallExpression(_) if record.kind == SyntaxKind::CallExpression => {
+                plan_direct_source_call_syntax(arena, store, current)
+                    .map_err(|_| invalid())?
+                    .callee()
+                    .node
+            }
+            _ => return Err(invalid().into()),
+        };
+        parent = current;
+        current = NodeRef::new(call.arena, call.file, child);
+    }
 }
 
 fn validate_class_body_call(
@@ -5329,6 +12849,9 @@ fn plan_outer_class_property_assignment(
 }
 
 fn is_property_assignment_target(host: &DeclaredTypeHost<'_>, target: NodeRef) -> bool {
+    if class_destructuring_write_assignment(host, target).is_some() {
+        return true;
+    }
     let Some(record) = host.node(target) else {
         return false;
     };
@@ -5367,19 +12890,25 @@ fn plan_constructor_property_assignment(
     {
         return Err(invalid().into());
     }
-    let expression = NodeRef::new(
-        target.arena,
-        target.file,
-        host.node(target)
-            .and_then(|record| record.parent)
-            .ok_or_else(invalid)?,
-    );
-    let plan = plan_class_property_write(store, host, expression).map_err(|error| match error {
+    let plan = if class_destructuring_write_assignment(host, target).is_some() {
+        plan_class_destructuring_property_write(store, host, target)
+    } else {
+        let expression = NodeRef::new(
+            target.arena,
+            target.file,
+            host.node(target)
+                .and_then(|record| record.parent)
+                .ok_or_else(invalid)?,
+        );
+        plan_class_property_write(store, host, expression)
+    }
+    .map_err(|error| match error {
         SourcePropertyError::Unsupported(_) => {
             SourceFlowError::Unsupported(SourceFlowUnsupported::PropertyWrite(target))
         }
         _ => invalid().into(),
     })?;
+    let expression = plan.node();
     let node = flow_node(bound.flow_graph(), flow)?;
     if plan.target() != target
         || plan.context().class_symbol() != body.class_symbol
@@ -5556,6 +13085,236 @@ fn logical_statement_rows(
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn prepare_class_expression_conditions(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    container: NodeRef,
+    points: &[NodeRef],
+    conditions: Vec<SourceFlowCondition>,
+) -> Result<
+    (
+        Vec<SourceFlowCondition>,
+        HashMap<NodeRef, SourceClassExpressionConditionProof>,
+    ),
+    SourceFlowError,
+> {
+    let mut proofs = HashMap::new();
+    if !conditions
+        .iter()
+        .any(|condition| matches!(condition, SourceFlowCondition::ClassExpression(_)))
+    {
+        return Ok((conditions, proofs));
+    }
+    let end = if matches!(
+        body.kind,
+        ClassBodyKind::Constructor | ClassBodyKind::StaticBlock
+    ) {
+        Some(
+            bound
+                .flow_graph()
+                .container_return(body.declaration)
+                .ok_or(SourceFlowInvariant::InvalidClassBody(body.declaration))?,
+        )
+    } else {
+        bound.flow_graph().container_end(container)
+    };
+    let retained = retained_condition_edges(bound, container, points, end)?;
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for condition in conditions {
+        if !seen.insert(condition.expression()) {
+            return Err(SourceFlowInvariant::DuplicateCondition(condition.expression()).into());
+        }
+        let SourceFlowCondition::ClassExpression(source) = condition else {
+            result.push(condition);
+            continue;
+        };
+        let Some(&edges) = retained.get(&source.expression) else {
+            continue;
+        };
+        let checked = validate_class_expression_condition(arena, bound, store, host, body, source)?;
+        proofs.insert(
+            source.expression,
+            SourceClassExpressionConditionProof { source, edges },
+        );
+        result.push(checked);
+    }
+    Ok((result, proofs))
+}
+
+#[allow(clippy::too_many_lines)] // Keep source ownership and binding checks together.
+fn validate_class_expression_condition(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    source: SourceClassExpressionCondition,
+) -> Result<SourceFlowCondition, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(source.expression);
+    let owner = class_flow_source_node(store, host, source.owner).map_err(|_| invalid())?;
+    let expression =
+        class_flow_source_node(store, host, source.expression).map_err(|_| invalid())?;
+    if !source.owner.is_for(arena.id(), bound.file_id())
+        || expression.parent != Some(source.owner.node)
+        || owner.flags.0 != 0
+        || !source_node_is_descendant_of(arena, source.owner, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let nullish = match &owner.data {
+        NodeData::BinaryExpression(binary) if owner.kind == SyntaxKind::BinaryExpression => {
+            let token = arena.get(binary.operator_token).ok_or_else(invalid)?;
+            if token.parent != Some(source.owner.node)
+                || token.flags.0 != 0
+                || !matches!(token.data, NodeData::Token(_))
+                || !matches!(
+                    token.kind,
+                    SyntaxKind::AmpersandAmpersandToken
+                        | SyntaxKind::BarBarToken
+                        | SyntaxKind::QuestionQuestionToken
+                )
+                || source.expression.node != binary.left && source.expression.node != binary.right
+            {
+                return Err(invalid().into());
+            }
+            token.kind == SyntaxKind::QuestionQuestionToken && source.expression.node == binary.left
+        }
+        NodeData::ConditionalExpression(conditional)
+            if owner.kind == SyntaxKind::ConditionalExpression
+                && conditional.condition == source.expression.node
+                && super::source_calls::conditional_call_argument_syntax(arena, source.owner)
+                    .is_some() =>
+        {
+            false
+        }
+        NodeData::IfStatement(statement)
+            if owner.kind == SyntaxKind::IfStatement
+                && statement.expression == source.expression.node
+                && statement.flow_node.is_none()
+                && statement.facts == 0 => false,
+        _ => return Err(invalid().into()),
+    };
+    if nullish != matches!(source.kind, SourceClassExpressionConditionKind::Nullish(_)) {
+        return Err(invalid().into());
+    }
+    let mut reference = source.expression;
+    let mut negated = false;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(reference) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let record = class_flow_source_node(store, host, reference).map_err(|_| invalid())?;
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if !nullish
+                    && record.kind == SyntaxKind::PrefixUnaryExpression
+                    && prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                negated = !negated;
+                prefix.operand
+            }
+            _ => break,
+        };
+        let child = NodeRef::new(reference.arena, reference.file, child);
+        let child_record = class_flow_source_node(store, host, child).map_err(|_| invalid())?;
+        if record.flags.0 != 0
+            || child_record.parent != Some(reference.node)
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        reference = child;
+    }
+    match source.kind {
+        SourceClassExpressionConditionKind::Nullish(symbol)
+        | SourceClassExpressionConditionKind::Truthiness(symbol, _) => {
+            let parameter = body
+                .parameters
+                .iter()
+                .find(|parameter| parameter.symbol == symbol)
+                .ok_or_else(invalid)?;
+            let record = class_flow_source_node(store, host, parameter.declaration)
+                .map_err(|_| invalid())?;
+            let NodeData::ParameterDeclaration(parameter_data) = &record.data else {
+                return Err(invalid().into());
+            };
+            if record.kind != SyntaxKind::Parameter
+                || record.parent != Some(body.declaration.node)
+                || parameter_data.name != parameter.name_node.node
+                || parameter_data
+                    .type_
+                    .map(|node| NodeRef::new(reference.arena, reference.file, node))
+                    != parameter.annotation
+                || bound.container(parameter.declaration) != Some(body.declaration)
+                || bound.flow_container(reference) != Some(body.declaration)
+                || bound
+                    .symbol(parameter.declaration)
+                    .and_then(|raw| store.get_merged_symbol(raw))
+                    != Some(symbol)
+                || own_class_flow_reference_symbol(store, host, bound, reference)? != Some(symbol)
+                || !matches!(
+                    arena
+                        .get(reference.node)
+                        .map(|node| (&node.kind, &node.data)),
+                    Some((SyntaxKind::Identifier, NodeData::Identifier(_)))
+                )
+                || matches!(source.kind, SourceClassExpressionConditionKind::Truthiness(_, expected) if expected != negated)
+            {
+                return Err(invalid().into());
+            }
+            Ok(if nullish {
+                SourceFlowCondition::Nullish(SourceNullishCondition {
+                    expression: source.expression,
+                    symbol: Some(symbol),
+                })
+            } else {
+                SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                    expression: source.expression,
+                    symbol,
+                    negated,
+                })
+            })
+        }
+        SourceClassExpressionConditionKind::Call => {
+            let NodeData::CallExpression(call) = &expression.data else {
+                return Err(invalid().into());
+            };
+            let syntax = plan_direct_source_call_syntax(arena, store, source.expression)
+                .map_err(|_| invalid())?;
+            if expression.kind != SyntaxKind::CallExpression
+                || expression.flags.0 != 0
+                || reference != source.expression
+                || negated
+                || call.question_dot_token.is_some()
+                || call.type_arguments.is_some()
+                || call.symbol.is_some()
+                || call.facts != 0
+                || !syntax.arguments().is_empty()
+                || class_call_flow_container(store, host, source.expression)? != body.declaration
+            {
+                return Err(invalid().into());
+            }
+            Ok(SourceFlowCondition::Unchanged(source.expression))
+        }
+        SourceClassExpressionConditionKind::Reference => {
+            references::validate_condition_syntax(store, host, bound, body, source.expression)?;
+            Ok(SourceFlowCondition::Reference(source.expression))
+        }
+    }
+}
+
 /// The binder drops logical joins without flow effects. Candidate syntax does not
 /// make those discarded edges part of a callable's retained flow plan.
 fn retained_linear_truthiness_conditions(
@@ -5582,15 +13341,31 @@ fn retained_linear_truthiness_conditions(
         }
         let mut reference = expression;
         let mut wrappers = HashSet::new();
-        while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
-            arena.get(reference.node).map(|record| &record.data)
-        {
+        let mut negated = false;
+        loop {
             if !wrappers.insert(reference) {
                 return Err(SourceFlowInvariant::UnknownCondition(expression).into());
             }
-            reference = NodeRef::new(reference.arena, reference.file, parenthesized.expression);
+            let inner = match arena
+                .get(reference.node)
+                .map(|record| (&record.kind, &record.data))
+            {
+                Some((
+                    SyntaxKind::ParenthesizedExpression,
+                    NodeData::ParenthesizedExpression(parenthesized),
+                )) => parenthesized.expression,
+                Some((
+                    SyntaxKind::PrefixUnaryExpression,
+                    NodeData::PrefixUnaryExpression(prefix),
+                )) if prefix.operator == SyntaxKind::ExclamationToken => {
+                    negated = !negated;
+                    prefix.operand
+                }
+                _ => break,
+            };
+            reference = NodeRef::new(reference.arena, reference.file, inner);
         }
-        if condition.negated
+        if condition.negated != negated
             || !arena.get(reference.node).is_some_and(|record| {
                 record.kind == SyntaxKind::Identifier
                     && matches!(record.data, NodeData::Identifier(_))
@@ -5601,6 +13376,22 @@ fn retained_linear_truthiness_conditions(
         validate_node_container(bound, graph, container, reference)?;
     }
 
+    let retained = retained_condition_edges(bound, container, points, graph.container_end(container))?;
+    Ok(conditions
+        .into_iter()
+        .filter(|condition| retained.contains_key(&condition.expression))
+        .map(SourceFlowCondition::Truthiness)
+        .collect())
+}
+
+fn retained_condition_edges(
+    bound: &BoundFile,
+    container: NodeRef,
+    points: &[NodeRef],
+    end: Option<FlowRef>,
+) -> Result<HashMap<NodeRef, u8>, SourceFlowError> {
+    let graph = bound.flow_graph();
+    validate_container(graph, container)?;
     let mut point_flows = HashMap::new();
     let mut point_order = Vec::new();
     for &point in points {
@@ -5617,10 +13408,10 @@ fn retained_linear_truthiness_conditions(
     let mut pending = point_order
         .iter()
         .map(|point| point_flows[point])
-        .chain(graph.container_end(container))
+        .chain(end)
         .collect::<Vec<_>>();
     let mut visited = HashSet::new();
-    let mut retained = HashSet::new();
+    let mut retained = HashMap::new();
     while let Some(flow) = pending.pop() {
         if !visited.insert(flow) {
             continue;
@@ -5629,8 +13420,13 @@ fn retained_linear_truthiness_conditions(
         match source_flow_kind(flow, node.flags)? {
             SourceFlowKind::Unreachable => validate_unreachable_node(graph, flow, &node)?,
             SourceFlowKind::Start => {}
-            SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
-                retained.insert(ast_payload(flow, &node)?);
+            kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
+                *retained.entry(ast_payload(flow, &node)?).or_default() |=
+                    if kind == SourceFlowKind::TrueCondition {
+                        TRUE_CONDITION_EDGE
+                    } else {
+                        FALSE_CONDITION_EDGE
+                    };
                 pending.push(linear_antecedent(flow, &node)?);
             }
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation | SourceFlowKind::Call => {
@@ -5641,11 +13437,7 @@ fn retained_linear_truthiness_conditions(
             }
         }
     }
-    Ok(conditions
-        .into_iter()
-        .filter(|condition| retained.contains(&condition.expression))
-        .map(SourceFlowCondition::Truthiness)
-        .collect())
+    Ok(retained)
 }
 
 fn validate_node_container(
@@ -5826,7 +13618,13 @@ fn linear_antecedent(flow: FlowRef, node: &FlowNode) -> Result<FlowRef, SourceFl
 }
 
 fn label_antecedents(flow: FlowRef, node: &FlowNode) -> Result<&[FlowRef], SourceFlowError> {
-    if node.antecedents.len() < 2 {
+    let minimum = match source_flow_kind(flow, node.flags)? {
+        SourceFlowKind::LoopLabel => 1,
+        SourceFlowKind::BranchLabel => 2,
+        _ => return Err(SourceFlowInvariant::InvalidAntecedents(flow).into()),
+    };
+    // A terminal break can leave the binder's loop label with only its entry edge.
+    if node.antecedents.len() < minimum {
         return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
     }
     let mut unique = HashSet::with_capacity(node.antecedents.len());
@@ -5855,6 +13653,10 @@ fn ast_payload(flow: FlowRef, node: &FlowNode) -> Result<NodeRef, SourceFlowErro
         _ => Err(SourceFlowInvariant::InvalidPayload(flow).into()),
     }
 }
+
+#[cfg(test)]
+#[path = "source_flow_counted_loop_tests.rs"]
+mod counted_loop_cycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5922,6 +13724,1443 @@ mod tests {
                 .then_some(NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap()
+    }
+
+    const SOURCE_LOOP_BACKEDGE_INPUT: &str = concat!(
+        "for (var count: 0 | 1 = 0; count < 2; ++count) { ",
+        "const unrelated = true; const inside: number = count; }",
+    );
+
+    struct SourceLoopBackedgeFixture {
+        plan: SourceFlowPlan,
+        count: SourceFlowAssignment,
+        unrelated: SourceFlowAssignment,
+        inside: SourceFlowAssignment,
+        annotation: NodeRef,
+        initial_annotation: NodeRef,
+        header_read: NodeRef,
+        body_read: NodeRef,
+        label: FlowRef,
+        prefix: FlowRef,
+    }
+
+    fn source_loop_backedge_fixture(
+        parsed: &ParseResult,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> SourceLoopBackedgeFixture {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = bound.file_id();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let assignment = |name| {
+            let declaration = captured_variable(parsed, file, name);
+            SourceFlowAssignment {
+                declaration,
+                symbol: bound.symbol(declaration).unwrap(),
+            }
+        };
+        let count = assignment("count");
+        let unrelated = assignment("unrelated");
+        let inside = assignment("inside");
+        let (statement, iteration) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((reference(node), iteration)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::BinaryExpression(condition) =
+            &parsed.arena.get(iteration.condition.unwrap()).unwrap().data
+        else {
+            panic!("expected the count comparison")
+        };
+        let header_read = reference(condition.left);
+        let NodeData::PrefixUnaryExpression(update) = &parsed
+            .arena
+            .get(iteration.incrementor.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the count update")
+        };
+        let NodeData::VariableDeclaration(count_data) =
+            &parsed.arena.get(count.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let NodeData::NumericLiteral(initializer) = &parsed
+            .arena
+            .get(count_data.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the written zero initializer")
+        };
+        assert_eq!(initializer.text, "0");
+        let annotation = reference(count_data.type_.unwrap());
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected the written count union")
+        };
+        let initial_annotation = reference(union.types.nodes[0]);
+        let NodeData::VariableDeclaration(inside_data) =
+            &parsed.arena.get(inside.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body_read = reference(inside_data.initializer.unwrap());
+        validate_source_reference(&parsed.arena, bound, store, host, body_read, count.symbol)
+            .unwrap();
+        let label = bound.flow_at(header_read).unwrap();
+        let prefix = bound.flow_at(body_read).unwrap();
+        assert_eq!(
+            source_flow_kind(label, flow_node(bound.flow_graph(), label).unwrap().flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        let prefix_node = flow_node(bound.flow_graph(), prefix).unwrap();
+        assert_eq!(
+            source_flow_kind(prefix, prefix_node.flags),
+            Ok(SourceFlowKind::Assignment)
+        );
+        assert_eq!(ast_payload(prefix, &prefix_node), Ok(unrelated.declaration));
+        let mut points = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = reference(node);
+                (record.kind == SyntaxKind::Identifier
+                    && source_node_is_descendant_of(&parsed.arena, node, statement.node)
+                    && bound.flow_at(node).is_some())
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            bound,
+            store,
+            host,
+            statement,
+            points,
+            [],
+            [count, unrelated, inside],
+            [SourceFlowUpdate {
+                target: reference(update.operand),
+                declaration: count.declaration,
+                symbol: count.symbol,
+                readonly: false,
+            }],
+            [],
+        )
+        .unwrap();
+        assert_ne!(prefix, plan.region.unwrap().entry);
+        SourceLoopBackedgeFixture {
+            plan,
+            count,
+            unrelated,
+            inside,
+            annotation,
+            initial_annotation,
+            header_read,
+            body_read,
+            label,
+            prefix,
+        }
+    }
+
+    fn source_loop_backedge_types(
+        context: &mut CanonicalCheckerContext<'_>,
+        fixture: &SourceLoopBackedgeFixture,
+    ) -> (TypeId, TypeId, TypeId, TypeId) {
+        let declared = context.get_type_from_type_node(fixture.annotation).unwrap();
+        let initial = context
+            .get_type_from_type_node(fixture.initial_annotation)
+            .unwrap();
+        assert_eq!(context.type_to_string(initial).unwrap(), "0");
+        let TypeData::Union(union) = context.store().type_payload(declared).unwrap().data() else {
+            panic!("expected the declared union")
+        };
+        assert!(union.union.types.contains(&initial));
+        let mut members = union
+            .union
+            .types
+            .iter()
+            .map(|type_| context.type_to_string(*type_).unwrap())
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        assert_eq!(members, ["0", "1"]);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        assert_ne!(declared, number);
+        assert_ne!(initial, declared);
+        (declared, initial, number, bootstrap.regular_true_type)
+    }
+
+    #[test]
+    fn source_loop_backedge_revisits_assignments_after_completion_invalidates_memo() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_260);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, number, true_type) =
+            source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        let header = frame
+            .snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.header_read,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(header.type_of(fixture.count.symbol), Some(number));
+        assert!(
+            frame
+                .memo
+                .contains_key(&(fixture.label, Some(fixture.count.symbol)))
+        );
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.unrelated.declaration,
+                fixture.unrelated.symbol,
+                true_type,
+                true_type,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let body = frame
+            .snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.body_read,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(body.type_of(fixture.count.symbol), Some(number));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
+        assert_eq!(
+            frame.assignment_states[&fixture.inside.declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        let memo = frame.memo.clone();
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame.snapshot_for_symbols_at(
+                    context.store_mut_for_test(),
+                    &globals,
+                    fixture.body_read,
+                    [fixture.count.symbol],
+                ),
+                Ok(body.clone())
+            );
+            assert_eq!(frame.memo, memo);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(frame.reference, None);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.inside.declaration,
+                fixture.inside.symbol,
+                number,
+                number,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let exit = frame
+            .snapshot_for_symbols_at_end(
+                context.store_mut_for_test(),
+                &globals,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(exit.type_of(fixture.count.symbol), Some(number));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(fixture.annotation)
+                .unwrap()
+                .resolved_type,
+            Some(declared)
+        );
+    }
+
+    #[test]
+    fn source_loop_backedge_revisits_a_real_false_condition_prefix() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "declare const stop: boolean; for (;;) { ",
+            "if (stop) { break; } const inside: false = stop; continue; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(32_261);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let statement = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ForStatement).then_some(reference(node))
+            })
+            .unwrap();
+        let condition = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::IfStatement(data) => Some(reference(data.expression)),
+                _ => None,
+            })
+            .unwrap();
+        let stop = bound
+            .symbol(captured_variable(&parsed, file, "stop"))
+            .unwrap();
+        let declaration = captured_variable(&parsed, file, "inside");
+        let inside = bound.symbol(declaration).unwrap();
+        let NodeData::VariableDeclaration(data) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let read = reference(data.initializer.unwrap());
+        validate_source_reference(&parsed.arena, &bound, context.store(), &host, read, stop)
+            .unwrap();
+        let prefix = bound.flow_at(read).unwrap();
+        let prefix_node = flow_node(bound.flow_graph(), prefix).unwrap();
+        assert_eq!(
+            source_flow_kind(prefix, prefix_node.flags),
+            Ok(SourceFlowKind::FalseCondition)
+        );
+        assert_eq!(ast_payload(prefix, &prefix_node), Ok(condition));
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            [condition, reference(data.name), read],
+            [SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                expression: condition,
+                symbol: stop,
+                negated: false,
+            })],
+            [SourceFlowAssignment {
+                declaration,
+                symbol: inside,
+            }],
+            [],
+            [],
+        )
+        .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (boolean, false_type, true_type) = (
+            bootstrap.boolean_type,
+            bootstrap.regular_false_type,
+            bootstrap.regular_true_type,
+        );
+        let mut frame = plan
+            .frame_with_captured_locals(
+                context.store(),
+                &host,
+                &bound,
+                [(stop, boolean)].into_iter().collect(),
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let body = frame
+            .snapshot_for_symbols_at(context.store_mut_for_test(), &globals, read, [stop])
+            .unwrap();
+        assert_eq!(body.type_of(stop), Some(false_type));
+        assert_eq!(frame.declared_types[&stop], boolean);
+        assert_eq!(
+            frame.assignment_states[&declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        frame
+            .complete_source_declaration(&host, declaration, inside, false_type, false_type)
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        assert_eq!(
+            frame.snapshot_for_symbols_at(context.store_mut_for_test(), &globals, read, [stop]),
+            Ok(body)
+        );
+        let exit = frame
+            .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [stop])
+            .unwrap();
+        assert_eq!(exit.type_of(stop), Some(true_type));
+        assert!(frame.visiting.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(frame.reference, None);
+    }
+
+    #[test]
+    fn source_loop_backedge_restores_outer_guards_before_success_and_pending_errors() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_262);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, number, _) = source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        let state = |frame: &SourceFlowFrame<'_, '_>| {
+            (
+                frame.base.clone(),
+                frame.declared_types.clone(),
+                frame.assignment_states.clone(),
+                frame.condition_values.clone(),
+                frame.call_effects.clone(),
+                frame.reference,
+            )
+        };
+        let node = flow_node(bound.flow_graph(), fixture.label).unwrap();
+        frame.reference = Some(fixture.count.symbol);
+        frame.visiting = [
+            (fixture.prefix, frame.reference),
+            (fixture.label, frame.reference),
+        ]
+        .into_iter()
+        .collect();
+        let outer = frame.visiting.clone();
+        let before = state(&frame);
+        let result = frame
+            .resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                0,
+            )
+            .unwrap();
+        assert_eq!(result.type_of(fixture.count.symbol), Some(number));
+        assert!(!result.incomplete);
+        assert_eq!(frame.visiting, outer);
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(state(&frame), before);
+
+        frame.reference = Some(fixture.inside.symbol);
+        frame.visiting = [
+            (fixture.prefix, frame.reference),
+            (fixture.label, frame.reference),
+        ]
+        .into_iter()
+        .collect();
+        let outer = frame.visiting.clone();
+        let before = state(&frame);
+        for _ in 0..2 {
+            assert_eq!(
+                frame.resolve_loop_label(
+                    context.store_mut_for_test(),
+                    &globals,
+                    fixture.label,
+                    &node,
+                    0
+                ),
+                Err(SourceFlowInvariant::PendingAssignment(fixture.inside.declaration).into())
+            );
+            assert_eq!(frame.visiting, outer);
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(state(&frame), before);
+            assert!(frame.memo.values().all(|snapshot| !snapshot.incomplete));
+        }
+        assert!(!frame.memo.contains_key(&(fixture.label, frame.reference)));
+        assert!(!frame.memo.contains_key(&(fixture.prefix, frame.reference)));
+        frame.reference = None;
+        frame.visiting = [(fixture.plan.region.unwrap().entry, None)]
+            .into_iter()
+            .collect();
+        let outer = frame.visiting.clone();
+        assert_eq!(
+            frame.snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.body_read,
+                [fixture.inside.symbol]
+            ),
+            Err(SourceFlowInvariant::PendingAssignment(fixture.inside.declaration).into())
+        );
+        assert_eq!(frame.reference, None);
+        assert_eq!(frame.visiting, outer);
+        assert!(frame.loop_snapshots.is_empty());
+    }
+
+    #[test]
+    fn source_loop_backedge_keeps_active_non_label_first_entry_and_depth_guards() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_263);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, _, _) = source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        frame.reference = Some(fixture.count.symbol);
+        let key = (fixture.prefix, frame.reference);
+        assert!(frame.memo.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+        assert!(frame.visiting.insert(key));
+        // This is an active-key check on a real assignment, not a fabricated graph.
+        assert_eq!(
+            frame.resolve_flow(context.store_mut_for_test(), &globals, fixture.prefix, 0),
+            Err(SourceFlowInvariant::Cycle(fixture.prefix).into())
+        );
+        assert_eq!(frame.visiting, [key].into_iter().collect());
+        let node = flow_node(bound.flow_graph(), fixture.label).unwrap();
+        let entry = node.antecedents[0];
+        assert_ne!(entry, fixture.plan.region.unwrap().entry);
+        assert_eq!(
+            ast_payload(entry, &flow_node(bound.flow_graph(), entry).unwrap()),
+            Ok(fixture.count.declaration)
+        );
+        frame.visiting = [(entry, frame.reference)].into_iter().collect();
+        assert_eq!(
+            frame.resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                0
+            ),
+            Err(SourceFlowInvariant::Cycle(entry).into())
+        );
+        assert_eq!(
+            frame.visiting,
+            [(entry, frame.reference)].into_iter().collect()
+        );
+        assert!(frame.memo.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+
+        frame.visiting = [key, (fixture.label, frame.reference)]
+            .into_iter()
+            .collect();
+        let outer = frame.visiting.clone();
+        let first = frame
+            .resolve_flow(context.store_mut_for_test(), &globals, entry, 0)
+            .unwrap();
+        assert_eq!(first.type_of(fixture.count.symbol), Some(initial));
+        let memo = frame.memo.clone();
+        let backedge = node.antecedents[1];
+        let target =
+            ast_payload(backedge, &flow_node(bound.flow_graph(), backedge).unwrap()).unwrap();
+        assert_eq!(fixture.plan.updates[&target].symbol, fixture.count.symbol);
+        assert!(!memo.contains_key(&(backedge, frame.reference)));
+        assert_eq!(
+            frame.resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                FLOW_DEPTH_LIMIT
+            ),
+            Err(SourceFlowInvariant::DepthLimit(backedge).into())
+        );
+        assert_eq!(frame.visiting, outer);
+        assert_eq!(frame.memo, memo);
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(frame.reference, Some(fixture.count.symbol));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
+    }
+
+    #[test]
+    fn ordinary_source_regions_prove_dead_updates_and_pre_class_exits() {
+        for (body, dead_update) in [
+            ("break;", true),
+            ("if (stop) { continue; } break;", false),
+            ("if (true) { break; }", true),
+        ] {
+            let source = format!(
+                "declare const stop: boolean; let count = 0; for (;; ++count) {{ {body} }} class Tail {{}}"
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(32_205);
+            let context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1;
+            let (node, data) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    if let NodeData::ForStatement(data) = &record.data {
+                        Some((node, data))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let statement = NodeRef::new(parsed.arena.id(), file, node);
+            let incrementor = data.incrementor.unwrap();
+            let NodeData::PrefixUnaryExpression(update) =
+                &parsed.arena.get(incrementor).unwrap().data
+            else {
+                unreachable!()
+            };
+            let operand = NodeRef::new(parsed.arena.id(), file, update.operand);
+            let class_name = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ClassDeclaration(class) => class.name,
+                    _ => None,
+                })
+                .unwrap();
+            let class_name = NodeRef::new(parsed.arena.id(), file, class_name);
+            let before = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let region =
+                source_statement_flow_region(&parsed.arena, bound, context.store(), statement)
+                    .unwrap();
+            assert_eq!(region.exit, bound.flow_at(class_name).unwrap());
+            assert_eq!(
+                region.unreachable_incrementor,
+                dead_update.then_some(NodeRef::new(parsed.arena.id(), file, incrementor))
+            );
+            let actual =
+                source_region_point_flow(&parsed.arena, bound, operand, Some(region)).unwrap();
+            if dead_update {
+                assert_eq!(bound.flow_at(operand), None);
+                assert_eq!(actual, bound.flow_graph().nodes().unreachable());
+                assert_eq!(
+                    source_region_point_flow(&parsed.arena, bound, operand, None),
+                    Err(SourceFlowInvariant::MissingFlowPoint(operand).into())
+                );
+            } else {
+                assert_eq!(Some(actual), bound.flow_at(operand));
+                assert_ne!(actual, bound.flow_graph().nodes().unreachable());
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_assertion_effects_reject_changed_arguments_and_cache_identity() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "declare function assertString(value: unknown): asserts value is string; ",
+            "declare const value: unknown; ",
+            "for (;;) { assertString(value); break; }",
+        ));
+        let file = FileId::new(32_206);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (call, argument) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                if let NodeData::CallExpression(call) = &record.data {
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, call.arguments.nodes[0]),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let symbol = bound
+            .symbol(captured_variable(&parsed, file, "value"))
+            .unwrap();
+        let signature = context
+            .store()
+            .signature_links(call)
+            .unwrap()
+            .effects_signature
+            .signature()
+            .unwrap();
+        let effect = SourceFlowCallEffect::Assertion {
+            signature,
+            argument,
+            symbol,
+        };
+        assert_eq!(
+            validate_source_call_effect(context.store(), &host, &bound, call, effect),
+            Ok(())
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_source_call_effect(
+                context.store(),
+                &host,
+                &bound,
+                call,
+                SourceFlowCallEffect::AssertionNoReference {
+                    signature,
+                    argument: None
+                }
+            ),
+            Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+        );
+        assert_eq!(
+            validate_source_call_effect(
+                context.store(),
+                &host,
+                &bound,
+                call,
+                SourceFlowCallEffect::Assertion {
+                    signature,
+                    argument: call,
+                    symbol
+                }
+            ),
+            Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+        );
+        let mut links = context.store().signature_links(call).unwrap().clone();
+        links.effects_signature = EffectsSignatureState::NoEffects;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(call, links)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                validate_source_call_effect(context.store(), &host, &bound, call, effect),
+                Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+            );
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_receiver_identity_and_invalidation() {
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; static value: string | null = null; } ",
+            "let model = new Model(); const other = new Model(); ",
+            "model.value = text; const narrowed: string = model.value; ",
+            "const wrapped: string = (model).value; const separate: string | null = other.value; ",
+            "Model.value = text; const staticRead: string = Model.value; ",
+            "model.value = null; const secondWrite: null = model.value; ",
+            "model = other; const reset: string | null = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_615);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let null = bootstrap.null_type;
+        let declared = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("Model")
+            .unwrap();
+        let field = context
+            .store()
+            .symbol(declared)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let union = context
+            .store()
+            .value_symbol_links(field)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        for (name, expected) in [
+            ("narrowed", string),
+            ("wrapped", string),
+            ("separate", union),
+            ("staticRead", string),
+            ("secondWrite", null),
+            ("reset", union),
+        ] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            assert_eq!(
+                context.get_type_at_location(read).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(union)
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the actual checked write and both cache restore paths.
+    fn own_class_property_flow_rechecks_written_expression_caches() {
+        use crate::semantic::source_properties::plan_own_class_property_write;
+        use crate::semantic::{SymbolNodeLinks, TypeNodeLinks, production::GlobalMergeCompletion};
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; const after: string = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_616);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let assignments = captured_assignment_syntax(&parsed, file);
+        let [(statement, expression, _)] = assignments.as_slice() else {
+            panic!("one actual assignment")
+        };
+        let statement = *statement;
+        let expression = *expression;
+        let assignment = super::super::assignment::plan_own_class_property_assignment(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+        )
+        .unwrap()
+        .unwrap();
+        let plan = plan_own_class_property_write(context.store(), &host, &assignment).unwrap();
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let receiver = context
+            .store()
+            .type_node_links(assignment.receiver)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let assigned = context.store().type_node_links(expression).unwrap().clone();
+        let flow_type = context
+            .store()
+            .type_node_links(access)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            flow_type,
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        let declared = context
+            .store()
+            .value_symbol_links(plan.member_source().symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let options = context.options();
+        let mut flow = OwnClassPropertyFlow::default();
+        flow.complete_assignment(
+            context.store(),
+            &host,
+            options,
+            &plan,
+            receiver,
+            assigned.resolved_type.unwrap(),
+            flow_type,
+        )
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let symbols = context
+            .store()
+            .symbol_node_links(assignment.receiver)
+            .unwrap()
+            .clone();
+        for corrupt_symbol in [false, true] {
+            if corrupt_symbol {
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    assignment.receiver,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(assignment.class_symbol)
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    expression,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..assigned.clone()
+                    }
+                ));
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    matches!(flow.read_type(context.store(), &host, options, access, assignment.receiver_symbol, receiver, plan.member_source().symbol, declared),
+                    Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidClassProperty(node))) if node == assignment.left)
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot()
+                    ),
+                    before
+                );
+                assert!(context.diagnostics().is_empty());
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(expression, assigned.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, symbols.clone())
+            );
+            assert_eq!(
+                flow.read_type(
+                    context.store(),
+                    &host,
+                    options,
+                    access,
+                    assignment.receiver_symbol,
+                    receiver,
+                    plan.member_source().symbol,
+                    declared
+                ),
+                Ok(Some(flow_type))
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each wrapper's source type, exact diagnostic, and replay together.
+    fn own_class_property_flow_matches_real_reference_wrappers() {
+        use crate::semantic::{CanonicalCheckerDiagnostic, production::GlobalMergeCompletion};
+        use ts_diagnostics::{Diagnostic, message_by_code};
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; static value: string | null = null; } ",
+            "const model = new Model(); model.value = text; Model.value = text; ",
+            "const nonNull: string = model!.value; ",
+            "const satisfied: string = (model satisfies Model).value; ",
+            "const staticRead: string = Model!.value; ",
+            "const comma = (model.value, model);",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_619);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let satisfied = captured_variable(&parsed, file, "satisfied");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(satisfied.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let name = NodeRef::new(parsed.arena.id(), file, variable.name);
+        let range = parsed.arena.get(name.node).unwrap().range;
+        assert_eq!(
+            &parsed.arena.source_text().unwrap()[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "satisfied"
+        );
+        let mut diagnostic =
+            Diagnostic::with_arguments(message_by_code(2322).unwrap(), ["string | null", "string"]);
+        diagnostic
+            .details
+            .push("  Type 'null' is not assignable to type 'string'.".to_owned());
+        let expected_diagnostic = CanonicalCheckerDiagnostic {
+            node: Some(name),
+            range_override: None,
+            diagnostic,
+            related_information: Vec::new(),
+        };
+        assert_eq!(
+            expected_diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Type 'string | null' is not assignable to type 'string'.\n",
+                "  Type 'null' is not assignable to type 'string'."
+            )
+        );
+        assert_eq!(
+            context.diagnostics().as_slice(),
+            std::slice::from_ref(&expected_diagnostic)
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let null = context.store().intrinsic_bootstrap().unwrap().null_type;
+        let class = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ClassDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let class = context.file(file).unwrap().1.symbol(class).unwrap();
+        let property = context
+            .store()
+            .symbol(class)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::PropertyDeclaration(property_node) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, property_node.type_.unwrap());
+        let declared = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(annotation)
+                .unwrap()
+                .resolved_type,
+            Some(declared)
+        );
+        let TypeData::Union(union) = context.store().type_payload(declared).unwrap().data() else {
+            panic!("the instance field must keep its canonical nullable union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&null));
+        let mut reads = Vec::new();
+        for name in ["nonNull", "satisfied", "staticRead"] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            let expected = if name == "satisfied" {
+                declared
+            } else {
+                string
+            };
+            assert_eq!(
+                context.get_type_at_location(read).unwrap(),
+                expected,
+                "{name}"
+            );
+            reads.push((read, expected));
+        }
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let comma = captured_variable(&parsed, file, "comma");
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(comma.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let receiver = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let model = bound
+            .symbol(captured_variable(&parsed, file, "model"))
+            .unwrap();
+        assert_eq!(
+            own_class_flow_reference_symbol(context.store(), &host, &bound, receiver),
+            Ok(Some(model))
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context.diagnostics().as_slice(),
+            std::slice::from_ref(&expected_diagnostic)
+        );
+        for (read, expected) in reads {
+            assert_eq!(context.get_type_at_location(read).unwrap(), expected);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_affected_object_bindings_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+        use crate::semantic::variables::VariableUnsupported;
+
+        let parsed = parse_source_file(
+            "declare const text: string; class Model { value: string | null = null; } const model = new Model(); model.value = text; const { value } = model; const after: string = value;",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_620);
+        let mut context = loop_context(&parsed, file);
+        let (element, name, pattern) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(binding) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, binding.name?),
+                    NodeRef::new(parsed.arena.id(), file, record.parent?),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Variable(VariableUnsupported::BindingPattern(pattern))
+                ))
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .is_none_or(|links| { links == &crate::semantic::ValueSymbolLinks::default() })
+            );
+            for node in [element, name] {
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .is_none_or(|links| { links == &TypeNodeLinks::default() })
+                );
+            }
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+    }
+
+    #[test]
+    fn own_class_property_flow_preserves_unaffected_object_bindings() {
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; other = 0; } ",
+            "const model = new Model(); const second = new Model(); model.value = text; ",
+            "const { other } = model; const numeric: number = other; ",
+            "const { value: separate } = second; const nullable: string | null = separate;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_621);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        for (name, expected) in [("numeric", "number"), ("nullable", "string | null")] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            let type_ = context.get_type_at_location(read).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_unknown_calls_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+
+        let parsed = parse_source_file(concat!(
+            "declare function visit(): void; declare const text: string; ",
+            "class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; visit(); ",
+            "const after: string = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_617);
+        let mut context = loop_context(&parsed, file);
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(access)
+                ))
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_computed_reads_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; ",
+            "const after: string = model['value'];",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_618);
+        let mut context = loop_context(&parsed, file);
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let unsupported = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(access));
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(unsupported));
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .is_none_or(|links| { links == &TypeNodeLinks::default() })
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .is_none_or(|links| { links == &crate::semantic::SymbolNodeLinks::default() })
+            );
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            access,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Class(access))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(access, TypeNodeLinks::default())
+        );
+        assert_eq!(context.check_source_file(file), Err(unsupported));
+        assert!(context.diagnostics().is_empty());
     }
 
     fn captured_assignment_syntax(
@@ -6355,6 +15594,247 @@ mod tests {
                 ),
                 before
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the method, capture, and retained flow damage checks together.
+    fn object_method_captured_write_rechecks_owner_binding_and_flow() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "function outer() { let value: string | number = 'old'; let other: number = 0; ",
+            "let values: number[] = []; ",
+            "const object = { write(): void { value = 1; value; }, ",
+            "append(): void { values.push(1); } }; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_940);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let declaration = captured_variable(&parsed, file, "value");
+        let symbol = bound.symbol(declaration).unwrap();
+        let other = bound
+            .symbol(captured_variable(&parsed, file, "other"))
+            .unwrap();
+        let syntax = captured_assignment_syntax(&parsed, file);
+        let [(statement, expression, target)] = syntax.as_slice() else {
+            panic!("expected one captured write");
+        };
+        let (statement, expression, target) = (*statement, *expression, *target);
+        let writer = bound.flow_container(target).unwrap();
+        let owner = bound.symbol(writer).unwrap();
+        let local = plan_source_captured_local(context.store(), &host, writer, target, symbol)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.declaration(), declaration);
+        assert_eq!(local.writing_callable(), writer);
+        assert_eq!(
+            local.declaring_callable(),
+            bound.container(declaration).unwrap()
+        );
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(writer.node).unwrap().data
+        else {
+            panic!("expected the real object method");
+        };
+        let NodeData::Block(block) = &parsed.arena.get(method.body.unwrap()).unwrap().data else {
+            panic!("expected the method block");
+        };
+        let points = block
+            .statements
+            .nodes
+            .iter()
+            .map(|node| NodeRef::new(writer.arena, file, *node))
+            .collect::<Vec<_>>();
+        let [before, after] = points.as_slice() else {
+            panic!("expected the write and following read");
+        };
+        assert_eq!(*before, statement);
+        let assignment = SourceFlowCapturedAssignment {
+            statement,
+            expression,
+            local,
+        };
+        let plan = SourceFlowPlan::preflight_linear_with_captured_effects(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            writer,
+            points.clone(),
+            [],
+            [],
+            [],
+            [],
+            [assignment],
+            [],
+        )
+        .unwrap();
+        assert_eq!(plan.start_payload, Some(writer));
+        assert_eq!(plan.end, bound.flow_graph().container_end(writer));
+        assert!(plan.assignment_declarations.is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (input, number) = (bootstrap.string_or_number_type, bootstrap.number_type);
+        let outer = [(symbol, input), (other, number)]
+            .into_iter()
+            .collect::<SourceFlowTypes>();
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(context.store(), &host, &bound, outer.clone())
+                .unwrap();
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, statement)
+                    .unwrap()
+                    .types(),
+                &outer
+            );
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, *after),
+                Err(SourceFlowInvariant::PendingAssignment(target).into())
+            );
+            frame.complete_assignment(target, symbol, number).unwrap();
+            let result = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, *after)
+                .unwrap();
+            assert_eq!(result.type_of(symbol), Some(number));
+            assert_eq!(result.type_of(other), Some(number));
+            assert_eq!(outer.get(&symbol), Some(&input));
+        }
+        let reject = |store: &CanonicalTypeMapperStore| {
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_source_captured_local(store, &host, &local),
+                    Err(SourceFlowInvariant::InvalidCapturedLocal(target).into())
+                );
+                assert!(
+                    matches!(plan.frame_with_captured_locals(store, &host, &bound, outer.clone()),
+                    Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidCapturedLocal(node))) if node == target)
+                );
+                assert_eq!(format!("{store:?}"), before);
+            }
+        };
+        let store = context.store_mut_for_test();
+        let parent = store.symbol(owner).unwrap().parent().unwrap();
+        let name = store.symbol(owner).unwrap().name().to_owned();
+        let members = store.symbol(parent).unwrap().members().unwrap();
+        let flags = store.symbol(owner).unwrap().flags();
+        let checks = store.symbol(owner).unwrap().check_flags();
+        for warm in [false, true] {
+            if warm {
+                assert!(store.set_symbol_node_links(
+                    target,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol)
+                    }
+                ));
+            }
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert!(store.set_symbol_relationships(owner, None, None, None, None));
+            reject(store);
+            assert!(store.set_symbol_relationships(owner, None, None, Some(parent), None));
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert!(store.set_symbol_flags(owner, SymbolFlags::PROPERTY, checks));
+            reject(store);
+            assert!(store.set_symbol_flags(owner, flags, checks));
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), other),
+                Some(Some(owner))
+            );
+            reject(store);
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), owner),
+                Some(Some(other))
+            );
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+        }
+        assert!(store.set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other)
+            }
+        ));
+        reject(store);
+        assert!(store.set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(symbol)
+            }
+        ));
+        assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+        assert!(
+            plan.frame_with_captured_locals(store, &host, &bound, outer.clone())
+                .is_ok()
+        );
+        for (index, mut changed) in [local; 3].into_iter().enumerate() {
+            match index {
+                0 => changed.annotation = declaration,
+                1 => changed.symbol = other,
+                2 => changed.writing_callable = local.declaring_callable,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_source_captured_local(store, &host, &changed),
+                Err(SourceFlowInvariant::InvalidCapturedLocal(target).into())
+            );
+        }
+        let values = captured_variable(&parsed, file, "values");
+        let values_symbol = bound.symbol(values).unwrap();
+        let (call, receiver) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::CallExpression(call) = &record.data else {
+                    return None;
+                };
+                let NodeData::PropertyAccessExpression(property) =
+                    &parsed.arena.get(call.expression)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(writer.arena, file, node),
+                    NodeRef::new(writer.arena, file, property.expression),
+                ))
+            })
+            .unwrap();
+        let append = bound.flow_container(receiver).unwrap();
+        assert_ne!(append, writer);
+        let captured = plan_source_captured_local(store, &host, append, receiver, values_symbol)
+            .unwrap()
+            .unwrap();
+        let origin = SourceCapturedFlowOrigin::ArrayMutation(SourceFlowCapturedArrayMutation {
+            mutation: SourceFlowArrayMutation {
+                call,
+                receiver,
+                declaration: values,
+                symbol: values_symbol,
+            },
+            local: captured,
+        });
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(
+                validate_captured_flow_origin(
+                    &parsed.arena,
+                    &bound,
+                    store,
+                    &host,
+                    append,
+                    origin,
+                    None,
+                ),
+                Err(SourceFlowInvariant::InvalidArrayMutation(call).into())
+            );
+            assert_eq!(format!("{store:?}"), before);
         }
     }
 
@@ -6938,6 +16418,448 @@ mod tests {
         }
     }
 
+    #[test]
+    fn class_property_branch_unions_keep_spent_and_active_caller_demand_errors() {
+        super::super::logical_operators::property_flow_test_support::assert_borrowed_union_preparation(
+            |store, globals, _, flow, array, sentinel, caller| {
+                ClassPropertyFlowTypes::Read { store, globals: Some(globals), session: Some(caller) }
+                    .join(flow, FlowFlags::BRANCH_LABEL, &[array, sentinel], array)
+                    .map_err(|error| match error {
+                        SourceFlowError::Join { error, .. } => error,
+                        other => panic!("expected the actual branch union preparation error: {other:?}"),
+                    })
+            },
+        );
+    }
+
+    fn class_truthiness_test_plan(
+        parsed: &ParseResult,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        body: &ClassBodyPlan,
+    ) -> (SourceFlowPlan, SourceClassPropertyTruthinessCondition) {
+        let reference = |node| NodeRef::new(parsed.arena.id(), bound.file_id(), node);
+        let points = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, _)| {
+                let node = reference(node);
+                (bound.flow_container(node) == Some(body.declaration)
+                    && bound.flow_at(node).is_some())
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        let conditions = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::IfStatement(branch) = &record.data else {
+                    return None;
+                };
+                source_node_is_descendant_of(&parsed.arena, reference(node), body.body.node)
+                    .then_some(SourceClassPropertyTruthinessCondition {
+                        expression: reference(branch.expression),
+                        access: reference(branch.expression),
+                        negated: false,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [condition] = conditions.as_slice() else {
+            panic!("expected one real property guard")
+        };
+        let calls = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = reference(node);
+                (record.kind == SyntaxKind::CallExpression
+                    && bound.container(node) == Some(body.declaration))
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        let plan = SourceFlowPlan::preflight_class_body_with_conditions(
+            &parsed.arena,
+            bound,
+            store,
+            host,
+            body,
+            points,
+            conditions
+                .iter()
+                .copied()
+                .map(SourceFlowCondition::ClassPropertyTruthiness),
+            [],
+            [],
+            calls,
+        )
+        .unwrap();
+        (plan, *condition)
+    }
+
+    #[test]
+    fn class_property_condition_receipts_reject_warm_caches_and_changed_source_proofs() {
+        use crate::semantic::instantiate::InstantiationLimits;
+        use crate::semantic::{classes, production::GlobalMergeCompletion};
+
+        let parsed = parse_source_file(concat!(
+            "class First { value?: 0 | 1; other?: 0 | 1; ",
+            "read(): void { if (this.value) { this.value; this.value = 0; this.value; } ",
+            "else { this.value; } this.value; } otherBody(): void {} } ",
+            "class Second { value?: 0 | 1; read(): void {} }",
+        ));
+        let file = FileId::new(202_675);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let owner = |name| {
+            context
+                .store()
+                .symbol_table(context.globals())
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        };
+        let first =
+            classes::plan_source_class_members(context.store(), &host, owner("First")).unwrap();
+        let second =
+            classes::plan_source_class_members(context.store(), &host, owner("Second")).unwrap();
+        let body = &first.bodies()[0];
+        let (plan, condition) =
+            class_truthiness_test_plan(&parsed, &bound, context.store(), &host, body);
+        let prepared =
+            classes::prepare_source_class_members(context.store_mut_for_test(), &host, &first)
+                .unwrap();
+        let access = prepared.body_access(context.store(), &host, body).unwrap();
+        let other_body_access = prepared
+            .body_access(context.store(), &host, &first.bodies()[1])
+            .unwrap();
+        let prepared_other =
+            classes::prepare_source_class_members(context.store_mut_for_test(), &host, &second)
+                .unwrap();
+        let other_class_access = prepared_other
+            .body_access(context.store(), &host, &second.bodies()[0])
+            .unwrap();
+        let source =
+            plan_class_property_truthiness(context.store(), &host, body, condition.access).unwrap();
+        let member = class_member_source(context.store(), &host, source.member).unwrap();
+        let other = context
+            .store()
+            .symbol(body.class_symbol)
+            .unwrap()
+            .members()
+            .unwrap();
+        let other = context
+            .store()
+            .symbol_table(other)
+            .unwrap()
+            .get_source("other")
+            .unwrap();
+        let other_member = class_member_source(context.store(), &host, other).unwrap();
+        let declared = context
+            .store()
+            .type_node_links(condition.access)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let mut reads = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = NodeRef::new(parsed.arena.id(), file, node);
+                (record.kind == SyntaxKind::PropertyAccessExpression
+                    && bound.flow_container(node) == Some(body.declaration)
+                    && record
+                        .parent
+                        .and_then(|parent| parsed.arena.get(parent))
+                        .is_some_and(|parent| parent.kind == SyntaxKind::ExpressionStatement))
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        reads.sort_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+        let [truthy, after_write, falsy, _joined] = reads.as_slice() else {
+            panic!("expected the four source reads")
+        };
+        let write = plan
+            .property_assignments
+            .values()
+            .find_map(|assignment| assignment.write.as_ref())
+            .unwrap();
+        let mut frame =
+            ClassInitializationFrame::new(body, &plan, &bound, access, HashMap::new()).unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let query_context = |store: &CanonicalTypeMapperStore, node| {
+            plan_class_property_truthiness(store, &host, body, node)
+                .unwrap()
+                .context
+        };
+        let context_ = query_context(context.store(), *truthy);
+        let before = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert!(matches!(frame.property_read_with_session(
+                context.store_mut_for_test(), &host, Some(&globals),
+                &context_,
+                *truthy, &member, declared, options, &mut caller,
+            ), Err(SourceFlowError::Invariant(SourceFlowInvariant::UnreachedCondition(node))) if node == condition.expression));
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+        let checked_guard = frame
+            .property_read_with_session(
+                context.store_mut_for_test(),
+                &host,
+                Some(&globals),
+                &source.context,
+                condition.access,
+                &member,
+                declared,
+                options,
+                &mut caller,
+            )
+            .unwrap();
+        assert_eq!(checked_guard.type_(), declared);
+        frame
+            .complete_property_condition(
+                context.store(),
+                &host,
+                condition,
+                checked_guard.type_(),
+                checked_guard.type_(),
+            )
+            .unwrap();
+        let completed = frame.property_conditions[&condition.expression].clone();
+        for read in [*truthy, *falsy] {
+            let expected = context
+                .store()
+                .type_node_links(read)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let context_ = query_context(context.store(), read);
+            assert_eq!(
+                frame
+                    .property_read_with_session(
+                        context.store_mut_for_test(),
+                        &host,
+                        Some(&globals),
+                        &context_,
+                        read,
+                        &member,
+                        declared,
+                        options,
+                        &mut caller,
+                    )
+                    .unwrap()
+                    .type_(),
+                expected
+            );
+        }
+        let context_ = query_context(context.store(), *after_write);
+        assert_eq!(
+            frame.property_read_with_session(
+                context.store_mut_for_test(),
+                &host,
+                Some(&globals),
+                &context_,
+                *after_write,
+                &member,
+                declared,
+                options,
+                &mut caller,
+            ),
+            Err(SourceFlowInvariant::PendingAssignment(write.plan.target()).into())
+        );
+        for damage in 0..8 {
+            let mut changed = completed.clone();
+            match damage {
+                0 => changed.access = other_body_access.clone(),
+                1 => changed.access = other_class_access.clone(),
+                2 => changed.member = other_member.clone(),
+                3 => changed.member.readonly = !changed.member.readonly,
+                4 => changed.flow = plan.end.unwrap(),
+                5 => changed.edges.swap(0, 1),
+                6 => changed.edges[0] = plan.start,
+                7 => changed.type_ = context.store().intrinsic_bootstrap().unwrap().string_type,
+                _ => unreachable!(),
+            }
+            frame
+                .property_conditions
+                .insert(condition.expression, changed);
+            let before = format!("{:?}", context.store());
+            let caller_before = format!("{caller:?}");
+            let context_ = query_context(context.store(), *truthy);
+            for _ in 0..2 {
+                assert_eq!(
+                    frame.property_read_with_session(
+                        context.store_mut_for_test(),
+                        &host,
+                        Some(&globals),
+                        &context_,
+                        *truthy,
+                        &member,
+                        declared,
+                        options,
+                        &mut caller,
+                    ),
+                    Err(SourceFlowInvariant::InvalidClassProperty(condition.access).into()),
+                    "damage {damage}"
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+                assert_eq!(format!("{caller:?}"), caller_before);
+            }
+        }
+        frame
+            .property_conditions
+            .insert(condition.expression, completed);
+        let original = context
+            .store()
+            .type_node_links(condition.access)
+            .unwrap()
+            .clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            condition.access,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..original.clone()
+            }
+        ));
+        let context_ = query_context(context.store(), *truthy);
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            frame.property_read_with_session(
+                context.store_mut_for_test(),
+                &host,
+                Some(&globals),
+                &context_,
+                *truthy,
+                &member,
+                declared,
+                options,
+                &mut caller,
+            ),
+            Err(SourceFlowInvariant::InvalidClassProperty(condition.access).into())
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(condition.access, original)
+        );
+        let mut changed = condition;
+        changed.negated = true;
+        assert!(
+            matches!(validate_class_property_condition(context.store(), &host, &bound, body, changed), Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidClassProperty(node))) if node == condition.access)
+        );
+        let symbol = context.store().symbol(member.symbol).unwrap();
+        let flags = symbol.flags();
+        let check_flags = symbol.check_flags();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            member.symbol,
+            flags.without(SymbolFlags::OPTIONAL),
+            check_flags
+        ));
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            plan_class_property_truthiness(context.store(), &host, body, condition.access),
+            Err(SourcePropertyError::InvalidCache(condition.access))
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_flags(member.symbol, flags, check_flags)
+        );
+    }
+
+    #[test]
+    fn class_property_flow_requires_current_run_ordinary_call_proofs() {
+        use crate::semantic::instantiate::InstantiationLimits;
+        use crate::semantic::{classes, production::GlobalMergeCompletion};
+
+        let parsed = parse_source_file(concat!(
+            "declare function touch(): void; ",
+            "class Guard { value?: number; read(): void { touch(); ",
+            "if (this.value) { this.value; } else { this.value; } } }",
+        ));
+        let file = FileId::new(202_676);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("Guard")
+            .unwrap();
+        let class = classes::plan_source_class_members(context.store(), &host, owner).unwrap();
+        let body = &class.bodies()[0];
+        let (plan, condition) =
+            class_truthiness_test_plan(&parsed, &bound, context.store(), &host, body);
+        assert_eq!(plan.calls.len(), 1);
+        let call = *plan.calls.keys().next().unwrap();
+        let links = context.store().signature_links(call).unwrap();
+        assert!(links.resolved_signature.signature().is_some());
+        assert_eq!(links.effects_signature, EffectsSignatureState::Unresolved);
+        let prepared =
+            classes::prepare_source_class_members(context.store_mut_for_test(), &host, &class)
+                .unwrap();
+        let token = prepared.body_access(context.store(), &host, body).unwrap();
+        let source =
+            plan_class_property_truthiness(context.store(), &host, body, condition.access).unwrap();
+        let member = class_member_source(context.store(), &host, source.member).unwrap();
+        let declared = context
+            .store()
+            .type_node_links(condition.access)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let mut frame =
+            ClassInitializationFrame::new(body, &plan, &bound, token, HashMap::new()).unwrap();
+        let before = format!("{:?}", context.store());
+        let caller_before = format!("{caller:?}");
+        for _ in 0..2 {
+            assert_eq!(
+                frame.property_read_with_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    Some(&globals),
+                    &source.context,
+                    condition.access,
+                    &member,
+                    declared,
+                    options,
+                    &mut caller,
+                ),
+                Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert_eq!(format!("{caller:?}"), caller_before);
+            assert!(frame.ordinary_calls.is_empty());
+            assert!(frame.property_conditions.is_empty());
+        }
+    }
+
     fn loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef, NodeRef) {
         let (function, parameter) = parsed
             .arena
@@ -6974,6 +16896,94 @@ mod tests {
             })
             .unwrap();
         (function, parameter, condition, return_statement)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the real entry, initializer, and later join together.
+    fn catch_scope_restores_both_type_maps_and_excludes_expired_flow_facts() {
+        let parsed = parse_source_file(concat!(
+            "function run(value: number) { try {} catch (error = value) { ",
+            "if (typeof error === 'string') {} } return value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(58_572);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(context.options().name_resolution),
+        ).unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let declaration = parsed.arena.iter().find_map(|(node, record)| {
+            (record.kind == SyntaxKind::FunctionDeclaration).then_some(reference(node))
+        }).unwrap();
+        let callable = super::super::source_callables::plan_source_callable(
+            context.store(), &host, declaration, bound.symbol(declaration).unwrap(),
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+        ).unwrap();
+        let syntax = plan_source_callable_statement_list_syntax(
+            &parsed.arena, &bound, context.store(), &callable,
+        ).unwrap();
+        let binding = *syntax.catch_bindings()[0];
+        let catch_block = match &parsed.arena.get(binding.clause.node).unwrap().data {
+            NodeData::CatchClause(caught) => reference(caught.block),
+            _ => unreachable!(),
+        };
+        let condition = parsed.arena.iter().find_map(|(_, record)| {
+            if let NodeData::IfStatement(branch) = &record.data {
+                Some(reference(branch.expression))
+            } else { None }
+        }).unwrap();
+        let returned = parsed.arena.iter().find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ReturnStatement).then_some(reference(node))
+        }).unwrap();
+        let points = parsed.arena.iter().filter_map(|(node, _)| {
+            let node = reference(node);
+            (bound.flow_container(node) == Some(declaration) && bound.flow_at(node).is_some())
+                .then_some(node)
+        }).collect::<Vec<_>>();
+        let plan = SourceFlowPlan::preflight_statement_list(
+            &parsed.arena, &bound, context.store(), &host, &syntax, points,
+            [SourceFlowCondition::Typeof(SourceTypeofCondition {
+                expression: condition, symbol: binding.symbol, tag: SourceTypeofTag::String,
+                comparison: SourceTypeofComparison::Equal,
+            })],
+            Vec::new(),
+            [SourceFlowAssignment { declaration: binding.declaration, symbol: binding.symbol }],
+            [], [], [], [],
+        ).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let unknown = bootstrap.unknown_type;
+        let parameter = callable.parameters[0].symbol;
+        let mut frame = plan.frame_with_captured_locals(
+            context.store(), &host, &bound, [(parameter, number)].into_iter().collect(),
+        ).unwrap();
+        let base = frame.base.clone();
+        let declared = frame.declared_types.clone();
+        let mut wrong = binding;
+        wrong.symbol = parameter;
+        assert!(matches!(frame.enter_catch_binding(context.store(), &wrong, unknown),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidParameterAssignment(node)))
+                if node == binding.declaration));
+        assert_eq!(frame.base, base);
+        assert_eq!(frame.declared_types, declared);
+        let scope = frame.enter_catch_binding(context.store(), &binding, unknown).unwrap();
+        assert_eq!(frame.declared_types.get(&binding.symbol), Some(&unknown));
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, binding.name).unwrap().type_of(binding.symbol), Some(unknown));
+        frame.complete_assignment(binding.declaration, binding.symbol, number).unwrap();
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, catch_block).unwrap().type_of(binding.symbol), Some(number));
+        assert!(!frame.memo.is_empty());
+        frame.restore_catch_binding(scope);
+        assert_eq!(frame.base, base);
+        assert_eq!(frame.declared_types, declared);
+        assert!(frame.memo.is_empty());
+        assert_eq!(frame.assignment_states.get(&binding.declaration), Some(&SourceFlowAssignmentState::Resolved(number)));
+        let after = frame.snapshot_at(context.store_mut_for_test(), &globals, returned).unwrap();
+        assert_eq!(after.type_of(parameter), Some(number));
+        assert_eq!(after.type_of(binding.symbol), None);
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, returned), Ok(after));
     }
 
     #[test]
@@ -7053,6 +17063,7 @@ mod tests {
         let container = NodeRef::new(arena.id(), file, NodeId::new(1));
         let start = FlowRef::new(arena.id(), file, FlowNodeId(3));
         let mut plan = SourceFlowPlan {
+            class_expression_conditions: HashMap::new(),
             container,
             start_container: container,
             start,
@@ -7068,7 +17079,14 @@ mod tests {
             calls: HashMap::new(),
             logical_statements: Vec::new(),
             class_body: None,
+            statement_list: None,
             property_assignments: HashMap::new(),
+            region: None,
+            updates: HashMap::new(),
+            nullish_assignments: HashMap::new(),
+            member_assignments: HashMap::new(),
+            element_assignments: HashMap::new(),
+            nullish_calls: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);
         assert_eq!(validate_start_node(&plan, start, &without_payload), Ok(()));
@@ -7140,6 +17158,271 @@ mod tests {
         assert_eq!(
             label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
+        );
+    }
+
+    const SINGLE_EDGE_LOOP_SOURCE: &str = "declare const value: number; for (;;) { value; break; }";
+
+    fn single_edge_loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef) {
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (statement, body) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((node, iteration.statement)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::Block(block) = &parsed.arena.get(body).unwrap().data else {
+            panic!("expected the actual loop body")
+        };
+        let [expression, jump] = block.statements.nodes.as_slice() else {
+            panic!("expected the source read and terminal break")
+        };
+        let NodeData::ExpressionStatement(expression) =
+            &parsed.arena.get(*expression).unwrap().data
+        else {
+            panic!("expected the source expression statement")
+        };
+        assert_eq!(
+            parsed.arena.get(*jump).unwrap().kind,
+            SyntaxKind::BreakStatement
+        );
+        (
+            reference(statement),
+            reference(expression.expression),
+            reference(*jump),
+        )
+    }
+
+    #[test]
+    fn single_edge_loop_label_checks_the_real_terminal_break_and_replays() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_209);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let entry = bound.flow_at(statement).unwrap();
+        let label = bound.flow_at(read).unwrap();
+        let row = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(
+            source_flow_kind(label, row.flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        assert_eq!(label_antecedents(label, &row), Ok([entry].as_slice()));
+        assert_eq!(bound.flow_at(jump), Some(label));
+        assert_eq!(
+            bound.flow_graph().container_end(bound.source_file()),
+            Some(label)
+        );
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        assert_eq!(plan.end, Some(label));
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let owner = bound
+            .symbol(captured_variable(&parsed, file, "value"))
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert_eq!(context.get_type_at_location(read), Ok(number));
+        let globals = context.global_types().clone();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.store().type_node_links(read).cloned(),
+                context.store().value_symbol_links(owner).cloned(),
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(owner, number)].into(),
+                )
+                .unwrap();
+            for point in [read, jump, read] {
+                let actual = frame
+                    .snapshot_for_symbols_at(context.store_mut_for_test(), &globals, point, [owner])
+                    .unwrap();
+                assert_eq!(actual.type_of(owner), Some(number));
+                assert!(actual.reachable);
+                assert!(!actual.incomplete);
+            }
+            let exit = frame
+                .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [owner])
+                .unwrap();
+            assert_eq!(exit.type_of(owner), Some(number));
+            assert!(exit.reachable);
+            assert!(!exit.incomplete);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn single_edge_loop_label_rejects_changed_kind_and_shape() {
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_210);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let (statement, read, _) = single_edge_loop_nodes(&parsed, file);
+        let label = bound.flow_at(read).unwrap();
+        let entry = bound.flow_at(statement).unwrap();
+        let original = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        let mut empty = original.clone();
+        empty.antecedents.clear();
+        let mut duplicate = original.clone();
+        duplicate.antecedents.push(entry);
+        let mut linear = original.clone();
+        linear.antecedent = Some(entry);
+        let mut payload = original.clone();
+        payload.payload = Some(FlowNodePayload::Ast(statement));
+        let mut branch = original.clone();
+        branch.flags = FlowFlags::BRANCH_LABEL;
+        let mut wrong_kind = original.clone();
+        wrong_kind.flags = FlowFlags::START;
+        wrong_kind.antecedents.push(label);
+        for changed in [empty, duplicate, linear, payload, branch, wrong_kind] {
+            assert_eq!(
+                label_antecedents(label, &changed),
+                Err(SourceFlowInvariant::InvalidAntecedents(label).into())
+            );
+            assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        }
+        let mut composite = original.clone();
+        composite.flags = FlowFlags::LOOP_LABEL | FlowFlags::BRANCH_LABEL;
+        assert_eq!(
+            label_antecedents(label, &composite),
+            Err(SourceFlowInvariant::InvalidFlowFlags {
+                flow: label,
+                flags: composite.flags
+            }
+            .into())
+        );
+        for metadata in [
+            FlowFlags::REFERENCED,
+            FlowFlags::SHARED,
+            FlowFlags::REFERENCED | FlowFlags::SHARED,
+        ] {
+            let mut annotated = original.clone();
+            annotated.flags = FlowFlags::LOOP_LABEL | metadata;
+            assert_eq!(label_antecedents(label, &annotated), Ok([entry].as_slice()));
+        }
+        assert_eq!(flow_node(bound.flow_graph(), label).unwrap(), original);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn single_edge_loop_label_keeps_foreign_flow_and_source_owner_rejection() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_211);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        let foreign = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let foreign_file = FileId::new(32_212);
+        let foreign_context = loop_context(&foreign, foreign_file);
+        let foreign_bound = foreign_context.file(foreign_file).unwrap().1;
+        let (_, foreign_read, _) = single_edge_loop_nodes(&foreign, foreign_file);
+        let foreign_flow = foreign_bound.flow_at(foreign_read).unwrap();
+        let mut foreign_point = plan.clone();
+        foreign_point.points.insert(read, foreign_flow);
+        let mut foreign_exit = plan.clone();
+        foreign_exit.end = Some(foreign_flow);
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for changed in [foreign_point, foreign_exit] {
+            assert_eq!(
+                changed.validate_flow_paths(bound),
+                Err(SourceFlowInvariant::ForeignFlow(foreign_flow).into())
+            );
+            assert_eq!(plan.validate_flow_paths(bound), Ok(()));
+        }
+        let mut wrong_owner = plan.clone();
+        wrong_owner.region.as_mut().unwrap().statement = read;
+        assert!(matches!(
+            wrong_owner.frame_with_captured_locals(context.store(), &host, bound, HashMap::new()),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidSourceRegion(node))) if node == read
+        ));
+        plan.frame_with_captured_locals(context.store(), &host, bound, HashMap::new())
+            .unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
         );
     }
 
@@ -7556,6 +17839,693 @@ mod tests {
             ),
             Err(SourceEqualityNarrowingError::UnsupportedType(ready)),
         );
+    }
+
+    fn source_numeric_equality_types(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (TypeId, [TypeId; 3]) {
+        let declaration = captured_variable(parsed, file, "choices");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap());
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected the written numeric union")
+        };
+        let [zero, one, two] = union.types.nodes.as_slice() else {
+            panic!("expected three written numeric members")
+        };
+        let literals = [*zero, *one, *two].map(|node| {
+            context
+                .get_type_from_type_node(NodeRef::new(parsed.arena.id(), file, node))
+                .unwrap()
+        });
+        let choices = context.get_type_from_type_node(annotation).unwrap();
+        let mut expected = literals;
+        expected.sort_unstable();
+        assert_eq!(
+            union_constituents(context.store(), choices),
+            Some(expected.as_slice())
+        );
+        (choices, literals)
+    }
+
+    #[test]
+    fn loose_numeric_equality_keeps_written_literals_and_cold_warm_results() {
+        let parsed = parse_source_file("declare const choices: 0 | 1 | 2;");
+        let file = FileId::new(32_270);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (choices, [zero, one, two]) =
+            source_numeric_equality_types(&mut context, &parsed, file);
+        let fresh_one = context.store().fresh_type_of_literal_type(one).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, never) = (bootstrap.number_type, bootstrap.never_type);
+
+        let rejected = narrow_by_equality(
+            context.store_mut_for_test(),
+            &globals,
+            choices,
+            fresh_one,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut remaining = [zero, two];
+        remaining.sort_unstable();
+        assert_eq!(
+            union_constituents(context.store(), rejected),
+            Some(remaining.as_slice()),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &remaining,
+                    UnionReduction::Literal,
+                ),
+            Ok(rejected),
+        );
+
+        for (input, value, require_match, expected) in [
+            (zero, one, true, never),
+            (zero, one, false, zero),
+            (one, fresh_one, true, one),
+            (one, fresh_one, false, never),
+            (fresh_one, one, true, fresh_one),
+            (fresh_one, one, false, never),
+            (number, fresh_one, true, one),
+            (number, fresh_one, false, number),
+            (choices, one, true, one),
+            (choices, one, false, rejected),
+            (choices, fresh_one, true, one),
+            (choices, fresh_one, false, rejected),
+        ] {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    false,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    narrow_by_equality(
+                        context.store_mut_for_test(),
+                        &globals,
+                        input,
+                        value,
+                        false,
+                        require_match,
+                        None,
+                    ),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context
+                            .store()
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .union_cache_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot(),
+                    ),
+                    warm,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damage case restores the same checked numeric inputs.
+    fn loose_numeric_equality_rejects_mixed_foreign_and_damaged_inputs_before_filtering() {
+        use crate::semantic::type_records::RegularLiteralLink;
+
+        let parsed = parse_source_file("declare const choices: 0 | 1 | 2;");
+        let file = FileId::new(32_271);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (choices, [zero, one, two]) =
+            source_numeric_equality_types(&mut context, &parsed, file);
+        let fresh_one = context.store().fresh_type_of_literal_type(one).unwrap();
+        let fresh_two = context.store().fresh_type_of_literal_type(two).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, unknown, null, regular_true) = (
+            bootstrap.number_type,
+            bootstrap.unknown_type,
+            bootstrap.null_type,
+            bootstrap.regular_true_type,
+        );
+        let text = context
+            .store_mut_for_test()
+            .regular_string_literal_type("1".to_owned())
+            .unwrap();
+        let mixed = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, text],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let nullable = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let foreign = loop_context(&parsed, FileId::new(32_272));
+        let foreign_number = foreign.store().intrinsic_bootstrap().unwrap().number_type;
+        let value = match context.store().type_payload(one).unwrap().data() {
+            TypeData::Literal(literal) => literal.value.clone(),
+            _ => unreachable!(),
+        };
+        let copied_one = context
+            .store_mut_for_test()
+            .alloc_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                value,
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let copied_number = context
+            .store_mut_for_test()
+            .alloc_intrinsic_type(TypeFlags::NUMBER, "number")
+            .unwrap();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for (input, value, expected) in [
+            (
+                mixed,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                unknown,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                nullable,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                choices,
+                text,
+                SourceEqualityNarrowingError::UnsupportedType(text),
+            ),
+            (
+                zero,
+                regular_true,
+                SourceEqualityNarrowingError::UnsupportedType(regular_true),
+            ),
+            (
+                foreign_number,
+                one,
+                SourceEqualityNarrowingError::InvalidType(foreign_number),
+            ),
+            (
+                one,
+                foreign_number,
+                SourceEqualityNarrowingError::InvalidType(foreign_number),
+            ),
+            (
+                choices,
+                copied_one,
+                SourceEqualityNarrowingError::Union(LiteralTypeCacheError::InvalidCachedLiteral(
+                    copied_one,
+                )),
+            ),
+            (
+                copied_number,
+                one,
+                SourceEqualityNarrowingError::Union(
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(copied_number),
+                ),
+            ),
+        ] {
+            let before = snapshot(context.store());
+            for require_match in [true, false] {
+                assert_eq!(
+                    narrow_by_equality(
+                        context.store_mut_for_test(),
+                        &globals,
+                        input,
+                        value,
+                        false,
+                        require_match,
+                        None,
+                    ),
+                    Err(expected),
+                );
+                assert_eq!(snapshot(context.store()), before);
+            }
+        }
+
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                one,
+                false,
+                true,
+                Some("kind"),
+            ),
+            Err(SourceEqualityNarrowingError::UnsupportedType(one)),
+        );
+        assert_eq!(snapshot(context.store()), before);
+
+        // Warm the result before damaging a leaf that a match would remove.
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Ok(one),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(two, Some(two), two)
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedLiteral(two)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(two, Some(fresh_two), two)
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(fresh_one, None, one)
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                number,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedLiteral(fresh_one)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(fresh_one, Some(fresh_one), one)
+        );
+
+        let owner = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(captured_variable(&parsed, file, "choices"))
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(choices, Some(owner))
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedUnion(choices)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(context.store_mut_for_test().set_type_symbol(choices, None));
+        let restored = snapshot(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    choices,
+                    fresh_one,
+                    false,
+                    true,
+                    None,
+                ),
+                Ok(one),
+            );
+            assert_eq!(snapshot(context.store()), restored);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The source and frame checks share the exact const-loop graph.
+    fn loose_numeric_equality_keeps_the_real_const_loop_and_reference_replay() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "for (const fixed = 0; fixed < 1; ++fixed) {\n",
+            "  const current: 0 = fixed;\n",
+            "  if (fixed == 1) { break; }\n",
+            "  if (fixed == 2) { continue; }\n",
+            "}\n",
+        ));
+        let file = FileId::new(32_273);
+        let mut context = loop_context(&parsed, file);
+        // The unchanged source must check before any test supplies frame values.
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2588, 2367, 2367],
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let assignment = |name| {
+            let declaration = captured_variable(&parsed, file, name);
+            SourceFlowAssignment {
+                declaration,
+                symbol: bound.symbol(declaration).unwrap(),
+            }
+        };
+        let fixed = assignment("fixed");
+        let current = assignment("current");
+        assert_ne!(fixed.symbol, current.symbol);
+        let (statement, iteration) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((reference(node), iteration)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::BinaryExpression(header) =
+            &parsed.arena.get(iteration.condition.unwrap()).unwrap().data
+        else {
+            panic!("expected the original header comparison")
+        };
+        let header_read = reference(header.left);
+        let NodeData::PrefixUnaryExpression(update) = &parsed
+            .arena
+            .get(iteration.incrementor.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the original prefix update")
+        };
+        let update_target = reference(update.operand);
+        let NodeData::VariableDeclaration(current_data) =
+            &parsed.arena.get(current.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body_read = reference(current_data.initializer.unwrap());
+        let mut conditions = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                (parsed.arena.get(binary.operator_token).unwrap().kind
+                    == SyntaxKind::EqualsEqualsToken)
+                    .then_some((
+                        reference(node),
+                        reference(binary.left),
+                        reference(binary.right),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        conditions.sort_by_key(|(node, _, _)| parsed.arena.get(node.node).unwrap().range.start);
+        let [first, second] = conditions.as_slice() else {
+            panic!("expected both original loose comparisons")
+        };
+        let second_flow = bound.flow_at(second.1).unwrap();
+        let second_row = flow_node(bound.flow_graph(), second_flow).unwrap();
+        assert_eq!(
+            source_flow_kind(second_flow, second_row.flags),
+            Ok(SourceFlowKind::FalseCondition)
+        );
+        assert_eq!(ast_payload(second_flow, &second_row), Ok(first.0));
+        let label = bound.flow_at(header_read).unwrap();
+        assert_eq!(
+            source_flow_kind(label, flow_node(bound.flow_graph(), label).unwrap().flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        for read in [header_read, update_target, body_read, first.1, second.1] {
+            validate_source_reference(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                read,
+                fixed.symbol,
+            )
+            .unwrap();
+        }
+        let mut points = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = reference(node);
+                (record.kind == SyntaxKind::Identifier
+                    && source_node_is_descendant_of(&parsed.arena, node, statement.node)
+                    && bound.flow_at(node).is_some())
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            points,
+            conditions.iter().map(|(expression, _, value)| {
+                SourceFlowCondition::Equality(SourceEqualityCondition {
+                    expression: *expression,
+                    symbol: fixed.symbol,
+                    value: *value,
+                    comparison: SourceTypeofComparison::Equal,
+                    strict: false,
+                    discriminant: None,
+                })
+            }),
+            [fixed, current],
+            [SourceFlowUpdate {
+                target: update_target,
+                declaration: fixed.declaration,
+                symbol: fixed.symbol,
+                readonly: true,
+            }],
+            [],
+        )
+        .unwrap();
+        let value_type = |symbol| {
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        };
+        let zero = value_type(fixed.symbol);
+        let current_type = value_type(current.symbol);
+        assert!(matches!(
+            context.store().type_payload(zero).unwrap().data(),
+            TypeData::Literal(_)
+        ));
+        assert!(matches!(
+            context.store().type_payload(current_type).unwrap().data(),
+            TypeData::Literal(_)
+        ));
+        let mut frame = plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        for (_, _, value) in &conditions {
+            frame
+                .complete_condition_value(
+                    *value,
+                    context
+                        .store()
+                        .type_node_links(*value)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        // The checked non-union declared types are also the post-assignment flow types.
+        frame
+            .complete_source_declaration(&host, fixed.declaration, fixed.symbol, zero, zero)
+            .unwrap();
+        assert_eq!(
+            frame.assignment_states[&update_target],
+            SourceFlowAssignmentState::ReadonlyUpdate
+        );
+        assert_eq!(
+            frame.assignment_states[&current.declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        for read in [header_read, update_target, body_read] {
+            let snapshot = frame
+                .snapshot_for_symbols_at(
+                    context.store_mut_for_test(),
+                    &globals,
+                    read,
+                    [fixed.symbol],
+                )
+                .unwrap();
+            assert_eq!(snapshot.type_of(fixed.symbol), Some(zero));
+            assert!(snapshot.reachable);
+            assert!(!snapshot.incomplete);
+        }
+        assert!(frame.memo.contains_key(&(label, Some(fixed.symbol))));
+        frame
+            .complete_source_declaration(
+                &host,
+                current.declaration,
+                current.symbol,
+                current_type,
+                current_type,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        for read in [first.1, second.1] {
+            assert_eq!(
+                frame
+                    .snapshot_for_symbols_at(
+                        context.store_mut_for_test(),
+                        &globals,
+                        read,
+                        [fixed.symbol]
+                    )
+                    .unwrap()
+                    .type_of(fixed.symbol),
+                Some(zero)
+            );
+        }
+        let memo = frame.memo.clone();
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame
+                    .snapshot_for_symbols_at(
+                        context.store_mut_for_test(),
+                        &globals,
+                        second.1,
+                        [fixed.symbol]
+                    )
+                    .unwrap()
+                    .type_of(fixed.symbol),
+                Some(zero)
+            );
+            assert_eq!(frame.memo, memo);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(frame.reference, None);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot()
+                ),
+                before
+            );
+        }
+        let diagnostics = context.diagnostics().clone();
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot()
+                ),
+                before
+            );
+        }
     }
 
     #[test]
@@ -8862,6 +19832,649 @@ mod tests {
     }
 
     #[test]
+    fn nullish_assignment_flow_keeps_nested_writes_conditional_and_replays() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(
+            "function effects(value: number | undefined, side: number | undefined): void { \
+             value ??= (side ??= 1); value; side; }",
+        );
+        let file = FileId::new(32_291);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (function, _, statements) = linear_function_nodes(&parsed, file, "effects");
+        let assignment = |name: &str| {
+            let declaration = captured_variable(&parsed, file, name);
+            let (expression, target) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::BinaryExpression(binary) = &record.data else {
+                        return None;
+                    };
+                    matches!(&parsed.arena.get(binary.left)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, binary.left),
+                    ))
+                })
+                .unwrap();
+            SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: Some(declaration),
+                symbol: bound.symbol(declaration),
+                readonly: false,
+            }
+        };
+        let value = assignment("value");
+        let side = assignment("side");
+        let value_symbol = value.symbol.unwrap();
+        let side_symbol = side.symbol.unwrap();
+        let plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            function,
+            statements
+                .iter()
+                .copied()
+                .chain([value.target, side.target]),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [value, side],
+        )
+        .unwrap();
+        let (number, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        let optional = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[number, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let base: SourceFlowTypes = [(value_symbol, optional), (side_symbol, optional)]
+            .into_iter()
+            .collect();
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(context.store(), &host, &bound, base.clone())
+                .unwrap();
+            let right = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, side.target)
+                .unwrap();
+            assert_eq!(right.type_of(value_symbol), Some(undefined));
+            assert_eq!(right.type_of(side_symbol), Some(optional));
+            assert!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, statements[1])
+                    .is_err()
+            );
+            frame
+                .complete_assignment(side.target, side_symbol, number)
+                .unwrap();
+            assert!(frame.memo.is_empty());
+            frame
+                .complete_assignment(value.target, value_symbol, number)
+                .unwrap();
+            let after = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, statements[1])
+                .unwrap();
+            assert_eq!(after.type_of(value_symbol), Some(number));
+            assert_eq!(after.type_of(side_symbol), Some(optional));
+            assert_eq!(frame.declared_types, base);
+            assert_eq!(
+                frame.complete_assignment(value.target, value_symbol, number),
+                Err(SourceFlowInvariant::AssignmentAlreadyCompleted(value.target).into())
+            );
+        }
+        for changed in [
+            SourceFlowNullishAssignment {
+                declaration: side.declaration,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                symbol: side.symbol,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                readonly: true,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                expression: side.expression,
+                ..value
+            },
+        ] {
+            assert!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    function,
+                    changed,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn nullish_assignment_flow_keeps_falsy_values_on_the_non_nullish_edge() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(
+            "function effects(value: string | number | boolean | undefined): void { \
+             value ??= 1; value; }",
+        );
+        let file = FileId::new(32_292);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (function, parameter, statements) = linear_function_nodes(&parsed, file, "effects");
+        let expression = expression_statement_expression(&parsed, file, statements[0]);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected nullish assignment")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let symbol = bound.symbol(parameter).unwrap();
+        let assignment = SourceFlowNullishAssignment {
+            expression,
+            target,
+            declaration: Some(parameter),
+            symbol: Some(symbol),
+            readonly: false,
+        };
+        let plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            function,
+            statements.iter().copied(),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [assignment],
+        )
+        .unwrap();
+        let (undefined, false_type, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.regular_false_type,
+                bootstrap.number_type,
+            )
+        };
+        let zero = context
+            .store_mut_for_test()
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let empty = context
+            .store_mut_for_test()
+            .regular_string_literal_type(String::new())
+            .unwrap();
+        let present = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, empty, false_type],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let input = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[present, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let edge = |wanted| {
+            bound
+                .flow_graph()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    (node.flags.intersects(wanted)
+                        && node.payload == Some(FlowNodePayload::Ast(target)))
+                    .then(|| {
+                        bound
+                            .flow_graph()
+                            .nodes()
+                            .flow_ref(FlowNodeId(u32::try_from(index).unwrap()))
+                            .unwrap()
+                    })
+                })
+                .unwrap()
+        };
+        let mut frame = plan
+            .frame(&bound, [(symbol, input)].into_iter().collect())
+            .unwrap();
+        assert_eq!(
+            frame
+                .resolve_flow(
+                    context.store_mut_for_test(),
+                    &globals,
+                    edge(FlowFlags::TRUE_CONDITION),
+                    0
+                )
+                .unwrap()
+                .type_of(symbol),
+            Some(present)
+        );
+        assert_eq!(
+            frame
+                .resolve_flow(
+                    context.store_mut_for_test(),
+                    &globals,
+                    edge(FlowFlags::FALSE_CONDITION),
+                    0
+                )
+                .unwrap()
+                .type_of(symbol),
+            Some(undefined)
+        );
+        frame.complete_assignment(target, symbol, number).unwrap();
+        assert!(frame.memo.is_empty());
+    }
+
+    #[test]
+    fn nullish_source_statement_keeps_readonly_assignment_state() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        for readonly in [false, true] {
+            let input = if readonly {
+                "const value: number | undefined = undefined; value ??= 1; value;"
+            } else {
+                "let value: number | undefined; value ??= 1; value;"
+            };
+            let parsed = parse_source_file(input);
+            let file = FileId::new(32_293);
+            let mut context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let declaration = captured_variable(&parsed, file, "value");
+            let symbol = bound.symbol(declaration).unwrap();
+            let (expression, binary) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| match &record.data {
+                    NodeData::BinaryExpression(binary) => {
+                        Some((NodeRef::new(parsed.arena.id(), file, id), binary))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let statement = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                parsed.arena.get(expression.node).unwrap().parent.unwrap(),
+            );
+            let assignment = SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: Some(declaration),
+                symbol: Some(symbol),
+                readonly,
+            };
+            let plan = SourceFlowPlan::preflight_source_statement_with_nullish_assignments(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                statement,
+                [target],
+                [],
+                [],
+                [],
+                [],
+                [assignment],
+            )
+            .unwrap();
+            let (number, undefined) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.undefined_type)
+            };
+            let mut frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(symbol, undefined)].into_iter().collect(),
+                )
+                .unwrap();
+            if readonly {
+                assert_eq!(
+                    frame.assignment_states[&target],
+                    SourceFlowAssignmentState::ReadonlyUpdate
+                );
+                assert_eq!(
+                    frame.complete_assignment(target, symbol, number),
+                    Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into())
+                );
+            } else {
+                frame.complete_assignment(target, symbol, number).unwrap();
+            }
+            let after = frame
+                .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [symbol])
+                .unwrap();
+            assert_eq!(
+                after.type_of(symbol),
+                Some(if readonly { undefined } else { number })
+            );
+        }
+    }
+
+    #[test]
+    fn nullish_structural_owners_keep_real_entries_and_call_antecedents() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let state = |context: &CanonicalCheckerContext<'_>, parsed: &ParseResult, file: FileId| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.index_info_len(),
+                    store.type_resolution_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                parsed
+                    .arena
+                    .iter()
+                    .map(|(id, _)| {
+                        let node = NodeRef::new(parsed.arena.id(), file, id);
+                        (
+                            node,
+                            store.node_links(node).cloned(),
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                            store.signature_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store
+                    .symbol_store()
+                    .symbols()
+                    .map(|(symbol, _)| (symbol, store.value_symbol_links(symbol).cloned()))
+                    .collect::<Vec<_>>(),
+                store
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.file(file).unwrap().1.flow_graph().clone(),
+                context.diagnostics().clone(),
+            )
+        };
+        let parsed = parse_source_file(concat!(
+            "declare function effect(): number;\n",
+            "function owner(value: number | undefined): void {\n",
+            "  value ??= (effect(), 1); value;\n",
+            "}\n",
+            "function foreign(other: number | undefined): void { other; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(32_294);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (owner, declaration, statements) = linear_function_nodes(&parsed, file, "owner");
+        let (foreign, _, _) = linear_function_nodes(&parsed, file, "foreign");
+        let expression = expression_statement_expression(&parsed, file, statements[0]);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected the actual nullish assignment");
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowNullishAssignment {
+            expression,
+            target,
+            declaration: Some(declaration),
+            symbol: bound.symbol(declaration),
+            readonly: false,
+        };
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        assert_eq!(bound.flow_container(expression), None);
+        assert_eq!(bound.flow_at(expression), None);
+        assert_eq!(bound.container(expression), Some(owner));
+        assert_eq!(bound.flow_container(target), Some(owner));
+        assert!(bound.flow_at(target).is_some());
+        assert_eq!(bound.flow_container(call), None);
+        let call_rows = bound
+            .flow_graph()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.flags.contains(FlowFlags::CALL)
+                    && node.payload == Some(FlowNodePayload::Ast(call))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_rows.len(), 1);
+        let antecedent = call_rows[0].antecedent.unwrap();
+        let globals = context.global_types().clone();
+        let (number, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        let optional = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[number, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let before = state(&context, &parsed, file);
+        let mut plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            owner,
+            statements.iter().copied().chain([target]),
+            [],
+            [],
+            [],
+            [call],
+            [],
+            [],
+            [],
+            [assignment],
+        )
+        .unwrap();
+        assert_eq!(plan.nullish_calls.get(&call), Some(&antecedent));
+        {
+            let symbol = assignment.symbol.unwrap();
+            let frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(symbol, optional)].into_iter().collect(),
+                )
+                .unwrap();
+            assert_eq!(frame.declared_types.get(&symbol), Some(&optional));
+        }
+        assert_eq!(state(&context, &parsed, file), before);
+        assert_eq!(
+            validate_nullish_call(&parsed.arena, &bound, owner, call, &[assignment]),
+            Ok(Some((statements[0], antecedent))),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+        for wrong_owner in [foreign, bound.source_file()] {
+            assert_eq!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    wrong_owner,
+                    assignment,
+                ),
+                Err(SourceFlowInvariant::InvalidParameterAssignment(target).into()),
+            );
+            assert_eq!(
+                validate_nullish_call(&parsed.arena, &bound, wrong_owner, call, &[assignment]),
+                Err(SourceFlowInvariant::InvalidCall(call).into()),
+            );
+            assert_eq!(state(&context, &parsed, file), before);
+        }
+        let other_target = expression_statement_expression(&parsed, file, statements[1]);
+        assert_eq!(
+            validate_source_nullish_assignment(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                owner,
+                SourceFlowNullishAssignment {
+                    target: other_target,
+                    ..assignment
+                },
+            ),
+            Err(SourceFlowInvariant::InvalidParameterAssignment(other_target).into()),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+        let wrong_antecedent = bound.flow_at(target).unwrap();
+        assert_ne!(wrong_antecedent, antecedent);
+        plan.nullish_calls.insert(call, wrong_antecedent);
+        assert_eq!(
+            plan.frame_with_captured_locals(context.store(), &host, &bound, SourceFlowTypes::new())
+                .err(),
+            Some(SourceFlowInvariant::InvalidCall(call).into()),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+
+        // A literal key retains a mutation even on a temporary receiver. A call key does not.
+        for (index, key) in ["index()", "'x'"].into_iter().enumerate() {
+            let parsed = parse_source_file(&format!(
+                "declare function receiver(): {{ [key: string]: number | undefined }}; \
+                 declare function index(): string; \
+                 function owner(unused: number): void {{ receiver()[{key}] ??= 1; }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(32_295 + u32::try_from(index).unwrap());
+            let context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let (owner, _, statements) = linear_function_nodes(&parsed, file, "owner");
+            let expression = expression_statement_expression(&parsed, file, statements[0]);
+            let NodeData::BinaryExpression(binary) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("expected the actual member assignment");
+            };
+            let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let NodeData::ElementAccessExpression(element) =
+                &parsed.arena.get(target.node).unwrap().data
+            else {
+                panic!("expected the actual element target");
+            };
+            let receiver = NodeRef::new(parsed.arena.id(), file, element.expression);
+            let assignment = SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: None,
+                symbol: None,
+                readonly: false,
+            };
+            assert_eq!(bound.flow_container(expression), None);
+            assert_eq!(bound.flow_container(receiver), None);
+            let writes = bound
+                .flow_graph()
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    node.flags.contains(FlowFlags::ASSIGNMENT)
+                        && node.payload == Some(FlowNodePayload::Ast(target))
+                })
+                .count();
+            assert_eq!(writes, index);
+            assert_eq!(bound.flow_container(target), (index == 1).then_some(owner));
+            let before = state(&context, &parsed, file);
+            assert_eq!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    owner,
+                    assignment,
+                ),
+                if index == 0 {
+                    Ok(())
+                } else {
+                    Err(SourceFlowUnsupported::PropertyWrite(target).into())
+                },
+            );
+            assert_eq!(state(&context, &parsed, file), before);
+            assert_eq!(
+                validate_nullish_call(&parsed.arena, &bound, owner, receiver, &[assignment]),
+                Err(SourceFlowInvariant::InvalidCall(receiver).into()),
+            );
+            assert_eq!(state(&context, &parsed, file), before);
+        }
+    }
+
+    #[test]
     fn parameter_assignment_flow_updates_only_its_authenticated_symbol() {
         for (index, parameters) in [
             "value: string | number, other: number",
@@ -8991,6 +20604,235 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn object_method_parameter_assignment_keeps_its_owner_and_flow_state() {
+        let parsed = parse_source_file(concat!(
+            "const object = { update(value: string | number, other: number): void { ",
+            "value = 1; value; } };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_330);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let (method, data) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::MethodDeclaration(data) => {
+                    Some((NodeRef::new(parsed.arena.id(), file, node), data))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let [parameter, other] = data.parameters.nodes.as_slice() else {
+            panic!("the method must keep both parameters")
+        };
+        let parameter = NodeRef::new(parsed.arena.id(), file, *parameter);
+        let other = NodeRef::new(parsed.arena.id(), file, *other);
+        let symbol = bound.symbol(parameter).unwrap();
+        let other_symbol = bound.symbol(other).unwrap();
+        let owner = bound.symbol(method).unwrap();
+        assert!(
+            context
+                .store()
+                .source_object_literal_method_owner_is_exact(method, owner)
+        );
+        let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+            panic!("the method must keep its block")
+        };
+        let [before, after] = body.statements.nodes.as_slice() else {
+            panic!("the method must keep its assignment and following read")
+        };
+        let before = NodeRef::new(parsed.arena.id(), file, *before);
+        let after = NodeRef::new(parsed.arena.id(), file, *after);
+        let expression = expression_statement_expression(&parsed, file, before);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("the first statement must assign the parameter")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowParameterAssignment {
+            target,
+            parameter,
+            symbol,
+        };
+        let (union, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_or_number_type, bootstrap.number_type)
+        };
+        let base = [(symbol, union), (other_symbol, number)]
+            .into_iter()
+            .collect::<SourceFlowTypes>();
+        let mut expected = base.clone();
+        expected.insert(symbol, number);
+        for _ in 0..2 {
+            let plan = SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                method,
+                [before, after],
+                [],
+                [assignment],
+                [],
+            )
+            .unwrap();
+            assert_eq!(plan.container, method);
+            assert_eq!(plan.assignment_declarations.get(&target), Some(&parameter));
+            let mut frame = plan.frame(&bound, base.clone()).unwrap();
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, before)
+                    .unwrap()
+                    .types(),
+                &base,
+            );
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, after),
+                Err(SourceFlowInvariant::PendingAssignment(target).into()),
+            );
+            frame.complete_assignment(target, symbol, number).unwrap();
+            let checked = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, after)
+                .unwrap();
+            assert_eq!(checked.types(), &expected);
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, after)
+                    .unwrap(),
+                checked,
+            );
+            assert_eq!(
+                frame.complete_assignment(target, symbol, number),
+                Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into()),
+            );
+            assert_eq!(bound.symbol(parameter), Some(symbol));
+            assert_eq!(bound.symbol(other), Some(other_symbol));
+            assert!(
+                context
+                    .store()
+                    .source_object_literal_method_owner_is_exact(method, owner)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn object_method_parameter_assignment_rejects_changed_owner_and_parameter_proofs() {
+        let parsed = parse_source_file(concat!(
+            "const object = { update(value: number, other: number): void { ",
+            "value = 1; value; } };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_331);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let (method, data) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::MethodDeclaration(data) => {
+                    Some((NodeRef::new(parsed.arena.id(), file, node), data))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let [parameter, other] = data.parameters.nodes.as_slice() else {
+            panic!("the method must keep both parameters")
+        };
+        let parameter = NodeRef::new(parsed.arena.id(), file, *parameter);
+        let other = NodeRef::new(parsed.arena.id(), file, *other);
+        let symbol = bound.symbol(parameter).unwrap();
+        let other_symbol = bound.symbol(other).unwrap();
+        let owner = bound.symbol(method).unwrap();
+        let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+            panic!("the method must keep its block")
+        };
+        let [before, after] = body.statements.nodes.as_slice() else {
+            panic!("the method must keep its assignment and following read")
+        };
+        let before = NodeRef::new(parsed.arena.id(), file, *before);
+        let after = NodeRef::new(parsed.arena.id(), file, *after);
+        let expression = expression_statement_expression(&parsed, file, before);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("the first statement must assign the parameter")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowParameterAssignment {
+            target,
+            parameter,
+            symbol,
+        };
+        let preflight = |store: &CanonicalTypeMapperStore, assignment| {
+            SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                store,
+                method,
+                [before, after],
+                [],
+                [assignment],
+                [],
+            )
+        };
+        let reject = |store: &CanonicalTypeMapperStore, assignment| {
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(matches!(
+                    preflight(store, assignment),
+                    Err(SourceFlowError::Invariant(
+                        SourceFlowInvariant::InvalidParameterAssignment(node)
+                    )) if node == target
+                ));
+                assert_eq!(format!("{store:?}"), before);
+            }
+        };
+        let store = context.store_mut_for_test();
+        assert!(preflight(store, assignment).is_ok());
+        let parent = store.symbol(owner).unwrap().parent().unwrap();
+        let name = store.symbol(owner).unwrap().name().to_owned();
+        let members = store.symbol(parent).unwrap().members().unwrap();
+        let flags = store.symbol(owner).unwrap().flags();
+        let checks = store.symbol(owner).unwrap().check_flags();
+        assert!(store.set_symbol_relationships(owner, None, None, None, None));
+        reject(store, assignment);
+        assert!(store.set_symbol_relationships(owner, None, None, Some(parent), None));
+        assert!(preflight(store, assignment).is_ok());
+        assert!(store.set_symbol_flags(owner, SymbolFlags::PROPERTY, checks));
+        reject(store, assignment);
+        assert!(store.set_symbol_flags(owner, flags, checks));
+        assert!(preflight(store, assignment).is_ok());
+        assert_eq!(
+            store.insert_symbol(members, name.clone(), other_symbol),
+            Some(Some(owner))
+        );
+        reject(store, assignment);
+        assert_eq!(
+            store.insert_symbol(members, name, owner),
+            Some(Some(other_symbol))
+        );
+        assert!(preflight(store, assignment).is_ok());
+        for forged in [
+            SourceFlowParameterAssignment {
+                symbol: other_symbol,
+                ..assignment
+            },
+            SourceFlowParameterAssignment {
+                parameter: other,
+                symbol: other_symbol,
+                ..assignment
+            },
+        ] {
+            reject(store, forged);
+        }
+        assert!(preflight(store, assignment).is_ok());
+        assert_eq!(bound.symbol(parameter), Some(symbol));
+        assert_eq!(bound.symbol(other), Some(other_symbol));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

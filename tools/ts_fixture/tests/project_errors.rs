@@ -184,3 +184,283 @@ fn config_diagnostics_without_retained_ranges_have_no_error_text() {
     let value = serde_json::to_value(&errors.pinned_error_baseline).unwrap();
     assert!(value.get("value").is_none());
 }
+
+#[test]
+fn census_failure_locations_use_the_typed_node_not_the_requested_root() {
+    use ts_ast::{NodeRef, SyntaxKind};
+    use ts_checker::semantic::{DeclaredTypeError, SourceCheckError, TypeNodeUnavailable};
+    use ts_compiler::{CanonicalCensusPhase, CanonicalProgramCheckError, Program};
+    use ts_fixture::project::ProjectCensusFailure;
+    use ts_options::CompilerOptions;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/census/root.ts", "const root = 1;\n")
+        .unwrap();
+    fs.write_file(
+        "/census/dependency.ts",
+        "const prefix = \"\u{1f642}\";\nconst dependency = 1;\n",
+    )
+    .unwrap();
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/census",
+        &["root.ts".to_owned(), "dependency.ts".to_owned()],
+        CompilerOptions {
+            no_lib: true,
+            no_check: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let source = program.source_file("/census/dependency.ts").unwrap();
+    let (id, node) = source
+        .parse
+        .arena
+        .iter()
+        .find(|(_, node)| {
+            node.kind == SyntaxKind::Identifier
+                && source
+                    .source_text
+                    .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                    == Some("dependency")
+        })
+        .unwrap();
+    let reference = NodeRef::new(source.parse.arena.id(), source.id, id);
+    let error = CanonicalProgramCheckError::SourceCheck {
+        file_name: "/census/root.ts".to_owned(),
+        error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+            TypeNodeUnavailable::MissingTypeReference(reference),
+        )),
+    };
+    let failure =
+        ProjectCensusFailure::from_error(Some(&program), CanonicalCensusPhase::Source, &error);
+    assert_eq!(failure.phase, "source");
+    assert_eq!(failure.returned_error, format!("{error:?}"));
+    assert_eq!(failure.detail, error.to_string());
+    assert_eq!(failure.code, error.failure_class().code());
+    assert_eq!(
+        failure.reported_file_name.as_deref(),
+        Some("/census/root.ts")
+    );
+    let location = failure.location.unwrap();
+    assert_eq!(location.file_name, "/census/dependency.ts");
+    assert_eq!(location.file_id, source.id.index());
+    assert_eq!(location.syntax_kind, "Identifier");
+    assert_eq!(location.start_byte, node.range.start.get());
+    assert_eq!(location.end_byte, node.range.end.get());
+    assert!(failure.location_unavailable.is_none());
+}
+
+#[test]
+fn census_failure_locations_reject_foreign_nodes_and_do_not_infer_from_file_ids() {
+    use ts_ast::NodeRef;
+    use ts_checker::semantic::SourceCheckError;
+    use ts_compiler::{CanonicalCensusPhase, CanonicalProgramCheckError, Program};
+    use ts_fixture::project::ProjectCensusFailure;
+    use ts_options::CompilerOptions;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/census/input.ts", "const value = 1;\n")
+        .unwrap();
+    let make = || {
+        Program::try_new_with_canonical_checker(
+            &fs,
+            "/census",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_check: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let first = make();
+    let other = make();
+    let source = other.source_file("/census/input.ts").unwrap();
+    let node = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+    assert!(first.node(node).is_none());
+    let error = CanonicalProgramCheckError::SourceCheck {
+        file_name: "/census/input.ts".to_owned(),
+        error: SourceCheckError::Call(node),
+    };
+    let foreign =
+        ProjectCensusFailure::from_error(Some(&first), CanonicalCensusPhase::Source, &error);
+    assert!(foreign.location.is_none());
+    assert!(
+        foreign
+            .location_unavailable
+            .as_deref()
+            .unwrap()
+            .contains("valid retained Program range")
+    );
+    assert_eq!(foreign.returned_error, format!("{error:?}"));
+    let no_program = ProjectCensusFailure::from_error(None, CanonicalCensusPhase::Source, &error);
+    assert!(no_program.location.is_none());
+    assert!(
+        no_program
+            .location_unavailable
+            .as_deref()
+            .unwrap()
+            .contains("No loaded Program")
+    );
+    let error = CanonicalProgramCheckError::MissingBoundFile {
+        file_name: "/census/input.ts".to_owned(),
+        file: first.source_file("/census/input.ts").unwrap().id,
+    };
+    let no_node =
+        ProjectCensusFailure::from_error(Some(&first), CanonicalCensusPhase::Binding, &error);
+    assert!(no_node.location.is_none());
+    assert!(no_node.location_unavailable.is_some());
+    assert_eq!(no_node.phase, "binding");
+    assert_eq!(no_node.returned_error, format!("{error:?}"));
+}
+
+#[test]
+fn census_callable_invariant_location_keeps_the_retained_node_and_error() {
+    use ts_ast::{NodeRef, SyntaxKind};
+    use ts_checker::semantic::{SourceCheckError, SourceFunctionInvariant};
+    use ts_compiler::{CanonicalCensusPhase, CanonicalProgramCheckError, Program};
+    use ts_fixture::project::ProjectCensusFailure;
+    use ts_options::CompilerOptions;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/census/root.ts", "const root = 1;\n")
+        .unwrap();
+    let prefix = "const prefix = \"\u{1f642}\";\r\nconst ";
+    fs.write_file(
+        "/census/dependency.ts",
+        &format!("{prefix}dependency = 1;\r\n"),
+    )
+    .unwrap();
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/census",
+        &["root.ts".to_owned(), "dependency.ts".to_owned()],
+        CompilerOptions {
+            no_lib: true,
+            no_check: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let source = program.source_file("/census/dependency.ts").unwrap();
+    let (id, node) = source
+        .parse
+        .arena
+        .iter()
+        .find(|(_, node)| {
+            node.kind == SyntaxKind::Identifier
+                && source
+                    .source_text
+                    .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                    == Some("dependency")
+        })
+        .unwrap();
+    let reference = NodeRef::new(source.parse.arena.id(), source.id, id);
+    let error = CanonicalProgramCheckError::SourceCheck {
+        file_name: "/census/root.ts".to_owned(),
+        error: SourceCheckError::Function(SourceFunctionInvariant::Callable(reference)),
+    };
+    let failure =
+        ProjectCensusFailure::from_error(Some(&program), CanonicalCensusPhase::Source, &error);
+    assert_eq!(failure.phase, "source");
+    assert_eq!(failure.class, "invariant");
+    assert_eq!(failure.code, "INV.SOURCE.FUNCTION");
+    assert_eq!(failure.detail, error.to_string());
+    assert_eq!(failure.returned_error, format!("{error:?}"));
+    assert_eq!(
+        failure.reported_file_name.as_deref(),
+        Some("/census/root.ts")
+    );
+    assert!(failure.location_unavailable.is_none());
+    let location = failure.location.unwrap();
+    assert_eq!(location.file_name, "/census/dependency.ts");
+    assert_eq!(location.file_id, source.id.index());
+    assert_eq!(location.syntax_kind, "Identifier");
+    assert_eq!(location.start_byte, node.range.start.get());
+    assert_eq!(location.end_byte, node.range.end.get());
+    assert_ne!(prefix.len(), prefix.chars().count());
+    assert_eq!(location.start_byte, u32::try_from(prefix.len()).unwrap());
+    assert_eq!(
+        location.end_byte,
+        u32::try_from(prefix.len() + "dependency".len()).unwrap()
+    );
+}
+
+#[test]
+fn census_callable_invariant_location_rejects_foreign_and_unmapped_nodes() {
+    use ts_ast::NodeRef;
+    use ts_checker::semantic::{SourceCheckError, SourceFunctionInvariant};
+    use ts_compiler::{CanonicalCensusPhase, CanonicalProgramCheckError, Program};
+    use ts_fixture::project::ProjectCensusFailure;
+    use ts_options::CompilerOptions;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/census/input.ts", "const value = 1;\n")
+        .unwrap();
+    let make = || {
+        Program::try_new_with_canonical_checker(
+            &fs,
+            "/census",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_check: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let first = make();
+    let other = make();
+    let source = first.source_file("/census/input.ts").unwrap();
+    let valid = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+    let source = other.source_file("/census/input.ts").unwrap();
+    let foreign = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+    assert!(first.node(valid).is_some());
+    assert!(other.node(foreign).is_some());
+    assert!(first.node(foreign).is_none());
+    let error = |invariant| CanonicalProgramCheckError::SourceCheck {
+        file_name: "/census/input.ts".to_owned(),
+        error: SourceCheckError::Function(invariant),
+    };
+    let foreign_error = error(SourceFunctionInvariant::Callable(foreign));
+    let no_program_error = error(SourceFunctionInvariant::Callable(valid));
+    let unmapped_error = error(SourceFunctionInvariant::MissingDeclaration(valid));
+    for (program, error, reason) in [
+        (
+            Some(&first),
+            &foreign_error,
+            "The returned node does not have a valid retained Program range.",
+        ),
+        (
+            None,
+            &no_program_error,
+            "No loaded Program is available to validate a location.",
+        ),
+        (
+            Some(&first),
+            &unmapped_error,
+            "This returned error has no supported typed node location.",
+        ),
+    ] {
+        let failure =
+            ProjectCensusFailure::from_error(program, CanonicalCensusPhase::Source, error);
+        assert!(failure.location.is_none());
+        assert_eq!(failure.location_unavailable.as_deref(), Some(reason));
+        assert_eq!(failure.phase, "source");
+        assert_eq!(failure.class, "invariant");
+        assert_eq!(failure.code, "INV.SOURCE.FUNCTION");
+        assert_eq!(failure.detail, error.to_string());
+        assert_eq!(failure.returned_error, format!("{error:?}"));
+        assert_eq!(
+            failure.reported_file_name.as_deref(),
+            Some("/census/input.ts")
+        );
+    }
+}

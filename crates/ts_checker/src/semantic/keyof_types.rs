@@ -5,8 +5,9 @@
 //! ordinary type parameters and fully resolved, source-owned interfaces,
 //! type literals, and fresh or derived object literals. Ordinary type
 //! parameters reuse one normalized `IndexType` identity. Named properties
-//! become canonical regular string-literal types,
-//! a number index contributes `number`, and a string index contributes
+//! become canonical regular string-literal types. Source property-object
+//! instances use their checked member and mapper proofs. A number index
+//! contributes `number`, and a string index contributes
 //! `string | number`. The latter absorbs every explicit property and number
 //! index in the result.
 //!
@@ -29,17 +30,26 @@ use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
 use super::{
-    CanonicalTypeMapperStore, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     array_types::CanonicalArrayTargets,
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
+    conditional_types::ConditionalBranchSource,
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
+    instantiate::InstantiationSession,
+    instantiated_members::{
+        PropertyObjectAliasMembers, SourcePropertyObjectMemberNames,
+        resolve_property_object_alias_members_with_array_targets,
+        validate_property_object_alias_members_with_array_targets,
+    },
     links::{TypeNodeLinks, ValueSymbolLinks},
-    mapped_types::{MappedTypeError, MappedTypeKey, MappedTypeKeys, plan_mapped_type_keys},
+    mapped_types::{MappedTypeError, MappedTypeKey, MappedTypeKeys, plan_mapped_type_keys_with_source},
+    object_aliases::{SourcePropertyObjectProjection, source_property_object_projection},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
-        validate_resolved_declared_property_object,
+        validate_resolved_closed_alias_property_object, validate_resolved_declared_property_object,
     },
+    relater::RelationUnavailable,
     signatures::IndexFlags,
     store::{PropertiesTypeCacheKey, SourceNodeParent},
     type_records::{
@@ -69,9 +79,13 @@ pub(super) struct NongenericKeyofPlan {
 }
 
 /// The source proof used to obtain the property names in a key plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum NongenericKeyofProof {
     Declared(DeclaredPropertyObjectProof),
+    ClosedAlias,
+    GenericInterface {
+        target: TypeId,
+    },
     FreshObjectLiteral {
         owner: SemanticSymbolId,
     },
@@ -79,7 +93,15 @@ pub(super) enum NongenericKeyofProof {
         owner: SemanticSymbolId,
         source: TypeId,
     },
+    SourcePropertyObject(Box<SourcePropertyObjectKeyProof>),
+    SourcePropertyNames(Box<SourcePropertyObjectMemberNames>),
     Composition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourcePropertyObjectKeyProof {
+    projection: SourcePropertyObjectProjection,
+    members: PropertyObjectAliasMembers,
 }
 
 impl PartialEq<DeclaredPropertyObjectProof> for NongenericKeyofProof {
@@ -103,8 +125,8 @@ impl NongenericKeyofPlan {
         self.target
     }
 
-    pub(super) const fn proof(&self) -> NongenericKeyofProof {
-        self.proof
+    pub(super) fn proof(&self) -> NongenericKeyofProof {
+        self.proof.clone()
     }
 
     pub(super) fn property_names(&self) -> &[String] {
@@ -218,12 +240,102 @@ pub(super) fn plan_nongeneric_keyof_type(
     plan_nongeneric_keyof_type_with_array_targets(store, target, None)
 }
 
+/// Publishes source object member names without demanding their value types.
+pub(super) fn prepare_keyof_type_with_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    prepare_keyof_object_members(store, target, array_targets, &mut HashSet::new())?;
+    plan_nongeneric_keyof_type_with_array_targets(store, target, array_targets)
+}
+
+fn prepare_keyof_object_members(
+    store: &mut CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<(), NongenericKeyofError> {
+    if !active.insert(target) {
+        return Err(NongenericKeyofError::MalformedObject(target));
+    }
+    let result = (|| {
+        let record = store
+            .type_payload(target)
+            .ok_or(NongenericKeyofError::InvalidType(target))?;
+        let children = match record.data() {
+            TypeData::Union(union) => {
+                store.validate_union_query_metadata(target)?;
+                union.union.types.clone()
+            }
+            TypeData::Intersection(_) => {
+                let projection = store
+                    .validate_intersection_type_with_array_targets(target, array_targets)
+                    .map_err(|_| NongenericKeyofError::MalformedObject(target))?;
+                if projection.reduced_to_never {
+                    return Ok(());
+                }
+                projection.types
+            }
+            TypeData::Object(_) => {
+                if source_property_object_projection(store, target)
+                    .map_err(|error| property_object_keyof_error(error, target))?
+                    .is_some()
+                {
+                    resolve_property_object_alias_members_with_array_targets(
+                        store,
+                        target,
+                        array_targets,
+                    )
+                    .map_err(|error| property_object_keyof_error(error, target))?;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        for child in children {
+            prepare_keyof_object_members(store, child, array_targets, active).map_err(|error| {
+                match error {
+                    NongenericKeyofError::UnsupportedObject(_) => {
+                        NongenericKeyofError::UnsupportedObject(target)
+                    }
+                    other => other,
+                }
+            })?;
+        }
+        Ok(())
+    })();
+    active.remove(&target);
+    result
+}
+
 /// Retains the caller's array identities for derived object-literal checks.
 /// The plan carries them through both cold execution and warm validation.
 pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    plan_nongeneric_keyof_type_worker(store, target, array_targets, None)
+}
+
+pub(super) fn plan_nongeneric_keyof_type_with_source(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    plan_nongeneric_keyof_type_worker(
+        store, target, Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some((globals, source)),
+    )
+}
+
+fn plan_nongeneric_keyof_type_worker(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
     let record = store
         .type_payload(target)
@@ -270,11 +382,12 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
                 &union.union.types,
                 true,
                 array_targets,
+                source,
             );
         }
         TypeData::Intersection(_) => {
             let projection = store
-                .validate_intersection_type(target)
+                .validate_intersection_type_with_array_targets(target, array_targets)
                 .map_err(|_| NongenericKeyofError::MalformedObject(target))?;
             if projection.reduced_to_never {
                 let result = store
@@ -289,26 +402,50 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
                 &projection.types,
                 false,
                 array_targets,
+                source,
             );
         }
-        TypeData::Mapped(_) => return plan_mapped_keyof_type(store, target, array_targets),
+        TypeData::Mapped(_) => return plan_mapped_keyof_type(store, target, array_targets, source),
         _ => {}
     }
 
-    let proof = match source_object_literal_proof(store, target, array_targets)? {
-        Some(proof) => proof,
-        None => match validate_resolved_declared_property_object(store, target) {
+    let existing = generic_interface_keyof_proof(store, target, array_targets)?
+        .or(source_object_literal_proof(store, target, array_targets)?);
+    let proof = if let Some(proof) = existing {
+        proof
+    } else if let Some(proof) = source_property_object_keyof_proof(store, target, array_targets)? {
+        proof
+    } else {
+        match validate_resolved_declared_property_object(store, target) {
             DeclaredPropertyObjectValidation::Valid(proof) => NongenericKeyofProof::Declared(proof),
             DeclaredPropertyObjectValidation::Malformed => {
                 return Err(NongenericKeyofError::MalformedObject(target));
             }
             DeclaredPropertyObjectValidation::NotDeclared => {
-                match validate_resolved_indexed_declared_object(store, target, record)? {
-                    Some(proof) => NongenericKeyofProof::Declared(proof),
-                    None => return Err(NongenericKeyofError::UnsupportedObject(target)),
+                match validate_resolved_closed_alias_property_object(store, target) {
+                    DeclaredPropertyObjectValidation::Valid(
+                        DeclaredPropertyObjectProof::TypeLiteral,
+                    ) => {
+                        // Keep key reads separate from generic object mapping.
+                        // The same source and graph checks run on every replay.
+                        match array_targets {
+                            Some(targets) => {
+                                store.validate_union_constituent_with_array_targets(targets, target)?;
+                            }
+                            None => store.validate_union_constituent(target)?,
+                        }
+                        NongenericKeyofProof::ClosedAlias
+                    }
+                    DeclaredPropertyObjectValidation::Malformed => {
+                        return Err(NongenericKeyofError::MalformedObject(target));
+                    }
+                    _ => match validate_resolved_indexed_declared_object(store, target, record)? {
+                        Some(proof) => NongenericKeyofProof::Declared(proof),
+                        None => return Err(NongenericKeyofError::UnsupportedObject(target)),
+                    },
                 }
             }
-        },
+        }
     };
     let structured = record
         .data()
@@ -323,7 +460,7 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
     let (has_string_index, has_number_index) = exact_index_kinds(store, structured)
         .ok_or(NongenericKeyofError::MalformedObject(target))?;
     let source_properties = if matches!(
-        proof,
+        &proof,
         NongenericKeyofProof::FreshObjectLiteral { .. }
             | NongenericKeyofProof::DerivedObjectLiteral { .. }
     ) {
@@ -359,6 +496,160 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
         preserves_origin,
         composition: None,
     })
+}
+
+/// Keeps the published raw rows when a key query replays after a named value
+/// was completed. The receipt still validates source, mapper, and cache owners.
+pub(super) fn plan_source_property_object_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    names: &SourcePropertyObjectMemberNames,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    let target = names.members().receiver;
+    names.validate(store, array_targets).map_err(|error| property_object_keyof_error(error, target))?;
+    let record = store.type_payload(target).ok_or(NongenericKeyofError::InvalidType(target))?;
+    let structured = record.data().structured().ok_or(NongenericKeyofError::MalformedObject(target))?;
+    let property_names = exact_property_names(store, structured).map_err(|error| match error {
+        ExactPropertyNamesError::Malformed => NongenericKeyofError::MalformedObject(target),
+        ExactPropertyNamesError::Unsupported(property) => NongenericKeyofError::UnsupportedPropertyName { target, property },
+    })?;
+    let (has_string_index, has_number_index) = exact_index_kinds(store, structured)
+        .ok_or(NongenericKeyofError::MalformedObject(target))?;
+    Ok(NongenericKeyofPlan {
+        target, proof: NongenericKeyofProof::SourcePropertyNames(Box::new(names.clone())),
+        source_properties: Vec::new(), array_targets, property_names,
+        has_string_index, has_number_index, preserves_origin: record.alias().is_some(), composition: None,
+    })
+}
+
+fn source_property_object_keyof_proof(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NongenericKeyofProof>, NongenericKeyofError> {
+    let record = store
+        .type_payload(target)
+        .ok_or(NongenericKeyofError::InvalidType(target))?;
+    if !matches!(record.data(), TypeData::Object(_)) {
+        return Ok(None);
+    }
+    let invalid = || NongenericKeyofError::MalformedObject(target);
+    let Some(projection) = source_property_object_projection(store, target)
+        .map_err(|error| property_object_keyof_error(error, target))?
+    else {
+        return Ok(None);
+    };
+    let members =
+        validate_property_object_alias_members_with_array_targets(store, target, array_targets)
+            .map_err(|error| property_object_keyof_error(error, target))?
+            .ok_or(NongenericKeyofError::UnsupportedObject(target))?;
+    if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+        return Err(NongenericKeyofError::UnsupportedObject(target));
+    }
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    if members.receiver != target
+        || members.target != projection.target()
+        || members.members != structured.members
+        || members.properties != structured.properties.as_deref().unwrap_or_default()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(NongenericKeyofProof::SourcePropertyObject(Box::new(
+        SourcePropertyObjectKeyProof { projection, members },
+    ))))
+}
+
+fn property_object_keyof_error(
+    error: RelationUnavailable,
+    target: TypeId,
+) -> NongenericKeyofError {
+    match error {
+        RelationUnavailable::MissingBootstrap => {
+            NongenericKeyofError::LiteralCache(LiteralTypeCacheError::BootstrapUninitialized)
+        }
+        RelationUnavailable::UnionValidationCapacity(_) => {
+            NongenericKeyofError::LiteralCache(LiteralTypeCacheError::Capacity)
+        }
+        RelationUnavailable::UnsupportedStructuredType(_) => {
+            NongenericKeyofError::UnsupportedObject(target)
+        }
+        _ => NongenericKeyofError::MalformedObject(target),
+    }
+}
+
+fn generic_interface_keyof_proof(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NongenericKeyofProof>, NongenericKeyofError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(NongenericKeyofError::InvalidType(type_))?;
+    let reference = match record.data() {
+        TypeData::TypeReference(reference) => reference,
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            &interface.reference
+        }
+        _ => return Ok(None),
+    };
+    let Some(target) = reference.object.target else {
+        return Ok(None);
+    };
+    let target_record = store
+        .type_payload(target)
+        .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+    if !matches!(target_record.data(), TypeData::Interface(_))
+        || target_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE != ObjectFlags::INTERFACE
+    {
+        return Ok(None);
+    }
+    let declarations = target_record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(|symbol| symbol.declarations())
+        .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+    let mut has_local_formals = false;
+    for &declaration in declarations {
+        let children = store
+            .source_direct_children(declaration)
+            .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+        has_local_formals |= children
+            .iter()
+            .any(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter));
+    }
+    if !has_local_formals {
+        return Ok(None);
+    }
+    let members = super::instantiated_members::validate_generic_interface_members(
+        store,
+        type_,
+        array_targets,
+    )
+    .map_err(|error| match error {
+        super::instantiated_members::GenericInterfaceMemberError::UnsupportedTarget(_)
+        | super::instantiated_members::GenericInterfaceMemberError::UnsupportedMember(_)
+        | super::instantiated_members::GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
+            NongenericKeyofError::UnsupportedObject(type_)
+        }
+        _ => NongenericKeyofError::MalformedObject(type_),
+    })?
+    .ok_or(NongenericKeyofError::UnsupportedObject(type_))?;
+    if members.reference() != type_
+        || members.target() != target
+        || members.members() != reference.object.structured.members
+        || members.properties()
+            != reference
+                .object
+                .structured
+                .properties
+                .as_deref()
+                .unwrap_or_default()
+    {
+        return Err(NongenericKeyofError::MalformedObject(type_));
+    }
+    Ok(Some(NongenericKeyofProof::GenericInterface { target }))
 }
 
 fn source_object_literal_proof(
@@ -558,8 +849,9 @@ fn plan_mapped_keyof_type(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
-    let keys = match plan_mapped_type_keys(store, target) {
+    let keys = match plan_mapped_type_keys_with_source(store, target, array_targets, source) {
         Ok(keys) => keys,
         Err(MappedTypeError::CrossProductTooLarge { size, limit }) => {
             return Ok(NongenericKeyofPlan {
@@ -646,6 +938,7 @@ fn plan_composite_keyof_type(
     types: &[TypeId],
     is_union: bool,
     array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
     if types.len() < 2 {
         return Err(NongenericKeyofError::MalformedObject(target));
@@ -654,7 +947,7 @@ fn plan_composite_keyof_type(
     let mut constituents = Vec::with_capacity(types.len());
     for type_ in types {
         let constituent =
-            plan_nongeneric_keyof_type_with_array_targets(store, *type_, array_targets).map_err(
+            plan_nongeneric_keyof_type_worker(store, *type_, array_targets, source).map_err(
                 |error| match error {
                     NongenericKeyofError::UnsupportedObject(_) => {
                         NongenericKeyofError::UnsupportedObject(target)
@@ -743,20 +1036,56 @@ pub(super) fn resolve_nongeneric_keyof_type(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<TypeId, NongenericKeyofError> {
-    if let Some(cached) = cached_nongeneric_keyof_type(store, plan)? {
+    resolve_nongeneric_keyof_type_worker(store, plan, None)
+}
+
+/// Uses the caller's budget for key-union preparation and recursive key plans.
+pub(super) fn resolve_nongeneric_keyof_type_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, NongenericKeyofError> {
+    resolve_nongeneric_keyof_type_worker(store, plan, Some(session))
+}
+
+fn resolve_nongeneric_keyof_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, NongenericKeyofError> {
+    resolve_nongeneric_keyof_type_with_context(store, plan, session, None)
+}
+
+pub(super) fn resolve_nongeneric_keyof_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    session: &mut InstantiationSession,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<TypeId, NongenericKeyofError> {
+    resolve_nongeneric_keyof_type_with_context(store, plan, Some(session), Some((globals, source)))
+}
+
+fn resolve_nongeneric_keyof_type_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    session: Option<&mut InstantiationSession>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<TypeId, NongenericKeyofError> {
+    if let Some(cached) = cached_nongeneric_keyof_type_with_context(store, plan, source)? {
         return Ok(cached);
     }
     if let Some(composition) = &plan.composition {
-        return resolve_composite_keyof_type(store, plan, composition);
+        return resolve_composite_keyof_type(store, plan, composition, session, source);
     }
     let key = properties_type_cache_key(store, plan)?;
     if !store.try_reserve_properties_type_cache(1) {
         return Err(LiteralTypeCacheError::Capacity.into());
     }
     let result = if plan.preserves_origin {
-        resolve_origin_preserving_nongeneric_keyof_type(store, plan)?
+        resolve_origin_preserving_nongeneric_keyof_type(store, plan, session)?
     } else {
-        resolve_nongeneric_keyof_leaf(store, plan)?
+        resolve_nongeneric_keyof_leaf_with_context(store, plan, session, source)?
     };
     if !store.cache_properties_type(key, result) {
         return Err(NongenericKeyofError::CachePublication(plan.target));
@@ -770,9 +1099,26 @@ pub(super) fn cached_nongeneric_keyof_type(
     store: &CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
-    validate_plan_against_store(store, plan)?;
+    cached_nongeneric_keyof_type_with_context(store, plan, None)
+}
+
+pub(super) fn cached_nongeneric_keyof_type_with_source(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    cached_nongeneric_keyof_type_with_context(store, plan, Some((globals, source)))
+}
+
+fn cached_nongeneric_keyof_type_with_context(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    validate_plan_against_store_with_context(store, plan, source)?;
     if let Some(composition) = &plan.composition {
-        return cached_composite_keyof_type(store, plan, composition);
+        return cached_composite_keyof_type(store, plan, composition, source);
     }
     let key = properties_type_cache_key(store, plan)?;
     let Some(cached) = store.cached_properties_type(key) else {
@@ -786,6 +1132,8 @@ fn resolve_composite_keyof_type(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
     composition: &KeyofComposition,
+    mut session: Option<&mut InstantiationSession>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<TypeId, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(*result),
@@ -797,7 +1145,9 @@ fn resolve_composite_keyof_type(
                 .alloc_index_type(plan.target, IndexFlags::NONE)
                 .ok_or_else(|| LiteralTypeCacheError::Capacity.into());
         }
-        KeyofComposition::Mapped(keys) => return resolve_mapped_keyof_type(store, plan, keys),
+        KeyofComposition::Mapped(keys) => {
+            return resolve_mapped_keyof_type(store, plan, keys, session);
+        }
         KeyofComposition::MappedOverflow { size, limit } => {
             debug_assert_eq!(plan.mapped_cross_product_too_large(), Some((*size, *limit)),);
             return store
@@ -814,7 +1164,7 @@ fn resolve_composite_keyof_type(
     let mut cold_count = 0usize;
     let mut union_operations = 1usize;
     for constituent in constituents {
-        if cached_nongeneric_keyof_type(store, constituent)?.is_some() {
+        if cached_nongeneric_keyof_type_with_context(store, constituent, source)?.is_some() {
             continue;
         }
         cold_count += 1;
@@ -828,18 +1178,37 @@ fn resolve_composite_keyof_type(
     if !store.try_reserve_properties_type_cache(cold_count) {
         return Err(LiteralTypeCacheError::Capacity.into());
     }
-    store.prepare_type_query_types(&cold_strings, &[], &[], union_operations, 0)?;
+    prepare_keyof_types(
+        store,
+        &cold_strings,
+        union_operations,
+        plan.array_targets,
+        session.as_deref_mut(),
+    )?;
 
     let mut results = Vec::with_capacity(constituents.len());
     for constituent in constituents {
-        results.push(resolve_nongeneric_keyof_type(store, constituent)?);
+        results.push(resolve_nongeneric_keyof_type_with_context(
+            store,
+            constituent,
+            session.as_deref_mut(),
+            source,
+        )?);
     }
 
     match composition {
         KeyofComposition::Intersection(_) => {
-            let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+            let mut prepared = prepare_keyof_types(
+                store, &[], 1, plan.array_targets, session.as_deref_mut(),
+            )?;
             store
-                .literal_union_type_prepared(&results, None, &mut prepared)
+                .literal_union_type_prepared_with_array_targets_and_session(
+                    &results,
+                    None,
+                    &mut prepared,
+                    plan.array_targets,
+                    session,
+                )
                 .map_err(Into::into)
         }
         KeyofComposition::Union(_) => {
@@ -851,9 +1220,17 @@ fn resolve_composite_keyof_type(
                     .never_type),
                 [only] => Ok(*only),
                 _ => {
-                    let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+                    let mut prepared = prepare_keyof_types(
+                        store, &[], 1, plan.array_targets, session.as_deref_mut(),
+                    )?;
                     store
-                        .literal_union_type_prepared(&keys, None, &mut prepared)
+                        .literal_union_type_prepared_with_array_targets_and_session(
+                            &keys,
+                            None,
+                            &mut prepared,
+                            plan.array_targets,
+                            session,
+                        )
                         .map_err(Into::into)
                 }
             }
@@ -873,6 +1250,7 @@ fn cached_composite_keyof_type(
     store: &CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
     composition: &KeyofComposition,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(Some(*result)),
@@ -894,7 +1272,7 @@ fn cached_composite_keyof_type(
     let mut results = Vec::with_capacity(constituents.len());
     let mut missing = false;
     for constituent in constituents {
-        match cached_nongeneric_keyof_type(store, constituent)? {
+        match cached_nongeneric_keyof_type_with_context(store, constituent, source)? {
             Some(result) => results.push(result),
             None => missing = true,
         }
@@ -917,6 +1295,7 @@ fn cached_composite_keyof_type(
             &keys,
             &results,
             matches!(composition, KeyofComposition::Intersection(_)),
+            plan.array_targets,
         ),
     }
 }
@@ -1021,6 +1400,7 @@ fn resolve_mapped_keyof_type(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
     keys: &[MappedTypeKey],
+    mut session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, NongenericKeyofError> {
     let mut pending = Vec::new();
     for key in keys {
@@ -1031,8 +1411,13 @@ fn resolve_mapped_keyof_type(
             pending.push(value.clone());
         }
     }
-    let mut prepared =
-        store.prepare_type_query_types(&pending, &[], &[], usize::from(keys.len() > 1), 0)?;
+    let mut prepared = prepare_keyof_types(
+        store,
+        &pending,
+        usize::from(keys.len() > 1),
+        plan.array_targets,
+        session.as_deref_mut(),
+    )?;
     let mut resolved = Vec::with_capacity(keys.len());
     for key in keys {
         let type_ = match key {
@@ -1051,7 +1436,13 @@ fn resolve_mapped_keyof_type(
                 .never_type
         }
         [only] => *only,
-        _ => store.literal_union_type_prepared(&resolved, None, &mut prepared)?,
+        _ => store.literal_union_type_prepared_with_array_targets_and_session(
+            &resolved,
+            None,
+            &mut prepared,
+            plan.array_targets,
+            session,
+        )?,
     };
     if let Some(TypeData::Mapped(mapped)) = store.type_payload(plan.target).map(TypeRecord::data)
         && let Some(constraint) = mapped.constraint_type
@@ -1090,9 +1481,7 @@ fn cached_mapped_keyof_type(
                 && let Some(constraint) = mapped.constraint_type
                 && union_contains_exact_keys(store, constraint, &resolved)
             {
-                store
-                    .validate_union_constituent(constraint)
-                    .map_err(|_| NongenericKeyofError::InvalidCachedResult(constraint))?;
+                validate_keyof_union(store, constraint, plan.array_targets)?;
                 return Ok(Some(constraint));
             }
             let mut cached = None;
@@ -1149,6 +1538,7 @@ fn cached_composite_key_union(
     keys: &[TypeId],
     results: &[TypeId],
     preserve_constituent_origins: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
     let mut named_unions = Vec::new();
     if preserve_constituent_origins {
@@ -1160,9 +1550,7 @@ fn cached_composite_key_union(
     if let [only] = named_unions.as_slice()
         && union_contains_exact_keys(store, *only, keys)
     {
-        store
-            .validate_union_constituent(*only)
-            .map_err(|_| NongenericKeyofError::InvalidCachedResult(*only))?;
+        validate_keyof_union(store, *only, array_targets)?;
         return Ok(Some(*only));
     }
 
@@ -1211,9 +1599,7 @@ fn cached_composite_key_union(
             Some(_) => false,
         };
         if origin_matches {
-            store
-                .validate_union_constituent(candidate)
-                .map_err(|_| NongenericKeyofError::InvalidCachedResult(candidate))?;
+            validate_keyof_union(store, candidate, array_targets)?;
             return Ok(Some(candidate));
         }
     }
@@ -1271,11 +1657,29 @@ fn union_contains_exact_keys(
 
 /// Dependency-independent anonymous-object executor retained as an explicit
 /// composition boundary for adversarial tests.
+#[cfg(test)]
 fn resolve_nongeneric_keyof_leaf(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<TypeId, NongenericKeyofError> {
-    validate_plan_against_store(store, plan)?;
+    resolve_nongeneric_keyof_leaf_worker(store, plan, None)
+}
+
+fn resolve_nongeneric_keyof_leaf_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, NongenericKeyofError> {
+    resolve_nongeneric_keyof_leaf_with_context(store, plan, session, None)
+}
+
+fn resolve_nongeneric_keyof_leaf_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    mut session: Option<&mut InstantiationSession>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<TypeId, NongenericKeyofError> {
+    validate_plan_against_store_with_context(store, plan, source)?;
     if plan.root_cache_required() {
         return Err(NongenericKeyofError::PropertiesCacheRequired {
             target: plan.target,
@@ -1289,7 +1693,13 @@ fn resolve_nongeneric_keyof_leaf(
     // when a string index later absorbs them during union reduction.
     let strings = plan.property_names.clone();
     let union_operations = usize::from(!plan.has_string_index && plan.reduced_key_count() >= 2);
-    let mut prepared = store.prepare_type_query_types(&strings, &[], &[], union_operations, 0)?;
+    let mut prepared = prepare_keyof_types(
+        store,
+        &strings,
+        union_operations,
+        plan.array_targets,
+        session.as_deref_mut(),
+    )?;
     let mut keys = Vec::with_capacity(plan.property_names.len() + 1);
     for name in &plan.property_names {
         keys.push(store.regular_string_literal_type(name.clone())?);
@@ -1317,7 +1727,13 @@ fn resolve_nongeneric_keyof_leaf(
         0 => Ok(never_type),
         1 => Ok(keys[0]),
         _ => store
-            .literal_union_type_prepared(&keys, None, &mut prepared)
+            .literal_union_type_prepared_with_array_targets_and_session(
+                &keys,
+                None,
+                &mut prepared,
+                plan.array_targets,
+                session,
+            )
             .map_err(Into::into),
     }
 }
@@ -1325,9 +1741,12 @@ fn resolve_nongeneric_keyof_leaf(
 fn resolve_origin_preserving_nongeneric_keyof_type(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
+    mut session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, NongenericKeyofError> {
     let strings = plan.property_names.clone();
-    let mut prepared = store.prepare_type_query_types(&strings, &[], &[], 1, 0)?;
+    let mut prepared = prepare_keyof_types(
+        store, &strings, 1, plan.array_targets, session.as_deref_mut(),
+    )?;
     let origin = store
         .alloc_index_type(plan.target, IndexFlags::NONE)
         .expect("the property-key preflight reserved the pinned Index origin");
@@ -1348,8 +1767,38 @@ fn resolve_origin_preserving_nongeneric_keyof_type(
         keys.push(number_type);
     }
     store
-        .literal_union_type_prepared_with_index_origin(&keys, origin, &mut prepared)
+        .literal_union_type_prepared_with_index_origin_and_array_targets(
+            &keys,
+            origin,
+            &mut prepared,
+            plan.array_targets,
+            session,
+        )
         .map_err(Into::into)
+}
+
+fn prepare_keyof_types(
+    store: &mut CanonicalTypeMapperStore,
+    strings: &[String],
+    union_operations: usize,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+    store.prepare_type_query_types_with_array_targets_and_session(
+        strings, &[], &[], union_operations, 0, array_targets, session,
+    )
+}
+
+fn validate_keyof_union(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), NongenericKeyofError> {
+    match array_targets {
+        Some(targets) => store.validate_union_constituent_with_array_targets(targets, type_),
+        None => store.validate_union_constituent(type_),
+    }
+    .map_err(|_| NongenericKeyofError::InvalidCachedResult(type_))
 }
 
 fn properties_type_cache_key(
@@ -1377,9 +1826,7 @@ fn validate_cached_nongeneric_keyof_result(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
-    store
-        .validate_union_constituent(cached)
-        .map_err(|_| NongenericKeyofError::InvalidCachedResult(cached))?;
+    validate_keyof_union(store, cached, plan.array_targets)?;
     let mut property_keys = Vec::with_capacity(plan.property_names.len());
     for name in &plan.property_names {
         let literal = bootstrap
@@ -1424,9 +1871,7 @@ fn validate_cached_nongeneric_keyof_result(
     };
 
     if plan.preserves_origin {
-        store
-            .validate_union_constituent(cached)
-            .map_err(|_| NongenericKeyofError::InvalidCachedResult(cached))?;
+        validate_keyof_union(store, cached, plan.array_targets)?;
         let Some(TypeData::Union(union)) = store.type_payload(cached).map(TypeRecord::data) else {
             return Err(NongenericKeyofError::InvalidCachedResult(cached));
         };
@@ -1470,19 +1915,36 @@ fn validate_plan_against_store(
     store: &CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<(), NongenericKeyofError> {
+    validate_plan_against_store_with_context(store, plan, None)
+}
+
+fn validate_plan_against_store_with_context(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<(), NongenericKeyofError> {
+    if source.is_some_and(|(globals, _)| {
+        plan.array_targets != Some(CanonicalArrayTargets::from_global_types(globals))
+    }) {
+        return Err(NongenericKeyofError::MalformedObject(plan.target));
+    }
     if let Some(
         KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents),
     ) = &plan.composition
     {
         for constituent in constituents {
-            validate_plan_against_store(store, constituent)?;
+            validate_plan_against_store_with_context(store, constituent, source)?;
         }
     }
-    let current =
-        plan_nongeneric_keyof_type_with_array_targets(store, plan.target, plan.array_targets)
+    let current = match &plan.proof {
+        NongenericKeyofProof::SourcePropertyNames(names) => {
+            plan_source_property_object_keyof_type(store, names, plan.array_targets)
+        }
+        _ => plan_nongeneric_keyof_type_worker(store, plan.target, plan.array_targets, source),
+    }
             .map_err(|error| {
                 if matches!(
-                    plan.proof,
+                    &plan.proof,
                     NongenericKeyofProof::FreshObjectLiteral { .. }
                         | NongenericKeyofProof::DerivedObjectLiteral { .. }
                 ) && matches!(error, NongenericKeyofError::UnsupportedObject(_))
@@ -1898,16 +2360,32 @@ mod tests {
         IndexFlags, NongenericKeyofError, NongenericKeyofPlan, NongenericKeyofProof,
         cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_leaf,
-        resolve_nongeneric_keyof_type, validate_cached_nongeneric_keyof_result,
-        validate_generic_keyof_index_type, validate_source_object_literal_for_keyof,
+        resolve_nongeneric_keyof_type, resolve_nongeneric_keyof_type_with_session,
+        validate_cached_nongeneric_keyof_result, validate_generic_keyof_index_type,
+        validate_source_object_literal_for_keyof,
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
         DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, RelationStateSnapshot,
         TypeAliasLinks, TypeId,
         array_types::CanonicalArrayTargets,
+        bootstrap::{LiteralTypeCacheError, UnionReduction},
+        callable_sets::{
+            StoredCallableSetValidation, validate_stored_callable_set_with_array_targets,
+        },
+        calls::DirectCallForm,
+        generic_calls::{
+            GenericCallVectorError, GenericCallVectorInvariant, GenericCallVectorRequest,
+            demand_generic_call_vector_selected_return,
+        },
+        generic_method_calls::{GenericMethodCallSelection, resolve_generic_method_call},
+        instantiate::{InstantiationError, InstantiationLimits, InstantiationSession},
+        instantiated_members::validate_generic_interface_members,
         links::ValueSymbolLinks,
         object_members,
+        structured_members::{
+            InterfaceHeritageMembersValidation, validate_interface_heritage_members,
+        },
         type_records::TypeData,
         types::{ObjectFlags, TypeFlags},
     };
@@ -3486,5 +3964,543 @@ mod tests {
             resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap(),
             fixture.store.intrinsic_bootstrap().unwrap().never_type
         );
+    }
+
+    fn keyof_session_interface(store: &CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source(name))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap()
+    }
+
+    fn keyof_session_cache_state(store: &CanonicalTypeMapperStore) -> [usize; 8] {
+        let (types, strings, unions, keys) = cache_state(store);
+        [
+            types,
+            strings,
+            unions,
+            keys,
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+        ]
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum KeyofSessionControl {
+        FailFastDirtyCache,
+        RecoveringDirtyCache,
+        RecoveringColdReturn,
+    }
+
+    #[allow(clippy::too_many_lines)] // One source graph checks selection, nested mapping, and cache replay.
+    fn assert_keyof_selected_return_uses_caller(nested: bool, control: KeyofSessionControl) {
+        const LIBRARY: FileId = FileId::new(163_150);
+        const SOURCE: FileId = FileId::new(163_151);
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: number; }",
+        ));
+        let returned = if nested { "Array<keyof T>" } else { "keyof T" };
+        let parsed = parse_source_file(&format!(
+            "interface Derived extends Base<number> {{}} \
+             interface Plain {{ value: number; }} \
+             interface Payload {{ firstKey: number; secondKey: string; }} \
+             interface Methods {{ m<T>(value: T): {returned}; \
+             m(a: number, b: number): number; }}",
+        ));
+        let mut binder = CanonicalBinder::new();
+        for (file, source, declaration, path) in [
+            (LIBRARY, &library, true, "\"/keyof-session-library.d.ts\""),
+            (SOURCE, &parsed, false, "\"/keyof-session.ts\""),
+        ] {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(LIBRARY, &library.arena), (SOURCE, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(SOURCE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), SOURCE, node),
+                    NodeRef::new(parsed.arena.id(), SOURCE, method.name),
+                ))
+            })
+            .unwrap();
+        let callee = context.get_type_at_location(name).unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(context.store(), callee, Some(targets))
+        else {
+            panic!("the real method group must retain its signatures")
+        };
+        assert_eq!(projection.call_signatures.len(), 2);
+        let original = projection.call_signatures[0].signature;
+        assert_eq!(
+            context.store().signature(original).unwrap().declaration(),
+            Some(declaration)
+        );
+        let template = context
+            .store()
+            .signature(original)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let index_template = if nested {
+            context
+                .store()
+                .canonical_array_reference_with_targets(targets, template)
+                .unwrap()
+                .unwrap()
+                .element_type
+        } else {
+            template
+        };
+        assert_eq!(
+            validate_generic_keyof_index_type(context.store(), index_template),
+            Ok(context
+                .store()
+                .signature(original)
+                .unwrap()
+                .type_parameters()[0])
+        );
+        let derived = keyof_session_interface(context.store(), "Derived");
+        let plain = keyof_session_interface(context.store(), "Plain");
+        let payload = keyof_session_interface(context.store(), "Payload");
+        let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+        else {
+            panic!("Derived must retain its source interface")
+        };
+        let base = data.resolved_base_types.as_ref().unwrap()[0];
+        let proxy = context
+            .store()
+            .symbol_table(data.reference.object.structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let store = context.store_mut_for_test();
+        let key_plan =
+            plan_nongeneric_keyof_type_with_array_targets(store, payload, Some(targets)).unwrap();
+        assert!(key_plan.preserves_origin());
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let error = store.intrinsic_bootstrap().unwrap().error_type;
+        let dirty_result = if control == KeyofSessionControl::RecoveringColdReturn {
+            None
+        } else {
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let source_union = store
+                .expression_union_type_with_global_types_and_session(
+                    &globals,
+                    &[number, derived],
+                    UnionReduction::Literal,
+                    &mut setup,
+                )
+                .unwrap();
+            let rows = store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len();
+            let result = store
+                .expression_union_type_with_global_types_and_session(
+                    &globals,
+                    &[source_union, plain],
+                    UnionReduction::Subtype,
+                    &mut setup,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+                rows + 1
+            );
+            let original_links = store.value_symbol_links(proxy).unwrap().clone();
+            assert_eq!(original_links.resolved_type, Some(number));
+            assert!(store.instantiated_property_recovery(proxy).is_none());
+            // Restore only the pre-query lazy value, before any recovery receipt exists.
+            assert!(store.set_value_symbol_links(
+                proxy,
+                ValueSymbolLinks {
+                    resolved_type: None,
+                    ..original_links
+                }
+            ));
+            store.mark_union_cache_validation_dirty();
+            Some(result)
+        };
+        let original_links = store.value_symbol_links(proxy).unwrap().clone();
+        assert!(store.instantiated_property_recovery(proxy).is_none());
+        assert_eq!(
+            validate_interface_heritage_members(store, derived),
+            InterfaceHeritageMembersValidation::Valid
+        );
+        assert!(
+            validate_generic_interface_members(store, base, None)
+                .unwrap()
+                .is_some()
+        );
+        let arguments = [payload];
+        let request = GenericCallVectorRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            explicit_type_arguments: Some(&arguments),
+            has_spread_argument: false,
+            callee,
+            arguments: &arguments,
+        };
+        let limit = if control == KeyofSessionControl::RecoveringColdReturn {
+            1
+        } else {
+            3 + usize::from(nested)
+        };
+        let limits = InstantiationLimits {
+            max_count: limit,
+            ..InstantiationLimits::default()
+        };
+        let mut limited = if control == KeyofSessionControl::FailFastDirtyCache {
+            InstantiationSession::new(limits)
+        } else {
+            InstantiationSession::new_recovering(store, limits, error).unwrap()
+        };
+        let selected =
+            resolve_generic_method_call(store, &globals, false, request, None, &mut limited)
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.diagnostic, None);
+        let GenericMethodCallSelection::Generic(generic) = &selected.selected else {
+            panic!("the one-argument call must select its generic method")
+        };
+        let signature = generic.projection().instantiation.signature;
+        assert_eq!(generic.projection().generic_signature, original);
+        assert_eq!(generic.projection().instantiation.type_arguments, arguments);
+        assert_eq!(store.signature(signature).unwrap().target(), Some(original));
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+        assert_eq!(limited.limit_event_count(), 0);
+        let before = keyof_session_cache_state(store);
+        let scans = store.union_cache_validation_scan_count();
+        let first = demand_generic_call_vector_selected_return(store, generic, &mut limited)
+            .map(|(returned, _)| returned);
+        match control {
+            KeyofSessionControl::FailFastDirtyCache => assert_eq!(
+                first,
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::Union(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                        derived.max(plain)
+                    ))
+                ))
+            ),
+            KeyofSessionControl::RecoveringDirtyCache => assert_eq!(
+                first,
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::Union(LiteralTypeCacheError::InvalidCachedUnion(
+                        dirty_result.unwrap()
+                    ))
+                ))
+            ),
+            KeyofSessionControl::RecoveringColdReturn => assert_eq!(first, Ok(error)),
+        }
+        assert_eq!(
+            (limited.query_count(), limited.total_count()),
+            (limit, limit)
+        );
+        assert_eq!(limited.limit_event_count(), 1);
+        let expected_scans = scans + usize::from(dirty_result.is_some());
+        assert_eq!(store.union_cache_validation_scan_count(), expected_scans);
+        if control == KeyofSessionControl::RecoveringDirtyCache {
+            assert_eq!(
+                store.value_symbol_links(proxy),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(error),
+                    ..original_links.clone()
+                })
+            );
+            assert!(
+                store
+                    .instantiated_property_recovery(proxy)
+                    .unwrap()
+                    .matches_published_links(store.value_symbol_links(proxy))
+            );
+        } else {
+            assert_eq!(store.value_symbol_links(proxy), Some(&original_links));
+            assert!(store.instantiated_property_recovery(proxy).is_none());
+        }
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        assert_eq!(keyof_session_cache_state(store), before);
+        let retry = demand_generic_call_vector_selected_return(store, generic, &mut limited)
+            .map(|(returned, _)| returned);
+        if control == KeyofSessionControl::FailFastDirtyCache {
+            assert_eq!(
+                retry,
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::CountLimit {
+                        count: limit,
+                        limit,
+                    }
+                ))
+            );
+        } else {
+            assert_eq!(retry, Ok(error));
+        }
+        assert_eq!(
+            (limited.query_count(), limited.total_count()),
+            (limit, limit)
+        );
+        assert_eq!(limited.limit_event_count(), 2);
+        assert_eq!(store.union_cache_validation_scan_count(), expected_scans);
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        assert_eq!(keyof_session_cache_state(store), before);
+        if control == KeyofSessionControl::RecoveringDirtyCache {
+            assert_eq!(
+                store.value_symbol_links(proxy).unwrap().resolved_type,
+                Some(error)
+            );
+            assert!(
+                store
+                    .instantiated_property_recovery(proxy)
+                    .unwrap()
+                    .matches_published_links(store.value_symbol_links(proxy))
+            );
+            // This is a real recovered member. A later control must not erase its receipt.
+            assert!(context.diagnostics().is_empty());
+            return;
+        }
+        assert_eq!(store.value_symbol_links(proxy), Some(&original_links));
+        assert!(store.instantiated_property_recovery(proxy).is_none());
+
+        if control == KeyofSessionControl::RecoveringColdReturn {
+            // A stale return must fail the reader before any new instantiation work.
+            assert!(store.set_signature_resolved_return_type(signature, Some(error)));
+            for _ in 0..2 {
+                assert_eq!(
+                    demand_generic_call_vector_selected_return(store, generic, &mut limited),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::InvalidCachedInstantiation {
+                            target: original,
+                            signature,
+                        }
+                    ))
+                );
+                assert_eq!(
+                    (limited.query_count(), limited.total_count()),
+                    (limit, limit)
+                );
+                assert_eq!(limited.limit_event_count(), 2);
+                assert_eq!(store.union_cache_validation_scan_count(), expected_scans);
+                assert_eq!(keyof_session_cache_state(store), before);
+            }
+            assert!(store.set_signature_resolved_return_type(signature, None));
+        }
+
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        let returned = demand_generic_call_vector_selected_return(store, generic, &mut adequate)
+            .unwrap()
+            .0;
+        let keys = if nested {
+            let reference = store
+                .canonical_array_reference_with_targets(targets, returned)
+                .unwrap()
+                .unwrap();
+            assert!(!reference.readonly);
+            reference.element_type
+        } else {
+            returned
+        };
+        let TypeData::Union(union) = store.type_payload(keys).unwrap().data() else {
+            panic!("Payload has two canonical property keys")
+        };
+        let expected = ["firstKey", "secondKey"].map(|name| {
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type(name)
+                .unwrap()
+        });
+        assert_eq!(union.union.types.len(), expected.len());
+        assert!(expected.iter().all(|key| union.union.types.contains(key)));
+        let TypeData::Index(origin) = store.type_payload(union.origin.unwrap()).unwrap().data()
+        else {
+            panic!("the named key union must keep its Index origin")
+        };
+        assert_eq!(origin.target, payload);
+        assert_eq!(origin.index_flags, IndexFlags::NONE);
+        assert_eq!(
+            cached_nongeneric_keyof_type(store, &key_plan),
+            Ok(Some(keys))
+        );
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(returned)
+        );
+        assert_eq!(
+            store.signature(original).unwrap().resolved_return_type(),
+            Some(template)
+        );
+        if dirty_result.is_some() {
+            assert_eq!(
+                store.value_symbol_links(proxy).unwrap().resolved_type,
+                Some(number)
+            );
+        } else {
+            assert_eq!(store.value_symbol_links(proxy), Some(&original_links));
+        }
+        assert!(store.instantiated_property_recovery(proxy).is_none());
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        let warm = keyof_session_cache_state(store);
+        let count = adequate.total_count();
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_generic_method_call(
+                    store,
+                    &globals,
+                    false,
+                    request,
+                    Some(signature),
+                    &mut adequate
+                ),
+                Ok(Some(selected.clone()))
+            );
+            assert_eq!(
+                demand_generic_call_vector_selected_return(store, generic, &mut adequate)
+                    .unwrap()
+                    .0,
+                returned
+            );
+            assert_eq!(
+                resolve_nongeneric_keyof_type_with_session(store, &key_plan, &mut limited),
+                Ok(keys)
+            );
+            assert_eq!(
+                (limited.query_count(), limited.total_count()),
+                (limit, limit)
+            );
+            assert_eq!(limited.limit_event_count(), 2);
+            assert_eq!(adequate.total_count(), count);
+            assert_eq!(adequate.limit_event_count(), 0);
+            assert_eq!(keyof_session_cache_state(store), warm);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn method_keyof_return_preparation_uses_the_callers_spent_budget() {
+        assert_keyof_selected_return_uses_caller(false, KeyofSessionControl::FailFastDirtyCache);
+    }
+
+    #[test]
+    fn nested_method_keyof_return_keeps_the_caller_through_mapper_recursion() {
+        assert_keyof_selected_return_uses_caller(true, KeyofSessionControl::FailFastDirtyCache);
+    }
+
+    #[test]
+    fn recovering_keyof_return_keeps_the_dirty_cache_error_and_property_receipt() {
+        for nested in [false, true] {
+            assert_keyof_selected_return_uses_caller(
+                nested,
+                KeyofSessionControl::RecoveringDirtyCache,
+            );
+        }
+    }
+
+    #[test]
+    fn nested_keyof_return_recovery_stays_cold_until_a_healthy_caller_retries() {
+        assert_keyof_selected_return_uses_caller(true, KeyofSessionControl::RecoveringColdReturn);
+    }
+
+    #[test]
+    fn borrowed_keyof_queries_reject_a_poisoned_key_cache_without_spending_the_caller() {
+        for recovering in [false, true] {
+            let mut fixture = fixture("interface Payload { firstKey: number; secondKey: string }");
+            let payload = resolve_interface(&mut fixture);
+            let plan = plan_nongeneric_keyof_type(&fixture.store, payload).unwrap();
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let keys =
+                resolve_nongeneric_keyof_type_with_session(&mut fixture.store, &plan, &mut setup)
+                    .unwrap();
+            let owner = fixture.store.type_payload(payload).unwrap().symbol();
+            assert!(owner.is_some());
+            assert!(fixture.store.set_type_symbol(keys, owner));
+            let limits = InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            };
+            let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+            let mut session = if recovering {
+                InstantiationSession::new_recovering(&fixture.store, limits, error).unwrap()
+            } else {
+                InstantiationSession::new(limits)
+            };
+            let before = keyof_session_cache_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_nongeneric_keyof_type_with_session(
+                        &mut fixture.store,
+                        &plan,
+                        &mut session
+                    ),
+                    Err(NongenericKeyofError::InvalidCachedResult(keys))
+                );
+                assert_eq!((session.query_count(), session.total_count()), (0, 0));
+                assert_eq!(session.limit_event_count(), 0);
+                assert_eq!(keyof_session_cache_state(&fixture.store), before);
+            }
+            assert!(fixture.store.set_type_symbol(keys, None));
+            assert_eq!(
+                resolve_nongeneric_keyof_type_with_session(&mut fixture.store, &plan, &mut session),
+                Ok(keys)
+            );
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert_eq!(session.limit_event_count(), 0);
+            assert_eq!(keyof_session_cache_state(&fixture.store), before);
+        }
     }
 }

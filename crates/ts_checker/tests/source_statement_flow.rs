@@ -1,11 +1,13 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName,
+    EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
-    SourceFunctionUnsupported, TypeId, UnsupportedSourceSyntax,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError,
+    SourceFunctionUnsupported, TypeData, TypeId, TypeNodeLinks, UnsupportedSourceSyntax,
+    signatures::SignatureFlags, type_records::LiteralValue,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -460,70 +462,125 @@ fn final_if_flow_preserves_local_condition_and_return_diagnostic_order_and_ancho
     assert!(is_type_checked(&context, file));
 }
 
-fn assert_final_if_boundary_is_atomic(source: &str, file: FileId) {
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the original source and its checked diagnostic replay together.
+fn missing_else_remains_an_explicit_atomic_boundary() {
+    let source = concat!(
+        "function missingElse(value: string | undefined): string {\n",
+        "  if (value) {\n",
+        "    const result: string = value;\n",
+        "    return result;\n",
+        "  }\n",
+        "}\n",
+    );
     let parsed = parse_source_file(source);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
     let declaration = function_declaration(&parsed, file);
+    let NodeData::FunctionDeclaration(function) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let annotation = NodeRef::new(parsed.arena.id(), file, function.type_.unwrap());
+    let result_read = unique_variable_initializer(&parsed, file, "result");
     let mut context = context(&parsed, file);
     let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
-    let before = (
-        context.store().type_len(),
-        context.store().mapper_len(),
-        context.store().signature_len(),
-    );
-
-    let first = context.check_source_file(file).unwrap_err();
-    assert!(
-        matches!(
-            &first,
-            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
-                SourceFunctionUnsupported::FunctionBody(_)
-            ))
-        ),
-        "unexpected boundary: {first:?}",
-    );
-    assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().mapper_len(),
-            context.store().signature_len(),
-        ),
-        before,
-    );
     assert!(context.store().value_symbol_links(owner).is_none());
     assert!(context.store().signature_links(declaration).is_none());
-    assert!(context.diagnostics().is_empty());
     assert!(!is_type_checked(&context, file));
 
-    let second = context.check_source_file(file).unwrap_err();
-    assert_eq!(second, first);
+    context.check_source_file(file).unwrap();
+
+    assert!(is_type_checked(&context, file));
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+    let callable = context.get_type_at_location(declaration).unwrap();
     assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().mapper_len(),
-            context.store().signature_len(),
-        ),
-        before,
+        context
+            .store()
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type,
+        Some(callable),
     );
-    assert!(context.store().value_symbol_links(owner).is_none());
-    assert!(context.store().signature_links(declaration).is_none());
-    assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
-}
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+        panic!("expected the original function object");
+    };
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&[signature][..])
+    );
+    assert_eq!(object.structured.call_signature_count, 1);
+    assert_eq!(
+        context.store().signature(signature).unwrap().declaration(),
+        Some(declaration)
+    );
+    assert_eq!(context.get_return_type_of_signature(signature), Ok(string));
+    assert_eq!(context.get_type_from_type_node(annotation), Ok(string));
+    assert_eq!(resolved_type(&context, result_read), string);
+    assert_eq!(context.get_type_at_location(result_read), Ok(string));
+    let parameter = NodeRef::new(parsed.arena.id(), file, function.parameters.nodes[0]);
+    let parameter_owner = context.file(file).unwrap().1.symbol(parameter).unwrap();
+    assert_eq!(
+        context.get_symbol_at_location(result_read),
+        Ok(Some(parameter_owner))
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected only the missing return diagnostic");
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2366);
+    assert_eq!(diagnostic.node, Some(annotation));
+    assert_eq!(node_text(source, &parsed, annotation), "string");
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Function lacks ending return statement and return type does not include 'undefined'.",
+    );
+    assert_eq!(diagnostic.range_override, None);
+    assert!(diagnostic.related_information.is_empty());
 
-#[test]
-fn missing_else_remains_an_explicit_atomic_boundary() {
-    assert_final_if_boundary_is_atomic(
-        concat!(
-            "function missingElse(value: string | undefined): string {\n",
-            "  if (value) {\n",
-            "    const result: string = value;\n",
-            "    return result;\n",
-            "  }\n",
-            "}\n",
-        ),
-        FileId::new(2),
-    );
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.type_resolution_len(),
+            ],
+            store.value_symbol_links(owner).cloned(),
+            store.signature_links(declaration).cloned(),
+            [declaration, annotation, result_read].map(|node| {
+                (
+                    store.node_links(node).cloned(),
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                )
+            }),
+            store
+                .source_file_links(context.source_file(file).unwrap())
+                .cloned(),
+            context.diagnostics().clone(),
+        )
+    };
+    let before = snapshot(&context);
+    for _ in 0..2 {
+        context.recheck_source_file(file).unwrap();
+        assert!(is_type_checked(&context, file));
+        assert_eq!(context.get_type_at_location(declaration), Ok(callable));
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(string));
+        assert_eq!(context.get_type_at_location(result_read), Ok(string));
+        assert_eq!(
+            context.get_symbol_at_location(result_read),
+            Ok(Some(parameter_owner))
+        );
+        assert_eq!(snapshot(&context), before);
+    }
 }
 
 #[test]
@@ -596,49 +653,525 @@ fn final_if_flow_recreates_invocation_state_after_a_later_semantic_failure() {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(4);
     let call = node_of_kind(&parsed, file, SyntaxKind::CallExpression);
-    let local_declarations = ["value", "branch"]
-        .into_iter()
-        .flat_map(|name| variable_declarations(&parsed, file, name))
-        .collect::<Vec<_>>();
     let mut context = context(&parsed, file);
 
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Call(call)),
-    );
-    assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
-    let (_, bound) = context.file(file).unwrap();
-    for declaration in &local_declarations {
-        let symbol = bound.symbol(*declaration).unwrap();
-        assert!(context.store().value_symbol_links(symbol).is_none());
-        let initializer = variable_initializer(&parsed, file, *declaration);
-        assert!(context.store().type_node_links(initializer).is_some());
-    }
-    let first_counts = (
-        context.store().type_len(),
-        context.store().mapper_len(),
-        context.store().signature_len(),
-    );
+    context.check_source_file(file).unwrap();
+    let cold = final_if_recovery_state(&context, &parsed, file);
+    let recovered = assert_final_if_overload_recovery(&context, &parsed, file, call);
+    let argument = node_of_kind(&parsed, file, SyntaxKind::TrueKeyword);
+    let range = parsed.arena.get(argument.node).unwrap().range;
+    assert_eq!((range.start.get(), range.end.get()), (377, 381));
+    assert_eq!(node_text(source, &parsed, argument), "true");
 
+    // Keep the original second check, then force real invocation-state replay.
+    context.check_source_file(file).unwrap();
+    assert_eq!(final_if_recovery_state(&context, &parsed, file), cold);
+    for _ in 0..2 {
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            assert_final_if_overload_recovery(&context, &parsed, file, call),
+            recovered,
+        );
+        assert_eq!(final_if_recovery_state(&context, &parsed, file), cold);
+        let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+        assert_eq!(context.get_type_at_location(call).unwrap(), never);
+        assert_eq!(
+            context.get_return_type_of_signature(recovered).unwrap(),
+            never
+        );
+        assert_eq!(final_if_recovery_state(&context, &parsed, file), cold);
+    }
+}
+
+fn final_if_recovery_state(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+) -> impl std::fmt::Debug + PartialEq + use<> {
+    let store = context.store();
+    (
+        [
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.type_predicate_len(),
+            store.index_info_len(),
+            store.type_alias_len(),
+            store.type_resolution_len(),
+        ],
+        store.relation_state_snapshot(),
+        context.diagnostics().clone(),
+        store
+            .source_file_links(context.source_file(file).unwrap())
+            .cloned(),
+        parsed
+            .arena
+            .iter()
+            .map(|(id, _)| {
+                let node = NodeRef::new(parsed.arena.id(), file, id);
+                (
+                    node,
+                    store.node_links(node).cloned(),
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                    store.signature_links(node).cloned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        store
+            .symbol_store()
+            .symbols()
+            .map(|(symbol, _)| {
+                (
+                    symbol,
+                    store.value_symbol_links(symbol).cloned(),
+                    store.declared_type_links(symbol).cloned(),
+                    store.type_alias_links(symbol).cloned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        store
+            .signatures()
+            .map(|(id, signature)| {
+                (
+                    (
+                        id,
+                        signature.flags(),
+                        signature.declaration(),
+                        signature.parameters().to_vec(),
+                        signature.min_argument_count(),
+                        signature.resolved_min_argument_count(),
+                        signature.resolved_return_type(),
+                    ),
+                    (
+                        signature.type_parameters().to_vec(),
+                        signature.this_parameter(),
+                        signature.target(),
+                        signature.mapper(),
+                        signature.resolved_type_predicate(),
+                        signature.isolated_signature_type(),
+                        signature.composite().cloned(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn assert_recovery_source_signatures(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    call: NodeRef,
+) -> [SignatureId; 2] {
+    let store = context.store();
+    let bound = context.file(file).unwrap().1;
+    let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+    let mut declarations = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallSignature).then_some(reference(node))
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+    let declarations: [NodeRef; 2] = declarations.try_into().unwrap();
+    let first = parsed.arena.get(declarations[0].node).unwrap();
+    let owner = reference(first.parent.unwrap());
+    let NodeData::InterfaceDeclaration(interface) = &parsed.arena.get(owner.node).unwrap().data
+    else {
+        panic!("Recovery must own both source signatures")
+    };
+    assert_eq!(interface.members.nodes, declarations.map(|node| node.node));
+    let owner_symbol = bound.symbol(owner).unwrap();
+    let NodeData::CallExpression(syntax) = &parsed.arena.get(call.node).unwrap().data else {
+        panic!("expected the original property call")
+    };
+    let callable = resolved_type(context, reference(syntax.expression));
+    let record = store.type_payload(callable).unwrap();
+    assert_eq!(record.symbol(), Some(owner_symbol));
+    let TypeData::Interface(interface) = record.data() else {
+        panic!("the callee must keep the real Recovery interface")
+    };
+    let signatures = declarations.map(|node| {
+        let links = store.signature_links(node).unwrap();
+        links.resolved_signature.signature().unwrap()
+    });
+    let members = &interface.reference.object.structured;
+    assert_eq!(members.signatures.as_deref(), Some(signatures.as_slice()));
+    assert_eq!(members.call_signature_count, 2);
+    let intrinsic = store.intrinsic_bootstrap().unwrap();
+    for ((declaration, id), expected_return) in declarations
+        .into_iter()
+        .zip(signatures)
+        .zip([intrinsic.string_type, intrinsic.number_type])
+    {
+        assert_eq!(
+            parsed.arena.get(declaration.node).unwrap().parent,
+            Some(owner.node)
+        );
+        let NodeData::CallSignatureDeclaration(syntax) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected a real call-signature declaration")
+        };
+        let signature = store.signature(id).unwrap();
+        let parameters = syntax
+            .parameters
+            .nodes
+            .iter()
+            .map(|&node| assert_recovery_parameter(context, parsed, reference(node)))
+            .collect::<Vec<_>>();
+        assert_eq!(signature.declaration(), Some(declaration));
+        assert_eq!(signature.parameters(), parameters);
+        assert_eq!(signature.resolved_return_type(), Some(expected_return));
+        assert_eq!(
+            resolved_type(context, reference(syntax.type_.unwrap())),
+            expected_return
+        );
+        assert!(signature.type_parameters().is_empty());
+        assert!(signature.this_parameter().is_none());
+        assert!(
+            !signature
+                .flags()
+                .contains(SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE)
+        );
+    }
+    signatures
+}
+
+fn assert_recovery_parameter(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    parameter: NodeRef,
+) -> SemanticSymbolId {
+    let NodeData::ParameterDeclaration(data) = &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        panic!("expected an owned source parameter")
+    };
+    assert!(data.question_token.is_none());
+    let annotation = NodeRef::new(parameter.arena, parameter.file, data.type_.unwrap());
+    let type_ = resolved_type(context, annotation);
+    let store = context.store();
+    let intrinsic = store.intrinsic_bootstrap().unwrap();
+    match parsed.arena.get(annotation.node).unwrap().kind {
+        SyntaxKind::NumberKeyword => assert_eq!(type_, intrinsic.number_type),
+        SyntaxKind::StringKeyword => assert_eq!(type_, intrinsic.string_type),
+        SyntaxKind::ArrayType => assert!(data.dot_dot_dot_token.is_some()),
+        _ => panic!("expected a scalar parameter or the real trailing array rest"),
+    }
+    let symbol = context
+        .file(parameter.file)
+        .unwrap()
+        .1
+        .symbol(parameter)
+        .unwrap();
     assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Call(call)),
+        store.value_symbol_links(symbol).unwrap().resolved_type,
+        Some(type_)
+    );
+    symbol
+}
+
+fn assert_final_if_local_state(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    completed: bool,
+) {
+    let store = context.store();
+    let bound = context.file(file).unwrap().1;
+    let number = store.intrinsic_bootstrap().unwrap().number_type;
+    let declarations = ["value", "branch"]
+        .into_iter()
+        .flat_map(|name| variable_declarations(parsed, file, name))
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 3);
+    let symbols = declarations
+        .iter()
+        .map(|&node| bound.symbol(node).unwrap())
+        .collect::<Vec<_>>();
+    assert_ne!(symbols[0], symbols[1]);
+    assert_ne!(symbols[0], symbols[2]);
+    assert_ne!(symbols[1], symbols[2]);
+    for (index, (&declaration, &symbol)) in declarations.iter().zip(&symbols).enumerate() {
+        if completed {
+            assert_eq!(
+                store.value_symbol_links(symbol).unwrap().resolved_type,
+                Some(number)
+            );
+        } else {
+            assert!(store.value_symbol_links(symbol).is_none());
+        }
+        let initializer = variable_initializer(parsed, file, declaration);
+        let initializer_type = resolved_type(context, initializer);
+        if index == 0 {
+            let TypeData::Literal(literal) = store.type_payload(initializer_type).unwrap().data()
+            else {
+                panic!("the leading initializer must keep the original numeric literal")
+            };
+            assert_eq!(
+                literal.value,
+                LiteralValue::Number(ts_jsnum::from_string("1"))
+            );
+        } else {
+            assert_eq!(initializer_type, number);
+            if completed {
+                assert_eq!(
+                    store
+                        .symbol_node_links(initializer)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(symbols[0])
+                );
+            }
+        }
+    }
+    let mut returns = parsed
+        .arena
+        .iter()
+        .filter_map(|(_, record)| {
+            let NodeData::ReturnStatement(statement) = &record.data else {
+                return None;
+            };
+            Some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                statement.expression.unwrap(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    returns.sort_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+    assert_eq!(returns.len(), 2);
+    for (read, symbol) in returns.into_iter().zip(&symbols[1..]) {
+        assert_eq!(resolved_type(context, read), number);
+        if completed {
+            assert_eq!(
+                store.symbol_node_links(read).unwrap().resolved_symbol,
+                Some(*symbol)
+            );
+        }
+    }
+    assert_eq!(store.type_resolution_len(), 0);
+    assert_eq!(is_type_checked(context, file), completed);
+}
+
+fn assert_final_if_overload_recovery(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    call: NodeRef,
+) -> SignatureId {
+    let visible = assert_recovery_source_signatures(context, parsed, file, call);
+    let store = context.store();
+    let intrinsic = store.intrinsic_bootstrap().unwrap();
+    let call_links = store.signature_links(call).unwrap();
+    let recovered = call_links.resolved_signature.signature().unwrap();
+    assert_eq!(
+        call_links,
+        &SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(recovered),
+            ..SignatureLinks::default()
+        }
+    );
+    assert!(!visible.contains(&recovered));
+    let signature = store.signature(recovered).unwrap();
+    let original = store.signature(visible[0]).unwrap();
+    assert_eq!(original.flags(), SignatureFlags::NONE);
+    assert_eq!(original.min_argument_count(), 2);
+    assert_eq!(original.parameters().len(), 2);
+    let second = store.signature(visible[1]).unwrap();
+    assert_eq!(second.flags(), SignatureFlags::NONE);
+    assert_eq!(second.min_argument_count(), 1);
+    assert_eq!(second.parameters().len(), 1);
+    assert_eq!(
+        signature.flags(),
+        SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+    );
+    assert_eq!(signature.declaration(), original.declaration());
+    assert_eq!(signature.min_argument_count(), 1);
+    assert_eq!(signature.parameters().len(), 2);
+    assert_eq!(signature.resolved_return_type(), Some(intrinsic.never_type));
+    assert_eq!(
+        store.type_node_links(call),
+        Some(&TypeNodeLinks {
+            resolved_type: Some(intrinsic.never_type),
+            ..TypeNodeLinks::default()
+        })
+    );
+    assert!(signature.type_parameters().is_empty());
+    assert!(signature.this_parameter().is_none());
+    assert!(signature.target().is_none());
+    assert!(signature.mapper().is_none());
+    assert!(signature.composite().is_none());
+    assert!(signature.resolved_type_predicate().is_none());
+    assert!(signature.isolated_signature_type().is_none());
+    let mut parameter_types = Vec::new();
+    for (&parameter, &source) in signature.parameters().iter().zip(original.parameters()) {
+        assert_ne!(parameter, source);
+        let record = store.symbol(parameter).unwrap();
+        let source_record = store.symbol(source).unwrap();
+        assert_eq!(
+            record.flags(),
+            source_record.flags() | SymbolFlags::TRANSIENT
+        );
+        assert_eq!(record.declarations(), source_record.declarations());
+        assert_eq!(
+            record.value_declaration(),
+            source_record.value_declaration()
+        );
+        assert_eq!(record.parent(), source_record.parent());
+        assert_eq!(record.name(), source_record.name());
+        let links = store.value_symbol_links(parameter).unwrap();
+        assert_eq!(links.target, Some(source));
+        assert!(links.mapper.is_none());
+        assert!(links.write_type.is_none());
+        parameter_types.push(links.resolved_type.unwrap());
+    }
+    let TypeData::Union(union) = store.type_payload(parameter_types[0]).unwrap().data() else {
+        panic!("the recovery parameter must combine both real scalar parameters")
+    };
+    let mut expected = [intrinsic.string_type, intrinsic.number_type];
+    expected.sort_unstable();
+    assert_eq!(union.union.types, expected);
+    assert_eq!(parameter_types[1], intrinsic.number_type);
+    assert_overload_argument_diagnostic(context, parsed, file);
+    assert_final_if_local_state(context, parsed, file, true);
+    let stopped = variable_declarations(parsed, file, "stopped");
+    let [stopped] = stopped.as_slice() else {
+        panic!("expected the original call result binding")
+    };
+    let symbol = context.file(file).unwrap().1.symbol(*stopped).unwrap();
+    assert_eq!(
+        store.value_symbol_links(symbol).unwrap().resolved_type,
+        Some(intrinsic.never_type)
+    );
+    recovered
+}
+
+fn assert_overload_argument_diagnostic(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+) {
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("only the one-argument overload must supply an argument diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2345);
+    assert_eq!(diagnostic.diagnostic.arguments, ["boolean", "string"]);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Argument of type 'boolean' is not assignable to parameter of type 'string'."
     );
     assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().mapper_len(),
-            context.store().signature_len(),
-        ),
-        first_counts,
+        diagnostic.node,
+        Some(node_of_kind(parsed, file, SyntaxKind::TrueKeyword))
     );
+    assert!(diagnostic.range_override.is_none());
+    assert!(diagnostic.diagnostic.details.is_empty());
+    assert!(diagnostic.related_information.is_empty());
+}
+
+fn assert_unsupported_rest_recovery(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    call: NodeRef,
+) {
+    let signatures = assert_recovery_source_signatures(context, parsed, file, call);
+    let store = context.store();
+    let first = store.signature(signatures[0]).unwrap();
+    let second = store.signature(signatures[1]).unwrap();
+    assert_eq!(first.flags(), SignatureFlags::HAS_REST_PARAMETER);
+    assert_eq!(first.min_argument_count(), 2);
+    assert_eq!(first.parameters().len(), 3);
+    assert_eq!(second.flags(), SignatureFlags::NONE);
+    assert_eq!(second.min_argument_count(), 1);
+    assert_eq!(second.parameters().len(), 1);
+    assert_ne!(first.resolved_return_type(), second.resolved_return_type());
+    let rest = store
+        .value_symbol_links(first.parameters()[2])
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let TypeData::TypeReference(array) = store.type_payload(rest).unwrap().data() else {
+        panic!("the real trailing rest annotation must be Array<number>")
+    };
+    assert_eq!(array.object.target, Some(context.global_types().array_type));
+    assert_eq!(
+        array.resolved_type_arguments.as_deref(),
+        Some([store.intrinsic_bootstrap().unwrap().number_type].as_slice())
+    );
+    for (name, target) in [
+        ("Array", context.global_types().array_type),
+        ("ReadonlyArray", context.global_types().readonly_array_type),
+    ] {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(interface.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        assert_eq!(store.type_payload(target).unwrap().symbol(), Some(owner));
+    }
+    assert!(store.type_node_links(call).is_none());
+    assert!(store.signature_links(call).is_none());
     assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
-    let (_, bound) = context.file(file).unwrap();
-    for declaration in local_declarations {
-        let symbol = bound.symbol(declaration).unwrap();
-        assert!(context.store().value_symbol_links(symbol).is_none());
+    assert_final_if_local_state(context, parsed, file, false);
+}
+
+#[test]
+fn final_if_flow_retries_after_unsupported_mixed_return_rest_overload_recovery() {
+    let source = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+        "interface Recovery {\n",
+        "  (value: number, other: number, ...more: number[]): string;\n",
+        "  (value: string): number;\n",
+        "}\n",
+        "type Broken = { fn: Recovery };\n",
+        "function replay(flag: boolean): number {\n",
+        "  let value: number = 1;\n",
+        "  if (flag) {\n",
+        "    const branch: number = value;\n",
+        "    return branch;\n",
+        "  } else {\n",
+        "    const branch: number = value;\n",
+        "    return branch;\n",
+        "  }\n",
+        "}\n",
+        "declare const api: Broken;\n",
+        "const stopped = api.fn(true);\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_232);
+    let call = node_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let mut context = context(&parsed, file);
+    let mut first_state = None;
+
+    for _ in 0..2 {
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Call(call))
+        );
+        assert_unsupported_rest_recovery(&context, &parsed, file, call);
+        let state = final_if_recovery_state(&context, &parsed, file);
+        if let Some(first) = &first_state {
+            assert_eq!(&state, first);
+        } else {
+            first_state = Some(state);
+        }
     }
 }
 
@@ -861,22 +1394,224 @@ fn joined_if_flow_preserves_branch_then_trailing_diagnostic_order() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the original named union and each narrowed path together.
 fn joined_if_branch_returns_remain_an_atomic_boundary() {
-    assert_final_if_boundary_is_atomic(
-        concat!(
-            "type Choice = \"yes\" | \"\" | undefined;\n",
-            "function branchReturn(value: Choice): Choice {\n",
-            "  if (value) {\n",
-            "    return value;\n",
-            "  } else {\n",
-            "    const falsy: \"\" | undefined = value;\n",
-            "  }\n",
-            "  const after: Choice = value;\n",
-            "  return value;\n",
-            "}\n",
-        ),
-        FileId::new(9),
+    let source = concat!(
+        "type Choice = \"yes\" | \"\" | undefined;\n",
+        "function branchReturn(value: Choice): Choice {\n",
+        "  if (value) {\n",
+        "    return value;\n",
+        "  } else {\n",
+        "    const falsy: \"\" | undefined = value;\n",
+        "  }\n",
+        "  const after: Choice = value;\n",
+        "  return value;\n",
+        "}\n",
     );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(9);
+    let declaration = function_declaration(&parsed, file);
+    let NodeData::FunctionDeclaration(function) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let annotation = NodeRef::new(parsed.arena.id(), file, function.type_.unwrap());
+    let parameter = NodeRef::new(parsed.arena.id(), file, function.parameters.nodes[0]);
+    let NodeData::ParameterDeclaration(parameter_data) =
+        &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let parameter_annotation = NodeRef::new(parsed.arena.id(), file, parameter_data.type_.unwrap());
+    let alias = node_of_kind(&parsed, file, SyntaxKind::TypeAliasDeclaration);
+    let falsy = variable_declarations(&parsed, file, "falsy")[0];
+    let after = variable_declarations(&parsed, file, "after")[0];
+    let falsy_read = variable_initializer(&parsed, file, falsy);
+    let after_read = variable_initializer(&parsed, file, after);
+    let NodeData::VariableDeclaration(after_data) = &parsed.arena.get(after.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let after_annotation = NodeRef::new(parsed.arena.id(), file, after_data.type_.unwrap());
+    let mut returns = parsed
+        .arena
+        .iter()
+        .filter_map(|(id, record)| {
+            let NodeData::ReturnStatement(returned) = &record.data else {
+                return None;
+            };
+            Some((
+                record.range.start.get(),
+                NodeRef::new(parsed.arena.id(), file, id),
+                NodeRef::new(parsed.arena.id(), file, returned.expression.unwrap()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    returns.sort_by_key(|&(start, _, _)| start);
+    assert_eq!(returns.len(), 2);
+    let then_read = returns[0].2;
+    let final_read = returns[1].2;
+    let mut context = context(&parsed, file);
+    let (_, bound) = context.file(file).unwrap();
+    let owner = bound.symbol(declaration).unwrap();
+    let parameter_owner = bound.symbol(parameter).unwrap();
+    let alias_owner = bound.symbol(alias).unwrap();
+    let after_owner = bound.symbol(after).unwrap();
+    assert!(context.store().signature_links(declaration).is_none());
+    assert!(!is_type_checked(&context, file));
+
+    context.check_source_file(file).unwrap();
+
+    assert!(is_type_checked(&context, file));
+    assert!(context.diagnostics().is_empty());
+    let choice = context.get_declared_type_of_symbol(alias_owner).unwrap();
+    assert_eq!(context.type_to_string(choice).unwrap(), "Choice");
+    let alias_id = context
+        .store()
+        .type_payload(choice)
+        .unwrap()
+        .alias()
+        .unwrap();
+    assert_eq!(
+        context.store().type_alias(alias_id).unwrap().symbol(),
+        Some(alias_owner)
+    );
+    assert_eq!(
+        context.store().symbol(alias_owner).unwrap().declarations(),
+        Some(&[alias][..])
+    );
+    let callable = context.get_type_at_location(declaration).unwrap();
+    assert_eq!(
+        context.store().type_payload(callable).unwrap().symbol(),
+        Some(owner)
+    );
+    assert_eq!(
+        context.store().symbol(owner).unwrap().declarations(),
+        Some(&[declaration][..])
+    );
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+        panic!("expected the original function object");
+    };
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&[signature][..])
+    );
+    assert_eq!(object.structured.call_signature_count, 1);
+    let record = context.store().signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(declaration));
+    assert_eq!(record.parameters(), &[parameter_owner]);
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(
+        context
+            .store()
+            .symbol(parameter_owner)
+            .unwrap()
+            .declarations(),
+        Some(&[parameter][..])
+    );
+    for annotation in [annotation, parameter_annotation, after_annotation] {
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(choice));
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(annotation)
+                .unwrap()
+                .resolved_symbol,
+            Some(alias_owner)
+        );
+    }
+    for value_owner in [parameter_owner, after_owner] {
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value_owner)
+                .unwrap()
+                .resolved_type,
+            Some(choice)
+        );
+    }
+    assert_eq!(context.get_return_type_of_signature(signature), Ok(choice));
+    let truthy = context.get_type_at_location(then_read).unwrap();
+    let falsy_type = context.get_type_at_location(falsy_read).unwrap();
+    assert_eq!(context.type_to_string(truthy).unwrap(), "\"yes\"");
+    assert_eq!(
+        context.type_to_string(falsy_type).unwrap(),
+        "\"\" | undefined"
+    );
+    assert_ne!(truthy, falsy_type);
+    assert_ne!(choice, falsy_type);
+    for location in [falsy_read, after_read, final_read] {
+        assert_eq!(resolved_type(&context, location), falsy_type);
+        assert_eq!(context.get_type_at_location(location), Ok(falsy_type));
+    }
+    for location in [then_read, falsy_read, after_read, final_read] {
+        assert_eq!(
+            context.get_symbol_at_location(location),
+            Ok(Some(parameter_owner))
+        );
+    }
+    let (_, bound) = context.file(file).unwrap();
+    assert_ne!(bound.flow_at(returns[0].1), bound.flow_at(returns[1].1));
+    assert_eq!(bound.flow_graph().container_end(declaration), None);
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.type_resolution_len(),
+            ],
+            [owner, parameter_owner, after_owner]
+                .map(|symbol| store.value_symbol_links(symbol).cloned()),
+            store.signature_links(declaration).cloned(),
+            [
+                annotation,
+                parameter_annotation,
+                after_annotation,
+                then_read,
+                falsy_read,
+                after_read,
+                final_read,
+            ]
+            .map(|node| {
+                (
+                    store.node_links(node).cloned(),
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                )
+            }),
+            store
+                .source_file_links(context.source_file(file).unwrap())
+                .cloned(),
+            context.diagnostics().clone(),
+        )
+    };
+    let before = snapshot(&context);
+    for _ in 0..2 {
+        context.recheck_source_file(file).unwrap();
+        assert!(is_type_checked(&context, file));
+        assert_eq!(context.get_type_at_location(declaration), Ok(callable));
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(choice));
+        assert_eq!(context.get_type_at_location(then_read), Ok(truthy));
+        for location in [falsy_read, after_read, final_read] {
+            assert_eq!(context.get_type_at_location(location), Ok(falsy_type));
+            assert_eq!(
+                context.get_symbol_at_location(location),
+                Ok(Some(parameter_owner))
+            );
+        }
+        assert_eq!(snapshot(&context), before);
+    }
 }
 
 #[test]

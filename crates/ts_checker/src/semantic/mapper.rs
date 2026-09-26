@@ -477,6 +477,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Some(application)
     }
 
+    pub(super) fn type_mapper_is_exact_composite(
+        &self,
+        mapper: TypeMapperId,
+        first: TypeMapperId,
+        second: TypeMapperId,
+    ) -> bool {
+        let Some(mapper) = self.mapper_payload(mapper) else {
+            return false;
+        };
+        matches!(
+            &mapper.data,
+            TypeMapperData::Composite {
+                first: actual_first,
+                second: actual_second,
+            } if *actual_first == first && *actual_second == second
+        )
+    }
+
     #[must_use]
     pub fn mapper_kind(&self, mapper: TypeMapperId) -> Option<TypeMapperKind> {
         Some(self.mapper_payload(mapper)?.kind())

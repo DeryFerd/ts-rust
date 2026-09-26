@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     AstScope, CanonicalSourceFileFacts, CheckFlags, EscapedName, EscapedNameRef,
     InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags, SymbolStore,
@@ -23,7 +23,14 @@ use super::{
     alias_provider::{ProductionAliasSourceRegistry, SourceFileNamespaceWrapper},
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
-    classes::{ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassProvenance},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set_with_array_targets,
+    },
+    callables::ValidatedSingleCallable,
+    classes::{
+        ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassAnnotationScope,
+        SourceClassProvenance,
+    },
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
@@ -39,6 +46,11 @@ use super::{
         InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
         PublishedInterfaceMethodOrigin, PublishedInterfaceMethodRecovery,
     },
+    interface_heritage::{
+        SourceInterfaceHeritageHeader, SourceInterfaceHeritageQueryContext,
+        validate_source_interface_heritage_complete_bases,
+        validate_source_interface_heritage_header,
+    },
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
@@ -53,23 +65,33 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
-    mapped_types::{MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers},
+    mapped_types::{
+        MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedInstance,
+        SourceMappedLookupRequest,
+    },
+    object_aliases::SourceAliasOperandGraph,
     object_members::{
-        ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof, ObjectLiteralPropertyCloneOrigin,
+        ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof,
+        ObjectLiteralPropertyCloneOrigin, SourceDeclaredMemberNames,
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
+    relater::RelationUnavailable,
     signatures::{
         CompositeSignature, ElementFlags, IndexFlags, IndexInfo, IndexInfoArena, Signature,
         SignatureArena, SignatureFlags, TupleElementInfo, TupleMetadata, TypePredicate,
         TypePredicateArena, TypePredicateKind,
     },
     source_callables::{
-        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
-        SourceCallableTypeParameterSyntaxProof, source_generic_index_map_syntax,
+        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableDefaultType,
+        SourceCallableTypeParameterSyntaxProof, SourceDirectCallResolution,
+        source_generic_index_map_syntax,
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
     source_flow::SourceCapturedLocal,
-    source_imports::SourceFileNamespaceIdentity,
+    source_imports::{
+        SourceAmbientClassHeritage, SourceFileNamespaceIdentity, SyntheticNamespacePropertyOrigin,
+        SyntheticNamespacePropertyState,
+    },
     source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
@@ -84,6 +106,540 @@ use super::{
     },
     types::{ObjectFlags, TypeFlags},
 };
+
+// Reuses the R54 bounded collector for stored rejection facts only.
+#[derive(Clone, Copy, Default)]
+pub(in crate::semantic) struct CurrentQueryContext {
+    pub host: Option<bool>,
+    pub globals: Option<bool>,
+    pub options: Option<bool>,
+    pub diagnostics: Option<bool>,
+    pub session: Option<bool>,
+    pub source: Option<bool>,
+    pub query_depth: Option<usize>,
+    pub array_targets: Option<bool>,
+    pub source_pending_allowed: Option<bool>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(in crate::semantic) struct CurrentQueryFrame {
+    pub request: Option<NodeRef>,
+    pub owner: Option<NodeRef>,
+    pub expression: Option<NodeRef>,
+    pub receiver: Option<TypeId>,
+    pub context: CurrentQueryContext,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::semantic) struct CurrentQueryTypeSnapshot {
+    kind: Option<super::type_records::TypeDataKind>,
+    record_present: Option<bool>,
+    type_flags_bits: Option<u64>,
+    object_flags_bits: Option<u64>,
+    symbol: Option<SemanticSymbolId>,
+    alias: Option<TypeAliasId>,
+    declaration: Option<NodeRef>,
+    mapped_declaration: Option<NodeRef>,
+    source_origin_kind: Option<&'static str>,
+    declaration_count: Option<usize>,
+    structured_present: Option<bool>,
+    members_resolved: Option<bool>,
+    members_slot_present: Option<bool>,
+    properties_slot_present: Option<bool>,
+    properties_count: Option<usize>,
+    signatures_slot_present: Option<bool>,
+    signature_count: Option<usize>,
+    call_signature_count: Option<usize>,
+    indexes_slot_present: Option<bool>,
+    index_count: Option<usize>,
+    constraint: Option<bool>,
+    mapped_template_present: Option<bool>,
+    mapped_modifiers_present: Option<bool>,
+    mapped_name_present: Option<bool>,
+    mapped_target_present: Option<bool>,
+    mapped_mapper_present: Option<bool>,
+    receipt_present: Option<bool>,
+    operands_ready: Option<bool>,
+    stored_selection: Option<bool>,
+    stored_argument_count: Option<usize>,
+    stored_selection_key: Option<TypeId>,
+    stored_key_record_present: Option<bool>,
+    stored_key_kind: Option<super::type_records::TypeDataKind>,
+    stored_key_type_flags_bits: Option<u64>,
+    stored_key_object_flags_bits: Option<u64>,
+    node_cache_node: Option<NodeRef>,
+    node_cache_present: Option<bool>,
+    node_resolved_slot_present: Option<bool>,
+    node_resolved_matches_type: Option<bool>,
+    declared_cache_symbol: Option<SemanticSymbolId>,
+    declared_cache_present: Option<bool>,
+    declared_resolved_slot_present: Option<bool>,
+    declared_resolved_matches_type: Option<bool>,
+    declared_in_progress: Option<bool>,
+    single_signature_present: Option<bool>,
+    generic_count: Option<usize>,
+    this_present: Option<bool>,
+    return_slot_present: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentQueryFrameRecord {
+    id: usize,
+    site: &'static str,
+    frame: CurrentQueryFrame,
+    request_inherited: bool,
+    owner_inherited: bool,
+    expression_inherited: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentQueryEvent {
+    sequence: usize,
+    kind: &'static str,
+    reason: &'static str,
+    producer: &'static str,
+    location: &'static std::panic::Location<'static>,
+    receiver: Option<TypeId>,
+    node: Option<NodeRef>,
+    frame: Option<CurrentQueryFrameRecord>,
+    snapshot: CurrentQueryTypeSnapshot,
+    resolution_call: Option<bool>,
+}
+
+struct CurrentQueryObservation {
+    active: bool,
+    frames: [Option<CurrentQueryFrameRecord>; 16],
+    frame_len: usize,
+    next_frame: usize,
+    frames_truncated: bool,
+    events: [Option<CurrentQueryEvent>; 32],
+    event_len: usize,
+    events_truncated: bool,
+}
+
+std::thread_local! {
+    static CURRENT_QUERY_OBSERVATION: std::cell::RefCell<CurrentQueryObservation> = const {
+        std::cell::RefCell::new(CurrentQueryObservation {
+            active: false,
+            frames: [None; 16],
+            frame_len: 0,
+            next_frame: 0,
+            frames_truncated: false,
+            events: [None; 32],
+            event_len: 0,
+            events_truncated: false,
+        })
+    };
+}
+
+static CURRENT_QUERY_PRODUCER_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Only direct storage reads are allowed here. Public getters can record dependencies.
+pub(in crate::semantic) fn current_query_type_snapshot(
+    store: &super::CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> CurrentQueryTypeSnapshot {
+    let can_sample = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        state.try_borrow().is_ok_and(|state| state.active && state.event_len < state.events.len())
+    }).unwrap_or(false);
+    if !can_sample {
+        return CurrentQueryTypeSnapshot::default();
+    }
+    let mut snapshot = CurrentQueryTypeSnapshot {
+        record_present: Some(false),
+        ..CurrentQueryTypeSnapshot::default()
+    };
+    let Some(record) = store.types.get(receiver) else { return snapshot; };
+    snapshot.record_present = Some(true);
+    snapshot.kind = Some(record.data().kind());
+    snapshot.type_flags_bits = Some(u64::from(record.flags().bits()));
+    snapshot.object_flags_bits = Some(u64::from(record.object_flags().bits()));
+    snapshot.symbol = record.symbol();
+    snapshot.alias = record.alias();
+    snapshot.members_resolved = Some(record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED));
+    let structured = record.data().structured();
+    snapshot.structured_present = Some(structured.is_some());
+    if let Some(structured) = structured {
+        snapshot.members_slot_present = Some(structured.members.is_some());
+        snapshot.properties_slot_present = Some(structured.properties.is_some());
+        snapshot.properties_count = structured.properties.as_ref().map(Vec::len);
+        snapshot.signatures_slot_present = Some(structured.signatures.is_some());
+        snapshot.signature_count = structured.signatures.as_ref().map(Vec::len);
+        snapshot.call_signature_count = Some(structured.call_signature_count);
+        snapshot.indexes_slot_present = Some(structured.index_infos.is_some());
+        snapshot.index_count = structured.index_infos.as_ref().map(Vec::len);
+        if let Some([signature]) = structured.signatures.as_deref() {
+            let signature = store.signatures.get(*signature);
+            snapshot.single_signature_present = Some(signature.is_some());
+            if let Some(signature) = signature {
+                snapshot.generic_count = Some(signature.type_parameters().len());
+                snapshot.this_present = Some(signature.this_parameter().is_some());
+                snapshot.return_slot_present = Some(signature.resolved_return_type().is_some());
+            }
+        }
+    }
+    if let TypeData::Mapped(mapped) = record.data() {
+        snapshot.constraint = Some(mapped.constraint_type.is_some());
+        snapshot.mapped_template_present = Some(mapped.template_type.is_some());
+        snapshot.mapped_modifiers_present = Some(mapped.modifiers_type.is_some());
+        snapshot.mapped_name_present = Some(mapped.name_type.is_some());
+        snapshot.mapped_target_present = Some(mapped.object.target.is_some());
+        snapshot.mapped_mapper_present = Some(mapped.object.mapper.is_some());
+        snapshot.mapped_declaration = mapped.declaration;
+        snapshot.declaration = mapped.declaration;
+        snapshot.source_origin_kind = mapped.declaration.map(|_| "mapped.declaration");
+        let receipt = store.source_mapped_instances.get(&receiver);
+        snapshot.receipt_present = Some(receipt.is_some());
+        snapshot.operands_ready = receipt.map(SourceMappedInstance::current_query_operands_ready);
+        // Stored slot metadata only. No projection proof or generic status is computed.
+        if let Some(receipt) = receipt {
+            let (selection, count, key) = receipt.current_query_stored_selection_key();
+            snapshot.stored_selection = Some(selection);
+            snapshot.stored_argument_count = Some(count);
+            snapshot.stored_selection_key = key;
+            if let Some(key) = key {
+                let record = store.types.get(key);
+                snapshot.stored_key_record_present = Some(record.is_some());
+                if let Some(record) = record {
+                    snapshot.stored_key_kind = Some(record.data().kind());
+                    snapshot.stored_key_type_flags_bits = Some(u64::from(record.flags().bits()));
+                    snapshot.stored_key_object_flags_bits = Some(u64::from(record.object_flags().bits()));
+                }
+            }
+        }
+    }
+    let mut native_symbol = record.symbol();
+    if snapshot.declaration.is_none() {
+        let origin = if let Some(symbol) = native_symbol {
+            Some((symbol, "record.symbol"))
+        } else {
+            record.alias().and_then(|alias| store.type_aliases.get(alias))
+                .and_then(TypeAlias::symbol).map(|symbol| {
+                    native_symbol = Some(symbol);
+                    (symbol, "record.alias.symbol")
+                })
+        };
+        if let Some((symbol, origin)) = origin {
+            if let Some(declarations) = store.symbols.symbol(symbol).and_then(Symbol::declarations) {
+                snapshot.declaration_count = Some(declarations.len());
+                snapshot.declaration = declarations.first().copied();
+                snapshot.source_origin_kind = Some(origin);
+            }
+        }
+    }
+    if let Some(node) = snapshot.declaration {
+        let links = store.links.type_node.try_get(&node);
+        snapshot.node_cache_node = Some(node);
+        snapshot.node_cache_present = Some(links.is_some());
+        snapshot.node_resolved_slot_present = links.map(|links| links.resolved_type.is_some());
+        snapshot.node_resolved_matches_type = links.and_then(|links| links.resolved_type)
+            .map(|resolved| resolved == receiver);
+    }
+    if let Some(symbol) = native_symbol {
+        let links = store.links.declared_type.try_get(&symbol);
+        snapshot.declared_cache_symbol = Some(symbol);
+        snapshot.declared_cache_present = Some(links.is_some());
+        snapshot.declared_resolved_slot_present = links.map(|links| links.declared_type.is_some());
+        snapshot.declared_resolved_matches_type = links.and_then(|links| links.declared_type)
+            .map(|resolved| resolved == receiver);
+        snapshot.declared_in_progress = Some(store.declared_types_in_progress.contains(&symbol));
+    }
+    snapshot
+}
+
+pub(in crate::semantic) struct CurrentQueryRequestScope {
+    index: usize,
+    id: usize,
+}
+
+impl CurrentQueryRequestScope {
+    pub fn enter(site: &'static str, capture: impl FnOnce() -> CurrentQueryFrame) -> Option<Self> {
+        let can_capture = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return false; };
+            if !state.active || state.event_len == state.events.len() { return false; }
+            if state.frame_len == state.frames.len() {
+                state.frames_truncated = true;
+                return false;
+            }
+            true
+        }).unwrap_or(false);
+        if !can_capture {
+            return None;
+        }
+        let mut frame = capture();
+        CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            if !state.active {
+                return None;
+            }
+            if state.frame_len == state.frames.len() {
+                state.frames_truncated = true;
+                return None;
+            }
+            let mut request_inherited = false;
+            let mut owner_inherited = false;
+            let mut expression_inherited = false;
+            if let Some(previous) = state.frames[..state.frame_len].last().copied().flatten() {
+                request_inherited = frame.request.is_none() && previous.frame.request.is_some();
+                owner_inherited = frame.owner.is_none() && previous.frame.owner.is_some();
+                expression_inherited = frame.expression.is_none() && previous.frame.expression.is_some();
+                frame.request = frame.request.or(previous.frame.request);
+                frame.owner = frame.owner.or(previous.frame.owner);
+                frame.expression = frame.expression.or(previous.frame.expression);
+            }
+            let index = state.frame_len;
+            let id = state.next_frame;
+            state.next_frame += 1;
+            state.frames[index] = Some(CurrentQueryFrameRecord {
+                id, site, frame, request_inherited, owner_inherited, expression_inherited,
+            });
+            state.frame_len += 1;
+            Some(Self { index, id })
+        }).ok().flatten()
+    }
+
+    pub fn receiver(&self, receiver: TypeId) {
+        let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return; };
+            if let Some(frame) = state.frames[self.index].as_mut().filter(|frame| frame.id == self.id) {
+                frame.frame.receiver = Some(receiver);
+            }
+        });
+    }
+}
+
+impl Drop for CurrentQueryRequestScope {
+    fn drop(&mut self) {
+        let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return; };
+            if state.frames[self.index].is_some_and(|frame| frame.id == self.id) {
+                state.frames[self.index] = None;
+                state.frame_len = self.index;
+            }
+        });
+    }
+}
+
+#[track_caller]
+pub(in crate::semantic) fn observe_current_query_event(
+    kind: &'static str,
+    reason: &'static str,
+    producer: &'static str,
+    receiver: Option<TypeId>,
+    node: Option<NodeRef>,
+    capture: impl FnOnce() -> CurrentQueryTypeSnapshot,
+) {
+    let can_capture = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        let Ok(mut state) = state.try_borrow_mut() else { return false; };
+        if !state.active { return false; }
+        if state.event_len == state.events.len() {
+            state.events_truncated = true;
+            return false;
+        }
+        true
+    }).unwrap_or(false);
+    if !can_capture {
+        return;
+    }
+    let snapshot = capture();
+    let location = std::panic::Location::caller();
+    let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        let Ok(mut state) = state.try_borrow_mut() else { return; };
+        if !state.active { return; }
+        if state.event_len == state.events.len() {
+            state.events_truncated = true;
+            return;
+        }
+        let frame = if state.frames_truncated {
+            None
+        } else {
+            state.frames[..state.frame_len].last().copied().flatten()
+        };
+        let resolution_call = None; // Resolver activity is not observed by this trial.
+        let index = state.event_len;
+        state.events[index] = Some(CurrentQueryEvent {
+            sequence: index,
+            kind,
+            reason,
+            producer,
+            location,
+            receiver,
+            node,
+            frame,
+            snapshot,
+            resolution_call,
+        });
+        state.event_len += 1;
+    });
+}
+
+/// Observes only the first cold check of the saved ordinary Query failure file.
+pub struct CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    file_name: CurrentQueryFilename,
+    source: NodeRef,
+    _source_lifetime: std::marker::PhantomData<&'a str>,
+    metadata: F,
+}
+
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Returns a scope only when ordinary Query observation is enabled.
+    pub fn current_query_producer_scope<'a, F>(file_name: &'a str, source: impl FnOnce() -> NodeRef, metadata: F) -> Option<CurrentQueryProducerScope<'a, F>>
+    where
+        F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+    {
+        if std::env::var_os("TS_RUST_OBSERVE_QUERY_CURRENT_PRODUCER")
+            .as_deref() != Some(std::ffi::OsStr::new("1"))
+            || file_name != "/home/theo/Code/sandbox/ts-rust/target/project-inputs/query/source/packages/query-core/src/timeoutManager.ts"
+        {
+            return None;
+        }
+        if CURRENT_QUERY_PRODUCER_SEEN.compare_exchange(
+            false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+        ).is_err() {
+            return None;
+        }
+        let entered = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return false; };
+            if state.active { return false; }
+            state.active = true;
+            true
+        }).unwrap_or(false);
+        if !entered { return None; }
+        let source = source();
+        observe_current_query_event(
+            "scope_begin", "cold_source", "compiler", None, Some(source),
+            CurrentQueryTypeSnapshot::default,
+        );
+        Some(CurrentQueryProducerScope { file_name: CurrentQueryFilename::new(file_name), source, metadata, _source_lifetime: std::marker::PhantomData })
+    }
+
+}
+
+impl<'a, F> CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    /// Records the original escaping intersection error without changing it.
+    pub fn escaping(&self, error: &super::SourceCheckError, store: &super::CanonicalTypeMapperStore) {
+        if let super::SourceCheckError::DeclaredType(super::DeclaredTypeError::TypeNodeUnavailable(
+            super::type_nodes::TypeNodeUnavailable::UnsupportedIntersectionConstituentType(receiver),
+        )) = error {
+            observe_current_query_event(
+                "escaping", "T06.TYPE_NODE", "compiler", Some(*receiver), None,
+                || current_query_type_snapshot(store, *receiver),
+            );
+        }
+    }
+}
+
+struct CurrentQueryFilename {
+    text: String,
+    truncated: bool,
+}
+
+impl CurrentQueryFilename {
+    fn new(text: &str) -> Self {
+        let mut end = text.len().min(256);
+        while !text.is_char_boundary(end) { end -= 1; }
+        Self { text: text[..end].to_owned(), truncated: end < text.len() }
+    }
+}
+
+impl std::fmt::Display for CurrentQueryFilename {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(output, "{:?} filename_truncated={}", self.text, self.truncated)
+    }
+}
+
+struct CurrentQueryNodeDisplay {
+    node: Option<NodeRef>,
+    metadata: Option<(CurrentQueryFilename, SyntaxKind, TextRange)>,
+}
+
+impl std::fmt::Display for CurrentQueryNodeDisplay {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(node) = self.node else { return output.write_str("unavailable"); };
+        write!(output, "{node:?} ")?;
+        if let Some((file_name, kind, range)) = &self.metadata {
+            write!(output, "filename={} kind={:?} start={} end={} units=utf8_bytes",
+                file_name, kind, range.start.get(), range.end.get())
+        } else {
+            output.write_str("filename=unavailable start=unavailable end=unavailable")
+        }
+    }
+}
+
+impl<'a, F> Drop for CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        use std::fmt::Write as _;
+        observe_current_query_event(
+            "scope_end", "cold_source", "compiler", None, Some(self.source),
+            CurrentQueryTypeSnapshot::default,
+        );
+        let records = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            state.active = false;
+            state.frames = [None; 16];
+            state.frame_len = 0;
+            Some((state.events, state.event_len, state.events_truncated, state.frames_truncated))
+        }).ok().flatten();
+        let Some((records, len, truncated, frames_truncated)) = records else { return; };
+        let mut output = std::io::stderr().lock();
+        for (index, record) in records[..len].iter().enumerate() {
+            let Some(event) = record else { continue; };
+            if truncated && index + 1 == len {
+                let _ = writeln!(output,
+                    "R54_QUERY_CURRENT_PRODUCER_TRUNCATED events_limit=32 frames_truncated={frames_truncated}");
+                continue;
+            }
+            let frame = event.frame.map(|record| record.frame).unwrap_or_default();
+            let node = |node: Option<NodeRef>| CurrentQueryNodeDisplay {
+                node,
+                metadata: node.and_then(|node| (self.metadata)(node))
+                    .map(|(file, kind, range)| (CurrentQueryFilename::new(file), kind, range)),
+            };
+            let constraint = match event.snapshot.constraint {
+                Some(true) => "present", Some(false) => "absent", None => "unavailable",
+            };
+            let operands = match event.snapshot.operands_ready {
+                Some(true) => "ready", Some(false) => "deferred", None => "unavailable",
+            };
+            let resolution = match event.resolution_call {
+                Some(true) => "active", Some(false) => "inactive", None => "unavailable",
+            };
+            let mut record = String::new();
+            let _ = writeln!(record,
+                "R54_QUERY_CURRENT_PRODUCER kind={} sequence={} reason={} producer={} site_file={} site_line={} site_column={} type={:?} frame_id={:?} frame_site={:?} frames_truncated={} scope_filename={} node=[{}] request=[{}] owner=[{}] expression=[{}] mapped_declaration=[{}] caller_receiver={:?} caller_host={:?} caller_globals={:?} caller_options={:?} caller_diagnostics={:?} caller_session={:?} caller_source_context={:?} caller_query_depth={:?} payload_kind={:?} constraint={} operands={} receipt_state_only=1 resolution_call={} resolution_coverage=unavailable type_source=[{}] request_inherited={:?} owner_inherited={:?} expression_inherited={:?} caller_array_targets={:?} caller_allow_source_pending={:?} stored_key_authenticated=0 stored_key_generic_status=unavailable shallow={:?}",
+                event.kind, event.sequence, event.reason, event.producer,
+                CurrentQueryFilename::new(event.location.file()), event.location.line(), event.location.column(),
+                event.receiver, event.frame.map(|frame| frame.id), event.frame.map(|frame| frame.site),
+                frames_truncated, &self.file_name, node(event.node),
+                node(frame.request), node(frame.owner), node(frame.expression), node(event.snapshot.mapped_declaration),
+                frame.receiver, frame.context.host, frame.context.globals, frame.context.options,
+                frame.context.diagnostics, frame.context.session, frame.context.source, frame.context.query_depth,
+                event.snapshot.kind, constraint, operands, resolution, node(event.snapshot.declaration),
+                event.frame.map(|frame| frame.request_inherited),
+                event.frame.map(|frame| frame.owner_inherited),
+                event.frame.map(|frame| frame.expression_inherited),
+                frame.context.array_targets, frame.context.source_pending_allowed, event.snapshot,
+            );
+            if record.len() > 65_536 {
+                let _ = writeln!(output,
+                    "R54_QUERY_CURRENT_PRODUCER_TRUNCATED record_byte_limit=65536 sequence={}", event.sequence);
+                continue;
+            }
+            let _ = output.write_all(record.as_bytes());
+        }
+    }
+}
 
 #[derive(Debug)]
 enum PreparedEntityName {
@@ -113,10 +669,47 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    class_annotation_role: Option<NodeId>,
+    type_parameter_annotations: Option<Box<TypeParameterAnnotationFacts>>,
+    rest_infer_true_branch: Option<NodeId>,
+    alias_type_parameter: Option<Box<AliasTypeParameterSyntaxFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
+    primitive_interface_member: Option<Box<SourcePrimitiveInterfaceMember>>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+/// Actual annotation roles for the two admitted primitive interface forms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourcePrimitiveInterfaceMember {
+    Property {
+        interface_name: NodeId,
+        member: NodeId,
+        name: NodeId,
+        annotation: NodeId,
+    },
+    StringIndex {
+        interface_name: NodeId,
+        member: NodeId,
+        parameter: NodeId,
+        name: NodeId,
+        key: NodeId,
+        value: NodeId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AliasTypeParameterSyntaxFacts {
+    constraint: Option<NodeId>,
+    default_type: Option<NodeId>,
+}
+
+/// Actual annotation roles on a type parameter owned by a type alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceAliasTypeParameterAnnotations {
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
 }
 
 /// Exact heritage syntax retained without resolving base names.
@@ -145,6 +738,19 @@ struct MappedTypeSyntaxFacts {
     modifiers: Option<MappedTypeModifiers>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeParameterAnnotationFacts {
+    constraint: Option<NodeId>,
+    default_type: Option<NodeId>,
+}
+
+/// Written operands stay separate from missing or changed type caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeParameterAnnotations {
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
+}
+
 /// Exact operand roles retained from one registered mapped declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceMappedTypeOperands {
@@ -159,6 +765,7 @@ struct SourceSymbolDeclarations {
     flags: SymbolFlags,
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
+    exports: Option<SymbolTableId>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +780,135 @@ impl SourceGlobalBinding {
     pub(super) fn declarations(&self) -> Option<&[NodeRef]> {
         self.declarations.as_deref()
     }
+}
+
+/// Ordered source ownership only. Cached types need their producer's proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceGlobalInterfaceValueOwner {
+    globals_table: SymbolTableId,
+    table_symbol: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declarations: Box<[NodeRef]>,
+    interfaces: Box<[NodeRef]>,
+    variables: Box<[NodeRef]>,
+    value_declaration: NodeRef,
+    value_annotation: NodeRef,
+}
+
+impl SourceGlobalInterfaceValueOwner {
+    pub(super) fn globals_table(&self) -> SymbolTableId {
+        self.globals_table
+    }
+
+    pub(super) fn table_symbol(&self) -> SemanticSymbolId {
+        self.table_symbol
+    }
+
+    pub(super) fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) fn declarations(&self) -> &[NodeRef] {
+        &self.declarations
+    }
+
+    pub(super) fn interfaces(&self) -> &[NodeRef] {
+        &self.interfaces
+    }
+
+    pub(super) fn variables(&self) -> &[NodeRef] {
+        &self.variables
+    }
+
+    pub(super) fn value_declaration(&self) -> NodeRef {
+        self.value_declaration
+    }
+
+    pub(super) fn value_annotation(&self) -> NodeRef {
+        self.value_annotation
+    }
+
+    /// Rechecks source metadata without reading any annotation type cache.
+    pub(super) fn validate_current(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+    ) -> Result<(), super::DeclaredTypeError> {
+        if store
+            .source_global_interface_value_owner(self.symbol)?
+            .as_ref()
+            == Some(self)
+        {
+            Ok(())
+        } else {
+            Err(super::DeclaredTypeError::Unavailable(
+                super::DeclaredTypeUnavailable::SymbolNotOwned(self.symbol),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientSymbol {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) canonical: SemanticSymbolId,
+    pub(super) canonical_parent: Option<SemanticSymbolId>,
+    pub(super) record: Symbol,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientExport {
+    pub(super) name: EscapedName,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) canonical: SemanticSymbolId,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientExportTable {
+    pub(super) table: SymbolTableId,
+    pub(super) entries: Box<[NativeAmbientExport]>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientModuleSource {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) exports: NativeAmbientExportTable,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientAliasEdge {
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+    pub(super) immediate: SemanticSymbolId,
+    pub(super) canonical_immediate: SemanticSymbolId,
+    pub(super) target: SemanticSymbolId,
+    pub(super) canonical_target: SemanticSymbolId,
+    pub(super) type_only_declaration: Option<NodeRef>,
+    pub(super) binding_table: SymbolTableId,
+    pub(super) binding_owner: Option<SemanticSymbolId>,
+    pub(super) binding_container: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientLosingExport {
+    pub(super) source_owner: SemanticSymbolId,
+    pub(super) name: EscapedName,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) selected: SemanticSymbolId,
+    pub(super) aliases: Box<[NativeAmbientAliasEdge]>,
+}
+
+/// The actual native selection after every constructor merge phase has finished.
+/// No member value type or mutable alias use flag is part of this receipt.
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientModuleExportResult {
+    pub(super) globals: SymbolTableId,
+    pub(super) name: EscapedName,
+    pub(super) table_symbol: SemanticSymbolId,
+    pub(super) owner: SemanticSymbolId,
+    pub(super) selected: NativeAmbientExportTable,
+    pub(super) sources: Box<[NativeAmbientModuleSource]>,
+    pub(super) symbols: Box<[NativeAmbientSymbol]>,
+    pub(super) losing: Box<[NativeAmbientLosingExport]>,
 }
 
 /// Binder edges for one interface contributed by an actual `declare global` block.
@@ -196,6 +932,7 @@ pub(super) struct SourceGlobalBindings {
     pub(super) table: SymbolTableId,
     entries: HashMap<EscapedName, SourceGlobalBinding>,
     interface_augmentations: HashMap<NodeRef, SourceGlobalInterfaceAugmentation>,
+    native_ambient_exports: Option<HashMap<SemanticSymbolId, NativeAmbientModuleExportResult>>,
 }
 
 impl SourceGlobalBindings {
@@ -251,6 +988,7 @@ pub(super) enum UnresolvedTypeError {
 struct RelationReadObservations {
     types: HashSet<TypeId>,
     type_aliases: HashSet<TypeAliasId>,
+    type_alias_owners: HashSet<TypeId>,
     signatures: HashSet<SignatureId>,
     symbols: HashSet<SemanticSymbolId>,
     symbol_tables: HashSet<SymbolTableId>,
@@ -318,6 +1056,7 @@ impl PropertiesTypeCacheKey {
 pub(super) enum SourceCallableFamily {
     FunctionDeclaration,
     ArrowFunction,
+    ObjectLiteralMethod,
 }
 
 /// Whether a source callable's return is owned by exact annotation syntax or
@@ -352,6 +1091,7 @@ impl SourceCallableFamily {
         match self {
             Self::FunctionDeclaration => SyntaxKind::FunctionDeclaration,
             Self::ArrowFunction => SyntaxKind::ArrowFunction,
+            Self::ObjectLiteralMethod => SyntaxKind::MethodDeclaration,
         }
     }
 
@@ -364,6 +1104,7 @@ impl SourceCallableFamily {
                     Self::ArrowFunction,
                     SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
                 )
+                | (Self::ObjectLiteralMethod, SyntaxKind::MethodDeclaration)
         )
     }
 }
@@ -411,6 +1152,7 @@ pub(super) struct SourceOverloadParameterProvenance {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
+    pub(super) default_parameter: Option<SourceCallableDefaultType>,
 }
 
 /// One declaration-order signature row owned by a source overload group.
@@ -419,18 +1161,36 @@ pub(super) struct SourceOverloadSignatureProvenance {
     pub(super) declaration: NodeRef,
     pub(super) signature: SignatureId,
     pub(super) flags: SignatureFlags,
+    pub(super) type_parameters: Box<[SourceCallableTypeParameterProvenance]>,
     pub(super) parameters: Box<[SourceOverloadParameterProvenance]>,
-    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation: Option<NodeRef>,
     pub(super) return_annotation_null_literal_identity: bool,
     pub(super) return_type: TypeId,
 }
 
-/// Immutable source/binder provenance for one local ambient overload value.
+/// The actual body declaration hidden from a source overload's call list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadImplementation {
+    pub(super) declaration: NodeRef,
+    pub(super) body: NodeRef,
+}
+
+/// Immutable source/binder provenance for one source overload value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceOverloadProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Box<[SourceOverloadSignatureProvenance]>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    pub(super) namespace_exports: Option<Arc<super::source_namespaces::NamespaceExportProof>>,
+}
+
+/// Source ownership for a callable value whose signatures have not been requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadIdentity {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) declarations: Box<[NodeRef]>,
+    pub(super) members: Option<SymbolTableId>,
 }
 
 /// Fully resolved parameter row staged before overload publication.
@@ -443,26 +1203,30 @@ pub(super) struct PreparedSourceOverloadParameter {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
+    pub(super) default_parameter: Option<SourceCallableDefaultType>,
 }
 
 /// Fully resolved signature row staged before overload publication.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct PreparedSourceOverloadSignature {
     pub(super) declaration: NodeRef,
+    pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
     pub(super) parameters: Vec<PreparedSourceOverloadParameter>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
-    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation: Option<NodeRef>,
     pub(super) return_annotation_null_literal_identity: bool,
     pub(super) return_type: TypeId,
 }
 
 /// Dependency-closed transaction input for one source overload group.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct PreparedSourceOverloadPublication {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    pub(super) namespace_exports: Option<Arc<super::source_namespaces::NamespaceExportProof>>,
 }
 
 /// Immutable syntax-plan edges for the admitted direct-interface heritage slice.
@@ -473,6 +1237,13 @@ pub(super) struct PreparedSourceOverloadPublication {
 pub(super) struct DirectInterfaceHeritageProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) bases: Vec<(SemanticSymbolId, TypeId)>,
+    pub(super) source: Option<SourceInterfaceHeritageHeader>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DirectInterfaceHeritageState {
+    Header(SourceInterfaceHeritageHeader),
+    Complete(DirectInterfaceHeritageProvenance),
 }
 
 /// Immutable source-plan edge for one direct local class base.
@@ -515,6 +1286,13 @@ pub(super) struct ResolvedSourceCallableTypeParameter {
     pub(super) default_type: TypeId,
 }
 
+/// Published receiver and value types stay separate from mutable signature links.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CallableSignatureParameterTypes {
+    this_type: Option<TypeId>,
+    parameters: Vec<TypeId>,
+}
+
 /// Dependency-closed inputs for publishing one source generic callable.
 ///
 /// The opaque syntax proof is produced only by source planning. The store
@@ -531,6 +1309,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) type_parameters: Vec<ResolvedSourceCallableTypeParameter>,
     pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
+    pub(super) this_parameter: Option<SemanticSymbolId>,
     pub(super) parameters: Vec<SemanticSymbolId>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -652,6 +1431,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     source_node_children: BTreeMap<NodeArenaId, Vec<Box<[NodeId]>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
+    source_merged_declaration_order: HashMap<SemanticSymbolId, Box<[NodeRef]>>,
+    source_declared_member_names: HashMap<TypeId, SourceDeclaredMemberNames>,
     source_global_bindings: Option<SourceGlobalBindings>,
     computed_method_name_groups: HashMap<SemanticSymbolId, ComputedMethodNameGroup>,
     source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
@@ -662,13 +1443,15 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_type_provenance: HashSet<TypeId>,
     declared_call_set_provenance: HashSet<TypeId>,
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
-    direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
+    direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageState>,
+    source_ambient_class_heritages: HashMap<TypeId, SourceAmbientClassHeritage>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
     published_interface_method_origins: HashMap<TypeId, PublishedInterfaceMethodOrigin>,
     published_interface_method_signature_owners: HashMap<SignatureId, TypeId>,
+    proxy_interface_method_signature_owners: HashMap<SignatureId, TypeId>,
     published_interface_method_recoveries: HashMap<TypeId, PublishedInterfaceMethodRecovery>,
     instantiated_property_alias_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
@@ -681,12 +1464,16 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
         HashMap<(SemanticSymbolId, CacheHashKey), OrdinaryIntersectionAliasRequestRecovery>,
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
+    source_mapped_lookup_requests: HashMap<TypeId, SourceMappedLookupRequest>,
+    source_mapped_instances: HashMap<TypeId, SourceMappedInstance>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
+    source_class_annotation_scopes: HashMap<TypeId, SourceClassAnnotationScope>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
     class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
     class_instance_super_members: HashMap<(TypeId, SemanticSymbolId), ClassInstanceSuperMember>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_direct_call_resolutions: HashMap<NodeRef, SourceDirectCallResolutionState>,
     source_callable_interface_return_proofs:
         HashMap<SignatureId, SourceCallableInterfaceReturnProof>,
     source_callable_alias_annotations: HashMap<
@@ -705,29 +1492,39 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
     source_callable_type_queries: HashMap<SignatureId, Arc<SourceCallableTypeQueryEvidence>>,
+    source_alias_default_graphs: HashMap<NodeRef, SourceAliasOperandGraph>,
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
+    synthetic_namespace_property_origins:
+        HashMap<SemanticSymbolId, SyntheticNamespacePropertyState>,
     object_literal_getter_origins: HashMap<SemanticSymbolId, ObjectLiteralGetterOrigin>,
+    source_object_rest_origins: HashMap<TypeId, super::source_object_rest::SourceObjectRestOrigin>,
     object_literal_getter_return_proofs: HashMap<SemanticSymbolId, ObjectLiteralGetterReturnProof>,
     source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
     source_file_namespace_wrappers: HashMap<SemanticSymbolId, SourceFileNamespaceWrapper>,
     source_file_namespace_wrapper_aliases: HashMap<SemanticSymbolId, SemanticSymbolId>,
     source_file_namespace_wrapper_defaults: HashMap<SemanticSymbolId, SemanticSymbolId>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
+    source_overload_identities: HashMap<TypeId, SourceOverloadIdentity>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_overload_types_by_signature: HashMap<SignatureId, TypeId>,
+    pub(super) overload_failure_signatures:
+        HashMap<(TypeId, Vec<SignatureId>), super::calls::OverloadFailureSignature>,
+    pub(super) overload_failure_signature_keys: HashMap<SignatureId, (TypeId, Vec<SignatureId>)>,
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
+    /// Pinned `SignatureKeyErased` entries. Mapped signature edges can stay lazy.
+    source_overload_erased_signatures: HashMap<SignatureId, SignatureId>,
     unresolved_symbols: HashMap<UnresolvedSymbolKey, SemanticSymbolId>,
     unresolved_symbol_keys: HashMap<SemanticSymbolId, UnresolvedSymbolKey>,
     /// Pinned checker `propertiesTypes`, including its WIP unresolved-members
     /// discriminator and origin-preservation mode.
     properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
-    callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
+    callable_signature_parameter_types: HashMap<SignatureId, CallableSignatureParameterTypes>,
     checked_source_callable_returns: HashMap<SignatureId, TypeId>,
     signature_return_provenance: HashMap<SignatureId, SignatureReturnProvenance>,
     canonical_tuple_targets: HashMap<CanonicalTupleTargetKey, CanonicalTupleTargetProvenance>,
@@ -736,10 +1533,12 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     pub(super) intersection_keys_by_type: HashMap<TypeId, IntersectionTypeCacheKey>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
+    relation_mapped_reads: HashMap<(RelationKind, CacheHashKey), Vec<super::type_nodes::SourceMappedReadProof>>,
     relation_inputs_generation: u64,
     relation_cache_generation: u64,
     relation_observable_types: HashSet<TypeId>,
     relation_observable_type_aliases: HashSet<TypeAliasId>,
+    relation_observable_type_alias_owners: HashSet<TypeId>,
     relation_observable_signatures: HashSet<SignatureId>,
     relation_observable_symbols: HashSet<SemanticSymbolId>,
     relation_observable_symbol_tables: HashSet<SymbolTableId>,
@@ -761,6 +1560,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
         HashMap<SemanticSymbolId, HashMap<CacheHashKey, UnionAliasInstantiationProof>>,
     claimed_strict_builtin_iterator_return: Option<bool>,
     claimed_strict_function_types: Option<bool>,
+    claimed_relation_function_types: Option<(TypeId, TypeId)>,
     pub(super) union_cache_needs_validation: bool,
     #[cfg(test)]
     pub(super) union_cache_validation_scans: usize,
@@ -769,6 +1569,44 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug)]
+enum SourceDirectCallResolutionState {
+    Checking(Arc<SourceDirectCallResolution>),
+    Publishing(Arc<SourceDirectCallResolution>),
+    Complete(Arc<SourceDirectCallResolution>),
+    PromiseExecutor {
+        proof: Arc<super::source_new::SourcePromiseExecutorProof>,
+        phase: PromiseExecutorPhase,
+    },
+    Invalid(NodeArenaRevision),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromiseExecutorPhase {
+    Checking,
+    Publishing,
+    Complete,
+}
+
+impl SourceDirectCallResolutionState {
+    fn proof(&self) -> Option<&Arc<SourceDirectCallResolution>> {
+        match self {
+            Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => Some(proof),
+            Self::PromiseExecutor { .. } | Self::Invalid(_) => None,
+        }
+    }
+
+    fn revision(&self) -> NodeArenaRevision {
+        match self {
+            Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => {
+                proof.revision()
+            }
+            Self::PromiseExecutor { proof, .. } => proof.revision(),
+            Self::Invalid(revision) => *revision,
+        }
     }
 }
 
@@ -809,6 +1647,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     flags: record.flags(),
                     declarations: declarations.into(),
                     value_declaration: record.value_declaration(),
+                    exports: record.exports(),
                 },
             );
         }
@@ -831,6 +1670,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_node_facts: BTreeMap::new(),
             source_node_children: BTreeMap::new(),
             source_symbol_declarations,
+            source_merged_declaration_order: HashMap::new(),
+            source_declared_member_names: HashMap::new(),
             source_global_bindings: None,
             computed_method_name_groups: HashMap::new(),
             source_declaration_owners,
@@ -842,12 +1683,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_call_set_provenance: HashSet::new(),
             declared_call_set_types_by_signature: HashMap::new(),
             direct_interface_heritage_provenance: HashMap::new(),
+            source_ambient_class_heritages: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             instantiated_property_alias_callables: HashMap::new(),
             published_interface_method_origins: HashMap::new(),
             published_interface_method_signature_owners: HashMap::new(),
+            proxy_interface_method_signature_owners: HashMap::new(),
             published_interface_method_recoveries: HashMap::new(),
             instantiated_property_alias_callable_types_by_signature: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
@@ -858,12 +1701,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             ordinary_intersection_alias_request_recoveries: HashMap::new(),
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
+            source_mapped_lookup_requests: HashMap::new(),
+            source_mapped_instances: HashMap::new(),
             source_class_provenance: HashMap::new(),
+            source_class_annotation_scopes: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
             class_instance_super_views_by_instance: HashMap::new(),
             class_instance_super_members: HashMap::new(),
             source_callable_provenance: HashMap::new(),
+            source_direct_call_resolutions: HashMap::new(),
             source_callable_interface_return_proofs: HashMap::new(),
             source_callable_alias_annotations: HashMap::new(),
             source_callable_alias_owners: HashMap::new(),
@@ -874,19 +1721,26 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
             source_callable_type_queries: HashMap::new(),
+            source_alias_default_graphs: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
+            synthetic_namespace_property_origins: HashMap::new(),
             object_literal_getter_origins: HashMap::new(),
+            source_object_rest_origins: HashMap::new(),
             object_literal_getter_return_proofs: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
             source_file_namespace_wrappers: HashMap::new(),
             source_file_namespace_wrapper_aliases: HashMap::new(),
             source_file_namespace_wrapper_defaults: HashMap::new(),
             source_overload_provenance: HashMap::new(),
+            source_overload_identities: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
             source_overload_types_by_signature: HashMap::new(),
+            overload_failure_signatures: HashMap::new(),
+            overload_failure_signature_keys: HashMap::new(),
             cached_signatures: HashMap::new(),
+            source_overload_erased_signatures: HashMap::new(),
             unresolved_symbols: HashMap::new(),
             unresolved_symbol_keys: HashMap::new(),
             properties_types: HashMap::new(),
@@ -900,10 +1754,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             intersection_keys_by_type: HashMap::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
+            relation_mapped_reads: HashMap::new(),
             relation_inputs_generation: 0,
             relation_cache_generation: 0,
             relation_observable_types: HashSet::new(),
             relation_observable_type_aliases: HashSet::new(),
+            relation_observable_type_alias_owners: HashSet::new(),
             relation_observable_signatures: HashSet::new(),
             relation_observable_symbols: HashSet::new(),
             relation_observable_symbol_tables: HashSet::new(),
@@ -924,6 +1780,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             union_alias_instantiations: HashMap::new(),
             claimed_strict_builtin_iterator_return: None,
             claimed_strict_function_types: None,
+            claimed_relation_function_types: None,
             union_cache_needs_validation: false,
             #[cfg(test)]
             union_cache_validation_scans: 0,
@@ -976,6 +1833,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// entries that their API did not explicitly admit.
     pub(super) const fn claimed_strict_function_types(&self) -> Option<bool> {
         self.claimed_strict_function_types
+    }
+
+    /// Retains the function globals used by structural property lookup.
+    /// Relation keys do not contain these checker-context identities.
+    pub(super) fn claim_relation_function_types(
+        &mut self,
+        requested: (TypeId, TypeId),
+    ) -> Result<(), (TypeId, TypeId)> {
+        match self.claimed_relation_function_types {
+            Some(established) if established != requested => Err(established),
+            Some(_) => Ok(()),
+            None => {
+                self.claimed_relation_function_types = Some(requested);
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn relation_function_types_match(
+        &self,
+        requested: Option<(TypeId, TypeId)>,
+    ) -> bool {
+        self.claimed_relation_function_types
+            .is_none_or(|established| requested == Some(established))
     }
 
     /// Registers a safe AST snapshot for semantic references.
@@ -1037,6 +1918,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_files_by_arena.insert(arena.id(), source);
         self.source_node_facts.insert(arena.id(), node_facts);
         self.source_node_children.insert(arena.id(), node_children);
+        for (callback, state) in &mut self.source_direct_call_resolutions {
+            if callback.arena == arena.id() && state.revision() != arena.revision() {
+                *state = SourceDirectCallResolutionState::Invalid(arena.revision());
+            }
+        }
         Some(source)
     }
 
@@ -1095,6 +1981,197 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Reads the retained file kind without treating missing facts as a module.
+    #[must_use]
+    pub(super) fn source_is_typescript_external_module(&self, node: NodeRef) -> bool {
+        self.source_node_fact(node).is_some()
+            && self
+                .source_file_facts
+                .get(&node.file)
+                .is_some_and(|facts| !facts.is_javascript_file() && facts.is_external_module())
+    }
+
+    /// Reads the registered source language without restricting module ownership.
+    #[must_use]
+    pub(super) fn source_is_typescript(&self, node: NodeRef) -> bool {
+        self.contains_node_ref(node)
+            && self
+                .source_file_facts
+                .get(&node.file)
+                .is_some_and(|facts| !facts.is_javascript_file())
+    }
+
+    /// Reads the real local/export pair for a consecutive implementation overload group.
+    pub(super) fn source_exported_overload_local(
+        &self,
+        owner: SemanticSymbolId,
+        declarations: &[NodeRef],
+    ) -> Option<SemanticSymbolId> {
+        let first = *declarations.first()?;
+        let record = self.symbol(owner)?;
+        let SourceNodeParent::Parent(source) = self.source_node_parent(first)? else {
+            return None;
+        };
+        let facts = self.source_file_facts.get(&first.file)?;
+        let module = record.parent()?;
+        let module_record = self.symbol(module)?;
+        if declarations.len() < 2
+            || facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || !facts.is_external_module()
+            || record.flags() != SymbolFlags::FUNCTION
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(declarations)
+            || record.value_declaration() != Some(first)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !self.source_symbol_declarations_match(owner)
+            || self.source_symbol_flags(owner) != Some(SymbolFlags::FUNCTION)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self
+                .source_files
+                .get(&first.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+            || !module_record.flags().intersects(SymbolFlags::MODULE)
+            || module_record.check_flags() != CheckFlags::NONE
+            || module_record.declarations() != Some(&[source])
+            || module_record.parent().is_some()
+            || module_record.export_symbol().is_some()
+            || self.get_merged_symbol(module) != Some(module)
+            || !self.source_symbol_declarations_match(module)
+            || self.source_symbol_flags(module) != Some(module_record.flags())
+            || !self.source_symbol_export_table_matches(module)
+            || module_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(record.name()))
+                != Some(owner)
+        {
+            return None;
+        }
+        if !self.source_exported_overload_declarations_are_exact(
+            source,
+            declarations,
+            record.name().as_utf8()?,
+        ) {
+            return None;
+        }
+        let mut locals = self
+            .source_declaration_owners
+            .get(&first)?
+            .iter()
+            .copied()
+            .filter(|local| {
+                self.symbol(*local).is_some_and(|local_record| {
+                    local_record.flags() == SymbolFlags::EXPORT_VALUE
+                        && local_record.check_flags() == CheckFlags::NONE
+                        && local_record.name() == record.name()
+                        && local_record.declarations() == Some(declarations)
+                        && local_record.value_declaration().is_none()
+                        && local_record.members().is_none()
+                        && local_record.exports().is_none()
+                        && local_record.parent().is_none()
+                        && local_record.export_symbol() == Some(owner)
+                        && self.get_merged_symbol(*local) == Some(*local)
+                        && self.source_symbol_declarations_match(*local)
+                        && self.source_symbol_flags(*local) == Some(SymbolFlags::EXPORT_VALUE)
+                        && self
+                            .value_symbol_links(*local)
+                            .is_none_or(|links| links == &ValueSymbolLinks::default())
+                })
+            });
+        let local = locals.next()?;
+        locals.next().is_none().then_some(local)
+    }
+
+    fn source_exported_overload_declarations_are_exact(
+        &self,
+        source: NodeRef,
+        declarations: &[NodeRef],
+        name: &str,
+    ) -> bool {
+        for (index, declaration) in declarations.iter().copied().enumerate() {
+            let Some(children) = self.source_direct_children(declaration) else {
+                return false;
+            };
+            let bodies = children
+                .iter()
+                .filter(|child| self.source_node_kind(**child) == Some(SyntaxKind::Block))
+                .count();
+            if declarations[..index].contains(&declaration)
+                || !declaration.is_for(source.arena, source.file)
+                || self.source_node_kind(declaration) != Some(SyntaxKind::FunctionDeclaration)
+                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(source))
+                || self
+                    .source_child_with_kind(declaration, SyntaxKind::ExportKeyword)
+                    .is_none()
+                || bodies != usize::from(index + 1 == declarations.len())
+                || children.iter().any(|child| {
+                    matches!(
+                        self.source_node_kind(*child),
+                        Some(
+                            SyntaxKind::DeclareKeyword
+                                | SyntaxKind::DefaultKeyword
+                                | SyntaxKind::AsyncKeyword
+                                | SyntaxKind::AsteriskToken
+                        )
+                    )
+                })
+                || self
+                    .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                    .and_then(|name| self.source_identifier_text(name))
+                    != Some(name)
+            {
+                return false;
+            }
+        }
+        let Some(mut statements) = self.source_direct_children(source) else {
+            return false;
+        };
+        statements.sort_by_key(|node| (self.source_node_start(*node), node.node.index()));
+        statements
+            .windows(declarations.len())
+            .any(|window| window == declarations)
+    }
+
+    /// An absent overload annotation means this exact empty implementation, never an unknown return.
+    pub(super) fn source_empty_overload_implementation_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        implementation: SourceOverloadImplementation,
+    ) -> bool {
+        let Some(declarations) = self.symbol(owner).and_then(|owner| owner.declarations()) else {
+            return false;
+        };
+        self.source_exported_overload_local(owner, declarations)
+            .is_some()
+            && declarations.last().copied() == Some(implementation.declaration)
+            && self.source_node_kind(implementation.body) == Some(SyntaxKind::Block)
+            && self.source_node_parent(implementation.body)
+                == Some(SourceNodeParent::Parent(implementation.declaration))
+            && self
+                .source_direct_children(implementation.body)
+                .is_some_and(|children| children.is_empty())
+            && self
+                .source_direct_children(implementation.declaration)
+                .is_some_and(|children| {
+                    children.iter().all(|child| {
+                        self.source_node_kind(*child).is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                SyntaxKind::ExportKeyword
+                                    | SyntaxKind::Identifier
+                                    | SyntaxKind::Parameter
+                                    | SyntaxKind::Block
+                            )
+                        })
+                    })
+                })
+    }
+
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
     #[must_use]
     pub(super) fn source_declaration_belongs_to_symbol(
@@ -1144,6 +2221,70 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.source_declaration_belongs_to_symbol(*declaration, symbol)
                 })
         })
+    }
+
+    /// Checks the original raw declaration and value list after a canonical merge.
+    #[must_use]
+    pub(super) fn source_raw_symbol_declarations_match(&self, raw: SemanticSymbolId) -> bool {
+        let Some(source) = self.source_symbol_declarations.get(&raw) else {
+            return false;
+        };
+        let Some(owner) = self.get_merged_symbol(raw) else {
+            return false;
+        };
+        self.symbol(raw).is_some_and(|record| {
+            record.flags() == source.flags
+                && record.declarations() == Some(source.declarations.as_ref())
+                && record.value_declaration() == source.value_declaration
+                && source.declarations.iter().all(|declaration| {
+                    self.source_declaration_belongs_to_symbol(*declaration, owner)
+                })
+        })
+    }
+
+    /// Checks the export table identity adopted from the binder.
+    #[must_use]
+    pub(super) fn source_symbol_export_table_matches(&self, symbol: SemanticSymbolId) -> bool {
+        self.source_symbol_declarations
+            .get(&symbol)
+            .zip(self.symbol(symbol))
+            .is_some_and(|(source, record)| source.exports == record.exports())
+    }
+
+    pub(super) fn source_mapped_instance(&self, type_: TypeId) -> Option<&SourceMappedInstance> {
+        self.source_mapped_instances.get(&type_)
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_source_mapped_instance_for_test(
+        &mut self,
+        type_: TypeId,
+    ) -> Option<SourceMappedInstance> {
+        self.source_mapped_instances.remove(&type_)
+    }
+
+    pub(super) fn try_reserve_source_mapped_instances(&mut self) -> bool {
+        self.source_mapped_instances.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_source_mapped_instance(&mut self, proof: SourceMappedInstance) -> bool {
+        let type_ = proof.type_id();
+        if self.types.get(type_).is_none() || self.source_mapped_instances.contains_key(&type_) {
+            return false;
+        }
+        self.source_mapped_instances.insert(type_, proof);
+        true
+    }
+
+    pub(super) fn complete_source_mapped_operands(&mut self, proof: SourceMappedInstance) -> bool {
+        let Some(previous) = self.source_mapped_instances.get_mut(&proof.type_id()) else {
+            return false;
+        };
+        if !previous.permits_operand_completion(&proof) {
+            return false;
+        }
+        *previous = proof;
+        true
     }
 
     /// Reads original binder flags after canonical symbol merges.
@@ -1242,8 +2383,284 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             table,
             entries,
             interface_augmentations,
+            native_ambient_exports: None,
         });
         true
+    }
+
+    /// Saves only the existing native result. Unsupported groups stay lazy.
+    pub(super) fn finalize_native_ambient_module_exports(
+        &mut self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+    ) -> bool {
+        let Some(bindings) = self.source_global_bindings.as_ref() else {
+            return false;
+        };
+        if sources.store_id() != self.id() || bindings.native_ambient_exports.is_some() {
+            return false;
+        }
+        let Some(globals) = self.symbol_table(bindings.table) else {
+            return false;
+        };
+        let mut results = HashMap::new();
+        if results.try_reserve(globals.len()).is_err() {
+            return false;
+        }
+        for (name, symbol) in globals.iter() {
+            if bindings.get(name).is_some()
+                && let Some(result) = self.capture_native_ambient_module_exports(
+                    sources,
+                    bindings.table,
+                    name,
+                    symbol,
+                )
+            {
+                results.insert(result.owner, result);
+            }
+        }
+        self.source_global_bindings
+            .as_mut()
+            .expect("the global receipt remains installed")
+            .native_ambient_exports = Some(results);
+        true
+    }
+
+    pub(super) fn native_ambient_module_exports(
+        &self,
+        owner: SemanticSymbolId,
+    ) -> Option<&NativeAmbientModuleExportResult> {
+        let results = self
+            .source_global_bindings
+            .as_ref()?
+            .native_ambient_exports
+            .as_ref()?;
+        results.get(&owner).or_else(|| {
+            let record = self.symbol(owner)?;
+            // A changed owner must not turn a saved selection into an absent receipt.
+            // The reader still requires the exact saved owner after this lookup.
+            results.values().find(|saved| {
+                record.name() == saved.name.as_ref()
+                    || saved.sources.iter().any(|source| {
+                        source.symbol == owner
+                            || self.get_merged_symbol(source.symbol) == Some(owner)
+                    })
+            })
+        })
+    }
+
+    fn remember_native_ambient_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<()> {
+        let canonical = self.get_merged_symbol(symbol)?;
+        for symbol in [symbol, canonical] {
+            if let std::collections::btree_map::Entry::Vacant(entry) = symbols.entry(symbol) {
+                entry.insert(NativeAmbientSymbol {
+                    symbol,
+                    canonical: self.get_merged_symbol(symbol)?,
+                    canonical_parent: self.get_parent_of_symbol(symbol),
+                    record: self.symbol(symbol)?.clone(),
+                });
+            }
+        }
+        Some(())
+    }
+
+    fn capture_native_ambient_export_table(
+        &self,
+        table: SymbolTableId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<NativeAmbientExportTable> {
+        let mut entries = Vec::new();
+        for (name, symbol) in self.symbol_table(table)?.iter() {
+            self.remember_native_ambient_symbol(symbol, symbols)?;
+            entries.push(NativeAmbientExport {
+                name: name.to_owned(),
+                symbol,
+                canonical: self.get_merged_symbol(symbol)?,
+            });
+        }
+        entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Some(NativeAmbientExportTable {
+            table,
+            entries: entries.into_boxed_slice(),
+        })
+    }
+
+    fn capture_native_ambient_alias_chain(
+        &self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+        root: SemanticSymbolId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<Box<[NativeAmbientAliasEdge]>> {
+        let mut current = root;
+        let mut seen = HashSet::new();
+        let mut edges = Vec::new();
+        let target = self
+            .alias_symbol_links(root)?
+            .alias_target
+            .symbol()
+            .and_then(|target| self.get_merged_symbol(target))?;
+        while seen.insert(current) {
+            self.remember_native_ambient_symbol(current, symbols)?;
+            let record = self.symbol(current)?;
+            if !record.flags().intersects(SymbolFlags::ALIAS) {
+                return (current == target && record.flags().intersects(SymbolFlags::VALUE))
+                    .then(|| edges.into_boxed_slice());
+            }
+            let &[declaration] = record.declarations()? else {
+                return None;
+            };
+            if record.flags() != SymbolFlags::ALIAS
+                || !self.source_symbol_declarations_match(current)
+            {
+                return None;
+            }
+            let (arena, bound) = sources.snapshot(declaration.file)?;
+            if !declaration.is_for(arena.id(), bound.file_id())
+                || bound.symbol(declaration) != Some(current)
+            {
+                return None;
+            }
+            let links = self.alias_symbol_links(current)?;
+            let immediate = links.immediate_target?;
+            let canonical_immediate = self.get_merged_symbol(immediate)?;
+            let edge_target = links.alias_target.symbol()?;
+            if self.get_merged_symbol(edge_target) != Some(target) {
+                return None;
+            }
+            self.remember_native_ambient_symbol(immediate, symbols)?;
+            self.remember_native_ambient_symbol(edge_target, symbols)?;
+            let binding_owner = record.parent();
+            let binding_container = if binding_owner.is_none() {
+                bound.container(declaration)
+            } else {
+                None
+            };
+            let binding_table = if let Some(owner) = binding_owner {
+                self.remember_native_ambient_symbol(owner, symbols)?;
+                self.symbol(owner)?.exports()?
+            } else {
+                bound.locals(binding_container?)?
+            };
+            if self.symbol_table(binding_table)?.get(record.name()) != Some(current) {
+                return None;
+            }
+            edges.push(NativeAmbientAliasEdge {
+                alias: current,
+                declaration,
+                immediate,
+                canonical_immediate,
+                target: edge_target,
+                canonical_target: target,
+                type_only_declaration: links.type_only_declaration,
+                binding_table,
+                binding_owner,
+                binding_container,
+            });
+            current = canonical_immediate;
+        }
+        None
+    }
+
+    fn capture_native_ambient_module_exports(
+        &self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+        globals: SymbolTableId,
+        name: EscapedNameRef<'_>,
+        table_symbol: SemanticSymbolId,
+    ) -> Option<NativeAmbientModuleExportResult> {
+        let owner = self.get_merged_symbol(table_symbol)?;
+        let record = self.symbol(owner)?;
+        let declarations = record.declarations()?;
+        if declarations.len() < 2
+            || !record.flags().intersects(SymbolFlags::MODULE)
+            || !name.as_bytes().starts_with(b"\"")
+            || !name.as_bytes().ends_with(b"\"")
+            || !self.source_merged_symbol_declarations_match(owner)
+        {
+            return None;
+        }
+        let mut symbols = BTreeMap::new();
+        self.remember_native_ambient_symbol(table_symbol, &mut symbols)?;
+        let selected = self.capture_native_ambient_export_table(record.exports()?, &mut symbols)?;
+        let mut source_owners = HashSet::new();
+        let mut contributions = Vec::new();
+        let mut losing = Vec::new();
+        for &declaration in declarations {
+            let (arena, bound) = sources.snapshot(declaration.file)?;
+            let NodeData::ModuleDeclaration(module) = &arena.get(declaration.node)?.data else {
+                return None;
+            };
+            let NodeData::StringLiteral(literal) = &arena.get(module.name)?.data else {
+                return None;
+            };
+            if name != EscapedName::source(format!("\"{}\"", literal.text)).as_ref()
+                || literal.text.contains('*')
+            {
+                return None;
+            }
+            let source = bound.symbol(declaration)?;
+            if self.get_merged_symbol(source) != Some(owner) {
+                return None;
+            }
+            if !source_owners.insert(source) {
+                continue;
+            }
+            self.remember_native_ambient_symbol(source, &mut symbols)?;
+            let exports = self.capture_native_ambient_export_table(
+                self.symbol(source)?.exports()?,
+                &mut symbols,
+            )?;
+            for entry in &exports.entries {
+                let result = selected
+                    .entries
+                    .iter()
+                    .find(|result| result.name == entry.name)?;
+                if entry.canonical == result.canonical {
+                    continue;
+                }
+                let omitted = self.symbol(entry.canonical)?;
+                let selected_record = self.symbol(result.canonical)?;
+                if omitted.flags() != SymbolFlags::ALIAS
+                    || !matches!(omitted.declarations(), Some([node])
+                        if self.source_node_kind(*node) == Some(SyntaxKind::ExportSpecifier))
+                    || selected_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    || !matches!(selected_record.declarations(), Some([node])
+                        if self.source_node_kind(*node) == Some(SyntaxKind::VariableDeclaration))
+                    || self.get_parent_of_symbol(entry.canonical) != Some(owner)
+                    || self.get_parent_of_symbol(result.canonical) != Some(owner)
+                {
+                    return None;
+                }
+                losing.push(NativeAmbientLosingExport {
+                    source_owner: source,
+                    name: entry.name.clone(),
+                    symbol: entry.canonical,
+                    selected: result.canonical,
+                    aliases: self.capture_native_ambient_alias_chain(
+                        sources,
+                        entry.canonical,
+                        &mut symbols,
+                    )?,
+                });
+            }
+            contributions.push(NativeAmbientModuleSource {
+                symbol: source,
+                exports,
+            });
+        }
+        (!losing.is_empty()).then(|| NativeAmbientModuleExportResult {
+            globals,
+            name: name.to_owned(),
+            table_symbol,
+            owner,
+            selected,
+            sources: contributions.into_boxed_slice(),
+            symbols: symbols.into_values().collect::<Vec<_>>().into_boxed_slice(),
+            losing: losing.into_boxed_slice(),
+        })
     }
 
     /// Copies source facts only. Unsupported declarations do not fail initialization.
@@ -1370,7 +2787,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .and_then(|table| table.get(record.name()))
                 != Some(original.table_symbol)
             || facts.is_javascript_file()
-            || !facts.is_external_module()
             || facts.is_common_js_module()
             || facts.is_default_library()
             || self.source_file_rank(declaration.file).is_none()
@@ -1389,8 +2805,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.source_node_parent(origin.block)
                 != Some(SourceNodeParent::Parent(origin.module))
             || self.source_node_kind(origin.module) != Some(SyntaxKind::ModuleDeclaration)
-            || self.source_node_parent(origin.module)
-                != Some(SourceNodeParent::Parent(origin.source))
+            || !self.source_global_augmentation_parent_is_exact(origin.module, origin.source)
             || self
                 .source_node_fact(origin.module)
                 .is_none_or(|facts| !facts.global_augmentation)
@@ -1468,6 +2883,551 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_global_bindings.as_ref()
     }
 
+    /// Proves the ordered mixed global owner without querying any annotation.
+    #[allow(clippy::too_many_lines)] // The retained order, selector and source owners form one proof.
+    pub(super) fn source_global_interface_value_owner(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<SourceGlobalInterfaceValueOwner>, super::DeclaredTypeError> {
+        let invalid = || {
+            super::DeclaredTypeError::Unavailable(super::DeclaredTypeUnavailable::SymbolNotOwned(
+                symbol,
+            ))
+        };
+        let Some(globals) = self.source_global_bindings.as_ref() else {
+            return Ok(None);
+        };
+        let Some(original) = globals.iter().find(|entry| entry.symbol == symbol) else {
+            return Ok(None);
+        };
+        let mixed_flags = SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE;
+        if original.flags.without(SymbolFlags::TRANSIENT) != mixed_flags {
+            return Ok(None);
+        }
+        let declarations = original.declarations().ok_or_else(invalid)?;
+        let owner = self.symbol(symbol).ok_or_else(invalid)?;
+        if declarations.is_empty()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.get_merged_symbol(original.table_symbol) != Some(symbol)
+            || globals.get(owner.name()).is_none_or(|entry| {
+                entry.symbol != symbol || entry.table_symbol != original.table_symbol
+            })
+            || self
+                .intrinsic_bootstrap
+                .as_ref()
+                .is_none_or(|bootstrap| bootstrap.globals != globals.table)
+            || self
+                .symbol_table(globals.table)
+                .and_then(|table| table.get(owner.name()))
+                != Some(original.table_symbol)
+            || owner.flags() != original.flags
+            || owner.declarations() != Some(declarations)
+            || !self.source_merged_symbol_declarations_match(symbol)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+        {
+            return Err(invalid());
+        }
+
+        // The first merged declaration determines the retained parent. This
+        // receipt applies to script globals, not owners introduced by an augmentation.
+        let first = declarations[0];
+        let facts = self
+            .source_file_facts
+            .get(&first.file)
+            .ok_or_else(invalid)?;
+        let source = self
+            .source_files
+            .get(&first.file)
+            .map(|source| source.node_ref())
+            .ok_or_else(invalid)?;
+        if facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self.source_file_rank(first.file).is_none()
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+        {
+            return Err(invalid());
+        }
+        let statement = match self.source_node_kind(first) {
+            Some(SyntaxKind::InterfaceDeclaration) => first,
+            Some(SyntaxKind::VariableDeclaration) => {
+                let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(first) else {
+                    return Err(invalid());
+                };
+                let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list)
+                else {
+                    return Err(invalid());
+                };
+                if self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                    || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                {
+                    return Err(invalid());
+                }
+                statement
+            }
+            _ => return Err(invalid()),
+        };
+        if facts.is_external_module()
+            || self.source_node_parent(statement) != Some(SourceNodeParent::Parent(source))
+        {
+            return Ok(None);
+        }
+        if owner.parent().is_some() {
+            return Err(invalid());
+        }
+
+        let mut interfaces = Vec::new();
+        let mut variables = Vec::new();
+        for &declaration in declarations {
+            let facts = self
+                .source_file_facts
+                .get(&declaration.file)
+                .ok_or_else(invalid)?;
+            let source = self
+                .source_files
+                .get(&declaration.file)
+                .map(|source| source.node_ref())
+                .ok_or_else(invalid)?;
+            let name = self
+                .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                .ok_or_else(invalid)?;
+            if facts.is_javascript_file()
+                || facts.is_common_js_module()
+                || self.source_file_rank(declaration.file).is_none()
+                || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+                || !self.source_declaration_belongs_to_symbol(declaration, symbol)
+                || self.source_identifier_text(name) != owner.name().as_utf8()
+                || self.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            {
+                return Err(invalid());
+            }
+            match self.source_node_kind(declaration) {
+                Some(SyntaxKind::InterfaceDeclaration) => {
+                    if self.source_node_parent(declaration)
+                        != Some(SourceNodeParent::Parent(source))
+                        || facts.is_external_module()
+                    {
+                        if !self.source_global_interface_augmentation_is_exact(symbol, declaration)
+                            || !self
+                                .source_global_interface_export_edges_are_exact(symbol, declaration)
+                        {
+                            return Err(invalid());
+                        }
+                    } else if self.source_node_parent(declaration)
+                        != Some(SourceNodeParent::Parent(source))
+                        || !self.source_global_script_owner_is_exact(symbol, declaration)
+                    {
+                        return Err(invalid());
+                    }
+                    interfaces.push(declaration);
+                }
+                Some(SyntaxKind::VariableDeclaration) => {
+                    let annotation = self
+                        .source_direct_type_annotation(declaration)
+                        .ok_or_else(invalid)?;
+                    let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(declaration)
+                    else {
+                        return Err(invalid());
+                    };
+                    let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list)
+                    else {
+                        return Err(invalid());
+                    };
+                    if !facts.is_declaration_file()
+                        || self.source_direct_children(declaration).as_deref()
+                            != Some(&[name, annotation])
+                        || self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                        || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                        || if self.source_node_parent(statement)
+                            != Some(SourceNodeParent::Parent(source))
+                            || facts.is_external_module()
+                        {
+                            !self.source_global_variable_augmentation_is_exact(
+                                symbol,
+                                declaration,
+                                statement,
+                            )
+                        } else {
+                            self.source_node_parent(statement)
+                                != Some(SourceNodeParent::Parent(source))
+                                || !self.source_global_script_owner_is_exact(symbol, declaration)
+                        }
+                    {
+                        return Err(invalid());
+                    }
+                    variables.push(declaration);
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        let selected = variables.first().copied().ok_or_else(invalid)?;
+        if interfaces.is_empty() || owner.value_declaration() != Some(selected) {
+            return Err(invalid());
+        }
+        let annotation = self
+            .source_direct_type_annotation(selected)
+            .ok_or_else(invalid)?;
+        Ok(Some(SourceGlobalInterfaceValueOwner {
+            globals_table: globals.table,
+            table_symbol: original.table_symbol,
+            symbol,
+            declarations: declarations.into(),
+            interfaces: interfaces.into_boxed_slice(),
+            variables: variables.into_boxed_slice(),
+            value_declaration: selected,
+            value_annotation: annotation,
+        }))
+    }
+
+    fn source_global_interface_export_edges_are_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(origin) = self
+            .source_global_bindings
+            .as_ref()
+            .and_then(|globals| globals.interface_augmentations.get(&declaration))
+        else {
+            return false;
+        };
+        let (Some(namespace), Some(raw), Some(local)) = (
+            origin
+                .namespace
+                .and_then(|symbol| self.get_merged_symbol(symbol)),
+            origin.raw_symbol,
+            origin.local_symbol,
+        ) else {
+            return false;
+        };
+        let Some(name) = self.symbol(owner).map(Symbol::name) else {
+            return false;
+        };
+        self.source_symbol_export_table_matches(namespace)
+            && self
+                .symbol(namespace)
+                .and_then(Symbol::exports)
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(name))
+                == Some(raw)
+            && self.source_symbol_export_table_matches(raw)
+            && self
+                .symbol(raw)
+                .is_some_and(|record| record.export_symbol().is_none())
+            && self.symbol(local).and_then(Symbol::export_symbol) == Some(raw)
+    }
+
+    fn source_global_script_owner_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let mut sources = owners.iter().copied().filter(|&symbol| {
+            self.get_merged_symbol(symbol) == Some(owner)
+                && self.source_symbol_declarations.contains_key(&symbol)
+        });
+        let Some(raw) = sources.next() else {
+            return false;
+        };
+        if sources.next().is_some() {
+            return false;
+        }
+        let Some(original) = self.source_symbol_declarations.get(&raw) else {
+            return false;
+        };
+        let Some(record) = self.symbol(raw) else {
+            return false;
+        };
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let allowed = SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE;
+        original.flags.without(allowed) == SymbolFlags::NONE
+            && original.declarations.contains(&declaration)
+            && record.name() == owner_record.name()
+            && record.parent().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+            && record.check_flags() == CheckFlags::NONE
+            && (raw == owner
+                || record.flags() == original.flags
+                    && record.declarations() == Some(original.declarations.as_ref())
+                    && record.value_declaration() == original.value_declaration)
+    }
+
+    /// Retained global membership and original binder groups prove this augmentation.
+    /// Accepts the binder's top-level external or nested ambient-module scope.
+    #[allow(clippy::too_many_lines)] // The nested source chain and complete module owner form one proof.
+    pub(super) fn source_global_augmentation_parent_is_exact(
+        &self,
+        module: NodeRef,
+        source: NodeRef,
+    ) -> bool {
+        let Some(facts) = self.source_file_facts.get(&source.file) else {
+            return false;
+        };
+        if !module.is_for(source.arena, source.file)
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self
+                .source_files
+                .get(&source.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+            || self
+                .source_node_fact(module)
+                .is_none_or(|facts| !facts.global_augmentation)
+        {
+            return false;
+        }
+        let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(module) else {
+            return false;
+        };
+        if parent == source {
+            return facts.is_external_module();
+        }
+        if !facts.is_declaration_file() || facts.is_external_module() || facts.is_default_library()
+        {
+            return false;
+        }
+        let Some(SourceNodeParent::Parent(outer)) = self.source_node_parent(parent) else {
+            return false;
+        };
+        if self.source_node_kind(parent) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(outer) != Some(SyntaxKind::ModuleDeclaration)
+            || self.source_node_parent(outer) != Some(SourceNodeParent::Parent(source))
+            || self.source_child_with_kind(outer, SyntaxKind::ModuleBlock) != Some(parent)
+            || self
+                .source_child_with_kind(outer, SyntaxKind::StringLiteral)
+                .is_none()
+            || self
+                .source_child_with_kind(outer, SyntaxKind::Identifier)
+                .is_some()
+            || self
+                .source_node_fact(outer)
+                .is_none_or(|facts| facts.global_augmentation)
+            || self
+                .source_direct_children(parent)
+                .is_none_or(|children| !children.contains(&module))
+            || self
+                .source_direct_children(source)
+                .is_none_or(|children| !children.contains(&outer))
+        {
+            return false;
+        }
+        let Some(raws) = self.source_declaration_owners.get(&outer) else {
+            return false;
+        };
+        let [raw] = raws.as_slice() else {
+            return false;
+        };
+        let Some(owner) = self.get_merged_symbol(*raw) else {
+            return false;
+        };
+        let (Some(raw_record), Some(record), Some(globals)) = (
+            self.symbol(*raw),
+            self.symbol(owner),
+            self.source_global_bindings.as_ref(),
+        ) else {
+            return false;
+        };
+        let Some(original) = globals.get(record.name()) else {
+            return false;
+        };
+        let Some(namespace) = self.source_declaration_symbol(module) else {
+            return false;
+        };
+        let Some(namespace_record) = self.symbol(namespace) else {
+            return false;
+        };
+        original.symbol == owner
+            && self.get_merged_symbol(original.table_symbol) == Some(owner)
+            && self
+                .intrinsic_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.globals == globals.table)
+            && self
+                .symbol_table(globals.table)
+                .and_then(|table| table.get(record.name()))
+                == Some(original.table_symbol)
+            && record.flags() == original.flags
+            && record.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::VALUE_MODULE
+            && record.declarations() == original.declarations()
+            && record.value_declaration()
+                == original
+                    .declarations()
+                    .and_then(|declarations| declarations.first().copied())
+            && self.source_merged_symbol_declarations_match(owner)
+            && self.source_raw_symbol_declarations_match(*raw)
+            && self.source_symbol_export_table_matches(*raw)
+            && raw_record.name() == record.name()
+            && raw_record.check_flags() == CheckFlags::NONE
+            && raw_record.parent().is_none()
+            && raw_record.members().is_none()
+            && raw_record.export_symbol().is_none()
+            && record.check_flags() == CheckFlags::NONE
+            && record.parent().is_none()
+            && record.members().is_none()
+            && record.export_symbol().is_none()
+            && namespace_record.parent().is_none()
+            && namespace_record.export_symbol().is_none()
+            && namespace_record.members().is_none()
+    }
+
+    #[allow(clippy::too_many_lines)] // Raw exports and local placeholders are different owners.
+    fn source_global_variable_augmentation_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+        statement: NodeRef,
+    ) -> bool {
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let Some(declarations) = owner_record.declarations() else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(block)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(module)) = self.source_node_parent(block) else {
+            return false;
+        };
+        let Some(source) = self
+            .source_files
+            .get(&declaration.file)
+            .map(|file| file.node_ref())
+        else {
+            return false;
+        };
+        if self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration)
+            || self
+                .source_node_fact(module)
+                .is_none_or(|facts| !facts.global_augmentation)
+            || !self.source_global_augmentation_parent_is_exact(module, source)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+            || self
+                .source_files
+                .get(&declaration.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+        {
+            return false;
+        }
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let source_owner = |flags: SymbolFlags| {
+            let mut matches = owners.iter().copied().filter(|symbol| {
+                self.source_symbol_declarations
+                    .get(symbol)
+                    .is_some_and(|record| record.flags.contains(flags))
+            });
+            let symbol = matches.next()?;
+            matches.next().is_none().then_some(symbol)
+        };
+        let (Some(raw), Some(local)) = (
+            source_owner(SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+            source_owner(SymbolFlags::EXPORT_VALUE),
+        ) else {
+            return false;
+        };
+        let Some(namespace) = self.source_declaration_symbol(module) else {
+            return false;
+        };
+        let (Some(namespace_record), Some(raw_record), Some(local_record)) =
+            (self.symbol(namespace), self.symbol(raw), self.symbol(local))
+        else {
+            return false;
+        };
+        let (Some(raw_source), Some(local_source)) = (
+            self.source_symbol_declarations.get(&raw),
+            self.source_symbol_declarations.get(&local),
+        ) else {
+            return false;
+        };
+        let raw_declarations = declarations
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                self.source_declaration_owners
+                    .get(declaration)
+                    .is_some_and(|owners| owners.contains(&raw))
+            })
+            .collect::<Vec<_>>();
+        let raw_value = raw_declarations
+            .iter()
+            .copied()
+            .find(|&node| self.source_node_kind(node) == Some(SyntaxKind::VariableDeclaration));
+        let raw_flags = SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | if raw_declarations
+                .iter()
+                .any(|&node| self.source_node_kind(node) == Some(SyntaxKind::InterfaceDeclaration))
+            {
+                SymbolFlags::INTERFACE
+            } else {
+                SymbolFlags::NONE
+            };
+        namespace_record.flags().intersects(SymbolFlags::MODULE)
+            && namespace_record.flags().without(SymbolFlags::TRANSIENT)
+                == self
+                    .source_symbol_flags(namespace)
+                    .unwrap_or(SymbolFlags::NONE)
+            && namespace_record.name() == InternalSymbolName::Global.as_ref()
+            && namespace_record.check_flags() == CheckFlags::NONE
+            && self.source_symbol_declarations_match(namespace)
+            && self.source_symbol_export_table_matches(namespace)
+            && namespace_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(owner_record.name()))
+                == Some(raw)
+            && raw != owner
+            && self.get_merged_symbol(raw) == Some(owner)
+            && raw_record.name() == owner_record.name()
+            && raw_record.flags() == raw_flags
+            && raw_source.flags == raw_flags
+            && raw_source.declarations.as_ref() == raw_declarations.as_slice()
+            && raw_record.declarations() == Some(raw_declarations.as_slice())
+            && raw_record.value_declaration() == raw_value
+            && raw_source.value_declaration == raw_value
+            && raw_record.check_flags() == CheckFlags::NONE
+            && raw_record
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                == Some(namespace)
+            && raw_record.exports().is_none()
+            && raw_record.export_symbol().is_none()
+            && (raw_flags.contains(SymbolFlags::INTERFACE) || raw_record.members().is_none())
+            && raw_declarations
+                .iter()
+                .all(|node| node.is_for(declaration.arena, declaration.file))
+            && local != raw
+            && local != owner
+            && self.get_merged_symbol(local) == Some(local)
+            && local_source.flags == SymbolFlags::EXPORT_VALUE
+            && local_record.flags() == SymbolFlags::EXPORT_VALUE
+            && local_record.check_flags() == CheckFlags::NONE
+            && local_record.name() == owner_record.name()
+            && local_source.declarations.as_ref() == raw_declarations.as_slice()
+            && local_record.declarations() == Some(raw_declarations.as_slice())
+            && self.source_symbol_declarations_match(local)
+            && local_record.value_declaration().is_none()
+            && local_record.parent().is_none()
+            && local_record.members().is_none()
+            && local_record.exports().is_none()
+            && local_record.export_symbol() == Some(raw)
+    }
+
     /// Checks complete binder declarations and flags after canonical symbol merges.
     #[must_use]
     pub(super) fn source_merged_symbol_declarations_match(&self, symbol: SemanticSymbolId) -> bool {
@@ -1494,6 +3454,428 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             && declarations
                 .iter()
                 .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
+    }
+
+    fn source_declaration_order(&self, symbol: SemanticSymbolId) -> Option<&[NodeRef]> {
+        self.source_merged_declaration_order
+            .get(&symbol)
+            .map(AsRef::as_ref)
+            .or_else(|| {
+                self.source_symbol_declarations
+                    .get(&symbol)
+                    .map(|source| source.declarations.as_ref())
+            })
+    }
+
+    pub(super) fn source_declared_member_names(
+        &self,
+        target: TypeId,
+    ) -> Option<&SourceDeclaredMemberNames> {
+        self.source_declared_member_names.get(&target)
+    }
+
+    pub(super) fn retain_source_declared_member_names(
+        &mut self,
+        target: TypeId,
+        names: SourceDeclaredMemberNames,
+    ) {
+        self.source_declared_member_names.insert(target, names);
+    }
+
+    /// Records the order used by the merger, independently of later symbol writes.
+    pub(super) fn record_source_symbol_merge(
+        &mut self,
+        target: SemanticSymbolId,
+        left: Option<SemanticSymbolId>,
+        right: SemanticSymbolId,
+    ) {
+        let expected = (|| {
+            let mut declarations = match left {
+                Some(left) => self.source_declaration_order(left)?.to_vec(),
+                None => Vec::new(),
+            };
+            declarations.extend_from_slice(self.source_declaration_order(right)?);
+            (self.symbol(target)?.declarations() == Some(declarations.as_slice()))
+                .then_some(declarations.into_boxed_slice())
+        })();
+        if let Some(expected) = expected {
+            self.source_merged_declaration_order
+                .insert(target, expected);
+        } else {
+            self.source_merged_declaration_order.remove(&target);
+        }
+    }
+
+    pub(super) fn source_merged_symbol_declarations_in_order(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        self.source_merged_symbol_declarations_match(symbol)
+            && self
+                .source_declaration_order(symbol)
+                .is_some_and(|expected| {
+                    self.symbol(symbol).and_then(Symbol::declarations) == Some(expected)
+                })
+    }
+
+    /// Proves a callable contribution's global block, raw export and local placeholder.
+    #[allow(clippy::too_many_lines)] // Keep the complete raw and local declaration group in one proof.
+    pub(super) fn source_global_callable_augmentation_local(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        let owner_record = self.symbol(owner)?;
+        let declarations = owner_record.declarations()?;
+        let source = self.source_files.get(&declaration.file)?.node_ref();
+        let facts = self.source_file_facts.get(&declaration.file)?;
+        let SourceNodeParent::Parent(block) = self.source_node_parent(declaration)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(module) = self.source_node_parent(block)? else {
+            return None;
+        };
+        let name = self.source_child_with_kind(module, SyntaxKind::Identifier)?;
+        if !facts.is_declaration_file()
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration)
+            || !self.source_global_augmentation_parent_is_exact(module, source)
+            || self.source_child_with_kind(module, SyntaxKind::ModuleBlock) != Some(block)
+            || self.source_identifier_text(name) != Some("global")
+            || self.source_node_parent(name) != Some(SourceNodeParent::Parent(module))
+            || self.source_file_rank(declaration.file).is_none()
+        {
+            return None;
+        }
+        let owners = self.source_declaration_owners.get(&declaration)?;
+        let mut raw_owners = owners.iter().copied().filter(|symbol| {
+            self.get_merged_symbol(*symbol) == Some(owner)
+                && self
+                    .source_symbol_declarations
+                    .get(symbol)
+                    .is_some_and(|source| {
+                        source.flags.contains(SymbolFlags::FUNCTION)
+                            && source.flags.without(SymbolFlags::FUNCTION | SymbolFlags::MODULE)
+                                == SymbolFlags::NONE
+                    })
+        });
+        let raw = raw_owners.next()?;
+        if raw_owners.next().is_some() {
+            return None;
+        }
+        let mut locals = owners.iter().copied().filter(|symbol| {
+            self.source_symbol_declarations
+                .get(symbol)
+                .is_some_and(|source| source.flags == SymbolFlags::EXPORT_VALUE)
+        });
+        let local = locals.next()?;
+        if locals.next().is_some() {
+            return None;
+        }
+        let namespace = self.source_declaration_symbol(module)?;
+        let namespace_record = self.symbol(namespace)?;
+        let raw_record = self.symbol(raw)?;
+        let local_record = self.symbol(local)?;
+        let raw_source = self.source_symbol_declarations.get(&raw)?;
+        let local_source = self.source_symbol_declarations.get(&local)?;
+        let raw_declarations = declarations
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                self.source_declaration_owners
+                    .get(declaration)
+                    .is_some_and(|owners| owners.contains(&raw))
+            })
+            .collect::<Vec<_>>();
+        let value = raw_declarations.iter().copied().find(|declaration| {
+            self.source_node_kind(*declaration) == Some(SyntaxKind::FunctionDeclaration)
+        })?;
+        if !namespace_record.flags().intersects(SymbolFlags::MODULE)
+            || namespace_record.flags().without(SymbolFlags::TRANSIENT)
+                != self.source_symbol_flags(namespace)?
+            || namespace_record.name() != InternalSymbolName::Global.as_ref()
+            || namespace_record.check_flags() != CheckFlags::NONE
+            || !self.source_symbol_declarations_match(namespace)
+            || !self.source_symbol_export_table_matches(namespace)
+            || namespace_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(owner_record.name()))
+                != Some(raw)
+            || raw == owner
+            || !self.source_raw_symbol_declarations_match(raw)
+            || !self.source_symbol_export_table_matches(raw)
+            || raw_record.name() != owner_record.name()
+            || raw_record.check_flags() != CheckFlags::NONE
+            || raw_record.members().is_some()
+            || raw_record.export_symbol().is_some()
+            || raw_record
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                != Some(namespace)
+            || raw_source.declarations.as_ref() != raw_declarations.as_slice()
+            || raw_source.value_declaration != Some(value)
+            || local == raw
+            || local == owner
+            || self.get_merged_symbol(local) != Some(local)
+            || local_record.flags() != SymbolFlags::EXPORT_VALUE
+            || local_record.check_flags() != CheckFlags::NONE
+            || local_record.name() != owner_record.name()
+            || local_source.declarations.as_ref() != raw_declarations.as_slice()
+            || !self.source_symbol_declarations_match(local)
+            || local_record.value_declaration().is_some()
+            || local_record.parent().is_some()
+            || local_record.members().is_some()
+            || local_record.exports().is_some()
+            || local_record.export_symbol() != Some(raw)
+            || self
+                .value_symbol_links(local)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return None;
+        }
+        for declaration in raw_declarations {
+            let name = self.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+            if !declaration.is_for(source.arena, source.file)
+                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(block))
+                || !matches!(
+                    self.source_node_kind(declaration),
+                    Some(SyntaxKind::FunctionDeclaration | SyntaxKind::ModuleDeclaration)
+                )
+                || self.source_identifier_text(name) != owner_record.name().as_utf8()
+            {
+                return None;
+            }
+        }
+        Some(local)
+    }
+
+    /// Retains global ambient overloads, with or without a namespace merge.
+    /// Each row and export must still belong to its original binder contribution.
+    pub(super) fn source_global_function_namespace_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<Vec<NodeRef>> {
+        let owner = self.symbol(symbol)?;
+        let globals = self.source_global_bindings.as_ref()?;
+        let original = globals.get(owner.name())?;
+        let declarations = owner.declarations()?;
+        let flags = owner.flags().without(SymbolFlags::TRANSIENT);
+        if !flags.contains(SymbolFlags::FUNCTION)
+            || flags.bits() & !(SymbolFlags::FUNCTION | SymbolFlags::MODULE).bits() != 0
+            || owner.flags() != original.flags
+            || declarations != original.declarations()?
+            || original.symbol != symbol
+            || self.get_merged_symbol(original.table_symbol) != Some(symbol)
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.intrinsic_bootstrap.as_ref()?.globals != globals.table
+            || self.symbol_table(globals.table)?.get(owner.name()) != Some(original.table_symbol)
+            || !self.source_merged_symbol_declarations_match(symbol)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.members().is_some()
+            || owner.export_symbol().is_some()
+        {
+            return None;
+        }
+        let mut functions = Vec::new();
+        let mut namespaces = Vec::new();
+        for &declaration in declarations {
+            let source = self.source_files.get(&declaration.file)?.node_ref();
+            let name = self.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+            let script = self.source_is_script_declaration_file(declaration)
+                && self.source_node_parent(declaration) == Some(SourceNodeParent::Parent(source));
+            if !script
+                && self.source_global_callable_augmentation_local(symbol, declaration).is_none()
+                || self.source_identifier_text(name) != owner.name().as_utf8()
+            {
+                return None;
+            }
+            match self.source_node_kind(declaration)? {
+                SyntaxKind::FunctionDeclaration => functions.push(declaration),
+                SyntaxKind::ModuleDeclaration => namespaces.push(declaration),
+                _ => return None,
+            }
+        }
+        let valid_group = if flags.intersects(SymbolFlags::MODULE) {
+            !functions.is_empty() && !namespaces.is_empty()
+        } else {
+            functions.len() >= 2 && namespaces.is_empty() && owner.exports().is_none()
+        };
+        if !valid_group || owner.value_declaration() != functions.first().copied() {
+            return None;
+        }
+        self.validate_source_merged_namespace_exports(symbol, &namespaces)?;
+        Some(functions)
+    }
+
+    /// Checks every saved export contribution and its canonical namespace member.
+    pub(super) fn validate_source_merged_namespace_exports(
+        &self,
+        symbol: SemanticSymbolId,
+        namespaces: &[NodeRef],
+    ) -> Option<()> {
+        let owner = self.symbol(symbol)?;
+        let mut expected_exports = HashMap::new();
+        for raw in std::iter::once(symbol).chain(self.merged_symbols.keys().copied()) {
+            if self.get_merged_symbol(raw) != Some(symbol) {
+                continue;
+            }
+            let Some(original) = self.source_symbol_declarations.get(&raw) else {
+                continue;
+            };
+            if !self.source_raw_symbol_declarations_match(raw)
+                || !self.source_symbol_export_table_matches(raw)
+            {
+                return None;
+            }
+            if let Some(exports) = original.exports {
+                for (name, member) in self.symbol_table(exports)?.iter() {
+                    let member = self.get_merged_symbol(member)?;
+                    if expected_exports
+                        .insert(name.to_owned(), member)
+                        .is_some_and(|previous| previous != member)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        let actual = owner.exports().and_then(|table| self.symbol_table(table));
+        if actual.map_or(0, |table| table.len()) != expected_exports.len() {
+            return None;
+        }
+        for (name, member) in expected_exports {
+            if actual?
+                .get(name.as_ref())
+                .and_then(|raw| self.get_merged_symbol(raw)) != Some(member)
+                || self.symbol(member)?.name() != name.as_ref()
+                || self.get_parent_of_symbol(member) != Some(symbol)
+                || !self.source_merged_symbol_declarations_match(member)
+            {
+                return None;
+            }
+            for &declaration in self.symbol(member)?.declarations()? {
+                let mut ancestor = declaration;
+                loop {
+                    let SourceNodeParent::Parent(parent) = self.source_node_parent(ancestor)? else {
+                        return None;
+                    };
+                    if namespaces.contains(&parent) {
+                        break;
+                    }
+                    ancestor = parent;
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// Proves a call member against every original interface contribution.
+    pub(super) fn source_interface_call_owner(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        let member = self.source_declaration_symbol(declaration)?;
+        let owner = self.get_parent_of_symbol(member)?;
+        let record = self.symbol(owner)?;
+        let declarations = record.declarations()?;
+        let members = self.symbol_table(record.members()?)?;
+        let call = self.symbol(member)?;
+        if self.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+            || record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !self.source_merged_symbol_declarations_match(owner)
+            || members.get(InternalSymbolName::New.as_ref()).is_some()
+            || members
+                .get(InternalSymbolName::Call.as_ref())
+                .and_then(|member| self.get_merged_symbol(member))
+                != Some(member)
+            || call.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
+            || call.check_flags() != CheckFlags::NONE
+            || call.name() != InternalSymbolName::Call.as_ref()
+            || call.value_declaration().is_some()
+            || call.members().is_some()
+            || call.exports().is_some()
+            || call.export_symbol().is_some()
+            || !self.source_merged_symbol_declarations_match(member)
+        {
+            return None;
+        }
+        let mut calls = Vec::new();
+        for &parent in declarations {
+            if self.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration) {
+                return None;
+            }
+            for child in self.source_direct_children(parent)? {
+                if self.source_node_kind(child) == Some(SyntaxKind::CallSignature) {
+                    if !self.source_interface_call_member_is_exact(owner, member, child) {
+                        return None;
+                    }
+                    calls.push(child);
+                }
+            }
+        }
+        (calls.contains(&declaration) && call.declarations() == Some(calls.as_slice()))
+            .then_some(owner)
+    }
+
+    fn source_interface_call_member_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        member: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(declaration) else {
+            return false;
+        };
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let [raw] = owners.as_slice() else {
+            return false;
+        };
+        let Some(raw_owner) = self.symbol(*raw).and_then(Symbol::parent) else {
+            return false;
+        };
+        self.get_merged_symbol(*raw) == Some(member)
+            && self.get_merged_symbol(raw_owner) == Some(owner)
+            && self.source_raw_symbol_declarations_match(*raw)
+            && self.source_raw_symbol_declarations_match(raw_owner)
+            && self.symbol(*raw).is_some_and(|record| {
+                record.flags() == SymbolFlags::SIGNATURE
+                    && record.check_flags() == CheckFlags::NONE
+                    && record.name() == InternalSymbolName::Call.as_ref()
+                    && record.members().is_none()
+                    && record.exports().is_none()
+                    && record.export_symbol().is_none()
+            })
+            && self.symbol(raw_owner).is_some_and(|record| {
+                record.check_flags() == CheckFlags::NONE
+                    && self
+                        .symbol(owner)
+                        .is_some_and(|owner| owner.name() == record.name())
+                    && self.get_parent_of_symbol(raw_owner) == self.get_parent_of_symbol(owner)
+                    && record.exports().is_none()
+                    && record.export_symbol().is_none()
+            })
+            && self
+                .source_declaration_owners
+                .get(&parent)
+                .is_some_and(|owners| owners.contains(&raw_owner))
+            && self
+                .symbol(raw_owner)
+                .and_then(Symbol::members)
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+                == Some(*raw)
     }
 
     /// Parses and copies one exact standalone `Identifier | QualifiedName`
@@ -1906,6 +4288,24 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.types.try_reserve(additional)
     }
 
+    pub(super) fn try_reserve_source_alias_default_graph(&mut self, node: NodeRef) -> bool {
+        self.source_alias_default_graphs.contains_key(&node)
+            || self.source_alias_default_graphs.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn source_alias_default_graph(
+        &self,
+        node: NodeRef,
+    ) -> Option<&SourceAliasOperandGraph> {
+        self.observe_relation_node_read(node);
+        self.source_alias_default_graphs.get(&node)
+    }
+
+    /// Source proofs retained after successful alias-default mapping.
+    pub fn source_alias_default_graph_count(&self) -> usize {
+        self.source_alias_default_graphs.len()
+    }
+
     pub(super) fn try_reserve_source_jsdoc_typedefs(&mut self, additional: usize) -> bool {
         self.source_jsdoc_typedefs.try_reserve(additional).is_ok()
     }
@@ -2192,8 +4592,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let contextual_pair = match (provenance.contextual_target, provenance.contextual_variable) {
             (None, None) => provenance.captured_assignment.is_none(),
             (Some(target), Some(variable)) => {
-                provenance.family == SourceCallableFamily::ArrowFunction
-                    && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                matches!(
+                    provenance.family,
+                    SourceCallableFamily::ArrowFunction | SourceCallableFamily::ObjectLiteralMethod
+                ) && (provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                    || self.source_node_kind(provenance.declaration)
+                        == Some(SyntaxKind::FunctionExpression))
                     && provenance.captured_assignment.is_none()
                     && target != type_
                     && self.types.get(target).is_some()
@@ -2682,6 +5086,177 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    pub(super) fn source_direct_call_resolution(
+        &self,
+        callback: NodeRef,
+    ) -> Option<&Arc<SourceDirectCallResolution>> {
+        let proof = self
+            .source_direct_call_resolutions
+            .get(&callback)?
+            .proof()?;
+        (self.source_files.get(&callback.file) == Some(&proof.source())
+            && proof.stored_is_exact(self))
+        .then_some(proof)
+    }
+
+    pub(super) fn source_direct_call_resolution_was_registered(&self, callback: NodeRef) -> bool {
+        self.source_direct_call_resolutions.get(&callback).is_some_and(|state| {
+            !matches!(state, SourceDirectCallResolutionState::PromiseExecutor { .. })
+        })
+    }
+
+    pub(super) fn source_promise_executor_resolution(
+        &self,
+        callback: NodeRef,
+    ) -> Option<&super::source_new::SourcePromiseExecutorProof> {
+        let SourceDirectCallResolutionState::PromiseExecutor { proof, .. } =
+            self.source_direct_call_resolutions.get(&callback)?
+        else {
+            return None;
+        };
+        proof.source_is_exact(self).then_some(proof.as_ref())
+    }
+
+    pub(super) fn source_promise_executor_was_registered(&self, callback: NodeRef) -> bool {
+        matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor { .. }))
+    }
+
+    pub(super) fn source_promise_executor_is_published(&self, callback: NodeRef) -> bool {
+        matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor {
+                phase: PromiseExecutorPhase::Publishing | PromiseExecutorPhase::Complete, ..
+            }))
+            && self.source_promise_executor_resolution(callback).is_some()
+    }
+
+    pub(super) fn begin_source_promise_executor_resolution(
+        &mut self,
+        proof: super::source_new::SourcePromiseExecutorProof,
+    ) -> Option<bool> {
+        let callback = proof.callback();
+        if !proof.source_is_exact(self) {
+            return None;
+        }
+        if let Some(existing) = self.source_direct_call_resolutions.get(&callback) {
+            return match existing {
+                SourceDirectCallResolutionState::PromiseExecutor { proof: old, phase: PromiseExecutorPhase::Complete }
+                    if old.as_ref() == &proof => Some(false),
+                _ => None,
+            };
+        }
+        self.source_direct_call_resolutions.try_reserve(1).ok()?;
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof: Arc::new(proof), phase: PromiseExecutorPhase::Checking });
+        Some(true)
+    }
+
+    pub(super) fn begin_source_promise_executor_publication(&mut self, callback: NodeRef) -> bool {
+        let Some(SourceDirectCallResolutionState::PromiseExecutor { proof, phase }) =
+            self.source_direct_call_resolutions.get(&callback)
+        else {
+            return false;
+        };
+        if !proof.source_is_exact(self) || *phase == PromiseExecutorPhase::Publishing {
+            return false;
+        }
+        let proof = Arc::clone(proof);
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Publishing });
+        true
+    }
+
+    pub(super) fn finish_source_promise_executor_resolution(&mut self, callback: NodeRef) -> bool {
+        let Some(SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Publishing }) =
+            self.source_direct_call_resolutions.get(&callback)
+        else {
+            return false;
+        };
+        if !proof.source_is_exact(self) {
+            return false;
+        }
+        let proof = Arc::clone(proof);
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Complete });
+        true
+    }
+
+    pub(super) fn fail_source_promise_executor_resolution(&mut self, callback: NodeRef) {
+        if let Some(state @ SourceDirectCallResolutionState::PromiseExecutor { .. }) =
+            self.source_direct_call_resolutions.get_mut(&callback)
+        {
+            *state = SourceDirectCallResolutionState::Invalid(state.revision());
+        }
+    }
+
+    pub(super) fn source_direct_call_resolution_is_published(&self, callback: NodeRef) -> bool {
+        matches!(
+            self.source_direct_call_resolutions.get(&callback),
+            Some(
+                SourceDirectCallResolutionState::Publishing(_)
+                    | SourceDirectCallResolutionState::Complete(_)
+            )
+        ) && self.source_direct_call_resolution(callback).is_some()
+    }
+
+    pub(super) fn begin_source_direct_call_resolution(
+        &mut self,
+        proof: Arc<SourceDirectCallResolution>,
+    ) -> Option<bool> {
+        let callback = proof.callback();
+        if matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor { .. }))
+            || self.source_files.get(&callback.file) != Some(&proof.source())
+            || !proof.stored_is_exact(self)
+            || self
+                .source_direct_call_resolutions
+                .get(&callback)
+                .is_some_and(|state| state.revision() != proof.revision())
+        {
+            return None;
+        }
+        if let Some(existing) = self
+            .source_direct_call_resolutions
+            .get(&callback)
+            .and_then(SourceDirectCallResolutionState::proof)
+        {
+            return (existing.as_ref() == proof.as_ref()).then_some(false);
+        }
+        self.source_direct_call_resolutions.try_reserve(1).ok()?;
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Checking(proof));
+        Some(true)
+    }
+
+    pub(super) fn begin_source_direct_call_publication(&mut self, callback: NodeRef) -> bool {
+        let Some(proof) = self.source_direct_call_resolution(callback).cloned() else {
+            return false;
+        };
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Publishing(proof));
+        true
+    }
+
+    pub(super) fn finish_source_direct_call_resolution(&mut self, callback: NodeRef) -> bool {
+        let Some(proof) = self.source_direct_call_resolution(callback).cloned() else {
+            return false;
+        };
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Complete(proof));
+        true
+    }
+
+    pub(super) fn fail_source_direct_call_resolution(&mut self, callback: NodeRef) {
+        for state in self.source_direct_call_resolutions.values_mut() {
+            if state
+                .proof()
+                .is_some_and(|proof| proof.depends_on(callback))
+            {
+                *state = SourceDirectCallResolutionState::Invalid(state.revision());
+            }
+        }
+    }
+
     fn source_direct_call_contextual_callable_is_exact(
         &self,
         declaration: NodeRef,
@@ -2690,6 +5265,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         contextual_target: TypeId,
         captured_assignment: Option<SourceCapturedLocal>,
     ) -> bool {
+        let lexical = if self.source_direct_call_resolutions.contains_key(&declaration) {
+            if !self.source_direct_call_resolution_is_published(declaration) {
+                return false;
+            }
+            let Some(proof) = self.source_direct_call_resolution(declaration) else {
+                return false;
+            };
+            if proof.target() != contextual_target {
+                return false;
+            }
+            true
+        } else {
+            false
+        };
         let Some(owner) = self.symbol(owner_symbol) else {
             return false;
         };
@@ -2699,6 +5288,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(SourceNodeParent::Parent(container)) = self.source_node_parent(call) else {
             return false;
         };
+        let value_container = captured_assignment
+            .is_none()
+            .then(|| super::source_callables::source_direct_call_value_container(self, call))
+            .flatten();
         let source = match self.source_node_kind(container) {
             Some(SyntaxKind::ExpressionStatement) if captured_assignment.is_none() => {
                 let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(container)
@@ -2748,7 +5341,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 };
                 source.node_ref()
             }
-            _ => return false,
+            _ => {
+                let Some((_, scope)) = value_container else {
+                    return false;
+                };
+                scope
+            }
         };
         if self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
             || !matches!(
@@ -2762,7 +5360,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         Some(SyntaxKind::ExpressionStatement)
                     )
             )
-            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || !lexical
+                && self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+                && value_container.is_none()
+                && !(self.source_node_kind(call) == Some(SyntaxKind::CallExpression)
+                    && self.source_node_kind(container) == Some(SyntaxKind::ExpressionStatement)
+                    && super::source_callables::source_direct_call_statement_container(
+                        self, container,
+                    )
+                    .is_some())
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.name() != InternalSymbolName::Function.as_ref()
@@ -2850,7 +5456,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             let Some(target_parameters) = self
                 .callable_signature_parameter_types
                 .get(&target_signature)
-                .map(Vec::as_slice)
+                .map(|types| types.parameters.as_slice())
             else {
                 return false;
             };
@@ -3099,20 +5705,74 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
-    /// Proves the exact variable or object-property owner of a contextual arrow.
+    /// Proves a method symbol and its containing object literal without reading types.
+    pub(super) fn source_object_literal_method_owner_is_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(object_declaration)) =
+            self.source_node_parent(declaration)
+        else {
+            return false;
+        };
+        let Some(object_symbol) = owner.parent() else {
+            return false;
+        };
+        let Some(object) = self.symbol(object_symbol) else {
+            return false;
+        };
+        self.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration)
+            && self.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+            && owner.flags() == SymbolFlags::METHOD
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.declarations() == Some(&[declaration])
+            && owner.value_declaration() == Some(declaration)
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.export_symbol().is_none()
+            && self.source_node_kind(object_declaration)
+                == Some(SyntaxKind::ObjectLiteralExpression)
+            && self.get_merged_symbol(object_symbol) == Some(object_symbol)
+            && object.flags() == SymbolFlags::OBJECT_LITERAL
+            && object.check_flags() == CheckFlags::NONE
+            && object.name() == InternalSymbolName::Object.as_ref()
+            && object.declarations() == Some(&[object_declaration])
+            && object.value_declaration() == Some(object_declaration)
+            && object.parent().is_none()
+            && object.exports().is_none()
+            && object.export_symbol().is_none()
+            && object
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(owner.name()))
+                == Some(owner_symbol)
+    }
+
+    /// Proves the exact variable, property, or method anchor of a contextual callable.
     pub(super) fn source_contextual_callable_anchor_is_exact(
         &self,
         declaration: NodeRef,
         owner_symbol: SemanticSymbolId,
         anchor: SemanticSymbolId,
     ) -> bool {
+        if self.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration) {
+            return anchor == owner_symbol
+                && self.source_object_literal_method_owner_is_exact(declaration, owner_symbol);
+        }
         let Some(owner) = self.symbol(owner_symbol) else {
             return false;
         };
         if anchor == owner_symbol
             || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
             || self.get_merged_symbol(anchor) != Some(anchor)
-            || self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+            || !matches!(
+                self.source_node_kind(declaration),
+                Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+            )
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.declarations() != Some(&[declaration])
@@ -3139,10 +5799,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         }
 
-        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
-            return symbol.parent().is_none()
-                && self.source_node_kind(anchor_declaration)
-                    == Some(SyntaxKind::VariableDeclaration)
+        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || self.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
+                && symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        {
+            return self.source_contextual_variable_parent_is_exact(
+                declaration,
+                anchor,
+                anchor_declaration,
+            ) && self.source_node_kind(anchor_declaration)
+                == Some(SyntaxKind::VariableDeclaration)
                 && (owner.exports().is_none()
                     || self.source_contextual_variable_expando_exports_are_exact(
                         declaration,
@@ -3186,6 +5852,78 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .members()
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(symbol.name()))
+                == Some(anchor)
+    }
+
+    fn source_contextual_variable_parent_is_exact(
+        &self,
+        declaration: NodeRef,
+        anchor: SemanticSymbolId,
+        variable: NodeRef,
+    ) -> bool {
+        let Some(symbol) = self.symbol(anchor) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(variable) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list) else {
+            return false;
+        };
+        if self
+            .source_child_with_kind(statement, SyntaxKind::ExportKeyword)
+            .is_none()
+        {
+            return symbol.parent().is_none();
+        }
+        let Some(parent) = symbol.parent() else {
+            return false;
+        };
+        let Some(module) = self.get_merged_symbol(parent) else {
+            return false;
+        };
+        let Some(module_record) = self.symbol(module) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        let Some(facts) = self.source_file_facts.get(&declaration.file) else {
+            return false;
+        };
+        let parent_is_exact = parent == module
+            || self.symbol(parent).is_some_and(|original| {
+                original.flags() == SymbolFlags::VALUE_MODULE
+                    && original.declarations() == Some(&[source])
+                    && original.value_declaration() == Some(source)
+                    && original.parent().is_none()
+                    && original.members().is_none()
+                    && original.export_symbol().is_none()
+                    && self.source_raw_symbol_declarations_match(parent)
+            });
+        facts.is_external_module()
+            && !facts.is_javascript_file()
+            && !facts.is_common_js_module()
+            && parent_is_exact
+            && self.source_node_parent(declaration) == Some(SourceNodeParent::Parent(variable))
+            && self.source_node_kind(list) == Some(SyntaxKind::VariableDeclarationList)
+            && self.source_node_kind(statement) == Some(SyntaxKind::VariableStatement)
+            && self
+                .source_files
+                .get(&declaration.file)
+                .map(|file| file.node_ref())
+                == Some(source)
+            && self.source_declaration_belongs_to_symbol(variable, anchor)
+            && self.source_symbol_declarations_match(anchor)
+            && self.source_declaration_symbol(source) == Some(module)
+            && super::source_imports::source_file_namespace_symbol_is_exact(self, module, source)
+            && module_record.name() == facts.source_file_symbol_name()
+            && (module_record.flags().contains(SymbolFlags::TRANSIENT)
+                || self.source_symbol_export_table_matches(module))
+            && module_record
+                .exports()
+                .and_then(|exports| self.symbol_table(exports))
+                .and_then(|exports| exports.get(symbol.name()))
                 == Some(anchor)
     }
 
@@ -3481,6 +6219,32 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     #[must_use]
+    pub(super) fn source_overload_identity(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceOverloadIdentity> {
+        self.observe_relation_type_read(type_);
+        self.source_overload_identities.get(&type_)
+    }
+
+    pub(super) fn source_overload_identity_conflicts(
+        &self,
+        owner: SemanticSymbolId,
+        declarations: &[NodeRef],
+        expected: Option<TypeId>,
+    ) -> bool {
+        self.source_overload_identities
+            .iter()
+            .any(|(&type_, identity)| {
+                Some(type_) != expected
+                    && (identity.owner_symbol == owner
+                        || identity
+                            .declarations
+                            .iter()
+                            .any(|node| declarations.contains(node)))
+            })
+    }
+
     pub(super) fn source_overload_provenance(
         &self,
         type_: TypeId,
@@ -3609,6 +6373,90 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.object_literal_property_clone_origins.get(&symbol)
     }
 
+    pub(super) fn synthetic_namespace_property_origin(
+        &self,
+        property: SemanticSymbolId,
+    ) -> Option<&SyntheticNamespacePropertyOrigin> {
+        self.synthetic_namespace_property_state(property)
+            .map(SyntheticNamespacePropertyState::origin)
+    }
+
+    pub(super) fn synthetic_namespace_property_state(
+        &self,
+        property: SemanticSymbolId,
+    ) -> Option<&SyntheticNamespacePropertyState> {
+        self.synthetic_namespace_property_origins.get(&property)
+    }
+
+    pub(super) fn synthetic_namespace_property_origins(
+        &self,
+    ) -> impl Iterator<Item = &SyntheticNamespacePropertyOrigin> {
+        self.synthetic_namespace_property_origins
+            .values()
+            .map(SyntheticNamespacePropertyState::origin)
+    }
+
+    pub(super) fn try_reserve_synthetic_namespace_property_origins(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.synthetic_namespace_property_origins
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn record_synthetic_namespace_property_origin(
+        &mut self,
+        origin: SyntheticNamespacePropertyOrigin,
+    ) -> bool {
+        if origin.property() == origin.source()
+            || self.symbol(origin.property()).is_none()
+            || self.symbol(origin.source()).is_none()
+            || self.symbol(origin.namespace()).is_none()
+            || self.type_payload(origin.namespace_type()).is_none()
+        {
+            return false;
+        }
+        if let Some(existing) = self.synthetic_namespace_property_state(origin.property()) {
+            return existing.origin() == &origin;
+        }
+        if self.synthetic_namespace_property_origins().any(|existing| {
+            existing.namespace() == origin.namespace() && existing.source() == origin.source()
+        }) || [origin.namespace(), origin.alias()]
+            .into_iter()
+            .any(|symbol| {
+                self.value_symbol_links(symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+        {
+            return false;
+        }
+        self.synthetic_namespace_property_origins.insert(
+            origin.property(),
+            SyntheticNamespacePropertyState::new(origin),
+        );
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn synthetic_namespace_property_origin_len(&self) -> usize {
+        self.synthetic_namespace_property_origins.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_synthetic_namespace_property_state_for_test(
+        &mut self,
+        property: SemanticSymbolId,
+        replacement: Option<SyntheticNamespacePropertyState>,
+    ) -> Option<SyntheticNamespacePropertyState> {
+        match replacement {
+            Some(replacement) => self
+                .synthetic_namespace_property_origins
+                .insert(property, replacement),
+            None => self.synthetic_namespace_property_origins.remove(&property),
+        }
+    }
+
     pub(super) fn object_literal_getter_origin(
         &self,
         symbol: SemanticSymbolId,
@@ -3697,6 +6545,29 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.object_literal_property_clone_origins
             .try_reserve(additional)
             .is_ok()
+    }
+
+    pub(super) fn source_object_rest_origin(
+        &self,
+        type_: TypeId,
+    ) -> Option<&super::source_object_rest::SourceObjectRestOrigin> {
+        self.source_object_rest_origins.get(&type_)
+    }
+
+    pub(super) fn record_source_object_rest_origin(
+        &mut self,
+        origin: super::source_object_rest::SourceObjectRestOrigin,
+    ) -> bool {
+        if self.source_object_rest_origins.try_reserve(1).is_err() {
+            return false;
+        }
+        match self.source_object_rest_origins.entry(origin.result()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &origin,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(origin);
+                true
+            }
+        }
     }
 
     pub(super) fn record_object_literal_property_clone_origin(
@@ -4152,10 +7023,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .any(|group| group.sources.contains(&source))
     }
 
+    /// Separates canonical declaration merges from computed or instantiated methods.
+    pub(super) fn source_merged_method_has_exact_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(method) = self.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = method.declarations() else {
+            return false;
+        };
+        method.flags().contains(SymbolFlags::TRANSIENT)
+            && method
+                .flags()
+                .without(SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL)
+                == SymbolFlags::METHOD
+            && method.check_flags() == CheckFlags::NONE
+            && !method.name().is_reserved_member_name()
+            && !method.name().is_private_identifier()
+            && !method.name().is_late_bound()
+            && self.get_merged_symbol(symbol) == Some(symbol)
+            && !self.source_symbol_declarations.contains_key(&symbol)
+            && self.source_merged_symbol_declarations_match(symbol)
+            && method.value_declaration() == declarations.first().copied()
+            && self
+                .get_parent_of_symbol(symbol)
+                .and_then(|owner| self.symbol(owner))
+                .is_some_and(|owner| owner.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE)
+            && declarations.iter().all(|declaration| {
+                self.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+            })
+    }
+
     /// Checks the method's optional flag against each source declaration.
     pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
         let method = self.symbol(symbol)?;
-        let sources = if method.flags().contains(SymbolFlags::TRANSIENT)
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
+        let sources = if method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.check_flags().contains(CheckFlags::LATE)
             || method.name().is_late_bound()
         {
@@ -4172,7 +7077,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for source in sources {
             let source_method = self.symbol(source)?;
             let original = source_method.declarations()?;
-            if source_method.flags() != flags
+            if source_method.flags()
+                != flags
+                    | if merged {
+                        SymbolFlags::TRANSIENT
+                    } else {
+                        SymbolFlags::NONE
+                    }
                 || source_method.value_declaration() != original.first().copied()
                 || source_method.check_flags() != CheckFlags::NONE
             {
@@ -4269,8 +7180,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let interface = self.symbol(owner)?;
         let owner_declarations = interface.declarations()?;
         let interface_type = self.declared_type_links(owner)?.declared_type?;
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
         let late = method.check_flags().contains(CheckFlags::LATE)
-            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.name().is_late_bound();
         let valid_late = !late || self.late_bound_method_has_exact_sources(symbol, owner);
         let members = if late {
@@ -4314,7 +7226,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || method.flags().without(
                 SymbolFlags::METHOD
                     | SymbolFlags::OPTIONAL
-                    | if late {
+                    | if late || merged {
                         SymbolFlags::TRANSIENT
                     } else {
                         SymbolFlags::NONE
@@ -4466,6 +7378,99 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         else {
             return None;
         };
+        if self.source_is_typescript_external_module(owner_declaration)
+            && self.source_node_kind(owner_declaration) == Some(SyntaxKind::InterfaceDeclaration)
+            && let Some(SourceNodeParent::Parent(source)) =
+                self.source_node_parent(owner_declaration)
+            && self.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        {
+            // Exported interfaces have separate local and export symbols.
+            // Read their original binder slots before accepting current table entries.
+            let [Some(owner), Some(local)] =
+                self.symbols.source_binding_symbols(owner_declaration)?
+            else {
+                return None;
+            };
+            let [Some(module), None] = self.symbols.source_binding_symbols(source)? else {
+                return None;
+            };
+            let [Some(method), None] = self.symbols.source_binding_symbols(declaration)? else {
+                return None;
+            };
+            let interface = self.symbol(owner)?;
+            let local_record = self.symbol(local)?;
+            let module_record = self.symbol(module)?;
+            let method_record = self.symbol(method)?;
+            let owner_type = self.declared_type_links(owner)?.declared_type?;
+            let declarations = interface.declarations()?;
+            let name = self.source_child_with_kind(owner_declaration, SyntaxKind::Identifier)?;
+            if self.source_node_parent(source) != Some(SourceNodeParent::Root)
+                || self
+                    .source_files
+                    .get(&source.file)
+                    .map(|file| file.node_ref())
+                    != Some(source)
+                || self
+                    .source_file_facts
+                    .get(&source.file)?
+                    .is_common_js_module()
+                || self.source_identifier_text(name) != interface.name().as_utf8()
+                || declarations.is_empty()
+                || !declarations.contains(&owner_declaration)
+                || declarations.iter().any(|&declaration| {
+                    self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+                        || self.source_node_parent(declaration)
+                            != Some(SourceNodeParent::Parent(source))
+                        || self.source_node_is_exported(declaration) != Some(true)
+                        || self.symbols.source_binding_symbols(declaration)
+                            != Some([Some(owner), Some(local)])
+                })
+                || interface.flags() != SymbolFlags::INTERFACE
+                || interface.parent() != Some(module)
+                || interface.value_declaration().is_some()
+                || interface.exports().is_some()
+                || interface.export_symbol().is_some()
+                || !self.source_raw_symbol_declarations_match(owner)
+                || self.get_merged_symbol(owner) != Some(owner)
+                || local == owner
+                || self.get_merged_symbol(local) != Some(local)
+                || local_record.flags() != SymbolFlags::NONE
+                || local_record.check_flags() != CheckFlags::NONE
+                || local_record.name() != interface.name()
+                || local_record.declarations() != Some(declarations)
+                || local_record.value_declaration().is_some()
+                || local_record.members().is_some()
+                || local_record.exports().is_some()
+                || local_record.parent().is_some()
+                || local_record.export_symbol() != Some(owner)
+                || !self.source_raw_symbol_declarations_match(local)
+                || module_record.flags() != SymbolFlags::VALUE_MODULE
+                || module_record.check_flags() != CheckFlags::NONE
+                || module_record.declarations() != Some(&[source])
+                || module_record.members().is_some()
+                || module_record.parent().is_some()
+                || module_record.export_symbol().is_some()
+                || self.get_merged_symbol(module) != Some(module)
+                || !self.source_raw_symbol_declarations_match(module)
+                || !self.source_symbol_export_table_matches(module)
+                || module_record
+                    .exports()
+                    .and_then(|exports| self.symbol_table(exports))
+                    .and_then(|exports| exports.get(interface.name()))
+                    != Some(owner)
+                || method_record.parent() != Some(owner)
+                || !self.source_raw_symbol_declarations_match(method)
+                || interface
+                    .members()
+                    .and_then(|members| self.symbol_table(members))
+                    .and_then(|members| members.get(method_record.name()))
+                    != Some(method)
+                || self.authenticated_interface_method_owner(method) != Some((owner, owner_type))
+            {
+                return None;
+            }
+            return Some(method);
+        }
         let globals = self.symbol_table(self.intrinsic_bootstrap.as_ref()?.globals)?;
         for (_, global) in globals.iter() {
             let Some(owner) = self.get_merged_symbol(global) else {
@@ -4610,6 +7615,109 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.declared_method_linked_type(requested, method_symbol)
     }
 
+    /// The outer `None` rejects malformed source. The inner `None` means no `this` parameter.
+    pub(super) fn declared_method_this_parameter_source(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<Option<(SemanticSymbolId, NodeRef)>> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+            return None;
+        }
+        let children = self.source_direct_children(declaration)?;
+        let Some(parameter) = children
+            .into_iter()
+            .filter(|child| self.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+            .min_by_key(|child| self.source_node_start(*child))
+        else {
+            return Some(None);
+        };
+        let Some(name) = self.source_child_with_kind(parameter, SyntaxKind::Identifier) else {
+            return Some(None);
+        };
+        if self.source_identifier_text(name) != Some("this") {
+            return Some(None);
+        }
+        let annotation = self.source_direct_type_annotation(parameter)?;
+        let symbol = self.source_declaration_symbol(parameter)?;
+        let record = self.symbol(symbol)?;
+        let children = self.source_direct_children(parameter)?;
+        if children.len() != 2
+            || !children.contains(&name)
+            || !children.contains(&annotation)
+            || self.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+            || record.name().as_utf8() != Some("this")
+            || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(&[parameter])
+            || record.value_declaration() != Some(parameter)
+            || record.parent().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return None;
+        }
+        Some(Some((symbol, annotation)))
+    }
+
+    /// Checks the separate signature slot against its real source symbol and type links.
+    pub(super) fn declared_method_this_parameter_type(
+        &self,
+        signature: &Signature,
+    ) -> Option<Option<TypeId>> {
+        let source = self.declared_method_this_parameter_source(signature.declaration()?)?;
+        let (symbol, mut annotation) = match (source, signature.this_parameter()) {
+            (None, None) => return Some(None),
+            (Some((symbol, annotation)), Some(actual))
+                if symbol == actual && !signature.parameters().contains(&symbol) =>
+            {
+                (symbol, annotation)
+            }
+            _ => return None,
+        };
+        let links = self.value_symbol_links(symbol)?;
+        let type_ = links.resolved_type?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || self.types.get(type_).is_none()
+        {
+            return None;
+        }
+        let exact_annotation_links = TypeNodeLinks {
+            resolved_type: Some(type_),
+            outer_type_parameters: None,
+        };
+        let mut seen = HashSet::new();
+        while self.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+            if !seen.insert(annotation)
+                || self.type_node_links(annotation).is_some_and(|links| {
+                    links != &TypeNodeLinks::default() && links != &exact_annotation_links
+                })
+                || self
+                    .symbol_node_links(annotation)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return None;
+            }
+            let children = self.source_direct_children(annotation)?;
+            let [inner] = children.as_slice() else {
+                return None;
+            };
+            if self.source_node_parent(*inner) != Some(SourceNodeParent::Parent(annotation)) {
+                return None;
+            }
+            annotation = *inner;
+        }
+        if !self.source_direct_type_annotation_is_exact(annotation, type_) {
+            return None;
+        }
+        Some(Some(type_))
+    }
+
     fn valid_declared_method_type_parameters(
         &self,
         signature: &Signature,
@@ -4671,6 +7779,64 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Checks a declared method's predicate against its registered source children.
+    pub(super) fn declared_method_type_predicate_is_exact(
+        &self,
+        signature: &Signature,
+        annotation: NodeRef,
+    ) -> bool {
+        let Some(predicate) = signature.resolved_type_predicate() else {
+            return self.source_node_kind(annotation) != Some(SyntaxKind::TypePredicate);
+        };
+        let Some(predicate) = self.type_predicate(predicate) else {
+            return false;
+        };
+        let Some(owner) = signature.declaration() else {
+            return false;
+        };
+        let Some(children) = self.source_direct_children(annotation) else {
+            return false;
+        };
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let (name, narrowed, return_type) = match (predicate.kind(), children.as_slice()) {
+            (TypePredicateKind::This, [name, narrowed]) => {
+                (*name, Some(*narrowed), bootstrap.boolean_type)
+            }
+            (TypePredicateKind::AssertsThis, [asserts, name])
+                if self.source_node_kind(*asserts) == Some(SyntaxKind::AssertsKeyword) =>
+            {
+                (*name, None, bootstrap.void_type)
+            }
+            (TypePredicateKind::AssertsThis, [asserts, name, narrowed])
+                if self.source_node_kind(*asserts) == Some(SyntaxKind::AssertsKeyword) =>
+            {
+                (*name, Some(*narrowed), bootstrap.void_type)
+            }
+            _ => return false,
+        };
+        self.source_node_kind(owner) == Some(SyntaxKind::MethodSignature)
+            && self.source_node_kind(annotation) == Some(SyntaxKind::TypePredicate)
+            && self.source_node_parent(annotation) == Some(SourceNodeParent::Parent(owner))
+            && self.source_node_kind(name) == Some(SyntaxKind::ThisType)
+            && predicate.parameter_name().is_empty()
+            && predicate.parameter_index() == 0
+            && signature.resolved_return_type() == Some(return_type)
+            && self.source_direct_type_annotation_is_exact(annotation, return_type)
+            && self
+                .symbol_node_links(name)
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+            && match (narrowed, predicate.type_id()) {
+                (None, None) => true,
+                (Some(annotation), Some(type_)) => {
+                    self.types.get(type_).is_some()
+                        && self.source_direct_type_annotation_is_exact(annotation, type_)
+                }
+                _ => false,
+            }
+    }
+
     fn declared_method_linked_type(
         &self,
         requested: SignatureId,
@@ -4701,6 +7867,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             let signature_id = links.resolved_signature.signature()?;
             let signature = self.signature(signature_id)?;
             let return_type = signature.resolved_return_type()?;
+            let this_type = self.declared_method_this_parameter_type(signature)?;
             let return_annotation = self.source_direct_type_annotation(*method_declaration)?;
             let allowed_flags =
                 SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES;
@@ -4712,9 +7879,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || signature.declaration() != Some(*method_declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !self.valid_declared_method_type_parameters(signature, *method_declaration)
-                || signature.this_parameter().is_some()
                 || signature.resolved_min_argument_count() != -1
-                || signature.resolved_type_predicate().is_some()
+                || !self.declared_method_type_predicate_is_exact(signature, return_annotation)
                 || signature.target().is_some()
                 || signature.mapper().is_some()
                 || signature.isolated_signature_type().is_some()
@@ -4733,6 +7899,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             parameter_declarations.retain(|parameter| {
                 self.source_node_kind(*parameter) == Some(SyntaxKind::Parameter)
             });
+            if signature.this_parameter().is_some() {
+                parameter_declarations.remove(0);
+            }
             if parameter_declarations.len() != signature.parameters().len() {
                 return None;
             }
@@ -4799,6 +7968,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     )
                 };
                 if parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || parameter_symbol.name().as_utf8() == Some("this")
+                    || self
+                        .source_child_with_kind(parameter_declaration, SyntaxKind::Identifier)
+                        .and_then(|name| self.source_identifier_text(name))
+                        == Some("this")
                     || parameter_symbol.check_flags() != CheckFlags::NONE
                     || parameter_symbol.value_declaration() != Some(parameter_declaration)
                     || parameter_symbol.members().is_some()
@@ -4842,8 +8016,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .callable_signature_parameter_types
                     .get(&signature_id)
                     .is_some_and(|cached| {
-                        cached.len() != signature.parameters().len()
-                            || signature.parameters().iter().zip(cached).any(
+                        cached.this_type != this_type
+                            || cached.parameters.len() != signature.parameters().len()
+                            || signature.parameters().iter().zip(&cached.parameters).any(
                                 |(parameter, expected)| {
                                     self.value_symbol_links(*parameter)
                                         .and_then(|links| links.resolved_type)
@@ -5078,7 +8253,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             _ => return None,
         }
 
-        if let Some(parameter_types) = self.callable_signature_parameter_types.get(&signature) {
+        if let Some(parameter_types) = self.callable_signature_parameter_types(signature) {
             if parameter_types.len() != signature_record.parameters().len() {
                 return None;
             }
@@ -5233,68 +8408,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
-    fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
-        if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
-            return self.type_has_function_type_provenance(type_)
-                && self
-                    .signature(signature)
-                    .is_some_and(|record| record.declaration().is_none())
-                && self
-                    .source_jsdoc_callback_identity(type_)
-                    .is_some_and(|identity| {
-                        self.source_node_kind(identity.owner)
-                            == Some(SyntaxKind::VariableDeclaration)
-                    });
-        }
-        let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
-            return false;
-        };
-        if self.signature_links(declaration).is_none_or(|links| {
-            links.resolved_signature != ResolvedSignatureState::Resolved(signature)
-        }) {
-            return false;
-        }
-        let type_ = if self.node_is_function_type(declaration)
-            || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
-        {
-            self.type_node_links(declaration)
-                .and_then(|links| links.resolved_type)
-                .filter(|type_| self.type_has_function_type_provenance(*type_))
-        } else if self.node_is_declared_callable_signature(declaration) {
-            self.declared_call_set_types_by_signature
-                .get(&signature)
-                .copied()
-                .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
-        } else if self.node_is_global_interface_method(declaration) {
-            self.global_interface_method_linked_type(signature)
-        } else if self.node_is_interface_method(declaration) {
-            self.interface_method_linked_type(signature)
-        } else if self.node_is_type_literal_method(declaration) {
-            self.type_literal_method_linked_type(signature)
-        } else {
-            self.source_callable_type_for_signature(signature)
-                .filter(|type_| {
-                    self.source_callable_provenance(*type_)
-                        .is_some_and(|provenance| {
-                            provenance.declaration == declaration
-                                && provenance.signature == signature
-                        })
-                })
-                .or_else(|| {
-                    self.source_overload_type_for_signature(signature)
-                        .filter(|type_| {
-                            self.source_overload_provenance(*type_)
-                                .is_some_and(|provenance| {
-                                    provenance.signatures.iter().any(|row| {
-                                        row.declaration == declaration && row.signature == signature
-                                    })
-                                })
-                        })
-                })
-        };
-        type_.is_some()
-    }
-
     #[must_use]
     pub fn types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypePayload)> {
         self.types.iter()
@@ -5391,6 +8504,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_union_cache_validation_dirty();
         }
         Ok(previous)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_merged_symbol_for_test(
+        &mut self,
+        source: SemanticSymbolId,
+        replacement: Option<SemanticSymbolId>,
+    ) -> Option<SemanticSymbolId> {
+        let previous = match replacement {
+            Some(target) => self.merged_symbols.insert(source, target),
+            None => self.merged_symbols.remove(&source),
+        };
+        if previous != replacement {
+            if self.relation_observable_symbols.contains(&source) {
+                self.mark_relation_inputs_dirty();
+            }
+            if self.has_callable_provenance() {
+                self.mark_union_cache_validation_dirty();
+            }
+        }
+        previous
     }
 
     /// Returns a symbol's raw parent after exactly one merged redirect.
@@ -5903,6 +9037,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
         });
         self.links.value_symbol.replace_key(symbol, links);
+        if let Some(type_) = published_type {
+            for state in self.synthetic_namespace_property_origins.values_mut() {
+                state.mark_value_published(symbol, type_);
+            }
+        }
         let mut recovery_invalidated = false;
         for recovery in self.instantiated_property_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
@@ -5986,6 +9125,65 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.observe_relation_symbol_read(symbol);
         self.property_object_alias_request_recoveries
             .get(&(symbol, key))
+    }
+
+    pub(super) fn source_mapped_lookup_request(
+        &self,
+        mapped_type: TypeId,
+    ) -> Option<&SourceMappedLookupRequest> {
+        self.observe_relation_type_read(mapped_type);
+        self.source_mapped_lookup_requests.get(&mapped_type)
+    }
+
+    pub(super) fn try_reserve_source_mapped_lookup_requests(&mut self) -> bool {
+        self.source_mapped_lookup_requests.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_source_mapped_lookup_request(
+        &mut self,
+        request: SourceMappedLookupRequest,
+    ) -> bool {
+        if self.types.get(request.mapped_type).is_none()
+            || self.types.get(request.lookup).is_none()
+            || self.types.get(request.declared_lookup).is_none()
+            || self.types.get(request.parameter).is_none()
+            || self.types.get(request.argument).is_none()
+        {
+            return false;
+        }
+        match self
+            .source_mapped_lookup_requests
+            .entry(request.mapped_type)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &request,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_mapped_lookup_request_count(&self) -> usize {
+        self.source_mapped_lookup_requests.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_mapped_lookup_request_for_test(
+        &mut self,
+        mapped_type: TypeId,
+        request: Option<SourceMappedLookupRequest>,
+    ) -> Option<SourceMappedLookupRequest> {
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        match request {
+            Some(request) => self
+                .source_mapped_lookup_requests
+                .insert(mapped_type, request),
+            None => self.source_mapped_lookup_requests.remove(&mapped_type),
+        }
     }
 
     pub(super) fn try_reserve_property_object_alias_request_recoveries(&mut self) -> bool {
@@ -6236,7 +9434,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 && [previous, declared_type]
                     .into_iter()
                     .flatten()
-                    .any(|type_| self.relation_type_is_observable(type_)));
+                    .any(|type_| self.relation_observable_type_alias_owners.contains(&type_)));
         let dirty = self.type_alias_links(symbol).is_some_and(|current| {
             current != &TypeAliasLinks::default()
                 && current != &links
@@ -6279,12 +9477,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// at `type_`. This reverse edge is maintained atomically with
     /// [`Self::set_type_alias_links`] and is used to prove symmetric alias
     /// provenance for declared type-literal identities.
+    /// The owner set is observed separately from the unchanged type payload,
+    /// including when no alias owns the type yet.
     #[must_use]
     pub(super) fn type_alias_declared_type_owners(
         &self,
         type_: TypeId,
     ) -> Option<&HashSet<SemanticSymbolId>> {
-        self.observe_relation_type_read(type_);
+        self.observe_relation_type_alias_owners_read(type_);
         self.type_alias_declared_type_owners.get(&type_)
     }
 
@@ -6927,6 +10127,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .load(Ordering::Relaxed)
     }
 
+    /// Member readers can share a coherent recorder while its owner remains live.
+    pub(super) fn active_relation_read_observation_token(&mut self) -> Option<RelationObservationToken> {
+        if !self
+            .relation_read_observation_active
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.active_relation_read_observations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|active| active.token)
+    }
+
     pub(super) fn begin_relation_read_observation(&mut self) -> Option<RelationObservationToken> {
         let active = self
             .active_relation_read_observations
@@ -7029,6 +10244,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     pub(super) fn observe_relation_type_alias_read(&self, alias: TypeAliasId) {
         self.with_relation_read_observations(|observed| {
             observed.type_aliases.insert(alias);
+        });
+    }
+
+    #[inline]
+    fn observe_relation_type_alias_owners_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.type_alias_owners.insert(type_);
         });
     }
 
@@ -7154,6 +10376,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.relation_observable_types.extend(observed.types);
         self.relation_observable_type_aliases
             .extend(observed.type_aliases);
+        self.relation_observable_type_alias_owners
+            .extend(observed.type_alias_owners);
         self.relation_observable_signatures
             .extend(observed.signatures);
         self.relation_observable_symbols.extend(observed.symbols);
@@ -7175,6 +10399,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn clear_relation_observations(&mut self) {
         self.relation_observable_types.clear();
         self.relation_observable_type_aliases.clear();
+        self.relation_observable_type_alias_owners.clear();
         self.relation_observable_signatures.clear();
         self.relation_observable_symbols.clear();
         self.relation_observable_symbol_tables.clear();
@@ -7193,6 +10418,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn prepare_relation_cache_write(&mut self) {
         if !self.relation_cache_is_current() {
             self.relations = RelationCaches::default();
+            self.relation_mapped_reads.clear();
             self.clear_relation_observations();
             self.relation_cache_generation = self.relation_inputs_generation;
         }
@@ -7246,6 +10472,37 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.prepare_relation_cache_write();
         for (key, result) in writes {
             self.relations.set(relation, key, result);
+            self.relation_mapped_reads.remove(&(relation, key));
+        }
+        self.mark_relation_inputs_observable(observed);
+        true
+    }
+
+    pub(super) fn relation_mapped_reads(
+        &self,
+        relation: RelationKind,
+        key: CacheHashKey,
+    ) -> Option<&[super::type_nodes::SourceMappedReadProof]> {
+        self.relation_cache_is_current().then(|| self.relation_mapped_reads.get(&(relation, key)))
+            .flatten().map(Vec::as_slice)
+    }
+
+    pub(super) fn commit_relation_cache_writes_with_mapped_reads(
+        &mut self,
+        observation: RelationObservationToken,
+        relation: RelationKind,
+        writes: Vec<(CacheHashKey, RelationComparisonResult, Vec<super::type_nodes::SourceMappedReadProof>)>,
+    ) -> bool {
+        if writes.is_empty() {
+            return false;
+        }
+        let Some(observed) = self.take_relation_read_observations(observation) else {
+            return false;
+        };
+        self.prepare_relation_cache_write();
+        for (key, result, proofs) in writes {
+            self.relations.set(relation, key, result);
+            self.relation_mapped_reads.insert((relation, key), proofs);
         }
         self.mark_relation_inputs_observable(observed);
         true
@@ -7572,7 +10829,52 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub(super) fn cached_signature_len(&self) -> usize {
-        self.cached_signatures.len()
+        self.cached_signatures.len() + self.source_overload_erased_signatures.len()
+    }
+
+    pub(super) fn source_overload_erased_signature(
+        &self,
+        target: SignatureId,
+    ) -> Option<SignatureId> {
+        self.observe_relation_signature_read(target);
+        self.source_overload_erased_signatures.get(&target).copied()
+    }
+
+    pub(super) fn try_reserve_source_overload_erased_signatures(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.source_overload_erased_signatures
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn set_source_overload_erased_signature(
+        &mut self,
+        target: SignatureId,
+        erased: SignatureId,
+    ) -> bool {
+        if self.source_overload_type_for_signature(target).is_none()
+            || self.source_overload_erased_signatures.contains_key(&target)
+            || self
+                .cached_signatures
+                .values()
+                .any(|entry| entry.instantiated == erased)
+            || self.signature(erased).is_none_or(|signature| {
+                signature.target() != Some(target)
+                    || signature.mapper().is_none()
+                    || !signature.type_parameters().is_empty()
+                    || signature.resolved_return_type().is_none()
+            })
+        {
+            return false;
+        }
+        self.source_overload_erased_signatures
+            .insert(target, erased);
+        if self.relation_signature_is_observable(target) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
     }
 
     /// Reports whether an owned signature is published by any authoritative
@@ -7585,7 +10887,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(
             self.cached_signatures
                 .values()
-                .any(|entry| entry.instantiated == signature),
+                .any(|entry| entry.instantiated == signature)
+                || self
+                    .source_overload_erased_signatures
+                    .values()
+                    .any(|entry| *entry == signature),
         )
     }
 
@@ -7593,6 +10899,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// symbol, mapper, and instantiated signature.
     pub(super) fn try_reserve_value_symbol_links(&mut self, additional: usize) -> bool {
         self.links.value_symbol.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_deferred_symbol_links(&mut self, additional: usize) -> bool {
+        self.links.deferred_symbol.try_reserve(additional)
     }
 
     pub(super) fn try_reserve_declared_value_provenance(&mut self, additional: usize) -> bool {
@@ -7741,59 +11051,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_ok()
     }
 
-    /// Publishes immutable semantic parameter identities for exact callables.
-    /// The whole batch is validated before any entry is inserted.
-    pub(super) fn set_callable_signature_parameter_types_batch(
-        &mut self,
-        parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
-    ) -> bool {
-        let mut signatures = HashSet::with_capacity(parameter_types.len());
-        if parameter_types.iter().any(|(signature, types)| {
-            !signatures.insert(*signature)
-                || self
-                    .callable_signature_parameter_types
-                    .contains_key(signature)
-                || !self.signature_owns_callable_type(*signature)
-                || self
-                    .signature(*signature)
-                    .is_none_or(|record| record.parameters().len() != types.len())
-                || self.signature(*signature).is_some_and(|record| {
-                    record.declaration().is_some_and(|declaration| {
-                        self.node_is_global_interface_method(declaration)
-                            || self.node_is_interface_method(declaration)
-                            || self.node_is_type_literal_method(declaration)
-                    }) && record.parameters().iter().copied().zip(types).any(
-                        |(parameter, type_)| {
-                            self.value_symbol_links(parameter)
-                                != Some(&ValueSymbolLinks {
-                                    resolved_type: Some(*type_),
-                                    ..ValueSymbolLinks::default()
-                                })
-                        },
-                    )
-                })
-                || !self.valid_optional_types(Some(types))
-        }) {
-            return false;
-        }
-        let relation_dirty = parameter_types
-            .iter()
-            .any(|(signature, _)| self.relation_signature_is_observable(*signature));
-        for (signature, types) in parameter_types {
-            let previous = self
-                .callable_signature_parameter_types
-                .insert(signature, types);
-            assert!(
-                previous.is_none(),
-                "callable parameter provenance was prevalidated absent"
-            );
-        }
-        if relation_dirty {
-            self.mark_relation_inputs_dirty();
-        }
-        true
-    }
-
     pub(super) fn callable_signature_parameter_types(
         &self,
         signature: SignatureId,
@@ -7801,7 +11058,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.observe_relation_signature_read(signature);
         self.callable_signature_parameter_types
             .get(&signature)
-            .map(Vec::as_slice)
+            .map(|types| types.parameters.as_slice())
+    }
+
+    pub(super) fn callable_signature_this_parameter_type(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.callable_signature_parameter_types
+            .get(&signature)
+            .and_then(|types| types.this_type)
     }
 
     pub(super) fn callable_signature_parameter_types_len(&self) -> usize {
@@ -8398,6 +11665,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(symbol) {
             return false;
         }
+        let rest_index_changed = self
+            .index_info(id)
+            .is_some_and(|index| index.index_symbol() != symbol)
+            && self
+                .source_object_rest_origins
+                .values()
+                .any(|origin| origin.references_index(id));
         let relation_dirty = self
             .index_info(id)
             .is_some_and(|index| index.index_symbol().is_some() && index.index_symbol() != symbol);
@@ -8411,10 +11685,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for recovery in self.instantiated_index_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_index_write(id);
         }
-        if relation_dirty || recovery_invalidated {
+        if relation_dirty || recovery_invalidated || rest_index_changed {
             self.mark_relation_inputs_dirty();
         }
-        if recovery_invalidated {
+        if recovery_invalidated || rest_index_changed {
             self.mark_union_cache_validation_dirty();
         }
         true
@@ -8495,8 +11769,81 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         facts.identifier_text.as_deref()
     }
 
+    pub(super) fn source_private_identifier_text(&self, node: NodeRef) -> Option<&str> {
+        let facts = self.source_node_fact(node)?;
+        if facts.kind != SyntaxKind::PrivateIdentifier {
+            return None;
+        }
+        facts.identifier_text.as_deref()
+    }
+
     pub(super) fn source_type_operator(&self, node: NodeRef) -> Option<SyntaxKind> {
         self.source_node_fact(node)?.type_operator
+    }
+
+    /// Reads the actual constraint and default roles from registered source syntax.
+    pub(super) fn source_type_parameter_annotations(
+        &self,
+        parameter: NodeRef,
+    ) -> Option<SourceTypeParameterAnnotations> {
+        let facts = self.source_node_fact(parameter)?;
+        if facts.kind != SyntaxKind::TypeParameter {
+            return None;
+        }
+        let syntax = facts.type_parameter_annotations.as_deref()?;
+        let reference = |node| NodeRef::new(parameter.arena, parameter.file, node);
+        let annotations = SourceTypeParameterAnnotations {
+            constraint: syntax.constraint.map(reference),
+            default_type: syntax.default_type.map(reference),
+        };
+        let children = self.source_direct_children(parameter)?;
+        if annotations.constraint.is_some() && annotations.constraint == annotations.default_type {
+            return None;
+        }
+        annotations
+            .constraint
+            .into_iter()
+            .chain(annotations.default_type)
+            .all(|annotation| {
+                annotation != parameter
+                    && children.contains(&annotation)
+                    && self.source_node_parent(annotation)
+                        == Some(SourceNodeParent::Parent(parameter))
+                    && self.source_node_kind(annotation).is_some_and(|kind| {
+                        kind.is_keyword_type()
+                            || (SyntaxKind::FIRST_TYPE_NODE as u16
+                                ..=SyntaxKind::LAST_TYPE_NODE as u16)
+                                .contains(&(kind as u16))
+                    })
+            })
+            .then_some(annotations)
+    }
+
+    /// An inferred rest parameter is visible in its conditional's true branch.
+    pub(super) fn source_rest_infer_true_branch_contains(
+        &self,
+        declaration: NodeRef,
+        function: NodeRef,
+    ) -> bool {
+        let Some(branch) = self
+            .source_node_fact(declaration)
+            .and_then(|facts| facts.rest_infer_true_branch)
+        else {
+            return false;
+        };
+        let branch = NodeRef::new(declaration.arena, declaration.file, branch);
+        let mut current = function;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if current == branch {
+                return true;
+            }
+            let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(current) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
     }
 
     /// Returns exact source roles, not mutable heritage or type-query caches.
@@ -8741,6 +12088,65 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    pub(super) fn source_alias_type_parameter_annotations(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SourceAliasTypeParameterAnnotations> {
+        let facts = self.source_node_fact(declaration)?;
+        let parent = NodeRef::new(declaration.arena, declaration.file, facts.parent?);
+        if facts.kind != SyntaxKind::TypeParameter
+            || self.source_node_kind(parent) != Some(SyntaxKind::TypeAliasDeclaration)
+        {
+            return None;
+        }
+        let annotations = facts.alias_type_parameter.as_deref()?;
+        let child = |node| {
+            let node = NodeRef::new(declaration.arena, declaration.file, node);
+            (self.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+                .then_some(node)
+        };
+        Some(SourceAliasTypeParameterAnnotations {
+            constraint: match annotations.constraint {
+                Some(node) => Some(child(node)?),
+                None => None,
+            },
+            default_type: match annotations.default_type {
+                Some(node) => Some(child(node)?),
+                None => None,
+            },
+        })
+    }
+
+    /// Reads the written parameter or field annotation from registered source.
+    /// Initializers can be allocated between the annotation and its holder.
+    #[must_use]
+    pub(super) fn source_class_annotation_role(&self, holder: NodeRef) -> Option<NodeRef> {
+        let facts = self.source_node_fact(holder)?;
+        if !matches!(
+            facts.kind,
+            SyntaxKind::Parameter | SyntaxKind::PropertyDeclaration
+        ) {
+            return None;
+        }
+        let annotation = NodeRef::new(holder.arena, holder.file, facts.class_annotation_role?);
+        let annotation_facts = self.source_node_fact(annotation)?;
+        let is_type = annotation_facts.kind.is_keyword_type()
+            || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                .contains(&(annotation_facts.kind as u16));
+        if !is_type
+            || annotation_facts.parent != Some(holder.node)
+            || self
+                .source_direct_children(holder)?
+                .iter()
+                .filter(|child| **child == annotation)
+                .count()
+                != 1
+        {
+            return None;
+        }
+        Some(annotation)
+    }
+
     /// Returns the final direct type annotation on a registered declaration.
     #[must_use]
     pub(super) fn source_direct_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
@@ -8849,6 +12255,145 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(Option::as_ref)
     }
 
+    pub(super) fn source_primitive_interface_member(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SourcePrimitiveInterfaceMember> {
+        self.source_node_fact(declaration)?
+            .primitive_interface_member
+            .as_deref()
+            .copied()
+    }
+
+    pub(super) fn source_primitive_interface_declaration(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<NodeRef> {
+        let source = self.source_symbol_declarations.get(&symbol)?;
+        let [declaration] = source.declarations.as_ref() else {
+            return None;
+        };
+        if !self.source_is_typescript_script(*declaration) {
+            return None;
+        }
+        self.source_primitive_interface_member(*declaration)?;
+        Some(*declaration)
+    }
+
+    #[allow(clippy::too_many_lines)] // Capture both primitive forms from their actual syntax fields.
+    fn primitive_interface_member_facts(
+        arena: &NodeArena,
+        declaration: NodeId,
+    ) -> Option<SourcePrimitiveInterfaceMember> {
+        let declaration_node = arena.get(declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &declaration_node.data else {
+            return None;
+        };
+        if declaration_node
+            .parent
+            .and_then(|parent| arena.get(parent))
+            .is_none_or(|parent| parent.kind != SyntaxKind::SourceFile)
+            || declaration_node.kind != SyntaxKind::InterfaceDeclaration
+            || declaration_node.flags.0 != 0
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.members.nodes.len() != 1
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < declaration_node.range.start
+            || interface.members.range.end != declaration_node.range.end
+            || interface.type_parameters.is_some()
+            || interface.heritage_clauses.is_some()
+            || interface.modifiers.is_some()
+        {
+            return None;
+        }
+        let member = interface.members.nodes[0];
+        let node = arena.get(member)?;
+        if node.parent != Some(declaration) || node.flags.0 != 0 {
+            return None;
+        }
+        let child = |id, parent, kind| {
+            arena.get(id).is_some_and(|node| {
+                node.parent == Some(parent) && node.kind == kind && node.flags.0 == 0
+            })
+        };
+        if !child(interface.name, declaration, SyntaxKind::Identifier) {
+            return None;
+        }
+        match &node.data {
+            NodeData::PropertyDeclaration(property)
+                if node.kind == SyntaxKind::PropertyDeclaration
+                    && property.initializer.is_none()
+                    && property.postfix_token.is_none()
+                    && property.symbol.is_none()
+                    && property.modifiers.is_none()
+                    && property.facts == 0
+                    && child(property.name, member, SyntaxKind::Identifier)
+                    && property.type_.is_some_and(|annotation| {
+                        child(annotation, member, SyntaxKind::StringKeyword)
+                    }) =>
+            {
+                Some(SourcePrimitiveInterfaceMember::Property {
+                    interface_name: interface.name,
+                    member,
+                    name: property.name,
+                    annotation: property.type_?,
+                })
+            }
+            NodeData::IndexSignatureDeclaration(index)
+                if node.kind == SyntaxKind::IndexSignature
+                    && index.parameters.nodes.len() == 1
+                    && !index.parameters.has_trailing_comma
+                    && index.parameters.range.start >= node.range.start
+                    && index.parameters.range.end <= node.range.end
+                    && index.full_signature.is_none()
+                    && index.next_container.is_none()
+                    && index.symbol.is_none()
+                    && index.type_parameters.is_none()
+                    && index.modifiers.is_none()
+                    && child(index.type_, member, SyntaxKind::NumberKeyword) =>
+            {
+                let parameter = index.parameters.nodes[0];
+                let parameter_node = arena.get(parameter)?;
+                let NodeData::ParameterDeclaration(data) = &parameter_node.data else {
+                    return None;
+                };
+                let key = data.type_?;
+                if parameter_node.kind != SyntaxKind::Parameter
+                    || parameter_node.flags.0 != 0
+                    || parameter_node.parent != Some(member)
+                    || parameter_node.range.start < index.parameters.range.start
+                    || parameter_node.range.end > index.parameters.range.end
+                    || data.dot_dot_dot_token.is_some()
+                    || data.initializer.is_some()
+                    || data.question_token.is_some()
+                    || data.symbol.is_some()
+                    || data.facts != 0
+                    || data.modifiers.is_some()
+                    || !child(data.name, parameter, SyntaxKind::Identifier)
+                    || !child(key, parameter, SyntaxKind::StringKeyword)
+                    || matches!(
+                        &arena.get(data.name)?.data,
+                        NodeData::Identifier(identifier)
+                            if identifier.text.is_empty() || identifier.text == "this"
+                    )
+                {
+                    return None;
+                }
+                Some(SourcePrimitiveInterfaceMember::StringIndex {
+                    interface_name: interface.name,
+                    member,
+                    parameter,
+                    name: data.name,
+                    key,
+                    value: index.type_,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn validated_source_node_facts(
         arena: &NodeArena,
         source_file: NodeId,
@@ -8885,6 +12430,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     NodeData::Identifier(identifier) if node.kind == SyntaxKind::Identifier => {
                         Some(identifier.text.clone().into_boxed_str())
                     }
+                    NodeData::PrivateIdentifier(identifier)
+                        if node.kind == SyntaxKind::PrivateIdentifier =>
+                    {
+                        Some(identifier.text.clone().into_boxed_str())
+                    }
                     _ => None,
                 },
                 default_function_name: Self::named_default_function_name(arena, node_id, node),
@@ -8894,6 +12444,37 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                class_annotation_role: match &node.data {
+                    NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                    NodeData::PropertyDeclaration(property) => property.type_,
+                    _ => None,
+                },
+                type_parameter_annotations: match &node.data {
+                    NodeData::TypeParameterDeclaration(parameter) => {
+                        Some(Box::new(TypeParameterAnnotationFacts {
+                            constraint: parameter.constraint,
+                            default_type: parameter.default_type,
+                        }))
+                    }
+                    _ => None,
+                },
+                rest_infer_true_branch: Self::rest_infer_true_branch(arena, node_id),
+                alias_type_parameter: match &node.data {
+                    NodeData::TypeParameterDeclaration(parameter)
+                        if node
+                            .parent
+                            .and_then(|parent| arena.get(parent))
+                            .is_some_and(|parent| {
+                                parent.kind == SyntaxKind::TypeAliasDeclaration
+                            }) =>
+                    {
+                        Some(Box::new(AliasTypeParameterSyntaxFacts {
+                            constraint: parameter.constraint,
+                            default_type: parameter.default_type,
+                        }))
+                    }
                     _ => None,
                 },
                 mapped_type: match &node.data {
@@ -8929,6 +12510,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                                 .unwrap_or(PlainInterfaceHeritageFacts::Unsupported),
                         )
                     }),
+                primitive_interface_member: Self::primitive_interface_member_facts(arena, node_id)
+                    .map(Box::new),
                 exported: match &node.data {
                     NodeData::TypeAliasDeclaration(declaration) => {
                         declaration.modifiers.as_ref().is_some_and(|modifiers| {
@@ -8955,6 +12538,70 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             node.for_each_child(|child| pending.push((child, Some(node_id))));
         }
         Some(facts)
+    }
+
+    fn rest_infer_true_branch(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+        let record = arena.get(declaration)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return None;
+        };
+        if record.flags.0 != 0
+            || data.constraint.is_some()
+            || data.default_type.is_some()
+            || data.expression.is_some()
+            || data.modifiers.is_some()
+            || data.symbol.is_some()
+        {
+            return None;
+        }
+        let infer = record.parent?;
+        let infer_record = arena.get(infer)?;
+        if !matches!(&infer_record.data, NodeData::InferTypeNode(data)
+            if data.type_parameter == declaration)
+            || infer_record.flags.0 != 0
+        {
+            return None;
+        }
+        let parameter = infer_record.parent?;
+        let parameter_record = arena.get(parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let rest = arena.get(parameter_data.dot_dot_dot_token?)?;
+        if parameter_data.type_ != Some(infer)
+            || parameter_data.question_token.is_some()
+            || parameter_data.initializer.is_some()
+            || parameter_data.modifiers.is_some()
+            || rest.kind != SyntaxKind::DotDotDotToken
+            || rest.parent != Some(parameter)
+        {
+            return None;
+        }
+        let function = parameter_record.parent?;
+        let function_record = arena.get(function)?;
+        let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+            return None;
+        };
+        if function_data.parameters.nodes.last() != Some(&parameter) {
+            return None;
+        }
+        let mut current = function;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let parent = arena.get(current)?.parent?;
+            let parent_record = arena.get(parent)?;
+            match &parent_record.data {
+                NodeData::ParenthesizedTypeNode(data) if data.type_ == current => {
+                    current = parent;
+                }
+                NodeData::ConditionalTypeNode(data) if data.extends_type == current => {
+                    return (arena.get(data.true_type)?.parent == Some(parent))
+                        .then_some(data.true_type);
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn index_source_node_children(facts: &[Option<SourceNodeFacts>]) -> Option<Vec<Box<[NodeId]>>> {
@@ -9581,6 +13228,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let facts = self.source_node_facts.get(&declaration.arena)?;
         let mut computed = None;
         let mut optional_count = 0usize;
+        let mut readonly = false;
         for (index, facts) in facts.iter().enumerate() {
             let Some(facts) = facts else {
                 continue;
@@ -9600,6 +13248,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     ));
                 }
                 SyntaxKind::QuestionToken => optional_count = optional_count.checked_add(1)?,
+                SyntaxKind::ReadonlyKeyword if !method => {
+                    if readonly {
+                        return None;
+                    }
+                    readonly = true;
+                }
                 _ => {}
             }
         }
@@ -9607,6 +13261,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if optional_count != usize::from(optional) {
             return None;
         }
+        let expected_check_flags = CheckFlags::LATE
+            | if readonly {
+                CheckFlags::READONLY
+            } else {
+                CheckFlags::NONE
+            };
         let mut key_expression = None;
         for (index, facts) in facts.iter().enumerate() {
             let Some(facts) = facts else {
@@ -9667,7 +13327,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let late_record = self.symbol(late)?;
             let value_links = self.value_symbol_links(late)?;
             if late_record.flags() != (original_flags | SymbolFlags::TRANSIENT)
-                || late_record.check_flags() != CheckFlags::LATE
+                || late_record.check_flags() != expected_check_flags
                 || late_record.name() != expected_name.as_ref()
                 || late_record.declarations() != Some(&[declaration])
                 || late_record.value_declaration() != Some(declaration)
@@ -9720,8 +13380,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         declarations.try_reserve_exact(1).ok()?;
         declarations.push(declaration);
 
-        let late =
-            self.alloc_transient_symbol(original_flags, canonical_name.clone(), CheckFlags::LATE);
+        let late = self.alloc_transient_symbol(
+            original_flags,
+            canonical_name.clone(),
+            expected_check_flags,
+        );
         assert!(self.set_symbol_declarations(late, Some(declarations), Some(declaration)));
         assert!(self.set_symbol_relationships(late, None, None, Some(owner), None));
         assert!(self.set_value_symbol_links(
@@ -9785,13 +13448,297 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         Some(type_)
     }
+}
 
-    /// Publishes a dependency-closed batch of local ambient overload groups.
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn record_source_alias_default_graph(
+        &mut self,
+        node: NodeRef,
+        raw_type: TypeId,
+        graph: SourceAliasOperandGraph,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        if !graph.source().is_default()
+            || !graph.matches_operand(graph.source(), node, raw_type)
+            || graph.validate_retained(self, raw_type, array_targets).is_err()
+        {
+            return false;
+        }
+        if let Some(existing) = self.source_alias_default_graphs.get(&node) {
+            return existing.matches_operand(graph.source(), node, raw_type)
+                && existing.validate_retained(self, raw_type, array_targets).is_ok();
+        }
+        self.source_alias_default_graphs.insert(node, graph);
+        if self.relation_observable_nodes.contains(&node) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
+        if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
+            return self.type_has_function_type_provenance(type_)
+                && self
+                    .signature(signature)
+                    .is_some_and(|record| record.declaration().is_none())
+                && self
+                    .source_jsdoc_callback_identity(type_)
+                    .is_some_and(|identity| {
+                        self.source_node_kind(identity.owner)
+                            == Some(SyntaxKind::VariableDeclaration)
+                    });
+        }
+        let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
+            return false;
+        };
+        if self.signature_links(declaration).is_none_or(|links| {
+            links.resolved_signature != ResolvedSignatureState::Resolved(signature)
+        }) {
+            return false;
+        }
+        let type_ = if self.node_is_function_type(declaration)
+            || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
+        {
+            self.type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| self.type_has_function_type_provenance(*type_))
+        } else if self.node_is_declared_callable_signature(declaration) {
+            self.declared_call_set_types_by_signature
+                .get(&signature)
+                .copied()
+                .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
+        } else if self.node_is_global_interface_method(declaration) {
+            self.interface_method_linked_type(signature)
+                .or_else(|| self.global_interface_method_linked_type(signature))
+                .filter(|type_| {
+                    matches!(
+                        super::callable_sets::validate_stored_global_method_callable_set(self, *type_),
+                        Some(super::callable_sets::StoredCallableSetValidation::Valid { projection, .. })
+                            if projection.call_signatures.iter().any(|callable| callable.signature == signature)
+                    )
+                })
+        } else if self.node_is_interface_method(declaration) {
+            self.interface_method_linked_type(signature)
+        } else if self.node_is_type_literal_method(declaration) {
+            self.type_literal_method_linked_type(signature)
+        } else {
+            self.source_callable_type_for_signature(signature)
+                .filter(|type_| {
+                    self.source_callable_provenance(*type_)
+                        .is_some_and(|provenance| {
+                            provenance.declaration == declaration
+                                && provenance.signature == signature
+                        })
+                })
+                .or_else(|| {
+                    self.source_overload_type_for_signature(signature)
+                        .filter(|type_| {
+                            self.source_overload_provenance(*type_)
+                                .is_some_and(|provenance| {
+                                    provenance.signatures.iter().any(|row| {
+                                        row.declaration == declaration && row.signature == signature
+                                    })
+                                })
+                        })
+                })
+        };
+        type_.is_some()
+    }
+
+    /// Publishes immutable semantic parameter identities for exact callables.
+    /// The whole batch is validated before any entry is inserted.
+    pub(super) fn set_callable_signature_parameter_types_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
+    ) -> bool {
+        self.set_callable_signature_parameter_types_with_this_batch(
+            parameter_types
+                .into_iter()
+                .map(|(signature, types)| (signature, None, types))
+                .collect(),
+        )
+    }
+
+    /// Publishes a source receiver without adding it to the signature's value list.
+    pub(super) fn set_callable_signature_parameter_types_with_this_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Option<TypeId>, Vec<TypeId>)>,
+    ) -> bool {
+        let function_receiver_is_valid = |id: SignatureId, this_type: TypeId| -> Option<()> {
+            let signature = self.signature(id)?;
+            let declaration = signature.declaration()?;
+            if !self.node_is_function_type(declaration) {
+                return None;
+            }
+            let owner = self.type_node_links(declaration)?.resolved_type?;
+            let structured = self.types.get(owner)?.data().structured()?;
+            if !self.type_has_function_type_provenance(owner)
+                || structured.signatures.as_deref() != Some([id].as_slice())
+                || structured.call_signature_count != 1
+            {
+                return None;
+            }
+            let parameter = signature.this_parameter()?;
+            let first = self
+                .source_direct_children(declaration)?
+                .into_iter()
+                .find(|child| self.source_node_kind(*child) == Some(SyntaxKind::Parameter))?;
+            let name = self.source_child_with_kind(first, SyntaxKind::Identifier)?;
+            let annotation = self.source_direct_type_annotation(first)?;
+            let children = self.source_direct_children(first)?;
+            let symbol = self.symbol(parameter)?;
+            if self.source_declaration_symbol(first) != Some(parameter)
+                || self.source_node_parent(first) != Some(SourceNodeParent::Parent(declaration))
+                || self.source_node_parent(name) != Some(SourceNodeParent::Parent(first))
+                || self.source_node_parent(annotation) != Some(SourceNodeParent::Parent(first))
+                || self.source_identifier_text(name) != Some("this")
+                || children.len() != 2
+                || !children.contains(&name)
+                || !children.contains(&annotation)
+                || name == annotation
+                || symbol.name().as_utf8() != Some("this")
+                || symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || symbol.check_flags() != CheckFlags::NONE
+                || symbol.declarations() != Some(&[first])
+                || symbol.value_declaration() != Some(first)
+                || symbol.members().is_some()
+                || symbol.exports().is_some()
+                || symbol.parent().is_some()
+                || symbol.export_symbol().is_some()
+                || self.get_merged_symbol(parameter) != Some(parameter)
+                || !self.source_direct_type_annotation_is_exact(annotation, this_type)
+                || self.value_symbol_links(parameter)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(this_type),
+                        ..ValueSymbolLinks::default()
+                    })
+            {
+                return None;
+            }
+            Some(())
+        };
+        let mut signatures = HashSet::with_capacity(parameter_types.len());
+        if parameter_types.iter().any(|(signature, this_type, types)| {
+            !signatures.insert(*signature)
+                || self
+                    .callable_signature_parameter_types
+                    .contains_key(signature)
+                || !self.signature_owns_callable_type(*signature)
+                || self
+                    .signature(*signature)
+                    .is_none_or(|record| record.parameters().len() != types.len())
+                || this_type.is_some_and(|type_| {
+                    self.types.get(type_).is_none()
+                        || self.signature(*signature).is_none_or(|record| {
+                            record.this_parameter().is_none()
+                                || record.declaration().is_none_or(|declaration| {
+                                    !self.node_is_source_callable_declaration(declaration)
+                                        && !self.node_is_interface_method(declaration)
+                                        && !self.node_is_type_literal_method(declaration)
+                                        && function_receiver_is_valid(*signature, type_).is_none()
+                                })
+                        })
+                })
+                || self.signature(*signature).is_some_and(|record| {
+                    record.declaration().is_some_and(|declaration| {
+                        self.node_is_global_interface_method(declaration)
+                            || self.node_is_interface_method(declaration)
+                            || self.node_is_type_literal_method(declaration)
+                    }) && (record.this_parameter().is_some() != this_type.is_some()
+                        || record.this_parameter().is_some_and(|parameter| {
+                            self.value_symbol_links(parameter)
+                                != Some(&ValueSymbolLinks {
+                                    resolved_type: *this_type,
+                                    ..ValueSymbolLinks::default()
+                                })
+                        })
+                        || record.parameters().iter().copied().zip(types).any(
+                            |(parameter, type_)| {
+                                self.value_symbol_links(parameter)
+                                    != Some(&ValueSymbolLinks {
+                                        resolved_type: Some(*type_),
+                                        ..ValueSymbolLinks::default()
+                                    })
+                            },
+                        ))
+                })
+                || self.signature(*signature).is_some_and(|record| {
+                    record
+                        .declaration()
+                        .is_some_and(|declaration| self.node_is_function_type(declaration))
+                        && record.this_parameter().is_some() != this_type.is_some()
+                })
+                || !self.valid_optional_types(Some(types))
+        }) {
+            return false;
+        }
+        let relation_dirty = parameter_types
+            .iter()
+            .any(|(signature, _, _)| self.relation_signature_is_observable(*signature));
+        for (signature, this_type, parameters) in parameter_types {
+            let previous = self.callable_signature_parameter_types.insert(
+                signature,
+                CallableSignatureParameterTypes {
+                    this_type,
+                    parameters,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "callable parameter provenance was prevalidated absent"
+            );
+        }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    /// Publishes a dependency-closed batch of local overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
     /// first callable identity is allocated. Once allocation begins, all
     /// reverse-map and link writes are infallible assertions over the reserved
     /// batch.
+    pub(super) fn publish_source_overload_identity(
+        &mut self,
+        identity: SourceOverloadIdentity,
+    ) -> Option<TypeId> {
+        if !super::source_overloads::source_overload_identity_header_is_exact(self, &identity)
+            || !super::source_overloads::source_overload_identity_links_are_cold(self, &identity)
+            || self
+                .value_symbol_links(identity.owner_symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || self.source_overload_identity_conflicts(
+                identity.owner_symbol,
+                &identity.declarations,
+                None,
+            )
+            || !self.try_reserve_types(1)
+            || !self.links.value_symbol.try_reserve(1)
+            || self.source_overload_identities.try_reserve(1).is_err()
+        {
+            return None;
+        }
+        let type_ = self.alloc_plain_object_type(
+            super::types::ObjectFlags::ANONYMOUS,
+            Some(identity.owner_symbol),
+        )?;
+        assert!(self.set_value_symbol_links(
+            identity.owner_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(
+            self.source_overload_identities
+                .insert(type_, identity)
+                .is_none()
+        );
+        Some(type_)
+    }
+
     pub(super) fn publish_source_overload_batch(
         &mut self,
         prepared: Vec<PreparedSourceOverloadPublication>,
@@ -9809,6 +13756,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let mut declarations = HashSet::with_capacity(signature_count);
         let mut parameter_declarations = HashSet::with_capacity(parameter_count);
         let mut parameter_symbols = HashSet::with_capacity(parameter_count);
+        let mut type_parameter_declarations = HashSet::new();
+        let mut type_parameter_symbols = HashSet::new();
 
         for group in &prepared {
             let owner = self.symbol(group.owner_symbol)?;
@@ -9820,15 +13769,58 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let common_parent = declaration_order
                 .first()
                 .and_then(|declaration| self.source_node_parent(*declaration));
-            if group.signatures.len() < 2
+            let export_local = group.implementation.and_then(|_| {
+                self.source_exported_overload_local(group.owner_symbol, &declaration_order)
+            });
+            let global_namespace = group.implementation.is_none()
+                && self
+                    .source_global_function_namespace_declarations(group.owner_symbol)
+                    .as_deref()
+                    == Some(declaration_order.as_slice());
+            let pending = self
+                .value_symbol_links(group.owner_symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|&type_| self.source_overload_identities.contains_key(&type_));
+            if let Some(type_) = pending {
+                let identity = self.source_overload_identity(type_)?;
+                if !global_namespace
+                    || identity.owner_symbol != group.owner_symbol
+                    || identity.declarations.as_ref() != declaration_order
+                    || !super::source_overloads::validate_pending_source_overload(self, type_)
+                {
+                    return None;
+                }
+            }
+            if !super::source_overloads::source_overload_namespace_exports_match(
+                self, group.owner_symbol, group.namespace_exports.as_deref(),
+            ) || group.signatures.len() < 2 && !global_namespace
+                || group.implementation.is_some_and(|implementation| {
+                    declaration_order.last().copied() != Some(implementation.declaration)
+                        || self.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
+                        || self.source_node_parent(implementation.body)
+                            != Some(SourceNodeParent::Parent(implementation.declaration))
+                })
                 || !owners.insert(group.owner_symbol)
-                || owner.flags() != SymbolFlags::FUNCTION
+                || !global_namespace
+                    && (owner.flags() != SymbolFlags::FUNCTION
+                        || owner.declarations() != Some(declaration_order.as_slice())
+                        || owner.exports().is_some())
                 || owner.check_flags() != CheckFlags::NONE
-                || owner.declarations() != Some(declaration_order.as_slice())
                 || owner.value_declaration() != declaration_order.first().copied()
                 || owner.members().is_some()
-                || owner.exports().is_some()
-                || owner.parent().is_some()
+                || owner.parent().is_some() && export_local.is_none()
+                || export_local.is_none()
+                    && declaration_order.iter().any(|declaration| {
+                        self.source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
+                            .is_some()
+                            && !(global_namespace
+                                && self
+                                    .source_global_callable_augmentation_local(
+                                        group.owner_symbol,
+                                        *declaration,
+                                    )
+                                    .is_some())
+                    })
                 || owner.export_symbol().is_some()
                 || self.get_merged_symbol(group.owner_symbol) != Some(group.owner_symbol)
                 || common_parent.is_none()
@@ -9836,9 +13828,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     SourceNodeParent::Parent(parent) => self.source_node_kind(parent),
                     SourceNodeParent::Root => None,
                 }) != Some(SyntaxKind::SourceFile)
-                || self
-                    .value_symbol_links(group.owner_symbol)
-                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || pending.is_none()
+                    && self
+                        .value_symbol_links(group.owner_symbol)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
                 || self
                     .source_callable_types_by_owner
                     .contains_key(&group.owner_symbol)
@@ -9857,10 +13850,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 return None;
             }
             for signature in &group.signatures {
+                let has_rest = signature.flags.contains(SignatureFlags::HAS_REST_PARAMETER);
                 if !declarations.insert(signature.declaration)
                     || self.source_node_kind(signature.declaration)
                         != Some(SyntaxKind::FunctionDeclaration)
-                    || self.source_node_parent(signature.declaration) != common_parent
+                    || !global_namespace
+                        && self.source_node_parent(signature.declaration) != common_parent
                     || self
                         .signature_links(signature.declaration)
                         .is_some_and(|links| links != &SignatureLinks::default())
@@ -9870,18 +13865,135 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     || self
                         .source_overload_types_by_declaration
                         .contains_key(&signature.declaration)
-                    || signature.flags.bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+                    || signature.flags.bits()
+                        & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER)
+                            .bits()
+                        != 0
+                    || has_rest && (signature.parameters.is_empty() || !global_namespace)
                     || signature.min_argument_count < 0
                     || usize::try_from(signature.min_argument_count)
                         .map_or(true, |minimum| minimum > signature.parameters.len())
                     || self.type_payload(signature.return_type).is_none()
-                    || !self.contains_node_ref(signature.return_annotation)
+                    || match signature.return_annotation {
+                        Some(annotation) => !self.contains_node_ref(annotation),
+                        None => {
+                            signature.return_annotation_null_literal_identity
+                                || signature.query_evidence.is_some()
+                                || group.implementation.is_none_or(|implementation| {
+                                    implementation.declaration != signature.declaration
+                                        || !self.source_empty_overload_implementation_is_exact(
+                                            group.owner_symbol,
+                                            implementation,
+                                        )
+                                })
+                                || self.intrinsic_bootstrap().is_none_or(|bootstrap| {
+                                    signature.return_type != bootstrap.void_type
+                                })
+                        }
+                    }
                 {
                     return None;
                 }
+                let declared_type_parameters = self
+                    .source_direct_children(signature.declaration)?
+                    .into_iter()
+                    .filter(|node| self.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+                    .collect::<Vec<_>>();
+                let resolved_type_parameters =
+                    signature
+                        .query_evidence
+                        .as_ref()
+                        .map_or_else(Vec::new, |evidence| {
+                            evidence
+                                .type_parameters()
+                                .iter()
+                                .map(|parameter| parameter.provenance.declaration)
+                                .collect()
+                        });
+                if declared_type_parameters != resolved_type_parameters {
+                    return None;
+                }
+                if let Some(evidence) = &signature.query_evidence {
+                    let plan = evidence.callable();
+                    if group.implementation.is_none() && !global_namespace
+                        || plan.declaration != signature.declaration
+                        || plan.owner_symbol != group.owner_symbol
+                        || plan.array_targets != group.array_targets
+                        || plan.flags != signature.flags
+                        || !evidence.is_exact(self)
+                        || !global_namespace
+                            && (plan.type_parameters.len() != 1
+                                || plan.type_parameters.iter().any(|parameter| {
+                                    parameter.constraint.is_some()
+                                        || parameter.default_type.is_some()
+                                }))
+                        || global_namespace
+                            && (plan.type_parameters.is_empty()
+                                || plan.body_mode
+                                    != super::source_callables::SourceCallableBodyMode::AmbientDeclaration
+                                || plan.export_local.is_none()
+                                || self.source_global_callable_augmentation_local(
+                                    group.owner_symbol,
+                                    signature.declaration,
+                                )
+                                    != plan.export_local)
+                        || plan.parameters.len() != signature.parameters.len()
+                        || plan.return_type.annotation_identity()
+                            != signature.return_annotation.map(|annotation| {
+                                (
+                                    annotation,
+                                    signature.return_annotation_null_literal_identity,
+                                )
+                            })
+                    {
+                        return None;
+                    }
+                    for parameter in evidence.type_parameters() {
+                        if !type_parameter_declarations.insert(parameter.provenance.declaration)
+                            || !type_parameter_symbols.insert(parameter.provenance.symbol)
+                        {
+                            return None;
+                        }
+                    }
+                    for (planned, parameter) in plan.parameters.iter().zip(&signature.parameters) {
+                        if planned.declaration != parameter.declaration
+                            || planned.symbol != parameter.symbol
+                            || planned.annotation_identity()
+                                != (
+                                    parameter.annotation,
+                                    parameter.annotation_null_literal_identity,
+                                )
+                            || evidence.annotation_type(parameter.annotation)
+                                != Some(parameter.base_type)
+                        {
+                            return None;
+                        }
+                    }
+                }
                 let mut optional_seen = false;
-                for parameter in &signature.parameters {
+                for (index, parameter) in signature.parameters.iter().enumerate() {
+                    let rest = has_rest && index + 1 == signature.parameters.len();
                     let symbol = self.symbol(parameter.symbol)?;
+                    if let Some(proof) = parameter.default_parameter {
+                        let planned = proof.parameter();
+                        if !parameter.optional
+                            || index < usize::try_from(signature.min_argument_count).ok()?
+                            || signature.query_evidence.is_some()
+                            || group.implementation.is_none_or(|implementation| {
+                                implementation.declaration != signature.declaration
+                            })
+                            || planned.declaration != parameter.declaration
+                            || planned.symbol != parameter.symbol
+                            || planned.annotation_identity()
+                                != (
+                                    parameter.annotation,
+                                    parameter.annotation_null_literal_identity,
+                                )
+                            || !proof.is_exact(self, signature.declaration, parameter.base_type)
+                        {
+                            return None;
+                        }
+                    }
                     if !parameter_declarations.insert(parameter.declaration)
                         || !parameter_symbols.insert(parameter.symbol)
                         || self.source_node_kind(parameter.declaration)
@@ -9903,7 +14015,34 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         || !self.contains_node_ref(parameter.annotation)
                         || self.type_payload(parameter.base_type).is_none()
                         || self.type_payload(parameter.call_type).is_none()
-                        || optional_seen && !parameter.optional
+                        || optional_seen && !parameter.optional && !rest
+                        || rest
+                            && (parameter.optional
+                                || usize::try_from(signature.min_argument_count).ok()? > index)
+                        || self
+                            .source_child_with_kind(parameter.declaration, SyntaxKind::DotDotDotToken)
+                            .is_some()
+                            != rest
+                        || rest
+                            && !super::source_overloads::default_library_overload_rest_parameter_is_exact(
+                                self,
+                                group.owner_symbol,
+                                signature.declaration,
+                                parameter.declaration,
+                                parameter.annotation,
+                                parameter.base_type,
+                                group.array_targets,
+                            )
+                            && !signature.query_evidence.as_ref().is_some_and(|evidence| {
+                                super::source_overloads::generic_global_overload_rest_parameter_is_exact(
+                                    self,
+                                    evidence,
+                                    parameter.declaration,
+                                    parameter.annotation,
+                                    parameter.base_type,
+                                    group.array_targets,
+                                )
+                            })
                     {
                         return None;
                     }
@@ -9922,6 +14061,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             )
             || !self.try_reserve_function_signature_return_annotations(signature_count)
             || !self.try_reserve_callable_signature_parameter_types(signature_count)
+            || self
+                .source_callable_type_parameters
+                .try_reserve(signature_count)
+                .is_err()
+            || self
+                .source_callable_type_queries
+                .try_reserve(signature_count)
+                .is_err()
             || !self.links.signature.try_reserve(signature_count)
             || !self.links.value_symbol.try_reserve(value_link_count)
         {
@@ -9930,19 +14077,37 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 
         let mut published = Vec::with_capacity(group_count);
         for group in prepared {
-            let type_ = self
-                .alloc_plain_object_type(
+            let members = self.symbol(group.owner_symbol).and_then(Symbol::exports);
+            let pending = self
+                .value_symbol_links(group.owner_symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|&type_| self.source_overload_identities.contains_key(&type_));
+            let type_ = if let Some(type_) = pending {
+                assert!(self.source_overload_identities.remove(&type_).is_some());
+                type_
+            } else {
+                self.alloc_plain_object_type(
                     super::types::ObjectFlags::ANONYMOUS,
                     Some(group.owner_symbol),
                 )
-                .expect("source overload owner was prevalidated");
+                .expect("source overload owner was prevalidated")
+            };
             let mut signature_ids = Vec::with_capacity(group.signatures.len());
             for signature in &group.signatures {
                 let signature_id = self
                     .alloc_signature(
                         signature.flags,
                         Some(signature.declaration),
-                        Vec::new(),
+                        signature
+                            .query_evidence
+                            .as_ref()
+                            .map_or_else(Vec::new, |evidence| {
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance.type_parameter)
+                                    .collect()
+                            }),
                         None,
                         signature
                             .parameters
@@ -9965,6 +14130,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         declaration: signature.declaration,
                         signature: *signature_id,
                         flags: signature.flags,
+                        type_parameters: signature.query_evidence.as_ref().map_or_else(
+                            Box::default,
+                            |evidence| {
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance)
+                                    .collect()
+                            },
+                        ),
                         parameters: signature
                             .parameters
                             .iter()
@@ -9977,6 +14152,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                                 base_type: parameter.base_type,
                                 call_type: parameter.call_type,
                                 optional: parameter.optional,
+                                default_parameter: parameter.default_parameter,
                             })
                             .collect(),
                         return_annotation: signature.return_annotation,
@@ -9993,7 +14169,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         SourceOverloadProvenance {
                             owner_symbol: group.owner_symbol,
                             signatures: provenance_rows,
+                            implementation: group.implementation,
                             array_targets: group.array_targets,
+                            namespace_exports: group.namespace_exports.clone(),
                         },
                     )
                     .is_none()
@@ -10014,6 +14192,25 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         .insert(*signature_id, type_)
                         .is_none()
                 );
+                if let Some(evidence) = &signature.query_evidence {
+                    assert!(
+                        self.source_callable_type_parameters
+                            .insert(
+                                *signature_id,
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance)
+                                    .collect(),
+                            )
+                            .is_none()
+                    );
+                    assert!(
+                        self.source_callable_type_queries
+                            .insert(*signature_id, Arc::clone(evidence))
+                            .is_none()
+                    );
+                }
             }
             assert!(self.set_value_symbol_links(
                 group.owner_symbol,
@@ -10022,14 +14219,20 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     ..ValueSymbolLinks::default()
                 },
             ));
-            assert!(self.set_structured_type_members(
-                type_,
-                None,
-                None,
-                Some(signature_ids.clone()),
-                None,
-                None,
-            ));
+            assert!(
+                self.set_structured_type_members(
+                    type_,
+                    members,
+                    None,
+                    Some(
+                        signature_ids
+                            [..signature_ids.len() - usize::from(group.implementation.is_some())]
+                            .to_vec()
+                    ),
+                    None,
+                    None,
+                )
+            );
             for (signature, signature_id) in group.signatures.iter().zip(&signature_ids) {
                 assert!(self.set_signature_links(
                     signature.declaration,
@@ -10038,11 +14241,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         ..SignatureLinks::default()
                     },
                 ));
-                assert!(self.set_function_signature_return_annotation(
-                    *signature_id,
-                    signature.return_annotation,
-                    signature.return_annotation_null_literal_identity,
-                ));
+                if let Some(annotation) = signature.return_annotation {
+                    assert!(self.set_function_signature_return_annotation(
+                        *signature_id,
+                        annotation,
+                        signature.return_annotation_null_literal_identity,
+                    ));
+                }
             }
             assert!(
                 self.set_callable_signature_parameter_types_batch(
@@ -10068,7 +14273,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     assert!(self.set_value_symbol_links(
                         parameter.symbol,
                         ValueSymbolLinks {
-                            resolved_type: Some(parameter.call_type),
+                            resolved_type: Some(if parameter.default_parameter.is_some() {
+                                parameter.base_type
+                            } else {
+                                parameter.call_type
+                            }),
                             ..ValueSymbolLinks::default()
                         },
                     ));
@@ -10078,7 +14287,186 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         Some(published)
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    fn relation_erasure_parameters(
+        &self,
+        original: &ValidatedSingleCallable,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Vec<TypeId>, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(self, original.owner, array_targets)
+        else {
+            return Err(invalid());
+        };
+        let mut rows = projection.call_signatures.iter()
+            .filter(|row| row.signature == original.signature);
+        let row = rows.next().ok_or_else(invalid)?;
+        if projection.owner != original.owner
+            || rows.next().is_some()
+            || row.owner != original.owner
+            || row.parameters != original.parameters
+            || row.rest_parameter != original.rest_parameter
+            || row.min_argument_count != original.min_argument_count
+            || row.strict_variance_exempt != original.strict_variance_exempt
+            || original.return_type.is_some_and(|type_| row.return_type != Some(type_))
+        {
+            return Err(invalid());
+        }
+        // A row retained by the relation can predate normal lazy return demand.
+        // None claims no return value. A claimed value must still match.
+        let source = self.signature(original.signature).ok_or_else(invalid)?;
+        if usize::try_from(source.min_argument_count()).ok() != Some(original.min_argument_count)
+            || source.parameters().len()
+                != original.parameters.len() + usize::from(original.rest_parameter.is_some())
+            || source.has_rest_parameter() != original.rest_parameter.is_some()
+        {
+            return Err(invalid());
+        }
+        let mut seen = HashSet::new();
+        for &parameter in source.type_parameters() {
+            if !seen.insert(parameter)
+                || self.type_payload(parameter).is_none_or(|record| {
+                    record.flags() != TypeFlags::TYPE_PARAMETER
+                        || !matches!(record.data(), TypeData::TypeParameter(_))
+                })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(source.type_parameters().to_vec())
+    }
+
+    fn relation_erased_signature_shape(
+        &self,
+        original: &ValidatedSingleCallable,
+        erased: SignatureId,
+        parameters: &[TypeId],
+        any: TypeId,
+    ) -> Result<TypeMapperId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let source = self.signature(original.signature).ok_or_else(invalid)?;
+        let signature = self.signature(erased).ok_or_else(invalid)?;
+        let mapper = signature.mapper().ok_or_else(invalid)?;
+        let arguments = vec![any; parameters.len()];
+        if parameters.is_empty()
+            || erased == original.signature
+            || signature.target() != Some(original.signature)
+            || signature.declaration() != source.declaration()
+            || signature.flags() != source.flags() & SignatureFlags::PROPAGATING_FLAGS
+            || signature.min_argument_count() != source.min_argument_count()
+            || signature.resolved_min_argument_count() < -1
+            || !signature.type_parameters().is_empty()
+            || signature.parameters().len() != source.parameters().len()
+            || signature.this_parameter().is_some() != source.this_parameter().is_some()
+            || signature.resolved_type_predicate().is_some()
+            || signature.isolated_signature_type().is_some()
+            || signature.composite().is_some()
+            || signature.resolved_return_type()
+                .is_some_and(|type_| self.type_payload(type_).is_none())
+            || self.type_mapper_has_exact_endpoints(mapper, parameters, &arguments) != Some(true)
+            || self.callable_signature_parameter_types(erased).is_some()
+        {
+            return Err(invalid());
+        }
+        let mut symbols = HashSet::new();
+        for (&source_symbol, &erased_symbol) in source.parameters().iter()
+            .zip(signature.parameters())
+        {
+            if !symbols.insert(erased_symbol)
+                || !self.instantiated_signature_symbol_matches(source_symbol, erased_symbol, mapper)
+                || self.value_symbol_links(erased_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|type_| self.type_payload(type_).is_none())
+            {
+                return Err(invalid());
+            }
+        }
+        if let (Some(source_symbol), Some(erased_symbol)) =
+            (source.this_parameter(), signature.this_parameter())
+        {
+            if !symbols.insert(erased_symbol)
+                || !self.instantiated_signature_symbol_matches(source_symbol, erased_symbol, mapper)
+                || self.value_symbol_links(erased_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|type_| self.type_payload(type_).is_none())
+            {
+                return Err(invalid());
+            }
+        }
+        // Slot values and the resolved minimum need selected-edge replay.
+        // This check proves their owner and shape, not their mapped result.
+        Ok(mapper)
+    }
+
+    pub(super) fn validate_relation_erased_signature(
+        &self,
+        original: &ValidatedSingleCallable,
+        erased: SignatureId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<TypeMapperId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let parameters = self.relation_erasure_parameters(original, array_targets)?;
+        let any = self.intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?.any_type;
+        if self.source_overload_erased_signature(original.signature) != Some(erased)
+            || self.source_overload_erased_signatures.iter().any(|(&target, &value)| {
+                value == erased && target != original.signature
+            })
+            || self.cached_signatures.values().any(|entry| entry.instantiated == erased)
+        {
+            return Err(invalid());
+        }
+        self.relation_erased_signature_shape(original, erased, &parameters, any)
+    }
+
+    pub(super) fn get_or_create_relation_erased_signature(
+        &mut self,
+        original: &ValidatedSingleCallable,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<SignatureId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let parameters = self.relation_erasure_parameters(original, array_targets)?;
+        if parameters.is_empty() {
+            return Ok(original.signature);
+        }
+        if let Some(erased) = self.source_overload_erased_signature(original.signature) {
+            self.validate_relation_erased_signature(original, erased, array_targets)?;
+            return Ok(erased);
+        }
+        let any = self.intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?.any_type;
+        if !self.try_reserve_source_overload_erased_signatures(1)
+            || !self.try_reserve_mappers(1)
+        {
+            return Err(RelationUnavailable::UnionValidationCapacity(original.owner));
+        }
+        let arguments = vec![any; parameters.len()];
+        let mapper = self.new_type_mapper(parameters.clone(), arguments).ok_or_else(invalid)?;
+        let erased = self.instantiate_signature_ex(original.signature, mapper, true)
+            .map_err(|error| match error {
+                super::signatures::SignatureInstantiationError::Capacity(_) => {
+                    RelationUnavailable::UnionValidationCapacity(original.owner)
+                }
+                _ => invalid(),
+            })?;
+        self.relation_erased_signature_shape(original, erased, &parameters, any)?;
+        if self.cached_signatures_contain(erased) != Some(false) {
+            return Err(invalid());
+        }
+        // Publish the shell only after its header, mapper, and symbols are proven.
+        self.source_overload_erased_signatures.insert(original.signature, erased);
+        if self.relation_signature_is_observable(original.signature) {
+            self.mark_relation_inputs_dirty();
+        }
+        self.validate_relation_erased_signature(original, erased, array_targets)?;
+        Ok(erased)
+    }
+}
+
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn try_reserve_properties_type_cache(&mut self, additional: usize) -> bool {
         self.properties_types.try_reserve(additional).is_ok()
     }
@@ -10130,11 +14518,119 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         type_: TypeId,
     ) -> Option<&DirectInterfaceHeritageProvenance> {
         self.observe_relation_type_read(type_);
-        self.direct_interface_heritage_provenance.get(&type_)
+        match self.direct_interface_heritage_provenance.get(&type_)? {
+            DirectInterfaceHeritageState::Header(_) => None,
+            DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+        }
+    }
+
+    /// Returns stored source evidence. The caller must validate it before use.
+    pub(super) fn source_interface_heritage_header(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceInterfaceHeritageHeader> {
+        self.observe_relation_type_read(type_);
+        match self.direct_interface_heritage_provenance.get(&type_)? {
+            DirectInterfaceHeritageState::Header(header) => Some(header),
+            DirectInterfaceHeritageState::Complete(provenance) => provenance.source.as_ref(),
+        }
+    }
+
+    /// The declared query owns this proof. Reads must recheck its source and links.
+    pub(super) fn source_ambient_class_heritage(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceAmbientClassHeritage> {
+        self.observe_relation_type_read(type_);
+        self.source_ambient_class_heritages.get(&type_)
+    }
+
+    pub(super) fn try_reserve_source_ambient_class_heritages(&mut self, additional: usize) -> bool {
+        self.source_ambient_class_heritages
+            .try_reserve(additional)
+            .is_ok()
     }
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn try_reserve_proxy_interface_method_signature_owners(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.proxy_interface_method_signature_owners
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    /// This owner survives changes to the copy's target, mapper, and parameters.
+    pub(super) fn proxy_interface_method_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.proxy_interface_method_signature_owners
+            .get(&signature)
+            .copied()
+    }
+
+    /// Only the member proxy producer records its completed callable.
+    pub(super) fn publish_proxy_interface_method_signature_owners(
+        &mut self,
+        callable: TypeId,
+        signatures: &[SignatureId],
+    ) -> bool {
+        if signatures.is_empty()
+            || self
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                != Some(signatures)
+            || signatures.iter().enumerate().any(|(index, signature)| {
+                signatures[..index].contains(signature)
+                    || self.signature(*signature).is_none()
+                    || self
+                        .proxy_interface_method_signature_owners
+                        .contains_key(signature)
+                    || self
+                        .published_interface_method_signature_owners
+                        .contains_key(signature)
+            })
+        {
+            return false;
+        }
+        for &signature in signatures {
+            self.proxy_interface_method_signature_owners
+                .insert(signature, callable);
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn proxy_interface_method_signature_owner_len(&self) -> usize {
+        self.proxy_interface_method_signature_owners.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_proxy_interface_method_type_for_signature_for_test(
+        &mut self,
+        signature: SignatureId,
+        callable: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let previous = match callable {
+            Some(callable) => self
+                .proxy_interface_method_signature_owners
+                .insert(signature, callable),
+            None => self
+                .proxy_interface_method_signature_owners
+                .remove(&signature),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     pub(super) fn try_reserve_published_interface_method_origins(
         &mut self,
         signature_count: usize,
@@ -10517,9 +15013,13 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             return false;
         }
         let relation_dirty = self.relation_signature_is_observable(signature);
-        let previous = self
-            .callable_signature_parameter_types
-            .insert(signature, parameter_types);
+        let previous = self.callable_signature_parameter_types.insert(
+            signature,
+            CallableSignatureParameterTypes {
+                this_type: None,
+                parameters: parameter_types,
+            },
+        );
         assert!(
             previous.is_none(),
             "the partial construct parameter list was absent"
@@ -10530,13 +15030,50 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         true
     }
 
-    /// Checks mapped Array.sort callbacks before storing their source identity.
+    /// Checks mapped callbacks and contextual arrows before storing their source identity.
     #[allow(clippy::too_many_lines)] // The callee, source parameters, and mapped target form one proof.
     pub(super) fn set_contextual_source_callable_provenance(
         &mut self,
         type_: TypeId,
         provenance: &SourceCallableProvenance,
     ) -> bool {
+        let promise_target_is_exact = provenance.family == SourceCallableFamily::ArrowFunction
+            && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+            && provenance.contextual_variable.is_none()
+            && provenance.captured_assignment.is_none()
+            && provenance.contextual_target.is_some_and(|target| {
+                target != type_
+                    && super::source_callables::stored_promise_executor_callable_is_exact(
+                        self, provenance.declaration, provenance.owner_symbol,
+                        provenance.signature, target,
+                    )
+            });
+        let expression_target_is_exact = provenance.family == SourceCallableFamily::ArrowFunction
+            && provenance.contextual_variable.is_none()
+            && provenance.captured_assignment.is_none()
+            && provenance.contextual_target.is_some_and(|target| {
+                target != type_
+                    && super::source_callables::stored_expression_arrow_context_is_exact(
+                        self,
+                        provenance.declaration,
+                        provenance.owner_symbol,
+                        target,
+                    )
+            });
+        let binding_default_target_is_exact =
+            provenance.family == SourceCallableFamily::ArrowFunction
+                && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                && provenance.contextual_variable.is_none()
+                && provenance.captured_assignment.is_none()
+                && provenance.contextual_target.is_some_and(|target| {
+                    target != type_
+                        && super::source_callables::stored_object_parameter_default_arrow_is_exact(
+                            self,
+                            provenance.declaration,
+                            provenance.owner_symbol,
+                            target,
+                        )
+                });
         let sort_target_is_exact = (|| {
             let target = provenance.contextual_target?;
             let SourceNodeParent::Parent(call) = self.source_node_parent(provenance.declaration)?
@@ -10642,7 +15179,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             Some(())
         })()
         .is_some();
-        if sort_target_is_exact {
+        if promise_target_is_exact
+            || expression_target_is_exact
+            || binding_default_target_is_exact
+            || sort_target_is_exact
+        {
             self.set_source_callable_provenance_with_context(type_, provenance, true)
         } else {
             self.set_source_callable_provenance(type_, provenance)
@@ -10831,7 +15372,93 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         Some(late)
     }
 
+    /// Retains the base proof after the canonical interface identity is initialized.
+    pub(super) fn publish_source_ambient_class_heritage(
+        &mut self,
+        type_: TypeId,
+        proof: SourceAmbientClassHeritage,
+    ) -> bool {
+        if proof.validate_current(self, type_).is_err() {
+            return false;
+        }
+        if let Some(previous) = self.source_ambient_class_heritages.get(&type_) {
+            return previous == &proof;
+        }
+        self.source_ambient_class_heritages.insert(type_, proof);
+        if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    /// Publishes only a host-proved source header, without member or result flags.
+    pub(super) fn publish_source_interface_heritage_header(
+        &mut self,
+        type_: TypeId,
+        header: SourceInterfaceHeritageHeader,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.publish_source_interface_heritage_header_with_query_context(
+            type_,
+            header,
+            array_targets,
+            None,
+        )
+    }
+
+    pub(super) fn publish_source_interface_heritage_header_with_query_context(
+        &mut self,
+        type_: TypeId,
+        header: SourceInterfaceHeritageHeader,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+    ) -> bool {
+        if super::interface_heritage::validate_source_interface_heritage_header_with_query_context(
+            self,
+            type_,
+            &header,
+            array_targets,
+            query,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if let Some(state) = self.direct_interface_heritage_provenance.get(&type_) {
+            // Replaying a header grants no authority over a completed result.
+            return match state {
+                DirectInterfaceHeritageState::Header(previous) => previous == &header,
+                DirectInterfaceHeritageState::Complete(provenance) => {
+                    provenance.source.as_ref() == Some(&header)
+                }
+            };
+        }
+        if !self.try_reserve_direct_interface_heritage_provenance(1) {
+            return false;
+        }
+        self.direct_interface_heritage_provenance
+            .insert(type_, DirectInterfaceHeritageState::Header(header));
+        if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    /// Keeps the legacy direct-interface publication path unchanged.
+    pub(super) fn publish_direct_interface_heritage_provenance(
+        &mut self,
+        type_: TypeId,
+        provenance: DirectInterfaceHeritageProvenance,
+    ) -> bool {
+        self.publish_direct_interface_heritage_provenance_with_array_targets(
+            type_, provenance, None, None,
+        )
+    }
+
     /// Publishes ordered source-planned direct-base edges exactly once.
+    ///
+    /// An alias record upgrades only its exact header after real base queries.
+    /// The borrowed query proof is checked here and is not stored.
     ///
     /// Callers stage the edge list and reserve the map slot before mutation.
     /// Every declared-type link is authoritative by the time heritage members
@@ -10840,11 +15467,38 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// property-only interface. Repeated bases require the exact nongeneric
     /// source sequence. More than two edges require nongeneric identities.
     #[allow(clippy::too_many_lines)] // Keep every edge proof before the single publication.
-    pub(super) fn publish_direct_interface_heritage_provenance(
+    pub(super) fn publish_direct_interface_heritage_provenance_with_array_targets(
         &mut self,
         type_: TypeId,
         provenance: DirectInterfaceHeritageProvenance,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
     ) -> bool {
+        if let Some(source) = provenance.source.as_ref() {
+            if !matches!(self.direct_interface_heritage_provenance.get(&type_),
+                Some(DirectInterfaceHeritageState::Header(header)) if header == source)
+                || self
+                    .type_payload(type_)
+                    .is_none_or(|record| record.symbol() != Some(provenance.owner_symbol))
+                || validate_source_interface_heritage_complete_bases(
+                    self,
+                    type_,
+                    source,
+                    &provenance.bases,
+                    array_targets,
+                    query,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.direct_interface_heritage_provenance
+                .insert(type_, DirectInterfaceHeritageState::Complete(provenance));
+            if self.relation_type_is_observable(type_) {
+                self.mark_relation_inputs_dirty();
+            }
+            return true;
+        }
         let Some(&(first_symbol, first_type)) = provenance.bases.first() else {
             return false;
         };
@@ -10904,47 +15558,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 && base_symbol != first_symbol
                 && base_type != type_
                 && base_type != first_type
-                && self.get_merged_symbol(base_symbol) == Some(base_symbol)
-                && self
-                    .declared_type_links(base_symbol)
-                    .is_some_and(|links| links.declared_type == Some(base_type))
-                && self.type_payload(base_type).is_some_and(|record| {
-                    let TypeData::Interface(interface) = record.data() else {
-                        return false;
-                    };
-                    let structured = &interface.reference.object.structured;
-                    record.flags() == TypeFlags::OBJECT
-                        && record.object_flags()
-                            == super::types::ObjectFlags::INTERFACE
-                                | super::types::ObjectFlags::MEMBERS_RESOLVED
-                        && record.symbol() == Some(base_symbol)
-                        && record.alias().is_none()
-                        && self.symbol(base_symbol).is_some_and(|symbol| {
-                            (symbol.flags() == SymbolFlags::INTERFACE
-                                || super::object_members::authenticated_nongeneric_global_interface_owner(
-                                    self,
-                                    base_symbol,
-                                ))
-                                && symbol.members() == interface.declared_members
-                        })
-                        && interface.all_type_parameters.is_none()
-                        && interface.outer_type_parameter_count == 0
-                        && interface.this_type.is_none()
-                        && interface.reference.object.target.is_none()
-                        && interface.reference.object.mapper.is_none()
-                        && interface.reference.object.instantiations == TypeCacheState::Unallocated
-                        && interface.reference.node.is_none()
-                        && interface.reference.resolved_type_arguments.is_none()
-                        && interface.base_types_resolved
-                        && interface.declared_members_resolved
-                        && interface.resolved_base_constructor_type.is_none()
-                        && interface.declared_call_signatures.is_none()
-                        && interface.declared_construct_signatures.is_none()
-                        && interface.declared_index_infos.is_none()
-                        && structured.signatures.is_none()
-                        && structured.call_signature_count == 0
-                        && structured.index_infos.is_none()
-                });
+                && super::structured_members::distinct_later_interface_base_is_supported(
+                    self,
+                    base_symbol,
+                    base_type,
+                );
             if !distinct_base_is_exact || !distinct_types.insert(base_type) {
                 return false;
             }
@@ -10965,7 +15583,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         else {
             return false;
         };
-        entry.insert(provenance);
+        entry.insert(DirectInterfaceHeritageState::Complete(provenance));
         if self.relation_type_is_observable(type_) {
             self.mark_relation_inputs_dirty();
         }
@@ -11232,6 +15850,43 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .is_ok()
     }
 
+    pub(super) fn begin_source_class_annotation_scope(
+        &mut self,
+        instance: TypeId,
+        scope: SourceClassAnnotationScope,
+    ) -> bool {
+        if self.source_class_annotation_scopes.contains_key(&instance)
+            || self.source_class_annotation_scopes.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.source_class_annotation_scopes.insert(instance, scope);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    pub(super) fn source_class_annotation_scope(
+        &self,
+        instance: TypeId,
+    ) -> Option<&SourceClassAnnotationScope> {
+        self.observe_relation_type_read(instance);
+        self.source_class_annotation_scopes.get(&instance)
+    }
+
+    pub(super) fn end_source_class_annotation_scope(&mut self, instance: TypeId) -> bool {
+        if self
+            .source_class_annotation_scopes
+            .remove(&instance)
+            .is_none()
+        {
+            return false;
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
     pub(super) fn source_class_provenance(
         &self,
         instance: TypeId,
@@ -11388,6 +16043,26 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
     }
 
+    /// Selects full source validation even after class links are removed.
+    pub(super) fn has_direct_class_heritage_claim_for_symbol(
+        &self,
+        owner: SemanticSymbolId,
+    ) -> bool {
+        self.direct_class_heritage_provenance
+            .iter()
+            .any(|(instance, provenance)| {
+                provenance.owner_symbol == owner
+                    || self
+                        .types
+                        .get(*instance)
+                        .is_some_and(|record| record.symbol() == Some(owner))
+                    || self
+                        .types
+                        .get(provenance.owner_value_type)
+                        .is_some_and(|record| record.symbol() == Some(owner))
+            })
+    }
+
     pub(super) fn direct_class_heritage_provenance(
         &self,
         instance_type: TypeId,
@@ -11397,7 +16072,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .get(&instance_type)
             .copied()
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes the exact instance/value split selected by one direct class
     /// heritage plan. All five identities must already be authoritative.
     pub(super) fn publish_direct_class_heritage_provenance(
@@ -11438,8 +16115,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if provenance.owner_symbol == provenance.base_symbol
             || !exact_class_instance(self, instance_type, provenance.owner_symbol)
             || !exact_class_value(self, provenance.owner_value_type, provenance.owner_symbol)
-            || !exact_class_instance(self, provenance.base_instance_type, provenance.base_symbol)
-            || !exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
+            || !(exact_class_instance(self, provenance.base_instance_type, provenance.base_symbol)
+                && exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
+                || super::classes::source_constructor_heritage_is_exact(
+                    self,
+                    instance_type,
+                    provenance,
+                ))
         {
             return false;
         }
@@ -11468,6 +16150,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         &mut self,
         prepared: PreparedSourceGenericCallablePublication<'_>,
     ) -> Option<(TypeId, SignatureId)> {
+        let written_this =
+            super::source_callables::source_callable_this_parameter(self, prepared.declaration)
+                .ok()?;
+        if prepared.this_parameter != written_this.map(|parameter| parameter.symbol)
+            || prepared.this_parameter.is_some_and(|parameter| {
+                parameter == prepared.owner_symbol
+                    || prepared.parameters.contains(&parameter)
+                    || self
+                        .value_symbol_links(parameter)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+        {
+            return None;
+        }
         let next_signature_local =
             NonZeroU32::new(u32::try_from(self.signature_len().checked_add(1)?).ok()?)?;
         let next_signature =
@@ -11618,16 +16314,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     .source_callable_alias_owners
                     .contains_key(&alias.owner())
                 && (prepared.return_annotation == Some(alias.owner_annotation())
-                    || prepared.parameters.iter().any(|parameter| {
-                        self.symbol(*parameter)
-                            .and_then(Symbol::value_declaration)
-                            .is_some_and(|declaration| {
-                                self.source_return_annotation_belongs_to(
-                                    declaration,
-                                    alias.owner_annotation(),
-                                )
-                            })
-                    }))
+                    || prepared
+                        .parameters
+                        .iter()
+                        .chain(prepared.this_parameter.iter())
+                        .any(|parameter| {
+                            self.symbol(*parameter)
+                                .and_then(Symbol::value_declaration)
+                                .is_some_and(|declaration| {
+                                    self.source_return_annotation_belongs_to(
+                                        declaration,
+                                        alias.owner_annotation(),
+                                    )
+                                })
+                        }))
                 && (alias.owner() == prepared.owner_symbol && alias.has_cold_value(self)
                     || prepared
                         .syntax
@@ -11756,7 +16456,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             .iter()
             .map(|row| row.provenance.type_parameter)
             .collect::<Vec<_>>();
-        let value_link_reservations = prepared.parameters.len().checked_add(1)?;
+        let value_link_reservations = prepared
+            .parameters
+            .len()
+            .checked_add(usize::from(prepared.this_parameter.is_some()))?
+            .checked_add(1)?;
         if !self.try_reserve_types(1)
             || !self.try_reserve_signatures(1)
             || !self.try_reserve_source_callable_provenance(1)
@@ -11788,7 +16492,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 prepared.flags,
                 Some(prepared.declaration),
                 type_parameter_ids,
-                None,
+                prepared.this_parameter,
                 prepared.parameters,
                 None,
                 None,
@@ -11937,6 +16641,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             || plan.type_parameter_syntax.as_ref() != prepared.syntax
             || evidence.type_parameters() != prepared.type_parameters.as_slice()
             || evidence.base_constraints().len() != prepared.type_parameters.len()
+            || plan.this_parameter.map(|parameter| parameter.symbol) != prepared.this_parameter
             || !plan
                 .parameters
                 .iter()
@@ -13318,6 +18023,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         )
     }
 
+    pub(super) fn is_interface_base_resolution_active(&self, type_: TypeId) -> bool {
+        self.type_resolutions.contains(
+            TypeResolutionTarget::Type(type_),
+            TypeSystemPropertyName::ResolvedBaseTypes,
+        )
+    }
+
     fn validate_canonical_resolution_target(
         &self,
         target: TypeResolutionTarget,
@@ -13490,6 +18202,1220 @@ fn canonical_type_resolution_property(
 }
 
 #[cfg(test)]
+#[path = "store_exported_interface_method_tests.rs"]
+mod exported_interface_method_tests;
+
+#[cfg(test)]
+mod source_global_owner_tests {
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::{DirectInterfaceHeritageProvenance, DirectInterfaceHeritageState};
+    use crate::semantic::{
+        CacheHashKey, CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+        DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData,
+        array_types::CanonicalArrayTargets,
+        constructor_values::plan_global_constructor_value,
+        interface_heritage::validate_source_interface_heritage_header,
+        links::TypeNodeLinks,
+        production::GlobalMergeCompletion,
+        relation::{RelationComparisonResult, RelationKind},
+        types::ObjectFlags,
+    };
+
+    #[derive(Clone, Copy)]
+    enum SourceKind {
+        Library,
+        ExternalDeclarations,
+        Script,
+    }
+
+    fn options() -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_function_types: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        }
+    }
+
+    fn context<'a>(
+        sources: &[(&'a ParseResult, FileId, SourceKind)],
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for &(parsed, file, kind) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/owner-proof-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        !matches!(kind, SourceKind::Script),
+                        matches!(kind, SourceKind::Library),
+                        if matches!(kind, SourceKind::ExternalDeclarations) {
+                            CanonicalModuleState::External
+                        } else {
+                            CanonicalModuleState::Script
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for &(parsed, file, _) in sources {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .iter()
+                .map(|(parsed, file, _)| (*file, &parsed.arena))
+                .collect(),
+            options(),
+        )
+        .unwrap()
+    }
+
+    fn global(store: &CanonicalTypeMapperStore, name: &str) -> SemanticSymbolId {
+        store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source(name)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap()
+    }
+
+    fn variable_annotation(parsed: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both parsed library kinds and damaged cache checks on the same method.
+    fn parsed_global_methods_use_complete_declared_ownership() {
+        use crate::semantic::{
+            callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+            links::ValueSymbolLinks,
+        };
+
+        for kind in [SourceKind::Script, SourceKind::Library] {
+            let parsed = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Object {} interface Function {} ",
+                "interface CallableFunction {} interface NewableFunction {} ",
+                "interface IArguments {} interface Boolean {} interface RegExp {} ",
+                "interface String {} interface Number { toFixed(digits?: number): string } ",
+                "declare const wrapper: Number;",
+            ));
+            let file = FileId::new(286_099);
+            let mut checker = context(&[(&parsed, file, kind)]);
+            let annotation = variable_annotation(&parsed, file, "wrapper");
+            let wrapper = checker.get_type_from_type_node(annotation).unwrap();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let bound_method = checker.file(file).unwrap().1.symbol(declaration).unwrap();
+            let store = checker.store_mut_for_test();
+            assert_eq!(
+                store.source_is_default_library_declaration(declaration),
+                matches!(kind, SourceKind::Library)
+            );
+            assert_eq!(
+                store.authenticated_interface_method_owner(bound_method),
+                Some((global(store, "Number"), wrapper))
+            );
+            let signature = store
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let callable = store
+                .value_symbol_links(bound_method)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                store.interface_method_linked_type(signature),
+                Some(callable)
+            );
+            assert_eq!(store.global_interface_method_linked_type(signature), None);
+            assert!(store.signature_owns_callable_type(signature));
+            let parameter = store.signature(signature).unwrap().parameters()[0];
+            assert_eq!(
+                store.symbol(parameter).unwrap().name().as_utf8(),
+                Some("digits")
+            );
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (number, string, undefined) = (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+            );
+            let optional = bootstrap.cached_optional_parameter_type(number).unwrap();
+            let TypeData::Union(union) = store.type_payload(optional).unwrap().data() else {
+                panic!("the strict optional parameter must retain its union")
+            };
+            assert_eq!(union.union.types.len(), 2);
+            assert!(union.union.types.contains(&number));
+            assert!(union.union.types.contains(&undefined));
+            assert_eq!(
+                store.callable_signature_parameter_types(signature),
+                Some([optional].as_slice())
+            );
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, callable)
+            else {
+                panic!("the complete parsed method proof must validate")
+            };
+            assert_eq!(projection.owner, callable);
+            assert!(projection.construct_signatures.is_empty());
+            assert_eq!(projection.call_signatures.len(), 1);
+            let projected = &projection.call_signatures[0];
+            assert_eq!(projected.signature, signature);
+            assert_eq!(projected.parameters, [optional]);
+            assert_eq!(projected.min_argument_count, 0);
+            assert_eq!(projected.return_type, Some(string));
+
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            for wrong in [number, string] {
+                assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                assert!(!store.signature_owns_callable_type(signature));
+                assert!(matches!(
+                    validate_stored_callable_set(store, callable),
+                    StoredCallableSetValidation::Malformed { .. }
+                ));
+                assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(optional),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                assert!(store.signature_owns_callable_type(signature));
+                assert!(matches!(
+                    validate_stored_callable_set(store, callable),
+                    StoredCallableSetValidation::Valid { .. }
+                ));
+            }
+            assert!(store.set_type_symbol(callable, Some(global(store, "Number"))));
+            assert!(!store.signature_owns_callable_type(signature));
+            assert!(!matches!(
+                validate_stored_callable_set(store, callable),
+                StoredCallableSetValidation::Valid { .. }
+            ));
+            assert!(store.set_type_symbol(callable, Some(bound_method)));
+            assert!(store.signature_owns_callable_type(signature));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert_eq!(checker.get_type_from_type_node(annotation), Ok(wrapper));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both cache states retain every nested owner through damage and restoration.
+    fn nested_global_constructor_owners_reject_changed_source_and_export_edges() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Vessel { browser: number; } ",
+            "declare var Vessel: { prototype: Vessel; new(): Vessel; };",
+        ));
+        let nested = parse_source_file(concat!(
+            "declare module 'vessel-provider' { ",
+            "global { interface Vessel { server: string; } ",
+            "var Vessel: typeof globalThis extends { onmessage: any; Vessel: infer T } ? T : never; } }",
+        ));
+        let companion =
+            parse_source_file("declare module 'vessel-provider' { interface Extra {} }");
+        let files = [
+            (&library, FileId::new(286_100), true),
+            (&nested, FileId::new(286_101), false),
+            (&companion, FileId::new(286_102), false),
+        ];
+        for warm in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            for &(parsed, file, is_library) in &files {
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"/nested-owner-{}.d.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            true,
+                            is_library,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut checker = CanonicalCheckerContext::new(
+                binder.finish(),
+                files
+                    .iter()
+                    .map(|(parsed, file, _)| (*file, &parsed.arena))
+                    .collect(),
+                options(),
+            )
+            .unwrap();
+            let bounds = files
+                .iter()
+                .map(|(_, file, _)| checker.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bounds)
+                    .map(|((parsed, _, _), bound)| (&parsed.arena, bound)),
+                GlobalMergeCompletion::for_test(options().name_resolution),
+            )
+            .unwrap();
+            let globals = checker.global_types().clone();
+            let owner = global(checker.store(), "Vessel");
+            let proof = checker
+                .store()
+                .source_global_interface_value_owner(owner)
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.interfaces().len(), 2);
+            assert_eq!(proof.variables().len(), 2);
+            assert_eq!(proof.value_declaration().file, files[0].1);
+            let plan =
+                plan_global_constructor_value(checker.store(), &host, &globals, options(), owner)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(plan.value_annotation(), proof.value_annotation());
+            if warm {
+                checker
+                    .get_type_from_type_node(proof.value_annotation())
+                    .unwrap();
+            }
+            let store = checker.store_mut_for_test();
+            let pristine_plan =
+                plan_global_constructor_value(store, &host, &globals, options(), owner)
+                    .unwrap()
+                    .unwrap();
+            let origin = *store
+                .source_global_bindings
+                .as_ref()
+                .unwrap()
+                .interface_augmentations
+                .get(&proof.interfaces()[1])
+                .unwrap();
+            let raw = origin.raw_symbol.unwrap();
+            let local = origin.local_symbol.unwrap();
+            let namespace = origin.namespace.unwrap();
+            let outer_block = store
+                .source_node_fact(origin.module)
+                .unwrap()
+                .parent
+                .unwrap();
+            let outer = store
+                .source_node_fact(NodeRef::new(
+                    origin.module.arena,
+                    origin.module.file,
+                    outer_block,
+                ))
+                .unwrap()
+                .parent
+                .unwrap();
+            let outer = NodeRef::new(origin.module.arena, origin.module.file, outer);
+            let outer_owner = store.source_declaration_symbol(outer).unwrap();
+            assert_ne!(bounds[1].symbol(outer).unwrap(), outer_owner);
+            assert_eq!(
+                store
+                    .symbol(outer_owner)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let module_parent = store.source_node_fact(origin.module).unwrap().parent;
+            let outer_parent = store.source_node_fact(outer).unwrap().parent;
+            let outer_record = store.symbol(outer_owner).unwrap().clone();
+            let raw_record = store.symbol(raw).unwrap().clone();
+            let local_record = store.symbol(local).unwrap().clone();
+            let namespace_record = store.symbol(namespace).unwrap().clone();
+            let exports = namespace_record.exports().unwrap();
+            let global_table = proof.globals_table();
+            let outer_table_symbol = store
+                .symbol_table(global_table)
+                .unwrap()
+                .get(outer_record.name())
+                .unwrap();
+            let merge_target = store.merged_symbols.get(&raw).copied().unwrap();
+            let saved_links = store.type_node_links(proof.value_annotation()).cloned();
+            let unselected = store
+                .source_direct_type_annotation(proof.variables()[1])
+                .unwrap();
+            assert!(store.type_node_links(unselected).is_none());
+            // Setters invalidate maintenance caches. Keep that state fixed during each read.
+            store.mark_relation_inputs_dirty();
+            store.mark_union_cache_validation_dirty();
+            let baseline = format!("{store:?}");
+            for damage in 0..10 {
+                let type_links = store.links.type_node.checkpoint();
+                match damage {
+                    0 => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .parent = Some(origin.source.node)
+                    }
+                    1 => {
+                        store.source_node_facts.get_mut(&outer.arena).unwrap()[outer.node.index()]
+                            .as_mut()
+                            .unwrap()
+                            .parent = Some(outer_block)
+                    }
+                    2 => assert!(store.set_symbol_relationships(
+                        raw,
+                        raw_record.members(),
+                        raw_record.exports(),
+                        Some(outer_owner),
+                        raw_record.export_symbol()
+                    )),
+                    3 => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        Some(owner)
+                    )),
+                    4 => {
+                        assert_eq!(
+                            store.insert_symbol(exports, EscapedName::source("Vessel"), owner),
+                            Some(Some(raw))
+                        );
+                    }
+                    5 => {
+                        store.merged_symbols.insert(raw, outer_owner);
+                    }
+                    6 => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                global_table,
+                                outer_record.name().to_owned(),
+                                namespace
+                            ),
+                            Some(Some(outer_table_symbol))
+                        );
+                    }
+                    7 => assert!(store.set_symbol_relationships(
+                        namespace,
+                        namespace_record.members(),
+                        namespace_record.exports(),
+                        Some(outer_owner),
+                        namespace_record.export_symbol()
+                    )),
+                    8 => assert!(store.set_type_node_links(
+                        proof.value_annotation(),
+                        TypeNodeLinks {
+                            resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                            ..saved_links.clone().unwrap_or_default()
+                        }
+                    )),
+                    9 => assert!(store.set_symbol_declarations(
+                        outer_owner,
+                        outer_record.declarations().map(<[NodeRef]>::to_vec),
+                        None
+                    )),
+                    _ => unreachable!(),
+                }
+                let damaged = format!("{store:?}");
+                for _ in 0..2 {
+                    if damage == 8 {
+                        proof.validate_current(store).unwrap();
+                    } else {
+                        assert!(
+                            proof.validate_current(store).is_err(),
+                            "warm={warm}, damage={damage}"
+                        );
+                    }
+                    assert!(
+                        plan_global_constructor_value(store, &host, &globals, options(), owner)
+                            .is_err(),
+                        "warm={warm}, damage={damage}"
+                    );
+                    assert_eq!(format!("{store:?}"), damaged);
+                }
+                match damage {
+                    0 => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .parent = module_parent
+                    }
+                    1 => {
+                        store.source_node_facts.get_mut(&outer.arena).unwrap()[outer.node.index()]
+                            .as_mut()
+                            .unwrap()
+                            .parent = outer_parent
+                    }
+                    2 => assert!(store.set_symbol_relationships(
+                        raw,
+                        raw_record.members(),
+                        raw_record.exports(),
+                        raw_record.parent(),
+                        raw_record.export_symbol()
+                    )),
+                    3 => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        local_record.export_symbol()
+                    )),
+                    4 => {
+                        assert_eq!(
+                            store.insert_symbol(exports, EscapedName::source("Vessel"), raw),
+                            Some(Some(owner))
+                        );
+                    }
+                    5 => {
+                        store.merged_symbols.insert(raw, merge_target);
+                    }
+                    6 => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                global_table,
+                                outer_record.name().to_owned(),
+                                outer_table_symbol
+                            ),
+                            Some(Some(namespace))
+                        );
+                    }
+                    7 => assert!(store.set_symbol_relationships(
+                        namespace,
+                        namespace_record.members(),
+                        namespace_record.exports(),
+                        namespace_record.parent(),
+                        namespace_record.export_symbol()
+                    )),
+                    8 => {
+                        assert!(store.links.type_node.restore_checkpoint(type_links));
+                    }
+                    9 => assert!(store.set_symbol_declarations(
+                        outer_owner,
+                        outer_record.declarations().map(<[NodeRef]>::to_vec),
+                        outer_record.value_declaration()
+                    )),
+                    _ => unreachable!(),
+                }
+                proof.validate_current(store).unwrap();
+                assert_eq!(
+                    plan_global_constructor_value(store, &host, &globals, options(), owner)
+                        .unwrap(),
+                    Some(pristine_plan.clone())
+                );
+                assert_eq!(format!("{store:?}"), baseline);
+                assert!(store.type_node_links(unselected).is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mixed_global_owner_metadata_keeps_generic_headers_and_rejects_changed_sources() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Packet<T = string> { item: T; } ",
+            "declare var Packet: { prototype: Packet; new(): Packet; }; ",
+            "interface Plain { item: number; } ",
+            "declare var Plain: { prototype: Plain; values: number[]; new(): Plain; }; ",
+            "interface TypeOnly {} declare var ValueOnly: number;",
+        ));
+        let augmentation = parse_source_file(concat!(
+            "export {}; declare global { ",
+            "interface Packet<T = string> { node: T; } ",
+            "var Packet: typeof globalThis extends { onmessage: any; Packet: infer T } ? T : never; ",
+            "var Plain: typeof globalThis extends { onmessage: any; Plain: infer T } ? T : never; }",
+        ));
+        let script = parse_source_file("interface Packet<T = string> { user: boolean; }");
+        let library_file = FileId::new(285_010);
+        let augmentation_file = FileId::new(285_011);
+        let script_file = FileId::new(285_012);
+        let sources = [
+            (
+                &augmentation,
+                augmentation_file,
+                SourceKind::ExternalDeclarations,
+            ),
+            (&library, library_file, SourceKind::Library),
+            (&script, script_file, SourceKind::Script),
+        ];
+        let mut checker = context(&sources);
+        let bounds = sources
+            .iter()
+            .map(|(_, file, _)| checker.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .iter()
+                .zip(&bounds)
+                .map(|((parsed, _, _), bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options().name_resolution),
+        )
+        .unwrap();
+        let globals = checker.global_types().clone();
+        let [owner, plain, other, value_only] =
+            ["Packet", "Plain", "TypeOnly", "ValueOnly"].map(|name| global(checker.store(), name));
+        let proof = checker
+            .store()
+            .source_global_interface_value_owner(owner)
+            .unwrap()
+            .unwrap();
+        let plain_proof = checker
+            .store()
+            .source_global_interface_value_owner(plain)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.symbol(), owner);
+        assert_eq!(proof.globals_table(), checker.globals());
+        assert_eq!(
+            proof
+                .declarations()
+                .iter()
+                .map(|node| node.file)
+                .collect::<Vec<_>>(),
+            [
+                library_file,
+                library_file,
+                script_file,
+                augmentation_file,
+                augmentation_file
+            ]
+        );
+        assert_eq!(
+            proof.interfaces(),
+            &[
+                proof.declarations()[0],
+                proof.declarations()[2],
+                proof.declarations()[3]
+            ]
+        );
+        assert_eq!(
+            proof.variables(),
+            &[proof.declarations()[1], proof.declarations()[4]]
+        );
+        assert_eq!(proof.value_declaration(), proof.variables()[0]);
+        assert_eq!(plain_proof.variables().len(), 2);
+        assert_eq!(plain_proof.interfaces().len(), 1);
+        assert_eq!(
+            checker
+                .store()
+                .source_global_interface_value_owner(other)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            checker
+                .store()
+                .source_global_interface_value_owner(value_only)
+                .unwrap(),
+            None
+        );
+        let before = format!("{:?}", checker.store());
+        for _ in 0..2 {
+            proof.validate_current(checker.store()).unwrap();
+            plain_proof.validate_current(checker.store()).unwrap();
+            assert!(checker.store().declared_type_links(owner).is_none());
+            assert!(checker.store().declared_type_links(plain).is_none());
+            for declaration in proof
+                .declarations()
+                .iter()
+                .chain(plain_proof.declarations())
+            {
+                if let Some(annotation) =
+                    checker.store().source_direct_type_annotation(*declaration)
+                {
+                    assert!(checker.store().type_node_links(annotation).is_none());
+                }
+            }
+            for &(parsed, file, _) in &sources {
+                for (node, record) in parsed.arena.iter().filter(|(_, record)| {
+                    record.kind == SyntaxKind::TypeParameter
+                        && record.parent.is_some_and(|parent| {
+                            proof.interfaces().iter().any(|declaration| {
+                                declaration.is_for(parsed.arena.id(), file)
+                                    && declaration.node == parent
+                            })
+                        })
+                }) {
+                    let node = NodeRef::new(parsed.arena.id(), file, node);
+                    let parameter = checker.store().source_declaration_symbol(node).unwrap();
+                    assert!(
+                        checker.store().declared_type_links(parameter).is_none(),
+                        "{record:?}"
+                    );
+                    assert!(checker.store().type_node_links(node).is_none());
+                }
+            }
+            assert_eq!(format!("{:?}", checker.store()), before);
+        }
+
+        // This real full query gives the metadata reader a valid warm Array annotation.
+        let value_type = checker
+            .get_type_from_type_node(plain_proof.value_annotation())
+            .unwrap();
+        let store = checker.store_mut_for_test();
+        assert!(
+            store
+                .type_payload(value_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        plain_proof.validate_current(store).unwrap();
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_ok());
+        let original_links = store
+            .type_node_links(plain_proof.value_annotation())
+            .unwrap()
+            .clone();
+        assert!(store.set_type_node_links(
+            plain_proof.value_annotation(),
+            TypeNodeLinks {
+                resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                ..original_links.clone()
+            }
+        ));
+        let damaged = format!("{store:?}");
+        plain_proof.validate_current(store).unwrap();
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_err());
+        assert_eq!(format!("{store:?}"), damaged);
+        assert!(store.set_type_node_links(plain_proof.value_annotation(), original_links));
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_ok());
+        assert!(
+            store
+                .type_node_links(
+                    store
+                        .source_direct_type_annotation(plain_proof.variables()[1])
+                        .unwrap()
+                )
+                .is_none()
+        );
+
+        let declarations = proof.declarations().to_vec();
+        let augmentation_interface = proof.interfaces()[2];
+        let origin = *store
+            .source_global_bindings
+            .as_ref()
+            .unwrap()
+            .interface_augmentations
+            .get(&augmentation_interface)
+            .unwrap();
+        let raw = origin.raw_symbol.unwrap();
+        let local = origin.local_symbol.unwrap();
+        let namespace = store.get_merged_symbol(origin.namespace.unwrap()).unwrap();
+        let raw_record = store.symbol(raw).unwrap().clone();
+        let local_record = store.symbol(local).unwrap().clone();
+        let namespace_record = store.symbol(namespace).unwrap().clone();
+        let exports = namespace_record.exports().unwrap();
+        let other_exports = store.clone_symbol_table(exports).unwrap();
+        assert!(store.source_raw_symbol_declarations_match(raw));
+        assert!(!store.source_symbol_declarations_match(raw));
+
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            Order,
+            MissingVariable,
+            SelectedValue,
+            RawParent,
+            RawValue,
+            RawFlags,
+            RawDeclarations,
+            LocalDeclarations,
+            LocalExport,
+            ExportTable,
+            GlobalEntry,
+            Keyword,
+        }
+        for damage in [
+            Damage::Order,
+            Damage::MissingVariable,
+            Damage::SelectedValue,
+            Damage::RawParent,
+            Damage::RawValue,
+            Damage::RawFlags,
+            Damage::RawDeclarations,
+            Damage::LocalDeclarations,
+            Damage::LocalExport,
+            Damage::ExportTable,
+            Damage::GlobalEntry,
+            Damage::Keyword,
+        ] {
+            match damage {
+                Damage::Order => {
+                    let mut changed = declarations.clone();
+                    changed.swap(3, 4);
+                    assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(changed),
+                        Some(proof.value_declaration())
+                    ));
+                    assert!(store.source_merged_symbol_declarations_match(owner));
+                }
+                Damage::MissingVariable => {
+                    let mut changed = declarations.clone();
+                    changed.pop();
+                    assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(changed),
+                        Some(proof.value_declaration())
+                    ));
+                }
+                Damage::SelectedValue => assert!(store.set_symbol_declarations(
+                    owner,
+                    Some(declarations.clone()),
+                    Some(proof.variables()[1])
+                )),
+                Damage::RawParent => assert!(store.set_symbol_relationships(
+                    raw,
+                    raw_record.members(),
+                    raw_record.exports(),
+                    Some(other),
+                    raw_record.export_symbol()
+                )),
+                Damage::RawValue => assert!(store.set_symbol_declarations(
+                    raw,
+                    raw_record.declarations().map(<[NodeRef]>::to_vec),
+                    None
+                )),
+                Damage::RawFlags => assert!(store.set_symbol_flags(
+                    raw,
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                    CheckFlags::NONE
+                )),
+                Damage::RawDeclarations => assert!(store.set_symbol_declarations(
+                    raw,
+                    Some(vec![augmentation_interface]),
+                    None
+                )),
+                Damage::LocalDeclarations => assert!(store.set_symbol_declarations(
+                    local,
+                    Some(vec![augmentation_interface]),
+                    None
+                )),
+                Damage::LocalExport => assert!(store.set_symbol_relationships(
+                    local,
+                    local_record.members(),
+                    local_record.exports(),
+                    local_record.parent(),
+                    Some(owner)
+                )),
+                Damage::ExportTable => assert!(store.set_symbol_relationships(
+                    namespace,
+                    namespace_record.members(),
+                    Some(other_exports),
+                    namespace_record.parent(),
+                    namespace_record.export_symbol()
+                )),
+                Damage::GlobalEntry => {
+                    assert_eq!(
+                        store.insert_symbol(
+                            proof.globals_table(),
+                            EscapedName::source("Packet"),
+                            raw
+                        ),
+                        Some(Some(proof.table_symbol()))
+                    );
+                }
+                Damage::Keyword => {
+                    store
+                        .source_node_facts
+                        .get_mut(&origin.module.arena)
+                        .unwrap()[origin.module.node.index()]
+                    .as_mut()
+                    .unwrap()
+                    .global_augmentation = false
+                }
+            }
+            if matches!(
+                damage,
+                Damage::RawValue | Damage::RawFlags | Damage::RawDeclarations
+            ) {
+                assert!(!store.source_raw_symbol_declarations_match(raw));
+            }
+            let damaged = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(
+                    store.source_global_interface_value_owner(owner).is_err(),
+                    "{damage:?}"
+                );
+                assert!(proof.validate_current(store).is_err(), "{damage:?}");
+                if matches!(damage, Damage::Keyword | Damage::ExportTable) {
+                    assert!(plain_proof.validate_current(store).is_err());
+                }
+                assert_eq!(format!("{store:?}"), damaged);
+            }
+            assert!(store.set_symbol_declarations(
+                owner,
+                Some(declarations.clone()),
+                Some(proof.value_declaration())
+            ));
+            assert!(store.set_symbol_declarations(
+                raw,
+                raw_record.declarations().map(<[NodeRef]>::to_vec),
+                raw_record.value_declaration()
+            ));
+            assert!(store.set_symbol_flags(raw, raw_record.flags(), raw_record.check_flags()));
+            assert!(store.set_symbol_relationships(
+                raw,
+                raw_record.members(),
+                raw_record.exports(),
+                raw_record.parent(),
+                raw_record.export_symbol()
+            ));
+            assert!(store.set_symbol_declarations(
+                local,
+                local_record.declarations().map(<[NodeRef]>::to_vec),
+                local_record.value_declaration()
+            ));
+            assert!(store.set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                local_record.export_symbol()
+            ));
+            assert!(store.set_symbol_relationships(
+                namespace,
+                namespace_record.members(),
+                namespace_record.exports(),
+                namespace_record.parent(),
+                namespace_record.export_symbol()
+            ));
+            assert!(
+                store
+                    .insert_symbol(
+                        proof.globals_table(),
+                        EscapedName::source("Packet"),
+                        proof.table_symbol()
+                    )
+                    .is_some()
+            );
+            store
+                .source_node_facts
+                .get_mut(&origin.module.arena)
+                .unwrap()[origin.module.node.index()]
+            .as_mut()
+            .unwrap()
+            .global_augmentation = true;
+            assert_eq!(
+                store.source_global_interface_value_owner(owner).unwrap(),
+                Some(proof.clone())
+            );
+            assert!(store.source_raw_symbol_declarations_match(raw));
+        }
+        assert!(store.declared_type_links(owner).is_none());
+        assert!(checker.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn interface_heritage_headers_keep_source_identity_and_complete_only_after_ready_bases() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Left = { values: number[]; }; type Right = { other: string; }; ",
+            "interface First extends Left { own: boolean; } ",
+            "interface Other extends Right { own: number; } ",
+            "declare let first: First; declare let other: Other; declare let left: Left;",
+        ));
+        let file = FileId::new(285_020);
+        let sources = [(&parsed, file, SourceKind::Library)];
+        let mut checker = context(&sources);
+        let first = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "first"))
+            .unwrap();
+        let other = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "other"))
+            .unwrap();
+        let left_type = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "left"))
+            .unwrap();
+        let arrays = CanonicalArrayTargets::from_global_types(checker.global_types());
+        let foreign = context(&sources);
+        let foreign_arrays = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        let store = checker.store_mut_for_test();
+        let [owner, left, right] = ["First", "Left", "Right"].map(|name| global(store, name));
+        let header = store
+            .source_interface_heritage_header(first)
+            .unwrap()
+            .clone();
+        let other_header = store
+            .source_interface_heritage_header(other)
+            .unwrap()
+            .clone();
+        let cold_type = format!("{:?}", store.type_payload(first));
+        let record = store.type_payload(first).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("actual interface")
+        };
+        assert!(interface.this_type.is_some());
+        assert_eq!(interface.reference.object.target, Some(first));
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(!interface.declared_members_resolved);
+        assert!(!interface.base_types_resolved);
+        assert!(store.direct_interface_heritage_provenance(first).is_none());
+        assert_eq!(
+            store.direct_interface_heritage_provenance.remove(&first),
+            Some(DirectInterfaceHeritageState::Header(header.clone()))
+        );
+
+        // An unavailable completed read must still observe its real receiver.
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.direct_interface_heritage_provenance(first).is_none());
+        let key = CacheHashKey::from_halves(285_020, 1);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::SUCCEEDED)]
+        ));
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(format!("{:?}", store.type_payload(first)), cold_type);
+        let before = format!("{store:?}");
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+        assert!(!store.publish_source_interface_heritage_header(
+            other,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+        let complete = DirectInterfaceHeritageProvenance {
+            owner_symbol: owner,
+            bases: vec![(left, left_type)],
+            source: Some(header.clone()),
+        };
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(foreign_arrays),
+                None
+            )
+        );
+        assert_eq!(format!("{store:?}"), before);
+        let mut wrong = complete.clone();
+        wrong.bases[0].0 = right;
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                wrong,
+                Some(arrays),
+                None
+            )
+        );
+        let mut legacy = complete.clone();
+        legacy.source = None;
+        assert!(!store.publish_direct_interface_heritage_provenance(first, legacy));
+        assert_eq!(format!("{store:?}"), before);
+
+        assert_eq!(
+            store
+                .direct_interface_heritage_provenance
+                .insert(first, DirectInterfaceHeritageState::Header(other_header)),
+            Some(DirectInterfaceHeritageState::Header(header.clone()))
+        );
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(!store.publish_source_interface_heritage_header(
+                first,
+                header.clone(),
+                Some(arrays)
+            ));
+            assert!(
+                !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                    first,
+                    complete.clone(),
+                    Some(arrays),
+                    None
+                )
+            );
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        store
+            .direct_interface_heritage_provenance
+            .insert(first, DirectInterfaceHeritageState::Header(header.clone()));
+
+        // The source getter observes the same receiver before the exact upgrade.
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert_eq!(store.source_interface_heritage_header(first), Some(&header));
+        let key = CacheHashKey::from_halves(285_020, 2);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::SUCCEEDED)]
+        ));
+        assert!(
+            store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(arrays),
+                None
+            )
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(
+            store.direct_interface_heritage_provenance(first),
+            Some(&complete)
+        );
+        assert_eq!(store.source_interface_heritage_header(first), Some(&header));
+        assert_eq!(format!("{:?}", store.type_payload(first)), cold_type);
+        assert!(store.set_interface_base_resolution(first, true, None, Some(vec![left_type])));
+        let record = store.type_payload(first).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("actual interface")
+        };
+        assert_eq!(
+            interface.resolved_base_types.as_deref(),
+            Some(&[left_type][..])
+        );
+        assert!(interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        let warm_type = format!("{:?}", store.type_payload(first));
+        let before = format!("{store:?}");
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(arrays),
+                None
+            )
+        );
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+
+        let declaration = store.symbol(left).unwrap().declarations().unwrap()[0];
+        let root = store.source_direct_type_annotation(declaration).unwrap();
+        let original = store.type_node_links(root).unwrap().clone();
+        assert!(store.set_type_node_links(
+            root,
+            TypeNodeLinks {
+                resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                ..original.clone()
+            }
+        ));
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(
+                validate_source_interface_heritage_header(store, first, &header, Some(arrays))
+                    .is_err()
+            );
+            assert!(!store.publish_source_interface_heritage_header(
+                first,
+                header.clone(),
+                Some(arrays)
+            ));
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        assert!(store.set_type_node_links(root, original));
+        assert!(
+            validate_source_interface_heritage_header(store, first, &header, Some(arrays)).is_ok()
+        );
+        assert_eq!(
+            store.direct_interface_heritage_provenance(first),
+            Some(&complete)
+        );
+        assert_eq!(format!("{:?}", store.type_payload(first)), warm_type);
+        assert!(checker.diagnostics().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod class_annotation_role_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
 
@@ -13507,7 +19433,7 @@ mod tests {
 
     use super::{
         AstScope, CachedSignatureLookup, PlainInterfaceBaseFacts, PlainInterfaceHeritageFacts,
-        SemanticStore, type_list_key,
+        SemanticStore, SourceTypeParameterAnnotations, type_list_key,
     };
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
@@ -16162,6 +22088,393 @@ mod tests {
         );
     }
 
+    const TUPLE_ALIAS_OBSERVATION_SOURCE: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+        "type Numeric = [number]; type Text = [string, boolean];\n",
+    );
+
+    struct TupleAliasObservationFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        aliases: [crate::semantic::SemanticSymbolId; 2],
+        tuples: [crate::semantic::TypeId; 2],
+        key: CacheHashKey,
+    }
+
+    fn tuple_alias_observation_fixture(
+        parsed: &ts_parser::ParseResult,
+    ) -> TupleAliasObservationFixture<'_> {
+        use crate::semantic::relation::IntersectionState;
+
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_080);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/tuple-alias-observation.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let aliases: [(crate::semantic::SemanticSymbolId, NodeRef); 2] = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                Some((
+                    binder.file(file).unwrap().symbol(declaration).unwrap(),
+                    NodeRef::new(parsed.arena.id(), file, alias.type_),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("the source has two tuple aliases");
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let tuples = aliases.map(|(_, node)| context.get_type_from_type_node(node).unwrap());
+        let aliases = aliases.map(|(symbol, _)| symbol);
+        for alias in aliases {
+            assert!(context.store().type_alias_links(alias).is_none());
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [
+            vec![bootstrap.number_type],
+            vec![bootstrap.string_type, bootstrap.boolean_type],
+        ];
+        for (tuple, arguments) in tuples.into_iter().zip(expected) {
+            let record = context.store().type_payload(tuple).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("the tuple query must return a canonical reference")
+            };
+            assert_eq!(
+                reference.resolved_type_arguments.as_deref(),
+                Some(arguments.as_slice())
+            );
+            assert!(record.alias().is_none());
+        }
+        assert_eq!(
+            context.is_type_assignable_to(tuples[0], tuples[1]),
+            Ok(false)
+        );
+        let key = context
+            .store()
+            .relation_key_if_available(tuples[0], tuples[1], IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            context
+                .store()
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        TupleAliasObservationFixture {
+            context,
+            aliases,
+            tuples,
+            key,
+        }
+    }
+
+    #[test]
+    fn source_tuple_alias_publication_preserves_payload_only_relations() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let before = context.store().relation_state_snapshot();
+        let generation = context.store().relation_inputs_generation;
+        let type_count = context.store().type_len();
+        for tuple in tuples {
+            assert!(context.store().relation_type_is_observable(tuple));
+            assert!(
+                !context
+                    .store()
+                    .relation_observable_type_alias_owners
+                    .contains(&tuple)
+            );
+        }
+        for (alias, tuple) in aliases.into_iter().zip(tuples) {
+            assert!(context.store().type_alias_links(alias).is_none());
+            assert!(!context.store().relation_observable_symbols.contains(&alias));
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            assert_eq!(
+                context.store().type_alias_declared_type_owners(tuple),
+                Some(&HashSet::from([alias]))
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::FAILED
+            );
+            assert_eq!(context.store().relation_inputs_generation, generation);
+            assert_eq!(context.store().relation_cache_generation, generation);
+            assert_eq!(context.store().relation_state_snapshot(), before);
+            assert_eq!(context.store().type_len(), type_count);
+        }
+        let links = context.store().checker_link_allocated_lengths();
+        for _ in 0..2 {
+            for (alias, tuple) in aliases.into_iter().zip(tuples) {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            }
+            assert_eq!(
+                context.is_type_assignable_to(tuples[0], tuples[1]),
+                Ok(false)
+            );
+            assert_eq!(context.store().relation_state_snapshot(), before);
+            assert_eq!(context.store().relation_inputs_generation, generation);
+            assert_eq!(context.store().relation_cache_generation, generation);
+            assert_eq!(context.store().type_len(), type_count);
+            assert_eq!(context.store().checker_link_allocated_lengths(), links);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_owner_misses_commit_and_clear_with_relation_replacement() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert_eq!(
+            store
+                .active_relation_read_observations
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .observations
+                .type_alias_owners,
+            HashSet::from([tuples[0]])
+        );
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::FAILED)],
+        ));
+        assert!(!store.relation_read_observation_is_active());
+        assert_eq!(
+            store.relation_observable_type_alias_owners,
+            HashSet::from([tuples[0]])
+        );
+        let before = store.relation_state_snapshot();
+        let generation = store.relation_inputs_generation;
+
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        let store = context.store();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        assert_eq!(context.store().relation_inputs_generation, generation + 1);
+
+        assert_eq!(
+            context.is_type_assignable_to(tuples[0], tuples[1]),
+            Ok(false)
+        );
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_cache_generation, generation + 1);
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+        let replaced = store.relation_state_snapshot();
+        assert!(store.set_type_alias_links(aliases[0], TypeAliasLinks::default()));
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_state_snapshot(), replaced);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_owner_changes_invalidate_both_ends_and_reject_foreign_links() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let foreign = tuple_alias_observation_fixture(&parsed);
+        for observed in 0..2 {
+            let TupleAliasObservationFixture {
+                mut context,
+                aliases,
+                tuples,
+                key,
+            } = tuple_alias_observation_fixture(&parsed);
+            for (alias, tuple) in aliases.into_iter().zip(tuples) {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            }
+            let store = context.store_mut_for_test();
+            let observation = store.begin_relation_read_observation().unwrap();
+            assert_eq!(
+                store.type_alias_declared_type_owners(tuples[observed]),
+                Some(&HashSet::from([aliases[observed]]))
+            );
+            assert!(store.commit_relation_cache_writes(
+                observation,
+                RelationKind::Assignable,
+                [(key, RelationComparisonResult::FAILED)],
+            ));
+            let before = store.relation_state_snapshot();
+            let generation = store.relation_inputs_generation;
+            let owners = store.type_alias_declared_type_owners.clone();
+            let links = store.type_alias_links(aliases[0]).unwrap().clone();
+            assert!(store.set_type_alias_links(aliases[0], links.clone()));
+            for (alias, candidate) in [
+                (foreign.aliases[0], links.clone()),
+                (
+                    aliases[0],
+                    TypeAliasLinks {
+                        declared_type: Some(foreign.tuples[0]),
+                        ..links.clone()
+                    },
+                ),
+            ] {
+                assert!(!store.set_type_alias_links(alias, candidate));
+                assert_eq!(store.type_alias_links(aliases[0]), Some(&links));
+                assert_eq!(store.type_alias_declared_type_owners, owners);
+                assert_eq!(store.relation_inputs_generation, generation);
+                assert_eq!(store.relation_cache_generation, generation);
+                assert_eq!(store.relation_state_snapshot(), before);
+                assert_eq!(
+                    store.relation_cache_get(RelationKind::Assignable, key),
+                    RelationComparisonResult::FAILED
+                );
+            }
+            assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+            assert!(store.set_type_alias_links(
+                aliases[0],
+                TypeAliasLinks {
+                    declared_type: Some(tuples[1]),
+                    ..links
+                }
+            ));
+            assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+            assert_eq!(
+                store.type_alias_declared_type_owners(tuples[1]),
+                Some(&HashSet::from(aliases))
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::NONE
+            );
+            assert_eq!(store.relation_inputs_generation, generation + 1);
+            assert_eq!(store.relation_cache_generation, generation);
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn source_alias_discard_keeps_payload_cache_and_observed_symbol_invalidation() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let before = store.relation_state_snapshot();
+        let generation = store.relation_inputs_generation;
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert!(store.type_alias_links(aliases[0]).is_none());
+        assert!(!store.commit_relation_cache_writes(observation, RelationKind::Assignable, []));
+        assert!(store.relation_read_observation_is_active());
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+        assert!(store.discard_relation_read_observation(observation));
+        assert!(!store.relation_read_observation_is_active());
+        assert!(!store.discard_relation_read_observation(observation));
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_inputs_generation, generation);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(store.relation_state_snapshot(), before);
+        let observation = store.begin_relation_read_observation().unwrap();
+        let links = store.type_alias_links(aliases[0]).unwrap().clone();
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::FAILED)],
+        ));
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(store.relation_observable_symbols.contains(&aliases[0]));
+        assert!(store.set_type_alias_links(aliases[0], links.clone()));
+        assert_eq!(store.relation_inputs_generation, generation);
+        assert!(store.set_type_alias_links(
+            aliases[0],
+            TypeAliasLinks {
+                type_parameters: Some(Vec::new()),
+                ..links
+            }
+        ));
+        assert_eq!(
+            store.type_alias_declared_type_owners(tuples[0]),
+            Some(&HashSet::from([aliases[0]]))
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
     #[test]
     fn first_members_and_exports_publication_invalidates_an_observed_miss() {
         let mut store = TestStore::new();
@@ -16681,6 +22994,97 @@ mod tests {
     }
 
     #[test]
+    fn merged_method_sources_reject_missing_declarations_and_forged_transient_flags() {
+        let first = parse_source_file(
+            "interface Reader { read(value: string): number; stable(): boolean; }",
+        );
+        let second = parse_source_file("interface Reader { read(value: number): string; }");
+        let files = [(FileId::new(64), &first), (FileId::new(65), &second)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/reader-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let declarations = files.map(|(file, parsed)| {
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::MethodSignature)
+        });
+        let raw = declarations.map(|node| binder.file(node.file).unwrap().symbol(node).unwrap());
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let merged = store.get_merged_symbol(raw[0]).unwrap();
+        assert_ne!(raw[0], merged);
+        assert_ne!(raw[1], merged);
+        assert_eq!(store.get_merged_symbol(raw[1]), Some(merged));
+        assert_eq!(
+            store.symbol(merged).unwrap().declarations(),
+            Some(&declarations[..])
+        );
+        let owner = store.get_parent_of_symbol(merged).unwrap();
+        let stable = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source("stable"))
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(store.source_merged_method_has_exact_declarations(merged));
+            assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+            assert!(!store.source_merged_method_has_exact_declarations(stable));
+            assert_eq!(store.declared_method_optional_flag(stable), Some(false));
+            assert_eq!(format!("{store:?}"), before);
+        }
+
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(vec![declarations[0]]),
+            Some(declarations[0]),
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), None);
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(declarations.to_vec()),
+            Some(declarations[0]),
+        ));
+        assert!(store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+
+        assert!(store.set_symbol_flags(
+            stable,
+            SymbolFlags::METHOD | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(stable));
+        assert_eq!(store.declared_method_optional_flag(stable), None);
+        assert!(store.set_symbol_flags(stable, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert_eq!(store.declared_method_optional_flag(stable), Some(false));
+    }
+
+    #[test]
     fn declared_method_optional_counts_match_retained_fact_scan() {
         let parsed = parse_source_file(concat!(
             "interface Contract { ",
@@ -16885,6 +23289,140 @@ mod tests {
             ],
         );
         assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_keep_written_roles_and_missing_facts_distinct() {
+        let parsed = parse_source_file(concat!(
+            "interface Methods { absent<T>(): T; ",
+            "constrained<T extends string>(): T; ",
+            "defaulted<T = string>(): T; ",
+            "both<T extends string = string>(): T; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(63);
+        let parameters = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+                Some((
+                    reference(node),
+                    SourceTypeParameterAnnotations {
+                        constraint: parameter.constraint.map(reference),
+                        default_type: parameter.default_type.map(reference),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 4);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        for (parameter, _) in &parameters {
+            assert_eq!(store.source_type_parameter_annotations(*parameter), None);
+        }
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            for (parameter, expected) in &parameters {
+                assert_eq!(
+                    store.source_type_parameter_annotations(*parameter),
+                    Some(*expected)
+                );
+                assert_eq!(
+                    store.source_type_parameter_annotations(NodeRef::new(
+                        parameter.arena,
+                        FileId::new(64),
+                        parameter.node,
+                    )),
+                    None
+                );
+            }
+            assert_eq!(format!("{store:?}"), before);
+        }
+        assert_eq!(parameters[0].1.constraint, None);
+        assert_eq!(parameters[0].1.default_type, None);
+        assert!(parameters[1].1.constraint.is_some());
+        assert_eq!(parameters[1].1.default_type, None);
+        assert_eq!(parameters[2].1.constraint, None);
+        assert!(parameters[2].1.default_type.is_some());
+        assert_ne!(parameters[3].1.constraint, parameters[3].1.default_type);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_reject_changed_roles_and_broken_child_edges() {
+        let mut parsed = parse_source_file("interface Methods { run<T extends string>(): T; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(65);
+        let parameter = node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeParameter);
+        let original = parsed.arena.get(parameter.node).unwrap().clone();
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let annotations = store.source_type_parameter_annotations(parameter).unwrap();
+        let constraint = annotations.constraint.unwrap();
+        let before = format!("{store:?}");
+        let NodeData::TypeParameterDeclaration(data) =
+            &mut parsed.arena.get_mut(parameter.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        data.default_type = data.constraint.take();
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            None
+        );
+        assert_eq!(
+            store.source_type_parameter_annotations(parameter),
+            Some(annotations)
+        );
+        assert_eq!(format!("{store:?}"), before);
+        *parsed.arena.get_mut(parameter.node).unwrap() = original;
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+
+        let parent = store.source_node_facts[&parameter.arena][constraint.node.index()]
+            .as_ref()
+            .unwrap()
+            .parent;
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = Some(source.node_ref().node);
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(store.source_type_parameter_annotations(parameter), None);
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = parent;
+        let children = store.source_node_children[&parameter.arena][parameter.node.index()].clone();
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = Box::new([]);
+        assert_eq!(store.source_type_parameter_annotations(parameter), None);
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = children;
+        for _ in 0..2 {
+            assert_eq!(
+                store.source_type_parameter_annotations(parameter),
+                Some(annotations)
+            );
+            assert_eq!(format!("{store:?}"), before);
+        }
     }
 
     #[test]
@@ -19457,6 +25995,7 @@ mod tests {
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
                 query_evidence: None,
+                this_parameter: None,
                 parameters,
                 flags: plan.flags,
                 min_argument_count: minimum,
@@ -19608,6 +26147,7 @@ mod tests {
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
                 query_evidence: None,
+                this_parameter: None,
                 parameters: vec![value],
                 flags: plan.flags,
                 min_argument_count: 1,
@@ -19694,6 +26234,7 @@ mod tests {
                 super::DirectInterfaceHeritageProvenance {
                     owner_symbol,
                     bases: vec![(base_symbol, base_type), second_base],
+                    source: None,
                 },
             ));
             assert_eq!(
@@ -19709,6 +26250,7 @@ mod tests {
         let paired = super::DirectInterfaceHeritageProvenance {
             owner_symbol,
             bases: vec![(base_symbol, base_type), (second_symbol, second_type)],
+            source: None,
         };
         assert!(store.try_reserve_direct_interface_heritage_provenance(2));
         assert!(store.publish_direct_interface_heritage_provenance(owner_type, paired.clone()));
@@ -19721,6 +26263,7 @@ mod tests {
         let single = super::DirectInterfaceHeritageProvenance {
             owner_symbol: single_owner,
             bases: vec![(base_symbol, base_type)],
+            source: None,
         };
         assert!(store.publish_direct_interface_heritage_provenance(single_type, single.clone()));
         assert_eq!(
@@ -19790,7 +26333,13 @@ mod tests {
         assert_eq!(original.owner_symbol, owner);
         assert_eq!(original.bases, vec![edge; 4]);
         assert_eq!(
-            store.direct_interface_heritage_provenance.remove(&derived),
+            store
+                .direct_interface_heritage_provenance
+                .remove(&derived)
+                .and_then(|state| match state {
+                    super::DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+                    super::DirectInterfaceHeritageState::Header(_) => None,
+                }),
             Some(original.clone()),
         );
         assert!(store.try_reserve_direct_interface_heritage_provenance(1));
@@ -19830,6 +26379,7 @@ mod tests {
                 super::DirectInterfaceHeritageProvenance {
                     owner_symbol: candidate_owner,
                     bases,
+                    source: None,
                 },
             ));
             assert_eq!(snapshot(store), before);
@@ -19916,7 +26466,13 @@ mod tests {
         assert_eq!(original.owner_symbol, owner);
         assert_eq!(original.bases, [(first, first_type), (second, second_type)]);
         assert_eq!(
-            store.direct_interface_heritage_provenance.remove(&derived),
+            store
+                .direct_interface_heritage_provenance
+                .remove(&derived)
+                .and_then(|state| match state {
+                    super::DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+                    super::DirectInterfaceHeritageState::Header(_) => None,
+                }),
             Some(original.clone()),
         );
         assert!(store.try_reserve_direct_interface_heritage_provenance(1));

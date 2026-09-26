@@ -702,13 +702,13 @@ fn class_method_generic_arity_and_static_name_diagnostics_keep_all_arguments() {
             "class Model { public run(value: Array) {} }",
             2314,
             "Array",
-            ["Array<T>", "1"],
+            vec!["Array<T>", "1", "1"],
         ),
         (
             "class C { static foo: string; bar() { let k = foo; } }",
             2662,
             "foo",
-            ["foo", "C"],
+            vec!["foo", "C"],
         ),
     ];
 
@@ -867,4 +867,241 @@ fn decorated_constructor_parameter_publishes_its_annotated_signature() {
         ),
         warm,
     );
+}
+
+#[test]
+fn valid_array_method_annotation_keeps_real_target_and_queries() {
+    use ts_checker::semantic::TypeData;
+
+    let source = "class Model { public run(value: Array<string>) {} }";
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let parsed = parse_source_file(source);
+    let file = FileId::new(2_160);
+    let library_file = FileId::new(2_170);
+    assert!(parsed.diagnostics.is_empty());
+    assert!(library.diagnostics.is_empty());
+    let make_context = || {
+        let mut binder = CanonicalBinder::new();
+        for (input, current, name, declaration, default_library) in [
+            (&library, library_file, "\"/project/lib.d.ts\"", true, true),
+            (&parsed, file, "\"/project/class-second-wave.ts\"", false, false),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &input.arena,
+                    input.source_file,
+                    current,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder.bind_typescript_declaration_slice(&input.arena, current).unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &library.arena), (file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    };
+    let nodes = parsed.arena.iter().map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node)).collect::<Vec<_>>();
+    let method = nodes.iter().copied().find(|node| parsed.arena.get(node.node).unwrap().kind == SyntaxKind::MethodDeclaration).unwrap();
+    let NodeData::MethodDeclaration(data) = &parsed.arena.get(method.node).unwrap().data else { unreachable!() };
+    let name = NodeRef::new(method.arena, file, data.name);
+    let parameter = NodeRef::new(method.arena, file, data.parameters.nodes[0]);
+    let NodeData::ParameterDeclaration(data) = &parsed.arena.get(parameter.node).unwrap().data else { unreachable!() };
+    let parameter_name = NodeRef::new(method.arena, file, data.name);
+    let annotation = NodeRef::new(method.arena, file, data.type_.unwrap());
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [store.type_len(), store.symbol_len(), store.signature_len(), store.mapper_len(), store.type_alias_len(), store.index_info_len(), store.symbol_store().symbol_table_len(), store.type_predicate_len()],
+            store.relation_state_snapshot(),
+            nodes.iter().map(|node| (*node, store.node_links(*node).cloned(), store.type_node_links(*node).cloned(), store.symbol_node_links(*node).cloned(), store.signature_links(*node).cloned())).collect::<Vec<_>>(),
+            nodes.iter().filter_map(|node| context.file(file).unwrap().1.symbol(*node)).map(|symbol| (symbol, store.value_symbol_links(symbol).cloned())).collect::<Vec<_>>(),
+            store.source_file_links(context.source_file(file).unwrap()).cloned(),
+            context.diagnostics().clone(),
+        )
+    };
+    for first in [None, Some(method), Some(name), Some(parameter), Some(parameter_name), Some(annotation)] {
+        let mut context = make_context();
+        let early = first.map(|node| context.get_type_at_location(node).unwrap());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let array_type = context.get_type_at_location(annotation).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let TypeData::TypeReference(array) = context.store().type_payload(array_type).unwrap().data() else {
+            panic!("the valid annotation must retain its canonical Array target")
+        };
+        assert_eq!(array.object.target, Some(context.global_types().array_type));
+        assert_eq!(array.resolved_type_arguments.as_deref(), Some(&[string][..]));
+        assert_eq!(context.type_to_string(array_type).unwrap(), "string[]");
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        assert_eq!(context.store().value_symbol_links(parameter_symbol).unwrap().resolved_type, Some(array_type));
+        assert_eq!(context.get_type_at_location(parameter), Ok(array_type));
+        assert_eq!(context.get_type_at_location(parameter_name), Ok(array_type));
+        assert_eq!(context.get_symbol_at_location(parameter_name), Ok(Some(parameter_symbol)));
+        let callable = context.get_type_at_location(method).unwrap();
+        assert_eq!(context.get_type_at_location(name), Ok(callable));
+        assert_eq!(context.type_to_string(callable).unwrap(), "(value: string[]) => void");
+        let signature = context.store().signature_links(method).unwrap().resolved_signature.signature().unwrap();
+        let ts_checker::semantic::TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+            panic!("the callable must retain its declaration signature")
+        };
+        assert_eq!(
+            (object.structured.signatures.as_deref(), object.structured.call_signature_count),
+            (Some(&[signature][..]), 1),
+        );
+        let record = context.store().signature(signature).unwrap();
+        assert_eq!(record.declaration(), Some(method));
+        assert_eq!(record.parameters(), &[parameter_symbol]);
+        assert_eq!(record.min_argument_count(), 1);
+        assert!(!record.has_rest_parameter());
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(void));
+        if let Some(node) = first { assert_eq!(context.get_type_at_location(node), Ok(early.unwrap())); }
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_type_at_location(annotation), Ok(array_type));
+            assert_eq!(context.get_type_at_location(parameter), Ok(array_type));
+            assert_eq!(context.get_type_at_location(parameter_name), Ok(array_type));
+            assert_eq!(context.get_type_at_location(method), Ok(callable));
+            assert_eq!(context.get_type_at_location(name), Ok(callable));
+            assert_eq!(context.store().signature_links(method).unwrap().resolved_signature.signature(), Some(signature));
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            assert!(snapshot(&context) == warm);
+        }
+    }
+}
+
+#[test]
+fn invalid_array_method_annotation_recovers_and_checks_later_error() {
+    let source = concat!(
+        "class Model { public run(value: Array) {} }\n",
+        "declare const model: Model;\n",
+        "model.run(1);\n",
+        "const later: string = 1;\n",
+    );
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let parsed = parse_source_file(source);
+    let file = FileId::new(2_161);
+    let library_file = FileId::new(2_171);
+    assert!(parsed.diagnostics.is_empty());
+    assert!(library.diagnostics.is_empty());
+    let make_context = || {
+        let mut binder = CanonicalBinder::new();
+        for (input, current, name, declaration, default_library) in [
+            (&library, library_file, "\"/project/lib.d.ts\"", true, true),
+            (&parsed, file, "\"/project/class-second-wave.ts\"", false, false),
+        ] {
+            binder.bind_source_file_with_facts(
+                &input.arena, input.source_file, current,
+                CanonicalSourceFileFacts::new_with_default_library(EscapedName::source(name), CanonicalSourceLanguage::TypeScript, declaration, default_library, CanonicalModuleState::Script),
+            ).unwrap();
+            binder.bind_typescript_declaration_slice(&input.arena, current).unwrap();
+        }
+        CanonicalCheckerContext::new(binder.finish(), [(library_file, &library.arena), (file, &parsed.arena)].into_iter().collect(), CanonicalCheckerOptions::default()).unwrap()
+    };
+    let nodes = parsed.arena.iter().map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node)).collect::<Vec<_>>();
+    let method = nodes.iter().copied().find(|node| parsed.arena.get(node.node).unwrap().kind == SyntaxKind::MethodDeclaration).unwrap();
+    let NodeData::MethodDeclaration(data) = &parsed.arena.get(method.node).unwrap().data else { unreachable!() };
+    let name = NodeRef::new(method.arena, file, data.name);
+    let parameter = NodeRef::new(method.arena, file, data.parameters.nodes[0]);
+    let NodeData::ParameterDeclaration(data) = &parsed.arena.get(parameter.node).unwrap().data else { unreachable!() };
+    let parameter_name = NodeRef::new(method.arena, file, data.name);
+    let annotation = NodeRef::new(method.arena, file, data.type_.unwrap());
+    let call = nodes.iter().copied().find(|node| parsed.arena.get(node.node).unwrap().kind == SyntaxKind::CallExpression).unwrap();
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [store.type_len(), store.symbol_len(), store.signature_len(), store.mapper_len(), store.type_alias_len(), store.index_info_len(), store.symbol_store().symbol_table_len(), store.type_predicate_len()],
+            store.relation_state_snapshot(),
+            nodes.iter().map(|node| (*node, store.node_links(*node).cloned(), store.type_node_links(*node).cloned(), store.symbol_node_links(*node).cloned(), store.signature_links(*node).cloned())).collect::<Vec<_>>(),
+            nodes.iter().filter_map(|node| context.file(file).unwrap().1.symbol(*node)).map(|symbol| (symbol, store.value_symbol_links(symbol).cloned())).collect::<Vec<_>>(),
+            store.source_file_links(context.source_file(file).unwrap()).cloned(), context.diagnostics().clone(),
+        )
+    };
+    for first in [None, Some(method), Some(name), Some(parameter), Some(parameter_name), Some(annotation)] {
+        let mut context = make_context();
+        let early = first.map(|node| context.get_type_at_location(node).unwrap());
+        context.check_source_file(file).unwrap();
+        let actual = context.diagnostics().as_slice().iter().map(|diagnostic| {
+            let node = diagnostic.node.unwrap();
+            let range = diagnostic.range_override.map_or_else(|| parsed.arena.get(node.node).unwrap().range, |range| range.range());
+            assert!(diagnostic.related_information.is_empty());
+            (diagnostic.diagnostic.code(), range.start.get(), range.end.get(), diagnostic.diagnostic.arguments.iter().map(String::as_str).collect::<Vec<_>>(), diagnostic.diagnostic.render().unwrap())
+        }).collect::<Vec<_>>();
+        assert_eq!(actual, [
+            (2314, 32, 37, vec!["Array<T>", "1", "1"], "Generic type 'Array<T>' requires 1 type argument(s).".to_owned()),
+            (2322, 92, 97, vec!["number", "string"], "Type 'number' is not assignable to type 'string'.".to_owned()),
+        ]);
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(context.get_type_at_location(annotation), Ok(error));
+        assert_eq!(context.get_type_at_location(parameter), Ok(error));
+        assert_eq!(context.get_type_at_location(parameter_name), Ok(error));
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        assert_eq!(context.store().value_symbol_links(parameter_symbol).unwrap().resolved_type, Some(error));
+        assert_eq!(context.get_symbol_at_location(parameter_name), Ok(Some(parameter_symbol)));
+        let callable = context.get_type_at_location(method).unwrap();
+        assert_eq!(context.get_type_at_location(name), Ok(callable));
+        assert_eq!(context.type_to_string(callable).unwrap(), "(value: any) => void");
+        assert_eq!(context.get_type_at_location(call), Ok(void));
+        let declaration_signature = context.store().signature_links(method).unwrap().resolved_signature.signature().unwrap();
+        let call_signature = context.store().signature_links(call).unwrap().resolved_signature.signature().unwrap();
+        let ts_checker::semantic::TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+            panic!("the callable must retain its declaration signature")
+        };
+        assert_eq!(
+            (object.structured.signatures.as_deref(), object.structured.call_signature_count),
+            (Some(&[declaration_signature][..]), 1),
+        );
+        let declaration = context.store().signature(declaration_signature).unwrap();
+        let selected = context.store().signature(call_signature).unwrap();
+        assert_eq!(declaration.declaration(), Some(method));
+        assert_eq!(selected.declaration(), Some(method));
+        assert_eq!(declaration.parameters(), &[parameter_symbol]);
+        assert_eq!(selected.parameters().len(), 1);
+        let selected_parameter = selected.parameters()[0];
+        assert_eq!(
+            context.store().symbol(selected_parameter).unwrap().declarations(),
+            context.store().symbol(parameter_symbol).unwrap().declarations(),
+        );
+        assert_eq!(
+            context.store().symbol(selected_parameter).unwrap().value_declaration(),
+            Some(parameter),
+        );
+        let selected_links = context.store().value_symbol_links(selected_parameter).unwrap();
+        assert_eq!(selected_links.resolved_type, Some(error));
+        if selected_parameter != parameter_symbol {
+            assert_eq!(selected_links.target, Some(parameter_symbol));
+            assert_eq!(selected_links.mapper, selected.mapper());
+        }
+        assert_eq!(declaration.min_argument_count(), 1);
+        assert_eq!(selected.min_argument_count(), 1);
+        assert!(!declaration.has_rest_parameter());
+        assert!(!selected.has_rest_parameter());
+        assert_eq!(context.get_return_type_of_signature(declaration_signature), Ok(void));
+        assert_eq!(context.get_return_type_of_signature(call_signature), Ok(void));
+        if let Some(node) = first { assert_eq!(context.get_type_at_location(node), Ok(early.unwrap())); }
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_type_at_location(annotation), Ok(error));
+            assert_eq!(context.get_type_at_location(parameter_name), Ok(error));
+            assert_eq!(context.get_type_at_location(method), Ok(callable));
+            assert_eq!(context.get_type_at_location(name), Ok(callable));
+            assert_eq!(context.get_type_at_location(call), Ok(void));
+            assert_eq!(context.store().signature_links(method).unwrap().resolved_signature.signature(), Some(declaration_signature));
+            assert_eq!(context.store().signature_links(call).unwrap().resolved_signature.signature(), Some(call_signature));
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            assert!(snapshot(&context) == warm);
+        }
+    }
 }

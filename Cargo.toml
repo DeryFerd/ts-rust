@@ -29,6 +29,7 @@ members = [
     "crates/ts_evaluator",
     "crates/ts_vfs",
     "crates/ts_watch",
+    "crates/ts_goport",
     "tools/ts_ast_codegen",
     "tools/ts_compare",
     "tools/ts_diagnostics_codegen",
@@ -48,3 +49,12 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Release profile for the goport binaries: `cargo build --profile goport`.
+# Binaries land in <target>/goport/. Other crates keep the default release
+# settings, and the test and dev profiles (used by the regression) do not
+# inherit this.
+[profile.goport]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

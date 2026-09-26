@@ -236,6 +236,68 @@ fn object_equality_accepts_optional_properties_when_both_assignments_fail() {
     }
 }
 
+fn check_sibling_alias_equality(operator: &str, right_argument: &str, disjoint: bool) {
+    let source = format!(
+        "type Box<T> = {{ value: T }};\n\
+         declare const left: Box<string>;\n\
+         declare const right: Box<{right_argument}>;\n\
+         const different = left {operator} right;\n"
+    );
+    let parsed = parse_source_file(&source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(6);
+    let mut context = context(&parsed, file, true);
+    context.check_source_file(file).unwrap();
+
+    let text = format!("left {operator} right");
+    let expression = binary_expression(&source, &parsed, file, &text);
+    let operands = binary_operands(&parsed, expression);
+    let [left, right] = operands.map(|node| resolved_type(&context, node));
+    assert_ne!(left, right);
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    for type_ in [left, right] {
+        assert_ne!(type_, bootstrap.any_type);
+        assert_ne!(type_, bootstrap.boolean_type);
+    }
+    assert_boolean_results(&context, &[expression]);
+
+    let diagnostics = context.diagnostics().as_slice();
+    if disjoint {
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.node, Some(expression));
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
+        assert_eq!(diagnostic.diagnostic.code(), 2367);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Box<string>", "Box<number>"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "This comparison appears to be unintentional because the types 'Box<string>' and 'Box<number>' have no overlap.",
+        );
+        let range = parsed.arena.get(expression.node).unwrap().range;
+        let start = source.find(&text).unwrap();
+        assert_eq!(usize::try_from(range.start.get()).unwrap(), start);
+        assert_eq!(usize::try_from(range.end.get()).unwrap(), start + text.len());
+    } else {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    assert_warm_recheck(&mut context, file, &[expression, operands[0], operands[1]]);
+}
+
+#[test]
+fn sibling_alias_equality_accepts_overlapping_arguments_and_replays() {
+    for operator in ["!==", "===", "==", "!="] {
+        check_sibling_alias_equality(operator, "string | number", false);
+    }
+}
+
+#[test]
+fn sibling_alias_equality_reports_disjoint_arguments_and_replays() {
+    for operator in ["!==", "===", "==", "!="] {
+        check_sibling_alias_equality(operator, "number", true);
+    }
+}
+
 #[test]
 fn disjoint_object_equality_reports_exact_binary_nodes_and_ordered_type_names() {
     let source = concat!(

@@ -1,4 +1,4 @@
-//! Lazy members for generic-interface references and property-object aliases.
+//! Lazy members for generic references and property-object aliases.
 //!
 //! This is the declared-member prefix of pinned `resolveTypeReferenceMembers`,
 //! `resolveObjectTypeMembers`, `instantiateSymbolTable`, and
@@ -11,8 +11,14 @@
 //!
 //! Source property objects keep their type-literal target and exact parameter
 //! mapper. Their source annotations and instantiated property types stay lazy.
+//! Returned function annotations use their checked source call's mapper.
 
 use std::collections::{HashMap, HashSet};
+
+mod source_names;
+pub(super) use source_names::{
+    SourcePropertyObjectMemberNames, capture_source_property_object_member_names,
+};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
@@ -22,30 +28,43 @@ use ts_binder::{
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId, RelationUnavailable, SignatureId,
-    SourceCheckError, TypeId, TypeMapperId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId, RelationUnavailable,
+    SignatureId, SourceCheckError, TypeId, TypeMapperId,
     array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
-        validate_stored_callable_set, validated_instantiated_method_mapper,
+        validated_instantiated_method_mapper, validated_instantiated_method_parameter_types,
     },
     callables::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
         ValidatedSingleCallable,
     },
+    classes::{
+        ClassConstructorVisibility, ClassHeritageMembersValidation, class_member_visibility,
+        completed_source_class_receiver_member_mapper, completed_source_class_receiver_members,
+        validate_class_heritage_members,
+    },
+    conditional_types::{
+        ConditionalBranchSource, ConditionalRemapProjection, ConditionalTypeError,
+        conditional_signature_projection_with_array_targets, is_signature_conditional_source,
+    },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     declared_values::{SelectedDeclaredProperty, selected_source_property_object_property},
     functions::{
-        FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
+        FunctionTypeDisplayError, GenericFunctionAliasProjection, StoredFunctionTypeValidation,
+        function_alias_instance_arguments, function_alias_instance_flags,
+        function_type_display_projection, generic_function_alias_projection,
         validate_stored_function_type,
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         cached_instantiation_with_vector, instantiable_member_type_contains_variables,
-        instantiate_type_with_session, instantiate_type_with_vector_and_session,
+        instantiate_type_with_session, instantiate_type_with_source,
+        instantiate_type_with_vector_and_session, instantiate_type_with_vector_and_source,
         instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
+    mapper::TypeMapperApplication,
     object_aliases::{
         SourcePropertyObjectProjection, cached_property_object_alias_physical_arguments,
         closed_declared_property_object_is_mapping_invariant, closed_type_alias_source_header,
@@ -56,16 +75,17 @@ use super::{
         cached_planned_type_identity, resolved_declared_property_types,
         validate_resolved_declared_property_object,
     },
-    reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
+    reference_types::{DirectGenericReference, DirectGenericReferenceError, validate_direct_generic_reference},
     signatures::{
         ElementFlags, IndexInfo, SignatureFlags, SignatureInstantiationError, TupleElementInfo,
     },
-    store::SourceNodeParent,
+    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    store::{CachedSignatureLookup, SourceNodeParent},
     structured_members::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
-    type_nodes::CanonicalTypeQuery,
+    type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, SourceTypeQueryContext},
     type_records::{
         ConstrainedTypeData, LiteralValue, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeDataKind, TypeParameterData,
@@ -142,7 +162,7 @@ pub(super) struct PropertyObjectAliasMembers {
     pub(super) properties: Vec<SemanticSymbolId>,
 }
 
-/// The property-function producer retains the caller's capability on its real copy.
+/// Function aliases and interface callbacks retain the caller's capability on their copies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct InstantiatedPropertyAliasCallable {
     type_: TypeId,
@@ -168,6 +188,15 @@ impl InstantiatedPropertyAliasCallable {
         if self.type_ == self.source
             || store.mapper_payload(self.mapper).is_none()
             || instantiated_function_property_owner(store, self.source, self.mapper).is_none()
+                && function_alias_instance_arguments(store, self.source, self.type_, self.mapper)
+                    .is_none()
+                && generic_interface_callback_mapping(
+                    store,
+                    self.source,
+                    self.mapper,
+                    self.array_targets,
+                )
+                .is_none()
             || self.array_targets.is_some_and(|targets| {
                 store.type_payload(targets.array_type()).is_none()
                     || store.type_payload(targets.readonly_array_type()).is_none()
@@ -190,10 +219,16 @@ impl InstantiatedPropertyAliasCallable {
         let Some(original) = store.signature(signature.source) else {
             return false;
         };
+        let alias_arguments =
+            function_alias_instance_arguments(store, self.source, self.type_, self.mapper);
+        let expected_flags = alias_arguments.as_ref().map_or(
+            Some(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED),
+            |arguments| function_alias_instance_flags(store, arguments),
+        );
         record.flags() == TypeFlags::OBJECT
-            && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            && Some(record.object_flags()) == expected_flags
             && record.symbol() == Some(symbol)
-            && record.alias().is_none()
+            && (record.alias().is_none() || alias_arguments.is_some())
             && object.target == Some(self.source)
             && object.mapper == Some(self.mapper)
             && object.instantiations == TypeCacheState::Unallocated
@@ -330,9 +365,25 @@ impl From<DirectGenericReferenceError> for GenericInterfaceMemberError {
 struct DeclaredProperty {
     symbol: SemanticSymbolId,
     name: EscapedName,
-    type_: TypeId,
+    value: DeclaredPropertyValue,
     requires_proxy: bool,
     method: bool,
+    source_mapper: Option<TypeMapperId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredPropertyValue {
+    Pending,
+    Resolved(TypeId),
+}
+
+impl DeclaredPropertyValue {
+    fn resolved(self) -> Option<TypeId> {
+        match self {
+            Self::Pending => None,
+            Self::Resolved(type_) => Some(type_),
+        }
+    }
 }
 
 type DeclaredTargetHeader = (
@@ -345,6 +396,14 @@ type DeclaredTargetHeader = (
 
 type InheritedInterfaceMembers = (Vec<SemanticSymbolId>, Vec<IndexInfoId>);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GenericMemberReplay {
+    Full,
+    Names,
+}
+
+pub(super) type CompletedSourceClassOriginMemberMapping = (TypeId, Vec<TypeId>, Vec<TypeId>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GenericInterfaceShape {
     reference: TypeId,
@@ -353,10 +412,28 @@ struct GenericInterfaceShape {
     target_arguments: Vec<TypeId>,
     properties: Vec<DeclaredProperty>,
     index_infos: Vec<IndexInfoId>,
+    call_signatures: Vec<SignatureId>,
     base_types: Vec<TypeId>,
     inherited_properties: Vec<SemanticSymbolId>,
     inherited_index_infos: Vec<IndexInfoId>,
     inherited_members_ready: bool,
+}
+
+impl GenericInterfaceShape {
+    fn same_member_names(&self, other: &Self) -> bool {
+        self.reference == other.reference && self.target == other.target
+            && self.source_parameters == other.source_parameters && self.target_arguments == other.target_arguments
+            && self.index_infos == other.index_infos && self.call_signatures == other.call_signatures
+            && self.base_types == other.base_types && self.inherited_properties == other.inherited_properties
+            && self.inherited_index_infos == other.inherited_index_infos
+            && self.inherited_members_ready == other.inherited_members_ready
+            && self.properties.len() == other.properties.len()
+            && self.properties.iter().zip(&other.properties).all(|(left, right)| {
+                left.symbol == right.symbol && left.name == right.name
+                    && left.requires_proxy == right.requires_proxy && left.method == right.method
+                    && left.source_mapper == right.source_mapper
+            })
+    }
 }
 
 /// Evidence created only after this producer observes a real caller limit event.
@@ -765,13 +842,7 @@ impl InstantiatedIndexRecovery {
                 .ok()
                 .as_deref()
                 == Some(self.mapper_sources.as_slice())
-            && self.mapper_targets
-                == shape
-                    .target_arguments
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(shape.reference))
-                    .collect::<Vec<_>>()
+            && self.mapper_targets == member_mapper_arguments(store, shape)
     }
 
     fn matches_cached_identity(
@@ -874,6 +945,7 @@ enum RecoveredPropertyTypeShape {
         index: TypeId,
         access: AccessFlags,
     },
+    Conditional(ConditionalRemapProjection),
     Object {
         data: ObjectTypeData,
         signatures: Vec<RecoveredPropertySignatureIdentity>,
@@ -1004,10 +1076,22 @@ impl InstantiatedPropertyRecovery {
             return false;
         }
         if self.method {
-            return matches!(
-                super::callable_sets::validate_stored_callable_set(store, result),
-                StoredCallableSetValidation::Valid { .. }
-            );
+            let validation = if super::callable_sets::completed_source_class_method_callable(
+                store,
+                template,
+                array_targets,
+            )
+            .is_some()
+            {
+                super::callable_sets::validate_stored_callable_set_with_array_targets(
+                    store,
+                    result,
+                    array_targets,
+                )
+            } else {
+                super::callable_sets::validate_stored_callable_set(store, result)
+            };
+            return matches!(validation, StoredCallableSetValidation::Valid { .. });
         }
         match array_targets {
             Some(targets) => store
@@ -1062,31 +1146,41 @@ impl InstantiatedPropertyRecoveryIdentity<'_> {
 
     /// Checks the original mapper and proxy without asking the member graph to validate itself.
     pub(super) fn receiver(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
-        let (_, owner_type) = store.authenticated_interface_method_owner(self.method())?;
-        let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
-            return None;
-        };
-        let receiver = store.map_type(self.mapper(), interface.this_type?)?;
-        let plan = plan_published_interface_method(
+        let receiver = if let Some(receiver) = completed_source_class_method_receiver(
             store,
+            self.source_type(),
+            self.mapper(),
             self.recovery.array_targets,
-            receiver,
-            self.method(),
-        )
-        .ok()?;
-        if plan.source != self.source_type()
-            || store.type_mapper_has_exact_endpoints(
-                self.mapper(),
-                &plan.mapper_sources,
-                &plan.mapper_targets,
-            ) != Some(true)
-        {
-            return None;
-        }
+        ) {
+            receiver
+        } else {
+            let (_, owner_type) = store.authenticated_interface_method_owner(self.method())?;
+            let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
+                return None;
+            };
+            let receiver = store.map_type(self.mapper(), interface.this_type?)?;
+            let plan = plan_published_interface_method(
+                store,
+                self.recovery.array_targets,
+                receiver,
+                self.method(),
+            )
+            .ok()?;
+            if plan.source != self.source_type()
+                || store.type_mapper_has_exact_endpoints(
+                    self.mapper(),
+                    &plan.mapper_sources,
+                    &plan.mapper_targets,
+                ) != Some(true)
+            {
+                return None;
+            }
+            plan.receiver
+        };
         let source = store.symbol(self.method())?;
         let proxy = store.symbol(self.recovery.symbol)?;
         let links = store.value_symbol_links(self.recovery.symbol)?;
-        let members = store.type_payload(plan.receiver)?.data().structured()?;
+        let members = store.type_payload(receiver)?.data().structured()?;
         let table = store.symbol_table(members.members?)?;
         let expected_checks = CheckFlags::INSTANTIATED
             | (source.check_flags()
@@ -1122,7 +1216,7 @@ impl InstantiatedPropertyRecoveryIdentity<'_> {
         {
             return None;
         }
-        Some(plan.receiver)
+        Some(receiver)
     }
 }
 
@@ -1223,6 +1317,20 @@ pub(super) fn property_recovery_type_identity(
                         index: indexed.index_type,
                         access: indexed.access_flags,
                     }
+                }
+                TypeData::Conditional(conditional)
+                    if is_signature_conditional_source(store, type_) =>
+                {
+                    let (projection, _) = conditional_signature_projection_with_array_targets(
+                        store,
+                        type_,
+                        array_targets,
+                    )
+                    .ok()?;
+                    pending.extend(projection.parameters());
+                    pending.extend(projection.arguments());
+                    pending.extend([conditional.check_type, conditional.extends_type]);
+                    RecoveredPropertyTypeShape::Conditional(projection)
                 }
                 TypeData::Object(object) => {
                     let mut signatures = Vec::new();
@@ -1558,6 +1666,7 @@ enum ColdPropertyPlan {
         target: SemanticSymbolId,
         data: SymbolData,
         name_type: Option<TypeId>,
+        source_mapper: Option<TypeMapperId>,
     },
 }
 
@@ -1568,11 +1677,12 @@ struct ColdMembersPlan {
 }
 
 #[derive(Debug)]
-struct ColdIndexValues {
+struct ColdMemberValues {
     mapper: Option<TypeMapperId>,
     mapper_sources: Vec<TypeId>,
     mapper_targets: Vec<TypeId>,
     indexes: Vec<ColdIndexValue>,
+    call_signatures: Vec<SignatureId>,
 }
 
 #[derive(Debug)]
@@ -1650,8 +1760,8 @@ impl CanonicalTypeMapperStore {
         )
     }
 
-    /// Resolves the declared member surface of one direct generic interface
-    /// reference, including the canonical target identity.
+    /// Resolves declared members of one direct generic interface or public
+    /// class-field reference, including the canonical target identity.
     ///
     /// The target must already own a fully resolved declared member surface.
     /// This store-level adapter intentionally does not parse or publish that
@@ -1660,7 +1770,7 @@ impl CanonicalTypeMapperStore {
     /// # Errors
     ///
     /// Returns [`GenericInterfaceMemberError`] for a foreign identity,
-    /// malformed or poisoned cache, nonlocal/merged/class target, unsupported
+    /// malformed or poisoned cache, an unsupported target, unsupported
     /// member or property type, or capacity failure. A rejected cold query
     /// publishes no transient property symbol, table, or structured-member
     /// cache. Failed instantiation can retain type and mapper identities.
@@ -1885,6 +1995,7 @@ pub(super) fn validate_property_object_alias_members_with_array_targets(
                         Some(cached),
                         validation_targets,
                     )
+                    .map_err(|error| property_object_alias_member_error(receiver, &error))?
                 {
                     return Err(invalid());
                 }
@@ -2008,6 +2119,15 @@ fn validate_source_property_object_cache_cycles(
     projection: &SourcePropertyObjectProjection,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), RelationUnavailable> {
+    validate_source_property_object_cache_cycles_with_replay(store, projection, array_targets, true)
+}
+
+fn validate_source_property_object_cache_cycles_with_replay(
+    store: &CanonicalTypeMapperStore,
+    projection: &SourcePropertyObjectProjection,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay_named_values: bool,
+) -> Result<(), RelationUnavailable> {
     let receiver = projection.type_();
     let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
     let mut graph = HashMap::<TypeId, Vec<TypeId>>::new();
@@ -2078,7 +2198,9 @@ fn validate_source_property_object_cache_cycles(
                 );
             }
             if let Some(structured) = member_record.data().structured() {
-                properties.extend(structured.properties.as_deref().unwrap_or_default());
+                if replay_named_values {
+                    properties.extend(structured.properties.as_deref().unwrap_or_default());
+                }
                 signatures.extend(structured.signatures.as_deref().unwrap_or_default());
                 indexes.extend(structured.index_infos.as_deref().unwrap_or_default());
             }
@@ -2122,6 +2244,13 @@ fn validate_source_property_object_cache_cycles(
                         ) {
                             continue;
                         }
+                        if !replay_named_values && matches!(store.source_node_kind(source), Some(
+                            SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration
+                                | SyntaxKind::MethodSignature | SyntaxKind::GetAccessor
+                                | SyntaxKind::SetAccessor
+                        )) {
+                            continue;
+                        }
                         source_nodes.push(source);
                     }
                 }
@@ -2130,12 +2259,9 @@ fn validate_source_property_object_cache_cycles(
         if type_ == receiver {
             aliases.insert(type_);
             children.extend(projection.arguments());
-            properties.extend(
-                projection
-                    .properties()
-                    .iter()
-                    .map(|property| property.symbol),
-            );
+            if replay_named_values {
+                properties.extend(projection.properties().iter().map(|property| property.symbol));
+            }
         } else if matches!(record.data(), TypeData::Object(_))
             && let Some(arguments) = cached_property_object_alias_physical_arguments(store, type_)
                 .map_err(|_| invalid())?
@@ -2456,11 +2582,7 @@ fn validate_property_object_alias_source_members(
     for (index, property) in projection.properties().iter().enumerate() {
         let type_ = match selected_source_property_object_property(store, projection, index)? {
             SelectedDeclaredProperty::Resolved(property) => Some(property.type_),
-            SelectedDeclaredProperty::Unresolved(symbol)
-                if symbol == property.symbol && !complete =>
-            {
-                None
-            }
+            SelectedDeclaredProperty::Unresolved(symbol) if symbol == property.symbol => None,
             _ => return Err(invalid()),
         };
         original_types.push(type_);
@@ -2523,14 +2645,36 @@ pub(super) fn resolve_property_object_alias_members_with_array_targets(
             array_targets,
         ),
     }?;
-    if let Some(members) = members {
-        return Ok(members);
-    }
     let projection = source_property_object_projection(store, receiver)?
         .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
     let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let (source_members, original_types) =
+        validate_property_object_alias_source_members(store, &projection)?;
+    if !store
+        .type_payload(projection.target())
+        .ok_or_else(invalid)?
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        // Instance member demand first resolves the template's names, not its values.
+        let properties = projection
+            .properties()
+            .iter()
+            .map(|property| property.symbol)
+            .collect::<Vec<_>>();
+        assert!(store.set_structured_type_members(
+            projection.target(),
+            source_members,
+            (!properties.is_empty()).then_some(properties),
+            None,
+            None,
+            None,
+        ));
+    }
+    if let Some(members) = members {
+        return Ok(members);
+    }
     let mapper = projection.mapper().ok_or_else(invalid)?;
-    let (_, original_types) = validate_property_object_alias_source_members(store, &projection)?;
     let mut properties = Vec::with_capacity(projection.properties().len());
     let mut proxy_count = 0;
     for (source, original) in projection.properties().iter().zip(original_types) {
@@ -2589,9 +2733,40 @@ pub(super) fn resolve_property_object_alias_members_with_array_targets(
     })
 }
 
+struct PropertyObjectAliasQuery<'query, 'host, 'arena> {
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &'query CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    diagnostics: &'query mut CanonicalCheckerDiagnostics,
+    context: Option<&'query mut SourceTypeQueryContext<'host, 'arena>>,
+}
+
+impl<'host, 'arena> PropertyObjectAliasQuery<'_, 'host, 'arena> {
+    fn run<R>(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        session: &mut InstantiationSession,
+        operation: impl FnOnce(
+            &mut CanonicalTypeQuery<'_, 'host, 'arena, '_>,
+        ) -> Result<R, DeclaredTypeError>,
+    ) -> Result<R, DeclaredTypeError> {
+        if let Some(context) = self.context.as_deref_mut() {
+            return context.query(store, session, self.diagnostics, operation);
+        }
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            self.host,
+            self.globals,
+            self.options,
+            session,
+            self.diagnostics,
+        )?;
+        operation(&mut query)
+    }
+}
+
 /// Resolves one original annotation, then maps only that property's value.
 #[allow(clippy::too_many_arguments)] // The source owner supplies the query session and diagnostics.
-#[allow(clippy::too_many_lines)] // Keep cold resolution, caller-session mapping, and publication together.
 pub(super) fn demand_property_object_alias_property(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2602,7 +2777,61 @@ pub(super) fn demand_property_object_alias_property(
     receiver: TypeId,
     property: SemanticSymbolId,
 ) -> Result<TypeId, SourceCheckError> {
-    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+    demand_property_object_alias_property_worker(
+        store,
+        session,
+        receiver,
+        property,
+        &mut PropertyObjectAliasQuery {
+            host,
+            globals: global_types,
+            options: options.into(),
+            diagnostics,
+            context: None,
+        },
+    )
+}
+
+/// Retains the conditional caller's aliases, recovery state, and query guards.
+#[allow(clippy::too_many_arguments)] // The existing caller owns all query inputs.
+pub(super) fn demand_property_object_alias_property_with_source<'host, 'arena>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    context: &mut SourceTypeQueryContext<'host, 'arena>,
+) -> Result<TypeId, ConditionalTypeError> {
+    demand_property_object_alias_property_worker(
+        store,
+        session,
+        receiver,
+        property,
+        &mut PropertyObjectAliasQuery {
+            host,
+            globals,
+            options,
+            diagnostics,
+            context: Some(context),
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines)] // Keep the existing proxy checks and publication order.
+fn demand_property_object_alias_property_worker<Error>(
+    store: &mut CanonicalTypeMapperStore,
+    session: &mut InstantiationSession,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    query: &mut PropertyObjectAliasQuery<'_, '_, '_>,
+) -> Result<TypeId, Error>
+where
+    Error: From<DeclaredTypeError> + From<RelationUnavailable>,
+{
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(query.globals));
     let members =
         validate_property_object_alias_members_with_array_targets(store, receiver, array_targets)?
             .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
@@ -2622,15 +2851,9 @@ pub(super) fn demand_property_object_alias_property(
         .value_symbol_links(property)
         .and_then(|links| links.resolved_type)
     {
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .preflight_type_of_declared_value(source.symbol)?;
+        query.run(store, session, |query| {
+            query.preflight_type_of_declared_value(source.symbol)
+        })?;
         return Ok(type_);
     }
     if session.recovery_error_type().is_some_and(|error_type| {
@@ -2643,27 +2866,15 @@ pub(super) fn demand_property_object_alias_property(
     }
     let template = match selected_source_property_object_property(store, &projection, index)? {
         SelectedDeclaredProperty::Resolved(property) => {
-            CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?
-            .preflight_type_of_declared_value(source.symbol)?;
+            query.run(store, session, |query| {
+                query.preflight_type_of_declared_value(source.symbol)
+            })?;
             property.type_
         }
         SelectedDeclaredProperty::Unresolved(symbol) if symbol == source.symbol => {
-            CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?
-            .get_type_of_declared_value(source.symbol)?
+            query.run(store, session, |query| {
+                query.get_type_of_declared_value(source.symbol)
+            })?
         }
         _ => return Err(invalid().into()),
     };
@@ -2693,15 +2904,9 @@ pub(super) fn demand_property_object_alias_property(
                 .ok_or_else(invalid)?
                 .1
         };
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_return_type_of_signature(signature)?;
+        query.run(store, session, |query| {
+            query.get_return_type_of_signature(signature)
+        })?;
     }
     let mapper = projection.mapper().ok_or_else(invalid)?;
     let limit_mark = session.limit_event_mark();
@@ -2742,13 +2947,15 @@ pub(super) fn demand_property_object_alias_property(
             identity,
         })
     } else {
-        if !cached_instantiated_property_type_matches(
+        if !cached_instantiated_property_type_matches_checked(
             store,
             template,
             instantiated,
             mapper,
             array_targets,
-        ) {
+        )
+        .map_err(|error| property_object_alias_member_error(receiver, &error))?
+        {
             return Err(invalid().into());
         }
         None
@@ -2857,8 +3064,8 @@ pub(super) fn resolve_members_with_array_targets_and_session(
     }) {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
     }
-    // Go substitutes own indexes before it resolves inherited members.
-    let indexes = prepare_cold_index_values(store, &shape, array_targets, session)?;
+    // Go substitutes own signatures and indexes before it resolves inherited members.
+    let values = prepare_cold_member_values(store, &shape, array_targets, session)?;
     if !shape.inherited_members_ready {
         materialize_inherited_members(store, &shape, array_targets, session)?;
         shape = validate_shape(store, reference, array_targets)?;
@@ -2867,7 +3074,7 @@ pub(super) fn resolve_members_with_array_targets_and_session(
         }
     }
     let plan = prepare_cold_members(store, &shape)?;
-    publish_cold_members(store, &shape, plan, indexes, array_targets)
+    publish_cold_members(store, &shape, plan, values, array_targets)
 }
 
 /// Validates the declaration graph and any published member cache without
@@ -2879,6 +3086,122 @@ pub(super) fn validate_generic_interface_members(
 ) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
     let shape = validate_shape(store, reference, array_targets)?;
     validate_warm_members(store, &shape, array_targets)
+}
+
+/// Exposes a generic interface's existing declared or instantiated call set.
+/// A cold instance is pending until member demand applies its enclosing mapper.
+pub(super) fn validate_generic_interface_callable(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(reference)?;
+    let target = match record.data() {
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            interface.reference.object.target?
+        }
+        TypeData::TypeReference(reference) => reference.object.target?,
+        _ => return None,
+    };
+    let TypeData::Interface(interface) = store.type_payload(target)?.data() else {
+        return None;
+    };
+    if interface.declared_call_signatures.is_none()
+        && !store.type_has_declared_call_set_provenance(target)
+        && !store.type_has_declared_call_set_provenance(reference)
+    {
+        return None;
+    }
+    let family = CallableFamily::DeclaredCallSignatures;
+    let validated = (|| {
+        let shape = validate_shape(store, reference, array_targets).ok()?;
+        let warm = validate_warm_members(store, &shape, array_targets).ok()?;
+        if shape.call_signatures.is_empty() {
+            return None;
+        }
+        if warm.is_none() && reference != target {
+            return (!store.type_has_declared_call_set_provenance(reference))
+                .then_some(StoredCallableSetValidation::Pending { family });
+        }
+        let signatures = if reference == target {
+            shape.call_signatures.as_slice()
+        } else {
+            record.data().structured()?.signatures.as_deref()?
+        };
+        let call_signatures =
+            generic_interface_call_projections(store, &shape, signatures, array_targets).ok()?;
+        let mut edges =
+            super::object_members::generic_declared_call_signature_edges(store, target)?;
+        append_validated_generic_interface_type_edges(store, &shape, array_targets, &mut edges)
+            .ok()?;
+        for callable in &call_signatures {
+            edges.extend_from_slice(&callable.parameters);
+            edges.extend(callable.rest_parameter);
+            edges.extend(callable.return_type);
+        }
+        Some(StoredCallableSetValidation::Valid {
+            family,
+            projection: CallableSetProjection {
+                owner: reference,
+                call_signatures: call_signatures.into_boxed_slice(),
+                construct_signatures: Box::new([]),
+            },
+            edges,
+        })
+    })();
+    Some(validated.unwrap_or(StoredCallableSetValidation::Malformed { family }))
+}
+
+/// Finds an exact declared or copied call in an interface's complete call set.
+pub(super) fn generic_interface_call_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(owner) = store.declared_call_set_type_for_signature(signature) else {
+        return Ok(None);
+    };
+    let validation = match validate_generic_interface_callable(store, owner, array_targets) {
+        Some(validation) => validation,
+        None if store.type_payload(owner).is_some_and(|record| {
+            matches!(record.data(), TypeData::Interface(_))
+                && !record.object_flags().contains(ObjectFlags::REFERENCE)
+        }) =>
+        {
+            // A generic call can belong to a nongeneric interface.
+            super::callable_sets::validate_stored_callable_set_with_array_targets(
+                store,
+                owner,
+                array_targets,
+            )
+        }
+        None => return Ok(None),
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(owner);
+    let StoredCallableSetValidation::Valid { projection, .. } = validation else {
+        return Err(invalid());
+    };
+    let callable = projection
+        .call_signatures
+        .iter()
+        .find(|callable| callable.signature == signature)
+        .ok_or_else(invalid)?;
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    let source = record.target().unwrap_or(signature);
+    let original = store.signature(source).ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::CallSignature) {
+        return Err(invalid());
+    }
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner,
+        source,
+        declaration,
+        source_return: original.resolved_return_type().ok_or_else(invalid)?,
+        return_type: callable.return_type.ok_or_else(invalid)?,
+    }))
 }
 
 /// Returns argument and member type edges without resolving cold tables or values.
@@ -2894,13 +3217,14 @@ pub(super) fn validated_generic_interface_type_edges(
         let target = validate_shape(store, shape.target, array_targets)?;
         append_validated_generic_interface_type_edges(store, &target, array_targets, &mut edges)?;
     }
-    append_validated_generic_callable_type_edges(store, reference, &mut edges)?;
+    append_validated_generic_callable_type_edges(store, reference, array_targets, &mut edges)?;
     Ok(edges)
 }
 
 fn append_validated_generic_callable_type_edges(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
     edges: &mut Vec<TypeId>,
 ) -> Result<(), GenericInterfaceMemberError> {
     let mut visited = HashSet::new();
@@ -2910,14 +3234,24 @@ fn append_validated_generic_callable_type_edges(
         if !visited.insert(type_) {
             continue;
         }
-        match validate_stored_callable_set(store, type_) {
+        match super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            type_,
+            array_targets,
+        ) {
             StoredCallableSetValidation::Valid {
                 edges: dependencies,
                 ..
             } => edges.extend(dependencies),
-            // A pending callable still needs its source owner to resolve it.
+            // Cold generic references already retain their declared call template.
+            // Graph validation need not specialize a callable that is only a property type.
             StoredCallableSetValidation::Pending { .. } => {
-                return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+                let shape = validate_shape(store, type_, array_targets)
+                    .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
+                if shape.call_signatures.is_empty() {
+                    return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+                }
+                append_validated_generic_interface_type_edges(store, &shape, array_targets, edges)?;
             }
             StoredCallableSetValidation::Malformed { .. } => {
                 return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
@@ -2946,11 +3280,22 @@ fn append_validated_generic_interface_type_edges(
     let warm = validate_warm_members(store, shape, array_targets)?;
     edges.extend_from_slice(&shape.target_arguments);
     edges.extend_from_slice(&shape.base_types);
-    edges.extend(shape.properties.iter().map(|property| property.type_));
+    edges.extend(
+        shape
+            .properties
+            .iter()
+            .filter_map(|property| property.value.resolved()),
+    );
     for &symbol in shape.inherited_properties.iter().chain(
         warm.iter()
             .flat_map(InstantiatedInterfaceMembers::properties),
     ) {
+        if shape.properties.iter().any(|property| {
+            property.symbol == symbol && property.value == DeclaredPropertyValue::Pending
+        }) && store.value_symbol_links(symbol).is_none()
+        {
+            continue;
+        }
         let links = store
             .value_symbol_links(symbol)
             .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
@@ -2963,6 +3308,44 @@ fn append_validated_generic_interface_type_edges(
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ))?;
+    for &signature in shape
+        .call_signatures
+        .iter()
+        .chain(structured.signatures.as_deref().unwrap_or_default())
+    {
+        let record =
+            store
+                .signature(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                    shape.reference,
+                ))?;
+        let return_type = record.resolved_return_type().ok_or(
+            GenericInterfaceMemberError::InvalidCachedMembers(shape.reference),
+        )?;
+        for parameter in record.parameters() {
+            edges.push(
+                store
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                        shape.reference,
+                    ))?,
+            );
+        }
+        for &parameter in record.type_parameters() {
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(parameter).map(super::TypeRecord::data)
+            else {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                    shape.reference,
+                ));
+            };
+            edges.push(parameter);
+            edges.extend(data.constraint);
+            edges.extend(data.resolved_default_type);
+        }
+        edges.push(return_type);
+    }
     for &index in shape
         .index_infos
         .iter()
@@ -3038,10 +3421,94 @@ pub(super) fn demand_instantiated_property_type(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    demand_instantiated_property_type_worker(store, reference, symbol, array_targets, session, None)
+        .map_err(|error| error.into_member(reference))
+}
+
+/// Keeps a resolved member table's lazy method value in the same source query.
+pub(super) fn demand_instantiated_property_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    reference: TypeId,
+    symbol: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, SourceCheckError> {
+    let mut source = SignatureInstantiationSource {
+        global_types,
+        branches: source,
+    };
+    demand_instantiated_property_type_worker(
+        store,
+        reference,
+        symbol,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        session,
+        Some(&mut source),
+    )
+    .map_err(|error| error.into_source(reference))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the existing proxy publication and recovery order.
+fn demand_instantiated_property_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    reference: TypeId,
+    symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
+    if let Some((template, sources, targets)) =
+        completed_source_class_origin_member_mapping(store, reference, symbol, array_targets)?
+    {
+        if store
+            .symbol(symbol)
+            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+        {
+            return match source {
+                Some(source) => instantiate_published_interface_method_worker(
+                    store,
+                    source.global_types,
+                    reference,
+                    symbol,
+                    session,
+                    Some(source),
+                ),
+                None => instantiate_completed_source_class_origin_method_with_session(
+                    store,
+                    reference,
+                    symbol,
+                    array_targets,
+                    session,
+                )
+                .map_err(Into::into),
+            };
+        }
+        return match source {
+            Some(source) => instantiate_type_with_vector_and_source(
+                store,
+                template,
+                &sources,
+                &targets,
+                source.global_types,
+                session,
+                source.branches,
+            ),
+            None => instantiate_type_with_vector_and_session(
+                store,
+                template,
+                &sources,
+                &targets,
+                array_targets,
+                session,
+            ),
+        }
+        .map_err(|error| MethodSignatureError::Source { template, error });
+    }
     let members = validate_generic_interface_members(store, reference, array_targets)?
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(reference))?;
     if !members.properties.contains(&symbol) {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let record = store
         .symbol(symbol)
@@ -3053,7 +3520,9 @@ pub(super) fn demand_instantiated_property_type(
     let proxy = record.flags().contains(SymbolFlags::TRANSIENT)
         && record.check_flags().contains(CheckFlags::INSTANTIATED);
     if !proxy {
-        return cached.ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return cached
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))
+            .map_err(Into::into);
     }
     let (target, mapper) = {
         let links = store
@@ -3080,8 +3549,36 @@ pub(super) fn demand_instantiated_property_type(
             super::callable_sets::validate_stored_declared_method_callable_set(store, template),
             Some(StoredCallableSetValidation::Valid { .. })
         )
+        && super::callable_sets::completed_source_class_method_callable(
+            store,
+            template,
+            array_targets,
+        )
+        .is_none()
     {
-        return Err(GenericInterfaceMemberError::InvalidMember(target));
+        return Err(GenericInterfaceMemberError::InvalidMember(target).into());
+    }
+    if method && let Some(source) = source.as_deref() {
+        let signatures = store
+            .type_payload(template)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+        for &signature in signatures {
+            let parameters =
+                copied_method_parameter_types(store, template, signature, array_targets)
+                    .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+            let returned = store
+                .signature(signature)
+                .and_then(super::signatures::Signature::resolved_return_type)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+            for type_ in parameters.iter().copied().chain([returned]) {
+                preflight_signature_conditional_source(store, type_, source)?;
+            }
+        }
+    }
+    if !method && let Some(source) = source.as_deref() {
+        preflight_signature_conditional_source(store, template, source)?;
     }
     if let Some(cached) = cached {
         if !cached_instantiated_property_value_matches(
@@ -3091,8 +3588,8 @@ pub(super) fn demand_instantiated_property_type(
             mapper,
             Some(cached),
             array_targets,
-        ) {
-            return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        )? {
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
         }
         return Ok(cached);
     }
@@ -3102,13 +3599,20 @@ pub(super) fn demand_instantiated_property_type(
             .is_none_or(|bootstrap| bootstrap.error_type != error_type)
             || store.validate_union_constituent(error_type).is_err()
     }) {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let limit_mark = session.limit_event_mark();
     let instantiated = if method {
-        instantiate_generic_interface_method_type(store, template, mapper, array_targets, session)?
+        instantiate_generic_interface_method_type(
+            store,
+            template,
+            mapper,
+            array_targets,
+            session,
+            source,
+        )?
     } else {
-        instantiate_generic_member_type(store, template, mapper, array_targets, session)?
+        instantiate_signature_member_type(store, template, mapper, array_targets, session, source)?
     };
     let links = store
         .value_symbol_links(symbol)
@@ -3125,7 +3629,7 @@ pub(super) fn demand_instantiated_property_type(
             ..ValueSymbolLinks::default()
         })
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let recovery = if session.recovery_error_type().is_some()
         && session.limit_event_occurred_since(limit_mark)
@@ -3134,7 +3638,7 @@ pub(super) fn demand_instantiated_property_type(
             property_recovery_type_identity(store, &[template, instantiated], array_targets)
                 .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
         if !store.try_reserve_instantiated_property_recoveries() {
-            return Err(GenericInterfaceMemberError::Capacity(template));
+            return Err(GenericInterfaceMemberError::Capacity(template).into());
         }
         Some(InstantiatedPropertyRecovery {
             valid: true,
@@ -3252,10 +3756,198 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     method: SemanticSymbolId,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    instantiate_published_interface_method_worker(
+        store,
+        global_types,
+        receiver,
+        method,
+        session,
+        None,
+    )
+    .map_err(|error| error.into_member(receiver))
+}
+
+/// Resolves conditional return branches through the caller's source owner.
+pub(super) fn instantiate_published_generic_interface_method_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, SourceCheckError> {
+    let mut source = SignatureInstantiationSource {
+        global_types,
+        branches: source,
+    };
+    instantiate_published_interface_method_worker(
+        store,
+        global_types,
+        receiver,
+        method,
+        session,
+        Some(&mut source),
+    )
+    .map_err(|error| error.into_source(receiver))
+}
+
+struct SignatureInstantiationSource<'a> {
+    global_types: &'a CanonicalGlobalTypes,
+    branches: &'a mut dyn ConditionalBranchSource,
+}
+
+fn preflight_signature_conditional_source(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    source: &SignatureInstantiationSource<'_>,
+) -> Result<(), MethodSignatureError> {
+    if matches!(
+        store.type_payload(template).map(super::TypeRecord::data),
+        Some(TypeData::Conditional(_))
+    ) {
+        source
+            .branches
+            .preflight(store, template)
+            .map_err(|error| MethodSignatureError::Source {
+                template,
+                error: InstantiationError::Declared(error),
+            })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum MethodSignatureError {
+    Member(GenericInterfaceMemberError),
+    Source {
+        template: TypeId,
+        error: InstantiationError,
+    },
+}
+
+impl From<GenericInterfaceMemberError> for MethodSignatureError {
+    fn from(error: GenericInterfaceMemberError) -> Self {
+        Self::Member(error)
+    }
+}
+
+impl MethodSignatureError {
+    fn into_member(self, receiver: TypeId) -> GenericInterfaceMemberError {
+        match self {
+            Self::Member(error) => error,
+            Self::Source { template, error } => match error {
+                InstantiationError::InvalidType(_)
+                | InstantiationError::InvalidMapper(_)
+                | InstantiationError::InvalidAlias(_)
+                | InstantiationError::Declared(_) => {
+                    GenericInterfaceMemberError::InvalidCachedMembers(receiver)
+                }
+                _ => property_instantiation_error(template, &error),
+            },
+        }
+    }
+
+    fn into_source(self, receiver: TypeId) -> SourceCheckError {
+        match self {
+            Self::Source {
+                error: InstantiationError::Declared(error),
+                ..
+            } => error.into(),
+            other => super::object_members::source_generic_member_error(
+                receiver,
+                &other.into_member(receiver),
+            ),
+        }
+    }
+}
+
+fn instantiate_published_interface_method_worker(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
     let targets = CanonicalArrayTargets::from_global_types(global_types);
     let plan = plan_published_interface_method(store, Some(targets), receiver, method)?;
-    if let Some(cached) = cached_published_interface_method(store, &plan, targets)? {
-        return mapped_interface_method_value(store, global_types, &plan, cached);
+    let callable = instantiate_published_interface_method_callable_worker(
+        store, targets, &plan, session, source,
+    )?;
+    mapped_interface_method_value(store, global_types, &plan, callable).map_err(Into::into)
+}
+
+/// Store-only relations cannot resolve conditional source branches or method-owned formals.
+fn instantiate_completed_source_class_origin_method_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    if completed_source_class_origin_member_mapping(store, receiver, method, array_targets)?
+        .is_none()
+    {
+        return Err(GenericInterfaceMemberError::UnsupportedMember(method));
+    }
+    let targets = array_targets.ok_or(GenericInterfaceMemberError::UnsupportedMember(method))?;
+    let plan = plan_published_interface_method(store, Some(targets), receiver, method)?;
+    if plan.optional_sentinel.is_some()
+        || plan.signatures.iter().any(|signature| {
+            store
+                .signature(signature.source)
+                .is_none_or(|record| !record.type_parameters().is_empty())
+        })
+    {
+        return Err(GenericInterfaceMemberError::UnsupportedMember(method));
+    }
+    let roots = plan
+        .signatures
+        .iter()
+        .flat_map(|signature| {
+            signature
+                .parameter_types
+                .iter()
+                .copied()
+                .chain([signature.return_type])
+        })
+        .collect::<Vec<_>>();
+    let identity = property_recovery_type_identity(store, &roots, Some(targets))
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    if let Some(conditional) = identity.iter().find(|entry| {
+        store
+            .type_payload(entry.type_)
+            .is_some_and(|record| matches!(record.data(), TypeData::Conditional(_)))
+    }) {
+        return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+            conditional.type_,
+        ));
+    }
+    instantiate_published_interface_method_callable_worker(store, targets, &plan, session, None)
+        .map_err(|error| error.into_member(receiver))
+}
+
+#[allow(clippy::too_many_lines)] // Keep method publication and recovery in one transaction.
+fn instantiate_published_interface_method_callable_worker(
+    store: &mut CanonicalTypeMapperStore,
+    targets: CanonicalArrayTargets,
+    plan: &PublishedInterfaceMethodPlan,
+    session: &mut InstantiationSession,
+    mut source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
+    if let Some(source) = source.as_deref() {
+        for template in plan.signatures.iter().flat_map(|signature| {
+            signature
+                .parameter_types
+                .iter()
+                .copied()
+                .chain([signature.return_type])
+        }) {
+            preflight_signature_conditional_source(store, template, source)?;
+        }
+    }
+    if let Some(cached) = cached_published_interface_method(store, plan, targets)? {
+        return Ok(cached);
     }
     if session.recovery_error_type().is_some_and(|error_type| {
         store
@@ -3263,32 +3955,31 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             .is_none_or(|bootstrap| bootstrap.error_type != error_type)
             || store.validate_union_constituent(error_type).is_err()
     }) {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            plan.receiver,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver).into());
     }
     if !store.try_reserve_mappers(1)
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(plan.signatures.len())
     {
-        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
     }
     let mapper = store
         .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
     let limit_mark = session.limit_event_mark();
     let mut signatures = Vec::with_capacity(plan.signatures.len());
-    for source in &plan.signatures {
-        let signature = instantiate_generic_method_signature(
+    for signature_source in &plan.signatures {
+        let signature = instantiate_generic_method_signature_worker(
             store,
-            source.source,
-            &source.parameter_types,
-            source.return_type,
+            signature_source.source,
+            &signature_source.parameter_types,
+            signature_source.return_type,
             mapper,
             Some(targets),
             session,
             plan.method,
             plan.receiver,
+            source.as_deref_mut(),
         )?;
         signatures.push(signature);
     }
@@ -3298,7 +3989,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
         )?;
         let snapshot = published_method_recovery_snapshot(
             store,
-            &plan,
+            plan,
             mapper,
             &signatures,
             targets,
@@ -3308,14 +3999,14 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             plan.receiver,
         ))?;
         if !store.try_reserve_published_interface_method_recoveries() {
-            return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+            return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
         }
         Some((error_type, snapshot))
     } else {
         None
     };
     if !store.try_reserve_published_interface_method_origins(signatures.len()) {
-        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
     }
     let origin_plan = plan.clone();
     let origin_signatures = signatures.clone().into_boxed_slice();
@@ -3325,9 +4016,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     if !store.set_object_target_and_mapper(callable, Some(plan.source), Some(mapper))
         || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            plan.receiver,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver).into());
     }
     if let Some((error_type, snapshot)) = recovery {
         assert!(store.publish_published_interface_method_recovery(
@@ -3351,7 +4040,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             signatures: origin_signatures,
         })
     );
-    mapped_interface_method_value(store, global_types, &plan, callable)
+    Ok(callable)
 }
 
 fn mapped_interface_method_value(
@@ -3425,7 +4114,7 @@ pub(super) fn instantiate_published_generic_array_property_callable(
                 &plan.mapper_targets,
             ) == Some(true)
         {
-            return match validate_instantiated_array_property_callable(store, type_) {
+            return match validate_instantiated_array_property_callable_checked(store, type_)? {
                 InstantiatedArrayPropertyCallableValidation::Valid(_) => Ok(type_),
                 InstantiatedArrayPropertyCallableValidation::NotCallable
                 | InstantiatedArrayPropertyCallableValidation::Malformed => {
@@ -3622,59 +4311,68 @@ pub(super) fn validate_instantiated_array_property_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> InstantiatedArrayPropertyCallableValidation {
+    validate_instantiated_array_property_callable_checked(store, type_)
+        .unwrap_or(InstantiatedArrayPropertyCallableValidation::Malformed)
+}
+
+#[allow(clippy::too_many_lines)] // Keep exact callable checks and fallible operand replay together.
+fn validate_instantiated_array_property_callable_checked(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<InstantiatedArrayPropertyCallableValidation, GenericInterfaceMemberError> {
     let not_callable = InstantiatedArrayPropertyCallableValidation::NotCallable;
     let malformed = || InstantiatedArrayPropertyCallableValidation::Malformed;
     let Some(record) = store.type_payload(type_) else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let TypeData::Object(object) = record.data() else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let (Some(source), Some(mapper), Some(property)) =
         (object.target, object.mapper, record.symbol())
     else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let Some(property_record) = store.symbol(property) else {
-        return malformed();
+        return Ok(malformed());
     };
     if !property_record.flags().contains(SymbolFlags::PROPERTY)
         || !store.type_has_function_type_provenance(source)
     {
-        return not_callable;
+        return Ok(not_callable);
     }
     let Some(owner) = property_record
         .parent()
         .and_then(|parent| store.get_merged_symbol(parent))
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(owner_record) = store.symbol(owner) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(target) = store
         .declared_type_links(owner)
         .and_then(|links| links.declared_type)
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(TypeData::Interface(interface)) = store
         .type_payload(target)
         .map(super::type_records::TypeRecord::data)
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(parameters) = interface.reference.resolved_type_arguments.as_deref() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(this_type) = interface.this_type else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(receiver) = store.map_type(mapper, this_type) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Ok(reference) = validate_direct_generic_reference(store, receiver) else {
-        return malformed();
+        return Ok(malformed());
     };
     let mapper_sources = parameters
         .iter()
@@ -3688,31 +4386,31 @@ pub(super) fn validate_instantiated_array_property_callable(
         .chain(std::iter::once(receiver))
         .collect::<Vec<_>>();
     let Some([signature]) = object.structured.signatures.as_deref() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(instantiated) = store.signature(*signature) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_id) = instantiated.target() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original) = store.signature(original_id) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(source_record) = store.type_payload(source) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(source_structured) = source_record.data().structured() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_types) = store.callable_signature_parameter_types(original_id) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(return_type) = instantiated.resolved_return_type() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_return) = original.resolved_return_type() else {
-        return malformed();
+        return Ok(malformed());
     };
     let targets = CanonicalArrayTargets::for_single_target_validation(target);
     let global_owner = store
@@ -3745,15 +4443,15 @@ pub(super) fn validate_instantiated_array_property_callable(
         || instantiated.declaration() != original.declaration()
         || instantiated.parameters().len() != original.parameters().len()
         || original.parameters().len() != original_types.len()
-        || !cached_instantiated_property_type_matches(
+        || !cached_instantiated_property_type_matches_checked(
             store,
             original_return,
             return_type,
             mapper,
             Some(targets),
-        )
+        )?
     {
-        return malformed();
+        return Ok(malformed());
     }
     let mut edges = Vec::with_capacity(original_types.len() + 1);
     for ((parameter, original_parameter), template) in instantiated
@@ -3763,10 +4461,10 @@ pub(super) fn validate_instantiated_array_property_callable(
         .zip(original_types)
     {
         let Some(links) = store.value_symbol_links(*parameter) else {
-            return malformed();
+            return Ok(malformed());
         };
         let Some(type_) = links.resolved_type else {
-            return malformed();
+            return Ok(malformed());
         };
         let valid_links = if parameter == original_parameter {
             links
@@ -3788,20 +4486,20 @@ pub(super) fn validate_instantiated_array_property_callable(
                 })
         };
         if !valid_links
-            || !cached_instantiated_property_type_matches(
+            || !cached_instantiated_property_type_matches_checked(
                 store,
                 *template,
                 type_,
                 mapper,
                 Some(targets),
-            )
+            )?
         {
-            return malformed();
+            return Ok(malformed());
         }
         edges.push(type_);
     }
     edges.push(return_type);
-    InstantiatedArrayPropertyCallableValidation::Valid(edges)
+    Ok(InstantiatedArrayPropertyCallableValidation::Valid(edges))
 }
 
 fn plan_published_interface_method(
@@ -3810,6 +4508,50 @@ fn plan_published_interface_method(
     receiver: TypeId,
     method: SemanticSymbolId,
 ) -> Result<PublishedInterfaceMethodPlan, GenericInterfaceMemberError> {
+    if let Some((source, mapper_sources, mapper_targets)) =
+        completed_source_class_origin_member_mapping(store, receiver, method, targets)?
+    {
+        let (target, projection, edges) =
+            super::callable_sets::completed_source_class_method_callable(store, source, targets)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+        for edge in edges {
+            store
+                .validate_cached_array_capability_with_pending_functions(targets, edge, &[])
+                .map_err(|_| GenericInterfaceMemberError::InvalidMember(method))?;
+        }
+        let mut signatures = Vec::with_capacity(projection.call_signatures.len());
+        for callable in projection.call_signatures {
+            let signature = store
+                .signature(callable.signature)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            let parameter_types =
+                copied_method_parameter_types(store, source, callable.signature, targets)
+                    .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            let return_type = callable
+                .return_type
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            let mut parameters = mapper_sources.clone();
+            parameters.extend_from_slice(signature.type_parameters());
+            for type_ in parameter_types.iter().copied().chain([return_type]) {
+                member_type_requires_instantiation(store, type_, &parameters, targets)?;
+            }
+            signatures.push(PublishedInterfaceMethodSignature {
+                source: callable.signature,
+                parameter_types,
+                return_type,
+            });
+        }
+        return Ok(PublishedInterfaceMethodPlan {
+            method,
+            source,
+            optional_sentinel: None,
+            target,
+            receiver,
+            mapper_sources,
+            mapper_targets,
+            signatures,
+        });
+    }
     let method_record = store
         .symbol(method)
         .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
@@ -3972,6 +4714,20 @@ fn plan_published_interface_method(
         for type_ in parameter_types.iter().copied().chain([return_type]) {
             member_type_requires_instantiation(store, type_, &signature_parameters, targets)?;
         }
+        if let Some(predicate) = record.resolved_type_predicate() {
+            let narrowed = store
+                .type_predicate(predicate)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
+                .type_id();
+            if let Some(narrowed) = narrowed {
+                member_type_requires_instantiation(
+                    store,
+                    narrowed,
+                    &signature_parameters,
+                    targets,
+                )?;
+            }
+        }
         planned.push(PublishedInterfaceMethodSignature {
             source: signature,
             parameter_types,
@@ -4070,6 +4826,15 @@ fn cached_published_interface_method(
     plan: &PublishedInterfaceMethodPlan,
     targets: CanonicalArrayTargets,
 ) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    if super::callable_sets::completed_source_class_method_callable(
+        store,
+        plan.source,
+        Some(targets),
+    )
+    .is_some()
+    {
+        return cached_published_source_class_method(store, plan, targets);
+    }
     let mut cached = None;
     for (type_, record) in store.types() {
         let TypeData::Object(object) = record.data() else {
@@ -4110,6 +4875,80 @@ fn cached_published_interface_method(
         validate_published_interface_method_copy(store, plan, type_, mapper, targets)?;
     }
     Ok(cached)
+}
+
+fn cached_published_source_class_method(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    targets: CanonicalArrayTargets,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver);
+    let mut cached = None;
+    for (type_, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        if record.symbol() != Some(plan.method) || object.target != Some(plan.source) {
+            continue;
+        }
+        let Some(origin) = store.published_interface_method_origin(type_) else {
+            if !matches!(
+                super::callable_sets::validate_stored_callable_set_with_array_targets(
+                    store,
+                    type_,
+                    Some(targets),
+                ),
+                StoredCallableSetValidation::Valid { .. }
+            ) {
+                return Err(invalid());
+            }
+            continue;
+        };
+        if !published_source_class_method_origin_matches(store, type_, Some(targets)) {
+            return Err(invalid());
+        }
+        if origin.plan.receiver != plan.receiver {
+            continue;
+        }
+        if origin.plan != *plan || cached.replace(type_).is_some() {
+            return Err(invalid());
+        }
+        validate_published_interface_method_copy(store, plan, type_, origin.mapper, targets)?;
+    }
+    Ok(cached)
+}
+
+/// The selected-method cache also retains exact completed class-origin plans.
+pub(super) fn published_source_class_method_origin_matches(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    let Some(origin) = store.published_interface_method_origin(type_) else {
+        return false;
+    };
+    origin.result == type_
+        && Some(origin.array_targets) == array_targets
+        && origin.matches_current_type(store)
+        && super::callable_sets::completed_source_class_method_callable(
+            store,
+            origin.plan.source,
+            array_targets,
+        )
+        .is_some()
+        && plan_published_interface_method(
+            store,
+            array_targets,
+            origin.plan.receiver,
+            origin.plan.method,
+        )
+        .is_ok_and(|plan| plan == origin.plan)
+        && origin.signatures.iter().all(|signature| {
+            store.published_interface_method_type_for_signature(*signature) == Some(type_)
+                && store
+                    .proxy_interface_method_type_for_signature(*signature)
+                    .is_none()
+        })
 }
 
 fn published_interface_method_header_matches(
@@ -4221,11 +5060,26 @@ pub(super) fn published_interface_method_signature_return(
         return Err(invalid());
     }
     validate_published_interface_method_copy(store, &plan, owner, origin.mapper, targets)?;
+    let validation = if super::callable_sets::completed_source_class_method_callable(
+        store,
+        plan.source,
+        array_targets,
+    )
+    .is_some()
+    {
+        super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            owner,
+            array_targets,
+        )
+    } else {
+        super::callable_sets::validate_stored_callable_set(store, owner)
+    };
     let StoredCallableSetValidation::Valid {
         family: CallableFamily::DeclaredCallSignatures,
         projection,
         ..
-    } = super::callable_sets::validate_stored_callable_set(store, owner)
+    } = validation
     else {
         return Err(invalid());
     };
@@ -4264,6 +5118,380 @@ pub(super) fn published_interface_method_signature_return(
     }))
 }
 
+/// A call shell must use the call return reader, not the receiver copy reader.
+pub(super) fn interface_method_signature_return_for_query(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    interface_method_signature_return_for_query_with_source(store, signature, array_targets, None)
+}
+
+pub(super) fn interface_method_signature_return_for_query_with_source(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let preflight =
+        generic_method_return_query_target(store, signature, array_targets).map(|target| {
+            let result =
+                super::generic_calls::preflight_generic_call_signature_return_target_with_source(
+                    store,
+                    array_targets,
+                    signature,
+                    source,
+                );
+            (target, result)
+        });
+    finish_interface_method_return_query(
+        store,
+        signature,
+        array_targets,
+        preflight,
+        source.is_some(),
+    )
+}
+
+pub(super) fn prepare_interface_method_signature_return_for_query(
+    store: &mut CanonicalTypeMapperStore,
+    signature: SignatureId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let preflight = generic_method_return_query_target(store, signature, arrays).map(|target| {
+        let result = super::generic_calls::prepare_generic_call_signature_return_with_source(
+            store, globals, signature, session, source,
+        );
+        (target, result)
+    });
+    finish_interface_method_return_query(store, signature, arrays, preflight, true)
+}
+
+fn generic_method_return_query_target(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<SignatureId> {
+    if store
+        .published_interface_method_type_for_signature(signature)
+        .is_none()
+        && store
+            .proxy_interface_method_type_for_signature(signature)
+            .is_none()
+        && let Some(target) = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::target)
+        && (store.interface_method_linked_type(target).is_some()
+            || super::callable_sets::completed_source_class_method_signature_type(
+                store,
+                target,
+                array_targets,
+            )
+            .is_some())
+    {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn finish_interface_method_return_query(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    preflight: Option<(
+        SignatureId,
+        Result<SignatureId, super::generic_calls::GenericCallVectorError>,
+    )>,
+    source_aware: bool,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    if preflight
+        .as_ref()
+        .is_some_and(|(target, result)| result.as_ref().is_ok_and(|source| source == target))
+    {
+        return Ok(None);
+    }
+    instantiated_interface_method_signature_return(store, signature, array_targets)
+        .inspect_err(|error| {
+            if store.relation_read_observation_is_active() {
+                return;
+            }
+            let metadata = store.signature(signature).map(|record| {
+                (record.target(), record.mapper(), record.declaration())
+            });
+            super::source::observe_call_failure_detail(
+                "method_return_dispatch",
+                format_args!(
+                    "signature={signature:?} source_aware={} preflight={preflight:?} fallback_error={error:?} metadata={metadata:?} observation_active=false",
+                    source_aware,
+                ),
+            );
+        })
+}
+
+/// Reads a selected-method copy or an exact value already owned by a member proxy.
+pub(super) fn instantiated_interface_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let proxy_owner = store.proxy_interface_method_type_for_signature(signature);
+    if let Some(result) =
+        published_interface_method_signature_return(store, signature, array_targets)?
+    {
+        if let Some(owner) = proxy_owner {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner));
+        }
+        return Ok(Some(result));
+    }
+    let result = proxy_interface_method_signature_return(store, signature, array_targets)?;
+    match (proxy_owner, result) {
+        (Some(owner), Some(result))
+            if result.owner == owner
+                && store
+                    .type_payload(owner)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref())
+                    .is_some_and(|signatures| {
+                        signatures.iter().all(|&signature| {
+                            store.proxy_interface_method_type_for_signature(signature)
+                                == Some(owner)
+                        })
+                    }) =>
+        {
+            Ok(Some(result))
+        }
+        (Some(owner), _) => Err(GenericInterfaceMemberError::InvalidCachedMembers(owner)),
+        (None, Some(result)) => Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            result.owner,
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Follow the existing receiver and proxy cache without searching for a copy.
+fn proxy_interface_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(copied) = store.signature(signature) else {
+        return Ok(None);
+    };
+    let Some(source) = copied.target() else {
+        return Ok(None);
+    };
+    let source_value = match store.interface_method_linked_type(source) {
+        Some(source_value) => source_value,
+        None => {
+            return proxy_source_class_method_signature_return(
+                store,
+                signature,
+                source,
+                array_targets,
+            );
+        }
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(source_value);
+    let original = store.signature(source).ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    let method = store
+        .source_declaration_symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let (owner, target) = store
+        .authenticated_interface_method_owner(method)
+        .ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let signature_mapper = copied.mapper().ok_or_else(invalid)?;
+    let this_type = interface.this_type.ok_or_else(invalid)?;
+    let owner_mapper = if original.type_parameters().is_empty() {
+        signature_mapper
+    } else {
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(signature_mapper, this_type)
+        else {
+            return Err(invalid());
+        };
+        second
+    };
+    if validated_instantiated_method_mapper(store, original, copied, owner_mapper, array_targets)
+        != Some(signature_mapper)
+    {
+        return Err(invalid());
+    }
+    let receiver = store
+        .map_type(owner_mapper, this_type)
+        .ok_or_else(invalid)?;
+    let members =
+        validate_generic_interface_members(store, receiver, array_targets)?.ok_or_else(invalid)?;
+    let method_record = store.symbol(method).ok_or_else(invalid)?;
+    let property = members
+        .members()
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get(method_record.name()))
+        .filter(|property| members.properties().contains(property))
+        .ok_or_else(invalid)?;
+    let proxy = store.symbol(property).ok_or_else(invalid)?;
+    let links = store.value_symbol_links(property).ok_or_else(invalid)?;
+    let callable = links.resolved_type.ok_or_else(invalid)?;
+    if !proxy
+        .flags()
+        .contains(SymbolFlags::METHOD | SymbolFlags::TRANSIENT)
+        || !proxy.check_flags().contains(CheckFlags::INSTANTIATED)
+        || links.target != Some(method)
+        || links.mapper != Some(owner_mapper)
+        || members.target() != target
+    {
+        return Err(invalid());
+    }
+    let (source_callable, value, _) = published_interface_method_value(store, owner, method)?;
+    if value != source_value {
+        return Err(invalid());
+    }
+    let sources = store
+        .type_payload(source_callable)
+        .and_then(|record| record.data().structured())
+        .and_then(|members| members.signatures.as_deref())
+        .ok_or_else(invalid)?;
+    let index = sources
+        .iter()
+        .position(|candidate| *candidate == source)
+        .ok_or_else(invalid)?;
+    let signatures = store
+        .type_payload(callable)
+        .and_then(|record| record.data().structured())
+        .and_then(|members| members.signatures.as_deref())
+        .ok_or_else(invalid)?;
+    if signatures.len() != sources.len()
+        || signatures.get(index) != Some(&signature)
+        || copied.declaration() != Some(declaration)
+    {
+        return Err(invalid());
+    }
+    for type_ in [source_callable, receiver, callable] {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .map_err(|_| invalid())?;
+    }
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner: callable,
+        source,
+        declaration,
+        source_return: original.resolved_return_type().ok_or_else(invalid)?,
+        return_type: copied.resolved_return_type().ok_or_else(invalid)?,
+    }))
+}
+
+#[allow(clippy::too_many_lines)] // The copied return stays tied to its completed origin and receiver proxy.
+fn proxy_source_class_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    source: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(source_value) = super::callable_sets::completed_source_class_method_signature_type(
+        store,
+        source,
+        array_targets,
+    ) else {
+        return Ok(None);
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(source_value);
+    let original = store.signature(source).ok_or_else(invalid)?;
+    let copied = store.signature(signature).ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    let method = store
+        .type_payload(source_value)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or_else(invalid)?;
+    let (target, originals, _) = super::callable_sets::completed_source_class_method_callable(
+        store,
+        source_value,
+        array_targets,
+    )
+    .ok_or_else(invalid)?;
+    let TypeData::Interface(class) = store.type_payload(target).ok_or_else(invalid)?.data() else {
+        return Err(invalid());
+    };
+    let signature_mapper = copied.mapper().ok_or_else(invalid)?;
+    let mapper = if original.type_parameters().is_empty() {
+        signature_mapper
+    } else {
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(signature_mapper, class.this_type.ok_or_else(invalid)?)
+        else {
+            return Err(invalid());
+        };
+        second
+    };
+    if validated_instantiated_method_mapper(store, original, copied, mapper, array_targets)
+        != Some(signature_mapper)
+    {
+        return Err(invalid());
+    }
+    let receiver =
+        completed_source_class_method_receiver(store, source_value, mapper, array_targets)
+            .ok_or_else(invalid)?;
+    let members =
+        validate_generic_interface_members(store, receiver, array_targets)?.ok_or_else(invalid)?;
+    let name = store.symbol(method).ok_or_else(invalid)?.name();
+    let property = members
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(name))
+        .filter(|property| members.properties().contains(property))
+        .ok_or_else(invalid)?;
+    let links = store.value_symbol_links(property).ok_or_else(invalid)?;
+    let callable = links.resolved_type.ok_or_else(invalid)?;
+    if links.target != Some(method) || links.mapper != Some(mapper) {
+        return Err(invalid());
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            callable,
+            array_targets,
+        )
+    else {
+        return Err(invalid());
+    };
+    let index = originals
+        .call_signatures
+        .iter()
+        .position(|callable| callable.signature == source)
+        .ok_or_else(invalid)?;
+    if projection.owner != callable
+        || !projection.construct_signatures.is_empty()
+        || projection.call_signatures.len() != originals.call_signatures.len()
+        || projection
+            .call_signatures
+            .get(index)
+            .is_none_or(|callable| callable.signature != signature)
+        || copied.declaration() != Some(declaration)
+    {
+        return Err(invalid());
+    }
+    for type_ in [source_value, receiver, callable] {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .map_err(|_| invalid())?;
+    }
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner: callable,
+        source,
+        declaration,
+        source_return: original.resolved_return_type().ok_or_else(invalid)?,
+        return_type: copied.resolved_return_type().ok_or_else(invalid)?,
+    }))
+}
+
 fn validate_published_interface_method_signature(
     store: &CanonicalTypeMapperStore,
     plan: &PublishedInterfaceMethodPlan,
@@ -4295,7 +5523,13 @@ fn validate_published_interface_method_signature(
         || instantiated.parameters().len() != original.parameters().len()
         || instantiated.min_argument_count() != original.min_argument_count()
         || instantiated.resolved_min_argument_count() != -1
-        || instantiated.resolved_type_predicate().is_some()
+        || !instantiated_method_predicate_matches(
+            store,
+            original,
+            instantiated,
+            signature_mapper,
+            Some(targets),
+        )
         || instantiated.target() != Some(source.source)
         || instantiated.mapper() != Some(signature_mapper)
         || instantiated.isolated_signature_type().is_some()
@@ -4386,10 +5620,49 @@ fn validate_published_interface_method_signature(
     Ok(())
 }
 
+pub(super) fn instantiated_method_predicate_matches(
+    store: &CanonicalTypeMapperStore,
+    original: &super::signatures::Signature,
+    instantiated: &super::signatures::Signature,
+    mapper: TypeMapperId,
+    targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    match (
+        original.resolved_type_predicate(),
+        instantiated.resolved_type_predicate(),
+    ) {
+        (None, None) => true,
+        (Some(original), Some(instantiated)) => {
+            let (Some(original), Some(instantiated)) = (
+                store.type_predicate(original),
+                store.type_predicate(instantiated),
+            ) else {
+                return false;
+            };
+            original.kind() == instantiated.kind()
+                && original.parameter_name() == instantiated.parameter_name()
+                && original.parameter_index() == instantiated.parameter_index()
+                && match (original.type_id(), instantiated.type_id()) {
+                    (None, None) => true,
+                    (Some(original), Some(instantiated)) => instantiated_method_type_matches(
+                        store,
+                        original,
+                        instantiated,
+                        mapper,
+                        targets,
+                    ),
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn property_instantiation_error(
     type_: TypeId,
     error: &InstantiationError,
 ) -> GenericInterfaceMemberError {
+    eprintln!("copied-call instantiation failure: template={type_:?} error={error:?}");
     match error {
         InstantiationError::DepthLimit { .. }
         | InstantiationError::CountLimit { .. }
@@ -4414,14 +5687,51 @@ fn instantiate_generic_member_type(
             template,
         ));
     }
-    instantiate_generic_member_type_worker(
+    let result = instantiate_generic_member_type_worker(
         store,
         template,
         mapper,
         array_targets,
         session,
         &mut HashSet::new(),
-    )
+    );
+    if let Err(GenericInterfaceMemberError::UnsupportedPropertyType(rejected)) = &result {
+        let describe = |type_| {
+            let record = store.type_payload(type_);
+            let state = record.map(|record| (record.data().kind(), record.flags(), record.alias()));
+            let formal = record.and_then(|record| match record.data() {
+                TypeData::TypeParameter(parameter) => Some((
+                    parameter.target,
+                    parameter.mapper,
+                    parameter.constraint,
+                    parameter.resolved_default_type,
+                )),
+                _ => None,
+            });
+            let declaration = record
+                .and_then(|record| record.symbol())
+                .and_then(|owner| store.symbol(owner))
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied();
+            (type_, state, formal, declaration)
+        };
+        eprintln!(
+            "copied-call mapped type failure: template={template:?} mapper={mapper:?} rejected={:?}",
+            describe(*rejected),
+        );
+        if let Some(TypeData::Union(union)) = store.type_payload(*rejected).map(|record| record.data())
+        {
+            for (index, &member) in union.union.types.iter().take(2).enumerate() {
+                eprintln!(
+                    "copied-call rejected union member: count={} index={index} member={:?}",
+                    union.union.types.len(),
+                    describe(member),
+                );
+            }
+        }
+    }
+    result
 }
 
 fn instantiate_generic_member_type_worker(
@@ -4460,6 +5770,13 @@ fn instantiate_generic_member_type_inner(
     session: &mut InstantiationSession,
     active: &mut HashSet<TypeId>,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    if generic_function_alias_projection(store, template)
+        .map_err(|_| GenericInterfaceMemberError::InvalidCachedMembers(template))?
+        .is_some()
+    {
+        return instantiate_type_with_session(store, template, mapper, array_targets, session)
+            .map_err(|error| property_instantiation_error(template, &error));
+    }
     if let Some(tuple) = store
         .canonical_tuple_shape(template)
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template))?
@@ -4531,6 +5848,10 @@ fn instantiate_generic_member_type_inner(
             });
     }
     if store.type_has_function_type_provenance(template) {
+        if source_callable_function_type_owner(store, template).is_some() {
+            return instantiate_type_with_session(store, template, mapper, array_targets, session)
+                .map_err(|error| property_instantiation_error(template, &error));
+        }
         if closed_declared_function_type(store, template, array_targets).map_err(|error| {
             match error {
                 RelationUnavailable::UnsupportedStructuredType(_)
@@ -4548,24 +5869,24 @@ fn instantiate_generic_member_type_inner(
         }
         return instantiate_function_member_type(store, template, mapper, array_targets, session);
     }
-    if let Some((callback, undefined)) = optional_function_member(store, template)? {
+    if let Some(optional) = optional_function_member(store, template)? {
         let instantiated_callback = instantiate_generic_member_type_worker(
             store,
-            callback,
+            optional.callback,
             mapper,
             array_targets,
             session,
             active,
         )?;
-        if instantiated_callback == callback {
+        if instantiated_callback == optional.callback {
             return Ok(template);
         }
+        let members = std::iter::once(instantiated_callback)
+            .chain(optional.undefined)
+            .chain(optional.null)
+            .collect::<Vec<_>>();
         return store
-            .literal_union_type_with_alias_and_array_targets(
-                &[instantiated_callback, undefined],
-                None,
-                array_targets,
-            )
+            .literal_union_type_with_alias_and_array_targets(&members, None, array_targets)
             .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template));
     }
     let indexed = match store
@@ -4596,6 +5917,15 @@ fn instantiate_generic_member_type_inner(
     let name = indexed_property_escaped_name(store, index);
     if validate_direct_generic_reference(store, object).is_ok() {
         resolve_members_with_array_targets_and_session(store, object, array_targets, session)?;
+    } else {
+        super::object_members::demand_primitive_interface_members(store, object).map_err(
+            |error| match error {
+                super::object_members::PropertyObjectError::Capacity(_) => {
+                    GenericInterfaceMemberError::Capacity(object)
+                }
+                _ => GenericInterfaceMemberError::InvalidCachedMembers(object),
+            },
+        )?;
     }
     let symbol = name.as_ref().and_then(|name| {
         store
@@ -4660,27 +5990,40 @@ fn method_tuple_union_members(
     Ok(Some(&union.union.types))
 }
 
+#[derive(Clone, Copy)]
+struct OptionalFunctionMember {
+    callback: TypeId,
+    undefined: Option<TypeId>,
+    null: Option<TypeId>,
+}
+
+/// A nullable callback retains each written nullish member through mapping.
 fn optional_function_member(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
-) -> Result<Option<(TypeId, TypeId)>, GenericInterfaceMemberError> {
+) -> Result<Option<OptionalFunctionMember>, GenericInterfaceMemberError> {
     let invalid = || GenericInterfaceMemberError::UnsupportedPropertyType(type_);
     let record = store.type_payload(type_).ok_or_else(invalid)?;
     let TypeData::Union(union) = record.data() else {
         return Ok(None);
     };
-    let [first, second] = union.union.types.as_slice() else {
+    if !(2..=3).contains(&union.union.types.len()) {
         return Ok(None);
-    };
-    let undefined = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .undefined_type;
-    let callback = if *first == undefined {
-        *second
-    } else if *second == undefined {
-        *first
-    } else {
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let mut callback = None;
+    let mut undefined = None;
+    let mut null = None;
+    for &member in &union.union.types {
+        if member == bootstrap.undefined_type {
+            undefined = Some(member);
+        } else if member == bootstrap.null_type {
+            null = Some(member);
+        } else if callback.replace(member).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(callback) = callback else {
         return Ok(None);
     };
     let callback_source = store.type_has_function_type_provenance(callback)
@@ -4699,7 +6042,11 @@ fn optional_function_member(
     {
         return Err(invalid());
     }
-    Ok(Some((callback, undefined)))
+    Ok(Some(OptionalFunctionMember {
+        callback,
+        undefined,
+        null,
+    }))
 }
 
 fn method_parameter_contains_function(
@@ -4709,7 +6056,7 @@ fn method_parameter_contains_function(
 ) -> bool {
     parameter == callback
         || optional_function_member(store, parameter)
-            .is_ok_and(|optional| optional.is_some_and(|(source, _)| source == callback))
+            .is_ok_and(|optional| optional.is_some_and(|member| member.callback == callback))
 }
 
 pub(super) fn instantiated_optional_function_member_type_matches(
@@ -4719,19 +6066,20 @@ pub(super) fn instantiated_optional_function_member_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<bool> {
-    let (source, undefined) = match optional_function_member(store, template) {
+    let source = match optional_function_member(store, template) {
         Ok(Some(optional)) => optional,
         Ok(None) => return None,
         Err(_) => return Some(false),
     };
     Some(
         optional_function_member(store, actual).is_ok_and(|optional| {
-            optional.is_some_and(|(mapped, sentinel)| {
-                sentinel == undefined
+            optional.is_some_and(|mapped| {
+                mapped.undefined == source.undefined
+                    && mapped.null == source.null
                     && instantiated_function_member_type_matches(
                         store,
-                        source,
-                        mapped,
+                        source.callback,
+                        mapped.callback,
                         mapper,
                         array_targets,
                     )
@@ -5043,11 +6391,32 @@ fn validate_closed_function_value_edges(
             TypeData::TypeReference(_) | TypeData::Interface(_) => {
                 let targets = array_targets
                     .ok_or(RelationUnavailable::UnavailableCanonicalArrayTarget(type_))?;
-                let array = store
+                if let Some(array) = store
                     .canonical_array_reference_with_targets(targets, type_)
                     .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(type_))?
-                    .ok_or(RelationUnavailable::UnsupportedStructuredType(type_))?;
-                pending.push(array.element_type);
+                {
+                    pending.push(array.element_type);
+                } else {
+                    let target = match record.data() {
+                        TypeData::TypeReference(reference) => reference.object.target,
+                        TypeData::Interface(interface) => interface.reference.object.target,
+                        _ => unreachable!("the reference family was matched above"),
+                    };
+                    // A different registered array target cannot use the generic-reference path.
+                    if record
+                        .symbol()
+                        .is_some_and(|symbol| store.symbol_is_registered_global_array(symbol))
+                        || target
+                            .and_then(|target| store.type_payload(target))
+                            .and_then(super::TypeRecord::symbol)
+                            .is_some_and(|symbol| store.symbol_is_registered_global_array(symbol))
+                    {
+                        return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                    }
+                    let reference = validate_direct_generic_reference(store, type_)
+                        .map_err(|_| RelationUnavailable::UnsupportedStructuredType(type_))?;
+                    pending.extend(reference.type_arguments);
+                }
             }
             TypeData::Object(_) if store.type_has_function_type_provenance(type_) => {
                 let edges = closed_declared_function_type_edges(store, type_)?
@@ -5164,7 +6533,11 @@ fn function_member_parameters(
         return None;
     }
     if function_member_declaring_method(store, source).is_none()
+        && generic_interface_callback_owner(store, source).is_none()
         && function_member_declaring_property_alias(store, source).is_none()
+        && !generic_function_alias_projection(store, source)
+            .is_ok_and(|projection| projection.is_some_and(|alias| alias.target == source))
+        && source_callable_function_type_owner(store, source).is_none()
     {
         return None;
     }
@@ -5177,6 +6550,7 @@ fn function_member_parameters(
     if !signature_record.type_parameters().is_empty()
         || signature_record.this_parameter().is_some()
         || signature_record.has_rest_parameter()
+            && source_parameter_function_type_owner(store, source).is_none()
         || signature_record.parameters().len() != parameter_types.len()
     {
         return None;
@@ -5184,7 +6558,783 @@ fn function_member_parameters(
     Some((record.symbol()?, *signature, parameter_types.to_vec()))
 }
 
-/// The installed function-type mapping covers direct global Array method parameters.
+/// Finds the source signature whose parameter or return contains this function type.
+#[allow(clippy::too_many_lines)] // Keep annotation ancestry and the source signature in one check.
+pub(super) fn source_callable_function_type_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<SignatureId> {
+    if let Some(owner) = source_parameter_function_type_owner(store, source) {
+        return Some(owner);
+    }
+    if !matches!(
+        validate_stored_function_type(store, source),
+        StoredFunctionTypeValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let source_record = store.type_payload(source)?;
+    let [signature] = source_record.data().structured()?.signatures.as_deref()? else {
+        return None;
+    };
+    let signature = store.signature(*signature)?;
+    if !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.has_rest_parameter()
+        || signature.resolved_type_predicate().is_some()
+    {
+        return None;
+    }
+    let symbol = source_record.symbol()?;
+    let [declaration] = store.symbol(symbol)?.declarations()? else {
+        return None;
+    };
+    let mut root = *declaration;
+    let mut identity = root;
+    let mut type_ = source;
+    let mut active = HashSet::new();
+    loop {
+        if active.len() >= InstantiationLimits::default().max_depth || !active.insert(root) {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(root)? else {
+            return None;
+        };
+        if store.source_node_kind(parent) == Some(SyntaxKind::ParenthesizedType) {
+            if store.source_direct_children(parent)?.as_slice() != [root]
+                || store.type_node_links(parent).is_some_and(|links| {
+                    links != &super::TypeNodeLinks::default()
+                        && (links.outer_type_parameters.is_some()
+                            || links.resolved_type != Some(type_))
+                })
+                || store
+                    .symbol_node_links(parent)
+                    .is_some_and(|links| links != &super::SymbolNodeLinks::default())
+            {
+                return None;
+            }
+            root = parent;
+            continue;
+        }
+        let (owner, parameter) = if store.source_node_kind(parent) == Some(SyntaxKind::Parameter) {
+            if store.source_direct_type_annotation(parent) != Some(root)
+                || !store.source_direct_type_annotation_is_exact(root, type_)
+            {
+                return None;
+            }
+            let SourceNodeParent::Parent(owner) = store.source_node_parent(parent)? else {
+                return None;
+            };
+            (owner, Some(parent))
+        } else {
+            (parent, None)
+        };
+        let signature = store
+            .signature_links(owner)?
+            .resolved_signature
+            .signature()?;
+        let record = store.signature(signature)?;
+        if store.source_node_kind(owner) == Some(SyntaxKind::FunctionType) {
+            let containing = store.type_node_links(owner)?.resolved_type?;
+            if !matches!(
+                validate_stored_function_type(store, containing),
+                StoredFunctionTypeValidation::Valid(_)
+            ) || record.declaration() != Some(owner)
+                || !record.type_parameters().is_empty()
+                || record.this_parameter().is_some()
+                || record.has_rest_parameter()
+                || record.resolved_type_predicate().is_some()
+            {
+                return None;
+            }
+            if let Some(parameter) = parameter {
+                let symbol = store.source_declaration_symbol(parameter)?;
+                let index = record
+                    .parameters()
+                    .iter()
+                    .position(|entry| *entry == symbol)?;
+                let parameter_type = *store
+                    .callable_signature_parameter_types(signature)?
+                    .get(index)?;
+                if parameter_type != type_
+                    && (store
+                        .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+                        .is_none()
+                        || store
+                            .validate_optional_parameter_type_metadata(type_, parameter_type)
+                            .is_err())
+                {
+                    return None;
+                }
+            } else if store.function_signature_return_annotation(signature) != Some((identity, false))
+                || record.resolved_return_type() != Some(type_)
+            {
+                return None;
+            }
+            root = owner;
+            identity = owner;
+            type_ = containing;
+            continue;
+        }
+        if store.source_node_kind(owner) == Some(SyntaxKind::ConstructSignature) {
+            return source_constructor_callback_owner(store, owner, parameter?, type_);
+        }
+        if parameter.is_some()
+            || !matches!(
+                store.source_node_kind(owner),
+                Some(
+                    SyntaxKind::FunctionDeclaration
+                        | SyntaxKind::FunctionExpression
+                        | SyntaxKind::ArrowFunction
+                )
+            )
+            || record.type_parameters().is_empty()
+            || store.function_signature_return_annotation(signature) != Some((identity, false))
+            || record.resolved_return_type() != Some(type_)
+        {
+            return None;
+        }
+        let callable = store.source_callable_type_for_declaration(owner)?;
+        return (store.source_callable_type_for_signature(signature) == Some(callable)
+            && matches!(
+                validate_stored_source_callable(store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ))
+        .then_some(signature);
+    }
+}
+
+/// Proves a callback parameter on an actual generic interface constructor.
+fn source_constructor_callback_owner(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    parameter: NodeRef,
+    callback: TypeId,
+) -> Option<SignatureId> {
+    let signature = store
+        .signature_links(declaration)?
+        .resolved_signature
+        .signature()?;
+    let record = store.signature(signature)?;
+    let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let owner = store.source_declaration_symbol(parent)?;
+    let owner = store.get_merged_symbol(owner)?;
+    let interface = store.symbol(owner)?;
+    let member = store.source_declaration_symbol(declaration)?;
+    let member = store.get_merged_symbol(member)?;
+    let constructor = store.symbol(member)?;
+    let parameter_symbol = store.source_declaration_symbol(parameter)?;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ConstructSignature)
+        || store.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration)
+        || !interface.flags().contains(SymbolFlags::INTERFACE)
+        || interface.check_flags() != CheckFlags::NONE
+        || !interface.declarations()?.contains(&parent)
+        || store
+            .source_direct_children(parent)?
+            .iter()
+            .any(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        || store
+            .symbol_table(interface.members()?)?
+            .get(InternalSymbolName::New.as_ref())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(member)
+        || constructor.flags() != SymbolFlags::SIGNATURE
+        || constructor.check_flags() != CheckFlags::NONE
+        || constructor
+            .parent()
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+        || !constructor.declarations()?.contains(&declaration)
+        || record.declaration() != Some(declaration)
+        || record.flags() != SignatureFlags::CONSTRUCT
+        || record.type_parameters().is_empty()
+        || record.parameters() != [parameter_symbol]
+        || record.min_argument_count() != 1
+        || record.resolved_min_argument_count() != -1
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+            .is_some()
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::DotDotDotToken)
+            .is_some()
+        || store.value_symbol_links(parameter_symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(callback),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+    let children = store.source_direct_children(declaration)?;
+    let formals = children
+        .iter()
+        .copied()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        .collect::<Vec<_>>();
+    if formals.len() != record.type_parameters().len()
+        || children
+            .iter()
+            .copied()
+            .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+            .collect::<Vec<_>>()
+            != [parameter]
+        || formals.iter().zip(record.type_parameters()).any(|(formal, type_)| {
+            store.source_node_parent(*formal) != Some(SourceNodeParent::Parent(declaration))
+                || store.source_declaration_symbol(*formal).is_none_or(|symbol| {
+                    cached_ordinary_type_parameter_owner(store, *type_) != Some(symbol)
+                        || store
+                            .symbol(symbol)
+                            .and_then(|record| record.declarations())
+                            != Some(std::slice::from_ref(formal))
+                })
+        })
+    {
+        return None;
+    }
+    let (return_node, allow_void) = store.function_signature_return_annotation(signature)?;
+    if allow_void
+        || store.source_node_parent(return_node) != Some(SourceNodeParent::Parent(declaration))
+        || !store
+            .source_direct_type_annotation_is_exact(return_node, record.resolved_return_type()?)
+    {
+        return None;
+    }
+    Some(signature)
+}
+
+/// Proves a callback annotation on a queried augmented-global overload.
+pub(super) fn source_parameter_function_type_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<SignatureId> {
+    if !matches!(
+        validate_stored_function_type(store, source),
+        StoredFunctionTypeValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let source_record = store.type_payload(source)?;
+    let [callback] = source_record.data().structured()?.signatures.as_deref()? else {
+        return None;
+    };
+    let callback = store.signature(*callback)?;
+    let declaration = callback.declaration()?;
+    let SourceNodeParent::Parent(parameter) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(owner) = store.source_node_parent(parameter)? else {
+        return None;
+    };
+    if !callback.type_parameters().is_empty()
+        || callback.this_parameter().is_some()
+        || callback.resolved_type_predicate().is_some()
+        || store.source_node_kind(declaration) != Some(SyntaxKind::FunctionType)
+        || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+        || store.source_node_kind(owner) != Some(SyntaxKind::FunctionDeclaration)
+        || store.source_direct_type_annotation(parameter) != Some(declaration)
+        || !store.source_direct_type_annotation_is_exact(declaration, source)
+    {
+        return None;
+    }
+    let callable = store.source_overload_type_for_declaration(owner)?;
+    if !matches!(
+        super::source_overloads::validate_stored_source_overload(store, callable),
+        super::source_overloads::StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let signature = store
+        .signature_links(owner)?
+        .resolved_signature
+        .signature()?;
+    let evidence = store.source_callable_type_query(signature)?;
+    let plan = evidence.callable();
+    let planned = plan
+        .parameters
+        .iter()
+        .find(|planned| planned.declaration == parameter)?;
+    if plan.declaration != owner
+        || plan.type_parameters.is_empty()
+        || plan.body_mode != super::source_callables::SourceCallableBodyMode::AmbientDeclaration
+        || plan.export_local.is_none()
+        || store.source_global_callable_augmentation_local(plan.owner_symbol, owner)
+            != plan.export_local
+        || evidence.annotation_type(declaration) != Some(source)
+        || planned.explicit_type_node() != Some(declaration)
+        || !evidence.is_exact(store)
+    {
+        return None;
+    }
+    Some(signature)
+}
+
+/// A nested function uses the exact mapper of a checked source call.
+fn source_callable_function_type_mapper_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+) -> Option<Option<CanonicalArrayTargets>> {
+    let owner = source_callable_function_type_owner(store, source)?;
+    let original = store.signature(owner)?;
+    let sources = original.type_parameters();
+    let targets = sources
+        .iter()
+        .map(|source| store.map_type(mapper, *source))
+        .collect::<Option<Vec<_>>>()?;
+    if store.type_mapper_has_exact_endpoints(mapper, sources, &targets) != Some(true) {
+        return None;
+    }
+    let CachedSignatureLookup::Hit(signature) =
+        store.cached_signature(owner, type_list_key(&targets), &targets)
+    else {
+        return None;
+    };
+    let signature = store.signature(signature)?;
+    if signature.target() != Some(owner)
+        || signature.mapper() != Some(mapper)
+        || signature.declaration() != original.declaration()
+        || signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.resolved_type_predicate().is_some()
+        || signature.parameters().len() != original.parameters().len()
+        || signature.min_argument_count() != original.min_argument_count()
+        || signature.composite().is_some()
+        || signature.isolated_signature_type().is_some()
+    {
+        return None;
+    }
+    if original.declaration().is_some_and(|declaration| {
+        store.source_node_kind(declaration) == Some(SyntaxKind::ConstructSignature)
+    }) {
+        Some(None)
+    } else if let Some(callable) = store.source_callable_type_for_signature(owner) {
+        Some(store.source_callable_provenance(callable)?.array_targets)
+    } else {
+        let callable = store.source_overload_type_for_signature(owner)?;
+        Some(store.source_overload_provenance(callable)?.array_targets)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GenericInterfaceCallbackOwner {
+    method: SemanticSymbolId,
+    target: TypeId,
+    signature: SignatureId,
+}
+
+/// Selects an original method before its callback returns can be classified.
+pub(super) fn selected_generic_interface_method_source(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SemanticSymbolId>, GenericInterfaceMemberError> {
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    if store
+        .type_payload(reference.target)
+        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
+    {
+        return Ok(None);
+    }
+    let (_, _, _, properties, _) =
+        declared_target_header(store, reference.target, array_targets)?;
+    Ok(properties.into_iter().find_map(|property| {
+        (property.method
+            && store
+                .symbol(property.symbol)
+                .is_some_and(|symbol| symbol.name() == name))
+        .then_some(property.symbol)
+    }))
+}
+
+/// Finds only the selected method's authenticated callbacks with unread returns.
+pub(super) fn pending_generic_interface_callback_returns(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+) -> Result<Vec<SignatureId>, GenericInterfaceMemberError> {
+    let Some((owner, target)) = store.authenticated_interface_method_owner(method) else {
+        return Ok(Vec::new());
+    };
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    if reference.target != target {
+        return Err(GenericInterfaceMemberError::InvalidTarget(receiver));
+    }
+    let (callable, _, _) = published_interface_method_value(store, owner, method)?;
+    let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+        super::callable_sets::validate_stored_declared_method_callable_set(store, callable)
+    else {
+        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    };
+    let mut pending = Vec::new();
+    for signature in &projection.call_signatures {
+        for &parameter in &signature.parameters {
+            let callback = optional_function_member(store, parameter)?
+                .map_or(parameter, |optional| optional.callback);
+            let Some(callback_owner) = generic_interface_callback_owner(store, callback) else {
+                continue;
+            };
+            if callback_owner.method != method
+                || callback_owner.target != target
+                || callback_owner.signature != signature.signature
+            {
+                return Err(GenericInterfaceMemberError::InvalidMember(method));
+            }
+            let (_, callback_signature, _) = function_member_parameters(store, callback)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            let record = store
+                .signature(callback_signature)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            if record.resolved_return_type().is_none() && !pending.contains(&callback_signature) {
+                pending.push(callback_signature);
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// Proves the actual callback annotation and its declared generic interface method.
+#[allow(clippy::too_many_lines)] // Annotation ancestry and the method's source identity form one proof.
+fn generic_interface_callback_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<GenericInterfaceCallbackOwner> {
+    if function_member_declaring_method(store, source).is_some() {
+        return None;
+    }
+    let record = store.type_payload(source)?;
+    let [declaration] = store.symbol(record.symbol()?)?.declarations()? else {
+        return None;
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::FunctionType)
+        || !matches!(
+            validate_stored_function_type(store, source),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let mut annotation = *declaration;
+    let mut annotation_type = source;
+    let mut visited = HashSet::new();
+    let parameter = loop {
+        if visited.len() >= InstantiationLimits::default().max_depth || !visited.insert(annotation)
+        {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(annotation)? else {
+            return None;
+        };
+        match store.source_node_kind(parent)? {
+            SyntaxKind::ParenthesizedType => {
+                if store.source_direct_children(parent)?.as_slice() != [annotation]
+                    || store.type_node_links(parent).is_some_and(|links| {
+                        links != &super::TypeNodeLinks::default()
+                            && (links.resolved_type != Some(annotation_type)
+                                || links.outer_type_parameters.is_some())
+                    })
+                {
+                    return None;
+                }
+            }
+            SyntaxKind::UnionType => {
+                let union = store.type_node_links(parent)?.resolved_type?;
+                let optional = optional_function_member(store, union).ok()??;
+                if optional.callback != source
+                    || store.source_direct_children(parent)?.iter().any(|child| {
+                        *child != annotation
+                            && !store.source_direct_type_annotation_is_exact(
+                                *child,
+                                bootstrap.undefined_type,
+                            )
+                            && !store
+                                .source_direct_type_annotation_is_exact(*child, bootstrap.null_type)
+                    })
+                {
+                    return None;
+                }
+                annotation_type = union;
+            }
+            SyntaxKind::Parameter => break parent,
+            _ => return None,
+        }
+        if store
+            .symbol_node_links(parent)
+            .is_some_and(|links| links != &super::SymbolNodeLinks::default())
+        {
+            return None;
+        }
+        annotation = parent;
+    };
+    let SourceNodeParent::Parent(declaration) = store.source_node_parent(parameter)? else {
+        return None;
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || store.source_direct_type_annotation(parameter) != Some(annotation)
+        || !store.source_direct_type_annotation_is_exact(annotation, annotation_type)
+    {
+        return None;
+    }
+    let method = store.get_merged_symbol(store.source_declaration_symbol(declaration)?)?;
+    let (_, target) = store.authenticated_interface_method_owner(method)?;
+    let reference = validate_direct_generic_reference(store, target).ok()?;
+    if reference.target != target || reference.type_arguments.is_empty() {
+        return None;
+    }
+    let method_type = store.value_symbol_links(method)?.resolved_type?;
+    valid_interface_method_value(store, method, method_type)?;
+    let signature = store
+        .signature_links(declaration)?
+        .resolved_signature
+        .signature()?;
+    let callable = store.signature(signature)?;
+    let parameter_symbol = store.source_declaration_symbol(parameter)?;
+    let index = callable
+        .parameters()
+        .iter()
+        .position(|symbol| *symbol == parameter_symbol)?;
+    let parameter_type = *store
+        .callable_signature_parameter_types(signature)?
+        .get(index)?;
+    if callable.declaration() != Some(declaration)
+        || store.interface_method_linked_type(signature) != Some(method_type)
+        || !method_parameter_contains_function(store, parameter_type, source)
+    {
+        return None;
+    }
+    Some(GenericInterfaceCallbackOwner {
+        method,
+        target,
+        signature,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct GenericInterfaceCallbackMapping {
+    owner: GenericInterfaceCallbackOwner,
+    receiver: TypeId,
+    owner_mapper: TypeMapperId,
+    copied_signature: Option<SignatureId>,
+}
+
+/// A callback uses the enclosing reference mapper and the method's own fresh formals.
+fn generic_interface_callback_mapping(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<GenericInterfaceCallbackMapping> {
+    let owner = generic_interface_callback_owner(store, source)?;
+    let TypeData::Interface(interface) = store.type_payload(owner.target)?.data() else {
+        return None;
+    };
+    let this_type = interface.this_type?;
+    let original = store.signature(owner.signature)?;
+    let owner_mapper = if original.type_parameters().is_empty() {
+        mapper
+    } else {
+        let TypeMapperApplication::Composite { second, .. } =
+            store.mapper_application(mapper, this_type)?
+        else {
+            return None;
+        };
+        second
+    };
+    let receiver = store.map_type(owner_mapper, this_type)?;
+    let reference = validate_direct_generic_reference(store, receiver).ok()?;
+    let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+    let sources = parameters
+        .iter()
+        .copied()
+        .chain([this_type])
+        .collect::<Vec<_>>();
+    let targets = reference
+        .type_arguments
+        .iter()
+        .copied()
+        .chain([receiver])
+        .collect::<Vec<_>>();
+    if reference.target != owner.target
+        || store.type_mapper_has_exact_endpoints(owner_mapper, &sources, &targets) != Some(true)
+    {
+        return None;
+    }
+    let copied_signature = if original.type_parameters().is_empty() {
+        None
+    } else {
+        let mut copies = store.signatures().filter(|(_, signature)| {
+            signature.target() == Some(owner.signature) && signature.mapper() == Some(mapper)
+        });
+        let (id, copied) = copies.next()?;
+        if copies.next().is_some()
+            || copied.declaration() != original.declaration()
+            || copied.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+            || copied.this_parameter().is_some()
+            || copied.parameters().len() != original.parameters().len()
+            || copied.min_argument_count() != original.min_argument_count()
+            || copied.resolved_min_argument_count() != -1
+            || copied.isolated_signature_type().is_some()
+            || copied.composite().is_some()
+            || validated_instantiated_method_mapper(
+                store,
+                original,
+                copied,
+                owner_mapper,
+                array_targets,
+            ) != Some(mapper)
+        {
+            return None;
+        }
+        Some(id)
+    };
+    for type_ in [owner.target, receiver] {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .ok()?;
+    }
+    Some(GenericInterfaceCallbackMapping {
+        owner,
+        receiver,
+        owner_mapper,
+        copied_signature,
+    })
+}
+
+/// Cold callbacks use the real proxy. Warm callbacks also validate its complete method copy.
+fn generic_interface_callback_member_origin(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    let mapping = generic_interface_callback_mapping(store, source, mapper, array_targets)?;
+    let members =
+        validate_generic_interface_members(store, mapping.receiver, array_targets).ok()??;
+    let method = store.symbol(mapping.owner.method)?;
+    let property = store.symbol_table(members.members()?)?.get(method.name())?;
+    let links = store.value_symbol_links(property)?;
+    if members.target() != mapping.owner.target
+        || !members.properties().contains(&property)
+        || links.target != Some(mapping.owner.method)
+        || links.mapper != Some(mapping.owner_mapper)
+    {
+        return None;
+    }
+    if let Some(callable) = links.resolved_type {
+        let record = store.type_payload(callable)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        let original_type = store
+            .value_symbol_links(mapping.owner.method)?
+            .resolved_type?;
+        let original_signatures = store
+            .type_payload(original_type)?
+            .data()
+            .structured()?
+            .signatures
+            .as_deref()?;
+        let index = original_signatures
+            .iter()
+            .position(|signature| *signature == mapping.owner.signature)?;
+        let signatures = object.structured.signatures.as_deref()?;
+        let copied = *signatures.get(index)?;
+        if record.symbol() != Some(mapping.owner.method)
+            || object.target != Some(original_type)
+            || object.mapper != Some(mapping.owner_mapper)
+            || signatures.len() != original_signatures.len()
+            || mapping
+                .copied_signature
+                .is_some_and(|expected| copied != expected)
+            || store.signature(copied)?.mapper() != Some(mapper)
+            || store.proxy_interface_method_type_for_signature(copied) != Some(callable)
+        {
+            return None;
+        }
+    }
+    Some(mapping.receiver)
+}
+
+pub(super) struct InstantiatedGenericInterfaceCallback {
+    pub(super) target: TypeId,
+    pub(super) mapper: TypeMapperId,
+    pub(super) method_signature: SignatureId,
+    pub(super) outer_parameters: Vec<TypeId>,
+    pub(super) callable: ValidatedSingleCallable,
+}
+
+/// A method call remaps the original callback through both existing mapper steps.
+pub(super) fn instantiated_generic_interface_callback_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<InstantiatedGenericInterfaceCallback> {
+    let TypeData::Object(object) = store.type_payload(type_)?.data() else {
+        return None;
+    };
+    let target = object.target?;
+    let mapper = object.mapper?;
+    let origin = store.instantiated_property_alias_callable(type_)?;
+    if origin.source != target || origin.mapper != mapper {
+        return None;
+    }
+    let mapping = generic_interface_callback_mapping(store, target, mapper, array_targets)?;
+    generic_interface_callback_member_origin(store, target, mapper, origin.array_targets)?;
+    if origin.array_targets != array_targets {
+        generic_interface_callback_member_origin(store, target, mapper, array_targets)?;
+    }
+    let callable =
+        instantiated_function_member_projection(store, target, type_, mapper, array_targets, None)?;
+    store
+        .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+        .ok()?;
+    let TypeData::Interface(interface) = store.type_payload(mapping.owner.target)?.data() else {
+        return None;
+    };
+    let outer_parameters = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()?
+        .iter()
+        .copied()
+        .chain([interface.this_type?])
+        .chain(
+            store
+                .signature(mapping.owner.signature)?
+                .type_parameters()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    let declaration = store.signature(callable.signature)?.declaration()?;
+    if store
+        .type_node_links(declaration)
+        .and_then(|links| links.outer_type_parameters.as_deref())
+        .is_some_and(|cached| cached != outer_parameters)
+    {
+        return None;
+    }
+    Some(InstantiatedGenericInterfaceCallback {
+        target,
+        mapper,
+        method_signature: mapping.copied_signature?,
+        outer_parameters,
+        callable,
+    })
+}
+
+/// The existing Array callback path keeps its own array capability checks.
 fn function_member_declaring_method(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
@@ -5417,9 +7567,87 @@ fn instantiated_function_property_recovery(
     ))
 }
 
-/// Copies a function-valued member through its authenticated owner mapper.
+pub(super) fn cached_generic_function_alias_instance(
+    store: &CanonicalTypeMapperStore,
+    source: &GenericFunctionAliasProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(source.target);
+    if arguments.len() != source.parameters.len()
+        || arguments
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(invalid());
+    }
+    if arguments == source.parameters.as_slice() {
+        store
+            .validate_cached_array_capability_with_pending_functions(
+                array_targets,
+                source.target,
+                &[],
+            )
+            .map_err(|_| invalid())?;
+        return Ok(Some(source.target));
+    }
+    let TypeData::Object(target) = store
+        .type_payload(source.target)
+        .ok_or_else(invalid)?
+        .data()
+    else {
+        return Err(invalid());
+    };
+    let TypeCacheState::Allocated(entries) = &target.instantiations else {
+        return Ok(None);
+    };
+    let Some(&type_) = entries.get(&type_list_key(arguments)) else {
+        return Ok(None);
+    };
+    let TypeData::Object(instance) = store.type_payload(type_).ok_or_else(invalid)?.data() else {
+        return Err(invalid());
+    };
+    let mapper = instance.mapper.ok_or_else(invalid)?;
+    if function_alias_instance_arguments(store, source.target, type_, mapper).as_deref()
+        != Some(arguments)
+        || !instantiated_function_member_type_matches(
+            store,
+            source.target,
+            type_,
+            mapper,
+            array_targets,
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(Some(type_))
+}
+
+/// Alias instances use the existing signature mapper and the caller's session.
+pub(super) fn instantiate_generic_function_alias(
+    store: &mut CanonicalTypeMapperStore,
+    source: &GenericFunctionAliasProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    if let Some(cached) =
+        cached_generic_function_alias_instance(store, source, arguments, array_targets)?
+    {
+        return Ok(cached);
+    }
+    if !store.try_reserve_mappers(1) {
+        return Err(GenericInterfaceMemberError::Capacity(source.target));
+    }
+    let mapper = store
+        .new_type_mapper(source.parameters.clone(), arguments.to_vec())
+        .ok_or(GenericInterfaceMemberError::Capacity(source.target))?;
+    instantiate_function_member_type(store, source.target, mapper, array_targets, session)
+}
+
+/// Copies a function-valued member or direct alias through its authenticated mapper.
 #[allow(clippy::too_many_lines)] // Keep cache checks, caller mapping, and publication together.
-fn instantiate_function_member_type(
+pub(super) fn instantiate_function_member_type(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     mapper: TypeMapperId,
@@ -5429,36 +7657,74 @@ fn instantiate_function_member_type(
     let (symbol, template) = function_member_signature(store, source)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
     let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    let interface_callback = generic_interface_callback_owner(store, source).is_some();
+    let function_alias = generic_function_alias_projection(store, source)
+        .map_err(|_| GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+    let alias_arguments = function_alias
+        .as_ref()
+        .map(|alias| {
+            let arguments = alias
+                .parameters
+                .iter()
+                .map(|parameter| store.map_type(mapper, *parameter))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+            if store.type_mapper_has_exact_endpoints(mapper, &alias.parameters, &arguments)
+                != Some(true)
+            {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+            }
+            Ok(arguments)
+        })
+        .transpose()?;
     if property_alias && instantiated_function_property_owner(store, source, mapper).is_none() {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
-    let mut cached = None;
-    for (type_, record) in store.types() {
-        let TypeData::Object(object) = record.data() else {
-            continue;
-        };
-        if object.target == Some(source)
-            && object.mapper == Some(mapper)
-            && (cached.replace(type_).is_some()
-                || property_alias
-                    && store
-                        .instantiated_property_alias_callable(type_)
-                        .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
-                || !instantiated_function_member_type_matches(
-                    store,
-                    source,
-                    type_,
-                    mapper,
-                    array_targets,
-                ))
-        {
-            return Err(GenericInterfaceMemberError::InvalidCachedMembers(type_));
-        }
+    if interface_callback
+        && generic_interface_callback_mapping(store, source, mapper, array_targets).is_none()
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
-    if let Some(cached) = cached {
+    let source_callable = source_callable_function_type_owner(store, source).is_some();
+    if source_callable
+        && source_callable_function_type_mapper_owner(store, source, mapper).is_none_or(|targets| {
+            source_parameter_function_type_owner(store, source).is_some() && targets != array_targets
+        })
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+    }
+    if let Some(cached) = cached_function_member_type(store, source, mapper, array_targets)? {
         return Ok(cached);
     }
-    let origin = property_alias.then_some((source, mapper, array_targets));
+    let origin = (property_alias || function_alias.is_some() || interface_callback).then_some((
+        source,
+        mapper,
+        array_targets,
+    ));
+    let mut new_alias_cache = if let Some(alias) = &function_alias {
+        let TypeData::Object(target) = store
+            .type_payload(source)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?
+            .data()
+        else {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        };
+        if matches!(target.instantiations, TypeCacheState::Unallocated) {
+            let mut entries = HashMap::new();
+            entries
+                .try_reserve(2)
+                .map_err(|_| GenericInterfaceMemberError::Capacity(source))?;
+            entries.insert(type_list_key(&alias.parameters), source);
+            Some(entries)
+        } else {
+            if !store.try_reserve_object_instantiations(source, 1) {
+                return Err(GenericInterfaceMemberError::Capacity(source));
+            }
+            None
+        }
+    } else {
+        None
+    };
     if origin.is_some()
         && array_targets.is_some_and(|targets| {
             store.type_payload(targets.array_type()).is_none()
@@ -5470,9 +7736,12 @@ fn instantiate_function_member_type(
     if !store.try_reserve_types(1)
         || !store.try_reserve_signatures(1)
         || origin.is_some() && !store.try_reserve_instantiated_property_alias_callables()
+        || function_alias.is_some()
+            && (!store.try_reserve_type_aliases(1) || !store.try_reserve_type_node_links(1))
     {
         return Err(GenericInterfaceMemberError::Capacity(source));
     }
+    let limit_mark = session.limit_event_mark();
     let signature = instantiate_generic_method_signature(
         store,
         template.source,
@@ -5484,6 +7753,13 @@ fn instantiate_function_member_type(
         symbol,
         source,
     )?;
+    if (function_alias.is_some() || source_callable || interface_callback)
+        && session.limit_event_occurred_since(limit_mark)
+    {
+        return session
+            .recovery_error_type()
+            .ok_or(GenericInterfaceMemberError::Capacity(source));
+    }
     let predicate = store
         .signature(template.source)
         .and_then(super::signatures::Signature::resolved_type_predicate);
@@ -5507,8 +7783,15 @@ fn instantiate_function_member_type(
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
         }
     }
+    let flags = alias_arguments
+        .as_ref()
+        .map_or(Some(ObjectFlags::ANONYMOUS), |arguments| {
+            function_alias_instance_flags(store, arguments)
+                .map(|flags| flags & !ObjectFlags::MEMBERS_RESOLVED)
+        })
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
     let callable = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+        .alloc_plain_object_type(flags, Some(symbol))
         .ok_or(GenericInterfaceMemberError::Capacity(source))?;
     if !store.set_object_target_and_mapper(callable, Some(source), Some(mapper))
         || !store.set_structured_type_members(
@@ -5522,6 +7805,38 @@ fn instantiate_function_member_type(
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
+    if let Some(alias) = function_alias {
+        let arguments = alias_arguments.expect("a direct alias has mapped arguments");
+        let identity = store
+            .alloc_type_alias(Some(alias.symbol))
+            .ok_or(GenericInterfaceMemberError::Capacity(source))?;
+        if !store.set_type_alias_arguments(identity, Some(arguments.clone()))
+            || !store.set_type_alias(callable, Some(identity))
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
+        let key = type_list_key(&arguments);
+        if let Some(mut entries) = new_alias_cache.take() {
+            entries.insert(key, callable);
+            if !store.set_object_instantiations(source, TypeCacheState::Allocated(entries)) {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+            }
+        } else if store.insert_object_instantiation(source, key, callable) != Some(callable) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
+        let declaration = store
+            .signature(template.source)
+            .and_then(super::signatures::Signature::declaration)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+        let mut links = store
+            .type_node_links(declaration)
+            .cloned()
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+        links.outer_type_parameters = Some(alias.parameters);
+        if !store.set_type_node_links(declaration, links) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
+    }
     if let Some((source, mapper, array_targets)) = origin {
         assert!(store.publish_instantiated_property_alias_callable(
             InstantiatedPropertyAliasCallable {
@@ -5534,6 +7849,43 @@ fn instantiate_function_member_type(
         ));
     }
     Ok(callable)
+}
+
+/// Reads the same exact function copy that the mapper would reuse.
+pub(super) fn cached_function_member_type(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    function_member_signature(store, source)
+        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
+    let retained_origin = function_member_declaring_property_alias(store, source).is_some()
+        || generic_interface_callback_owner(store, source).is_some();
+    let mut cached = None;
+    for (type_, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        if object.target == Some(source)
+            && object.mapper == Some(mapper)
+            && (cached.replace(type_).is_some()
+                || retained_origin
+                    && store
+                        .instantiated_property_alias_callable(type_)
+                        .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
+                || !instantiated_function_member_type_matches(
+                    store,
+                    source,
+                    type_,
+                    mapper,
+                    array_targets,
+                ))
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(type_));
+        }
+    }
+    Ok(cached)
 }
 
 /// Validates copies under both their retained and current caller capabilities.
@@ -5553,7 +7905,10 @@ pub(super) fn instantiated_function_member_type_matches(
         return store.mapper_payload(mapper).is_some()
             && closed_declared_function_type(store, source, array_targets) == Ok(true);
     }
-    if function_member_declaring_property_alias(store, source).is_some() {
+    if function_member_declaring_property_alias(store, source).is_some()
+        || generic_function_alias_projection(store, source).is_ok_and(|alias| alias.is_some())
+        || generic_interface_callback_owner(store, source).is_some()
+    {
         let Some(origin) = store.instantiated_property_alias_callable(actual) else {
             return false;
         };
@@ -5623,8 +7978,21 @@ fn instantiated_function_member_projection(
     recovery: Option<InstantiatedFunctionRecovery<'_>>,
 ) -> Option<ValidatedSingleCallable> {
     let (symbol, template) = function_member_signature(store, source)?;
+    if source_callable_function_type_owner(store, source).is_some() {
+        let targets = source_callable_function_type_mapper_owner(store, source, mapper)?;
+        if source_parameter_function_type_owner(store, source).is_some() && targets != array_targets {
+            return None;
+        }
+    }
     if function_member_declaring_property_alias(store, source).is_some() {
         instantiated_function_property_owner(store, source, mapper)?;
+        let origin = store.instantiated_property_alias_callable(actual)?;
+        if origin.source != source || origin.mapper != mapper {
+            return None;
+        }
+    }
+    if generic_interface_callback_owner(store, source).is_some() {
+        generic_interface_callback_mapping(store, source, mapper, array_targets)?;
         let origin = store.instantiated_property_alias_callable(actual)?;
         if origin.source != source || origin.mapper != mapper {
             return None;
@@ -5641,6 +8009,11 @@ fn instantiated_function_member_projection(
     let signature_id = *signature;
     let signature = store.signature(signature_id)?;
     let return_type = signature.resolved_return_type()?;
+    let alias_arguments = function_alias_instance_arguments(store, source, actual, mapper);
+    let expected_flags = alias_arguments.as_ref().map_or(
+        Some(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED),
+        |arguments| function_alias_instance_flags(store, arguments),
+    );
     let recovered = match recovery {
         Some(InstantiatedFunctionRecovery::Property(recovery)) => {
             if recovery.source_type() != source
@@ -5674,9 +8047,9 @@ fn instantiated_function_member_projection(
     };
     if store.mapper_payload(mapper).is_none()
         || record.flags() != TypeFlags::OBJECT
-        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || Some(record.object_flags()) != expected_flags
         || record.symbol() != Some(symbol)
-        || record.alias().is_some()
+        || record.alias().is_some() && alias_arguments.is_none()
         || object.target != Some(source)
         || object.mapper != Some(mapper)
         || object.instantiations != TypeCacheState::Unallocated
@@ -5803,11 +8176,16 @@ fn instantiated_function_member_projection(
         }
         parameters.push(actual_type);
     }
+    let rest_parameter = if signature.has_rest_parameter() {
+        Some(parameters.pop()?)
+    } else {
+        None
+    };
     Some(ValidatedSingleCallable {
         owner: actual,
         signature: signature_id,
         parameters,
-        rest_parameter: None,
+        rest_parameter,
         min_argument_count: usize::try_from(signature.min_argument_count()).ok()?,
         return_type: Some(return_type),
         strict_variance_exempt: false,
@@ -5984,36 +8362,55 @@ pub(super) fn validate_instantiated_function_member_callable(
     let family = CallableFamily::FunctionType;
     let validated = (|| {
         let mapper = object.mapper?;
-        let (targets, recovery, alias) =
-            if let Some(receiver) = instantiated_function_property_owner(store, source, mapper) {
-                let origin = store.instantiated_property_alias_callable(type_)?;
-                if origin.source != source || origin.mapper != mapper {
-                    return None;
+        let (targets, recovery, alias) = if let Some(receiver) =
+            instantiated_function_property_owner(store, source, mapper)
+        {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            let recovery = match instantiated_function_property_recovery(
+                store, source, type_, mapper, receiver,
+            )? {
+                FunctionPropertyRecovery::Normal => None,
+                FunctionPropertyRecovery::Recovered(identity) => {
+                    Some(InstantiatedFunctionRecovery::Property(identity))
                 }
-                let recovery = match instantiated_function_property_recovery(
-                    store, source, type_, mapper, receiver,
-                )? {
-                    FunctionPropertyRecovery::Normal => None,
-                    FunctionPropertyRecovery::Recovered(identity) => {
-                        Some(InstantiatedFunctionRecovery::Property(identity))
-                    }
-                };
-                (
-                    origin.array_targets,
-                    recovery,
-                    Some(source_property_object_projection(store, receiver).ok()??),
-                )
-            } else {
-                (
-                    Some(instantiated_function_member_owner(store, source, mapper)?),
-                    None,
-                    None,
-                )
             };
+            (
+                origin.array_targets,
+                recovery,
+                Some(source_property_object_projection(store, receiver).ok()??),
+            )
+        } else if function_alias_instance_arguments(store, source, type_, mapper).is_some() {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            (origin.array_targets, None, None)
+        } else if let Some(targets) =
+            source_callable_function_type_mapper_owner(store, source, mapper)
+        {
+            (targets, None, None)
+        } else if generic_interface_callback_owner(store, source).is_some() {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            generic_interface_callback_member_origin(store, source, mapper, origin.array_targets)?;
+            (origin.array_targets, None, None)
+        } else {
+            (
+                Some(instantiated_function_member_owner(store, source, mapper)?),
+                None,
+                None,
+            )
+        };
         let callable = instantiated_function_member_projection(
             store, source, type_, mapper, targets, recovery,
         )?;
         let mut edges = callable.parameters.clone();
+        edges.extend(callable.rest_parameter);
         edges.extend(callable.return_type);
         if let Some(predicate) = store
             .signature(callable.signature)?
@@ -6027,6 +8424,10 @@ pub(super) fn validate_instantiated_function_member_callable(
             edges.push(source);
             edges.extend(alias.arguments());
             edges.extend(alias.identity_arguments());
+        }
+        if let Some(arguments) = function_alias_instance_arguments(store, source, type_, mapper) {
+            edges.push(source);
+            edges.extend(arguments);
         }
         Some((callable, edges))
     })();
@@ -6051,6 +8452,23 @@ pub(super) fn instantiated_function_member_signature_return(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<Result<TypeId, GenericInterfaceMemberError>> {
+    if let Some((owner, mapped)) = super::instantiate::instantiated_function_signature_projection(
+        store,
+        signature,
+        array_targets,
+    ) {
+        return Some(
+            mapped
+                .map_err(|error| property_instantiation_error(owner, &error))
+                .and_then(|(callable, _)| {
+                    callable
+                        .return_type
+                        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                            callable.owner,
+                        ))
+                }),
+        );
+    }
     // This retained source only claims malformed instances. It cannot authorize a return.
     let source_claim = store
         .signature(signature)
@@ -6182,21 +8600,36 @@ pub(super) fn instantiated_property_function_signature_return_type(
     {
         return Err(invalid());
     }
-    let receiver = instantiated_function_property_owner(store, origin.source, origin.mapper)
-        .ok_or_else(invalid)?;
-    let recovery = match instantiated_function_property_recovery(
-        store,
-        origin.source,
-        type_,
-        origin.mapper,
-        receiver,
-    )
-    .ok_or_else(invalid)?
+    let recovery = if let Some(receiver) =
+        instantiated_function_property_owner(store, origin.source, origin.mapper)
     {
-        FunctionPropertyRecovery::Normal => None,
-        FunctionPropertyRecovery::Recovered(identity) => {
-            Some(InstantiatedFunctionRecovery::Property(identity))
+        match instantiated_function_property_recovery(
+            store,
+            origin.source,
+            type_,
+            origin.mapper,
+            receiver,
+        )
+        .ok_or_else(invalid)?
+        {
+            FunctionPropertyRecovery::Normal => None,
+            FunctionPropertyRecovery::Recovered(identity) => {
+                Some(InstantiatedFunctionRecovery::Property(identity))
+            }
         }
+    } else if function_alias_instance_arguments(store, origin.source, type_, origin.mapper)
+        .is_some()
+        || generic_interface_callback_member_origin(
+            store,
+            origin.source,
+            origin.mapper,
+            origin.array_targets,
+        )
+        .is_some()
+    {
+        None
+    } else {
+        return Err(invalid());
     };
     let current = instantiated_function_member_projection(
         store,
@@ -6264,19 +8697,260 @@ pub(super) fn instantiated_function_member_display(
     })())
 }
 
+fn valid_copied_method_source(
+    store: &CanonicalTypeMapperStore,
+    method: SemanticSymbolId,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    valid_interface_method_value(store, method, type_).is_some()
+        || store
+            .type_payload(type_)
+            .is_some_and(|record| record.symbol() == Some(method))
+            && super::callable_sets::completed_source_class_method_callable(
+                store,
+                type_,
+                array_targets,
+            )
+            .is_some()
+}
+
+fn copied_method_parameter_types(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<Vec<TypeId>> {
+    if let Some(parameters) = store.callable_signature_parameter_types(signature) {
+        return Some(parameters.to_vec());
+    }
+    if super::callable_sets::completed_source_class_method_signature_type(
+        store,
+        signature,
+        array_targets,
+    ) != Some(source)
+    {
+        return None;
+    }
+    store
+        .signature(signature)?
+        .parameters()
+        .iter()
+        .map(|parameter| store.value_symbol_links(*parameter)?.resolved_type)
+        .collect()
+}
+
+/// Keeps a completed class origin's table intact while applying its inherited member map.
+pub(super) fn completed_source_class_origin_member_mapping(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    member: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<CompletedSourceClassOriginMemberMapping>, GenericInterfaceMemberError> {
+    if store.source_class_provenance(receiver).is_none() {
+        return Ok(None);
+    }
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(receiver);
+    let TypeData::Interface(class) = store.type_payload(receiver).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let formals = class
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .ok_or_else(invalid)?;
+    if class.all_type_parameters.as_deref().is_none_or(|all| {
+        all.len() != formals.len() + 1
+            || &all[..formals.len()] != formals
+            || all.last().copied() != class.this_type
+    }) {
+        return Err(invalid());
+    }
+    let members = completed_source_class_receiver_members(store, receiver)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if !members.instance_properties().contains(&member) {
+        return Err(GenericInterfaceMemberError::InvalidMember(member));
+    }
+    let source = store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(member))?;
+    let Some(mapper) = completed_source_class_receiver_member_mapper(store, receiver, member)
+        .map_err(|_| invalid())?
+    else {
+        if !store
+            .symbol(member)
+            .is_some_and(|member| member.flags().contains(SymbolFlags::METHOD))
+        {
+            return Ok(None);
+        }
+        if let Some([declaration]) = store
+            .symbol(member)
+            .and_then(|method| method.declarations())
+            && let Some(signature) = store
+                .signature_links(*declaration)
+                .and_then(|links| links.resolved_signature.signature())
+            && let Some(callee) =
+                super::classes::source_class_generic_method_callee(store, signature, array_targets)
+                    .map_err(|_| GenericInterfaceMemberError::InvalidMember(member))?
+        {
+            let StoredCallableSetValidation::Valid {
+                projection, edges, ..
+            } = super::callable_sets::validate_stored_callable_set_with_array_targets(
+                store,
+                source,
+                array_targets,
+            )
+            else {
+                return Err(GenericInterfaceMemberError::InvalidMember(member));
+            };
+            if callee != source
+                || projection.owner != source
+                || !projection.construct_signatures.is_empty()
+                || !matches!(projection.call_signatures.as_ref(), [callable] if callable.signature == signature)
+            {
+                return Err(GenericInterfaceMemberError::InvalidMember(member));
+            }
+            let parameters = store
+                .signature(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(member))?
+                .type_parameters();
+            for &edge in &edges {
+                store
+                    .validate_cached_array_capability_with_pending_functions(
+                        array_targets,
+                        edge,
+                        &[],
+                    )
+                    .map_err(|_| GenericInterfaceMemberError::InvalidMember(member))?;
+                member_type_requires_instantiation(store, edge, parameters, array_targets)?;
+            }
+            let roots = std::iter::once(source).chain(edges).collect::<Vec<_>>();
+            let identity = property_recovery_type_identity(store, &roots, array_targets)
+                .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
+            let this_type = class.this_type.ok_or_else(invalid)?;
+            if identity.iter().any(|entry| entry.type_ == this_type) {
+                return Err(GenericInterfaceMemberError::UnsupportedPropertyType(source));
+            }
+            // The original generic method needs no class receiver substitution.
+            return Ok(None);
+        }
+        super::callable_sets::completed_source_class_method_callable(store, source, array_targets)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(member))?;
+        let this_type = class.this_type.ok_or_else(invalid)?;
+        let identity =
+            property_recovery_type_identity(store, &[source], array_targets).ok_or_else(invalid)?;
+        if !identity.iter().any(|entry| entry.type_ == this_type) {
+            return Ok(None);
+        }
+        return Ok(Some((
+            source,
+            formals.iter().copied().chain([this_type]).collect(),
+            formals.iter().copied().chain([receiver]).collect(),
+        )));
+    };
+    let declaring = store
+        .get_parent_of_symbol(member)
+        .and_then(|symbol| store.declared_type_links(symbol))
+        .and_then(|links| links.declared_type)
+        .and_then(|type_| store.type_payload(type_))
+        .ok_or(GenericInterfaceMemberError::InvalidMember(member))?;
+    let TypeData::Interface(base) = declaring.data() else {
+        return Err(GenericInterfaceMemberError::InvalidMember(member));
+    };
+    let sources = base.all_type_parameters.clone().ok_or_else(invalid)?;
+    if sources.last().copied() != base.this_type || sources.is_empty() {
+        return Err(invalid());
+    }
+    let mut targets = sources
+        .iter()
+        .map(|source| store.map_type(mapper, *source).ok_or_else(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    if targets.last().copied() != class.this_type {
+        return Err(invalid());
+    }
+    *targets.last_mut().ok_or_else(invalid)? = receiver;
+    Ok(Some((source, sources, targets)))
+}
+
+/// Reads the receiver from the exact class-formal mapper, including synthetic this.
+pub(super) fn completed_source_class_method_receiver(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    let (target, _, _) =
+        super::callable_sets::completed_source_class_method_callable(store, source, array_targets)?;
+    let TypeData::Interface(class) = store.type_payload(target)?.data() else {
+        return None;
+    };
+    let this_type = class.this_type?;
+    let receiver = store.map_type(mapper, this_type)?;
+    let method = store.type_payload(source)?.symbol()?;
+    if let Some((template, sources, targets)) =
+        completed_source_class_origin_member_mapping(store, receiver, method, array_targets).ok()?
+    {
+        return (template == source
+            && store.type_mapper_has_exact_endpoints(mapper, &sources, &targets) == Some(true))
+        .then_some(receiver);
+    }
+    let direct = validate_direct_generic_reference(store, receiver).ok()?;
+    let inherited =
+        completed_source_class_receiver_member_mapper(store, direct.target, method).ok()?;
+    let receiver_mapper = match inherited {
+        None if direct.target == target => mapper,
+        Some(inherited) => {
+            let TypeMapperApplication::Composite { first, second } =
+                store.mapper_application(mapper, this_type)?
+            else {
+                return None;
+            };
+            if first != inherited {
+                return None;
+            }
+            second
+        }
+        None => return None,
+    };
+    let TypeData::Interface(receiver_class) = store.type_payload(direct.target)?.data() else {
+        return None;
+    };
+    let sources = receiver_class
+        .reference
+        .resolved_type_arguments
+        .as_deref()?
+        .iter()
+        .copied()
+        .chain(std::iter::once(receiver_class.this_type?))
+        .collect::<Vec<_>>();
+    let targets = direct
+        .type_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(receiver))
+        .collect::<Vec<_>>();
+    (receiver_class.all_type_parameters.as_deref() == Some(sources.as_slice())
+        && store.type_mapper_has_exact_endpoints(receiver_mapper, &sources, &targets) == Some(true))
+    .then_some(receiver)
+}
+
 fn instantiate_generic_interface_method_type(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
-) -> Result<TypeId, GenericInterfaceMemberError> {
+    mut branch_source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
     let method = store
         .type_payload(source)
         .and_then(super::type_records::TypeRecord::symbol)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
-    if valid_interface_method_value(store, method, source).is_none() {
-        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    if !valid_copied_method_source(store, method, source, array_targets) {
+        return Err(GenericInterfaceMemberError::InvalidMember(method).into());
     }
     let sources = store
         .type_payload(source)
@@ -6289,23 +8963,24 @@ fn instantiate_generic_interface_method_type(
             let record = store
                 .signature(signature)
                 .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
-            let parameters = store
-                .callable_signature_parameter_types(signature)
+            let parameters = copied_method_parameter_types(store, source, signature, array_targets)
                 .filter(|parameters| parameters.len() == record.parameters().len())
-                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
-                .to_vec();
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
             let return_type = record
                 .resolved_return_type()
                 .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
             Ok((signature, parameters, return_type))
         })
         .collect::<Result<Vec<_>, GenericInterfaceMemberError>>()?;
-    if !store.try_reserve_types(1) || !store.try_reserve_signatures(sources.len()) {
-        return Err(GenericInterfaceMemberError::Capacity(source));
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(sources.len())
+        || !store.try_reserve_proxy_interface_method_signature_owners(sources.len())
+    {
+        return Err(GenericInterfaceMemberError::Capacity(source).into());
     }
     let mut signatures = Vec::with_capacity(sources.len());
     for (original, parameter_templates, return_template) in sources {
-        let signature = instantiate_generic_method_signature(
+        let signature = instantiate_generic_method_signature_worker(
             store,
             original,
             &parameter_templates,
@@ -6315,6 +8990,7 @@ fn instantiate_generic_interface_method_type(
             session,
             method,
             source,
+            branch_source.as_deref_mut(),
         )?;
         signatures.push(signature);
     }
@@ -6322,9 +8998,17 @@ fn instantiate_generic_interface_method_type(
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
         .ok_or(GenericInterfaceMemberError::Capacity(source))?;
     if !store.set_object_target_and_mapper(callable, Some(source), Some(mapper))
-        || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
+        || !store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        )
+        || !store.publish_proxy_interface_method_signature_owners(callable, &signatures)
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source).into());
     }
     Ok(callable)
 }
@@ -6341,6 +9025,58 @@ fn instantiate_generic_method_signature(
     method: SemanticSymbolId,
     owner_type: TypeId,
 ) -> Result<SignatureId, GenericInterfaceMemberError> {
+    instantiate_generic_method_signature_worker(
+        store,
+        original,
+        parameter_templates,
+        return_template,
+        owner_mapper,
+        array_targets,
+        session,
+        method,
+        owner_type,
+        None,
+    )
+    .map_err(|error| error.into_member(owner_type))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep fresh method parameters in the caller's mapper and session.
+fn instantiate_generic_method_signature_worker(
+    store: &mut CanonicalTypeMapperStore,
+    original: SignatureId,
+    parameter_templates: &[TypeId],
+    return_template: TypeId,
+    owner_mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    method: SemanticSymbolId,
+    owner_type: TypeId,
+    mut source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<SignatureId, MethodSignatureError> {
+    let receiver_predicate = match store.signature(original) {
+        Some(signature)
+            if signature.declaration().is_some_and(|node| {
+                store.source_node_kind(node) == Some(SyntaxKind::MethodSignature)
+            }) =>
+        {
+            signature
+                .resolved_type_predicate()
+                .map(|id| {
+                    let predicate = store
+                        .type_predicate(id)
+                        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+                    Ok::<_, GenericInterfaceMemberError>((
+                        id,
+                        predicate.kind(),
+                        predicate.parameter_index(),
+                        predicate.parameter_name().to_owned(),
+                        predicate.type_id(),
+                    ))
+                })
+                .transpose()?
+        }
+        _ => None,
+    };
     let source_parameters = store
         .signature(original)
         .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
@@ -6351,21 +9087,23 @@ fn instantiate_generic_method_signature(
             .iter()
             .copied()
             .map(|parameter| {
-                instantiate_generic_member_type(
+                instantiate_signature_member_type(
                     store,
                     parameter,
                     owner_mapper,
                     array_targets,
                     session,
+                    source.as_deref_mut(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let return_type = instantiate_generic_member_type(
+        let return_type = instantiate_signature_member_type(
             store,
             return_template,
             owner_mapper,
             array_targets,
             session,
+            source.as_deref_mut(),
         )?;
         Some((parameters, return_type))
     } else {
@@ -6392,40 +9130,50 @@ fn instantiate_generic_method_signature(
         ))?;
     let fresh_parameters = instantiated.type_parameters().to_vec();
     if fresh_parameters.len() != source_parameters.len() {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            owner_type,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
     }
-    for (fresh, source) in fresh_parameters.into_iter().zip(source_parameters) {
+    for (fresh, source_parameter) in fresh_parameters.into_iter().zip(source_parameters) {
         let (constraint, default_type) = match store
-            .type_payload(source)
+            .type_payload(source_parameter)
             .map(super::type_records::TypeRecord::data)
         {
             Some(TypeData::TypeParameter(parameter)) => {
                 (parameter.constraint, parameter.resolved_default_type)
             }
-            _ => return Err(GenericInterfaceMemberError::InvalidMember(method)),
+            _ => return Err(GenericInterfaceMemberError::InvalidMember(method).into()),
         };
         let constraint = constraint
             .map(|constraint| {
-                instantiate_generic_member_type(store, constraint, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    constraint,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .transpose()?;
         let default_type = default_type
             .map(|default_type| {
-                instantiate_generic_member_type(store, default_type, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    default_type,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .transpose()?;
         if !store.set_type_parameter_resolution(
             fresh,
             constraint,
-            Some(source),
+            Some(source_parameter),
             Some(mapper),
             default_type,
         ) {
-            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-                owner_type,
-            ));
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
         }
     }
 
@@ -6436,18 +9184,50 @@ fn instantiate_generic_method_signature(
             .iter()
             .copied()
             .map(|parameter| {
-                instantiate_generic_member_type(store, parameter, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    parameter,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let return_type = instantiate_generic_member_type(
+        let return_type = instantiate_signature_member_type(
             store,
             return_template,
             mapper,
             array_targets,
             session,
+            source.as_deref_mut(),
         )?;
         (parameters, return_type)
     };
+    if let Some((original_predicate, kind, index, name, narrowed)) = receiver_predicate {
+        let instantiated_narrowed = narrowed
+            .map(|type_| {
+                instantiate_signature_member_type(
+                    store,
+                    type_,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
+            })
+            .transpose()?;
+        let predicate = if instantiated_narrowed == narrowed {
+            original_predicate
+        } else {
+            store
+                .alloc_type_predicate(kind, index, name, instantiated_narrowed)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(owner_type))?
+        };
+        if !store.set_signature_resolved_type_predicate(signature, Some(predicate)) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
+        }
+    }
     let parameters = store
         .signature(signature)
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
@@ -6469,17 +9249,40 @@ fn instantiate_generic_method_signature(
                     },
                 )
         {
-            return Err(GenericInterfaceMemberError::InvalidCachedProperty(
-                parameter,
-            ));
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(parameter).into());
         }
     }
     if !store.set_signature_resolved_return_type(signature, Some(return_type)) {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            owner_type,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
     }
     Ok(signature)
+}
+
+fn instantiate_signature_member_type(
+    store: &mut CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
+    if matches!(
+        store.type_payload(template).map(super::TypeRecord::data),
+        Some(TypeData::Conditional(_))
+    ) && let Some(source) = source
+    {
+        return instantiate_type_with_source(
+            store,
+            template,
+            mapper,
+            source.global_types,
+            session,
+            source.branches,
+        )
+        .map_err(|error| MethodSignatureError::Source { template, error });
+    }
+    instantiate_generic_member_type(store, template, mapper, array_targets, session)
+        .map_err(Into::into)
 }
 
 fn indexed_property_name(store: &CanonicalTypeMapperStore, index: TypeId) -> Option<String> {
@@ -6542,6 +9345,15 @@ fn cached_inherited_properties(
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<InheritedInterfaceMembers>, GenericInterfaceMemberError> {
+    cached_inherited_properties_with_replay(store, shape, array_targets, GenericMemberReplay::Full)
+}
+
+fn cached_inherited_properties_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<Option<InheritedInterfaceMembers>, GenericInterfaceMemberError> {
     let mut inherited = Vec::new();
     let mut inherited_indexes = Vec::new();
     let mut names = shape
@@ -6560,11 +9372,12 @@ fn cached_inherited_properties(
         })
         .collect::<Result<HashSet<_>, _>>()?;
     for base in &shape.base_types {
-        let Some(base) = mapped_inherited_type(store, shape, *base)? else {
+        let Some(base) = mapped_inherited_type(store, shape, *base, array_targets)? else {
             return Ok(None);
         };
-        let (properties, indexes) = if validate_direct_generic_reference(store, base).is_ok() {
-            let Some(members) = validate_generic_interface_members(store, base, array_targets)?
+        let (properties, indexes) = if source_member_reference_with_replay(store, base, replay).is_ok() {
+            let shape = validate_shape_with_replay(store, base, array_targets, replay)?;
+            let Some(members) = validate_warm_members_with_replay(store, &shape, array_targets, replay)?
             else {
                 return Ok(None);
             };
@@ -6587,7 +9400,13 @@ fn cached_inherited_properties(
                 structured.index_infos.clone().unwrap_or_default(),
             )
         } else {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            let members =
+                super::interface_heritage::interface_alias_base_members(store, base, array_targets)
+                    .map_err(|_| GenericInterfaceMemberError::UnsupportedTarget(base))?;
+            let Some(members) = members else {
+                return Ok(None);
+            };
+            (members.properties, members.indexes)
         };
         for property in properties {
             let name = store
@@ -6616,70 +9435,12 @@ fn mapped_inherited_type(
     store: &CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
-    if let Some(index) = shape
-        .source_parameters
-        .iter()
-        .position(|parameter| *parameter == type_)
-    {
-        return shape
-            .target_arguments
-            .get(index)
-            .copied()
-            .map(Some)
-            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target));
-    }
-    let this_type = store
-        .type_payload(shape.target)
-        .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => interface.this_type,
-            _ => None,
-        })
-        .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
-    if type_ == this_type {
-        return Ok(Some(shape.reference));
-    }
-    let record = store
-        .type_payload(type_)
-        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
-    if matches!(record.data(), TypeData::Intrinsic(_) | TypeData::Literal(_)) {
-        return Ok(Some(type_));
-    }
-    let reference = match validate_direct_generic_reference(store, type_) {
-        Ok(reference) => reference,
-        Err(_) if matches!(record.data(), TypeData::Interface(_)) => {
-            return Ok(Some(type_));
-        }
-        Err(_) => return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_)),
-    };
-    let mut arguments = Vec::with_capacity(reference.type_arguments.len());
-    for argument in &reference.type_arguments {
-        let Some(argument) = mapped_inherited_type(store, shape, *argument)? else {
-            return Ok(None);
-        };
-        arguments.push(argument);
-    }
-    if arguments == reference.type_arguments {
-        return Ok(Some(type_));
-    }
-    let TypeData::Interface(target) = store
-        .type_payload(reference.target)
-        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?
-        .data()
-    else {
-        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
-    };
-    let TypeCacheState::Allocated(cache) = &target.reference.object.instantiations else {
-        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
-    };
-    let Some(cached) = cache.get(&type_list_key(&arguments)).copied() else {
-        return Ok(None);
-    };
-    let actual = validate_direct_generic_reference(store, cached)?;
-    if actual.target != reference.target || actual.type_arguments != arguments {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(cached));
-    }
-    Ok(Some(cached))
+    let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let targets = member_mapper_arguments(store, shape);
+    cached_instantiation_with_vector(store, type_, &sources, &targets, array_targets, None)
+        .map_err(|error| property_instantiation_error(type_, &error))
 }
 
 fn materialize_inherited_members(
@@ -6689,12 +9450,7 @@ fn materialize_inherited_members(
     session: &mut InstantiationSession,
 ) -> Result<(), GenericInterfaceMemberError> {
     let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
+    let targets = member_mapper_arguments(store, shape);
     for base in &shape.base_types {
         let limit_mark = session.limit_event_mark();
         let resolved = instantiate_type_with_vector_and_session(
@@ -6712,7 +9468,7 @@ fn materialize_inherited_members(
                 shape.reference,
             ));
         }
-        if validate_direct_generic_reference(store, resolved).is_ok() {
+        if source_member_reference(store, resolved).is_ok() {
             resolve_members_with_array_targets_and_session(
                 store,
                 resolved,
@@ -6723,16 +9479,71 @@ fn materialize_inherited_members(
             validate_resolved_declared_property_object(store, resolved),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         ) {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(resolved));
+            super::interface_heritage::resolve_interface_alias_base_members(
+                store,
+                resolved,
+                array_targets,
+                session,
+            )
+            .map_err(|_| GenericInterfaceMemberError::UnsupportedTarget(resolved))?;
         }
     }
     Ok(())
+}
+
+pub(super) fn source_member_reference(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+) -> Result<DirectGenericReference, GenericInterfaceMemberError> {
+    source_member_reference_with_replay(store, reference, GenericMemberReplay::Full)
+}
+
+fn source_member_reference_with_replay(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    replay: GenericMemberReplay,
+) -> Result<DirectGenericReference, GenericInterfaceMemberError> {
+    let direct_error = match validate_direct_generic_reference(store, reference) {
+        Ok(direct) => return Ok(direct),
+        Err(error) => error,
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(reference);
+    let Some(names) = store.source_declared_member_names(reference) else {
+        return Err(direct_error.into());
+    };
+    let record = store.type_payload(reference).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    if interface.reference.resolved_type_arguments.as_deref().is_some_and(|args| !args.is_empty()) {
+        return Err(direct_error.into());
+    }
+    let target_is_valid = match replay {
+        GenericMemberReplay::Full => names.validates_target(store, reference),
+        GenericMemberReplay::Names => names.validates_target_for_names(store, reference),
+    };
+    if !target_is_valid
+        || record.object_flags().contains(ObjectFlags::CLASS)
+        || super::declared::cached_interface_type(store, names.owner()).map_err(|_| invalid())? != Some(reference)
+    {
+        return Err(invalid());
+    }
+    Ok(DirectGenericReference { target: reference, type_arguments: Vec::new() })
 }
 
 fn validate_shape(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<GenericInterfaceShape, GenericInterfaceMemberError> {
+    validate_shape_with_replay(store, reference, array_targets, GenericMemberReplay::Full)
+}
+
+fn validate_shape_with_replay(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
 ) -> Result<GenericInterfaceShape, GenericInterfaceMemberError> {
     // Check produced recovery graphs before an invalid nested reference can
     // make the declared member domain appear merely unsupported.
@@ -6746,21 +9557,27 @@ fn validate_shape(
             && recovery.shape.reference == reference
             && !recovery.matches_cached_identity(store, recovery.array_targets)
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
         }
     }
-    let direct = validate_direct_generic_reference(store, reference)?;
+    let direct = source_member_reference_with_replay(store, reference, replay)?;
+    let class_target = store
+        .type_payload(direct.target)
+        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS));
     let mut active = Vec::new();
     let mut validated = HashSet::new();
-    let (_, source_parameters, _, properties, index_infos) = validate_declared_target(
+    let (_, source_parameters, _, properties, index_infos) = validate_declared_target_with_replay(
         store,
         direct.target,
         array_targets,
         &mut active,
         0,
         &mut validated,
+        replay,
     )?;
-    let base_types = store
+    let mut base_types = store
         .type_payload(direct.target)
         .and_then(|record| match record.data() {
             TypeData::Interface(interface) => Some(
@@ -6773,6 +9590,10 @@ fn validate_shape(
             _ => None,
         })
         .ok_or(GenericInterfaceMemberError::InvalidTarget(direct.target))?;
+    if class_target && store.source_class_provenance(direct.target).is_some() {
+        // The completed class plan retains its inherited origins and base-to-child maps.
+        base_types.clear();
+    }
     let mut shape = GenericInterfaceShape {
         reference,
         target: direct.target,
@@ -6780,18 +9601,36 @@ fn validate_shape(
         target_arguments: direct.type_arguments,
         properties,
         index_infos,
+        call_signatures: store
+            .type_payload(direct.target)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface.declared_call_signatures.clone(),
+                _ => None,
+            })
+            .unwrap_or_default(),
         base_types,
         inherited_properties: Vec::new(),
         inherited_index_infos: Vec::new(),
         inherited_members_ready: false,
     };
-    if let Some((properties, indexes)) = cached_inherited_properties(store, &shape, array_targets)?
+    if reference == shape.target
+        && (class_target || store.source_declared_member_names(shape.target).is_some())
+    {
+        // A target keeps its own symbols. Only an applied reference needs copies.
+        for property in &mut shape.properties {
+            property.requires_proxy = false;
+        }
+    }
+    if replay == GenericMemberReplay::Names {
+        retain_published_property_choices(store, &mut shape)?;
+    }
+    if let Some((properties, indexes)) = cached_inherited_properties_with_replay(store, &shape, array_targets, replay)?
     {
         shape.inherited_properties = properties;
         shape.inherited_index_infos = indexes;
         shape.inherited_members_ready = true;
     }
-    if reference != shape.target {
+    if reference != shape.target && !class_target {
         let mut target_shape = GenericInterfaceShape {
             reference: shape.target,
             target: shape.target,
@@ -6799,21 +9638,50 @@ fn validate_shape(
             target_arguments: shape.source_parameters.clone(),
             properties: shape.properties.clone(),
             index_infos: shape.index_infos.clone(),
+            call_signatures: shape.call_signatures.clone(),
             base_types: shape.base_types.clone(),
             inherited_properties: Vec::new(),
             inherited_index_infos: Vec::new(),
             inherited_members_ready: false,
         };
+        if store.source_declared_member_names(shape.target).is_some() {
+            for property in &mut target_shape.properties {
+                property.requires_proxy = false;
+            }
+        }
         if let Some((properties, indexes)) =
-            cached_inherited_properties(store, &target_shape, array_targets)?
+            cached_inherited_properties_with_replay(store, &target_shape, array_targets, replay)?
         {
             target_shape.inherited_properties = properties;
             target_shape.inherited_index_infos = indexes;
             target_shape.inherited_members_ready = true;
         }
-        validate_warm_members(store, &target_shape, array_targets)?;
+        if replay == GenericMemberReplay::Names {
+            retain_published_property_choices(store, &mut target_shape)?;
+        }
+        validate_warm_members_with_replay(store, &target_shape, array_targets, replay)?;
     }
     Ok(shape)
+}
+
+fn retain_published_property_choices(
+    store: &CanonicalTypeMapperStore,
+    shape: &mut GenericInterfaceShape,
+) -> Result<(), GenericInterfaceMemberError> {
+    let record = store.type_payload(shape.reference)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference))?;
+    if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference));
+    }
+    let properties = record.data().structured()
+        .and_then(|structured| structured.properties.as_deref()).unwrap_or_default();
+    if properties.len() < shape.properties.len() {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference));
+    }
+    for (property, actual) in shape.properties.iter_mut().zip(properties) {
+        property.requires_proxy = *actual != property.symbol;
+    }
+    Ok(())
 }
 
 fn validate_declared_target(
@@ -6824,39 +9692,101 @@ fn validate_declared_target(
     heritage_start: usize,
     validated: &mut HashSet<TypeId>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
-    if store
-        .type_payload(target)
-        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
-    {
-        return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
-    }
+    validate_declared_target_with_replay(store, target, array_targets, active, heritage_start, validated, GenericMemberReplay::Full)
+}
+
+fn validate_declared_target_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut Vec<TypeId>,
+    heritage_start: usize,
+    validated: &mut HashSet<TypeId>,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     if validated.contains(&target) {
-        return declared_target_header(store, target);
+        return declared_target_header_with_replay(store, target, array_targets, replay);
     }
     if active.contains(&target) {
-        return declared_target_header(store, target);
+        return declared_target_header_with_replay(store, target, array_targets, replay);
     }
     let (owner, source_parameters, declared_members, mut properties, index_infos) =
-        declared_target_header(store, target)?;
+        declared_target_header_with_replay(store, target, array_targets, replay)?;
     let owner_record = store
         .symbol(owner)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-    let Some(declarations) = owner_record
+    let Some(_) = owner_record
         .declarations()
         .filter(|declarations| !declarations.is_empty())
     else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if declarations
-        .iter()
-        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration))
-    {
-        return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
-    }
+    // The header validates interface declarations and any merged global value owner.
 
     let mapper_parameters = mapper_parameters_for_target(store, target, &source_parameters)?;
     active.push(target);
-    let base_types = store
+    let source_class = owner_record.flags().contains(SymbolFlags::CLASS)
+        && store.source_class_provenance(target).is_some();
+    if !source_class {
+        super::object_members::generic_declared_call_signature_edges(store, target)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+        let TypeData::Interface(interface) = store
+            .type_payload(target)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+            .data()
+        else {
+            return Err(GenericInterfaceMemberError::InvalidTarget(target));
+        };
+        for &signature in interface
+            .declared_call_signatures
+            .as_deref()
+            .unwrap_or_default()
+        {
+            let record = store
+                .signature(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+            // Each call can use its own formals, but not a sibling call's formals.
+            let mut signature_parameters = mapper_parameters.clone();
+            signature_parameters.extend_from_slice(record.type_parameters());
+            let mut edges = store
+                .callable_signature_parameter_types(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+                .to_vec();
+            for &parameter in record.type_parameters() {
+                let Some(TypeData::TypeParameter(data)) =
+                    store.type_payload(parameter).map(super::TypeRecord::data)
+                else {
+                    return Err(GenericInterfaceMemberError::InvalidTarget(target));
+                };
+                edges.push(parameter);
+                edges.extend(data.constraint);
+                edges.extend(data.resolved_default_type);
+            }
+            edges.push(
+                record
+                    .resolved_return_type()
+                    .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?,
+            );
+            for type_ in edges {
+                member_type_requires_instantiation(
+                    store,
+                    type_,
+                    &signature_parameters,
+                    array_targets,
+                )?;
+                validate_nested_reference_targets_with_replay(
+                    store,
+                    type_,
+                    array_targets,
+                    active,
+                    validated,
+                    &mut HashSet::new(),
+                    replay,
+                )?;
+            }
+        }
+    }
+    let mut base_types = store
         .type_payload(target)
         .and_then(|record| match record.data() {
             TypeData::Interface(interface) => Some(
@@ -6869,31 +9799,83 @@ fn validate_declared_target(
             _ => None,
         })
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if source_class {
+        base_types.clear();
+    }
     for base in base_types {
-        if let Ok(reference) = validate_direct_generic_reference(store, base) {
+        if let Ok(reference) = source_member_reference_with_replay(store, base, replay) {
             if active[heritage_start..].contains(&reference.target) {
                 return Err(GenericInterfaceMemberError::InvalidTarget(target));
             }
             member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
-            validate_declared_target(
+            validate_declared_target_with_replay(
                 store,
                 reference.target,
                 array_targets,
                 active,
                 heritage_start,
                 validated,
+                replay,
             )?;
         } else if !matches!(
             validate_resolved_declared_property_object(store, base),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         ) {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            if !super::interface_heritage::interface_base_has_statically_known_members(store, base)
+                .map_err(|_| GenericInterfaceMemberError::InvalidTarget(base))?
+            {
+                return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            }
+            member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
         }
     }
     for property in &mut properties {
+        if replay == GenericMemberReplay::Names {
+            continue;
+        }
+        let Some(type_) = property.value.resolved() else {
+            // The source-name proof fixes this policy before any value is read.
+            property.requires_proxy = true;
+            continue;
+        };
+        let property_parameters = if property.source_mapper.is_some() {
+            let declaring = store
+                .get_parent_of_symbol(property.symbol)
+                .and_then(|symbol| store.declared_type_links(symbol))
+                .and_then(|links| links.declared_type)
+                .and_then(|type_| store.type_payload(type_))
+                .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?;
+            let TypeData::Interface(class) = declaring.data() else {
+                return Err(GenericInterfaceMemberError::InvalidMember(property.symbol));
+            };
+            class
+                .all_type_parameters
+                .clone()
+                .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?
+        } else {
+            mapper_parameters.clone()
+        };
+        property.requires_proxy |= property.source_mapper.is_some();
         if property.method {
+            if let Some((_, _, edges)) =
+                super::callable_sets::completed_source_class_method_callable(
+                    store,
+                    type_,
+                    array_targets,
+                )
+            {
+                for edge in edges {
+                    store
+                        .validate_cached_array_capability_with_pending_functions(
+                            array_targets,
+                            edge,
+                            &[],
+                        )
+                        .map_err(|_| GenericInterfaceMemberError::InvalidMember(property.symbol))?;
+                }
+            }
             let signatures = store
-                .type_payload(property.type_)
+                .type_payload(type_)
                 .and_then(|record| record.data().structured())
                 .and_then(|structured| structured.signatures.as_deref())
                 .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?
@@ -6905,12 +9887,11 @@ fn validate_declared_target(
                 let return_type = signature_record
                     .resolved_return_type()
                     .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?;
-                let parameter_types = store
-                    .callable_signature_parameter_types(signature)
-                    .filter(|types| types.len() == signature_record.parameters().len())
-                    .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?
-                    .to_vec();
-                let mut signature_parameters = mapper_parameters.clone();
+                let parameter_types =
+                    copied_method_parameter_types(store, type_, signature, array_targets)
+                        .filter(|types| types.len() == signature_record.parameters().len())
+                        .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?;
+                let mut signature_parameters = property_parameters.clone();
                 signature_parameters.extend_from_slice(signature_record.type_parameters());
                 property.requires_proxy |= !signature_record.type_parameters().is_empty();
                 for type_ in parameter_types
@@ -6927,15 +9908,15 @@ fn validate_declared_target(
                 }
             }
         } else {
-            property.requires_proxy = member_type_requires_instantiation(
+            property.requires_proxy |= member_type_requires_instantiation(
                 store,
-                property.type_,
-                &mapper_parameters,
+                type_,
+                &property_parameters,
                 array_targets,
             )?;
             validate_nested_reference_targets(
                 store,
-                property.type_,
+                type_,
                 array_targets,
                 active,
                 validated,
@@ -6949,13 +9930,14 @@ fn validate_declared_target(
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
             .value_type();
         member_type_requires_instantiation(store, value, &mapper_parameters, array_targets)?;
-        validate_nested_reference_targets(
+        validate_nested_reference_targets_with_replay(
             store,
             value,
             array_targets,
             active,
             validated,
             &mut HashSet::new(),
+            replay,
         )?;
     }
     let popped = active
@@ -7020,6 +10002,23 @@ fn member_type_requires_instantiation_inner(
     active: &mut HashSet<TypeId>,
     classify_only: bool,
 ) -> Result<bool, GenericInterfaceMemberError> {
+    if is_signature_conditional_source(store, type_) {
+        return instantiable_member_type_contains_variables(
+            store,
+            type_,
+            mapper_parameters,
+            array_targets,
+        )
+        .map_err(|error| match error {
+            InstantiationError::UnsupportedType(_) => {
+                GenericInterfaceMemberError::UnsupportedPropertyType(type_)
+            }
+            InstantiationError::Union(super::bootstrap::LiteralTypeCacheError::Capacity) => {
+                GenericInterfaceMemberError::Capacity(type_)
+            }
+            _ => GenericInterfaceMemberError::InvalidCachedMembers(type_),
+        });
+    }
     if let Some(tuple) = store
         .canonical_tuple_shape(type_)
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
@@ -7111,10 +10110,10 @@ fn member_type_requires_instantiation_inner(
         }
         return Ok(requires);
     }
-    if let Some((callback, _)) = optional_function_member(store, type_)? {
+    if let Some(optional) = optional_function_member(store, type_)? {
         return member_type_requires_instantiation_worker(
             store,
-            callback,
+            optional.callback,
             mapper_parameters,
             array_targets,
             active,
@@ -7170,29 +10169,56 @@ fn mapper_parameters_for_target(
     target: TypeId,
     source_parameters: &[TypeId],
 ) -> Result<Vec<TypeId>, GenericInterfaceMemberError> {
-    let this_type = store
+    let interface = store
         .type_payload(target)
         .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => interface.this_type,
+            TypeData::Interface(interface) => Some(interface),
             _ => None,
         })
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
     Ok(source_parameters
         .iter()
         .copied()
-        .chain(std::iter::once(this_type))
+        .chain(interface.this_type)
         .collect())
+}
+
+fn member_mapper_arguments(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+) -> Vec<TypeId> {
+    let has_this = matches!(store.type_payload(shape.target).map(|record| record.data()),
+        Some(TypeData::Interface(interface)) if interface.this_type.is_some());
+    shape.target_arguments.iter().copied().chain(has_this.then_some(shape.reference)).collect()
 }
 
 #[allow(clippy::too_many_lines)] // One fail-closed proof covers the complete admitted source surface.
 fn declared_target_header(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
-    let record = store
-        .type_payload(target)
+    declared_target_header_with_replay(store, target, array_targets, GenericMemberReplay::Full)
+}
+
+fn declared_target_header_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    if let Some(names) = store.source_declared_member_names(target) {
+        return source_declared_target_header_with_replay(store, target, names, replay);
+    }
+    let record = crate::semantic::relater::original_failure_payload!(target, store
+        .type_payload(target))
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if record.object_flags().contains(ObjectFlags::CLASS) {
+        return declared_class_field_target_header(store, target, array_targets);
+    }
     let TypeData::Interface(interface) = record.data() else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
     let owner = record
@@ -7236,71 +10262,98 @@ fn declared_target_header(
         | ObjectFlags::MEMBERS_RESOLVED
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
-    if record.flags() != TypeFlags::OBJECT
-        || record.object_flags().contains(ObjectFlags::CLASS)
-        || record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
-            != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
-        || !(record.object_flags() & !allowed_target_flags).is_empty()
-        || record.alias().is_some()
-        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
-        || owner_record
+    let mixed_owner = if owner_record
+        .flags()
+        .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+        != SymbolFlags::NONE
+        || owner_record.value_declaration().is_some()
+    {
+        store
+            .source_global_interface_value_owner(owner)
+            .map_err(|_| GenericInterfaceMemberError::InvalidTarget(target))?
+            .filter(|mixed| mixed.symbol() == owner)
+    } else {
+        None
+    };
+    if crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), record.flags(), TypeFlags::OBJECT)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.1@", "instantiated_members.rs", ":", line!()), record.object_flags().contains(ObjectFlags::CLASS))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.2@", "instantiated_members.rs", ":", line!()), record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
+            != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE))
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.1.3@", "instantiated_members.rs", ":", line!()), (record.object_flags() & !allowed_target_flags).is_empty())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.4@", "instantiated_members.rs", ":", line!()), record.alias().is_some())
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.1.5@", "instantiated_members.rs", ":", line!()), owner_record.flags().contains(SymbolFlags::INTERFACE))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.6@", "instantiated_members.rs", ":", line!()), (owner_record
             .flags()
             .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
             != SymbolFlags::NONE
-        || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.value_declaration().is_some()
-        || owner_record.exports().is_some()
-        || owner_record.export_symbol().is_some()
-        || store.get_merged_symbol(owner) != Some(owner)
-        || store
+            && mixed_owner.is_none()))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.7@", "instantiated_members.rs", ":", line!()), owner_record.check_flags() != CheckFlags::NONE)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.8@", "instantiated_members.rs", ":", line!()), owner_record.value_declaration().is_some() && mixed_owner.is_none())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.9@", "instantiated_members.rs", ":", line!()), owner_record.exports().is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.10@", "instantiated_members.rs", ":", line!()), owner_record.export_symbol().is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.11@", "instantiated_members.rs", ":", line!()), store.get_merged_symbol(owner) != Some(owner))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.12@", "instantiated_members.rs", ":", line!()), store
             .declared_type_links(owner)
             .and_then(|links| links.declared_type)
-            != Some(target)
-        || all_parameters.len() != source_parameters.len() + 1
-        || &all_parameters[..source_parameters.len()] != source_parameters.as_slice()
-        || all_parameters.last().copied() != Some(this_type)
-        || interface.outer_type_parameter_count != 0
-        || interface.resolved_base_constructor_type.is_some()
-        || interface
+            != Some(target))
+         ||  crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.13@", "instantiated_members.rs", ":", line!()), all_parameters.len(), source_parameters.len() + 1)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.14@", "instantiated_members.rs", ":", line!()), &all_parameters[..source_parameters.len()] != source_parameters.as_slice())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.15@", "instantiated_members.rs", ":", line!()), all_parameters.last().copied() != Some(this_type))
+         ||  crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.16@", "instantiated_members.rs", ":", line!()), interface.outer_type_parameter_count, 0)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.17@", "instantiated_members.rs", ":", line!()), interface.resolved_base_constructor_type.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.18@", "instantiated_members.rs", ":", line!()), interface
             .resolved_base_types
             .as_ref()
-            .is_some_and(Vec::is_empty)
-        || interface.declared_call_signatures.is_some()
-        || interface.declared_construct_signatures.is_some()
-        || (!record
+            .is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.19@", "instantiated_members.rs", ":", line!()), !interface.declared_members_resolved && interface.declared_call_signatures.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.20@", "instantiated_members.rs", ":", line!()), interface.declared_construct_signatures.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.21@", "instantiated_members.rs", ":", line!()), (!record
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
-            && structured != &StructuredTypeData::default())
-        || structured.signatures.is_some()
-        || structured.call_signature_count != 0
-        || structured.constrained != ConstrainedTypeData::default()
-        || structured
+            && structured != &StructuredTypeData::default()))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.22@", "instantiated_members.rs", ":", line!()), record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+            && (structured.signatures.as_deref() != interface.declared_call_signatures.as_deref()
+                || structured.call_signature_count
+                    != interface
+                        .declared_call_signatures
+                        .as_ref()
+                        .map_or(0, Vec::len)))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.23@", "instantiated_members.rs", ":", line!()), structured.constrained != ConstrainedTypeData::default())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.24@", "instantiated_members.rs", ":", line!()), structured
             .object_type_without_abstract_construct_signatures
-            .is_some()
-        || source_parameters
+            .is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.25@", "instantiated_members.rs", ":", line!()), source_parameters
             .iter()
             .copied()
             .collect::<HashSet<_>>()
             .len()
-            != source_parameters.len()
+            != source_parameters.len())
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let Some(this_record) = store.type_payload(this_type) else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     };
-    if this_record.flags() != TypeFlags::TYPE_PARAMETER
-        || this_record.symbol() != Some(owner)
-        || this_record.alias().is_some()
-        || !matches!(
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), this_record.flags() != TypeFlags::TYPE_PARAMETER)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.1@", "instantiated_members.rs", ":", line!()), this_record.symbol() != Some(owner))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.2@", "instantiated_members.rs", ":", line!()), this_record.alias().is_some())
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.2.3@", "instantiated_members.rs", ":", line!()), matches!(
             this_record.data(),
             TypeData::TypeParameter(data)
                 if data.is_this_type
                     && data.constraint == Some(target)
                     && data.target.is_none()
                     && data.mapper.is_none()
-        )
+        ))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
 
@@ -7308,12 +10361,26 @@ fn declared_target_header(
         .declarations()
         .filter(|declarations| !declarations.is_empty())
     else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if owner_declarations
+    let interface_declarations = if let Some(mixed) = &mixed_owner {
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), mixed.declarations() != owner_declarations) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+            return Err(GenericInterfaceMemberError::InvalidTarget(target));
+        }
+        mixed.interfaces()
+    } else {
+        owner_declarations
+    };
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), interface_declarations
         .iter()
-        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration))
+        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration)))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     }
     let mut parameter_symbols = HashSet::with_capacity(source_parameters.len());
@@ -7323,18 +10390,20 @@ fn declared_target_header(
         let parameter_record = store
             .symbol(parameter_symbol)
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-        if store.get_parent_of_symbol(parameter_symbol) != Some(owner)
-            || raw_table
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), store.get_parent_of_symbol(parameter_symbol) != Some(owner))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.5.1@", "instantiated_members.rs", ":", line!()), raw_table
                 .get(parameter_record.name())
                 .and_then(|symbol| store.get_merged_symbol(symbol))
-                != Some(parameter_symbol)
-            || !parameter_symbols.insert(parameter_symbol)
+                != Some(parameter_symbol))
+             ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.5.2@", "instantiated_members.rs", ":", line!()), parameter_symbols.insert(parameter_symbol))
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidTarget(target));
         }
     }
-    if !interface.base_types_resolved || !interface.declared_members_resolved {
-        if !interface.base_types_resolved
+    if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.6.0@", "instantiated_members.rs", ":", line!()), interface.base_types_resolved)  ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.6.1@", "instantiated_members.rs", ":", line!()), interface.declared_members_resolved) {
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.7.0@", "instantiated_members.rs", ":", line!()), !interface.base_types_resolved
             && !interface.declared_members_resolved
             && interface.resolved_base_types.is_none()
             && declared_members.is_none()
@@ -7348,10 +10417,14 @@ fn declared_target_header(
                 owner_declarations,
                 raw_members,
                 &parameter_symbols,
-            )
+            ))
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
         }
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let index_infos = interface
@@ -7359,16 +10432,24 @@ fn declared_target_header(
         .as_deref()
         .unwrap_or_default()
         .to_vec();
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.8.0@", "instantiated_members.rs", ":", line!()), super::object_members::generic_declared_call_signature_edges(store, target).is_none()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    }
+    let call_symbol = raw_table.get(InternalSymbolName::Call.as_ref());
     let index_symbol = raw_table.get(InternalSymbolName::Index.as_ref());
-    if index_infos.is_empty() != index_symbol.is_none()
-        || interface
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.0@", "instantiated_members.rs", ":", line!()), index_infos.is_empty() != index_symbol.is_none())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.1@", "instantiated_members.rs", ":", line!()), interface
             .declared_index_infos
             .as_ref()
-            .is_some_and(Vec::is_empty)
-        || index_symbol.is_some_and(|symbol| {
+            .is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.2@", "instantiated_members.rs", ":", line!()), index_symbol.is_some_and(|symbol| {
             !valid_index_symbol(store, owner, owner_declarations, symbol, &index_infos)
-        })
+        }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let declared_count = declared_table.map_or(0, ts_binder::semantic::SymbolTable::len);
@@ -7391,7 +10472,9 @@ fn declared_target_header(
         .into_iter()
         .flat_map(ts_binder::semantic::SymbolTable::iter)
     {
-        if !seen.insert(symbol) {
+        if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.10.0@", "instantiated_members.rs", ":", line!()), seen.insert(symbol)) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         }
         let property = store
@@ -7401,6 +10484,8 @@ fn declared_target_header(
             .declarations()
             .filter(|declarations| !declarations.is_empty())
         else {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         };
         let mut earliest = None;
@@ -7408,24 +10493,30 @@ fn declared_target_header(
         for declaration in declarations {
             let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(*declaration)
             else {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             };
             let Some(owner_index) = owner_declarations
                 .iter()
                 .position(|owner_declaration| *owner_declaration == parent)
             else {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             };
-            if !(if method {
+            if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.0@", "instantiated_members.rs", ":", line!()), (if method {
                 store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
             } else {
                 matches!(
                     store.source_node_kind(*declaration),
                     Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
                 )
-            }) || !declaration.is_for(parent.arena, parent.file)
-                || !seen_declarations.insert(*declaration)
+            }))  ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.1@", "instantiated_members.rs", ":", line!()), declaration.is_for(parent.arena, parent.file))
+                 ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.2@", "instantiated_members.rs", ":", line!()), seen_declarations.insert(*declaration))
             {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             }
             let position = (owner_index, *declaration);
@@ -7441,13 +10532,14 @@ fn declared_target_header(
         let type_ = links
             .resolved_type
             .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
-        let optional_type_is_valid = optional_member_type_is_normalized(
+        let optional_type_is_valid = replay == GenericMemberReplay::Names || optional_member_type_is_normalized(
             store,
             type_,
             property.flags().contains(SymbolFlags::OPTIONAL),
         );
+        let merged_method = method && store.source_merged_method_has_exact_declarations(symbol);
         let late = property.check_flags().contains(CheckFlags::LATE)
-            || property.flags().contains(SymbolFlags::TRANSIENT)
+            || property.flags().contains(SymbolFlags::TRANSIENT) && !merged_method
             || property.name().is_late_bound()
             || links.name_type.is_some();
         let valid_identity = if late {
@@ -7458,13 +10550,18 @@ fn declared_target_header(
                 declarations,
                 links,
                 resolved_table,
-            ) && (!method || valid_interface_method_value(store, symbol, type_).is_some())
+            ) && (replay == GenericMemberReplay::Names || !method || valid_interface_method_value(store, symbol, type_).is_some())
         } else if method {
             property.flags().contains(SymbolFlags::METHOD)
-                && property
-                    .flags()
-                    .without(SymbolFlags::METHOD | SymbolFlags::OPTIONAL)
-                    == SymbolFlags::NONE
+                && property.flags().without(
+                    SymbolFlags::METHOD
+                        | SymbolFlags::OPTIONAL
+                        | if merged_method {
+                            SymbolFlags::TRANSIENT
+                        } else {
+                            SymbolFlags::NONE
+                        },
+                ) == SymbolFlags::NONE
                 && property.check_flags() == CheckFlags::NONE
                 && raw_table
                     .get(property.name())
@@ -7475,7 +10572,7 @@ fn declared_target_header(
                         resolved_type: Some(type_),
                         ..ValueSymbolLinks::default()
                     })
-                && valid_interface_method_value(store, symbol, type_).is_some()
+                && (replay == GenericMemberReplay::Names || valid_interface_method_value(store, symbol, type_).is_some())
         } else {
             let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
             property.flags().contains(SymbolFlags::PROPERTY)
@@ -7492,21 +10589,23 @@ fn declared_target_header(
                         ..ValueSymbolLinks::default()
                     })
         };
-        if !valid_identity
-            || property.name() != name
-            || property.name().is_reserved_member_name()
-            || property.name().is_private_identifier()
-            || property
+        if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.12.0@", "instantiated_members.rs", ":", line!()), valid_identity)
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.1@", "instantiated_members.rs", ":", line!()), property.name() != name)
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.2@", "instantiated_members.rs", ":", line!()), property.name().is_reserved_member_name())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.3@", "instantiated_members.rs", ":", line!()), property.name().is_private_identifier())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.4@", "instantiated_members.rs", ":", line!()), property
                 .value_declaration()
-                .is_none_or(|value| !declarations.contains(&value))
-            || store.get_parent_of_symbol(symbol) != Some(owner)
-            || property.members().is_some()
-            || property.exports().is_some()
-            || property.export_symbol().is_some()
-            || store.get_merged_symbol(symbol) != Some(symbol)
-            || store.type_payload(type_).is_none()
-            || !optional_type_is_valid
+                .is_none_or(|value| !declarations.contains(&value)))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.5@", "instantiated_members.rs", ":", line!()), store.get_parent_of_symbol(symbol) != Some(owner))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.6@", "instantiated_members.rs", ":", line!()), property.members().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.7@", "instantiated_members.rs", ":", line!()), property.exports().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.8@", "instantiated_members.rs", ":", line!()), property.export_symbol().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.9@", "instantiated_members.rs", ":", line!()), store.get_merged_symbol(symbol) != Some(symbol))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.10@", "instantiated_members.rs", ":", line!()), store.type_payload(type_).is_none())
+             ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.12.11@", "instantiated_members.rs", ":", line!()), optional_type_is_valid)
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         }
         if late {
@@ -7523,27 +10622,33 @@ fn declared_target_header(
             DeclaredProperty {
                 symbol,
                 name: property.name().to_owned(),
-                type_,
+                value: DeclaredPropertyValue::Resolved(type_),
                 requires_proxy: false,
                 method,
+                source_mapper: None,
             },
         ));
     }
     let early_count = declared_count
         .checked_sub(late_count)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-    if store.source_computed_member_count(owner) != Some(late_declaration_count) {
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.13.0@", "instantiated_members.rs", ":", line!()), store.source_computed_member_count(owner) != Some(late_declaration_count)) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
-    if raw_table.len()
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.14.0@", "instantiated_members.rs", ":", line!()), raw_table.len()
         != early_count
             .checked_add(parameter_symbols.len())
             .and_then(|count| count.checked_add(usize::from(index_symbol.is_some())))
-            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+            .and_then(|count| count.checked_add(usize::from(call_symbol.is_some())))
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?)
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
-    if late_count != 0
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.15.0@", "instantiated_members.rs", ":", line!()), late_count != 0
         && resolved_table.is_none_or(|resolved| {
             resolved.len() != raw_table.len() + late_count
                 || raw_table.iter().any(|(name, symbol)| {
@@ -7552,8 +10657,10 @@ fn declared_target_header(
                         .and_then(|member| store.get_merged_symbol(member))
                         != store.get_merged_symbol(symbol)
                 })
-        })
+        }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     if raw_table.iter().any(|(name, symbol)| {
@@ -7562,18 +10669,23 @@ fn declared_target_header(
         };
         (!seen.contains(&canonical)
             && !parameter_symbols.contains(&canonical)
-            && Some(canonical) != index_symbol)
+            && Some(canonical) != index_symbol
+            && Some(canonical) != call_symbol)
             || store
                 .symbol(symbol)
                 .is_none_or(|record| record.name() != name)
     }) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     properties.sort_unstable_by_key(|(owner_index, declaration, _)| (*owner_index, *declaration));
-    if properties
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.16.0@", "instantiated_members.rs", ":", line!()), properties
         .windows(2)
-        .any(|pair| (pair[0].0, pair[0].1) >= (pair[1].0, pair[1].1))
+        .any(|pair| (pair[0].0, pair[0].1) >= (pair[1].0, pair[1].1)))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let properties = properties
@@ -7586,6 +10698,337 @@ fn declared_target_header(
         declared_members,
         properties,
         index_infos,
+    ))
+}
+
+fn source_declared_target_header(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    names: &super::object_members::SourceDeclaredMemberNames,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    source_declared_target_header_with_replay(store, target, names, GenericMemberReplay::Full)
+}
+
+fn source_declared_target_header_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    names: &super::object_members::SourceDeclaredMemberNames,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(target);
+    let target_is_valid = match replay {
+        GenericMemberReplay::Full => names.validates_target(store, target),
+        GenericMemberReplay::Names => names.validates_target_for_names(store, target),
+    };
+    if crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), target_is_valid) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(invalid());
+    }
+    let direct = source_member_reference_with_replay(store, target, replay).map_err(|_| invalid())?;
+    if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), direct.target != target) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(invalid());
+    }
+    let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
+    else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(invalid());
+    };
+    if crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), interface.base_types_resolved)  ||  crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.3.1@", "instantiated_members.rs", ":", line!()), interface.declared_members_resolved) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(invalid());
+    }
+    let owner = names.owner();
+    let declarations = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+        .ok_or_else(invalid)?;
+    let index_infos = interface.declared_index_infos.clone().unwrap_or_default();
+    let index_symbol = match replay {
+        GenericMemberReplay::Full => names.raw_member_symbol(store, InternalSymbolName::Index.as_ref()),
+        GenericMemberReplay::Names => names.raw_member_symbol_for_names(store, InternalSymbolName::Index.as_ref()),
+    }
+        .map_err(|()| invalid())?;
+    if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), index_symbol.is_some() != !index_infos.is_empty())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.1@", "instantiated_members.rs", ":", line!()), index_symbol.is_some_and(|symbol| {
+            !valid_index_symbol(store, owner, declarations, symbol, &index_infos)
+        }))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.2@", "instantiated_members.rs", ":", line!()), super::object_members::generic_declared_call_signature_edges(store, target).is_none())
+    {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+        return Err(invalid());
+    }
+    let mut properties = Vec::new();
+    for symbol in names.properties() {
+        let member = store
+            .symbol(symbol)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+        let value = match store.value_symbol_links(symbol) {
+            Some(links) if links.resolved_type.is_some() => {
+                let type_ = links
+                    .resolved_type
+                    .expect("the value branch checked the type");
+                if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), store.type_payload(type_).is_none())
+                     ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.1@", "instantiated_members.rs", ":", line!()), replay == GenericMemberReplay::Names && links != &(ValueSymbolLinks {
+                        resolved_type: Some(type_), ..ValueSymbolLinks::default()
+                    }))
+                     ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.2@", "instantiated_members.rs", ":", line!()), replay == GenericMemberReplay::Full && (!super::structured_members::valid_property_symbol(store, symbol)
+                    || !optional_member_type_is_normalized(
+                        store,
+                        type_,
+                        member.flags().contains(SymbolFlags::OPTIONAL),
+                    )))
+                {
+                    #[cfg(test)]
+                    crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+                    return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+                }
+                DeclaredPropertyValue::Resolved(type_)
+            }
+            links
+                if links.is_none_or(|links| links == &ValueSymbolLinks::default())
+                    && store.declared_value_provenance(symbol).is_none()
+                    && store.instantiated_property_recovery(symbol).is_none() =>
+            {
+                DeclaredPropertyValue::Pending
+            }
+            _ => return Err(GenericInterfaceMemberError::InvalidMember(symbol)),
+        };
+        properties.push(DeclaredProperty {
+            symbol,
+            name: member.name().to_owned(),
+            value,
+            // The mapping policy cannot change when a source value is queried.
+            requires_proxy: true,
+            method: member.flags().contains(SymbolFlags::METHOD),
+            source_mapper: None,
+        });
+    }
+    Ok((
+        owner,
+        direct.type_arguments,
+        interface.declared_members,
+        properties,
+        index_infos,
+    ))
+}
+
+/// Selects a real class reference without treating malformed class caches as another family.
+pub(super) fn class_reference_field_target(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let record = store
+        .type_payload(reference)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference))?;
+    let TypeData::TypeReference(data) = record.data() else {
+        return Ok(None);
+    };
+    let class_owner = record
+        .symbol()
+        .and_then(|owner| store.symbol(owner))
+        .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS));
+    let class_target = data
+        .object
+        .target
+        .and_then(|target| store.type_payload(target))
+        .is_some_and(|target| target.object_flags().contains(ObjectFlags::CLASS));
+    if !class_owner && !class_target {
+        return Ok(None);
+    }
+    let direct = validate_direct_generic_reference(store, reference)?;
+    declared_class_field_target_header(store, direct.target, array_targets)?;
+    Ok(Some(direct.target))
+}
+
+#[allow(clippy::too_many_lines)] // Source order and completed class identity are one target proof.
+fn declared_class_field_target_header(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(target);
+    let unsupported = || GenericInterfaceMemberError::UnsupportedTarget(target);
+    let direct = validate_direct_generic_reference(store, target)?;
+    if direct.target != target {
+        return Err(invalid());
+    }
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    if let Some(members) =
+        completed_source_class_receiver_members(store, target).map_err(|_| invalid())?
+    {
+        let owner = record.symbol().ok_or_else(invalid)?;
+        if members.shells().instance_type() != target || members.shells().symbol() != owner {
+            return Err(invalid());
+        }
+        let mut properties = Vec::with_capacity(members.instance_properties().len());
+        for &symbol in members.instance_properties() {
+            let property = store
+                .symbol(symbol)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+            let method = property.flags().contains(SymbolFlags::METHOD);
+            let source_mapper =
+                completed_source_class_receiver_member_mapper(store, target, symbol)
+                    .map_err(|_| GenericInterfaceMemberError::InvalidMember(symbol))?;
+            if source_mapper.is_none() && property.parent() != Some(owner)
+                || store.get_merged_symbol(symbol) != Some(symbol)
+                || property.name().is_reserved_member_name()
+                || property.name().is_late_bound()
+                || property
+                    .flags()
+                    .without(SymbolFlags::PROPERTY | SymbolFlags::METHOD | SymbolFlags::OPTIONAL)
+                    != SymbolFlags::NONE
+                || property.flags().contains(SymbolFlags::PROPERTY) == method
+            {
+                return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+            }
+            let type_ = store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+            if method && !valid_copied_method_source(store, symbol, type_, array_targets) {
+                return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+            }
+            properties.push(DeclaredProperty {
+                symbol,
+                name: property.name().to_owned(),
+                value: DeclaredPropertyValue::Resolved(type_),
+                requires_proxy: false,
+                method,
+                source_mapper,
+            });
+        }
+        return Ok((
+            owner,
+            direct.type_arguments,
+            interface.declared_members,
+            properties,
+            interface.declared_index_infos.clone().unwrap_or_default(),
+        ));
+    }
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if owner_record.flags() != SymbolFlags::CLASS {
+        return Err(unsupported());
+    }
+    let [declaration] = owner_record.declarations().ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Err(
+            if !interface.declared_members_resolved
+                && !interface.base_types_resolved
+                && interface.declared_members.is_none()
+                && interface.declared_call_signatures.is_none()
+                && interface.declared_construct_signatures.is_none()
+                && interface.declared_index_infos.is_none()
+                && interface.resolved_base_types.is_none()
+                && interface.reference.object.structured == StructuredTypeData::default()
+            {
+                unsupported()
+            } else {
+                invalid()
+            },
+        );
+    }
+    if validate_class_heritage_members(store, target) != ClassHeritageMembersValidation::Valid {
+        return Err(invalid());
+    }
+    if interface.resolved_base_types.is_some()
+        || interface.declared_index_infos.is_some()
+        || store.direct_class_heritage_provenance(target).is_some()
+    {
+        return Err(unsupported());
+    }
+    let mut parameter_nodes = Vec::new();
+    for child in store
+        .source_direct_children(*declaration)
+        .ok_or_else(invalid)?
+    {
+        match store.source_node_kind(child).ok_or_else(invalid)? {
+            SyntaxKind::HeritageClause => return Err(unsupported()),
+            SyntaxKind::TypeParameter => parameter_nodes.push(child),
+            _ => {}
+        }
+    }
+    parameter_nodes.sort_unstable_by_key(|node| store.source_node_start(*node));
+    if parameter_nodes.len() != direct.type_arguments.len() {
+        return Err(invalid());
+    }
+    for (&parameter, &type_) in parameter_nodes.iter().zip(&direct.type_arguments) {
+        let symbol = store
+            .source_declaration_symbol(parameter)
+            .ok_or_else(invalid)?;
+        if cached_ordinary_type_parameter_owner(store, type_) != Some(symbol)
+            || store.get_parent_of_symbol(symbol) != Some(owner)
+            || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(*declaration))
+        {
+            return Err(invalid());
+        }
+    }
+    let declared_members = interface.declared_members;
+    let mut properties = Vec::new();
+    for &symbol in interface
+        .reference
+        .object
+        .structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+    {
+        let property = store.symbol(symbol).ok_or_else(invalid)?;
+        let property_declaration = property.value_declaration().ok_or_else(invalid)?;
+        if property
+            .flags()
+            .without(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+            != SymbolFlags::NONE
+            || !property.flags().contains(SymbolFlags::PROPERTY)
+            || property.name().is_private_identifier()
+            || property.name().is_reserved_member_name()
+            || property.name().is_late_bound()
+            || store.source_node_kind(property_declaration) != Some(SyntaxKind::PropertyDeclaration)
+            || class_member_visibility(store, property_declaration)
+                != ClassConstructorVisibility::Public
+        {
+            return Err(GenericInterfaceMemberError::UnsupportedMember(symbol));
+        }
+        if property.parent() != Some(owner)
+            || store.source_node_parent(property_declaration)
+                != Some(SourceNodeParent::Parent(*declaration))
+        {
+            return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+        }
+        let type_ = store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+        properties.push(DeclaredProperty {
+            symbol,
+            name: property.name().to_owned(),
+            value: DeclaredPropertyValue::Resolved(type_),
+            requires_proxy: false,
+            method: false,
+            source_mapper: None,
+        });
+    }
+    Ok((
+        owner,
+        direct.type_arguments,
+        declared_members,
+        properties,
+        Vec::new(),
     ))
 }
 
@@ -7637,7 +11080,9 @@ fn cold_generic_interface_has_authenticated_non_property_members(
                 return false;
             }
             (SyntaxKind::PropertySignature, true)
-        } else if record.flags() == SymbolFlags::METHOD {
+        } else if record.flags() == SymbolFlags::METHOD
+            || store.source_merged_method_has_exact_declarations(symbol)
+        {
             if record.check_flags() != CheckFlags::NONE || record.name().as_utf8().is_none() {
                 return false;
             }
@@ -7787,18 +11232,18 @@ fn cached_instantiated_property_value_matches(
     mapper: TypeMapperId,
     cached: Option<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
-) -> bool {
+) -> Result<bool, GenericInterfaceMemberError> {
     if let Some(recovery) = store.instantiated_property_recovery(symbol) {
         let Some(cached) = cached else {
-            return false;
+            return Ok(false);
         };
         let Some(target) = store
             .value_symbol_links(symbol)
             .and_then(|links| links.target)
         else {
-            return false;
+            return Ok(false);
         };
-        return recovery.matches(
+        return Ok(recovery.matches(
             store,
             symbol,
             target,
@@ -7806,14 +11251,71 @@ fn cached_instantiated_property_value_matches(
             mapper,
             cached,
             array_targets,
-        );
+        ));
     }
-    cached.is_none_or(|cached| {
-        cached_instantiated_property_type_matches(store, template, cached, mapper, array_targets)
-    })
+    match cached {
+        None => Ok(true),
+        Some(cached) => cached_instantiated_property_type_matches_checked(
+            store,
+            template,
+            cached,
+            mapper,
+            array_targets,
+        ),
+    }
 }
 
+#[cfg(test)]
 fn cached_instantiated_property_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    cached: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    cached_instantiated_property_type_matches_checked(
+        store,
+        template,
+        cached,
+        mapper,
+        array_targets,
+    )
+    .unwrap_or(false)
+}
+
+// Fallible proxy reads retain capacity failures from bounded source validation.
+fn cached_instantiated_property_type_matches_checked(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    cached: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, GenericInterfaceMemberError> {
+    if let Some(TypeData::IndexedAccess(indexed)) = store
+        .type_payload(template)
+        .map(super::type_records::TypeRecord::data)
+        && indexed.access_flags == AccessFlags::NONE
+        && let Some(object) = mapped_index_component(store, indexed.object_type, mapper)
+    {
+        super::object_members::validate_primitive_interface_members(store, object).map_err(
+            |error| match error {
+                super::object_members::PropertyObjectError::Capacity(_) => {
+                    GenericInterfaceMemberError::Capacity(object)
+                }
+                _ => GenericInterfaceMemberError::InvalidCachedMembers(object),
+            },
+        )?;
+    }
+    Ok(cached_instantiated_property_type_matches_inner(
+        store,
+        template,
+        cached,
+        mapper,
+        array_targets,
+    ))
+}
+
+fn cached_instantiated_property_type_matches_inner(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
     cached: TypeId,
@@ -7887,7 +11389,7 @@ fn cached_instantiated_property_type_matches(
         .unwrap_or(false)
 }
 
-fn cached_instantiated_interface_method_type_matches(
+pub(super) fn cached_instantiated_interface_method_type_matches(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
     actual: TypeId,
@@ -7900,7 +11402,7 @@ fn cached_instantiated_interface_method_type_matches(
     let Some(method) = source_record.symbol() else {
         return false;
     };
-    if valid_interface_method_value(store, method, source).is_none() {
+    if !valid_copied_method_source(store, method, source, array_targets) {
         return false;
     }
     let Some(source_signatures) = source_record
@@ -7957,7 +11459,8 @@ fn cached_instantiated_interface_method_type_matches(
             let Some(actual_return) = instantiated.resolved_return_type() else {
                 return false;
             };
-            let Some(parameter_types) = store.callable_signature_parameter_types(source_signature)
+            let Some(parameter_types) =
+                copied_method_parameter_types(store, source, source_signature, array_targets)
             else {
                 return false;
             };
@@ -8055,6 +11558,18 @@ fn validate_nested_reference_targets(
     validated_targets: &mut HashSet<TypeId>,
     visited_types: &mut HashSet<TypeId>,
 ) -> Result<(), GenericInterfaceMemberError> {
+    validate_nested_reference_targets_with_replay(store, type_, array_targets, active_targets, validated_targets, visited_types, GenericMemberReplay::Full)
+}
+
+fn validate_nested_reference_targets_with_replay(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active_targets: &mut Vec<TypeId>,
+    validated_targets: &mut HashSet<TypeId>,
+    visited_types: &mut HashSet<TypeId>,
+    replay: GenericMemberReplay,
+) -> Result<(), GenericInterfaceMemberError> {
     if !visited_types.insert(type_) {
         return Ok(());
     }
@@ -8063,13 +11578,14 @@ fn validate_nested_reference_targets(
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
     {
         for element in tuple.element_types() {
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 *element,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
         }
         visited_types.remove(&type_);
@@ -8081,32 +11597,35 @@ fn validate_nested_reference_targets(
     match record.data() {
         TypeData::Union(data) => {
             for constituent in &data.union.types {
-                validate_nested_reference_targets(
+                validate_nested_reference_targets_with_replay(
                     store,
                     *constituent,
                     array_targets,
                     active_targets,
                     validated_targets,
                     visited_types,
+                    replay,
                 )?;
             }
         }
         TypeData::IndexedAccess(indexed) => {
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 indexed.object_type,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 indexed.index_type,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
@@ -8115,32 +11634,35 @@ fn validate_nested_reference_targets(
                     .canonical_array_reference_with_targets(targets, type_)
                     .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
             {
-                validate_nested_reference_targets(
+                validate_nested_reference_targets_with_replay(
                     store,
                     array.element_type,
                     array_targets,
                     active_targets,
                     validated_targets,
                     visited_types,
+                    replay,
                 )?;
             } else if let Ok(reference) = validate_direct_generic_reference(store, type_) {
                 let heritage_start = active_targets.len();
-                validate_declared_target(
+                validate_declared_target_with_replay(
                     store,
                     reference.target,
                     array_targets,
                     active_targets,
                     heritage_start,
                     validated_targets,
+                    replay,
                 )?;
                 for argument in reference.type_arguments {
-                    validate_nested_reference_targets(
+                    validate_nested_reference_targets_with_replay(
                         store,
                         argument,
                         array_targets,
                         active_targets,
                         validated_targets,
                         visited_types,
+                        replay,
                     )?;
                 }
             }
@@ -8151,13 +11673,184 @@ fn validate_nested_reference_targets(
     Ok(())
 }
 
+/// Gets the enclosing mapper without treating the call's fresh formals as owner arguments.
+fn generic_interface_call_owner_mapper(
+    store: &CanonicalTypeMapperStore,
+    original: SignatureId,
+    signature: SignatureId,
+) -> Option<TypeMapperId> {
+    let source = store.signature(original)?;
+    let mapper = store.signature(signature)?.mapper()?;
+    let Some(&parameter) = source.type_parameters().first() else {
+        return Some(mapper);
+    };
+    let TypeMapperApplication::Composite { second, .. } =
+        store.mapper_application(mapper, parameter)?
+    else {
+        return None;
+    };
+    Some(second)
+}
+
+/// Proves copied call signatures with the same mapper and parameter checks as
+/// generic methods. The target keeps its original signature and binder symbols.
+fn generic_interface_call_projections(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    signatures: &[SignatureId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<ValidatedSingleCallable>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(shape.reference);
+    if signatures.len() != shape.call_signatures.len() {
+        return Err(invalid());
+    }
+    let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let targets = member_mapper_arguments(store, shape);
+    let mut result = Vec::with_capacity(signatures.len());
+    for (&signature, &original) in signatures.iter().zip(&shape.call_signatures) {
+        let source = store.signature(original).ok_or_else(invalid)?;
+        let actual = store.signature(signature).ok_or_else(invalid)?;
+        let mut parameters = store
+            .callable_signature_parameter_types(original)
+            .ok_or_else(invalid)?
+            .to_vec();
+        if parameters.len() != source.parameters().len() {
+            return Err(invalid());
+        }
+        let rest_parameter = if source.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
+        let source_return = source.resolved_return_type().ok_or_else(invalid)?;
+        let template = ValidatedSingleCallable {
+            owner: shape.target,
+            signature: original,
+            parameters,
+            rest_parameter,
+            min_argument_count: usize::try_from(source.min_argument_count())
+                .map_err(|_| invalid())?,
+            return_type: Some(source_return),
+            strict_variance_exempt: false,
+        };
+        if store.declared_call_set_type_for_signature(signature) != Some(shape.reference) {
+            return Err(invalid());
+        }
+        if shape.reference == shape.target {
+            if signature != original {
+                return Err(invalid());
+            }
+            result.push(template);
+            continue;
+        }
+        let mapper = actual.mapper().ok_or_else(invalid)?;
+        let owner_mapper =
+            generic_interface_call_owner_mapper(store, original, signature).ok_or_else(invalid)?;
+        let return_type = actual.resolved_return_type().ok_or_else(invalid)?;
+        if signature == original
+            || store.type_mapper_has_exact_endpoints(owner_mapper, &sources, &targets) != Some(true)
+            || validated_instantiated_method_mapper(
+                store,
+                source,
+                actual,
+                owner_mapper,
+                array_targets,
+            ) != Some(mapper)
+            || actual.flags() != (source.flags() & SignatureFlags::PROPAGATING_FLAGS)
+            || actual.declaration() != source.declaration()
+            || actual.this_parameter().is_some()
+            || actual.min_argument_count() != source.min_argument_count()
+            || actual.resolved_min_argument_count() != -1
+            || actual.resolved_type_predicate().is_some()
+            || actual.target() != Some(original)
+            || actual.isolated_signature_type().is_some()
+            || actual.composite().is_some()
+            || store.signature_has_circular_return_type(signature)
+            || store
+                .function_signature_return_annotation(signature)
+                .is_some()
+            || !instantiated_method_type_matches(
+                store,
+                source_return,
+                return_type,
+                mapper,
+                array_targets,
+            )
+        {
+            return Err(invalid());
+        }
+        let mut parameters = validated_instantiated_method_parameter_types(
+            store,
+            signature,
+            &template,
+            owner_mapper,
+            array_targets,
+        )
+        .ok_or_else(invalid)?;
+        let rest_parameter = if actual.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
+        if store
+            .callable_signature_parameter_types(signature)
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        result.push(ValidatedSingleCallable {
+            owner: shape.reference,
+            signature,
+            parameters,
+            rest_parameter,
+            return_type: Some(return_type),
+            ..template
+        });
+    }
+    Ok(result)
+}
+
+fn property_receiver_mapper(
+    store: &CanonicalTypeMapperStore,
+    property: &DeclaredProperty,
+    mapper: TypeMapperId,
+) -> Option<TypeMapperId> {
+    match property.source_mapper {
+        None => Some(mapper),
+        Some(source_mapper) => {
+            let identity = match property.value {
+                DeclaredPropertyValue::Resolved(type_) => type_,
+                DeclaredPropertyValue::Pending => {
+                    let owner = store.get_parent_of_symbol(property.symbol)?;
+                    store.declared_type_links(owner)?.declared_type?
+                }
+            };
+            let TypeMapperApplication::Composite { first, second } =
+                store.mapper_application(mapper, identity)?
+            else {
+                return None;
+            };
+            (first == source_mapper).then_some(second)
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Warm replay validates the complete transactional cache shape.
 fn validate_warm_members(
     store: &CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
-    let record = store.type_payload(shape.reference).ok_or(
+    validate_warm_members_with_replay(store, shape, array_targets, GenericMemberReplay::Full)
+}
+
+fn validate_warm_members_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
+    let record = crate::semantic::relater::original_failure_payload!(shape.reference, store.type_payload(shape.reference)).ok_or(
         GenericInterfaceMemberError::InvalidCachedMembers(shape.reference),
     )?;
     let structured =
@@ -8171,14 +11864,18 @@ fn validate_warm_members(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
-        if structured != &StructuredTypeData::default() {
+        if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), structured != &StructuredTypeData::default()) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
         return Ok(None);
     }
-    if !shape.inherited_members_ready {
+    if crate::semantic::relater::original_failure_neg!(concat!("validate_warm_members_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), shape.inherited_members_ready) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
@@ -8196,6 +11893,8 @@ fn validate_warm_members(
             properties
         }
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
@@ -8212,43 +11911,36 @@ fn validate_warm_members(
                 ))?,
         ),
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
     };
-    if structured.signatures.is_some()
-        || structured.call_signature_count != 0
-        || structured.constrained != ConstrainedTypeData::default()
-        || structured
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), structured.call_signature_count != shape.call_signatures.len())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.1@", "instantiated_members.rs", ":", line!()), structured.signatures.as_ref().map_or(0, Vec::len) != shape.call_signatures.len())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.2@", "instantiated_members.rs", ":", line!()), structured.signatures.as_ref().is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.3@", "instantiated_members.rs", ":", line!()), structured.constrained != ConstrainedTypeData::default())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.4@", "instantiated_members.rs", ":", line!()), structured
             .object_type_without_abstract_construct_signatures
-            .is_some()
+            .is_some())
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
     }
+    let callables = generic_interface_call_projections(
+        store,
+        shape,
+        structured.signatures.as_deref().unwrap_or_default(),
+        array_targets,
+    )?;
     let (own_properties, inherited_properties) = properties.split_at(shape.properties.len());
-    let mapper_targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
-    let all_parameters = shape
-        .source_parameters
-        .iter()
-        .copied()
-        .chain(std::iter::once(
-            store
-                .type_payload(shape.target)
-                .and_then(|record| match record.data() {
-                    TypeData::Interface(interface) => interface.this_type,
-                    _ => None,
-                })
-                .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?,
-        ))
-        .collect::<Vec<_>>();
+    let mapper_targets = member_mapper_arguments(store, shape);
+    let all_parameters = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
     let mapper = own_properties
         .iter()
         .zip(&shape.properties)
@@ -8257,20 +11949,38 @@ fn validate_warm_members(
                 store
                     .value_symbol_links(*property)
                     .and_then(|links| links.mapper)
+                    .and_then(|mapper| property_receiver_mapper(store, source, mapper))
             } else {
                 None
             }
+        })
+        .or_else(|| {
+            callables
+                .first()
+                .zip(shape.call_signatures.first())
+                .and_then(|(callable, &original)| {
+                    generic_interface_call_owner_mapper(store, original, callable.signature)
+                })
         });
-    if mapper.is_none()
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), mapper.is_none()
         && shape
             .properties
             .iter()
-            .any(|property| property.requires_proxy)
-        || mapper.is_some_and(|mapper| {
+            .any(|property| property.requires_proxy))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.1@", "instantiated_members.rs", ":", line!()), mapper.is_some_and(|mapper| {
             store.type_mapper_has_exact_endpoints(mapper, &all_parameters, &mapper_targets)
                 != Some(true)
-        })
+        }))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.2@", "instantiated_members.rs", ":", line!()), callables
+            .iter()
+            .zip(&shape.call_signatures)
+            .any(|(callable, &original)| {
+                generic_interface_call_owner_mapper(store, original, callable.signature)
+                    .is_some_and(|call_mapper| Some(call_mapper) != mapper)
+            }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
@@ -8286,23 +11996,37 @@ fn validate_warm_members(
         None if expected_index_count == 0 => &[][..],
         Some(indexes) if indexes.len() == expected_index_count && !indexes.is_empty() => indexes,
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
     };
     let (own_indexes, inherited_indexes) = indexes.split_at(shape.index_infos.len());
-    if own_indexes
-        .iter()
-        .zip(&shape.index_infos)
-        .any(|(actual, source)| {
-            !valid_instantiated_index_info(store, shape, *source, *actual, mapper, array_targets)
-        })
-        || inherited_indexes != shape.inherited_index_infos.as_slice()
-    {
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), inherited_indexes != shape.inherited_index_infos.as_slice()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
+    }
+    for (actual, source) in own_indexes.iter().zip(&shape.index_infos) {
+        if crate::semantic::relater::original_failure_neg!(concat!("validate_warm_members_with_replay.reject.6.0@", "instantiated_members.rs", ":", line!()), valid_instantiated_index_info_with_replay(
+            store,
+            shape,
+            *source,
+            *actual,
+            mapper,
+            array_targets,
+            replay,
+        )?) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                shape.reference,
+            ));
+        }
     }
     for (property, source) in own_properties.iter().zip(&shape.properties) {
         let symbol =
@@ -8315,9 +12039,11 @@ fn validate_warm_members(
             .symbol(source.symbol)
             .ok_or(GenericInterfaceMemberError::InvalidMember(source.symbol))?;
         if !source.requires_proxy {
-            if *property != source.symbol
-                || table.and_then(|table| table.get(symbol.name())) != Some(source.symbol)
+            if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.8.0@", "instantiated_members.rs", ":", line!()), *property != source.symbol)
+                 ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.8.1@", "instantiated_members.rs", ":", line!()), table.and_then(|table| table.get(symbol.name())) != Some(source.symbol))
             {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                     *property,
                 ));
@@ -8330,6 +12056,12 @@ fn validate_warm_members(
         let links = store.value_symbol_links(*property).ok_or(
             GenericInterfaceMemberError::InvalidCachedProperty(*property),
         )?;
+        let property_mapper = links
+            .mapper
+            .filter(|candidate| property_receiver_mapper(store, source, *candidate) == Some(mapper))
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(
+                *property,
+            ))?;
         let expected_checks = CheckFlags::INSTANTIATED
             | (target.check_flags()
                 & (CheckFlags::READONLY
@@ -8351,7 +12083,7 @@ fn validate_warm_members(
                 != &(ValueSymbolLinks {
                     resolved_type: links.resolved_type,
                     target: Some(source.symbol),
-                    mapper: Some(mapper),
+                    mapper: Some(property_mapper),
                     name_type: store
                         .value_symbol_links(source.symbol)
                         .and_then(|links| links.name_type),
@@ -8360,15 +12092,26 @@ fn validate_warm_members(
             || links
                 .resolved_type
                 .is_some_and(|type_| store.type_payload(type_).is_none())
-            || !cached_instantiated_property_value_matches(
-                store,
-                *property,
-                source.type_,
-                mapper,
-                links.resolved_type,
-                array_targets,
-            )
+            || replay == GenericMemberReplay::Full
+                && match source.value {
+                    DeclaredPropertyValue::Pending => {
+                        links.resolved_type.is_some()
+                            || store.instantiated_property_recovery(*property).is_some()
+                    }
+                    DeclaredPropertyValue::Resolved(type_) => {
+                        !cached_instantiated_property_value_matches(
+                            store,
+                            *property,
+                            type_,
+                            property_mapper,
+                            links.resolved_type,
+                            array_targets,
+                        )?
+                    }
+                }
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                 *property,
             ));
@@ -8378,7 +12121,9 @@ fn validate_warm_members(
         let record = store
             .symbol(*actual)
             .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(*actual))?;
-        if actual != expected || table.and_then(|table| table.get(record.name())) != Some(*actual) {
+        if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.9.0@", "instantiated_members.rs", ":", line!()), actual != expected)  ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.9.1@", "instantiated_members.rs", ":", line!()), table.and_then(|table| table.get(record.name())) != Some(*actual)) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(*actual));
         }
     }
@@ -8399,11 +12144,32 @@ fn valid_instantiated_index_info(
     mapper: Option<TypeMapperId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    valid_instantiated_index_info_with_replay(
+        store,
+        shape,
+        source,
+        actual,
+        mapper,
+        array_targets,
+        GenericMemberReplay::Full,
+    )
+    .unwrap_or(false)
+}
+
+fn valid_instantiated_index_info_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    source: IndexInfoId,
+    actual: IndexInfoId,
+    mapper: Option<TypeMapperId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<bool, GenericInterfaceMemberError> {
     let Some(source_info) = store.index_info(source) else {
-        return false;
+        return Ok(false);
     };
     let Some(actual_info) = store.index_info(actual) else {
-        return false;
+        return Ok(false);
     };
     if source_info.key_type() != actual_info.key_type()
         || source_info.is_readonly() != actual_info.is_readonly()
@@ -8412,31 +12178,42 @@ fn valid_instantiated_index_info(
         || source_info.index_symbol().is_some()
         || actual_info.index_symbol().is_some()
     {
-        return false;
+        return Ok(false);
     }
     if let Some(recovery) = store.instantiated_index_recovery(actual) {
-        return recovery.matches(store, shape, source, actual, mapper, array_targets);
+        return Ok(match replay {
+            GenericMemberReplay::Full => {
+                recovery.matches(store, shape, source, actual, mapper, array_targets)
+            }
+            GenericMemberReplay::Names => {
+                recovery.source == source
+                    && recovery.index == actual
+                    && recovery.shape.same_member_names(shape)
+                    && recovery.mapper == mapper
+                    && recovery.matches_cached_identity(store, array_targets)
+                    && mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
+                        .ok()
+                        .as_deref()
+                        == Some(recovery.mapper_sources.as_slice())
+                    && recovery.mapper_targets == member_mapper_arguments(store, shape)
+            }
+        });
     }
     let value_matches = if let Some(mapper) = mapper {
-        cached_instantiated_property_type_matches(
+        cached_instantiated_property_type_matches_checked(
             store,
             source_info.value_type(),
             actual_info.value_type(),
             mapper,
             array_targets,
-        )
+        )?
     } else {
         let Ok(sources) =
             mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
         else {
-            return false;
+            return Ok(false);
         };
-        let targets = shape
-            .target_arguments
-            .iter()
-            .copied()
-            .chain(std::iter::once(shape.reference))
-            .collect::<Vec<_>>();
+        let targets = member_mapper_arguments(store, shape);
         cached_instantiation_with_vector(
             store,
             source_info.value_type(),
@@ -8449,7 +12226,8 @@ fn valid_instantiated_index_info(
         .flatten()
             == Some(actual_info.value_type())
     };
-    value_matches && (source == actual) == (source_info.value_type() == actual_info.value_type())
+    Ok(value_matches
+        && (source == actual) == (source_info.value_type() == actual_info.value_type()))
 }
 
 fn prepare_cold_property_proxy(
@@ -8481,6 +12259,7 @@ fn prepare_cold_property_proxy(
         name_type: store
             .value_symbol_links(source)
             .and_then(|links| links.name_type),
+        source_mapper: None,
     })
 }
 
@@ -8503,9 +12282,11 @@ fn prepare_cold_members(
     } else {
         Some(prepare_member_table(shape.reference, count)?)
     };
-    if !store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0))
-        || !store.try_reserve_value_symbol_links(proxy_count)
+    if crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_members.reject.1.0@", "instantiated_members.rs", ":", line!()), store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0)))
+         ||  crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_members.reject.1.1@", "instantiated_members.rs", ":", line!()), store.try_reserve_value_symbol_links(proxy_count))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
     let mut properties = Vec::with_capacity(count);
@@ -8520,11 +12301,15 @@ fn prepare_cold_members(
         let target = store
             .symbol(source.symbol)
             .ok_or(GenericInterfaceMemberError::InvalidMember(source.symbol))?;
-        properties.push(prepare_cold_property_proxy(
+        let mut proxy = prepare_cold_property_proxy(
             store,
             source.symbol,
             target.check_flags().contains(CheckFlags::READONLY),
-        )?);
+        )?;
+        if let ColdPropertyPlan::Proxy { source_mapper, .. } = &mut proxy {
+            *source_mapper = source.source_mapper;
+        }
+        properties.push(proxy);
     }
     for inherited in &shape.inherited_properties {
         let name = store
@@ -8542,26 +12327,70 @@ fn prepare_cold_members(
     Ok(ColdMembersPlan { table, properties })
 }
 
-fn prepare_cold_index_values(
+fn prepare_cold_call_signatures(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    mapper: Option<TypeMapperId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<Vec<SignatureId>, GenericInterfaceMemberError> {
+    let mut signatures = Vec::with_capacity(shape.call_signatures.len());
+    for &original in &shape.call_signatures {
+        if shape.reference == shape.target {
+            signatures.push(original);
+            continue;
+        }
+        let parameters = store
+            .callable_signature_parameter_types(original)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?
+            .to_vec();
+        let return_type = store
+            .signature(original)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+        let owner = store
+            .type_payload(shape.target)
+            .and_then(super::type_records::TypeRecord::symbol)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+        let limit_mark = session.limit_event_mark();
+        signatures.push(instantiate_generic_method_signature(
+            store,
+            original,
+            &parameters,
+            return_type,
+            mapper.ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?,
+            array_targets,
+            session,
+            owner,
+            shape.reference,
+        )?);
+        if session.limit_event_occurred_since(limit_mark) {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                shape.reference,
+            ));
+        }
+    }
+    Ok(signatures)
+}
+
+fn prepare_cold_member_values(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
-) -> Result<ColdIndexValues, GenericInterfaceMemberError> {
+) -> Result<ColdMemberValues, GenericInterfaceMemberError> {
     let mapper_sources =
         mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let mapper_targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
-    let requires_mapper = !shape.index_infos.is_empty()
-        && shape
-            .properties
-            .iter()
-            .any(|property| property.requires_proxy);
-    if !store.try_reserve_mappers(usize::from(requires_mapper)) {
+    let mapper_targets = member_mapper_arguments(store, shape);
+    let requires_mapper = !shape.call_signatures.is_empty() && shape.reference != shape.target
+        || !shape.index_infos.is_empty()
+            && shape
+                .properties
+                .iter()
+                .any(|property| property.requires_proxy);
+    if crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_member_values.reject.1.0@", "instantiated_members.rs", ":", line!()), store.try_reserve_mappers(usize::from(requires_mapper))) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
     let mapper = requires_mapper.then(|| {
@@ -8569,6 +12398,8 @@ fn prepare_cold_index_values(
             .new_type_mapper(mapper_sources.clone(), mapper_targets.clone())
             .expect("prevalidated mapper endpoints remain store-owned")
     });
+    let call_signatures =
+        prepare_cold_call_signatures(store, shape, mapper, array_targets, session)?;
     let mut indexes = Vec::with_capacity(shape.index_infos.len());
     for source in &shape.index_infos {
         let info = store
@@ -8622,27 +12453,30 @@ fn prepare_cold_index_values(
             recovery,
         });
     }
-    Ok(ColdIndexValues {
+    Ok(ColdMemberValues {
         mapper,
         mapper_sources,
         mapper_targets,
         indexes,
+        call_signatures,
     })
 }
 
+#[allow(clippy::too_many_lines)] // Publish mapped signatures, properties, and indexes after reservation.
 fn publish_cold_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     plan: ColdMembersPlan,
-    indexes: ColdIndexValues,
+    values: ColdMemberValues,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
-    let ColdIndexValues {
+    let ColdMemberValues {
         mapper,
         mapper_sources,
         mapper_targets,
         indexes,
-    } = indexes;
+        call_signatures,
+    } = values;
     let count = indexes
         .len()
         .checked_add(shape.inherited_index_infos.len())
@@ -8656,9 +12490,22 @@ fn publish_cold_members(
             .properties
             .iter()
             .any(|property| property.requires_proxy);
+    let inherited_mapper_count = shape
+        .properties
+        .iter()
+        .filter(|property| property.requires_proxy && property.source_mapper.is_some())
+        .count();
     if !store.try_reserve_index_infos(indexes.len())
         || !store.try_reserve_instantiated_index_recoveries(recovery_count)
-        || !store.try_reserve_mappers(usize::from(needs_mapper))
+        || !store.try_reserve_mappers(usize::from(needs_mapper) + inherited_mapper_count)
+        || !store.try_reserve_declared_call_set_provenance(
+            usize::from(shape.reference != shape.target && !call_signatures.is_empty()),
+            if shape.reference == shape.target {
+                0
+            } else {
+                call_signatures.len()
+            },
+        )
     {
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
@@ -8712,11 +12559,14 @@ fn publish_cold_members(
     }
     index_infos.extend_from_slice(&shape.inherited_index_infos);
     let (members, properties) = publish_prepared_property_table(store, plan, mapper);
+    if shape.reference != shape.target && !call_signatures.is_empty() {
+        assert!(store.set_declared_call_set_provenance(shape.reference, &call_signatures));
+    }
     assert!(store.set_structured_type_members(
         shape.reference,
         members,
         (!properties.is_empty()).then(|| properties.clone()),
-        None,
+        (!call_signatures.is_empty()).then_some(call_signatures),
         None,
         (!index_infos.is_empty()).then_some(index_infos),
     ));
@@ -8748,7 +12598,18 @@ fn publish_prepared_property_table(
                 target,
                 data,
                 name_type,
+                source_mapper,
             } => {
+                let mapper = source_mapper.map_or(mapper, |source_mapper| {
+                    Some(
+                        store
+                            .combine_type_mappers(
+                                Some(source_mapper),
+                                mapper.expect("an inherited proxy has a receiver mapper"),
+                            )
+                            .expect("the completed class retains both owned mapper inputs"),
+                    )
+                });
                 let name = data.name.clone();
                 let symbol = store
                     .alloc_symbol(data)
@@ -8818,6 +12679,7 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
         LateBoundLinks, MembersAndExportsLinks, ResolvedSignatureState, SignatureLinks,
         SymbolNodeLinks, TypeNodeLinks, bootstrap::UnionReduction,
+        callable_sets::validate_stored_callable_set,
         object_aliases::property_object_alias_projection, signatures::ElementFlags,
         tuple_types::CanonicalTupleTypeRequest,
     };
@@ -8915,6 +12777,2320 @@ mod tests {
         context.get_type_from_type_node(annotation).unwrap()
     }
 
+    mod selected_method_call_return_tests {
+        use super::*;
+        use crate::semantic::{
+            DeclaredTypeError, TypeNodeUnavailable,
+            calls::DirectCallForm,
+            generic_calls::{
+                GenericCallVectorApplicability, GenericCallVectorRequest,
+                GenericCallVectorResolution, preflight_generic_call_signature_return_target,
+            },
+            generic_method_calls::{GenericMethodCallSelection, resolve_generic_method_call},
+            production::GlobalMergeCompletion,
+        };
+
+        struct Fixture<'a> {
+            context: CanonicalCheckerContext<'a>,
+            parsed: &'a ParseResult,
+            file: FileId,
+            callable: TypeId,
+        }
+
+        fn source(methods: &str) -> ParseResult {
+            parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 interface Plain {{ method<U>(value: U): U; }} \
+                 interface Box<T> {{ {methods} }} \
+                 interface Derived extends Box<number> {{}} \
+                 interface Other extends Box<string> {{}}"
+            ))
+        }
+
+        fn signatures(store: &CanonicalTypeMapperStore, callable: TypeId) -> Vec<SignatureId> {
+            store
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_ref()
+                .unwrap()
+                .to_vec()
+        }
+
+        fn proxy_callable(
+            context: &mut CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            file: FileId,
+            name: &str,
+        ) -> TypeId {
+            let owner = source_symbol(parsed, file, context, name);
+            let derived = context.get_declared_type_of_symbol(owner).unwrap();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("the source declaration must keep its interface type")
+            };
+            let reference = interface.resolved_base_types.as_ref().unwrap()[0];
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                EscapedNameRef::source("method"),
+                Some(targets),
+                &mut session,
+            )
+            .unwrap()
+            .unwrap()
+            .type_id()
+        }
+
+        fn fixture(parsed: &ParseResult, receiver: bool) -> Fixture<'_> {
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(202_932);
+            let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+            let callable = if receiver {
+                proxy_callable(&mut context, parsed, file, "Derived")
+            } else {
+                let owner = source_symbol(parsed, file, &context, "Plain");
+                context.get_declared_type_of_symbol(owner).unwrap();
+                let method = context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source("method"))
+                    .unwrap();
+                context
+                    .store()
+                    .value_symbol_links(method)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            };
+            assert!(context.diagnostics().is_empty());
+            Fixture {
+                context,
+                parsed,
+                file,
+                callable,
+            }
+        }
+
+        fn select(fixture: &mut Fixture<'_>, recovery: bool) -> GenericCallVectorResolution {
+            let globals = fixture.context.global_types().clone();
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let arguments = [bootstrap.string_type];
+            let type_arguments = [bootstrap.string_type, bootstrap.number_type];
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let result = resolve_generic_method_call(
+                store,
+                &globals,
+                false,
+                GenericCallVectorRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    explicit_type_arguments: Some(&type_arguments[..if recovery { 2 } else { 1 }]),
+                    has_spread_argument: false,
+                    callee: fixture.callable,
+                    arguments: &arguments,
+                },
+                None,
+                &mut session,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.diagnostic.is_some(), recovery);
+            let GenericMethodCallSelection::Generic(selected) = result.selected else {
+                panic!("the real generic method must supply the selected shell")
+            };
+            assert_eq!(
+                selected.applicability(),
+                if recovery {
+                    GenericCallVectorApplicability::TypeArgumentArity {
+                        minimum: 1,
+                        maximum: 1,
+                        actual: 2,
+                    }
+                } else {
+                    GenericCallVectorApplicability::Applicable
+                }
+            );
+            selected
+        }
+
+        fn query_return(
+            fixture: &mut Fixture<'_>,
+            signature: SignatureId,
+            session: &mut InstantiationSession,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+            let options = fixture.context.options();
+            let globals = fixture.context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature);
+            assert!(diagnostics.is_empty());
+            result
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct SignatureState {
+            declaration: Option<NodeRef>,
+            flags: SignatureFlags,
+            minimum: i32,
+            resolved_minimum: i32,
+            type_parameters: Vec<TypeId>,
+            parameters: Vec<(SemanticSymbolId, Option<ValueSymbolLinks>)>,
+            return_type: Option<TypeId>,
+            target: Option<SignatureId>,
+            mapper: Option<TypeMapperId>,
+            proxy_owner: Option<TypeId>,
+        }
+
+        fn signature_state(
+            store: &CanonicalTypeMapperStore,
+            signature: SignatureId,
+        ) -> SignatureState {
+            let record = store.signature(signature).unwrap();
+            SignatureState {
+                declaration: record.declaration(),
+                flags: record.flags(),
+                minimum: record.min_argument_count(),
+                resolved_minimum: record.resolved_min_argument_count(),
+                type_parameters: record.type_parameters().to_vec(),
+                parameters: record
+                    .parameters()
+                    .iter()
+                    .map(|&parameter| (parameter, store.value_symbol_links(parameter).cloned()))
+                    .collect(),
+                return_type: record.resolved_return_type(),
+                target: record.target(),
+                mapper: record.mapper(),
+                proxy_owner: store.proxy_interface_method_type_for_signature(signature),
+            }
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct Snapshot {
+            counts: ([usize; 6], [usize; 26]),
+            call_cache: usize,
+            proxy_owners: usize,
+            signatures: Vec<(SignatureId, SignatureState)>,
+            nodes: Vec<(
+                Option<TypeNodeLinks>,
+                Option<SignatureLinks>,
+                Option<SymbolNodeLinks>,
+            )>,
+        }
+
+        fn snapshot(fixture: &Fixture<'_>, signature: SignatureId) -> Snapshot {
+            let store = fixture.context.store();
+            let mut pending = signatures(store, fixture.callable);
+            pending.push(signature);
+            let mut seen = HashSet::new();
+            let mut recorded = Vec::new();
+            while let Some(signature) = pending.pop() {
+                if seen.insert(signature) {
+                    let state = signature_state(store, signature);
+                    pending.extend(state.target);
+                    recorded.push((signature, state));
+                }
+            }
+            Snapshot {
+                counts: property_recovery_store_counts(store),
+                call_cache: store.cached_signature_len(),
+                proxy_owners: store.proxy_interface_method_signature_owner_len(),
+                signatures: recorded,
+                nodes: fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .map(|(node, _)| {
+                        let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.signature_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        fn invalid(signature: SignatureId) -> DeclaredTypeError {
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                signature,
+            ))
+        }
+
+        fn assert_rejected(fixture: &mut Fixture<'_>, signature: SignatureId) {
+            let before = snapshot(fixture, signature);
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            for _ in 0..2 {
+                assert_eq!(
+                    query_return(fixture, signature, &mut session),
+                    Err(invalid(signature))
+                );
+                assert_eq!(snapshot(fixture, signature), before);
+            }
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+
+        #[test]
+        fn selected_method_call_returns_keep_cold_recovery_shells_and_the_caller() {
+            let parsed = source("method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, false);
+            let selected = select(&mut fixture, false);
+            let first_recovery = select(&mut fixture, true);
+            let second_recovery = select(&mut fixture, true);
+            let shells = [&selected, &first_recovery, &second_recovery]
+                .map(|result| result.projection().instantiation.signature);
+            assert_ne!(shells[0], shells[1]);
+            assert_ne!(shells[1], shells[2]);
+            let original = selected.projection().generic_signature;
+            let store = fixture.context.store();
+            let original_state = signature_state(store, original);
+            let parameter = store.signature(original).unwrap().type_parameters()[0];
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            for (index, &signature) in shells.iter().enumerate() {
+                assert_eq!(store.cached_signatures_contain(signature), Some(index == 0));
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    None
+                );
+                assert_eq!(
+                    store.proxy_interface_method_type_for_signature(signature),
+                    None
+                );
+                let before = snapshot(&fixture, signature);
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(store, targets, signature),
+                    Ok(original)
+                );
+                assert_eq!(
+                    interface_method_signature_return_for_query(store, signature, targets),
+                    Ok(None)
+                );
+                assert_eq!(snapshot(&fixture, signature), before);
+            }
+            let mut limited = InstantiationSession::new(InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    fixture.context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    targets,
+                    &mut limited
+                ),
+                Ok(number)
+            );
+            assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+            let before = snapshot(&fixture, shells[0]);
+            assert_eq!(
+                query_return(&mut fixture, shells[0], &mut limited),
+                Err(invalid(shells[0]))
+            );
+            assert_eq!(snapshot(&fixture, shells[0]), before);
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (1, 1, 1)
+            );
+
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    fixture.context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    targets,
+                    &mut caller
+                ),
+                Ok(number)
+            );
+            for (index, signature) in shells.into_iter().enumerate() {
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(string)
+                );
+                assert_eq!(
+                    (caller.query_count(), caller.total_count()),
+                    (index + 2, index + 2)
+                );
+                let warm = snapshot(&fixture, signature);
+                for _ in 0..2 {
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(string)
+                    );
+                    assert_eq!(snapshot(&fixture, signature), warm);
+                    assert_eq!(
+                        (caller.query_count(), caller.total_count()),
+                        (index + 2, index + 2)
+                    );
+                }
+            }
+            assert_eq!(caller.limit_event_count(), 0);
+            assert_eq!(
+                signature_state(fixture.context.store(), original),
+                original_state
+            );
+        }
+
+        #[test]
+        fn selected_method_call_returns_reject_and_restore_damaged_shells() {
+            let parsed = source("method<U>(value: U): U;");
+            for recovery in [false, true] {
+                let mut fixture = fixture(&parsed, false);
+                let selected = select(&mut fixture, recovery);
+                let signature = selected.projection().instantiation.signature;
+                let source = selected.projection().generic_signature;
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                let expected = fixture
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .string_type;
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                let store = fixture.context.store_mut_for_test();
+                let original = signature_state(store, signature);
+                let parameter = original.parameters[0].0;
+                let links = original.parameters[0].1.clone().unwrap();
+                let source_parameter = store.signature(source).unwrap().type_parameters()[0];
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                let wrong_mapper = store
+                    .new_type_mapper(vec![source_parameter], vec![number])
+                    .unwrap();
+                for damage in 0..6 {
+                    let store = fixture.context.store_mut_for_test();
+                    match damage {
+                        0 => assert!(
+                            store.set_signature_resolved_return_type(signature, Some(number))
+                        ),
+                        1 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            Some(source),
+                            Some(wrong_mapper)
+                        )),
+                        2 => {
+                            let mut changed = links.clone();
+                            changed.resolved_type = Some(number);
+                            assert!(store.set_value_symbol_links(parameter, changed));
+                        }
+                        3 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            None,
+                            original.mapper
+                        )),
+                        4 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            Some(signature),
+                            original.mapper
+                        )),
+                        _ => assert!(
+                            store.set_signature_type_parameters(signature, vec![source_parameter])
+                        ),
+                    }
+                    assert_rejected(&mut fixture, signature);
+                    let store = fixture.context.store_mut_for_test();
+                    assert!(
+                        store.set_signature_resolved_return_type(signature, original.return_type)
+                    );
+                    assert!(store.set_signature_target_and_mapper(
+                        signature,
+                        original.target,
+                        original.mapper
+                    ));
+                    assert!(store.set_signature_type_parameters(
+                        signature,
+                        original.type_parameters.clone()
+                    ));
+                    assert!(store.set_value_symbol_links(parameter, links.clone()));
+                    assert_eq!(signature_state(store, signature), original);
+                    let before = snapshot(&fixture, signature);
+                    let count = caller.total_count();
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                    assert_eq!(caller.total_count(), count);
+                    assert_eq!(snapshot(&fixture, signature), before);
+                }
+            }
+        }
+
+        #[test]
+        fn selected_generic_receiver_calls_keep_the_authenticated_intermediate_target() {
+            let parsed = source("method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, true);
+            let receiver = signatures(fixture.context.store(), fixture.callable)[0];
+            let store = fixture.context.store();
+            let source = store.signature(receiver).unwrap().target().unwrap();
+            let fresh = store.signature(receiver).unwrap().type_parameters()[0];
+            assert_ne!(fresh, store.signature(source).unwrap().type_parameters()[0]);
+            assert_eq!(
+                store.proxy_interface_method_type_for_signature(receiver),
+                Some(fixture.callable)
+            );
+            assert_eq!(store.interface_method_linked_type(receiver), None);
+            assert!(store.interface_method_linked_type(source).is_some());
+            let receiver_state = signature_state(store, receiver);
+            let selected = select(&mut fixture, false);
+            let recovery = select(&mut fixture, true);
+            let expected = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_type;
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            for selected in [&selected, &recovery] {
+                let signature = selected.projection().instantiation.signature;
+                let store = fixture.context.store();
+                assert_eq!(selected.projection().generic_signature, receiver);
+                assert_eq!(store.signature(signature).unwrap().target(), Some(receiver));
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    None
+                );
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(store, targets, signature),
+                    Ok(receiver)
+                );
+                assert_eq!(
+                    interface_method_signature_return_for_query(store, signature, targets),
+                    Ok(None)
+                );
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                let before = snapshot(&fixture, signature);
+                let count = caller.total_count();
+                for _ in 0..2 {
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                    assert_eq!(snapshot(&fixture, signature), before);
+                    assert_eq!(caller.total_count(), count);
+                }
+            }
+            assert_eq!(query_return(&mut fixture, receiver, &mut caller), Ok(fresh));
+            assert_eq!(
+                signature_state(fixture.context.store(), receiver),
+                receiver_state
+            );
+            assert_eq!(caller.limit_event_count(), 0);
+        }
+
+        #[test]
+        fn receiver_method_owners_reject_missing_markers_and_coherent_call_shell_damage() {
+            let parsed = source("method<U>(): number; method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, true);
+            let other = proxy_callable(&mut fixture.context, &parsed, fixture.file, "Other");
+            assert_ne!(fixture.callable, other);
+            let copies = signatures(fixture.context.store(), fixture.callable);
+            assert_eq!(copies.len(), 2);
+            let signature = copies[0];
+            let store = fixture.context.store();
+            let source = store.signature(signature).unwrap().target().unwrap();
+            let original = signature_state(store, signature);
+            let expected = store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(original.parameters.is_empty());
+            assert_eq!(original.minimum, 0);
+            assert_eq!(original.type_parameters.len(), 1);
+            assert_eq!(original.return_type, Some(expected));
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                query_return(&mut fixture, signature, &mut caller),
+                Ok(expected)
+            );
+            for copy in copies.iter().copied() {
+                for changed in [None, Some(other)] {
+                    assert_eq!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .replace_proxy_interface_method_type_for_signature_for_test(
+                                copy, changed
+                            ),
+                        Some(fixture.callable)
+                    );
+                    assert_rejected(&mut fixture, signature);
+                    assert_eq!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .replace_proxy_interface_method_type_for_signature_for_test(
+                                copy,
+                                Some(fixture.callable)
+                            ),
+                        changed
+                    );
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                }
+            }
+            let before = snapshot(&fixture, signature);
+            assert!(
+                !fixture
+                    .context
+                    .store_mut_for_test()
+                    .publish_proxy_interface_method_signature_owners(
+                        fixture.callable,
+                        &copies[..1]
+                    )
+            );
+            assert!(
+                !fixture
+                    .context
+                    .store_mut_for_test()
+                    .publish_proxy_interface_method_signature_owners(fixture.callable, &copies)
+            );
+            assert_eq!(snapshot(&fixture, signature), before);
+
+            let store = fixture.context.store_mut_for_test();
+            assert!(store.set_signature_target_and_mapper(signature, None, original.mapper));
+            assert_rejected(&mut fixture, signature);
+            let store = fixture.context.store_mut_for_test();
+            let source_parameter = store.signature(source).unwrap().type_parameters()[0];
+            let call_mapper = store
+                .new_type_mapper(vec![source_parameter], vec![expected])
+                .unwrap();
+            assert!(store.set_signature_type_parameters(signature, Vec::new()));
+            assert!(store.set_signature_target_and_mapper(
+                signature,
+                Some(source),
+                Some(call_mapper)
+            ));
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            assert_eq!(
+                preflight_generic_call_signature_return_target(
+                    fixture.context.store(),
+                    targets,
+                    signature
+                ),
+                Ok(source)
+            );
+            assert_eq!(
+                fixture.context.store().cached_signatures_contain(signature),
+                Some(false)
+            );
+            assert_rejected(&mut fixture, signature);
+            let store = fixture.context.store_mut_for_test();
+            assert!(store.set_signature_target_and_mapper(
+                signature,
+                original.target,
+                original.mapper
+            ));
+            assert!(
+                store.set_signature_type_parameters(signature, original.type_parameters.clone())
+            );
+            assert_eq!(signature_state(store, signature), original);
+            let before = snapshot(&fixture, signature);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                assert_eq!(snapshot(&fixture, signature), before);
+            }
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture checks signature, parameter, and mapper mutations.
+    fn generic_interface_call_caches_reject_changed_parameters_returns_and_mappers() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; } ",
+            "declare const callable: Callable<string>; callable('value');",
+        ));
+        let file = FileId::new(202_621);
+        for corruption in 0..3 {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let reference =
+                property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+            let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                validate_generic_interface_callable(context.store(), reference, None)
+            else {
+                panic!("the checked call must retain its generic-interface signature")
+            };
+            let signature = projection.call_signatures[0].signature;
+            let parameter = context.store().signature(signature).unwrap().parameters()[0];
+            let source = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .target()
+                .unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let store = context.store_mut_for_test();
+            match corruption {
+                0 => {
+                    assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+                }
+                1 => {
+                    let mut links = store.value_symbol_links(parameter).unwrap().clone();
+                    links.resolved_type = Some(number);
+                    assert!(store.set_value_symbol_links(parameter, links));
+                }
+                _ => {
+                    let source_parameter = store.signature(source).unwrap().parameters()[0];
+                    let template = store
+                        .value_symbol_links(source_parameter)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    let mapper = store.new_type_mapper(vec![template], vec![number]).unwrap();
+                    assert!(store.set_signature_target_and_mapper(
+                        signature,
+                        Some(source),
+                        Some(mapper)
+                    ));
+                }
+            }
+            let warm = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    validate_stored_callable_set(store, reference),
+                    StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }
+                ));
+                assert_eq!(
+                    resolve_members_with_array_targets(store, reference, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(reference)),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len()
+                    ),
+                    warm,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the saved records next to their corruption and restoration.
+    fn generic_interface_call_domains_reject_sibling_formals() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B>(value: B): A; <C>(value: C): A; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_988);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let target = validate_direct_generic_reference(store, reference)
+            .unwrap()
+            .target;
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let healthy = validate_generic_interface_callable(store, reference, None);
+        assert!(matches!(
+            &healthy,
+            Some(StoredCallableSetValidation::Valid { .. })
+        ));
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("the declared call set must retain its interface")
+        };
+        let [first, second] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the source must retain both call signatures")
+        };
+        let (first, second) = (*first, *second);
+        let sibling = store.signature(second).unwrap().type_parameters()[0];
+        let original_return = store.signature(first).unwrap().resolved_return_type();
+        assert_ne!(
+            store.signature(first).unwrap().type_parameters()[0],
+            sibling
+        );
+        assert_ne!(original_return, Some(sibling));
+        let (annotation, null_literal_identity) =
+            store.function_signature_return_annotation(first).unwrap();
+        assert!(!null_literal_identity);
+        assert_eq!(
+            store.source_node_kind(annotation),
+            Some(SyntaxKind::TypeReference)
+        );
+        let annotation_links = store.type_node_links(annotation).cloned().unwrap();
+        assert_eq!(annotation_links.resolved_type, original_return);
+        let members = store
+            .type_payload(reference)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let warm = counts(store);
+        assert!(store.set_signature_resolved_return_type(first, Some(sibling)));
+        assert!(store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(sibling),
+                ..annotation_links.clone()
+            },
+        ));
+        for _ in 0..2 {
+            assert!(
+                super::super::object_members::generic_declared_call_signature_edges(store, target)
+                    .is_some()
+            );
+            assert_eq!(
+                validate_generic_interface_members(store, reference, None),
+                Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                    sibling
+                )),
+            );
+            assert_eq!(counts(store), warm);
+            assert_eq!(
+                store.type_payload(reference).unwrap().data().structured(),
+                Some(&members),
+            );
+        }
+        assert!(store.set_signature_resolved_return_type(first, original_return));
+        assert!(store.set_type_node_links(annotation, annotation_links));
+        for _ in 0..2 {
+            assert_eq!(
+                validate_generic_interface_callable(store, reference, None),
+                healthy
+            );
+            assert_eq!(counts(store), warm);
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(counts(context.store()), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation must fail without publishing or changing a cache.
+    fn generic_interface_call_copies_reject_changed_formals_and_owner_mappers() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B extends A = A>(value: B): B; } ",
+            "declare const text: Callable<string>; ",
+            "declare const numeric: Callable<number>;",
+        ));
+        let file = FileId::new(202_986);
+        for corruption in ["constraint", "default", "target", "mapper", "signature"] {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let text = property_object_alias_variable_type(&parsed, file, &mut context, "text");
+            let numeric =
+                property_object_alias_variable_type(&parsed, file, &mut context, "numeric");
+            let store = context.store_mut_for_test();
+            for reference in [text, numeric] {
+                resolve_members_with_array_targets(store, reference, None).unwrap();
+            }
+            let signature = |store: &CanonicalTypeMapperStore, reference| {
+                let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                    validate_generic_interface_callable(store, reference, None)
+                else {
+                    panic!("the interface must retain its complete copied call signature")
+                };
+                projection.call_signatures[0].signature
+            };
+            let copied = signature(store, text);
+            let other = signature(store, numeric);
+            let original = store.signature(copied).unwrap().target().unwrap();
+            let mapper = store.signature(copied).unwrap().mapper().unwrap();
+            let other_mapper = store.signature(other).unwrap().mapper().unwrap();
+            let fresh = store.signature(copied).unwrap().type_parameters()[0];
+            let source = store.signature(original).unwrap().type_parameters()[0];
+            assert_ne!(fresh, store.signature(other).unwrap().type_parameters()[0]);
+            assert_ne!(mapper, other_mapper);
+            let TypeData::TypeParameter(data) = store.type_payload(fresh).unwrap().data() else {
+                panic!("the copied call must keep its own fresh parameter")
+            };
+            let data = data.clone();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                "signature" => assert!(store.set_signature_type_parameters(copied, vec![source])),
+                "mapper" => assert!(store.set_signature_target_and_mapper(
+                    copied,
+                    Some(original),
+                    Some(other_mapper),
+                )),
+                _ => assert!(store.set_type_parameter_resolution(
+                    fresh,
+                    if corruption == "constraint" {
+                        Some(number)
+                    } else {
+                        data.constraint
+                    },
+                    if corruption == "target" {
+                        Some(fresh)
+                    } else {
+                        data.target
+                    },
+                    data.mapper,
+                    if corruption == "default" {
+                        Some(number)
+                    } else {
+                        data.resolved_default_type
+                    },
+                )),
+            }
+            let counts = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let warm = counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_callable(store, text, None),
+                    Some(StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }),
+                    "{corruption}",
+                );
+                assert_eq!(
+                    generic_interface_call_signature_return(store, copied, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(text)),
+                );
+                assert_eq!(
+                    resolve_members_with_array_targets(store, text, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(text)),
+                );
+                assert_eq!(counts(store), warm);
+            }
+            assert!(store.set_signature_type_parameters(copied, vec![fresh]));
+            assert!(store.set_signature_target_and_mapper(copied, Some(original), Some(mapper)));
+            assert!(store.set_type_parameter_resolution(
+                fresh,
+                data.constraint,
+                data.target,
+                data.mapper,
+                data.resolved_default_type,
+            ));
+            assert_eq!(signature(store, text), copied);
+            assert_eq!(signature(store, numeric), other);
+            assert_eq!(counts(store), warm);
+        }
+    }
+
+    #[test]
+    fn generic_interface_call_owned_parameters_keep_caller_limits() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B extends A = A>(value: B): B; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_987);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default()),
+        );
+        assert_eq!(
+            validate_generic_interface_callable(store, reference, None),
+            Some(StoredCallableSetValidation::Pending {
+                family: CallableFamily::DeclaredCallSignatures,
+            }),
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must resolve the unchanged source signature")
+        };
+        let copied = store
+            .signature(projection.call_signatures[0].signature)
+            .unwrap();
+        assert_eq!(
+            projection.call_signatures[0].parameters,
+            copied.type_parameters()
+        );
+        assert_eq!(
+            copied.resolved_return_type(),
+            Some(copied.type_parameters()[0])
+        );
+    }
+
+    #[test]
+    fn generic_interface_call_limits_leave_the_instance_unpublished() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_622);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let error_type = bootstrap.error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default()),
+        );
+        assert_eq!(
+            validate_generic_interface_callable(store, reference, None),
+            Some(StoredCallableSetValidation::Pending {
+                family: CallableFamily::DeclaredCallSignatures,
+            }),
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must resolve the untouched declared call template")
+        };
+        assert_eq!(projection.call_signatures[0].parameters, [string]);
+        assert_eq!(projection.call_signatures[0].return_type, Some(string));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check source and copied signature order on cold and warm references.
+    fn generic_interface_overloads_reject_changed_signature_order_and_count() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; (value: T, extra: number): T; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_625);
+        for corruption in 0..4 {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let reference =
+                property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+            let store = context.store_mut_for_test();
+            let target = validate_direct_generic_reference(store, reference)
+                .unwrap()
+                .target;
+            let copies = if corruption == 3 {
+                None
+            } else {
+                resolve_members_with_array_targets(store, reference, None).unwrap();
+                let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                    validate_generic_interface_callable(store, reference, None)
+                else {
+                    panic!("the interface must retain both mapped call signatures")
+                };
+                assert_eq!(projection.call_signatures.len(), 2);
+                Some(
+                    projection
+                        .call_signatures
+                        .iter()
+                        .map(|call| call.signature)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            if corruption == 0 || corruption == 3 {
+                let TypeData::Interface(interface) = store.type_payload(target).unwrap().data()
+                else {
+                    panic!("the declared target must be an interface")
+                };
+                let mut signatures = interface.declared_call_signatures.clone().unwrap();
+                signatures.reverse();
+                if corruption == 3 {
+                    let declaration = store
+                        .signature(signatures[0])
+                        .unwrap()
+                        .declaration()
+                        .unwrap();
+                    let call_symbol = store.source_declaration_symbol(declaration).unwrap();
+                    let mut declarations = store
+                        .symbol(call_symbol)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .to_vec();
+                    declarations.reverse();
+                    assert!(store.set_symbol_declarations(call_symbol, Some(declarations), None));
+                }
+                assert!(store.set_interface_declared_members(
+                    target,
+                    true,
+                    None,
+                    Some(signatures),
+                    None,
+                    None
+                ));
+            } else {
+                let mut signatures = copies.unwrap();
+                if corruption == 1 {
+                    signatures.reverse();
+                } else {
+                    signatures.pop();
+                }
+                assert!(store.set_structured_type_members(
+                    reference,
+                    None,
+                    None,
+                    Some(signatures),
+                    None,
+                    None
+                ));
+            }
+            let expected = if corruption == 0 || corruption == 3 {
+                GenericInterfaceMemberError::InvalidTarget(target)
+            } else {
+                GenericInterfaceMemberError::InvalidCachedMembers(reference)
+            };
+            let warm = (store.type_len(), store.signature_len(), store.mapper_len());
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_callable(store, reference, None),
+                    Some(StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }),
+                );
+                assert_eq!(
+                    resolve_members_with_array_targets(store, reference, None),
+                    Err(expected.clone()),
+                );
+                assert_eq!(
+                    (store.type_len(), store.signature_len(), store.mapper_len()),
+                    warm
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_interface_overload_later_limits_leave_all_signature_rows_unpublished() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: number): string; (value: T): T; } ",
+            "declare const callable: Callable<boolean>;",
+        ));
+        let file = FileId::new(202_626);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let target = validate_direct_generic_reference(store, reference)
+            .unwrap()
+            .target;
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("the declared target must be an interface")
+        };
+        let originals = interface.declared_call_signatures.clone().unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let boolean = bootstrap.boolean_type;
+        let error_type = bootstrap.error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        let copied = store
+            .signatures()
+            .filter_map(|(id, signature)| {
+                signature
+                    .target()
+                    .filter(|source| originals.contains(source))
+                    .map(|_| id)
+            })
+            .collect::<Vec<_>>();
+        assert!(!copied.is_empty());
+        assert_eq!(
+            store.signature(copied[0]).unwrap().target(),
+            Some(originals[0])
+        );
+        assert_eq!(
+            store.signature(copied[0]).unwrap().resolved_return_type(),
+            Some(string)
+        );
+        assert!(copied.iter().all(|signature| {
+            store
+                .declared_call_set_type_for_signature(*signature)
+                .is_none()
+        }));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default())
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must publish the complete overload set")
+        };
+        assert_eq!(projection.call_signatures.len(), originals.len());
+        for ((call, original), return_type) in projection
+            .call_signatures
+            .iter()
+            .zip(originals)
+            .zip([string, boolean])
+        {
+            assert_eq!(
+                store.signature(call.signature).unwrap().target(),
+                Some(original)
+            );
+            assert_eq!(call.return_type, Some(return_type));
+        }
+    }
+
+    fn class_field_owner(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(class.name?)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let raw = context.file(file).unwrap().1.symbol(node).unwrap();
+        context.store().get_merged_symbol(raw).unwrap()
+    }
+
+    #[test]
+    fn class_reference_fields_require_the_class_producer_and_keep_values_lazy() {
+        let parsed = parse_source_file("class Box<T> { value!: T; fixed!: number; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_501);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let cold = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    None,
+                    &mut session
+                ),
+                Err(GenericInterfaceMemberError::UnsupportedTarget(target))
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), cold);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+        }
+        let class = context.get_nongeneric_class_members(owner).unwrap();
+        assert_eq!(class.shells().instance_type(), target);
+        let source = class.instance_properties()[0];
+        let fixed = class.instance_properties()[1];
+        let TypeData::Interface(origin) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the class owns the real generic origin")
+        };
+        let origin = origin.clone();
+        let parameter = origin.reference.resolved_type_arguments.as_deref().unwrap()[0];
+        let this = origin.this_type.unwrap();
+        let origin_links = context.store().value_symbol_links(source).cloned().unwrap();
+        assert_eq!(origin_links.resolved_type, Some(parameter));
+        let members = resolve_members_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            reference,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let proxy = members.properties()[0];
+        assert_ne!(proxy, source);
+        assert_eq!(members.properties()[1], fixed);
+        let mapper = members.mapper().unwrap();
+        assert_eq!(
+            context.store().type_mapper_has_exact_endpoints(
+                mapper,
+                &[parameter, this],
+                &[string, reference]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(proxy),
+            Some(&ValueSymbolLinks {
+                target: Some(source),
+                mapper: Some(mapper),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                reference,
+                proxy,
+                None,
+                &mut session
+            ),
+            Ok(string)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                reference,
+                fixed,
+                None,
+                &mut session
+            ),
+            Ok(number)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(
+            context.store().value_symbol_links(source),
+            Some(&origin_links)
+        );
+        assert!(
+            matches!(context.store().type_payload(target).unwrap().data(), TypeData::Interface(actual) if actual == &origin)
+        );
+        let warm = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    None,
+                    &mut session
+                ),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), warm);
+            assert_eq!(session.query_count(), 1);
+        }
+        let own = resolve_members_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            target,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(own.properties(), class.instance_properties());
+        assert_eq!(own.mapper(), None);
+        assert_eq!(property_recovery_store_counts(context.store()), warm);
+    }
+
+    #[test]
+    fn class_reference_fields_reject_and_restore_source_proxy_and_mapper_caches() {
+        for poison in 0..4 {
+            let parsed = parse_source_file("class Box<T> { value!: T; fixed!: number; }");
+            let file = FileId::new(202_502);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = class_field_owner(&parsed, file, &context, "Box");
+            let class = context.get_nongeneric_class_members(owner).unwrap();
+            let target = class.shells().instance_type();
+            let source = class.instance_properties()[0];
+            let fixed = class.instance_properties()[1];
+            let annotation = context
+                .store()
+                .symbol(source)
+                .unwrap()
+                .value_declaration()
+                .and_then(|node| context.store().source_direct_type_annotation(node))
+                .unwrap();
+            let original_annotation = context
+                .store()
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let reference = context
+                .store_mut_for_test()
+                .create_direct_generic_reference_type(target, &[string])
+                .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let members = resolve_members_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let proxy = members.properties()[0];
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            let original_links = context.store().value_symbol_links(proxy).cloned().unwrap();
+            let mut links = original_links.clone();
+            let expected = match poison {
+                0 => {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                    GenericInterfaceMemberError::InvalidTarget(target)
+                }
+                1 => {
+                    let TypeData::Interface(origin) =
+                        context.store().type_payload(target).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let sources = origin.all_type_parameters.clone().unwrap();
+                    links.mapper = context
+                        .store_mut_for_test()
+                        .new_type_mapper(sources, vec![number, reference]);
+                    assert!(links.mapper.is_some());
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedMembers(reference)
+                }
+                2 => {
+                    links.target = Some(fixed);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedProperty(proxy)
+                }
+                3 => {
+                    links.resolved_type = Some(number);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedProperty(proxy)
+                }
+                _ => unreachable!(),
+            };
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().relation_state_snapshot(),
+                    context.store().type_node_links(annotation).cloned(),
+                    context.store().value_symbol_links(proxy).cloned(),
+                    context.store().value_symbol_links(source).cloned(),
+                )
+            };
+            let poisoned = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_members(context.store(), reference, None),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    demand_instantiated_property_type(
+                        context.store_mut_for_test(),
+                        reference,
+                        proxy,
+                        None,
+                        &mut session
+                    ),
+                    Err(expected.clone())
+                );
+                assert_eq!(snapshot(&context), poisoned);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, original_annotation)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(proxy, original_links)
+            );
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(
+                validate_generic_interface_members(context.store(), reference, None),
+                Ok(Some(members))
+            );
+            let restored = snapshot(&context);
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(snapshot(&context), restored);
+        }
+    }
+
+    #[test]
+    fn class_reference_fields_compare_substituted_members_and_replay() {
+        let parsed = parse_source_file(concat!(
+            "class Box<T> { value!: T; fixed!: number; } ",
+            "declare const text: Box<string>; declare const count: Box<number>;",
+        ));
+        let file = FileId::new(202_506);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let text = property_object_alias_variable_type(&parsed, file, &mut context, "text");
+        let count = property_object_alias_variable_type(&parsed, file, &mut context, "count");
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let source = context
+            .get_nongeneric_class_members(owner)
+            .unwrap()
+            .instance_properties()[0];
+        let source_links = context.store().value_symbol_links(source).cloned().unwrap();
+        assert_eq!(context.is_type_assignable_to(text, count), Ok(false));
+        assert_eq!(context.is_type_assignable_to(count, text), Ok(false));
+        assert_eq!(context.is_type_assignable_to(text, text), Ok(true));
+        assert_eq!(context.is_type_assignable_to(count, count), Ok(true));
+        let warm = (
+            property_recovery_store_counts(context.store()),
+            context.store().relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.is_type_assignable_to(text, count), Ok(false));
+            assert_eq!(context.is_type_assignable_to(count, text), Ok(false));
+            assert_eq!(context.is_type_assignable_to(text, text), Ok(true));
+            assert_eq!(context.is_type_assignable_to(count, count), Ok(true));
+            assert_eq!(
+                context.store().value_symbol_links(source),
+                Some(&source_links)
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().relation_state_snapshot()
+                ),
+                warm
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn class_reference_fields_keep_the_callers_instantiation_budget() {
+        let parsed = parse_source_file("class Box<T> { value!: T; }");
+        let file = FileId::new(202_503);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let class = context.get_nongeneric_class_members(owner).unwrap();
+        let target = class.shells().instance_type();
+        let source = class.instance_properties()[0];
+        let template = context
+            .store()
+            .value_symbol_links(source)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number, error) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.error_type,
+        );
+        let store = context.store_mut_for_test();
+        let first = store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let second = store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let first_members =
+            resolve_members_with_array_targets_and_session(store, first, None, &mut session)
+                .unwrap();
+        let second_members =
+            resolve_members_with_array_targets_and_session(store, second, None, &mut session)
+                .unwrap();
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                first,
+                first_members.properties()[0],
+                None,
+                &mut session
+            ),
+            Ok(string)
+        );
+        assert_eq!(session.query_count(), 1);
+        let mark = session.limit_event_mark();
+        let proxy = second_members.properties()[0];
+        assert_eq!(
+            demand_instantiated_property_type(store, second, proxy, None, &mut session),
+            Ok(error)
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert!(store.instantiated_property_recovery(proxy).is_some());
+        assert_eq!(
+            store.value_symbol_links(source).unwrap().resolved_type,
+            Some(template)
+        );
+        let warm = property_recovery_store_counts(store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(store, second, proxy, None, &mut session),
+            Ok(error)
+        );
+        assert!(!session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(property_recovery_store_counts(store), warm);
+    }
+
+    #[test]
+    fn class_reference_fields_keep_methods_private_fields_and_heritage_unsupported() {
+        for source in [
+            "class Box<T> { value!: T; method(): void {} }",
+            "class Box<T> { private value!: T; }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(202_504);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = class_field_owner(&parsed, file, &context, "Box");
+            let class = context.get_nongeneric_class_members(owner).unwrap();
+            let target = class.shells().instance_type();
+            let rejected = *class.instance_properties().last().unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let reference = context
+                .store_mut_for_test()
+                .create_direct_generic_reference_type(target, &[string])
+                .unwrap();
+            let cold = property_recovery_store_counts(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_members(reference, None),
+                    Err(GenericInterfaceMemberError::UnsupportedMember(rejected))
+                );
+                assert_eq!(property_recovery_store_counts(context.store()), cold);
+                assert_eq!(
+                    context
+                        .store()
+                        .type_payload(reference)
+                        .unwrap()
+                        .data()
+                        .structured(),
+                    Some(&StructuredTypeData::default())
+                );
+            }
+        }
+        let parsed =
+            parse_source_file("class Base<T> { value!: T; } class Derived<U> extends Base<U> {}");
+        let file = FileId::new(202_505);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let base = class_field_owner(&parsed, file, &context, "Base");
+        let derived = class_field_owner(&parsed, file, &context, "Derived");
+        context.get_nongeneric_class_members(base).unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let heritage = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, base.expression))
+            })
+            .unwrap();
+        let cold = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_nongeneric_class_members(derived),
+                Err(crate::semantic::ClassError::Unsupported(
+                    crate::semantic::ClassUnsupported::Heritage(heritage)
+                ))
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_members(reference, None),
+                Err(GenericInterfaceMemberError::UnsupportedTarget(target))
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), cold);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+        }
+    }
+
+    fn completed_class_receiver_fixture<'a>(
+        parsed: &'a ParseResult,
+        name: &str,
+    ) -> (CanonicalCheckerContext<'a>, TypeId) {
+        let file = FileId::new(203_121);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let owner = class_field_owner(parsed, file, &context, name);
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        (context, target)
+    }
+
+    fn class_receiver_member(
+        store: &CanonicalTypeMapperStore,
+        receiver: TypeId,
+        name: &str,
+    ) -> SemanticSymbolId {
+        store
+            .type_payload(receiver)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(name))
+            .unwrap()
+    }
+
+    #[test]
+    fn completed_class_receiver_methods_keep_origins_private_fields_and_two_maps() {
+        let parsed = parse_source_file(concat!(
+            "class Box<T> { value!: T; private secret!: T; ",
+            "read(value: T): T { return value; } self() { return this; } }",
+        ));
+        let file = FileId::new(203_121);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let first = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let cold = property_recovery_store_counts(context.store());
+        assert_eq!(
+            resolve_members_with_array_targets(context.store_mut_for_test(), first, None),
+            Err(GenericInterfaceMemberError::UnsupportedTarget(target))
+        );
+        assert_eq!(property_recovery_store_counts(context.store()), cold);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let second = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let source = class_receiver_member(context.store(), target, "read");
+        let original = context.store().value_symbol_links(source).cloned().unwrap();
+        let source_type = original.resolved_type.unwrap();
+        let source_signature = context
+            .store()
+            .type_payload(source_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let TypeData::Interface(class) = context.store().type_payload(target).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let formal = class.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let this_type = class.this_type.unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut copies = Vec::new();
+        for (receiver, expected) in [(first, string), (second, number)] {
+            let property = resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                receiver,
+                EscapedNameRef::source("read"),
+                None,
+                &mut session,
+            )
+            .unwrap()
+            .unwrap();
+            let store = context.store();
+            let mapper = store
+                .value_symbol_links(property.symbol())
+                .unwrap()
+                .mapper
+                .unwrap();
+            assert_eq!(store.map_type(mapper, formal), Some(expected));
+            assert_eq!(store.map_type(mapper, this_type), Some(receiver));
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                super::super::callable_sets::validate_stored_callable_set(
+                    store,
+                    property.type_id(),
+                )
+            else {
+                panic!("the completed receiver must retain its actual class method")
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                panic!("the source has one ordinary method signature")
+            };
+            assert_eq!(callable.parameters, [expected]);
+            assert_eq!(callable.return_type, Some(expected));
+            let signature = store.signature(callable.signature).unwrap();
+            assert!(signature.type_parameters().is_empty());
+            assert_eq!(signature.target(), Some(source_signature));
+            assert_eq!(signature.mapper(), Some(mapper));
+            assert_eq!(store.value_symbol_links(source), Some(&original));
+            copies.push((
+                property.symbol(),
+                property.type_id(),
+                callable.signature,
+                mapper,
+            ));
+            let secret = resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                receiver,
+                EscapedNameRef::source("secret"),
+                None,
+                &mut session,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(secret.type_id(), expected);
+            let secret_source = class_receiver_member(context.store(), target, "secret");
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(secret.symbol())
+                    .unwrap()
+                    .target,
+                Some(secret_source)
+            );
+        }
+        assert_ne!(copies[0], copies[1]);
+        let warm = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            for (receiver, (symbol, callable, _, _)) in [first, second].into_iter().zip(&copies) {
+                assert_eq!(
+                    demand_instantiated_property_type(
+                        context.store_mut_for_test(),
+                        receiver,
+                        *symbol,
+                        None,
+                        &mut session,
+                    ),
+                    Ok(*callable)
+                );
+            }
+            assert_eq!(property_recovery_store_counts(context.store()), warm);
+            assert_eq!(context.store().value_symbol_links(source), Some(&original));
+        }
+    }
+
+    #[test]
+    fn completed_class_method_copies_reject_changed_returns_mappers_and_owner_markers() {
+        let parsed = parse_source_file("class Box<T> { read(value: T): T { return value; } }");
+        let (mut context, target) = completed_class_receiver_fixture(&parsed, "Box");
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let receiver = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let property = resolve_property_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            receiver,
+            EscapedNameRef::source("read"),
+            None,
+            &mut session,
+        )
+        .unwrap()
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let TypeData::Object(object) = store.type_payload(property.type_id()).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let source_type = object.target.unwrap();
+        let mapper = object.mapper.unwrap();
+        let copied = object.structured.signatures.as_ref().unwrap()[0];
+        let source = store.signature(copied).unwrap().target().unwrap();
+        let wrong_mapper = store.new_simple_type_mapper(string, number).unwrap();
+        let warm = property_recovery_store_counts(store);
+        for damage in 0..3 {
+            match damage {
+                0 => assert!(store.set_signature_resolved_return_type(copied, Some(number))),
+                1 => assert!(store.set_object_target_and_mapper(
+                    property.type_id(),
+                    Some(source_type),
+                    Some(wrong_mapper),
+                )),
+                2 => assert_eq!(
+                    store.replace_proxy_interface_method_type_for_signature_for_test(copied, None),
+                    Some(property.type_id())
+                ),
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    instantiated_interface_method_signature_return(store, copied, None),
+                    Err(if damage == 2 {
+                        GenericInterfaceMemberError::InvalidCachedMembers(source_type)
+                    } else {
+                        GenericInterfaceMemberError::InvalidCachedProperty(property.symbol())
+                    })
+                );
+                assert_eq!(property_recovery_store_counts(store), warm);
+            }
+            match damage {
+                0 => assert!(store.set_signature_resolved_return_type(copied, Some(string))),
+                1 => assert!(store.set_object_target_and_mapper(
+                    property.type_id(),
+                    Some(source_type),
+                    Some(mapper),
+                )),
+                2 => assert_eq!(
+                    store.replace_proxy_interface_method_type_for_signature_for_test(
+                        copied,
+                        Some(property.type_id()),
+                    ),
+                    None
+                ),
+                _ => unreachable!(),
+            }
+            let returned = instantiated_interface_method_signature_return(store, copied, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(returned.owner, property.type_id());
+            assert_eq!(returned.source, source);
+            assert_eq!(returned.return_type, string);
+            assert_eq!(property_recovery_store_counts(store), warm);
+        }
+    }
+
+    #[test]
+    fn completed_class_method_copies_keep_array_authority_and_the_spent_caller() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Box<T> { read(value: T[]): T[] { return value; } }",
+        ));
+        let (mut context, target) = completed_class_receiver_fixture(&parsed, "Box");
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let receiver = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let foreign = checker_context(
+            &parsed,
+            FileId::new(203_122),
+            CanonicalCheckerOptions::default(),
+        );
+        let foreign_targets = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        let cold = property_recovery_store_counts(context.store());
+        for authority in [None, Some(foreign_targets)] {
+            assert!(matches!(
+                resolve_members_with_array_targets(
+                    context.store_mut_for_test(),
+                    receiver,
+                    authority
+                ),
+                Err(GenericInterfaceMemberError::InvalidMember(_))
+            ));
+            assert_eq!(property_recovery_store_counts(context.store()), cold);
+        }
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        let members = resolve_members_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            receiver,
+            Some(targets),
+            &mut limited,
+        )
+        .unwrap();
+        let proxy = *members.properties().first().unwrap();
+        let TypeData::Interface(class) = context.store().type_payload(target).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let formal = class.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                formal,
+                &[formal],
+                &[number],
+                Some(targets),
+                &mut limited,
+            ),
+            Ok(number)
+        );
+        let before = property_recovery_store_counts(context.store());
+        assert!(matches!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                receiver,
+                proxy,
+                Some(targets),
+                &mut limited,
+            ),
+            Err(GenericInterfaceMemberError::Capacity(_))
+        ));
+        assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+        assert_eq!(limited.limit_event_count(), 1);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type,
+            None
+        );
+        assert_eq!(property_recovery_store_counts(context.store()), before);
+        let mut fresh = InstantiationSession::new(InstantiationLimits::default());
+        let callable = demand_instantiated_property_type(
+            context.store_mut_for_test(),
+            receiver,
+            proxy,
+            Some(targets),
+            &mut fresh,
+        )
+        .unwrap();
+        let signature = context
+            .store()
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let returned = instantiated_interface_method_signature_return(
+            context.store(),
+            signature,
+            Some(targets),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_reference_with_targets(targets, returned.return_type)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            string
+        );
+        let warm = property_recovery_store_counts(context.store());
+        for authority in [None, Some(foreign_targets)] {
+            assert!(
+                instantiated_interface_method_signature_return(
+                    context.store(),
+                    signature,
+                    authority
+                )
+                .is_err()
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), warm);
+        }
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                receiver,
+                proxy,
+                Some(targets),
+                &mut fresh,
+            ),
+            Ok(callable)
+        );
+        assert_eq!(property_recovery_store_counts(context.store()), warm);
+    }
+
+    #[test]
+    fn completed_class_inherited_member_copies_keep_the_retained_mapper_composition() {
+        let parsed = parse_source_file(concat!(
+            "class Base<T> { value: T; constructor(value: T) { this.value = value; } ",
+            "read(value: T): T { return value; } } ",
+            "class Box<U> extends Base<U> { constructor(value: U) { super(value); } }",
+        ));
+        let (mut context, target) = completed_class_receiver_fixture(&parsed, "Box");
+        let base_owner = class_field_owner(&parsed, FileId::new(203_121), &context, "Base");
+        let base = context.get_declared_type_of_symbol(base_owner).unwrap();
+        let source = class_receiver_member(context.store(), base, "read");
+        let original = context.store().value_symbol_links(source).cloned().unwrap();
+        let inherited =
+            completed_source_class_receiver_member_mapper(context.store(), target, source)
+                .unwrap()
+                .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let receiver = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let property = resolve_property_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            receiver,
+            EscapedNameRef::source("read"),
+            None,
+            &mut session,
+        )
+        .unwrap()
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let links = store
+            .value_symbol_links(property.symbol())
+            .cloned()
+            .unwrap();
+        assert_eq!(links.target, Some(source));
+        let mapper = links.mapper.unwrap();
+        let Some(TypeMapperApplication::Composite { first, second }) =
+            store.mapper_application(mapper, original.resolved_type.unwrap())
+        else {
+            panic!("the inherited member must retain its base map before the receiver map")
+        };
+        assert_eq!(first, inherited);
+        let TypeData::Interface(class) = store.type_payload(target).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(
+            store.map_type(second, class.this_type.unwrap()),
+            Some(receiver)
+        );
+        assert_eq!(
+            completed_source_class_method_receiver(
+                store,
+                original.resolved_type.unwrap(),
+                mapper,
+                None
+            ),
+            Some(receiver)
+        );
+        let warm = property_recovery_store_counts(store);
+        assert!(store.set_value_symbol_links(
+            property.symbol(),
+            ValueSymbolLinks {
+                mapper: Some(inherited),
+                ..links.clone()
+            }
+        ));
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                receiver,
+                property.symbol(),
+                None,
+                &mut session
+            ),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                property.symbol()
+            ))
+        );
+        assert_eq!(property_recovery_store_counts(store), warm);
+        assert!(store.set_value_symbol_links(property.symbol(), links));
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                receiver,
+                property.symbol(),
+                None,
+                &mut session
+            ),
+            Ok(property.type_id())
+        );
+        assert_eq!(store.value_symbol_links(source), Some(&original));
+        assert_eq!(property_recovery_store_counts(store), warm);
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // Compare cold templates with the same reference's published values.
     fn generic_interface_type_edges_preserve_cold_templates_and_warm_values() {
@@ -8964,7 +15140,7 @@ mod tests {
             assert!(cold.contains(&argument));
             assert!(cold.contains(&shape.source_parameters[0]));
             for property in &shape.properties {
-                assert!(cold.contains(&property.type_));
+                assert!(cold.contains(&property.value.resolved().expect("declared member value is resolved")));
             }
             for base in &shape.base_types {
                 assert!(cold.contains(base));
@@ -20214,6 +26390,959 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PrimitiveInterfaceMemberRecipeForm {
+        Property,
+        StringIndex,
+    }
+
+    fn primitive_interface_member_recipe_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+        form: PrimitiveInterfaceMemberRecipeForm,
+    ) -> (CanonicalCheckerContext<'_>, TypeId, TypeId, TypeId) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let shape_symbol = source_symbol(parsed, file, &context, "Shape");
+        let pick_symbol = source_symbol(parsed, file, &context, "Pick");
+        let shape = context.get_declared_type_of_symbol(shape_symbol).unwrap();
+        let target = context.get_declared_type_of_symbol(pick_symbol).unwrap();
+        let parameter = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("Pick must retain its generic interface target"),
+        };
+        match form {
+            PrimitiveInterfaceMemberRecipeForm::Property => {
+                let key = context
+                    .store_mut_for_test()
+                    .regular_string_literal_type("value".to_owned())
+                    .unwrap();
+                let template = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, AccessFlags::NONE)
+                    .unwrap();
+                publish_generic_target_for_test(
+                    &mut context,
+                    target,
+                    &[("selected", template)],
+                    None,
+                );
+            }
+            PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                let key = context
+                    .store_mut_for_test()
+                    .regular_string_literal_type("missing".to_owned())
+                    .unwrap();
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let named = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, AccessFlags::NONE)
+                    .unwrap();
+                let broad = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, string, AccessFlags::NONE)
+                    .unwrap();
+                publish_generic_target_for_test(
+                    &mut context,
+                    target,
+                    &[("named", named), ("broad", broad)],
+                    None,
+                );
+            }
+        }
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[shape])
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(shape).unwrap().data()
+        else {
+            panic!("Shape must retain its interface identity");
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(!interface.base_types_resolved);
+        assert_eq!(
+            interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        (context, shape, target, reference)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Source and raw reads must preserve the published identity.
+    fn primitive_interface_member_recipes_replay_source_reads_after_raw_publication() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                concat!(
+                    "interface Shape { value: string }\n",
+                    "interface Pick<T> { selected: T[\"value\"] }\n",
+                    "type Probe = Shape[\"value\"];\n",
+                ),
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number }\n",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }\n",
+                    "type NamedProbe = Shape[\"missing\"];\n",
+                    "type BroadProbe = Shape[string];\n",
+                ),
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_320);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let probes = parsed
+                .arena
+                .iter()
+                .filter_map(|(_, node)| match &node.data {
+                    NodeData::TypeAliasDeclaration(alias) => {
+                        Some(NodeRef::new(parsed.arena.id(), file, alias.type_))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for probe in &probes {
+                assert_eq!(
+                    context.store().source_node_kind(*probe),
+                    Some(SyntaxKind::IndexedAccessType),
+                );
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(*probe)
+                        .is_none_or(|links| { links == &TypeNodeLinks::default() })
+                );
+            }
+            let names: &[&str] = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => &["selected"],
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => &["named", "broad"],
+            };
+            assert_eq!(probes.len(), names.len());
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let expected = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => string,
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => number,
+            };
+            let selected = names
+                .iter()
+                .map(|name| {
+                    let property = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, name, None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(property.type_id(), expected);
+                    property
+                })
+                .collect::<Vec<_>>();
+            let plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let property_types =
+                (form == PrimitiveInterfaceMemberRecipeForm::Property).then_some(string);
+            let index_types = (form == PrimitiveInterfaceMemberRecipeForm::StringIndex)
+                .then_some((string, number));
+            assert_eq!(
+                interface_state(context.store(), &plan, shape),
+                Ok(PropertyObjectState::Resolved(shape)),
+            );
+            assert_eq!(
+                validate_resolved_declared_member_types(
+                    context.store(),
+                    &plan,
+                    property_types.as_slice(),
+                    index_types.as_slice(),
+                    &[],
+                ),
+                Ok(()),
+            );
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its published interface");
+            };
+            let published = published.clone();
+            assert!(published.base_types_resolved);
+            assert!(published.resolved_base_types.is_none());
+            assert!(published.resolved_base_constructor_type.is_none());
+            assert_eq!(published.declared_members, plan.members);
+            assert_eq!(published.reference.object.structured.members, plan.members);
+            assert_eq!(
+                published.declared_index_infos,
+                published.reference.object.structured.index_infos,
+            );
+            let member = plan
+                .properties
+                .first()
+                .map(|property| property.symbol)
+                .or_else(|| plan.indexes.first().map(|index| index.symbol))
+                .unwrap();
+            let member_links = context.store().value_symbol_links(member).cloned();
+            let mut warm_counts = None;
+            for _ in 0..2 {
+                for probe in &probes {
+                    assert_eq!(context.get_type_from_type_node(*probe).unwrap(), expected);
+                }
+                assert_eq!(context.get_declared_type_of_symbol(owner).unwrap(), shape);
+                for (name, property) in names.iter().zip(&selected) {
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None),
+                        Ok(Some(*property)),
+                    );
+                }
+                assert_eq!(
+                    context.store().type_payload(shape).unwrap().data(),
+                    &TypeData::Interface(published.clone()),
+                );
+                assert_eq!(
+                    context.store().value_symbol_links(member).cloned(),
+                    member_links
+                );
+                assert_eq!(
+                    interface_state(context.store(), &plan, shape),
+                    Ok(PropertyObjectState::Resolved(shape)),
+                );
+                assert_eq!(
+                    validate_resolved_declared_member_types(
+                        context.store(),
+                        &plan,
+                        property_types.as_slice(),
+                        index_types.as_slice(),
+                        &[],
+                    ),
+                    Ok(()),
+                );
+                let counts = property_recovery_store_counts(context.store());
+                if let Some(warm) = warm_counts {
+                    assert_eq!(counts, warm);
+                }
+                warm_counts = Some(counts);
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Read damage twice, then restore the exact records.
+    fn primitive_interface_member_recipes_reject_and_restore_warm_source_and_cache_damage() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_321);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let selected = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+            if form == PrimitiveInterfaceMemberRecipeForm::StringIndex {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "broad", None)
+                        .unwrap()
+                        .unwrap()
+                        .type_id(),
+                    selected.type_id(),
+                );
+            }
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let (member, annotation) = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    (plan.properties[0].symbol, plan.properties[0].type_node)
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    (plan.indexes[0].symbol, plan.indexes[0].value_type_node)
+                }
+            };
+            assert_eq!(
+                context.get_type_from_type_node(annotation).unwrap(),
+                selected.type_id(),
+            );
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(selected.type_id()),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let annotation_links = context
+                .store()
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let wrong = if selected.type_id() == string {
+                number
+            } else {
+                string
+            };
+            let reject_twice = |context: &mut CanonicalCheckerContext<'_>| {
+                let TypeData::Interface(publication) =
+                    context.store().type_payload(shape).unwrap().data()
+                else {
+                    panic!("Shape must keep its damaged publication");
+                };
+                let publication = publication.clone();
+                let annotation_before = context.store().type_node_links(annotation).cloned();
+                let bound = context.store().symbol(member).unwrap();
+                let declarations_before = bound.declarations().map(<[NodeRef]>::to_vec);
+                let value_declaration_before = bound.value_declaration();
+                let member_before = context.store().value_symbol_links(member).cloned();
+                let proxy_before = context
+                    .store()
+                    .value_symbol_links(selected.symbol())
+                    .cloned();
+                let counts_before = property_recovery_store_counts(context.store());
+                for _ in 0..2 {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        context.store().type_payload(shape).unwrap().data(),
+                        &TypeData::Interface(publication.clone()),
+                    );
+                    assert_eq!(
+                        context.store().type_node_links(annotation).cloned(),
+                        annotation_before,
+                    );
+                    let bound = context.store().symbol(member).unwrap();
+                    assert_eq!(bound.declarations(), declarations_before.as_deref());
+                    assert_eq!(bound.value_declaration(), value_declaration_before);
+                    assert_eq!(
+                        context.store().value_symbol_links(member).cloned(),
+                        member_before
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(selected.symbol())
+                            .cloned(),
+                        proxy_before,
+                    );
+                    assert_eq!(
+                        property_recovery_store_counts(context.store()),
+                        counts_before
+                    );
+                }
+            };
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..annotation_links.clone()
+                },
+            ));
+            reject_twice(&mut context);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, annotation_links)
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+
+            let bound = context.store().symbol(member).unwrap();
+            let declarations = bound.declarations().unwrap().to_vec();
+            let value_declaration = bound.value_declaration();
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(Vec::new()),
+                None,
+            ));
+            reject_twice(&mut context);
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(declarations),
+                value_declaration,
+            ));
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its complete publication");
+            };
+            let published = published.clone();
+            match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    let links = context.store().value_symbol_links(member).cloned().unwrap();
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        member,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..links.clone()
+                        },
+                    ));
+                    reject_twice(&mut context);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(member, links)
+                    );
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    let original = published.declared_index_infos.as_ref().unwrap()[0];
+                    let info = context.store().index_info(original).unwrap();
+                    let (key, readonly, declaration, components) = (
+                        info.key_type(),
+                        info.is_readonly(),
+                        info.declaration(),
+                        info.components().to_vec(),
+                    );
+                    let wrong_index = context
+                        .store_mut_for_test()
+                        .alloc_index_info(key, wrong, readonly, declaration, components)
+                        .unwrap();
+                    let structured = &published.reference.object.structured;
+                    for replace_structured in [true, false] {
+                        assert!(context.store_mut_for_test().set_interface_declared_members(
+                            shape,
+                            true,
+                            published.declared_members,
+                            None,
+                            None,
+                            Some(vec![wrong_index]),
+                        ));
+                        if replace_structured {
+                            assert!(context.store_mut_for_test().set_structured_type_members(
+                                shape,
+                                structured.members,
+                                structured.properties.clone(),
+                                None,
+                                None,
+                                Some(vec![wrong_index]),
+                            ));
+                        }
+                        reject_twice(&mut context);
+                        assert!(context.store_mut_for_test().set_interface_declared_members(
+                            shape,
+                            true,
+                            published.declared_members,
+                            None,
+                            None,
+                            published.declared_index_infos.clone(),
+                        ));
+                        assert!(context.store_mut_for_test().set_structured_type_members(
+                            shape,
+                            structured.members,
+                            structured.properties.clone(),
+                            None,
+                            None,
+                            structured.index_infos.clone(),
+                        ));
+                        assert_eq!(
+                            context
+                                .store_mut_for_test()
+                                .resolve_generic_interface_property(reference, name, None),
+                            Ok(Some(selected)),
+                        );
+                        assert_eq!(
+                            context.store().index_info(original).unwrap().value_type(),
+                            number,
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+            let replay_plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let property_types =
+                (form == PrimitiveInterfaceMemberRecipeForm::Property).then_some(string);
+            let index_types = (form == PrimitiveInterfaceMemberRecipeForm::StringIndex)
+                .then_some((string, number));
+            assert_eq!(
+                interface_state(context.store(), &replay_plan, shape),
+                Ok(PropertyObjectState::Resolved(shape)),
+            );
+            assert_eq!(
+                validate_resolved_declared_member_types(
+                    context.store(),
+                    &replay_plan,
+                    property_types.as_slice(),
+                    index_types.as_slice(),
+                    &[],
+                ),
+                Ok(()),
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(published),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep budget failure and malformed publication separate.
+    fn primitive_interface_member_recipes_keep_shells_on_failed_budgeted_publication() {
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_322);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let expected = if form == PrimitiveInterfaceMemberRecipeForm::Property {
+                string
+            } else {
+                number
+            };
+            let mut limited = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            let mark = limited.limit_event_mark();
+            assert!(
+                resolve_property_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    EscapedNameRef::source(name),
+                    None,
+                    &mut limited,
+                )
+                .is_err()
+            );
+            assert!(limited.limit_event_occurred_since(mark));
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            let proxies = context
+                .store()
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap_or_default();
+            assert!(proxies.iter().all(|proxy| {
+                context
+                    .store()
+                    .value_symbol_links(*proxy)
+                    .is_none_or(|links| {
+                        links
+                            .resolved_type
+                            .is_none_or(|cached| cached != string && cached != number)
+                    })
+            }));
+            let mut normal = InstantiationSession::new(InstantiationLimits::default());
+            let selected = resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                EscapedNameRef::source(name),
+                None,
+                &mut normal,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.type_id(), expected);
+
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => bootstrap.string_type,
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => bootstrap.number_type,
+            };
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let raw = context.store().symbol(owner).unwrap().members().unwrap();
+            let table = context.store().symbol_table(raw).unwrap();
+            let member = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => table.get_source("value").unwrap(),
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    table.get(InternalSymbolName::Index.as_ref()).unwrap()
+                }
+            };
+            let bound = context.store().symbol(member).unwrap();
+            let declarations = bound.declarations().unwrap().to_vec();
+            let value_declaration = bound.value_declaration();
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(Vec::new()),
+                None,
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None)
+                    .is_err()
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(declarations),
+                value_declaration,
+            ));
+            let selected = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.type_id(), expected);
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its complete interface");
+            };
+            assert!(published.declared_members_resolved);
+            assert!(published.base_types_resolved);
+            assert_eq!(
+                published.declared_index_infos,
+                published.reference.object.structured.index_infos,
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep missing keys, index fallback and rejected access together.
+    fn primitive_interface_member_recipes_preserve_missing_keys_and_index_fallback() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_323);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, "absent", None),
+                Ok(None),
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    let (mut context, shape, target, reference) =
+                        primitive_interface_member_recipe_fixture(&parsed, file, form);
+                    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                    let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+                    let parameter = match context.store().type_payload(target).unwrap().data() {
+                        TypeData::Interface(interface) => interface
+                            .reference
+                            .resolved_type_arguments
+                            .as_ref()
+                            .unwrap()[0],
+                        _ => panic!("Pick must retain its generic target"),
+                    };
+                    let owner = source_symbol(&parsed, file, &context, "Pick");
+                    let member = context
+                        .store()
+                        .symbol(owner)
+                        .unwrap()
+                        .members()
+                        .and_then(|raw| context.store().symbol_table(raw))
+                        .and_then(|table| table.get_source(name))
+                        .unwrap();
+                    let links = context.store().value_symbol_links(member).cloned().unwrap();
+                    let missing = context
+                        .store_mut_for_test()
+                        .regular_string_literal_type("missing".to_owned())
+                        .unwrap();
+                    let template = context
+                        .store_mut_for_test()
+                        .alloc_indexed_access_type(parameter, missing, AccessFlags::NONE)
+                        .unwrap();
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        member,
+                        ValueSymbolLinks {
+                            resolved_type: Some(template),
+                            ..links
+                        },
+                    ));
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None)
+                            .is_err()
+                    );
+                    let owner = source_symbol(&parsed, file, &context, "Shape");
+                    let plan = {
+                        let host = context.declared_type_host().unwrap();
+                        plan_interface(context.store(), &host, owner).unwrap()
+                    };
+                    assert_eq!(
+                        interface_state(context.store(), &plan, shape),
+                        Ok(PropertyObjectState::Resolved(shape)),
+                    );
+                    assert_eq!(
+                        validate_resolved_declared_member_types(
+                            context.store(),
+                            &plan,
+                            &[string],
+                            &[],
+                            &[],
+                        ),
+                        Ok(()),
+                    );
+                    let proxies = context
+                        .store()
+                        .type_payload(reference)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .properties
+                        .as_deref()
+                        .unwrap_or_default();
+                    assert!(proxies.iter().all(|proxy| {
+                        context
+                            .store()
+                            .value_symbol_links(*proxy)
+                            .is_none_or(|links| {
+                                links
+                                    .resolved_type
+                                    .is_none_or(|cached| cached != string && cached != number)
+                            })
+                    }));
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    let named = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "named", None)
+                        .unwrap()
+                        .unwrap();
+                    let broad = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "broad", None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(named.type_id(), number);
+                    assert_eq!(broad.type_id(), number);
+                    let indexes = context
+                        .store()
+                        .type_payload(shape)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .index_infos
+                        .clone()
+                        .unwrap();
+                    assert_eq!(indexes.len(), 1);
+                    let warm = property_recovery_store_counts(context.store());
+                    for _ in 0..2 {
+                        for (name, selected) in [("named", named), ("broad", broad)] {
+                            assert_eq!(
+                                context
+                                    .store_mut_for_test()
+                                    .resolve_generic_interface_property(reference, name, None),
+                                Ok(Some(selected)),
+                            );
+                        }
+                        assert_eq!(
+                            context
+                                .store()
+                                .type_payload(shape)
+                                .unwrap()
+                                .data()
+                                .structured()
+                                .unwrap()
+                                .index_infos
+                                .as_ref(),
+                            Some(&indexes),
+                        );
+                        assert_eq!(property_recovery_store_counts(context.store()), warm);
+                    }
+                }
+            }
+            for flags in [AccessFlags::INCLUDE_UNDEFINED, AccessFlags::NONE] {
+                let (mut context, shape, target, reference) =
+                    primitive_interface_member_recipe_fixture(&parsed, file, form);
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+                let parameter = match context.store().type_payload(target).unwrap().data() {
+                    TypeData::Interface(interface) => interface
+                        .reference
+                        .resolved_type_arguments
+                        .as_ref()
+                        .unwrap()[0],
+                    _ => panic!("Pick must retain its generic target"),
+                };
+                let owner = source_symbol(&parsed, file, &context, "Pick");
+                let member = context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|raw| context.store().symbol_table(raw))
+                    .and_then(|table| table.get_source(name))
+                    .unwrap();
+                let links = context.store().value_symbol_links(member).cloned().unwrap();
+                let key = if flags == AccessFlags::NONE {
+                    context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .es_symbol_type
+                } else {
+                    context
+                        .store_mut_for_test()
+                        .regular_string_literal_type("missing".to_owned())
+                        .unwrap()
+                };
+                let template = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, flags)
+                    .unwrap();
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    member,
+                    ValueSymbolLinks {
+                        resolved_type: Some(template),
+                        ..links
+                    },
+                ));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, name, None)
+                        .is_err()
+                );
+                let proxies = context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .as_deref()
+                    .unwrap_or_default();
+                assert!(proxies.iter().all(|proxy| {
+                    context
+                        .store()
+                        .value_symbol_links(*proxy)
+                        .is_none_or(|links| {
+                            links
+                                .resolved_type
+                                .is_none_or(|cached| cached != string && cached != number)
+                        })
+                }));
+                if flags == AccessFlags::INCLUDE_UNDEFINED {
+                    let TypeData::Interface(interface) =
+                        context.store().type_payload(shape).unwrap().data()
+                    else {
+                        panic!("Shape must retain its cold interface");
+                    };
+                    assert!(!interface.declared_members_resolved);
+                    assert!(!interface.base_types_resolved);
+                }
+            }
+        }
     }
 
     #[test]

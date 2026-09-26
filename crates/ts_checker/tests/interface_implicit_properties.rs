@@ -149,8 +149,28 @@ fn ordinary_interface_implicit_properties_preserve_cold_and_warm_types() {
     let owner = symbol(&context, &parsed, "Loose");
     assert!(context.store().declared_type_links(owner).is_none());
     let type_ = context.get_declared_type_of_symbol(owner).unwrap();
-    assert_properties(&context, &parsed, type_);
+    {
+        let store = context.store();
+        assert_eq!(
+            store.declared_type_links(owner).and_then(|links| links.declared_type),
+            Some(type_),
+        );
+        let payload = store.type_payload(type_).unwrap();
+        let TypeData::Interface(interface) = payload.data() else {
+            panic!("Loose must retain its declared interface type");
+        };
+        assert_eq!(payload.symbol(), Some(owner));
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_members.is_none());
+        assert!(interface.reference.object.structured.properties.is_none());
+        assert!(
+            store
+                .type_node_links(named_declaration(&parsed, "value").1)
+                .is_none()
+        );
+    }
     context.check_source_file(FILE).unwrap();
+    assert_properties(&context, &parsed, type_);
     assert!(context.diagnostics().is_empty());
     let bootstrap = context.store().intrinsic_bootstrap().unwrap();
     assert_eq!(

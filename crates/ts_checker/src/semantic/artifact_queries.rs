@@ -205,6 +205,18 @@ struct ArtifactTypeNamePart {
     text: EscapedName,
 }
 
+struct AmbientClassHeritageArtifact {
+    source_declaration: NodeRef,
+    source_symbol: SemanticSymbolId,
+    expression: NodeRef,
+    reference: NodeRef,
+    qualifier: NodeRef,
+    leaf: NodeRef,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    side: super::classes::ClassQueryTypeSide,
+}
+
 impl CanonicalCheckerContext<'_> {
     /// Returns the canonical semantic type for one exact Program node.
     ///
@@ -222,6 +234,24 @@ impl CanonicalCheckerContext<'_> {
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
         let catch_rest = self.catch_rest_artifact_type(node)?;
         let declaration = self.prepare_artifact_type_location(node)?;
+
+        if self.class_binding_key_artifact_symbol(node)?.is_some() {
+            // Go's getTypeOfNode does not classify an explicit binding key as
+            // an expression or declaration name, even though its symbol query
+            // identifies the receiver's property.
+            let type_ = self
+                .store()
+                .intrinsic_bootstrap()
+                .ok_or(CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: SyntaxKind::Identifier,
+                })?
+                .error_type;
+            return self.validate_artifact_type(node, type_);
+        }
+        if let Some(type_) = self.class_assignment_artifact_type(node)? {
+            return self.validate_artifact_type(node, type_);
+        }
 
         if let Some(type_) = self
             .import_meta_artifact_type(node)
@@ -255,11 +285,19 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.checked_prefix_unary_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.checked_conditional_literal_artifact_type(node)? {
             return Ok(type_);
         }
 
         if let Some(type_) = self.arrow_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.computed_object_property_artifact_type(node)? {
             return Ok(type_);
         }
 
@@ -297,6 +335,18 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.ambient_class_type_name_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.ambient_class_heritage_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.javascript_class_heritage_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some((type_, _)) = self.class_heritage_artifact_target(node)? {
             return Ok(type_);
         }
@@ -305,7 +355,16 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some((type_, _)) = self.source_alias_interface_heritage_artifact_target(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.checked_source_method_artifact_type(node)? {
+            return self.validate_artifact_type(node, type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
+            && kind != SyntaxKind::TypeReference
             && let Some(type_) = self.cached_artifact_type(node)?
         {
             return Ok(type_);
@@ -395,6 +454,10 @@ impl CanonicalCheckerContext<'_> {
         }
         self.prepare_artifact_location(node)?;
 
+        if let Some(symbol) = self.class_binding_key_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
         match self
             .import_meta_artifact_symbol(
                 node,
@@ -448,6 +511,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(Some(symbol));
         }
 
+        if let Some((_, symbol)) = self.source_alias_interface_heritage_artifact_target(node)? {
+            return Ok(Some(symbol));
+        }
+
         let (bound_symbol, parent, supported) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             (
@@ -475,6 +542,12 @@ impl CanonicalCheckerContext<'_> {
             )
             && let Some(symbol) = self.cached_artifact_symbol(node)?
         {
+            if matches!(
+                parent,
+                None | Some(LocationParent::ElementAccess(_) | LocationParent::TypeQuery(_))
+            ) {
+                return self.expression_export_artifact_symbol(node, symbol).map(Some);
+            }
             return Ok(Some(symbol));
         }
 
@@ -564,7 +637,9 @@ impl CanonicalCheckerContext<'_> {
             }
             Some(LocationParent::TypeQuery(query)) => {
                 self.get_type_from_type_node(query)?;
-                self.cached_artifact_symbol(node)
+                self.cached_artifact_symbol(node)?
+                    .map(|symbol| self.expression_export_artifact_symbol(node, symbol))
+                    .transpose()
             }
             Some(
                 LocationParent::PropertyAccess(access) | LocationParent::ElementAccess(access),
@@ -987,6 +1062,164 @@ impl CanonicalCheckerContext<'_> {
             .get(node.node)
             .ok_or(CanonicalArtifactQueryError::ForeignNode(node))?;
         Ok((arena, bound, record))
+    }
+
+    fn class_assignment_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, _, record) = self.validated_artifact_node(node)?;
+        if record.kind != SyntaxKind::ObjectLiteralExpression {
+            return Ok(None);
+        }
+        let Some(NodeData::BinaryExpression(binary)) = record
+            .parent
+            .and_then(|parent| arena.get(parent))
+            .map(|parent| &parent.data)
+        else {
+            return Ok(None);
+        };
+        if binary.left != node.node
+            || arena
+                .get(binary.operator_token)
+                .is_none_or(|node| node.kind != SyntaxKind::EqualsToken)
+            || arena
+                .get(binary.right)
+                .is_none_or(|node| node.kind != SyntaxKind::ThisKeyword)
+        {
+            return Ok(None);
+        }
+        let invalid = || CanonicalArtifactQueryError::SourceCheck(SourceCheckError::Property(node));
+        let host = self.declared_type_host()?;
+        let plan = super::object_members::plan_object_literal(self.store(), &host, node)
+            .map_err(|_| invalid())?;
+        if !plan.is_class_assignment() {
+            return Err(invalid());
+        }
+        for property in plan.class_assignment_properties().ok_or_else(invalid)? {
+            super::source_properties::class_binding_property_artifact_symbol(
+                self.store(),
+                &host,
+                property.binding(),
+                property.receiver(),
+            )
+            .map_err(|_| invalid())?;
+        }
+        let state = super::object_members::object_literal_state(self.store(), &plan)
+            .map_err(|_| invalid())?
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            })?;
+        let types = plan
+            .properties
+            .iter()
+            .map(|property| {
+                let links = self
+                    .store()
+                    .type_node_links(property.type_node)
+                    .ok_or_else(invalid)?;
+                if links.outer_type_parameters.is_some() {
+                    return Err(invalid());
+                }
+                links.resolved_type.ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        super::object_members::validate_resolved_property_types(self.store(), &plan, &types)
+            .map_err(|_| invalid())?;
+        Ok(Some(state.type_id()))
+    }
+
+    fn class_binding_key_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (arena, _, record) = self.validated_artifact_node(node)?;
+        if record.kind != SyntaxKind::Identifier {
+            return Ok(None);
+        }
+        let Some(binding_id) = record.parent else {
+            return Ok(None);
+        };
+        let binding = NodeRef::new(node.arena, node.file, binding_id);
+        let (_, _, binding_record) = self.validated_artifact_node(binding)?;
+        let NodeData::BindingElement(element) = &binding_record.data else {
+            return Ok(None);
+        };
+        if element.property_name != Some(node.node) || element.name == Some(node.node) {
+            return Ok(None);
+        }
+        let Some(pattern) = binding_record.parent.and_then(|parent| arena.get(parent)) else {
+            return Ok(None);
+        };
+        if pattern.kind != SyntaxKind::ObjectBindingPattern {
+            return Ok(None);
+        }
+        let Some(NodeData::VariableDeclaration(variable)) = pattern
+            .parent
+            .and_then(|parent| arena.get(parent))
+            .map(|parent| &parent.data)
+        else {
+            return Ok(None);
+        };
+        let Some(receiver_id) = variable.initializer else {
+            return Ok(None);
+        };
+        let receiver = NodeRef::new(node.arena, node.file, receiver_id);
+        if self.validated_artifact_node(receiver)?.2.kind != SyntaxKind::ThisKeyword {
+            return Ok(None);
+        }
+        let host = self.declared_type_host()?;
+        let symbol = super::source_properties::class_binding_property_artifact_symbol(
+            self.store(),
+            &host,
+            binding,
+            receiver,
+        )
+        .map_err(|error| match error {
+            super::source_properties::SourcePropertyError::Unsupported(_)
+            | super::source_properties::SourcePropertyError::PendingClassProperty(_) => {
+                CanonicalArtifactQueryError::UnsupportedNode {
+                    node,
+                    kind: record.kind,
+                }
+            }
+            _ => CanonicalArtifactQueryError::SourceCheck(SourceCheckError::Property(node)),
+        })?;
+        if let Some(links) = self.store().symbol_node_links(node)
+            && links != &super::SymbolNodeLinks::default()
+            && links
+                != &(super::SymbolNodeLinks {
+                    resolved_symbol: Some(symbol),
+                })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: links.resolved_symbol.unwrap_or(symbol),
+            });
+        }
+        let error_type = self
+            .store()
+            .intrinsic_bootstrap()
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            })?
+            .error_type;
+        if let Some(links) = self.store().type_node_links(node)
+            && links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(error_type),
+                    ..TypeNodeLinks::default()
+                })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: links.resolved_type.unwrap_or(error_type),
+            });
+        }
+        Ok(Some(symbol))
     }
 
     fn cached_artifact_type(
@@ -1712,6 +1945,28 @@ impl CanonicalCheckerContext<'_> {
         Ok(())
     }
 
+    fn checked_prefix_unary_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(
+            record.data,
+            NodeData::PrefixUnaryExpression(_)
+                | NodeData::ParenthesizedExpression(_)
+                | NodeData::NumericLiteral(_)
+                | NodeData::BigIntLiteral(_)
+                | NodeData::KeywordExpression(_)
+        ) {
+            return Ok(None);
+        }
+        let source = self
+            .source_file(node.file)
+            .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+        super::source::checked_prefix_unary_artifact_type(arena, bound, source, self.store(), node)
+            .map_err(CanonicalArtifactQueryError::from)
+    }
+
     fn checked_conditional_literal_artifact_type(
         &self,
         node: NodeRef,
@@ -2034,6 +2289,93 @@ impl CanonicalCheckerContext<'_> {
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
     }
 
+    fn expression_export_artifact_symbol(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let NodeData::Identifier(identifier) = &record.data else {
+            return Ok(symbol);
+        };
+        let Some(parent) = record.parent else {
+            return Ok(symbol);
+        };
+        let (_, _, parent) =
+            self.validated_artifact_node(NodeRef::new(node.arena, node.file, parent))?;
+        let direct_type_query_name = record.kind == SyntaxKind::Identifier
+            && parent.kind == SyntaxKind::TypeQuery
+            && matches!(
+                &parent.data,
+                NodeData::TypeQueryNode(query)
+                    if query.expr_name == node.node && query.type_arguments.is_none()
+            );
+        if is_type_syntax(&parent.data) && !direct_type_query_name
+            || matches!(
+                parent.data,
+                NodeData::QualifiedName(_)
+                    | NodeData::ImportEqualsDeclaration(_)
+                    | NodeData::ExportAssignment(_)
+                    | NodeData::ExpressionWithTypeArguments(_)
+            )
+        {
+            return Ok(symbol);
+        }
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+        let local = self.store().symbol(symbol).ok_or_else(invalid)?;
+        if local.flags() != SymbolFlags::EXPORT_VALUE {
+            return Ok(symbol);
+        }
+        let raw_export = local.export_symbol().ok_or_else(invalid)?;
+        let export = self.merged_artifact_symbol(node, raw_export)?;
+        let raw_record = self.store().symbol(raw_export).ok_or_else(invalid)?;
+        let export_record = self.store().symbol(export).ok_or_else(invalid)?;
+        let declarations = local.declarations().ok_or_else(invalid)?;
+        if declarations.is_empty()
+            || local.check_flags() != ts_binder::CheckFlags::NONE
+            || local.name() != EscapedNameRef::source(&identifier.text)
+            || local.value_declaration().is_some()
+            || local.parent().is_some()
+            || local.members().is_some()
+            || local.exports().is_some()
+            || self.store().get_merged_symbol(symbol) != Some(symbol)
+            || !raw_record.flags().intersects(SymbolFlags::VALUE)
+            || !export_record.flags().intersects(SymbolFlags::VALUE)
+            || raw_record
+                .flags()
+                .intersects(SymbolFlags::ALIAS | SymbolFlags::EXPORT_VALUE)
+            || export_record
+                .flags()
+                .intersects(SymbolFlags::ALIAS | SymbolFlags::EXPORT_VALUE)
+        {
+            return Err(invalid());
+        }
+        for (index, &declaration) in declarations.iter().enumerate() {
+            let (_, bound, _) = self.validated_artifact_node(declaration)?;
+            if declarations[..index].contains(&declaration)
+                || bound.local_symbol(declaration) != Some(symbol)
+                || bound.symbol(declaration) != Some(raw_export)
+                || raw_record
+                    .declarations()
+                    .is_none_or(|rows| !rows.contains(&declaration))
+                || export_record
+                    .declarations()
+                    .is_none_or(|rows| !rows.contains(&declaration))
+            {
+                return Err(invalid());
+            }
+        }
+        // Source checks retain the local export marker. Public value lookup
+        // skips that marker and returns the real exported declaration symbol.
+        if self.lexical_artifact_symbol(node, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)?
+            != Some(symbol)
+            || self.lexical_artifact_symbol(node, SymbolFlags::VALUE)? != Some(export)
+        {
+            return Err(invalid());
+        }
+        Ok(export)
+    }
+
     fn module_declaration_artifact_type(
         &mut self,
         node: NodeRef,
@@ -2113,6 +2455,62 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn computed_object_property_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let declaration = match &record.data {
+            NodeData::ComputedPropertyName(_) => {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                NodeRef::new(node.arena, node.file, parent)
+            }
+            NodeData::PropertyAssignment(_) => node,
+            _ => return Ok(None),
+        };
+        let (_, _, property) = self.validated_artifact_node(declaration)?;
+        let NodeData::PropertyAssignment(assignment) = &property.data else {
+            return Ok(None);
+        };
+        if node != declaration && assignment.name != node.node {
+            return Ok(None);
+        }
+        let Some(owner) = property.parent else {
+            return Ok(None);
+        };
+        if arena
+            .get(owner)
+            .is_none_or(|owner| owner.kind != SyntaxKind::ObjectLiteralExpression)
+        {
+            return Ok(None);
+        }
+        let owner = NodeRef::new(node.arena, node.file, owner);
+        let Some(type_) = self.cached_artifact_type(owner)? else {
+            return Ok(None);
+        };
+        let Some(TypeData::Object(object)) = self.store().type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        if object.source_computed_literal.is_none()
+            && !super::object_members::source_object_requires_computed_proof(self.store(), type_)
+        {
+            return Ok(None);
+        }
+        let symbol = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?;
+        let value = super::object_members::source_computed_object_property_type(
+            self.store(),
+            type_,
+            symbol,
+        )
+        .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?;
+        self.validate_artifact_type(node, value).map(Some)
     }
 
     fn literal_computed_artifact_symbol(
@@ -2442,6 +2840,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         let (arena, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        // Module names use the binder's canonical quotes, not property-name spelling.
+        if matches!(declaration_record.data, NodeData::ModuleDeclaration(_)) {
+            return Ok(None);
+        }
         let Some(name_id) = declaration_name(&declaration_record.data) else {
             return Ok(None);
         };
@@ -3287,8 +3689,555 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(owner))
     }
 
-    /// A class base name denotes its instance here, even when checking the
-    /// extends expression retained the constructor value at that same node.
+    /// Demands an empty JavaScript class through the existing class member query.
+    /// The written qualified base selects the class, not its JSDoc annotation.
+    #[allow(clippy::too_many_lines)] // Keep source role selection and both exact class sides in one demand path.
+    fn javascript_class_heritage_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (whole, owner, value_leaf) = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            if !bound.source_facts().is_some_and(|facts| {
+                facts.is_javascript_file()
+                    && !facts.is_declaration_file()
+                    && !facts.is_external_or_common_js_module()
+            }) {
+                return Ok(None);
+            }
+            let whole = if matches!(
+                record.data,
+                NodeData::QualifiedName(_) | NodeData::PropertyAccessExpression(_)
+            ) {
+                node
+            } else if record.kind == SyntaxKind::Identifier
+                && let Some(parent) = record.parent
+                && arena.get(parent).is_some_and(|record| match &record.data {
+                    NodeData::QualifiedName(name) => name.right == node.node,
+                    NodeData::PropertyAccessExpression(access) => access.name == node.node,
+                    _ => false,
+                })
+            {
+                NodeRef::new(node.arena, node.file, parent)
+            } else {
+                return Ok(None);
+            };
+            let Some(wrapper) = arena
+                .get(whole.node)
+                .and_then(|record| record.parent)
+                .and_then(|parent| arena.get(parent))
+            else {
+                return Ok(None);
+            };
+            let NodeData::ExpressionWithTypeArguments(expression) = &wrapper.data else {
+                return Ok(None);
+            };
+            if expression.expression != whole.node || expression.type_arguments.is_some() {
+                return Ok(None);
+            }
+            let Some(clause) = wrapper.parent.and_then(|parent| arena.get(parent)) else {
+                return Ok(None);
+            };
+            let NodeData::HeritageClause(heritage) = &clause.data else {
+                return Ok(None);
+            };
+            let Some(owner) = clause.parent else {
+                return Ok(None);
+            };
+            let Some(NodeData::ClassDeclaration(class)) =
+                arena.get(owner).map(|record| &record.data)
+            else {
+                return Ok(None);
+            };
+            if heritage.token != SyntaxKind::ExtendsKeyword
+                || class.type_parameters.is_some()
+                || class.modifiers.is_some()
+                || !class.members.nodes.is_empty()
+            {
+                return Ok(None);
+            }
+            let declaration = NodeRef::new(node.arena, node.file, owner);
+            let symbol = bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store().get_merged_symbol(symbol))
+                .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+            (whole, symbol, node != whole)
+        };
+        let members = self
+            .get_nongeneric_class_members(owner)
+            .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?;
+        let instance = members.shells().instance_type();
+        let Some((base, symbol)) = self.class_heritage_artifact_target(whole)? else {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            });
+        };
+        let provenance = self
+            .store()
+            .direct_class_heritage_provenance(instance)
+            .ok_or(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            })?;
+        if provenance.owner_symbol != owner
+            || provenance.base_symbol != symbol
+            || provenance.base_instance_type != base
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            });
+        }
+        self.validate_artifact_type(
+            node,
+            if value_leaf {
+                provenance.base_value_type
+            } else {
+                base
+            },
+        )
+        .map(Some)
+    }
+
+    /// A warm constructor must not change a genuine type-reference name to a value.
+    #[allow(clippy::too_many_lines)] // Authenticate the same namespace class before the existing type query.
+    fn ambient_class_type_name_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let name = match &self.validated_artifact_node(node)?.2.data {
+            NodeData::TypeReferenceNode(reference) => {
+                NodeRef::new(node.arena, node.file, reference.type_name)
+            }
+            _ => node,
+        };
+        let Some(path) = self.type_name_artifact_path(name)? else {
+            return Ok(None);
+        };
+        let [qualifier, leaf] = path.parts.as_slice() else {
+            return Ok(None);
+        };
+        if ![path.reference, path.full_name, leaf.identifier].contains(&node)
+            || !matches!(&self.validated_artifact_node(path.reference)?.2.data,
+                NodeData::TypeReferenceNode(reference) if reference.type_arguments.is_none())
+        {
+            return Ok(None);
+        }
+        let Some(namespace) = self.lexical_artifact_symbol(
+            qualifier.identifier,
+            SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(namespace_record) = self.store().symbol(namespace) else {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: namespace,
+            });
+        };
+        if namespace_record.flags() != SymbolFlags::VALUE_MODULE {
+            return Ok(None);
+        }
+        let Some(symbol) = namespace_record
+            .exports()
+            .and_then(|exports| self.store().symbol_table(exports))
+            .and_then(|exports| exports.get(leaf.text.as_ref()))
+        else {
+            return Ok(None);
+        };
+        if self
+            .store()
+            .symbol(symbol)
+            .is_none_or(|owner| owner.flags() != SymbolFlags::CLASS)
+            || self
+                .store()
+                .value_symbol_links(symbol)
+                .is_none_or(|links| links == &super::ValueSymbolLinks::default())
+        {
+            return Ok(None);
+        }
+        let host = self.declared_type_host()?;
+        match super::classes::validate_ambient_namespace_class_query_shell(
+            self.store(),
+            &host,
+            symbol,
+        ) {
+            Ok(()) => {}
+            Err(super::ClassError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
+        }
+        let instance = self
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: SyntaxKind::TypeReference,
+            })?;
+        for location in [path.reference, path.full_name, leaf.identifier] {
+            if let Some(links) = self.store().type_node_links(location) {
+                if links.outer_type_parameters.is_some() {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(location));
+                }
+                if let Some(cached) = links.resolved_type
+                    && cached != instance
+                {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: location,
+                        type_: cached,
+                    });
+                }
+            }
+        }
+        if self.type_name_artifact_symbol(path.full_name)? != Some(Some(symbol)) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        let type_ = self.type_node_artifact_type(path.reference)?;
+        if type_ != instance {
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    /// Grammar-only JavaScript heritage has no completed source-class base graph.
+    /// Prove the actual namespace class and query role before reading any cache.
+    #[allow(clippy::too_many_lines)] // Keep every source parent and list edge in one proof.
+    fn ambient_class_heritage_artifact(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<AmbientClassHeritageArtifact>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_external_module())
+        {
+            return Ok(None);
+        }
+        let (expression, side) = match &record.data {
+            NodeData::QualifiedName(_) => (node, super::classes::ClassQueryTypeSide::Instance),
+            NodeData::Identifier(_) => {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                let parent = NodeRef::new(node.arena, node.file, parent);
+                let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+                if !matches!(&parent_record.data,
+                    NodeData::QualifiedName(name) if name.right == node.node)
+                {
+                    return Ok(None);
+                }
+                (parent, super::classes::ClassQueryTypeSide::Value)
+            }
+            _ => return Ok(None),
+        };
+        let (_, _, expression_record) = self.validated_artifact_node(expression)?;
+        let NodeData::QualifiedName(name) = &expression_record.data else {
+            return Ok(None);
+        };
+        let Some(reference) = expression_record.parent else {
+            return Ok(None);
+        };
+        let reference = NodeRef::new(node.arena, node.file, reference);
+        let (_, _, reference_record) = self.validated_artifact_node(reference)?;
+        let NodeData::ExpressionWithTypeArguments(base) = &reference_record.data else {
+            return Ok(None);
+        };
+        let Some(clause) = reference_record.parent else {
+            return Ok(None);
+        };
+        let clause = NodeRef::new(node.arena, node.file, clause);
+        let (_, _, clause_record) = self.validated_artifact_node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let Some(declaration) = clause_record.parent else {
+            return Ok(None);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration);
+        let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &declaration_record.data else {
+            return Ok(None);
+        };
+        if heritage.token != SyntaxKind::ExtendsKeyword
+            || class.type_parameters.is_some()
+            || class.modifiers.is_some()
+            || !class.members.nodes.is_empty()
+            || base.type_arguments.is_some()
+        {
+            return Ok(None);
+        }
+        let qualifier = NodeRef::new(node.arena, node.file, name.left);
+        let leaf = NodeRef::new(node.arena, node.file, name.right);
+        let (_, _, qualifier_record) = self.validated_artifact_node(qualifier)?;
+        let (_, _, leaf_record) = self.validated_artifact_node(leaf)?;
+        let (NodeData::Identifier(qualifier_name), NodeData::Identifier(member_name)) =
+            (&qualifier_record.data, &leaf_record.data)
+        else {
+            return Ok(None);
+        };
+        let source = bound.source_file();
+        let source_record = arena
+            .get(source.node)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(source))?;
+        let NodeData::SourceFile(source_data) = &source_record.data else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(source));
+        };
+        if expression_record.kind != SyntaxKind::QualifiedName
+            || name.flow_node.is_some()
+            || name.facts != 0
+            || reference_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base.expression != expression.node
+            || base.facts != 0
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || heritage.types.nodes.as_slice() != [reference.node]
+            || reference_record.range.start < heritage.types.range.start
+            || reference_record.range.end > heritage.types.range.end
+            || declaration_record.kind != SyntaxKind::ClassDeclaration
+            || declaration_record.parent != Some(source.node)
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.members.has_trailing_comma
+            || class.members.range.end != declaration_record.range.end
+            || class.heritage_clauses.as_ref().is_none_or(|clauses| {
+                clauses.has_trailing_comma || clauses.nodes.as_slice() != [clause.node]
+            })
+            || source_record.kind != SyntaxKind::SourceFile
+            || source_record.parent.is_some()
+            || source_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|statement| **statement == declaration.node)
+                .count()
+                != 1
+            || qualifier_record.kind != SyntaxKind::Identifier
+            || qualifier_name.flow_node.is_some()
+            || qualifier_name.text.is_empty()
+            || leaf_record.kind != SyntaxKind::Identifier
+            || member_name.flow_node.is_some()
+            || member_name.text.is_empty()
+        {
+            return Err(CanonicalArtifactQueryError::ForeignNode(node));
+        }
+        for (child, parent) in [
+            (qualifier, expression),
+            (leaf, expression),
+            (expression, reference),
+            (reference, clause),
+            (clause, declaration),
+            (declaration, source),
+        ] {
+            let (_, _, child_record) = self.validated_artifact_node(child)?;
+            let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+            if child_record.flags.0 != 0
+                || child_record.parent != Some(parent.node)
+                || child_record.range.start < parent_record.range.start
+                || child_record.range.end > parent_record.range.end
+            {
+                return Err(CanonicalArtifactQueryError::ForeignNode(child));
+            }
+        }
+        let source_symbol = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+        let source_owner = self.store().symbol(source_symbol).ok_or(
+            CanonicalArtifactQueryError::InvalidSymbol {
+                node: declaration,
+                symbol: source_symbol,
+            },
+        )?;
+        if source_owner.flags() != SymbolFlags::CLASS
+            || source_owner.check_flags() != ts_binder::CheckFlags::NONE
+            || source_owner.declarations() != Some(&[declaration])
+            || source_owner.value_declaration() != Some(declaration)
+            || source_owner.parent().is_some()
+            || source_owner.export_symbol().is_some()
+            || self.store().get_merged_symbol(source_symbol) != Some(source_symbol)
+            || !self.store().source_symbol_declarations_match(source_symbol)
+            || !self
+                .store()
+                .source_declaration_belongs_to_symbol(declaration, source_symbol)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: declaration,
+                symbol: source_symbol,
+            });
+        }
+        let namespace = self
+            .lexical_artifact_symbol(qualifier, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)?
+            .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                node: qualifier,
+                kind: SyntaxKind::Identifier,
+            })?;
+        let namespace_record =
+            self.store()
+                .symbol(namespace)
+                .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: qualifier,
+                    symbol: namespace,
+                })?;
+        if namespace_record.flags() != SymbolFlags::VALUE_MODULE
+            || self
+                .store()
+                .module_symbol_links(namespace)
+                .and_then(|links| links.resolved_exports)
+                .is_some_and(|exports| Some(exports) != namespace_record.exports())
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: qualifier,
+                symbol: namespace,
+            });
+        }
+        let symbol = namespace_record
+            .exports()
+            .and_then(|exports| self.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source(&member_name.text))
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                node: expression,
+                symbol: namespace,
+            })?;
+        if self.store().get_parent_of_symbol(symbol) != Some(namespace) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        Ok(Some(AmbientClassHeritageArtifact {
+            source_declaration: declaration,
+            source_symbol,
+            expression,
+            reference,
+            qualifier,
+            leaf,
+            namespace,
+            symbol,
+            side,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep source-family selection before the existing role and cache proof.
+    fn ambient_class_heritage_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let Some(query) = self.ambient_class_heritage_artifact(node)? else {
+            return Ok(None);
+        };
+        let host = self.declared_type_host()?;
+        let mut full_members = super::classes::ambient_class_heritage_requires_full_members(
+            self.store(),
+            &host,
+            query.source_declaration,
+            query.source_symbol,
+        )
+        .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?;
+        if !full_members {
+            let invalid_owner = || CanonicalArtifactQueryError::Class {
+                node,
+                error: super::ClassError::Invariant(
+                    super::classes::ClassInvariant::InvalidOwnerSymbol(query.symbol),
+                ),
+            };
+            let owner = self
+                .store()
+                .symbol(query.symbol)
+                .ok_or_else(invalid_owner)?;
+            let [declaration] = owner.declarations().unwrap_or_default() else {
+                return Err(invalid_owner());
+            };
+            full_members = super::source_namespaces::plan_ambient_namespace_class_query_owner(
+                self.store(),
+                &host,
+                query.symbol,
+                *declaration,
+            )
+            .map_err(|_| invalid_owner())?
+            .is_none();
+        }
+        if full_members {
+            return self
+                .javascript_class_heritage_artifact_type(node)?
+                .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                    node,
+                    kind: self.validated_artifact_node(node)?.2.kind,
+                })
+                .map(Some);
+        }
+        super::classes::validate_ambient_namespace_class_query_shell(
+            self.store(),
+            &host,
+            query.symbol,
+        )
+        .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?;
+        let instance = self
+            .store()
+            .declared_type_links(query.symbol)
+            .and_then(|links| links.declared_type);
+        let value = self
+            .store()
+            .value_symbol_links(query.symbol)
+            .and_then(|links| links.resolved_type);
+        let namespace_value = self
+            .store()
+            .value_symbol_links(query.namespace)
+            .and_then(|links| links.resolved_type);
+        for (location, expected) in [
+            (query.expression, value),
+            (query.leaf, value),
+            (query.reference, instance),
+            (query.qualifier, namespace_value),
+        ] {
+            if let Some(links) = self.store().type_node_links(location) {
+                if links.outer_type_parameters.is_some() {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(location));
+                }
+                if let Some(cached) = links.resolved_type
+                    && Some(cached) != expected
+                {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: location,
+                        type_: cached,
+                    });
+                }
+            }
+        }
+        for (location, expected) in [
+            (query.expression, query.symbol),
+            (query.leaf, query.symbol),
+            (query.reference, query.symbol),
+            (query.qualifier, query.namespace),
+        ] {
+            if let Some(cached) = self
+                .store()
+                .symbol_node_links(location)
+                .and_then(|links| links.resolved_symbol)
+                && cached != expected
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: location,
+                    symbol: cached,
+                });
+            }
+        }
+        // The baseline asks the whole heritage row for the base instance. Do not
+        // publish that override as the ordinary constructor-expression cache.
+        let type_ = match query.side {
+            super::classes::ClassQueryTypeSide::Instance => {
+                self.get_declared_type_of_symbol(query.symbol)?
+            }
+            super::classes::ClassQueryTypeSide::Value => self
+                .get_class_query_shells(query.symbol)
+                .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?
+                .value_type(),
+        };
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    /// Keeps the declared base separate from an imported constructor expression.
     fn class_heritage_artifact_target(
         &self,
         node: NodeRef,
@@ -3354,9 +4303,38 @@ impl CanonicalCheckerContext<'_> {
         {
             return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
         }
+        let source = self.store().source_class_provenance(owner_type);
+        let (type_, reference_symbol) = if let Some(imported) =
+            source.and_then(super::classes::SourceClassProvenance::imported_base)
+        {
+            let host = self
+                .declared_type_host()?
+                .with_module_resolutions(self.module_resolutions());
+            let value = imported
+                .completed_value(self.store(), &host, self.global_types(), self.options())
+                .map_err(|error| {
+                    CanonicalArtifactQueryError::SourceCheck(
+                        super::source::source_class_import_error(node, &error),
+                    )
+                })?
+                .ok_or(CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: record.kind,
+                })?;
+            if imported.demand.read.node != node
+                || imported.owner.symbol != symbol
+                || value.members.shells().instance_type() != base
+                || value.members.shells().value_type() != provenance.base_value_type
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
+            }
+            (provenance.base_value_type, imported.demand.read.resolved_symbol)
+        } else {
+            (base, symbol)
+        };
         // The source-body producer retains the value expression. The older
         // declaration producer retains the base type or leaves the name cold.
-        let expected_cache = if self.store().source_class_provenance(owner_type).is_some() {
+        let expected_cache = if source.is_some() {
             provenance.base_value_type
         } else {
             base
@@ -3378,15 +4356,15 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol_node_links(node)
             .and_then(|links| links.resolved_symbol)
-            && self.merged_artifact_symbol(node, cached)? != symbol
+            && self.merged_artifact_symbol(node, cached)? != reference_symbol
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol {
                 node,
                 symbol: cached,
             });
         }
-        self.validate_artifact_type(node, base)?;
-        Ok(Some((base, symbol)))
+        self.validate_artifact_type(node, type_)?;
+        Ok(Some((type_, reference_symbol)))
     }
 
     /// Reads the existing class receiver proof. This does not check a body again
@@ -3476,10 +4454,197 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some((type_, symbol)))
     }
 
+    /// Reads the written base slot and lexical symbol from current complete source proof.
+    /// Missing conditional query proof stays an error at this read-only entry.
+    #[allow(clippy::too_many_lines)] // Keep source eligibility, complete proof and both cache checks together.
+    fn source_alias_interface_heritage_artifact_target(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let (_, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(record.data, NodeData::Identifier(_)) {
+            return Ok(None);
+        }
+        let Some(reference_id) = record.parent else {
+            return Ok(None);
+        };
+        let reference = NodeRef::new(node.arena, node.file, reference_id);
+        let (_, _, reference_record) = self.validated_artifact_node(reference)?;
+        let NodeData::ExpressionWithTypeArguments(expression) = &reference_record.data else {
+            return Ok(None);
+        };
+        if expression.expression != node.node || expression.type_arguments.is_some() {
+            return Ok(None);
+        }
+        let Some(clause_id) = reference_record.parent else {
+            return Ok(None);
+        };
+        let clause = NodeRef::new(node.arena, node.file, clause_id);
+        let (_, _, clause_record) = self.validated_artifact_node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let Some(owner_id) = clause_record.parent else {
+            return Ok(None);
+        };
+        let owner = NodeRef::new(node.arena, node.file, owner_id);
+        let (_, _, owner_record) = self.validated_artifact_node(owner)?;
+        let NodeData::InterfaceDeclaration(declaration) = &owner_record.data else {
+            return Ok(None);
+        };
+        if heritage.token != SyntaxKind::ExtendsKeyword || declaration.type_parameters.is_some() {
+            return Ok(None);
+        }
+        let Some(owner_symbol) = bound.symbol(owner) else {
+            return Ok(None);
+        };
+        let owner_symbol = self.merged_artifact_symbol(node, owner_symbol)?;
+        let store = self.store();
+        if !store.source_declaration_belongs_to_symbol(owner, owner_symbol)
+            || store
+                .symbol(owner_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .is_none_or(|declarations| {
+                    declarations.iter().filter(|node| **node == owner).count() != 1
+                })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: owner,
+                symbol: owner_symbol,
+            });
+        }
+        let owner_type = store
+            .declared_type_links(owner_symbol)
+            .and_then(|links| links.declared_type);
+        let invalid = || match owner_type {
+            Some(type_) => CanonicalArtifactQueryError::InvalidType { node, type_ },
+            None => CanonicalArtifactQueryError::MissingType {
+                node: owner,
+                kind: SyntaxKind::InterfaceDeclaration,
+            },
+        };
+        let host = self.declared_type_host()?;
+        let Some(header) = super::interface_heritage::plan_source_interface_heritage_header(
+            store,
+            &host,
+            owner_symbol,
+        )
+        .map_err(|_| invalid())?
+        else {
+            if owner_type.is_some_and(|owner_type| {
+                store
+                    .source_interface_heritage_header(owner_type)
+                    .is_some_and(|header| header.bases().iter().any(|base| base.alias().is_some()))
+            }) {
+                return Err(invalid());
+            }
+            return Ok(None);
+        };
+        let owner_type = owner_type.ok_or_else(invalid)?;
+        if record.kind != SyntaxKind::Identifier
+            || reference_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || owner_record.kind != SyntaxKind::InterfaceDeclaration
+            || declaration.heritage_clauses.as_ref().is_none_or(|clauses| {
+                clauses.nodes.iter().filter(|id| **id == clause_id).count() != 1
+            })
+            || heritage
+                .types
+                .nodes
+                .iter()
+                .filter(|id| **id == reference_id)
+                .count()
+                != 1
+            || header.owner_symbol() != owner_symbol
+            || !header.owner_declarations().contains(&owner)
+        {
+            return Err(invalid());
+        }
+        let targets =
+            Some(super::array_types::CanonicalArrayTargets::from_global_types(self.global_types()));
+        super::interface_heritage::validate_source_interface_heritage_header(
+            store, owner_type, &header, targets,
+        )
+        .map_err(|_| invalid())?;
+        let provenance = store
+            .direct_interface_heritage_provenance(owner_type)
+            .ok_or_else(invalid)?;
+        if provenance.owner_symbol != owner_symbol || provenance.source.as_ref() != Some(&header) {
+            return Err(invalid());
+        }
+        super::interface_heritage::validate_source_interface_heritage_complete_bases(
+            store,
+            owner_type,
+            &header,
+            &provenance.bases,
+            targets,
+            None,
+        )
+        .map_err(|_| invalid())?;
+        let Some(TypeData::Interface(interface)) =
+            store.type_payload(owner_type).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        if !interface.base_types_resolved
+            || interface.resolved_base_types.as_ref().is_none_or(|bases| {
+                bases.len() != provenance.bases.len()
+                    || bases
+                        .iter()
+                        .zip(&provenance.bases)
+                        .any(|(base, (_, retained))| base != retained)
+            })
+        {
+            return Err(invalid());
+        }
+        let index = header
+            .bases()
+            .iter()
+            .position(|base| {
+                base.declaration() == owner
+                    && base.clause() == clause
+                    && base.node() == reference
+                    && base.expression() == node
+            })
+            .ok_or_else(invalid)?;
+        let &(symbol, type_) = provenance.bases.get(index).ok_or_else(invalid)?;
+        if header.bases()[index].symbol() != symbol {
+            return Err(invalid());
+        }
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        for cached_node in [reference, node] {
+            if let Some(links) = store.type_node_links(cached_node)
+                && *links != TypeNodeLinks::default()
+                && *links
+                    != (TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(invalid());
+            }
+            if let Some(cached) = store
+                .symbol_node_links(cached_node)
+                .and_then(|links| links.resolved_symbol)
+                && self
+                    .merged_artifact_symbol(cached_node, cached)
+                    .map_err(|_| invalid())?
+                    != symbol
+            {
+                return Err(invalid());
+            }
+        }
+        self.validate_artifact_type(node, type_)?;
+        Ok(Some((type_, symbol)))
+    }
+
     fn heritage_artifact_target(
         &self,
         node: NodeRef,
     ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        if let Some(target) = self.source_alias_interface_heritage_artifact_target(node)? {
+            return Ok(Some(target));
+        }
         let (arena, bound, record) = self.validated_artifact_node(node)?;
         let Some(reference_id) = record.parent else {
             return Ok(None);
@@ -4005,7 +5170,10 @@ impl CanonicalCheckerContext<'_> {
         ) {
             return Ok(None);
         }
-        let Some(object_type) = self.cached_artifact_type(object)? else {
+        let Some(object_type) = self
+            .class_assignment_artifact_type(object)?
+            .or(self.cached_artifact_type(object)?)
+        else {
             return Ok(None);
         };
         let Some(TypeData::Object(object_data)) =
@@ -4391,6 +5559,525 @@ fn supports_symbol_location(data: &NodeData) -> bool {
 }
 
 #[cfg(test)]
+mod source_alias_heritage_tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SemanticSymbolId,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::{CanonicalArtifactQueryError, CanonicalCheckerContext};
+    use crate::semantic::{CanonicalCheckerOptions, SymbolNodeLinks, TypeId, TypeNodeLinks};
+
+    const FILES: [FileId; 2] = [FileId::new(203_480), FileId::new(203_481)];
+
+    fn inputs() -> [ParseResult; 2] {
+        [
+            parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+                "interface Root { root: number; }\n",
+                "interface Merged extends Root { own: boolean; }\n",
+            )),
+            parse_source_file(concat!(
+                "type Added = { value: string };\n",
+                "type EmptyOne = string extends string ? {} : { unusedOne: number };\n",
+                "type EmptyTwo = number extends number ? {} : { unusedTwo: string };\n",
+                "interface Merged extends Added {}\n",
+                "interface Merged extends Root {}\n",
+                "interface Merged extends EmptyOne, Added {}\n",
+                "interface Separate extends EmptyTwo { separate: number; }\n",
+            )),
+        ]
+    }
+
+    fn context(parsed: &[ParseResult; 2]) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        for (index, (file, parsed)) in FILES.into_iter().zip(parsed).enumerate() {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if index == 0 {
+                            "\"/lib/lib.alias-base.d.ts\""
+                        } else {
+                            "\"/project/alias-base.d.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        index == 0,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            FILES
+                .into_iter()
+                .zip(parsed)
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn owner(
+        checker: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> (NodeRef, SemanticSymbolId) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let name = match &record.data {
+                    NodeData::InterfaceDeclaration(data) => data.name,
+                    NodeData::TypeAliasDeclaration(data) => data.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(name)?.data else {
+                    return None;
+                };
+                if name.text != expected {
+                    return None;
+                }
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                let symbol = checker.file(file)?.1.symbol(declaration)?;
+                Some((declaration, checker.store().get_merged_symbol(symbol)?))
+            })
+            .unwrap_or_else(|| panic!("missing source owner {expected}"))
+    }
+
+    fn references(parsed: &[ParseResult; 2], expected: &str) -> Vec<(NodeRef, NodeRef)> {
+        let mut references = Vec::new();
+        for (file, parsed) in FILES.into_iter().zip(parsed) {
+            let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+            else {
+                unreachable!()
+            };
+            for declaration in &source.statements.nodes {
+                let NodeData::InterfaceDeclaration(data) =
+                    &parsed.arena.get(*declaration).unwrap().data
+                else {
+                    continue;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(data.name).unwrap().data else {
+                    unreachable!()
+                };
+                if name.text != expected {
+                    continue;
+                }
+                for clause in &data.heritage_clauses.as_ref().unwrap().nodes {
+                    let NodeData::HeritageClause(data) = &parsed.arena.get(*clause).unwrap().data
+                    else {
+                        unreachable!()
+                    };
+                    for node in &data.types.nodes {
+                        let NodeData::ExpressionWithTypeArguments(data) =
+                            &parsed.arena.get(*node).unwrap().data
+                        else {
+                            unreachable!()
+                        };
+                        references.push((
+                            NodeRef::new(parsed.arena.id(), file, *node),
+                            NodeRef::new(parsed.arena.id(), file, data.expression),
+                        ));
+                    }
+                }
+            }
+        }
+        references
+    }
+
+    fn snapshot(checker: &CanonicalCheckerContext<'_>) -> String {
+        format!("{:#?}", (checker.store(), checker.diagnostics()))
+    }
+
+    fn assert_unavailable(
+        checker: &mut CanonicalCheckerContext<'_>,
+        references: &[(NodeRef, NodeRef)],
+        owner_type: TypeId,
+    ) {
+        let before = snapshot(checker);
+        for _ in 0..2 {
+            for &(_, name) in references {
+                let error = CanonicalArtifactQueryError::InvalidType {
+                    node: name,
+                    type_: owner_type,
+                };
+                assert_eq!(checker.heritage_artifact_target(name), Err(error));
+                assert_eq!(checker.get_symbol_at_location(name), Err(error));
+                assert_eq!(checker.get_type_at_location(name), Err(error));
+            }
+            assert_eq!(snapshot(checker), before);
+        }
+    }
+
+    fn assert_ready(
+        checker: &mut CanonicalCheckerContext<'_>,
+        rows: &[(NodeRef, SemanticSymbolId, TypeId)],
+    ) {
+        let before = snapshot(checker);
+        for type_first in [false, true] {
+            for &(name, symbol, type_) in rows {
+                assert_eq!(
+                    checker.heritage_artifact_target(name),
+                    Ok(Some((type_, symbol)))
+                );
+                if type_first {
+                    assert_eq!(checker.get_type_at_location(name), Ok(type_));
+                }
+                assert_eq!(checker.get_symbol_at_location(name), Ok(Some(symbol)));
+                assert_eq!(checker.get_type_at_location(name), Ok(type_));
+            }
+            assert_eq!(snapshot(checker), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold headers and complete answers on the same real owners.
+    fn source_alias_heritage_artifacts_keep_merged_slots_and_lexical_symbols() {
+        let parsed = inputs();
+        let merged_references = references(&parsed, "Merged");
+        let separate_references = references(&parsed, "Separate");
+        assert_eq!(merged_references.len(), 5);
+        assert_eq!(separate_references.len(), 1);
+        let mut checker = context(&parsed);
+        let (_, merged) = owner(&checker, &parsed[0], FILES[0], "Merged");
+        let (_, root) = owner(&checker, &parsed[0], FILES[0], "Root");
+        let (_, separate) = owner(&checker, &parsed[1], FILES[1], "Separate");
+        let aliases = ["Added", "EmptyOne", "EmptyTwo"]
+            .map(|name| owner(&checker, &parsed[1], FILES[1], name).1);
+        let derived = checker.get_declared_type_of_symbol(merged).unwrap();
+        let separate_type = checker.get_declared_type_of_symbol(separate).unwrap();
+        assert_ne!(derived, separate_type);
+        let header = checker
+            .store()
+            .source_interface_heritage_header(derived)
+            .unwrap();
+        assert_eq!(
+            header
+                .bases()
+                .iter()
+                .map(|base| (base.node(), base.expression()))
+                .collect::<Vec<_>>(),
+            merged_references
+        );
+        assert!(
+            checker
+                .store()
+                .direct_interface_heritage_provenance(derived)
+                .is_none()
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert_unavailable(&mut checker, &separate_references, separate_type);
+        for alias in aliases {
+            assert!(
+                checker
+                    .store()
+                    .type_alias_links(alias)
+                    .is_none_or(|links| links.declared_type.is_none())
+            );
+        }
+        for file in FILES {
+            checker.check_source_file(file).unwrap();
+        }
+        assert!(checker.diagnostics().is_empty());
+        let provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(derived)
+            .unwrap();
+        let symbols = [root, aliases[0], root, aliases[1], aliases[0]];
+        assert_eq!(
+            provenance
+                .bases
+                .iter()
+                .map(|(symbol, _)| *symbol)
+                .collect::<Vec<_>>(),
+            symbols
+        );
+        let empty = checker
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(provenance.bases[3].1, empty);
+        let separate_provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(separate_type)
+            .unwrap();
+        assert_eq!(separate_provenance.bases, [(aliases[2], empty)]);
+        assert_ne!(aliases[1], aliases[2]);
+        assert_ne!(provenance.bases[0].1, provenance.bases[1].1);
+        assert_eq!(provenance.bases[1], provenance.bases[4]);
+        assert_ne!(
+            checker
+                .store()
+                .type_payload(provenance.bases[1].1)
+                .unwrap()
+                .symbol(),
+            Some(aliases[0])
+        );
+        let mut rows = merged_references
+            .iter()
+            .zip(&provenance.bases)
+            .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_))
+            .collect::<Vec<_>>();
+        rows.extend(
+            separate_references
+                .iter()
+                .zip(&separate_provenance.bases)
+                .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_)),
+        );
+        assert_ready(&mut checker, &rows);
+        let reversed = rows.iter().rev().copied().collect::<Vec<_>>();
+        assert_ready(&mut checker, &reversed);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each real proof mutation beside its rejection and restoration.
+    fn source_alias_heritage_artifacts_reject_stale_proof_and_cache_shortcuts() {
+        let parsed = inputs();
+        let merged_references = references(&parsed, "Merged");
+        let separate_references = references(&parsed, "Separate");
+        let mut checker = context(&parsed);
+        let (_, merged) = owner(&checker, &parsed[0], FILES[0], "Merged");
+        let (_, root_symbol) = owner(&checker, &parsed[0], FILES[0], "Root");
+        let (_, separate) = owner(&checker, &parsed[1], FILES[1], "Separate");
+        let (added, added_symbol) = owner(&checker, &parsed[1], FILES[1], "Added");
+        let (first_empty, first_empty_symbol) = owner(&checker, &parsed[1], FILES[1], "EmptyOne");
+        let (_, second_empty_symbol) = owner(&checker, &parsed[1], FILES[1], "EmptyTwo");
+        for file in FILES {
+            checker.check_source_file(file).unwrap();
+        }
+        assert!(checker.diagnostics().is_empty());
+        let derived = checker.get_declared_type_of_symbol(merged).unwrap();
+        let separate_type = checker.get_declared_type_of_symbol(separate).unwrap();
+        let provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(derived)
+            .unwrap()
+            .clone();
+        let separate_provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(separate_type)
+            .unwrap()
+            .clone();
+        let mut rows = merged_references
+            .iter()
+            .zip(&provenance.bases)
+            .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_))
+            .collect::<Vec<_>>();
+        rows.extend(
+            separate_references
+                .iter()
+                .zip(&separate_provenance.bases)
+                .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_)),
+        );
+        let bases = provenance
+            .bases
+            .iter()
+            .map(|(_, type_)| *type_)
+            .collect::<Vec<_>>();
+        assert_ready(&mut checker, &rows);
+
+        let mut swapped = bases.clone();
+        swapped.swap(0, 1);
+        for damaged in [Some(swapped), Some(bases[..bases.len() - 1].to_vec()), None] {
+            assert!(checker.store_mut_for_test().set_interface_base_resolution(
+                derived,
+                damaged.is_some(),
+                None,
+                damaged,
+            ));
+            assert_unavailable(&mut checker, &merged_references, derived);
+            assert!(checker.store_mut_for_test().set_interface_base_resolution(
+                derived,
+                true,
+                None,
+                Some(bases.clone()),
+            ));
+            assert_ready(&mut checker, &rows);
+        }
+
+        let original_alias = checker
+            .store()
+            .type_alias_links(added_symbol)
+            .unwrap()
+            .clone();
+        let mut changed_alias = original_alias.clone();
+        changed_alias.declared_type = Some(bases[0]);
+        assert!(
+            checker
+                .store_mut_for_test()
+                .set_type_alias_links(added_symbol, changed_alias)
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert!(
+            checker
+                .store_mut_for_test()
+                .set_type_alias_links(added_symbol, original_alias)
+        );
+        assert_ready(&mut checker, &rows);
+
+        for declaration in [added, first_empty] {
+            let NodeData::TypeAliasDeclaration(alias) =
+                &parsed[1].arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let root = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+            let original = checker.store().type_node_links(root).unwrap().clone();
+            let mut changed = original.clone();
+            changed.resolved_type = Some(bases[0]);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(root, changed)
+            );
+            assert_unavailable(&mut checker, &merged_references, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(root, original)
+            );
+            assert_ready(&mut checker, &rows);
+        }
+
+        let added_row = provenance
+            .source
+            .as_ref()
+            .unwrap()
+            .bases()
+            .iter()
+            .find(|base| base.symbol() == added_symbol)
+            .unwrap();
+        let added_reference = [(added_row.node(), added_row.expression())];
+        for node in [added_row.node(), added_row.expression()] {
+            let original = checker
+                .store()
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(checker.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(bases[0]),
+                    ..original.clone()
+                },
+            ));
+            assert_unavailable(&mut checker, &added_reference, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(node, original)
+            );
+            assert_ready(&mut checker, &rows);
+
+            let original = checker
+                .store()
+                .symbol_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(checker.store_mut_for_test().set_symbol_node_links(
+                node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(second_empty_symbol),
+                },
+            ));
+            assert_unavailable(&mut checker, &added_reference, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_symbol_node_links(node, original)
+            );
+            assert_ready(&mut checker, &rows);
+        }
+
+        let source = checker.source_file(FILES[1]).unwrap();
+        let locals = checker
+            .file(FILES[1])
+            .unwrap()
+            .1
+            .locals(source.node_ref())
+            .unwrap();
+        let original = checker
+            .store()
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("EmptyOne")
+            .unwrap();
+        assert_eq!(
+            checker.store().get_merged_symbol(original),
+            Some(first_empty_symbol)
+        );
+        assert_eq!(bases[3], separate_provenance.bases[0].1);
+        assert_eq!(
+            checker.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("EmptyOne"),
+                second_empty_symbol,
+            ),
+            Some(Some(original))
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert_eq!(
+            checker.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("EmptyOne"),
+                original,
+            ),
+            Some(Some(second_empty_symbol))
+        );
+        assert_ready(&mut checker, &rows);
+
+        let written_owner = added_row.declaration();
+        let raw_owner = checker
+            .file(written_owner.file)
+            .unwrap()
+            .1
+            .symbol(written_owner)
+            .unwrap();
+        assert_ne!(raw_owner, merged);
+        assert_eq!(checker.store().get_merged_symbol(raw_owner), Some(merged));
+        assert_eq!(
+            checker
+                .store_mut_for_test()
+                .record_merged_symbol(root_symbol, raw_owner),
+            Ok(Some(merged))
+        );
+        let error = CanonicalArtifactQueryError::InvalidSymbol {
+            node: written_owner,
+            symbol: root_symbol,
+        };
+        let damaged = snapshot(&checker);
+        for _ in 0..2 {
+            let name = added_row.expression();
+            assert_eq!(checker.heritage_artifact_target(name), Err(error));
+            assert_eq!(checker.get_symbol_at_location(name), Err(error));
+            assert_eq!(checker.get_type_at_location(name), Err(error));
+            assert_eq!(snapshot(&checker), damaged);
+        }
+        assert_eq!(
+            checker
+                .store_mut_for_test()
+                .record_merged_symbol(merged, raw_owner),
+            Ok(Some(root_symbol))
+        );
+        assert_ready(&mut checker, &rows);
+    }
+}
+
+#[cfg(test)]
 mod cold_merged_namespace_tests;
 
 #[cfg(test)]
@@ -4417,13 +6104,779 @@ mod tests {
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerOptions,
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks,
-        ValueSymbolLinks,
+        IntrinsicBootstrapOptions, ModuleSymbolLinks, SourceAssertionError, SourceCheckError,
+        SourceLiteralCacheError, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
         types::{ObjectFlags, TypeFlags},
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn ambient_class_heritage_context<'a>(
+        declarations: &'a ParseResult,
+        main: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, name, language, declaration_file) in [
+            (
+                declarations,
+                FileId::new(6_185),
+                "\"/library.d.ts\"",
+                CanonicalSourceLanguage::TypeScript,
+                true,
+            ),
+            (
+                main,
+                FileId::new(6_186),
+                "\"/consumer.js\"",
+                CanonicalSourceLanguage::JavaScript,
+                false,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(name),
+                        language,
+                        declaration_file,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        binder
+            .bind_typescript_declaration_slice(&declarations.arena, FileId::new(6_185))
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&main.arena, FileId::new(6_186))
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (FileId::new(6_185), &declarations.arena),
+                (FileId::new(6_186), &main.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn ambient_class_heritage_expression(parsed: &ParseResult) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(6_186),
+                    base.expression,
+                ))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each wrong role cache is checked before any class-value publication.
+    fn ambient_class_heritage_queries_reject_wrong_role_caches_without_repair() {
+        let declarations =
+            parse_source_file("declare namespace Library { class Entry {} class Other {} }");
+        let main = ts_parser::parse_javascript_source_file(
+            "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+        );
+        let expression = ambient_class_heritage_expression(&main);
+        for warm in [false, true] {
+            for poison in [
+                "leaf_type",
+                "whole_type",
+                "reference_type",
+                "qualifier_type",
+                "leaf_symbol",
+                "whole_symbol",
+                "reference_symbol",
+                "qualifier_symbol",
+                "leaf_outer_parameters",
+                "whole_outer_parameters",
+            ] {
+                let mut context = ambient_class_heritage_context(&declarations, &main);
+                context.check_source_file(FileId::new(6_185)).unwrap();
+                context.check_source_file(FileId::new(6_186)).unwrap();
+                let query = context
+                    .ambient_class_heritage_artifact(expression)
+                    .unwrap()
+                    .unwrap();
+                let other = context
+                    .store()
+                    .symbol(query.namespace)
+                    .unwrap()
+                    .exports()
+                    .and_then(|exports| context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("Other"))
+                    .unwrap();
+                let other_shells = context.get_class_query_shells(other).unwrap();
+                let instance = context.get_type_at_location(expression).unwrap();
+                assert!(context.store().value_symbol_links(query.symbol).is_none());
+                let prior = warm.then(|| context.get_type_at_location(query.leaf).unwrap());
+                let location = match poison {
+                    "leaf_type" | "leaf_symbol" | "leaf_outer_parameters" => query.leaf,
+                    "whole_type" | "whole_symbol" | "whole_outer_parameters" => query.expression,
+                    "reference_type" | "reference_symbol" => query.reference,
+                    "qualifier_type" | "qualifier_symbol" => query.qualifier,
+                    _ => unreachable!(),
+                };
+                let original_type = context
+                    .store()
+                    .type_node_links(location)
+                    .cloned()
+                    .unwrap_or_default();
+                let original_symbol = context
+                    .store()
+                    .symbol_node_links(location)
+                    .cloned()
+                    .unwrap_or_default();
+                let store = context.store_mut_for_test();
+                if poison.ends_with("symbol") {
+                    assert!(store.set_symbol_node_links(
+                        location,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(other)
+                        }
+                    ));
+                } else if poison.ends_with("outer_parameters") {
+                    assert!(store.set_type_node_links(
+                        location,
+                        TypeNodeLinks {
+                            outer_type_parameters: Some(Vec::new()),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                } else {
+                    let wrong = if matches!(poison, "leaf_type" | "whole_type") {
+                        instance
+                    } else {
+                        other_shells.value_type()
+                    };
+                    assert!(store.set_type_node_links(
+                        location,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    (
+                        format!("{:?}", context.store()),
+                        context.diagnostics().clone(),
+                    )
+                };
+                let changed = snapshot(&context);
+                for node in [query.expression, query.leaf, query.leaf, query.expression] {
+                    assert!(
+                        context.get_type_at_location(node).is_err(),
+                        "{warm}, {poison}"
+                    );
+                    assert_eq!(snapshot(&context), changed);
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_type_node_links(location, original_type));
+                assert!(store.set_symbol_node_links(location, original_symbol));
+                assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+                let value = context.get_type_at_location(query.leaf).unwrap();
+                assert_ne!(value, instance);
+                if let Some(prior) = prior {
+                    assert_eq!(value, prior);
+                }
+                let after = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(context.get_type_at_location(query.leaf), Ok(value));
+                    assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+                    assert_eq!(snapshot(&context), after);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_class_heritage_query_proof_rejects_wrong_lists_and_ranges() {
+        let declarations = parse_source_file("declare namespace Library { class Entry {} }");
+        for poison in ["class_list", "base_list", "base_range"] {
+            let mut main = ts_parser::parse_javascript_source_file(
+                "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+            );
+            let expression = ambient_class_heritage_expression(&main);
+            let reference = main.arena.get(expression.node).unwrap().parent.unwrap();
+            let clause = main.arena.get(reference).unwrap().parent.unwrap();
+            let declaration = main.arena.get(clause).unwrap().parent.unwrap();
+            if poison == "class_list" {
+                let NodeData::ClassDeclaration(class) =
+                    &mut main.arena.get_mut(declaration).unwrap().data
+                else {
+                    unreachable!()
+                };
+                class.heritage_clauses.as_mut().unwrap().has_trailing_comma = true;
+            } else {
+                let NodeData::HeritageClause(heritage) =
+                    &mut main.arena.get_mut(clause).unwrap().data
+                else {
+                    unreachable!()
+                };
+                if poison == "base_list" {
+                    heritage.types.has_trailing_comma = true;
+                } else {
+                    heritage.types.range.end = heritage.types.range.start;
+                }
+            }
+            // Bind the changed source graph, so this is not a stale-arena rejection.
+            let context = ambient_class_heritage_context(&declarations, &main);
+            let before = format!("{:?}", context.store());
+            assert!(matches!(
+                context.ambient_class_heritage_artifact(expression),
+                Err(CanonicalArtifactQueryError::ForeignNode(_))
+            ));
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn ambient_class_type_reference_names_keep_instances_after_value_queries() {
+        let declarations = parse_source_file(concat!(
+            "declare namespace Library { class Entry {} }\n",
+            "type Ref = Library.Entry;\n",
+        ));
+        let main = ts_parser::parse_javascript_source_file(
+            "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+        );
+        let expression = ambient_class_heritage_expression(&main);
+        let (reference, name, leaf) = declarations
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                let NodeData::QualifiedName(name) =
+                    &declarations.arena.get(reference.type_name)?.data
+                else {
+                    return None;
+                };
+                let node = |id| NodeRef::new(declarations.arena.id(), FileId::new(6_185), id);
+                Some((node(id), node(reference.type_name), node(name.right)))
+            })
+            .unwrap();
+        for type_first in [false, true] {
+            let mut context = ambient_class_heritage_context(&declarations, &main);
+            let query = context
+                .ambient_class_heritage_artifact(expression)
+                .unwrap()
+                .unwrap();
+            let instance = context.get_declared_type_of_symbol(query.symbol).unwrap();
+            if type_first {
+                for node in [leaf, name, reference] {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                }
+                assert!(context.store().value_symbol_links(query.symbol).is_none());
+            }
+            let value = context.get_type_at_location(query.leaf).unwrap();
+            assert_ne!(value, instance);
+            for node in [leaf, name, reference, leaf] {
+                assert_eq!(context.get_type_at_location(node), Ok(instance));
+                assert_eq!(context.get_symbol_at_location(node), Ok(Some(query.symbol)));
+            }
+            for poisoned in [reference, name, leaf] {
+                let original = context
+                    .store()
+                    .type_node_links(poisoned)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    poisoned,
+                    TypeNodeLinks {
+                        resolved_type: Some(value),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let changed = format!("{:?}", context.store());
+                for node in [leaf, name, reference] {
+                    assert!(context.get_type_at_location(node).is_err());
+                    assert_eq!(format!("{:?}", context.store()), changed);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, original)
+                );
+            }
+            assert_eq!(context.get_type_at_location(query.leaf), Ok(value));
+            assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                for node in [leaf, name, reference] {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold queries, full derived graphs and partial claims on their real source owners.
+    fn ambient_heritage_dispatch_keeps_cold_and_completed_derived_roles() {
+        let main = ts_parser::parse_javascript_source_file(
+            "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+        );
+        let expression = ambient_class_heritage_expression(&main);
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                format!("{:?}", context.store()),
+                context.diagnostics().clone(),
+            )
+        };
+        for repeated_namespace in [false, true] {
+            let declarations = parse_source_file(if repeated_namespace {
+                "declare namespace Library { class Entry {} }\n\
+                 declare namespace Library { class Other {} }"
+            } else {
+                "declare namespace Library { class Entry {} }"
+            });
+            for query_first in [false, true] {
+                let mut context = ambient_class_heritage_context(&declarations, &main);
+                context.check_source_file(FileId::new(6_185)).unwrap();
+                context.check_source_file(FileId::new(6_186)).unwrap();
+                let query = context
+                    .ambient_class_heritage_artifact(expression)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .file(query.source_declaration.file)
+                        .unwrap()
+                        .1
+                        .symbol(query.source_declaration),
+                    Some(query.source_symbol)
+                );
+                let cold_instance = context
+                    .get_declared_type_of_symbol(query.source_symbol)
+                    .unwrap();
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(query.source_symbol)
+                        .is_none()
+                );
+                if query_first {
+                    let instance = context.get_type_at_location(expression).unwrap();
+                    if !repeated_namespace {
+                        assert!(context.store().value_symbol_links(query.symbol).is_none());
+                        assert!(
+                            context
+                                .store()
+                                .value_symbol_links(query.source_symbol)
+                                .is_none()
+                        );
+                    }
+                    let value = context.get_type_at_location(query.leaf).unwrap();
+                    assert_ne!(instance, value);
+                }
+                let members = context
+                    .get_nongeneric_class_members(query.source_symbol)
+                    .unwrap();
+                assert_eq!(members.shells().instance_type(), cold_instance);
+                let base = members.base().unwrap();
+                assert_eq!(
+                    context.get_type_at_location(expression),
+                    Ok(base.instance_type())
+                );
+                assert_eq!(
+                    context.get_type_at_location(query.leaf),
+                    Ok(base.value_type())
+                );
+                if repeated_namespace {
+                    let before = snapshot(&context);
+                    assert!(matches!(
+                        context.get_class_query_shells(query.symbol),
+                        Err(crate::semantic::ClassError::Unsupported(_))
+                    ));
+                    assert_eq!(snapshot(&context), before);
+                }
+                let original = context.store().type_node_links(expression).cloned();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    expression,
+                    TypeNodeLinks {
+                        resolved_type: Some(base.value_type()),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let damaged = snapshot(&context);
+                for node in [expression, query.leaf, expression] {
+                    assert!(context.get_type_at_location(node).is_err());
+                    assert_eq!(snapshot(&context), damaged);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(expression, original.unwrap_or_default())
+                );
+                let original_value = context
+                    .store()
+                    .value_symbol_links(query.source_symbol)
+                    .unwrap()
+                    .clone();
+                let original_declared = context
+                    .store()
+                    .declared_type_links(query.source_symbol)
+                    .unwrap()
+                    .clone();
+                for detached_instance in [false, true] {
+                    assert!(
+                        context.store_mut_for_test().set_value_symbol_links(
+                            query.source_symbol,
+                            ValueSymbolLinks::default()
+                        )
+                    );
+                    if detached_instance {
+                        assert!(context.store_mut_for_test().set_declared_type_links(
+                            query.source_symbol,
+                            DeclaredTypeLinks::default()
+                        ));
+                    }
+                    let partial = snapshot(&context);
+                    for node in [query.leaf, expression, query.leaf] {
+                        assert!(matches!(
+                            context.get_type_at_location(node),
+                            Err(CanonicalArtifactQueryError::Class { .. })
+                        ));
+                        assert_eq!(snapshot(&context), partial);
+                    }
+                    assert!(
+                        context.store_mut_for_test().set_declared_type_links(
+                            query.source_symbol,
+                            original_declared.clone()
+                        )
+                    );
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(query.source_symbol, original_value.clone())
+                    );
+                }
+                let restored = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.get_type_at_location(expression),
+                        Ok(base.instance_type())
+                    );
+                    assert_eq!(
+                        context.get_type_at_location(query.leaf),
+                        Ok(base.value_type())
+                    );
+                    assert_eq!(snapshot(&context), restored);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+
+        let declarations = parse_source_file("declare namespace Library { class Entry {} }");
+        for partial_value in [false, true] {
+            let mut context = ambient_class_heritage_context(&declarations, &main);
+            context.check_source_file(FileId::new(6_185)).unwrap();
+            context.check_source_file(FileId::new(6_186)).unwrap();
+            let query = context
+                .ambient_class_heritage_artifact(expression)
+                .unwrap()
+                .unwrap();
+            let instance = context
+                .get_declared_type_of_symbol(query.source_symbol)
+                .unwrap();
+            let flags = context
+                .store()
+                .type_payload(instance)
+                .unwrap()
+                .object_flags();
+            if partial_value {
+                let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    query.source_symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_object_flags(instance, flags | ObjectFlags::MEMBERS_RESOLVED)
+                );
+            }
+            let partial = snapshot(&context);
+            for node in [expression, query.leaf, expression] {
+                assert!(matches!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::Class { .. })
+                ));
+                assert_eq!(snapshot(&context), partial);
+            }
+            if partial_value {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(query.source_symbol, ValueSymbolLinks::default())
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_object_flags(instance, flags)
+                );
+            }
+            let base_instance = context.get_type_at_location(expression).unwrap();
+            assert_ne!(base_instance, instance);
+            assert!(context.store().value_symbol_links(query.symbol).is_none());
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(query.source_symbol)
+                    .is_none_or(|links| links == &ValueSymbolLinks::default())
+            );
+            let stable = snapshot(&context);
+            assert_eq!(context.get_type_at_location(expression), Ok(base_instance));
+            assert_eq!(snapshot(&context), stable);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each poison and restoration on the same checked graph.
+    fn class_binding_key_queries_reject_wrong_key_and_receiver_caches() {
+        let parsed = parse_source_file(
+            "class Model { value: string; constructor() { let { value: local } = this; } }",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_802);
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (binding, key, local) = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                let NodeData::BindingElement(element) = &node.data else {
+                    return None;
+                };
+                Some((
+                    reference(id),
+                    reference(element.property_name?),
+                    reference(element.name?),
+                ))
+            })
+            .unwrap();
+        let receiver = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::ThisKeyword).then_some(reference(id)))
+            .unwrap();
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let member = context.get_symbol_at_location(key).unwrap().unwrap();
+        let local_symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        assert_ne!(member, local_symbol);
+        assert_eq!(
+            context.get_symbol_at_location(local),
+            Ok(Some(local_symbol))
+        );
+        assert_eq!(context.get_type_at_location(key), Ok(error_type));
+        assert_eq!(context.get_type_at_location(local), Ok(string));
+        let receiver_links = context.store().type_node_links(receiver).unwrap().clone();
+        for poison in 0..3 {
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_type_node_links(
+                    key,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                1 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                    key,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(local_symbol),
+                    }
+                )),
+                _ => assert!(context.store_mut_for_test().set_type_node_links(
+                    receiver,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+            assert!(context.get_type_at_location(key).is_err());
+            assert!(context.get_symbol_at_location(key).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                before
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(key, TypeNodeLinks::default())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(key, SymbolNodeLinks::default())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(receiver, receiver_links.clone())
+            );
+            assert_eq!(context.get_type_at_location(key), Ok(error_type));
+            assert_eq!(context.get_symbol_at_location(key), Ok(Some(member)));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve duplicate declarations and clone identity across poisons.
+    fn class_assignment_artifacts_reject_changed_duplicate_groups_and_clones() {
+        let parsed = parse_source_file(concat!(
+            "class Model { x: string; y: string; constructor() { ",
+            "let { x, y: local } = this; ({ x, y: local, 'y': local } = this); } }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_803);
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let type_ = context.get_type_at_location(object).unwrap();
+        let (raw, clone, declarations, first, links) = {
+            let host = context.declared_type_host().unwrap();
+            let plan = crate::semantic::object_members::plan_object_literal(
+                context.store(),
+                &host,
+                object,
+            )
+            .unwrap();
+            assert_eq!(plan.properties.len(), 2);
+            let raw = plan.properties[1].symbol;
+            let record = context.store().symbol(raw).unwrap();
+            let declarations = record.declarations().unwrap().to_vec();
+            assert_eq!(declarations.len(), 2);
+            let first = record.value_declaration();
+            let TypeData::Object(data) = context.store().type_payload(type_).unwrap().data() else {
+                panic!("the assignment pattern must retain its actual object type")
+            };
+            let clone = data.structured.properties.as_ref().unwrap()[1];
+            let links = context.store().value_symbol_links(clone).unwrap().clone();
+            assert_eq!(links.target, Some(raw));
+            (raw, clone, declarations, first, links)
+        };
+        let object_links = context.store().type_node_links(object).unwrap().clone();
+        for poison in 0..3 {
+            match poison {
+                0 => {
+                    let mut reversed = declarations.clone();
+                    reversed.reverse();
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        raw,
+                        Some(reversed),
+                        first
+                    ));
+                }
+                1 => {
+                    let mut wrong = links.clone();
+                    wrong.target = Some(clone);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(clone, wrong)
+                    );
+                }
+                _ => {
+                    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        object,
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+            assert!(context.get_type_at_location(object).is_err());
+            assert!(context.type_to_string(type_).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                before
+            );
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                raw,
+                Some(declarations.clone()),
+                first
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(clone, links.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(object, object_links.clone())
+            );
+            assert_eq!(context.get_type_at_location(object), Ok(type_));
+            assert_eq!(
+                context.type_to_string(type_).unwrap(),
+                "{ x: string; y: string; }"
+            );
+        }
     }
 
     fn context_with_options(
@@ -4452,6 +6905,602 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    const CHECKED_METHOD_FILE: FileId = FileId::new(6_180);
+    const CHECKED_METHOD_LIBRARY_FILE: FileId = FileId::new(6_181);
+    const CHECKED_METHOD_LIBRARY: &str = concat!(
+        "interface Array<T> {}\n",
+        "interface String { charAt(pos: number): string; }\n",
+        "interface Console { log(...data: any[]): void; count(label?: string): void; }\n",
+        "declare var console: Console;\n",
+    );
+    const CHECKED_CONSOLE_SOURCE: &str = concat!(
+        "function g(str: string) {\n",
+        "  switch (str) {\n",
+        "    case 'a': return; console.log('1'); console.log('2');\n",
+        "    case 'b': console.log('3');\n",
+        "  }\n",
+        "}\n",
+    );
+    const CHECKED_STRING_SOURCE: &str = concat!(
+        "function f(x: string | number) {\n",
+        "  switch (typeof x) {\n",
+        "    case '':\n",
+        "    case 'string': x.charAt(0); break;\n",
+        "  }\n",
+        "}\n",
+    );
+
+    fn checked_method_context<'a>(
+        library: &'a ParseResult,
+        source: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, name, default_library) in [
+            (library, CHECKED_METHOD_LIBRARY_FILE, "\"/lib.d.ts\"", true),
+            (source, CHECKED_METHOD_FILE, "\"/project.ts\"", false),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (CHECKED_METHOD_LIBRARY_FILE, &library.arena),
+                (CHECKED_METHOD_FILE, &source.arena),
+            ],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(false),
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct CheckedMethodLocations {
+        receiver: NodeRef,
+        property: NodeRef,
+        name: NodeRef,
+        call: NodeRef,
+    }
+
+    fn checked_method_locations(source: &ParseResult) -> CheckedMethodLocations {
+        source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                let reference = |id| NodeRef::new(source.arena.id(), CHECKED_METHOD_FILE, id);
+                Some(CheckedMethodLocations {
+                    receiver: reference(access.expression),
+                    property: reference(id),
+                    name: reference(access.name),
+                    call: reference(record.parent.unwrap()),
+                })
+            })
+            .unwrap()
+    }
+
+    type CheckedMethodNodeState = (
+        NodeRef,
+        Option<TypeNodeLinks>,
+        Option<SymbolNodeLinks>,
+        Option<crate::semantic::SignatureLinks>,
+    );
+    type CheckedMethodValueState = (
+        ts_binder::SemanticSymbolId,
+        Option<DeclaredTypeLinks>,
+        Option<ValueSymbolLinks>,
+    );
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CheckedMethodSnapshot {
+        counts: [usize; 7],
+        links: [usize; 26],
+        nodes: Vec<CheckedMethodNodeState>,
+        values: Vec<CheckedMethodValueState>,
+        source: Option<crate::semantic::SourceFileLinks>,
+        diagnostics: crate::semantic::CanonicalCheckerDiagnostics,
+        relations: crate::semantic::RelationStateSnapshot,
+    }
+
+    fn checked_method_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        library: &ParseResult,
+        source: &ParseResult,
+    ) -> CheckedMethodSnapshot {
+        let store = context.store();
+        CheckedMethodSnapshot {
+            counts: [
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            links: store.checker_link_allocated_lengths(),
+            nodes: [
+                (library, CHECKED_METHOD_LIBRARY_FILE),
+                (source, CHECKED_METHOD_FILE),
+            ]
+            .into_iter()
+            .flat_map(|(parsed, file)| {
+                parsed.arena.iter().map(move |(id, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, id);
+                    (
+                        node,
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                        store.signature_links(node).cloned(),
+                    )
+                })
+            })
+            .collect(),
+            values: store
+                .symbol_store()
+                .symbols()
+                .map(|(symbol, _)| {
+                    (
+                        symbol,
+                        store.declared_type_links(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                    )
+                })
+                .collect(),
+            source: store
+                .source_file_links(context.source_file(CHECKED_METHOD_FILE).unwrap())
+                .cloned(),
+            diagnostics: context.diagnostics().clone(),
+            relations: store.relation_state_snapshot(),
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_require_source_and_keep_unused_methods_cold() {
+        let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+        let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+        let locations = checked_method_locations(&source);
+        let mut context = checked_method_context(&library, &source);
+        let cold = checked_method_snapshot(&context, &library, &source);
+        assert_eq!(
+            context.checked_source_method_artifact_type(locations.property),
+            Ok(None)
+        );
+        assert_eq!(checked_method_snapshot(&context, &library, &source), cold);
+        context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+        let method = context
+            .store()
+            .symbol_node_links(locations.property)
+            .unwrap()
+            .resolved_symbol
+            .unwrap();
+        let owner = context.store().get_parent_of_symbol(method).unwrap();
+        assert!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        let diagnostics = context.diagnostics().clone();
+        let method_type = context.get_type_at_location(locations.name).unwrap();
+        assert_eq!(
+            context.get_type_at_location(locations.property),
+            Ok(method_type)
+        );
+        let count = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|table| context.store().symbol_table(table))
+            .and_then(|table| table.get_source("count"))
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(count)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        assert_eq!(context.diagnostics(), &diagnostics);
+        let warm = checked_method_snapshot(&context, &library, &source);
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_type_at_location(locations.name),
+                Ok(method_type)
+            );
+            context.recheck_source_file(CHECKED_METHOD_FILE).unwrap();
+            assert_eq!(checked_method_snapshot(&context, &library, &source), warm);
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_cold_and_warm_type_cache_damage() {
+        use crate::semantic::{SourceAssertionError, SourceCheckError};
+        for warm in [false, true] {
+            for changed in ["receiver", "property", "name", "call"] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+                if warm {
+                    context.get_type_at_location(locations.property).unwrap();
+                }
+                let poisoned = match changed {
+                    "receiver" => locations.receiver,
+                    "property" => locations.property,
+                    "name" => locations.name,
+                    "call" => locations.call,
+                    _ => unreachable!(),
+                };
+                let query = if changed == "name" {
+                    locations.name
+                } else {
+                    locations.property
+                };
+                let saved = context
+                    .store()
+                    .type_node_links(poisoned)
+                    .cloned()
+                    .unwrap_or_default();
+                let expected = if changed == "name" {
+                    context
+                        .store()
+                        .type_node_links(locations.property)
+                        .and_then(|links| links.resolved_type)
+                } else {
+                    saved.resolved_type
+                };
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    poisoned,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let error = expected.map_or(SourceCheckError::Property(query), |expected| {
+                    SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                        node: poisoned,
+                        cached: Some(number),
+                        expected,
+                    })
+                });
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.get_type_at_location(query),
+                        Err(CanonicalArtifactQueryError::SourceCheck(error)),
+                        "{warm} {changed}"
+                    );
+                    assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, saved)
+                );
+                let healthy = context.get_type_at_location(query).unwrap();
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(context.get_type_at_location(query), Ok(healthy));
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_changed_method_owner_and_value() {
+        use crate::semantic::SourceCheckError;
+        for text in [CHECKED_CONSOLE_SOURCE, CHECKED_STRING_SOURCE] {
+            for changed in ["flags", "owner", "value"] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(text);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                let method_type = context.get_type_at_location(locations.property).unwrap();
+                let method = context
+                    .store()
+                    .symbol_node_links(locations.property)
+                    .unwrap()
+                    .resolved_symbol
+                    .unwrap();
+                let record = context.store().symbol(method).unwrap();
+                let flags = record.flags();
+                let check_flags = record.check_flags();
+                let relationships = (
+                    record.members(),
+                    record.exports(),
+                    record.parent(),
+                    record.export_symbol(),
+                );
+                let value = context.store().value_symbol_links(method).cloned().unwrap();
+                match changed {
+                    "flags" => assert!(context.store_mut_for_test().set_symbol_flags(
+                        method,
+                        SymbolFlags::PROPERTY,
+                        check_flags
+                    )),
+                    "owner" => assert!(context.store_mut_for_test().set_symbol_relationships(
+                        method,
+                        None,
+                        None,
+                        Some(method),
+                        None
+                    )),
+                    "value" => {
+                        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                        assert!(context.store_mut_for_test().set_value_symbol_links(
+                            method,
+                            ValueSymbolLinks {
+                                resolved_type: Some(number),
+                                ..value.clone()
+                            }
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    for query in [locations.property, locations.name] {
+                        assert_eq!(
+                            context.get_type_at_location(query),
+                            Err(CanonicalArtifactQueryError::SourceCheck(
+                                SourceCheckError::Property(query)
+                            )),
+                            "{text} {changed}"
+                        );
+                        assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                    }
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_flags(method, flags, check_flags)
+                );
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    method,
+                    relationships.0,
+                    relationships.1,
+                    relationships.2,
+                    relationships.3
+                ));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(method, value)
+                );
+                assert_eq!(
+                    context.get_type_at_location(locations.property),
+                    Ok(method_type)
+                );
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(
+                    context.get_type_at_location(locations.name),
+                    Ok(method_type)
+                );
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_changed_source_symbols_before_demand() {
+        for warm in [false, true] {
+            for receiver in [false, true] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+                if warm {
+                    context.get_type_at_location(locations.property).unwrap();
+                }
+                let changed = if receiver {
+                    locations.receiver
+                } else {
+                    locations.property
+                };
+                let saved = context.store().symbol_node_links(changed).cloned().unwrap();
+                let expected = saved.resolved_symbol.unwrap();
+                let other = if receiver {
+                    locations.property
+                } else {
+                    locations.receiver
+                };
+                let wrong = context
+                    .store()
+                    .symbol_node_links(other)
+                    .unwrap()
+                    .resolved_symbol
+                    .unwrap();
+                assert_ne!(wrong, expected);
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    changed,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(wrong),
+                    }
+                ));
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    for query in [locations.property, locations.name] {
+                        assert_eq!(
+                            context.get_type_at_location(query),
+                            Err(CanonicalArtifactQueryError::SourceCheck(
+                                crate::semantic::SourceCheckError::Variable(
+                                    crate::semantic::VariableInvariant::InvalidSymbolNodeCache {
+                                        node: changed,
+                                        cached: Some(wrong),
+                                        expected,
+                                    }
+                                ),
+                            ))
+                        );
+                        assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                    }
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(changed, saved)
+                );
+                let method = context.get_type_at_location(locations.property).unwrap();
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(context.get_type_at_location(locations.name), Ok(method));
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_keep_the_string_receiver_and_call_signature_exact() {
+        use crate::semantic::SourceCheckError;
+        for changed in ["receiver", "property", "call", "signature", "symbol"] {
+            let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+            let source = parse_source_file(CHECKED_STRING_SOURCE);
+            let locations = checked_method_locations(&source);
+            let mut context = checked_method_context(&library, &source);
+            let method_type = context.get_type_at_location(locations.property).unwrap();
+            let call = context
+                .store()
+                .signature_links(locations.call)
+                .cloned()
+                .unwrap();
+            let signature = call.resolved_signature.signature().unwrap();
+            let declaration = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .declaration()
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature(),
+                Some(signature)
+            );
+            let property = context
+                .store()
+                .symbol_node_links(locations.property)
+                .cloned()
+                .unwrap();
+            let type_node = match changed {
+                "receiver" => locations.receiver,
+                "call" => locations.call,
+                _ => locations.property,
+            };
+            let saved = context.store().type_node_links(type_node).cloned().unwrap();
+            match changed {
+                "receiver" | "property" | "call" => {
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        type_node,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                "signature" => assert!(context.store_mut_for_test().set_signature_links(
+                    locations.call,
+                    crate::semantic::SignatureLinks::default()
+                )),
+                "symbol" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(locations.property, SymbolNodeLinks::default())
+                ),
+                _ => unreachable!(),
+            }
+            let before = checked_method_snapshot(&context, &library, &source);
+            for _ in 0..2 {
+                for query in [locations.property, locations.name] {
+                    assert_eq!(
+                        context.get_type_at_location(query),
+                        Err(CanonicalArtifactQueryError::SourceCheck(
+                            SourceCheckError::Property(query)
+                        )),
+                        "{changed}"
+                    );
+                    assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                }
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(type_node, saved)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_links(locations.call, call)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(locations.property, property)
+            );
+            assert_eq!(
+                context.get_type_at_location(locations.property),
+                Ok(method_type)
+            );
+            let restored = checked_method_snapshot(&context, &library, &source);
+            assert_eq!(
+                context.get_type_at_location(locations.name),
+                Ok(method_type)
+            );
+            assert_eq!(
+                checked_method_snapshot(&context, &library, &source),
+                restored
+            );
+        }
     }
 
     #[test]
@@ -6903,6 +9952,278 @@ mod tests {
                 assert_eq!(context.get_type_at_location(declaration), Ok(instance));
             }
         }
+    }
+
+    #[test]
+    fn prefix_unary_readback_requires_a_checked_source_and_owned_nodes() {
+        let parsed = parse_source_file("const value = !!true;");
+        let foreign = parse_source_file("const value = !!true;");
+        let file = FileId::new(6_230);
+        let prefix = |parsed: &ParseResult| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let node = prefix(&parsed);
+        let foreign_node = prefix(&foreign);
+        let mut context = context(&parsed, file);
+        let source = context.source_file(file).unwrap();
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [store.type_len(), store.symbol_len(), store.signature_len()],
+                store.checker_link_allocated_lengths(),
+                store.source_file_links(source).cloned(),
+                context.diagnostics().len(),
+            )
+        };
+        let cold = state(&context);
+        for _ in 0..2 {
+            assert_eq!(context.checked_prefix_unary_artifact_type(node), Ok(None));
+            assert_eq!(
+                context.get_type_at_location(foreign_node),
+                Err(CanonicalArtifactQueryError::ForeignNode(foreign_node)),
+            );
+            assert_eq!(state(&context), cold);
+        }
+        context.check_source_file(file).unwrap();
+        let warm = state(&context);
+        assert!(
+            context
+                .checked_prefix_unary_artifact_type(node)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(state(&context), warm);
+    }
+
+    #[test]
+    fn prefix_unary_readback_rejects_changed_chain_and_literal_caches() {
+        for poison in 0..5 {
+            let parsed = parse_source_file("const value = !!true;");
+            let file = FileId::new(6_231);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let outer = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    variable
+                        .initializer
+                        .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let operand = |node: NodeRef| {
+                let NodeData::PrefixUnaryExpression(prefix) =
+                    &parsed.arena.get(node.node).unwrap().data
+                else {
+                    panic!("the source has a prefix expression")
+                };
+                NodeRef::new(parsed.arena.id(), file, prefix.operand)
+            };
+            let inner = operand(outer);
+            let literal = operand(inner);
+            let (truth, falsity, regular_false, boolean, symbol) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.true_type,
+                    bootstrap.false_type,
+                    bootstrap.regular_false_type,
+                    bootstrap.boolean_type,
+                    bootstrap.unknown_symbol,
+                )
+            };
+            let error = match poison {
+                0..=2 => {
+                    let (node, cached, expected) = match poison {
+                        0 => (outer, Some(boolean), truth),
+                        1 => (inner, Some(truth), falsity),
+                        _ => (literal, None, truth),
+                    };
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: cached,
+                            outer_type_parameters: (poison == 2).then(Vec::new),
+                        },
+                    ));
+                    SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                        node,
+                        cached,
+                        expected,
+                    })
+                }
+                3 => {
+                    assert!(context.store_mut_for_test().set_symbol_node_links(
+                        inner,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol)
+                        },
+                    ));
+                    SourceCheckError::PrimitiveOperator(inner)
+                }
+                4 => {
+                    assert!(context.store_mut_for_test().set_literal_links(
+                        regular_false,
+                        Some(regular_false),
+                        regular_false,
+                    ));
+                    SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(
+                        regular_false,
+                    ))
+                }
+                _ => unreachable!(),
+            };
+            let source = context.source_file(file).unwrap();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.source_file_links(source).cloned(),
+                    store.relation_state_snapshot(),
+                    [outer, inner, literal].map(|node| {
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    }),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let before = state(&context);
+            for node in [outer, inner, literal] {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::SourceCheck(error)),
+                    "poison {poison}"
+                );
+                assert_eq!(state(&context), before, "poison {poison}");
+            }
+            if poison == 4 {
+                assert!(context.store_mut_for_test().set_literal_links(
+                    regular_false,
+                    Some(falsity),
+                    regular_false,
+                ));
+                let restored = state(&context);
+                for (node, expected) in [(outer, truth), (inner, falsity), (literal, truth)] {
+                    assert_eq!(context.get_type_at_location(node), Ok(expected));
+                    assert_eq!(state(&context), restored);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_unary_queries_keep_unsupported_operators_and_missing_scalar_state() {
+        for (text, operator) in [
+            ("const value = +2;", SyntaxKind::PlusToken),
+            ("const value = ~2;", SyntaxKind::TildeToken),
+            (
+                "const flag = true; const value = !flag;",
+                SyntaxKind::ExclamationToken,
+            ),
+        ] {
+            let parsed = parse_source_file(text);
+            let file = FileId::new(6_232);
+            let node = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let mut context = context(&parsed, file);
+            let source = context.source_file(file).unwrap();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source).cloned(),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let before = state(&context);
+            assert_eq!(
+                context.get_type_at_location(node),
+                Err(CanonicalArtifactQueryError::SourceCheck(
+                    SourceCheckError::Unsupported(
+                        crate::semantic::UnsupportedSourceSyntax::InvalidPrefixUnaryOperator {
+                            node,
+                            operator
+                        },
+                    )
+                )),
+                "{text}",
+            );
+            assert_eq!(state(&context), before);
+        }
+
+        let parsed = parse_source_file("enum E { A = -17 }");
+        let file = FileId::new(6_233);
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(ts_jsnum::Number::new(-17.0))
+                .is_none()
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        assert_eq!(
+            context.get_type_at_location(node),
+            Err(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: SyntaxKind::PrefixUnaryExpression,
+            })
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            before
+        );
     }
 
     #[test]

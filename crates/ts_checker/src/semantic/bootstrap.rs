@@ -50,6 +50,7 @@ use super::{
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     indexed_access_types::cached_deferred_indexed_access_type,
+    instantiate::InstantiationSession,
     instantiated_members::validate_property_object_alias_members_with_array_targets,
     links::{
         LateBoundLinks, MembersAndExportsLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks,
@@ -61,12 +62,12 @@ use super::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
     relater::RelationUnavailable,
-    relation::RelationStateSnapshot,
+    relation::{RelationKind, RelationStateSnapshot},
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{PlainInterfaceHeritageFacts, SemanticStore, SourceNodeParent},
     structured_members::{
-        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        valid_declared_member_table, validate_interface_heritage_members_with_array_targets,
+        InterfaceHeritageMembersValidation, valid_declared_member_table,
+        validate_interface_heritage_members_with_array_targets,
     },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -710,6 +711,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.union_cache_validation_scans
     }
 
+    #[cfg(test)]
+    pub(super) fn union_cache_len(&self) -> usize {
+        self.intrinsic_bootstrap()
+            .map_or(0, IntrinsicBootstrap::union_cache_len)
+    }
+
     /// Reserves one dependency-closed batch of regular/fresh literal pairs.
     ///
     /// This is the mutation barrier for literal type-node execution. Every
@@ -750,6 +757,58 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             &[],
             0,
             0,
+            None,
+        )
+    }
+
+    /// Keeps cached union validation in the caller's instantiation session.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_type_query_types_with_session(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        session: &mut InstantiationSession,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            UnionArrayValidation::None,
+            &[],
+            0,
+            0,
+            Some(session),
+        )
+    }
+
+    /// Keeps explicit Array targets and the caller's session during preparation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_type_query_types_with_array_targets_and_session(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            &[],
+            0,
+            0,
+            session,
         )
     }
 
@@ -772,6 +831,32 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             &[],
             0,
             0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_type_query_types_with_global_types_and_session(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        global_types: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            UnionArrayValidation::GlobalTypes(global_types),
+            &[],
+            0,
+            0,
+            Some(session),
         )
     }
 
@@ -798,6 +883,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             pending_function_types,
             pending_function_capacity,
             additional_type_aliases,
+            None,
         )
     }
 
@@ -813,6 +899,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         pending_function_types: &[PendingFunctionTypeProof],
         pending_function_capacity: usize,
         additional_type_aliases: usize,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
         if numbers.iter().any(|value| value.is_nan())
             || bigints.iter().any(|value| {
@@ -834,6 +921,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.validate_union_cache(
                 array_validation,
                 &pending_ids.iter().copied().collect::<Vec<_>>(),
+                session,
             )?;
             if pending_function_types.is_empty() {
                 self.union_cache_needs_validation = false;
@@ -1172,6 +1260,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         array_validation: UnionArrayValidation<'_>,
         pending_function_types: &[TypeId],
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<(), LiteralTypeCacheError> {
         #[cfg(test)]
         {
@@ -1217,6 +1306,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 result,
                 array_validation,
                 &allowed_pending,
+                session.as_deref_mut(),
             )?;
         }
         Ok(())
@@ -1269,15 +1359,21 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_union_structure(union)?;
         let record = self
             .type_payload(union)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_cache.missing_type"))?;
         let TypeData::Union(data) = record.data() else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_cache.not_union"));
         };
-        if data.union.types != key.types
-            || self.checked_union_alias(union, record.alias())? != key.alias
-            || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
-        {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        let guard = if data.union.types != key.types {
+            Some("union_cache.members")
+        } else if self.checked_union_alias(union, record.alias())? != key.alias {
+            Some("union_cache.alias")
+        } else if !self.union_origin_matches(union, data.origin, key.origin.as_ref()) {
+            Some("union_cache.origin")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         Ok(())
     }
@@ -1311,6 +1407,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result: TypeId,
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !self.valid_union_alias_key(key.alias.as_ref()) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
@@ -1330,6 +1427,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             key.alias,
             array_validation.global_types(),
             true,
+            session,
         )? {
             UnionPlan::Existing(expected) => expected,
             UnionPlan::Union {
@@ -1404,14 +1502,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
         let alias = self
             .type_alias(alias)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_alias.missing_identity"))?;
         let symbol = alias
             .symbol()
             .filter(|symbol| self.valid_union_alias_symbol(*symbol))
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_alias.symbol"))?;
         let key = UnionAliasCacheKey::new(symbol, alias.type_arguments().unwrap_or_default());
         if !self.valid_union_alias_key(Some(&key)) {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_alias.key"));
         }
         Ok(Some(key))
     }
@@ -1456,22 +1554,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return if alias.is_none() && data.origin.is_none() {
                 Ok(())
             } else {
-                Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+                Err(self.invalid_cached_union_at(union, "union_creation.missing_proof"))
             };
         };
-        if proof.key.alias != alias
-            || proof.key.types != data.union.types
-            || !self.union_origin_matches(union, data.origin, proof.key.origin.as_ref())
-            || proof.owners.iter().any(|expected| {
-                self.symbol(expected.symbol).is_none_or(|owner| {
-                    self.get_merged_symbol(expected.symbol) != Some(expected.symbol)
-                        || owner.flags() != expected.flags
-                        || owner.parent() != expected.parent
-                        || owner.declarations() != expected.declarations.as_deref()
-                })
+        let guard = if proof.key.alias != alias {
+            Some("union_creation.alias")
+        } else if proof.key.types != data.union.types {
+            Some("union_creation.members")
+        } else if !self.union_origin_matches(union, data.origin, proof.key.origin.as_ref()) {
+            Some("union_creation.origin")
+        } else if proof.owners.iter().any(|expected| {
+            self.symbol(expected.symbol).is_none_or(|owner| {
+                self.get_merged_symbol(expected.symbol) != Some(expected.symbol)
+                    || owner.flags() != expected.flags
+                    || owner.parent() != expected.parent
+                    || owner.declarations() != expected.declarations.as_deref()
             })
-        {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }) {
+            Some("union_creation.source_owner")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         Ok(())
     }
@@ -1610,10 +1715,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         origin: TypeId,
     ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(origin) else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_origin.missing_type"));
         };
         if origin == union {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_origin.self_reference"));
         }
         match record.data() {
             TypeData::Union(data)
@@ -1637,29 +1742,179 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             {
                 Ok(())
             }
-            _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+            _ => {
+                self.trace_cached_union_failure("union_origin.shape", origin, &union);
+                Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+            }
         }
+    }
+
+    pub(super) fn invalid_cached_union_at(
+        &self,
+        union: TypeId,
+        guard: &str,
+    ) -> LiteralTypeCacheError {
+        let error = LiteralTypeCacheError::InvalidCachedUnion(union);
+        self.trace_cached_union_failure(guard, union, &error);
+        error
+    }
+
+    /// Records one failed check without demanding types or extending observations.
+    pub(super) fn trace_cached_union_failure(
+        &self,
+        guard: &str,
+        type_: TypeId,
+        cause: &dyn std::fmt::Debug,
+    ) {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+
+        if self.relation_read_observation_is_active() {
+            return;
+        }
+        struct TraceBuffer {
+            bytes: [u8; 4096],
+            len: usize,
+        }
+        impl std::fmt::Write for TraceBuffer {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let mut count = text.len().min(self.bytes.len() - 1 - self.len);
+                while !text.is_char_boundary(count) {
+                    count -= 1;
+                }
+                self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+                self.len += count;
+                if count == text.len() {
+                    Ok(())
+                } else {
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+        let mut trace = TraceBuffer {
+            bytes: [0; 4096],
+            len: 0,
+        };
+        let _ = write!(
+            trace,
+            "CACHED_UNION_FAILURE guard={guard} type={type_:?} cause={cause:?}"
+        );
+        let root = self.type_payload(type_);
+        let alias = root
+            .and_then(TypeRecord::alias)
+            .and_then(|alias| self.type_alias(alias));
+        let alias_symbol = alias.and_then(super::type_records::TypeAlias::symbol);
+        let owner = alias_symbol.and_then(|symbol| self.symbol(symbol));
+        let arguments = alias
+            .and_then(super::type_records::TypeAlias::type_arguments)
+            .unwrap_or_default();
+        let formals = alias_symbol
+            .and_then(|symbol| self.type_alias_links(symbol))
+            .and_then(|links| links.type_parameters.as_deref());
+        let (origin, members) = match root.map(TypeRecord::data) {
+            Some(TypeData::Union(data)) => (data.origin, data.union.types.as_slice()),
+            _ => (None, &[][..]),
+        };
+        let _ = write!(
+            trace,
+            " alias={alias_symbol:?} alias_name={:?} declaration={:?} argument_count={} formal_count={:?} origin={origin:?} member_count={}",
+            owner.and_then(|symbol| symbol.name().as_utf8()),
+            owner
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|nodes| nodes.first()),
+            arguments.len(),
+            formals.map(|parameters| parameters.len()),
+            members.len(),
+        );
+        for (role, candidate) in std::iter::once(("root", type_))
+            .chain(
+                formals
+                    .unwrap_or_default()
+                    .iter()
+                    .take(2)
+                    .map(|type_| ("formal", *type_)),
+            )
+            .chain(arguments.iter().take(2).map(|type_| ("alias_argument", *type_)))
+            .chain(members.iter().take(2).map(|type_| ("member", *type_)))
+        {
+            let record = self.type_payload(candidate);
+            let symbol = record.and_then(TypeRecord::symbol);
+            let owner = symbol.and_then(|symbol| self.symbol(symbol));
+            let kind = record.map(|record| match record.data() {
+                TypeData::Intrinsic(_) => "intrinsic",
+                TypeData::Literal(_) => "literal",
+                TypeData::TypeParameter(_) => "parameter",
+                TypeData::Tuple(_) => "tuple",
+                TypeData::TypeReference(_) => "reference",
+                TypeData::Mapped(_) => "mapped",
+                TypeData::Union(_) => "union",
+                _ => "other",
+            });
+            let parameter = match record.map(TypeRecord::data) {
+                Some(TypeData::TypeParameter(data)) => Some((
+                    data.constraint,
+                    data.target,
+                    data.mapper,
+                    data.resolved_default_type,
+                )),
+                _ => None,
+            };
+            let reference = match record.map(TypeRecord::data) {
+                Some(TypeData::TypeReference(data)) => {
+                    let arguments = data.resolved_type_arguments.as_deref().unwrap_or_default();
+                    Some((
+                        data.object.target,
+                        arguments.len(),
+                        &arguments[..arguments.len().min(2)],
+                    ))
+                }
+                _ => None,
+            };
+            let _ = write!(
+                trace,
+                "\nCACHED_UNION_TYPE role={role} type={candidate:?} kind={kind:?} flags={:?} object_flags={:?} symbol={symbol:?} name={:?} declaration={:?} parameter={parameter:?} reference={reference:?}",
+                record.map(TypeRecord::flags),
+                record.map(TypeRecord::object_flags),
+                owner.and_then(|symbol| symbol.name().as_utf8()),
+                owner
+                    .and_then(|symbol| symbol.declarations())
+                    .and_then(|nodes| nodes.first()),
+            );
+        }
+        trace.bytes[trace.len] = b'\n';
+        trace.len += 1;
+        let _ = std::io::stderr().lock().write_all(&trace.bytes[..trace.len]);
     }
 
     fn validate_union_structure(&self, union: TypeId) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(union) else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_structure.missing_type"));
         };
         let TypeData::Union(data) = record.data() else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_structure.not_union"));
         };
-        if data.union.types.len() < 2
-            || record.symbol().is_some()
-            || data
-                .union
-                .types
-                .iter()
-                .any(|constituent| self.type_payload(*constituent).is_none())
-            || record.flags() != self.expected_union_type_flags(&data.union.types)?
-            || !self.union_object_flags_match(&data.union.types, record.object_flags())?
-            || !self.union_types_are_strictly_sorted(&data.union.types)
+        let guard = if data.union.types.len() < 2 {
+            Some("union_structure.member_count")
+        } else if record.symbol().is_some() {
+            Some("union_structure.symbol")
+        } else if data
+            .union
+            .types
+            .iter()
+            .any(|constituent| self.type_payload(*constituent).is_none())
         {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            Some("union_structure.missing_member")
+        } else if record.flags() != self.expected_union_type_flags(&data.union.types)? {
+            Some("union_structure.type_flags")
+        } else if !self.union_object_flags_match(&data.union.types, record.object_flags())? {
+            Some("union_structure.object_flags")
+        } else if !self.union_types_are_strictly_sorted(&data.union.types) {
+            Some("union_structure.member_order")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         self.validate_union_creation(union, record, data)?;
         if let Some(origin) = data.origin {
@@ -1722,10 +1977,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             _ if base_record.flags().intersects(TypeFlags::NEVER) => Vec::new(),
             _ => vec![base],
         };
-        expected.push(bootstrap.undefined_type);
         expected.retain(|type_| *type_ != bootstrap.missing_type);
-        expected.sort_unstable();
-        expected.dedup();
+        self.insert_union_type(&mut expected, bootstrap.undefined_type)?;
         match expected.as_slice() {
             [single] if *single == resolved => {}
             _ => {
@@ -1820,13 +2073,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<(), LiteralTypeCacheError> {
         let record = self
             .type_payload(type_)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+            .ok_or_else(|| self.invalid_cached_union_at(type_, "union_identity.missing_type"))?;
         // Union reduction returns the remaining type without a new alias.
         if matches!(record.data(), TypeData::Union(_)) {
             self.validate_union_structure(type_)?;
             if self.checked_union_alias(type_, record.alias())?
                 != Some(UnionAliasCacheKey::new(symbol, arguments))
             {
+                self.trace_cached_union_failure(
+                    "union_identity.expected_alias",
+                    type_,
+                    &(symbol, arguments),
+                );
                 return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
             }
         }
@@ -2048,6 +2306,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .map(|alias| alias.symbol)
                 != Some(expected_alias)
         {
+            self.trace_cached_union_failure("union_result.expected_alias", type_, &expected_alias);
             return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
         }
         Ok(())
@@ -2245,7 +2504,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let alias = self.checked_union_alias(union, record.alias())?;
         let origin = data.origin.map(|origin| {
             let Some(record) = self.type_payload(origin) else {
-                return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+                return Err(self.invalid_cached_union_at(union, "union_key.missing_origin"));
             };
             match record.data() {
                 TypeData::Union(origin) => Ok(UnionOriginCacheKey::DenormalizedUnion(
@@ -2254,7 +2513,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 TypeData::Index(_) if self.valid_index_union_origin(origin) => {
                     Ok(UnionOriginCacheKey::Index(origin))
                 }
-                _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+                _ => Err(self.invalid_cached_union_at(union, "union_key.origin_kind")),
             }
         });
         let origin = match origin {
@@ -2272,6 +2531,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|bootstrap| bootstrap.union_types.get(&key))
             .copied();
         if cached != Some(union) {
+            self.trace_cached_union_failure("union_key.cache_entry", union, &cached);
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
         Ok(key)
@@ -2637,6 +2897,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
+            return if array_validation.targets() == Some(targets) {
+                Ok(())
+            } else {
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+            };
+        }
+        if let Some(edges) = super::classes::class_instance_type_edges(self, type_)
+            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+        {
+            for edge in edges {
+                self.validate_cached_array_capability_worker(
+                    edge,
+                    array_validation,
+                    visited,
+                    allowed_pending,
+                )?;
+            }
+            return Ok(());
+        }
         if let Some(source_interfaces) = visited.source_interfaces
             && let Some(edges) = source_interfaces(type_)?
         {
@@ -2705,7 +2985,61 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 Ok(())
             }
+            TypeData::Intersection(_) => {
+                if self
+                    .primitive_empty_intersection_type(type_)
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+                    .is_some()
+                    && let Some(alias) = record.alias().and_then(|alias| self.type_alias(alias))
+                {
+                    for argument in alias.type_arguments().unwrap_or_default() {
+                        self.validate_cached_array_capability_worker(
+                            *argument,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                if let Some(edges) = self.source_interface_condition_identity_edges(
+                    type_,
+                    array_validation,
+                    visited,
+                    allowed_pending,
+                )? {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                if let TypeData::Interface(interface) = record.data()
+                    && let Some(edges) = self.source_ambient_class_interface_edges(
+                        type_,
+                        record,
+                        interface,
+                        array_validation,
+                        visited,
+                        allowed_pending,
+                    )?
+                {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if let TypeData::Interface(interface) = record.data()
                     && let Some(edges) = self.native_global_heritage_interface_edges(
                         type_,
@@ -2783,6 +3117,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         record,
                         interface,
                         array_validation.targets(),
+                        allowed_pending,
                     )
                 {
                     for edge in edges {
@@ -2819,8 +3154,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. }
-                    | StoredCallableSetValidation::Pending { .. } => {
+                    validation @ (StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. }) => {
+                        self.trace_cached_union_failure(
+                            "array_capability.callable",
+                            type_,
+                            &validation,
+                        );
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable if unsupported_callable => {
@@ -2828,85 +3168,48 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
-                if let TypeData::Interface(interface) = record.data()
+                if matches!(record.data(), TypeData::Interface(_))
                     && self.direct_interface_heritage_provenance(type_).is_some()
                 {
-                    match validate_interface_heritage_members_with_array_targets(
+                    for edge in self.validated_interface_heritage_array_edges(
+                        type_,
+                        array_validation.targets(),
+                        None,
+                    )? {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                if matches!(record.data(), TypeData::Interface(_))
+                    && !record.object_flags().contains(ObjectFlags::CLASS)
+                    && self.source_declared_member_names(type_).is_some()
+                    && !array_validation.targets().is_some_and(|targets| {
+                        type_ == targets.array_type() || type_ == targets.readonly_array_type()
+                    })
+                    && record.symbol().is_none_or(|symbol| {
+                        !self.symbol_is_registered_global_array(symbol)
+                    })
+                {
+                    let edges = super::instantiated_members::validated_generic_interface_type_edges(
                         self,
                         type_,
                         array_validation.targets(),
-                    ) {
-                        InterfaceHeritageMembersValidation::Valid => {
-                            for property in interface
-                                .reference
-                                .object
-                                .structured
-                                .properties
-                                .as_deref()
-                                .unwrap_or_default()
-                            {
-                                let links = self
-                                    .value_symbol_links(*property)
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                if let Some(target) = links.target {
-                                    let reference = inherited_generic_property_reference(
-                                        self,
-                                        type_,
-                                        *property,
-                                        array_validation.targets(),
-                                    )
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                    let template = self
-                                        .value_symbol_links(target)
-                                        .and_then(|links| links.resolved_type)
-                                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                    // The proxy can stay lazy, but its template and substitutions cannot be skipped.
-                                    for edge in [template, reference] {
-                                        self.validate_cached_array_capability_worker(
-                                            edge,
-                                            array_validation,
-                                            visited,
-                                            allowed_pending,
-                                        )?;
-                                    }
-                                } else if links.resolved_type.is_none() {
-                                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                                }
-                                if let Some(property_type) = links.resolved_type {
-                                    self.validate_cached_array_capability_worker(
-                                        property_type,
-                                        array_validation,
-                                        visited,
-                                        allowed_pending,
-                                    )?;
-                                }
-                            }
-                            for index in interface
-                                .reference
-                                .object
-                                .structured
-                                .index_infos
-                                .as_deref()
-                                .unwrap_or_default()
-                            {
-                                let value_type = self
-                                    .index_info(*index)
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?
-                                    .value_type();
-                                self.validate_cached_array_capability_worker(
-                                    value_type,
-                                    array_validation,
-                                    visited,
-                                    allowed_pending,
-                                )?;
-                            }
-                            return Ok(());
-                        }
-                        InterfaceHeritageMembersValidation::Malformed
-                        | InterfaceHeritageMembersValidation::NotHeritage => {
-                            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                        }
+                    )
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
                     }
+                    return Ok(());
                 }
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
@@ -2936,6 +3239,102 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Ok(()),
         }
+    }
+
+    pub(super) fn validated_interface_heritage_array_edges(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&super::interface_heritage::SourceInterfaceHeritageQueryContext<'_>>,
+    ) -> Result<Vec<TypeId>, LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let Some(TypeData::Interface(interface)) = self.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        if self.direct_interface_heritage_provenance(type_).is_none()
+            || super::structured_members::validate_interface_heritage_members_with_query_context(
+                self,
+                type_,
+                array_targets,
+                query,
+            ) != InterfaceHeritageMembersValidation::Valid
+        {
+            return Err(invalid());
+        }
+        let structured = &interface.reference.object.structured;
+        let mut edges = Vec::new();
+        for property in structured.properties.as_deref().unwrap_or_default() {
+            if self.value_symbol_links(*property).is_none_or(|links| {
+                links.target.is_none() && links.resolved_type.is_none()
+            }) {
+                let owner = self
+                    .get_parent_of_symbol(*property)
+                    .and_then(|owner| self.declared_type_links(owner))
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(invalid)?;
+                let names = self.source_declared_member_names(owner).ok_or_else(invalid)?;
+                if !names.validates_target(self, owner)
+                    || !names.properties().any(|symbol| symbol == *property)
+                {
+                    return Err(invalid());
+                }
+                edges.extend(
+                    super::instantiated_members::validated_generic_interface_type_edges(
+                        self,
+                        owner,
+                        array_targets,
+                    )
+                    .map_err(|_| invalid())?,
+                );
+                edges.push(owner);
+                continue;
+            }
+            let links = self.value_symbol_links(*property).ok_or_else(invalid)?;
+            if let Some(target) = links.target {
+                if let Some(reference) = super::structured_members::inherited_generic_property_reference_with_query_context(
+                    self,
+                    type_,
+                    *property,
+                    array_targets,
+                    query,
+                )
+                {
+                    // The shared member proof checks both unresolved source values
+                    // and every published value without forcing an unread member.
+                    edges.extend(
+                        super::instantiated_members::validated_generic_interface_type_edges(
+                            self,
+                            reference,
+                            array_targets,
+                        )
+                        .map_err(|_| invalid())?,
+                    );
+                    edges.push(reference);
+                } else {
+                    let reference = super::structured_members::inherited_alias_property_reference_with_query_context(
+                        self,
+                        type_,
+                        *property,
+                        array_targets,
+                        query,
+                    )
+                    .ok_or_else(invalid)?;
+                    let template = self
+                        .value_symbol_links(target)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or_else(invalid)?;
+                    edges.extend([template, reference]);
+                }
+            } else if links.resolved_type.is_none() {
+                return Err(invalid());
+            }
+            edges.extend(links.resolved_type);
+        }
+        for index in structured.index_infos.as_deref().unwrap_or_default() {
+            edges.push(self.index_info(*index).ok_or_else(invalid)?.value_type());
+        }
+        Ok(edges)
     }
 
     /// The full-member proof owns only source property and method declarations.
@@ -3174,7 +3573,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 )?;
             }
             let Some(edges) =
-                self.native_global_heritage_source_edges(&source, false, array_targets)
+                self.native_global_heritage_source_edges(&source, false, array_targets, &pending)
             else {
                 return Ok(false);
             };
@@ -3523,50 +3922,63 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if !self.native_global_interface_member_metadata_is_exact(owner) {
                 return None;
             }
-            let mut pending = Vec::new();
-            for &declaration in self.native_global_source_declarations(owner)? {
-                if self.source_node_kind(declaration)? != SyntaxKind::InterfaceDeclaration {
-                    continue;
-                }
-                for node in self.source_direct_children(declaration)? {
-                    match self.source_node_kind(node)? {
-                        SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
-                        SyntaxKind::HeritageClause if source.clauses.contains(&node) => {}
-                        SyntaxKind::MethodSignature
-                        | SyntaxKind::PropertyDeclaration
-                        | SyntaxKind::PropertySignature
-                        | SyntaxKind::GetAccessor
-                        | SyntaxKind::SetAccessor
-                        | SyntaxKind::IndexSignature
-                        | SyntaxKind::CallSignature
-                        | SyntaxKind::ConstructSignature => pending.push(node),
-                        _ => return None,
-                    }
+            edges.extend(self.source_interface_cached_member_edges(
+                self.native_global_source_declarations(owner)?,
+                &source.clauses,
+            )?);
+        }
+        Some(edges)
+    }
+
+    fn source_interface_cached_member_edges(
+        &self,
+        declarations: &[NodeRef],
+        heritage: &[NodeRef],
+    ) -> Option<Vec<TypeId>> {
+        let mut pending = Vec::new();
+        for &declaration in declarations {
+            if self.source_node_kind(declaration)? != SyntaxKind::InterfaceDeclaration {
+                continue;
+            }
+            for node in self.source_direct_children(declaration)? {
+                match self.source_node_kind(node)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
+                    SyntaxKind::HeritageClause if heritage.contains(&node) => {}
+                    SyntaxKind::MethodSignature
+                    | SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::IndexSignature
+                    | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature => pending.push(node),
+                    _ => return None,
                 }
             }
-            while let Some(node) = pending.pop() {
-                if let Some(type_) = self
-                    .type_node_links(node)
-                    .and_then(|links| links.resolved_type)
+        }
+        let mut edges = Vec::new();
+        while let Some(node) = pending.pop() {
+            if let Some(type_) = self
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+            {
+                let kind = self.source_node_kind(node)?;
+                if !kind.is_keyword_type()
+                    && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                        .contains(&(kind as u16))
                 {
-                    let kind = self.source_node_kind(node)?;
-                    if !kind.is_keyword_type()
-                        && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
-                            .contains(&(kind as u16))
-                    {
-                        return None;
-                    }
-                    edges.push(type_);
+                    return None;
                 }
-                if let Some(type_) = self
-                    .source_declaration_symbol(node)
-                    .and_then(|symbol| self.value_symbol_links(symbol))
-                    .and_then(|links| links.resolved_type)
-                {
-                    edges.push(type_);
-                }
-                pending.extend(self.source_direct_children(node)?);
+                edges.push(type_);
             }
+            if let Some(type_) = self
+                .source_declaration_symbol(node)
+                .and_then(|symbol| self.value_symbol_links(symbol))
+                .and_then(|links| links.resolved_type)
+            {
+                edges.push(type_);
+            }
+            pending.extend(self.source_direct_children(node)?);
         }
         Some(edges)
     }
@@ -3576,12 +3988,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         source: &NativeGlobalHeritageSource,
         require_base_types: bool,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let mut edges = self.lazy_default_library_interface_member_edges_worker(
             source.symbol,
             array_targets,
             None,
             &source.clauses,
+            allowed_pending,
         )?;
         for base in &source.bases {
             let cached = cached_interface_type(self, base.symbol).ok()?;
@@ -3599,12 +4013,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     record,
                     interface,
                     array_targets,
+                    allowed_pending,
                 )?);
             } else {
                 edges.extend(self.lazy_default_library_interface_member_edges(
                     base.symbol,
                     array_targets,
                     None,
+                    allowed_pending,
                 )?);
             }
         }
@@ -3676,9 +4092,205 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 allowed_pending,
             )?;
         }
-        self.native_global_heritage_source_edges(&source, true, array_validation.targets())
-            .map(Some)
-            .ok_or_else(invalid)
+        self.native_global_heritage_source_edges(
+            &source,
+            true,
+            array_validation.targets(),
+            allowed_pending,
+        )
+        .map(Some)
+        .ok_or_else(invalid)
+    }
+
+    /// A source heritage header proves identity, not a selected alias base or member absence.
+    fn source_interface_condition_identity_edges(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> {
+        let Some(header) = self.source_interface_heritage_header(type_) else {
+            return Ok(None);
+        };
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let mut edges = super::interface_heritage::validate_source_interface_heritage_header(
+            self,
+            type_,
+            header,
+            array_validation.targets(),
+        )
+        .map_err(|_| invalid())?;
+
+        // Complete members retain their existing structured validator. A changed
+        // complete receipt must fail the header check before reaching that path.
+        if self.direct_interface_heritage_provenance(type_).is_some() {
+            return Ok(None);
+        }
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = record.data() else {
+            return Err(invalid());
+        };
+        let flags = record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        if flags != ObjectFlags::INTERFACE
+            && flags != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            || interface.base_types_resolved
+            || interface.resolved_base_types.is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+        {
+            return Err(invalid());
+        }
+        if self
+            .members_and_exports_links(header.owner_symbol())
+            .is_some_and(|links| links != &MembersAndExportsLinks::default())
+        {
+            return Err(invalid());
+        }
+        for &declaration in header.owner_declarations() {
+            if self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+                continue;
+            }
+            for node in self
+                .source_direct_children(declaration)
+                .ok_or_else(invalid)?
+            {
+                if matches!(
+                    self.source_node_kind(node),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::DeclareKeyword
+                            | SyntaxKind::HeritageClause
+                    )
+                ) {
+                    continue;
+                }
+                let member = self.source_declaration_symbol(node).ok_or_else(invalid)?;
+                object_members::validate_cold_source_member_symbol(
+                    self,
+                    header.owner_symbol(),
+                    member,
+                )
+                .map_err(|_| invalid())?;
+                let record = self.symbol(member).ok_or_else(invalid)?;
+                if !record.flags().contains(SymbolFlags::SIGNATURE) {
+                    if record.name() == InternalSymbolName::Computed.as_ref() {
+                        let name = self
+                            .source_child_with_kind(node, SyntaxKind::ComputedPropertyName)
+                            .ok_or_else(invalid)?;
+                        if self.source_node_parent(name) != Some(SourceNodeParent::Parent(node)) {
+                            return Err(invalid());
+                        }
+                    } else {
+                        let name = self
+                            .source_child_with_kind(node, SyntaxKind::Identifier)
+                            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                        if record.name().as_utf8() != self.source_identifier_text(name) {
+                            return Err(invalid());
+                        }
+                    }
+                }
+            }
+        }
+        let mut clauses = Vec::new();
+        for base in header.bases() {
+            if !clauses.contains(&base.clause()) {
+                clauses.push(base.clause());
+            }
+        }
+        let cached_edges = self
+            .source_interface_cached_member_edges(header.owner_declarations(), &clauses)
+            .ok_or_else(invalid)?;
+        for edge in cached_edges {
+            self.validate_cached_array_capability_worker(
+                edge,
+                array_validation,
+                array_visited,
+                allowed_pending,
+            )?;
+        }
+        edges.extend(
+            self.lazy_default_library_interface_member_edges_worker(
+                header.owner_symbol(),
+                array_validation.targets(),
+                None,
+                &clauses,
+                allowed_pending,
+            )
+            .ok_or_else(invalid)?,
+        );
+        Ok(Some(edges))
+    }
+
+    /// A retained class base permits identity use, not class member resolution.
+    fn source_ambient_class_interface_edges(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        interface: &InterfaceTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> {
+        let Some(proof) = self.source_ambient_class_heritage(type_) else {
+            return Ok(None);
+        };
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let base = proof.validate_current(self, type_).map_err(|_| invalid())?;
+        let flags = record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        if flags != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            || self.direct_interface_heritage_provenance(type_).is_some()
+            || self.source_interface_heritage_header(type_).is_some()
+            || interface.base_types_resolved
+            || interface.resolved_base_types.is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+            || !self.native_global_interface_member_metadata_is_exact(proof.owner())
+        {
+            return Err(invalid());
+        }
+        let declarations = self
+            .native_global_source_declarations(proof.owner())
+            .ok_or_else(invalid)?;
+        let heritage = [proof.clause()];
+        for edge in self
+            .source_interface_cached_member_edges(declarations, &heritage)
+            .ok_or_else(invalid)?
+        {
+            self.validate_cached_array_capability_worker(
+                edge,
+                array_validation,
+                array_visited,
+                allowed_pending,
+            )?;
+        }
+        let mut edges = self
+            .lazy_default_library_interface_member_edges_worker(
+                proof.owner(),
+                array_validation.targets(),
+                None,
+                &heritage,
+                allowed_pending,
+            )
+            .ok_or_else(invalid)?;
+        edges.extend(base);
+        edges.extend(interface.this_type);
+        edges.extend(interface.reference.object.target);
+        Ok(Some(edges))
     }
 
     /// Global interface annotations keep their identity as member queries populate caches.
@@ -3688,6 +4300,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         record: &TypeRecord,
         interface: &InterfaceTypeData,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let symbol = record.symbol()?;
         let library_owner =
@@ -3718,7 +4331,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return if library_owner {
                 Some(Vec::new())
             } else {
-                self.lazy_default_library_interface_member_edges(symbol, array_targets, None)
+                self.lazy_default_library_interface_member_edges(
+                    symbol,
+                    array_targets,
+                    None,
+                    allowed_pending,
+                )
             };
         }
         let resolved = flags == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
@@ -3750,6 +4368,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             symbol,
             array_targets,
             resolved.then_some(structured),
+            allowed_pending,
         )
     }
 
@@ -3862,12 +4481,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         symbol: SemanticSymbolId,
         array_targets: Option<CanonicalArrayTargets>,
         resolved: Option<&StructuredTypeData>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         self.lazy_default_library_interface_member_edges_worker(
             symbol,
             array_targets,
             resolved,
             &[],
+            allowed_pending,
         )
     }
 
@@ -3878,6 +4499,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_targets: Option<CanonicalArrayTargets>,
         resolved: Option<&StructuredTypeData>,
         heritage: &[NodeRef],
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let owner = self.symbol(symbol)?;
         let declarations = owner.declarations()?;
@@ -3952,7 +4574,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             resolved_members.push(published);
                         }
                     }
-                    edges.extend(self.lazy_default_library_member_edges(member, array_targets)?);
+                    edges.extend(self.lazy_default_library_member_edges(
+                        member,
+                        array_targets,
+                        allowed_pending,
+                    )?);
                 }
             }
         }
@@ -3987,6 +4613,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         source: SemanticSymbolId,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let source_record = self.symbol(source)?;
         let member = self
@@ -3994,7 +4621,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|links| links.late_symbol)
             .unwrap_or(source);
         let record = self.symbol(member)?;
+        let late_property_name_type = if member != source
+            && record.flags().contains(SymbolFlags::PROPERTY)
+        {
+            Some(object_members::declared_late_property_name_type(
+                self, source, member,
+            )?)
+        } else {
+            None
+        };
         if member != source
+            && late_property_name_type.is_none()
             && (!record.flags().contains(SymbolFlags::METHOD)
                 || record.check_flags() != CheckFlags::LATE
                 || self.get_parent_of_symbol(member) != self.get_parent_of_symbol(source)
@@ -4021,6 +4658,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             *declaration,
                             array_targets,
                             &mut HashSet::new(),
+                            allowed_pending,
                         )
                     })
                 {
@@ -4034,10 +4672,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 // Keep the dependencies from the provider that proved this publication.
                 return Some(edges);
             }
-            if record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
+            let property_flags = SymbolFlags::PROPERTY
+                | if late_property_name_type.is_some() {
+                    SymbolFlags::TRANSIENT
+                } else {
+                    SymbolFlags::NONE
+                };
+            if record.flags().without(SymbolFlags::OPTIONAL) != property_flags
                 || self.value_symbol_links(member)
                     != Some(&ValueSymbolLinks {
                         resolved_type: Some(value),
+                        name_type: late_property_name_type,
                         ..ValueSymbolLinks::default()
                     })
             {
@@ -4045,17 +4690,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             for &declaration in record.declarations()? {
                 let annotation = self.source_direct_type_annotation(declaration)?;
-                let annotation_type = self.lazy_default_library_annotation_type(
+                let annotation_type = self.lazy_default_library_annotation_type_with_pending(
                     annotation,
                     array_targets,
                     &mut HashSet::new(),
+                    allowed_pending,
                 )?;
                 // Nongeneric properties store the annotation. Reads add optionality.
                 if value != annotation_type {
                     return None;
                 }
             }
-            return Some(vec![value]);
+            let mut edges = vec![value];
+            edges.extend(late_property_name_type);
+            return Some(edges);
         }
         if member != source {
             return None;
@@ -4071,10 +4719,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if !kind.is_keyword_type()
                     && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
                         .contains(&(kind as u16))
-                    || self.lazy_default_library_annotation_type(
+                    || self.lazy_default_library_annotation_type_with_pending(
                         node,
                         array_targets,
                         &mut HashSet::new(),
+                        allowed_pending,
                     ) != Some(type_)
                 {
                     return None;
@@ -4083,10 +4732,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if matches!(
                     self.source_node_kind(node),
                     Some(SyntaxKind::FunctionType | SyntaxKind::ConstructorType)
-                ) && matches!(
-                    validate_stored_callable_set(self, type_),
-                    StoredCallableSetValidation::Valid { .. }
-                ) {
+                ) && match validate_stored_callable_set(self, type_) {
+                    StoredCallableSetValidation::Valid { .. } => true,
+                    StoredCallableSetValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } => allowed_pending.contains(&type_),
+                    _ => false,
+                } {
                     continue;
                 }
             } else if self
@@ -4116,12 +4768,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 
     /// Rebuilds the annotation identity from source before accepting a cached type.
-    #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
     pub(super) fn lazy_default_library_annotation_type(
         &self,
         node: NodeRef,
         array_targets: Option<CanonicalArrayTargets>,
         active: &mut HashSet<NodeRef>,
+    ) -> Option<TypeId> {
+        self.lazy_default_library_annotation_type_with_pending(
+            node,
+            array_targets,
+            active,
+            &HashSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
+    fn lazy_default_library_annotation_type_with_pending(
+        &self,
+        node: NodeRef,
+        array_targets: Option<CanonicalArrayTargets>,
+        active: &mut HashSet<NodeRef>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<TypeId> {
         if !active.insert(node) {
             return None;
@@ -4133,8 +4800,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let [child] = children.as_slice() else {
                     return None;
                 };
-                let expected =
-                    self.lazy_default_library_annotation_type(*child, array_targets, active)?;
+                let expected = self.lazy_default_library_annotation_type_with_pending(
+                    *child,
+                    array_targets,
+                    active,
+                    allowed_pending,
+                )?;
                 return self
                     .type_node_links(node)
                     .is_none_or(|links| {
@@ -4188,8 +4859,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let array = self
                         .canonical_array_reference_with_targets(targets, cached)
                         .ok()??;
-                    let expected_element =
-                        self.lazy_default_library_annotation_type(*element, array_targets, active)?;
+                    let expected_element = self.lazy_default_library_annotation_type_with_pending(
+                        *element,
+                        array_targets,
+                        active,
+                        allowed_pending,
+                    )?;
                     (array.base_type == cached && array.element_type == expected_element)
                         .then_some(cached)
                 }
@@ -4224,10 +4899,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             return None;
                         }
                         let body = self.source_direct_type_annotation(*declaration)?;
-                        return (self.lazy_default_library_annotation_type(
+                        return (self.lazy_default_library_annotation_type_with_pending(
                             body,
                             array_targets,
                             active,
+                            allowed_pending,
                         )? == cached)
                             .then_some(cached);
                     }
@@ -4257,10 +4933,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return None;
                     }
                     for (&argument, expected) in arguments.iter().zip(reference.type_arguments) {
-                        if self.lazy_default_library_annotation_type(
+                        if self.lazy_default_library_annotation_type_with_pending(
                             argument,
                             array_targets,
                             active,
+                            allowed_pending,
                         )? != expected
                         {
                             return None;
@@ -4272,7 +4949,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let types = children
                         .into_iter()
                         .map(|child| {
-                            self.lazy_default_library_annotation_type(child, array_targets, active)
+                            self.lazy_default_library_annotation_type_with_pending(
+                                child,
+                                array_targets,
+                                active,
+                                allowed_pending,
+                            )
                         })
                         .collect::<Option<Vec<_>>>()?;
                     let mut parent = node;
@@ -4301,8 +4983,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let [child] = children.as_slice() else {
                         return None;
                     };
-                    (self.lazy_default_library_annotation_type(*child, array_targets, active)?
-                        == cached)
+                    (self.lazy_default_library_annotation_type_with_pending(
+                        *child,
+                        array_targets,
+                        active,
+                        allowed_pending,
+                    )? == cached)
                         .then_some(cached)
                 }
                 SyntaxKind::LiteralType
@@ -4312,20 +4998,30 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     (cached == self.intrinsic_bootstrap()?.null_type).then_some(cached)
                 }
                 SyntaxKind::FunctionType | SyntaxKind::ConstructorType => {
-                    let StoredCallableSetValidation::Valid {
-                        family: CallableFamily::FunctionType,
-                        projection,
-                        ..
-                    } = validate_stored_callable_set(self, cached)
-                    else {
-                        return None;
+                    // Recursive member annotations can revisit a callback whose
+                    // parameter publication is still owned by the prepared query.
+                    let signatures = match validate_stored_callable_set(self, cached) {
+                        StoredCallableSetValidation::Valid {
+                            family: CallableFamily::FunctionType,
+                            projection,
+                            ..
+                        } => projection
+                            .call_signatures
+                            .iter()
+                            .map(|callable| callable.signature)
+                            .chain(projection.construct_signatures.iter().copied())
+                            .collect::<Vec<_>>(),
+                        StoredCallableSetValidation::Pending {
+                            family: CallableFamily::FunctionType,
+                        } if allowed_pending.contains(&cached) => self
+                            .type_payload(cached)?
+                            .data()
+                            .structured()?
+                            .signatures
+                            .as_deref()?
+                            .to_vec(),
+                        _ => return None,
                     };
-                    let signatures = projection
-                        .call_signatures
-                        .iter()
-                        .map(|callable| callable.signature)
-                        .chain(projection.construct_signatures.iter().copied())
-                        .collect::<Vec<_>>();
                     let [signature] = signatures.as_slice() else {
                         return None;
                     };
@@ -4334,6 +5030,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             node,
                             array_targets,
                             active,
+                            allowed_pending,
                         ))
                     .then_some(cached)
                 }
@@ -4349,6 +5046,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         node: NodeRef,
         array_targets: Option<CanonicalArrayTargets>,
         active: &mut HashSet<NodeRef>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> bool {
         let Some(mut pending) = self.source_direct_children(node) else {
             return false;
@@ -4362,8 +5060,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
                             .contains(&(kind as u16))
                 })
-                && self.lazy_default_library_annotation_type(child, array_targets, active)
-                    != Some(type_)
+                && self.lazy_default_library_annotation_type_with_pending(
+                    child,
+                    array_targets,
+                    active,
+                    allowed_pending,
+                ) != Some(type_)
             {
                 return false;
             }
@@ -4488,10 +5190,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<(), LiteralTypeCacheError> {
         let tuple = self
             .canonical_tuple_shape(type_)
-            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .map_err(|error| {
+                self.trace_cached_union_failure("union_tuple.canonical_shape", type_, &error);
+                LiteralTypeCacheError::InvalidCachedUnion(type_)
+            })?
             .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
         if !visiting.insert(type_) {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+            return Err(self.invalid_cached_union_at(type_, "union_tuple.cycle"));
         }
         // Declared members can refer back to this tuple. Direct containment
         // cycles still fail through the separate structural visiting set.
@@ -4684,9 +5389,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .is_none_or(|base| base == expected_base)
     }
 
-    /// Authenticates a fresh method parameter against its source and receiver mapper.
+    /// Authenticates a fresh signature parameter against its source and receiver mapper.
     #[allow(clippy::too_many_lines)] // Source, receiver, and fresh mapper form one identity proof.
-    fn instantiated_interface_method_type_parameter_owner(
+    fn instantiated_interface_signature_type_parameter_owner(
         &self,
         type_: TypeId,
         record: &TypeRecord,
@@ -4700,18 +5405,39 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let [declaration] = symbol_record.declarations()? else {
             return None;
         };
-        let SourceNodeParent::Parent(method_declaration) = self.source_node_parent(*declaration)?
+        let SourceNodeParent::Parent(signature_declaration) = self.source_node_parent(*declaration)?
         else {
             return None;
         };
         let signature_id = self
-            .signature_links(method_declaration)?
+            .signature_links(signature_declaration)?
             .resolved_signature
             .signature()?;
         let signature = self.signature(signature_id)?;
-        let callable = self.interface_method_linked_type(signature_id)?;
-        let method = self.type_payload(callable)?.symbol()?;
-        let (_, owner_type) = self.authenticated_interface_method_owner(method)?;
+        let owner_type = match self.source_node_kind(signature_declaration)? {
+            SyntaxKind::MethodSignature => {
+                if !super::callable_sets::valid_declared_method_type_parameters(
+                    self,
+                    signature,
+                    signature_declaration,
+                ) {
+                    return None;
+                }
+                let callable = self.interface_method_linked_type(signature_id)?;
+                let method = self.type_payload(callable)?.symbol()?;
+                self.authenticated_interface_method_owner(method)?.1
+            }
+            SyntaxKind::CallSignature => {
+                let owner = self.source_interface_call_owner(signature_declaration)?;
+                object_members::declared_interface_call_type_parameter_view(
+                    self,
+                    signature,
+                    signature_declaration,
+                )?;
+                cached_interface_type(self, owner).ok()??
+            }
+            _ => return None,
+        };
         let TypeData::Interface(interface) = self.type_payload(owner_type)?.data() else {
             return None;
         };
@@ -4747,14 +5473,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             || source_record.symbol() != Some(symbol)
             || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
             || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
-            || self.source_node_kind(method_declaration) != Some(SyntaxKind::MethodSignature)
-            || signature.declaration() != Some(method_declaration)
+            || signature.declaration() != Some(signature_declaration)
             || !signature.type_parameters().contains(&source)
-            || !super::callable_sets::valid_declared_method_type_parameters(
-                self,
-                signature,
-                method_declaration,
-            )
             || interface_parameters.is_empty()
             || receiver_reference.target != owner_type
             || receiver_reference.type_arguments.len() != interface_parameters.len()
@@ -4806,6 +5526,68 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
     fn validate_supported_record_mapped_union_constituent(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        mapped: &super::type_records::MappedTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        match self.validate_supported_callable_record_union_constituent(
+            type_,
+            record,
+            mapped,
+            array_validation,
+            visiting,
+            array_visited,
+            allowed_pending,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(rejected))
+                if rejected == type_ => {}
+            Err(error) => {
+                if matches!(&error, LiteralTypeCacheError::InvalidCachedUnion(_)) {
+                    self.trace_cached_union_failure("union_record.callable_proof", type_, &error);
+                }
+                return Err(error);
+            }
+        }
+        // Callable Records retain the signature checks on their existing path.
+        if mapped.template_type.is_none_or(|value| {
+            !matches!(
+                validate_stored_callable_set(self, value),
+                StoredCallableSetValidation::NotCallable
+            )
+        }) {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+        let edges = self
+            .record_mapped_alias_type_edges(type_)
+            .map_err(|error| {
+                self.trace_cached_union_failure("union_record.source_proof", type_, &error);
+                LiteralTypeCacheError::InvalidCachedUnion(type_)
+            })?
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !visiting.insert(type_) {
+            return Err(self.invalid_cached_union_at(type_, "union_record.cycle"));
+        }
+        let result = edges.into_iter().try_for_each(|edge| {
+            self.validate_union_constituent_worker(
+                edge,
+                array_validation,
+                visiting,
+                array_visited,
+                allowed_pending,
+            )
+        });
+        visiting.remove(&type_);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
+    fn validate_supported_callable_record_union_constituent(
         &self,
         type_: TypeId,
         record: &TypeRecord,
@@ -4936,9 +5718,39 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        let mut stage = "union_constituent.payload";
+        let result = self.validate_union_constituent_observed(
+            type_,
+            array_validation,
+            visiting,
+            array_visited,
+            allowed_pending,
+            &mut stage,
+        );
+        if matches!(
+            &result,
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(failed)
+                | LiteralTypeCacheError::InvalidCachedUnion(failed)) if *failed == type_
+        ) {
+            self.trace_cached_union_failure(stage, type_, &result);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // The trace borrows the existing validation state.
+    fn validate_union_constituent_observed(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+        stage: &mut &'static str,
+    ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        *stage = "union_constituent.enum";
         if record.flags().intersects(TypeFlags::ENUM_LIKE) {
             return validate_enum_type_union_constituent(self, type_).ok_or_else(|| {
                 if matches!(record.data(), TypeData::Literal(_)) {
@@ -4948,7 +5760,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             });
         }
+        *stage = "union_constituent.class_declarations";
         self.validate_union_class_declarations(type_, record)?;
+        *stage = "union_constituent.class_scope_targets";
+        if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
+            return if array_validation.targets() == Some(targets) {
+                Ok(())
+            } else {
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+            };
+        }
+        *stage = "union_constituent.type_kind";
         match record.data() {
             TypeData::Intrinsic(data) => {
                 self.validate_supported_intrinsic(type_, record, &data.intrinsic_name)
@@ -5031,7 +5853,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 let Some(symbol) =
                     cached_ordinary_type_parameter_owner(self, type_).or_else(|| {
-                        self.instantiated_interface_method_type_parameter_owner(
+                        self.instantiated_interface_signature_type_parameter_owner(
                             type_, record, parameter,
                         )
                     })
@@ -5127,8 +5949,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. }
-                    | StoredCallableSetValidation::Pending { .. } => {
+                    validation @ (StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. }) => {
+                        self.trace_cached_union_failure(
+                            "union_constituent.object_callable",
+                            type_,
+                            &validation,
+                        );
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable
@@ -5193,6 +6020,49 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Interface(interface) => {
+                *stage = "union_constituent.interface_source_identity";
+                if let Some(edges) = self.source_interface_condition_identity_edges(
+                    type_,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )? {
+                    if !visiting.insert(type_) {
+                        return Ok(());
+                    }
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                *stage = "union_constituent.interface_ambient_class_identity";
+                if let Some(edges) = self.source_ambient_class_interface_edges(
+                    type_,
+                    record,
+                    interface,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )? {
+                    if !visiting.insert(type_) {
+                        return Ok(());
+                    }
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                *stage = "union_constituent.interface_native_heritage";
                 if let Some(edges) = self.native_global_heritage_interface_edges(
                     type_,
                     record,
@@ -5214,11 +6084,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "union_constituent.interface_lazy_library";
                 if let Some(edges) = self.lazy_default_library_interface_union_edges(
                     type_,
                     record,
                     interface,
                     array_validation.targets(),
+                    allowed_pending,
                 ) {
                     if !visiting.insert(type_) {
                         return Ok(());
@@ -5233,6 +6105,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "union_constituent.interface_callable";
                 match validate_stored_callable_set(self, type_) {
                     StoredCallableSetValidation::Valid { edges, .. } => {
                         if !visiting.insert(type_) {
@@ -5266,6 +6139,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
+                *stage = "union_constituent.interface_class_heritage";
                 match validate_class_heritage_members(self, type_) {
                     ClassHeritageMembersValidation::Valid => {
                         return self.validate_cached_array_capability_worker(
@@ -5286,6 +6160,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     ClassHeritageMembersValidation::NotClass => {}
                 }
+                *stage = "union_constituent.interface_heritage";
                 if self.direct_interface_heritage_provenance(type_).is_some() {
                     if validate_interface_heritage_members_with_array_targets(
                         self,
@@ -5302,6 +6177,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         allowed_pending,
                     );
                 }
+                *stage = "union_constituent.interface_property_graph";
                 match object_members::validate_resolved_declared_property_object(self, type_) {
                     object_members::DeclaredPropertyObjectValidation::Valid(_) => self
                         .validate_cached_array_capability_worker(
@@ -5323,6 +6199,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                 )
                             }
                             object_members::DeclaredPropertyTypeGraphValidation::Opaque => {
+                                *stage = "union_constituent.interface_opaque";
                                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
                             }
                             object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
@@ -5402,6 +6279,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 array_visited,
                 allowed_pending,
             ),
+            TypeData::Intersection(_) => {
+                if self
+                    .primitive_empty_intersection_type(type_)
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+                    .is_none()
+                {
+                    self.validate_source_object_intersection_union_constituent(
+                        type_,
+                        array_validation,
+                        visiting,
+                        array_visited,
+                        allowed_pending,
+                    )?;
+                }
+                self.validate_cached_array_capability_worker(
+                    type_,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )
+            }
             TypeData::Union(data) => {
                 if !visiting.insert(type_) {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
@@ -5429,7 +6327,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         TypeFlags::NONE
                     };
                 if record.flags() != expected_flags {
-                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    return Err(self.invalid_cached_union_at(type_, "union_constituent.type_flags"));
                 }
                 if let Some(origin) = data.origin {
                     self.validate_supported_union_origin(
@@ -5455,6 +6353,87 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_)),
         }
+    }
+
+    /// Object intersections retain their canonical source and member-cache proofs in unions.
+    fn validate_source_object_intersection_union_constituent(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let types = if record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+            self.validate_intersection_type_with_array_targets(type_, array_validation.targets())
+                .map_err(|_| invalid())?
+                .types
+        } else {
+            self.validate_deferred_intersection_type_with_array_targets(
+                type_,
+                array_validation.targets(),
+            )
+            .map_err(|_| invalid())?
+            .types
+        };
+        if !visiting.insert(type_) {
+            return Err(invalid());
+        }
+        let result = (|| {
+            for constituent in types {
+                let constituent_record = self.type_payload(constituent).ok_or_else(invalid)?;
+                let structured = constituent_record.data().structured().ok_or_else(invalid)?;
+                if constituent_record.flags() != TypeFlags::OBJECT
+                    || structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                    || structured
+                        .index_infos
+                        .as_ref()
+                        .is_some_and(|indexes| !indexes.is_empty())
+                    || super::object_aliases::source_property_object_projection(self, constituent)
+                        .map_err(|_| invalid())?
+                        .is_none()
+                        && !matches!(
+                            object_members::validate_resolved_declared_property_object(
+                                self,
+                                constituent,
+                            ),
+                            object_members::DeclaredPropertyObjectValidation::Valid(_)
+                        )
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                self.validate_union_constituent_worker(
+                    constituent,
+                    array_validation,
+                    visiting,
+                    array_visited,
+                    allowed_pending,
+                )?;
+            }
+            if let Some(alias) = record.alias() {
+                for argument in self
+                    .type_alias(alias)
+                    .ok_or_else(invalid)?
+                    .type_arguments()
+                    .unwrap_or_default()
+                {
+                    self.validate_cached_array_capability_worker(
+                        *argument,
+                        array_validation,
+                        array_visited,
+                        allowed_pending,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        visiting.remove(&type_);
+        result
     }
 
     fn is_cold_class_union_constituent(
@@ -5530,10 +6509,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )?;
         }
 
+        self.validate_union_origin_members(union, origin, normalized)
+    }
+
+    /// Checks origin membership without reading object members or callable returns.
+    pub(super) fn validate_union_origin_members(
+        &self,
+        union: TypeId,
+        origin: TypeId,
+        normalized: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_origin_structure(union, origin)?;
+        let Some(TypeData::Union(data)) = self.type_payload(origin).map(TypeRecord::data) else {
+            return Ok(());
+        };
         let mut flattened = Vec::new();
         let mut leaf_count = 0usize;
         let mut flattening = HashSet::new();
         for constituent in &data.union.types {
+            if matches!(self.type_payload(*constituent).map(TypeRecord::data), Some(TypeData::Union(_))) {
+                self.validate_union_query_metadata(*constituent)?;
+            }
             self.flatten_supported_union_type(
                 *constituent,
                 &mut flattened,
@@ -5542,6 +6538,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )?;
         }
         if leaf_count != normalized.len() || flattened != normalized {
+            self.trace_cached_union_failure(
+                "union_origin.normalized_members",
+                union,
+                &(leaf_count, normalized, &flattened),
+            );
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
         Ok(())
@@ -5814,6 +6815,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Ok(origins);
                     }
                 }
+                (TypeData::Intersection(left_data), TypeData::Intersection(right_data))
+                    if self
+                        .primitive_empty_intersection_type(left)
+                        .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(left))?
+                        .is_some()
+                        && self
+                            .primitive_empty_intersection_type(right)
+                            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(right))?
+                            .is_some() =>
+                {
+                    let constituents = self.compare_union_type_lists_worker(
+                        &left_data.intersection.types,
+                        &right_data.intersection.types,
+                        comparing,
+                    )?;
+                    if constituents != Ordering::Equal {
+                        return Ok(constituents);
+                    }
+                }
                 _ => {}
             }
             Ok(left.get().cmp(&right.get()))
@@ -6050,6 +7070,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: &mut Vec<TypeId>,
         has_object_types: bool,
         global_types: Option<&CanonicalGlobalTypes>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<(), LiteralTypeCacheError> {
         // This is the dependency-closed `removeSubtypes` prefix for expression
         // unions. The validator admits primitives, literals, recursively
@@ -6125,13 +7146,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     continue;
                 }
-                let related = match global_types {
-                    Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
+                let related = if let Some(session) = session.as_deref_mut() {
+                    self.is_type_related_to_with_session(
                         source,
                         target,
+                        RelationKind::StrictSubtype,
                         global_types,
-                    ),
-                    None => self.is_type_strict_subtype_of(source, target),
+                        None,
+                        session,
+                    )
+                } else {
+                    match global_types {
+                        Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
+                            source,
+                            target,
+                            global_types,
+                        ),
+                        None => self.is_type_strict_subtype_of(source, target),
+                    }
                 }
                 .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(source))?;
                 if related {
@@ -6214,6 +7246,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             None,
             &mut prepared,
             UnionArrayValidation::None,
+            None,
         )
     }
 
@@ -6233,6 +7266,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             None,
             &mut prepared,
             UnionArrayValidation::GlobalTypes(global_types),
+            None,
+        )
+    }
+
+    /// Keeps subtype reduction in the caller's instantiation session.
+    pub(super) fn expression_union_type_with_global_types_and_session(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        reduction: UnionReduction,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut prepared = self.prepare_type_query_types_with_global_types_and_session(
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            global_types,
+            session,
+        )?;
+        self.union_type_prepared(
+            types,
+            reduction,
+            None,
+            &mut prepared,
+            UnionArrayValidation::GlobalTypes(global_types),
+            Some(session),
         )
     }
 
@@ -6258,6 +7319,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias_symbol.map(|symbol| (symbol, &[][..])),
             prepared,
             None,
+        )
+    }
+
+    pub(super) fn literal_union_type_prepared_with_array_targets_and_session(
+        &mut self,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias_symbol.map(|symbol| UnionAliasCacheKey::new(symbol, &[])),
+            prepared,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            session,
         )
     }
 
@@ -6296,6 +7375,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    pub(super) fn literal_union_type_prepared_with_global_types_and_session(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias_symbol.map(|symbol| UnionAliasCacheKey::new(symbol, &[])),
+            prepared,
+            UnionArrayValidation::GlobalTypes(global_types),
+            Some(session),
+        )
+    }
+
     /// Keeps the alias symbol and ordered arguments in the canonical union key.
     pub(super) fn literal_union_type_with_alias_prepared(
         &mut self,
@@ -6310,6 +7407,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
             prepared,
             UnionArrayValidation::from_global_types(global_types),
+            None,
         )
     }
 
@@ -6318,6 +7416,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: &[TypeId],
         alias: Option<(SemanticSymbolId, &[TypeId])>,
         targets: Option<CanonicalArrayTargets>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.literal_union_type_with_alias_and_array_targets_worker(types, alias, targets, None)
+    }
+
+    pub(super) fn literal_union_type_with_alias_and_array_targets_and_session(
+        &mut self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+        targets: Option<CanonicalArrayTargets>,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.literal_union_type_with_alias_and_array_targets_worker(
+            types,
+            alias,
+            targets,
+            Some(session),
+        )
+    }
+
+    fn literal_union_type_with_alias_and_array_targets_worker(
+        &mut self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+        targets: Option<CanonicalArrayTargets>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let mut prepared = self.prepare_type_query_types_worker(
             &[],
@@ -6329,6 +7452,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             &[],
             0,
             0,
+            session.as_deref_mut(),
         )?;
         self.union_type_prepared(
             types,
@@ -6336,6 +7460,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
             &mut prepared,
             targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            session,
         )
     }
 
@@ -6471,7 +7596,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         origin: TypeId,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        prepared.consume_union(self.id(), false, None)?;
+        self.literal_union_type_prepared_with_index_origin_and_array_targets(
+            types, origin, prepared, None, None,
+        )
+    }
+
+    pub(super) fn literal_union_type_prepared_with_index_origin_and_array_targets(
+        &mut self,
+        types: &[TypeId],
+        origin: TypeId,
+        prepared: &mut PreparedTypeQueryTypes,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let array_validation =
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets);
+        prepared.consume_union(self.id(), false, targets)?;
         if !prepared.pending_function_types.is_empty() {
             self.mark_union_cache_validation_dirty();
         }
@@ -6481,7 +7621,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         for type_ in types {
             self.validate_union_constituent_worker(
                 *type_,
-                UnionArrayValidation::None,
+                array_validation,
                 &mut HashSet::new(),
                 &mut CachedArrayWalk::default(),
                 &prepared.pending_function_types,
@@ -6497,7 +7637,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if types.len() == 1 {
             return Ok(types[0]);
         }
-        match self.plan_union_type(types, UnionReduction::Literal, None, None, false)? {
+        match self.plan_union_type(types, UnionReduction::Literal, None, None, false, session)? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
@@ -6509,7 +7649,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 object_flags,
                 None,
                 Some(UnionOriginPlan::ExistingIndex(origin)),
-                UnionArrayValidation::None,
+                array_validation,
                 &prepared.pending_function_types,
             ),
             UnionPlan::Union { alias: Some(_), .. } => Err(LiteralTypeCacheError::InvalidValue),
@@ -6523,6 +7663,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         prepared: &mut PreparedTypeQueryTypes,
         array_validation: UnionArrayValidation<'_>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let array_targets = array_validation.targets();
         prepared.consume_union(self.id(), alias.is_some(), array_targets)?;
@@ -6597,6 +7738,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 cached,
                 array_validation,
                 &prepared.pending_function_types,
+                session.as_deref_mut(),
             )?;
             return Ok(cached);
         }
@@ -6607,6 +7749,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias,
             array_validation,
             &prepared.pending_function_types,
+            session,
         )?;
         if let Some(key) = union_of_union_key {
             let bootstrap = self
@@ -6625,6 +7768,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         match self.plan_union_type(
             types,
@@ -6632,6 +7776,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias,
             array_validation.global_types(),
             true,
+            session,
         )? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
@@ -6657,6 +7802,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         global_types: Option<&CanonicalGlobalTypes>,
         synthesize_origin: bool,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let (mut normalized, includes) = match self.normalize_union_members(types, reduction)? {
             UnionMembersPlan::Existing(existing) => return Ok(UnionPlan::Existing(existing)),
@@ -6667,6 +7813,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 &mut normalized,
                 includes.intersects(TypeFlags::OBJECT),
                 global_types,
+                session,
             )?;
         }
         self.finish_union_type_plan(
@@ -7782,6 +8929,7 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
+        SymbolNodeLinks,
         declared::type_list_key,
         instantiate::canonical_anonymous_union,
         object_aliases::property_object_alias_projection,
@@ -8059,6 +9207,324 @@ mod tests {
             );
             assert_eq!(native_heritage_snapshot(store), before);
         }
+    }
+
+    const SOURCE_HEADER_IDENTITY_SOURCE: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "type HeaderFields = {}; ",
+        "interface HeaderValue extends HeaderFields { ",
+        "readonly label: string; read(): string; items: string[]; } ",
+        "declare var HeaderValue: unknown;",
+    );
+
+    fn assert_source_header_identity_result(
+        store: &TestStore,
+        receiver: TypeId,
+        targets: Option<CanonicalArrayTargets>,
+        expected: Result<(), LiteralTypeCacheError>,
+    ) {
+        let before = native_heritage_snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                targets.map_or_else(
+                    || store.validate_union_constituent(receiver),
+                    |targets| store
+                        .validate_union_constituent_with_array_targets(targets, receiver),
+                ),
+                expected,
+            );
+            assert_eq!(
+                targets.map_or_else(
+                    || store.validate_cached_array_capability(receiver),
+                    |targets| store
+                        .validate_cached_array_capability_with_array_targets(targets, receiver),
+                ),
+                expected,
+            );
+            assert_eq!(native_heritage_snapshot(store), before);
+        }
+    }
+
+    #[test]
+    fn source_alias_heritage_union_keeps_cold_header_and_warm_member_edges() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_831);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let alias = native_heritage_owner(&context, "HeaderFields");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let header = context
+            .store()
+            .source_interface_heritage_header(receiver)
+            .unwrap()
+            .clone();
+        assert_eq!(header.owner_symbol(), owner);
+        let [base] = header.bases() else {
+            panic!("the real interface has one alias base");
+        };
+        assert_eq!(base.symbol(), alias);
+        let request = base.alias().unwrap();
+        assert_eq!(request.symbol(), alias);
+        assert!(
+            context
+                .store()
+                .declared_type_links(alias)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(request.root())
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        let TypeData::Interface(interface) = context.store().type_payload(receiver).unwrap().data()
+        else {
+            panic!("the source query must retain the interface identity");
+        };
+        assert_eq!(interface.reference.object.target, Some(receiver));
+        let this = interface.this_type.unwrap();
+        let TypeData::TypeParameter(this_parameter) =
+            context.store().type_payload(this).unwrap().data()
+        else {
+            panic!("alias heritage retains the actual this parameter");
+        };
+        assert!(this_parameter.is_this_type);
+        assert_eq!(this_parameter.constraint, Some(receiver));
+        assert!(!interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            context
+                .store()
+                .direct_interface_heritage_provenance(receiver)
+                .is_none()
+        );
+        assert_source_header_identity_result(context.store(), receiver, targets, Ok(()));
+
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[receiver, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let (method, method_name) = native_heritage_member(context.store(), owner, "read");
+        assert!(context.store().value_symbol_links(method).is_none());
+        let callable = context.get_type_at_location(method_name).unwrap();
+        let alias_type = context.get_declared_type_of_symbol(alias).unwrap();
+        assert_eq!(
+            alias_type,
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_type_literal_type,
+        );
+        assert_source_header_identity_result(context.store(), receiver, targets, Ok(()));
+        let warm = native_heritage_snapshot(context.store());
+        for _ in 0..2 {
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(receiver));
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(alias_type));
+            assert_eq!(context.get_type_at_location(method_name), Ok(callable));
+            let store = context.store_mut_for_test();
+            assert_eq!(
+                store.source_interface_heritage_header(receiver),
+                Some(&header)
+            );
+            assert!(
+                store
+                    .direct_interface_heritage_provenance(receiver)
+                    .is_none()
+            );
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &[receiver, undefined],
+                    UnionReduction::Literal,
+                ),
+                Ok(union),
+            );
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+            assert_eq!(native_heritage_snapshot(store), warm);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_heritage_union_rejects_changed_header_and_method_caches() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_832);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let header = context
+            .store()
+            .source_interface_heritage_header(receiver)
+            .unwrap()
+            .clone();
+        let base = header.bases()[0].clone();
+        let (_, method_name) = native_heritage_member(context.store(), owner, "read");
+        let callable = context.get_type_at_location(method_name).unwrap();
+        let (label, _) = native_heritage_member(context.store(), owner, "label");
+        let label_type = native_heritage_publish_property(&mut context, &parsed, file, label);
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let store = context.store_mut_for_test();
+        let invalid = Err(LiteralTypeCacheError::InvalidCachedUnion(receiver));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(label_type, store.intrinsic_bootstrap().unwrap().string_type);
+        assert!(store.set_source_property_readonly(label, false));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_source_property_readonly(label, true));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        let flags = store.symbol(label).unwrap().flags();
+        assert!(store.set_symbol_flags(label, flags | SymbolFlags::OPTIONAL, CheckFlags::READONLY));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_symbol_flags(label, flags, CheckFlags::READONLY));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        let array_owner = store
+            .type_payload(targets.unwrap().array_type())
+            .unwrap()
+            .symbol()
+            .unwrap();
+        for claimed in [None, Some(array_owner)] {
+            assert!(store.set_type_symbol(receiver, claimed));
+            assert_source_header_identity_result(store, receiver, targets, invalid);
+            assert!(store.set_type_symbol(receiver, Some(owner)));
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        }
+        let original = store
+            .symbol_node_links(base.expression())
+            .cloned()
+            .unwrap_or_default();
+        assert!(store.set_symbol_node_links(
+            base.expression(),
+            SymbolNodeLinks {
+                resolved_symbol: Some(array_owner)
+            },
+        ));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_symbol_node_links(base.expression(), original));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        for bases in [None, Some(vec![number])] {
+            assert!(store.set_interface_base_resolution(receiver, true, None, bases));
+            assert_source_header_identity_result(store, receiver, targets, invalid);
+            assert!(store.set_interface_base_resolution(receiver, false, None, None));
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        }
+        let root = base.alias().unwrap().root();
+        let root_links = store.type_node_links(root).cloned().unwrap_or_default();
+        assert!(store.set_type_node_links(
+            root,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None
+            },
+        ));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_type_node_links(root, root_links));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_stored_declared_method_callable_set(store, callable)
+        else {
+            panic!("the real selected method must keep its callable proof");
+        };
+        let signature = projection.call_signatures[0].signature;
+        let returned = store.signature(signature).unwrap().resolved_return_type();
+        assert_eq!(
+            returned,
+            Some(store.intrinsic_bootstrap().unwrap().string_type)
+        );
+        assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+        assert_source_header_identity_result(
+            store,
+            receiver,
+            targets,
+            Err(LiteralTypeCacheError::InvalidCachedUnion(callable)),
+        );
+        assert!(store.set_signature_resolved_return_type(signature, returned));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+    }
+
+    #[test]
+    fn source_alias_heritage_union_keeps_unread_and_published_array_authority() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_833);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let foreign = native_heritage_context(&parsed, file, true);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let foreign_targets = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let (items, name) = native_heritage_member(context.store(), owner, "items");
+        let annotation = context
+            .store()
+            .symbol(items)
+            .unwrap()
+            .value_declaration()
+            .and_then(|node| context.store().source_direct_type_annotation(node))
+            .unwrap();
+        assert_source_header_identity_result(context.store(), receiver, None, Ok(()));
+        let array = context.get_type_from_type_node(annotation).unwrap();
+        let mismatch = CanonicalArrayTargets::for_test(
+            targets.readonly_array_type(),
+            targets.readonly_array_type(),
+        );
+        for publish in [false, true] {
+            if publish {
+                assert_eq!(
+                    native_heritage_publish_property(&mut context, &parsed, file, items),
+                    array
+                );
+                assert_eq!(context.get_type_at_location(name), Ok(array));
+            } else {
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(items)
+                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+                );
+            }
+            let store = context.store_mut_for_test();
+            assert_source_header_identity_result(store, receiver, Some(targets), Ok(()));
+            let missing = Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array));
+            assert_source_header_identity_result(store, receiver, None, missing);
+            for wrong in [foreign_targets, mismatch] {
+                let expected =
+                    store.validate_cached_array_capability_with_array_targets(wrong, array);
+                assert!(
+                    matches!(expected, Err(LiteralTypeCacheError::ArrayType { type_, .. }) if type_ == array)
+                );
+                assert_source_header_identity_result(store, receiver, Some(wrong), expected);
+                assert_source_header_identity_result(store, receiver, Some(targets), Ok(()));
+            }
+            let any = store.intrinsic_bootstrap().unwrap().any_type;
+            let before = native_heritage_snapshot(store);
+            assert_eq!(
+                store.expression_union_type(&[receiver, any], UnionReduction::Literal),
+                missing.map(|()| any)
+            );
+            assert_eq!(native_heritage_snapshot(store), before);
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &[receiver, any],
+                    UnionReduction::Literal
+                ),
+                Ok(any)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
@@ -10279,6 +11745,198 @@ mod tests {
     }
 
     #[test]
+    fn overload_failure_parameter_union_uses_the_caller_instantiation_budget() {
+        use crate::semantic::{
+            calls::{
+                DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
+                DirectCallUnsupported, resolve_direct_call_with_session,
+            },
+            instantiate::{InstantiationLimits, InstantiationSession},
+        };
+
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Recovery { (value: Derived): number; (value: Plain): number; } ",
+            "function keep(callable: Recovery): number { return 1; }",
+        ));
+        assert!(declarations.diagnostics.is_empty());
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(62_290);
+        let library_file = FileId::new(62_291);
+        let mut binder = CanonicalBinder::new();
+        for (file, source, is_declaration) in
+            [(library_file, &declarations, true), (file, &parsed, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &declarations.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name).unwrap().data
+                else {
+                    return None;
+                };
+                (name.text == "Recovery").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callee = context.get_declared_type_of_symbol(owner).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callee)
+        else {
+            panic!("the source overload group must be published")
+        };
+        assert_eq!(projection.call_signatures.len(), 2);
+        let (derived, _, proxy) = inherited_graph_property(context.store());
+        assert_eq!(projection.call_signatures[0].parameters, [derived]);
+        let broad = projection.call_signatures[1].parameters[0];
+        assert!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let request = DirectCallRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee,
+            arguments: &[],
+        };
+        let before = (
+            store.signature_len(),
+            store.symbol_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        let mark = limited.limit_event_mark();
+        assert!(matches!(
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut limited),
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::OverloadFailureRecovery(type_))) if type_ == callee
+        ));
+        assert!(limited.limit_event_occurred_since(mark));
+        assert_eq!(limited.limit_event_count(), 1);
+        assert!(
+            store
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        assert_eq!(
+            (
+                store.signature_len(),
+                store.symbol_len(),
+                store.overload_failure_signatures.len()
+            ),
+            before
+        );
+
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        let recovered =
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut adequate)
+                .unwrap();
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert!(matches!(
+            recovered.applicability,
+            DirectCallApplicability::TooFewArguments {
+                expected_at_least: 1,
+                actual: 0
+            }
+        ));
+        let record = store.signature(recovered.projection.signature).unwrap();
+        assert_eq!(
+            record.flags(),
+            SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(record.parameters()[0])
+                .unwrap()
+                .resolved_type,
+            Some(broad)
+        );
+        assert_eq!(
+            store.value_symbol_links(proxy).unwrap().resolved_type,
+            Some(store.intrinsic_bootstrap().unwrap().number_type)
+        );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let count = adequate.total_count();
+        assert_eq!(
+            resolve_direct_call_with_session(
+                store,
+                &globals,
+                false,
+                request,
+                Some(recovered.projection.signature),
+                &mut adequate
+            )
+            .unwrap(),
+            recovered
+        );
+        assert_eq!(adequate.total_count(), count);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.overload_failure_signatures.len()
+            ),
+            warm
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Both bodies must preserve cold array targets through source replay.
     fn inherited_index_callables_preserve_cold_array_targets() {
         let declarations = parse_source_file(concat!(
@@ -12308,6 +13966,154 @@ mod tests {
                 .cached_template_literal_type(&[String::new(), String::new()], &[number_type],),
             None,
         );
+    }
+
+    #[test]
+    fn primitive_empty_intersections_preserve_literal_union_members_and_replay() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let (empty, cases) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.empty_type_literal_type,
+                [
+                    (bootstrap.string_type, bootstrap.empty_string_type),
+                    (bootstrap.number_type, bootstrap.zero_type),
+                    (bootstrap.bigint_type, bootstrap.zero_bigint_type),
+                ],
+            )
+        };
+        for (primitive, literal) in cases {
+            for operands in [[primitive, empty], [empty, primitive]] {
+                let retained = store
+                    .canonical_source_intersection_type(&operands, None)
+                    .unwrap();
+                let union = store
+                    .literal_union_type(&[literal, retained], None)
+                    .unwrap();
+                assert_eq!(union_types(&store, union), &[literal, retained]);
+                let flags = store.type_payload(union).unwrap().object_flags();
+                assert!(flags.contains(ObjectFlags::CONTAINS_INTERSECTIONS));
+                assert!(!flags.contains(ObjectFlags::PRIMITIVE_UNION));
+                let before = snapshot(&store);
+                for members in [[literal, retained], [retained, literal]] {
+                    assert_eq!(store.validate_union_constituent(union), Ok(()));
+                    assert_eq!(store.validate_cached_union_result(union, None), Ok(()));
+                    assert_eq!(store.validate_cached_array_capability(retained), Ok(()));
+                    assert_eq!(
+                        store.cached_literal_union_type_with_alias(&members, None, None),
+                        Ok(Some(union))
+                    );
+                    assert_eq!(store.literal_union_type(&members, None), Ok(union));
+                    assert_eq!(snapshot(&store), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_empty_union_replay_rejects_missing_intersection_provenance() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let (string, empty, literal) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.empty_type_literal_type,
+                bootstrap.empty_string_type,
+            )
+        };
+        let retained = store
+            .canonical_source_intersection_type(&[string, empty], None)
+            .unwrap();
+        let members = [literal, retained];
+        let union = store.literal_union_type(&members, None).unwrap();
+        let intact = snapshot(&store);
+        let key = store.intersection_keys_by_type.remove(&retained).unwrap();
+        let before = snapshot(&store);
+        for _ in 0..2 {
+            let expected = LiteralTypeCacheError::InvalidCachedUnion(retained);
+            assert_eq!(store.validate_union_constituent(union), Err(expected));
+            assert_eq!(
+                store.validate_cached_union_result(union, None),
+                Err(expected)
+            );
+            assert_eq!(
+                store.validate_cached_array_capability(retained),
+                Err(expected)
+            );
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&members, None, None),
+                Err(expected)
+            );
+            assert_eq!(store.literal_union_type(&members, None), Err(expected));
+            assert_eq!(snapshot(&store), before);
+        }
+        assert!(
+            store
+                .intersection_keys_by_type
+                .insert(retained, key)
+                .is_none()
+        );
+        assert_eq!(store.validate_union_constituent(union), Ok(()));
+        assert_eq!(store.validate_cached_union_result(union, None), Ok(()));
+        assert_eq!(store.literal_union_type(&members, None), Ok(union));
+        assert_eq!(snapshot(&store), intact);
+    }
+
+    #[test]
+    fn primitive_empty_union_order_uses_constituents_before_allocation_order() {
+        for number_first in [false, true] {
+            let mut store = initialized(IntrinsicBootstrapOptions::default());
+            let (string, number, empty) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.empty_type_literal_type,
+                )
+            };
+            let primitives = if number_first {
+                [number, string]
+            } else {
+                [string, number]
+            };
+            let allocated = primitives.map(|primitive| {
+                store
+                    .canonical_source_intersection_type(&[primitive, empty], None)
+                    .unwrap()
+            });
+            let expected = if number_first {
+                [allocated[1], allocated[0]]
+            } else {
+                allocated
+            };
+            let union = store.literal_union_type(&allocated, None).unwrap();
+            assert_eq!(union_types(&store, union), &expected);
+            assert_eq!(
+                store.literal_union_type(&[allocated[1], allocated[0]], None),
+                Ok(union)
+            );
+            assert_eq!(store.validate_union_constituent(union), Ok(()));
+        }
     }
 
     #[test]
@@ -14787,6 +16593,10 @@ mod tests {
 
     #[test]
     fn derived_object_subtype_discriminants_preserve_nested_and_contextual_provenance() {
+        use crate::semantic::relation::{
+            IntersectionState, RelationCacheSnapshot, RelationComparisonResult, RelationKind,
+        };
+
         let parsed = parse_source_file(concat!(
             "interface Array<T> {} ",
             "interface NestedFirst { kind: 'first'; values: number[] } ",
@@ -14903,7 +16713,110 @@ mod tests {
                 .unwrap();
             assert!(store.validate_contextual_widened_object_property(*member, optional));
         }
+
+        // A and B retain the initializer owners, not the declared interfaces.
+        let [a_owner, b_owner] =
+            [context_first, context_second].map(|source| record(store, source).symbol().unwrap());
+        assert_ne!(a_owner, b_owner);
+        let [a, b] = [a_owner, b_owner].map(|owner| {
+            contextual_members
+                .iter()
+                .copied()
+                .find(|member| record(store, *member).symbol() == Some(owner))
+                .unwrap()
+        });
+        assert_eq!(contextual_members.as_slice(), &[a, b]);
+        let [a_properties, b_properties] = [a, b].map(|member| {
+            record(store, member)
+                .data()
+                .structured()
+                .and_then(|structured| structured.properties.as_deref())
+                .unwrap()
+                .to_vec()
+        });
+        for (properties, names) in [
+            (&a_properties, ["kind", "first", "second"]),
+            (&b_properties, ["first", "kind", "second"]),
+        ] {
+            assert_eq!(
+                properties
+                    .iter()
+                    .map(|property| store.symbol(*property).unwrap().name().as_utf8().unwrap())
+                    .collect::<Vec<_>>(),
+                names,
+            );
+        }
+        let (number, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        assert_eq!(
+            store
+                .value_symbol_links(a_properties[1])
+                .unwrap()
+                .resolved_type,
+            Some(number),
+        );
+        for (optional, donor) in [
+            (a_properties[2], b_properties[2]),
+            (b_properties[0], a_properties[1]),
+        ] {
+            let optional_record = store.symbol(optional).unwrap();
+            let donor_record = store.symbol(donor).unwrap();
+            assert!(optional_record.flags().contains(SymbolFlags::OPTIONAL));
+            assert!(!donor_record.flags().contains(SymbolFlags::OPTIONAL));
+            let links = store.value_symbol_links(optional).unwrap();
+            assert_eq!(links.resolved_type, Some(undefined));
+            assert_eq!(links.target, Some(donor));
+            assert_eq!(optional_record.declarations(), donor_record.declarations());
+            assert_eq!(
+                optional_record.value_declaration(),
+                donor_record.value_declaration(),
+            );
+            assert_eq!(optional_record.parent(), donor_record.parent());
+        }
+        for (property, value) in [
+            (a_properties[0], "context-first"),
+            (b_properties[1], "context-second"),
+        ] {
+            let type_ = store
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                literal_data(store, type_).value,
+                LiteralValue::String(value.into()),
+            );
+        }
+
+        // Declaration order makes B.first the first unit property. A.first is
+        // number, so B -> A reaches the strict relation and fails on kind.
+        // A -> B is skipped by the unequal kind discriminants. Widening used
+        // Literal reduction, so neither direction has been queried yet.
         let contextual_relations = store.relation_state_snapshot();
+        assert_eq!(
+            contextual_relations.strict_subtype,
+            RelationCacheSnapshot::default(),
+        );
+        let contextual_counts = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        let [b_to_a, a_to_b] = [(b, a), (a, b)].map(|(source, target)| {
+            store
+                .relation_key_if_available(source, target, IntersectionState::NONE, false, false)
+                .unwrap()
+                .key()
+        });
+        assert_ne!(b_to_a, a_to_b);
+        for key in [b_to_a, a_to_b] {
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, key),
+                RelationComparisonResult::NONE,
+            );
+        }
         assert_eq!(
             store.expression_union_type_with_global_types(
                 &global_types,
@@ -14912,7 +16825,62 @@ mod tests {
             ),
             Ok(contextual),
         );
-        assert_eq!(store.relation_state_snapshot(), contextual_relations);
+        let mut expected_relations = contextual_relations;
+        expected_relations.strict_subtype = RelationCacheSnapshot {
+            allocated: true,
+            entries: 1,
+        };
+        assert_eq!(store.relation_state_snapshot(), expected_relations);
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, b_to_a),
+            RelationComparisonResult::FAILED,
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, a_to_b),
+            RelationComparisonResult::NONE,
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            contextual_counts,
+        );
+
+        let contextual_warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        for members in [[a, b], [b, a]] {
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &global_types,
+                    &members,
+                    UnionReduction::Subtype,
+                ),
+                Ok(contextual),
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, b_to_a),
+                RelationComparisonResult::FAILED,
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, a_to_b),
+                RelationComparisonResult::NONE,
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                    store.relation_state_snapshot(),
+                ),
+                contextual_warm,
+            );
+        }
 
         let property = record(store, widened_first)
             .data()
@@ -14994,7 +16962,9 @@ mod tests {
                 let mut types = Vec::new();
                 store.insert_union_type(&mut types, target).unwrap();
                 store.insert_union_type(&mut types, canonical).unwrap();
-                store.remove_union_subtypes(&mut types, true, None).unwrap();
+                store
+                    .remove_union_subtypes(&mut types, true, None, None)
+                    .unwrap();
                 assert_eq!(types, [canonical]);
             }
         }

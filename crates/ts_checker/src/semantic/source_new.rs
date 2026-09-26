@@ -1,7 +1,11 @@
 //! Exact source integration for admitted class and declared constructions.
 //!
-//! This is the dependency-closed `new Model()`, `new Model`, and single-literal
-//! constructor branch of pinned TypeScript-Go `checkCallExpression`,
+//! This includes `new Model()`, `new Model`, literal overload arguments, and
+//! checked expression arguments for a direct local constructor, an explicit
+//! source constructor, or an authenticated default-library construct value.
+//! Generic source classes and named library constructors use the common
+//! Construct selector and inference.
+//! It follows pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
 //! exported ambient class, an earlier ambient variable, a named constructor
@@ -11,14 +15,15 @@
 //! arguments and canonical generic instantiations. Global arrays retain their
 //! real length and generic-item overloads, including authenticated empty object
 //! literals. Planning proves syntax, resolver routes, provider provenance, and
-//! cold/warm caches before source execution may publish class or expression
-//! state.
+//! available cache facts before canonical declaration preparation. The source
+//! expression checker validates argument semantics before New selection and
+//! result publication.
 
 use std::collections::{HashMap, HashSet};
 
 mod global_error;
 
-use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
+use ts_ast::{NodeArena, NodeArenaRevision, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
     CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
@@ -30,18 +35,35 @@ use super::{
     CanonicalTypeMapperStore, ClassError, DeclaredTypeError, DeclaredTypeHost,
     ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
     TypeNodeLinks, ValueSymbolLinks,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
-    callables::CallableFamily,
+    callables::{CallableFamily, ValidatedSingleCallable},
     classes::{
-        ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan, SourceClassPlan,
-        authenticated_class_constructor_value, completed_source_class_members,
-        execute_nongeneric_class_member_query, optional_constructor_parameter_type,
-        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
-        source_class_plan_is_current,
+        ClassBodyAccessToken, ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
+        ClassTypeQueryContext, SourceClassPlan, authenticated_class_constructor_value,
+        completed_source_class_members, execute_nongeneric_class_member_query,
+        optional_constructor_parameter_type, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query, source_class_plan_is_current,
+    },
+    conditional_types::ConditionalTypeError,
+    constructor_values::{
+        GlobalConstructorValuePlan, plan_global_constructor_value, plan_global_named_constructor,
+        plan_source_generic_constructor_value, prepare_global_constructor_candidates,
+        resolve_global_constructor_candidates, validate_global_plan,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
+    generic_calls::{
+        GenericCallVectorError, GenericCallVectorRequest, GenericConstructorContextMethod,
+        PreparedGenericConstructorContext, demand_generic_call_vector_return_with_session,
+        materialize_generic_call_vector_source, preflight_generic_class_constructor_signature,
+    },
+    generic_method_calls::{
+        GenericMethodCallError, GenericMethodCallResolution, GenericMethodCallSelection,
+        prepare_generic_constructor_context, resolve_generic_class_constructor,
+        resolve_generic_class_constructor_with_context,
+    },
     instantiate::InstantiationSession,
     jsdoc::leading_jsdoc_comment,
     object_members::{
@@ -50,7 +72,7 @@ use super::{
     },
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{Signature, SignatureFlags},
-    source::{PlannedExpression, PlannedExpressionKind},
+    source::{CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind},
     source_callables::{
         source_direct_call_argument_arrow_is_exact,
         source_promise_constructor_argument_arrow_is_exact,
@@ -167,6 +189,20 @@ const fn invariant(reason: SourceNewInvariant) -> SourceNewError {
     SourceNewError::Invariant(reason)
 }
 
+fn trace_constructor_failure(
+    stage: &'static str,
+    expression: NodeRef,
+    constructor: NodeRef,
+    details: std::fmt::Arguments<'_>,
+) {
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr().lock(),
+        format_args!(
+            "ts-rust-constructor-error stage={stage} expression={expression:?} constructor={constructor:?} {details}\n"
+        ),
+    );
+}
+
 /// Opaque syntax, resolver, and provider proof for one direct construction.
 #[derive(Clone, Debug)]
 pub(super) struct SourceDefaultNewPlan {
@@ -180,6 +216,13 @@ pub(super) struct SourceDefaultNewPlan {
     additional_arguments: Vec<SourceNewArgument>,
     parameter: Option<SourceNewParameter>,
     executor: Option<Box<PlannedExpression>>,
+    expression_arguments: Option<SourceNewExpressionArguments>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceNewExpressionArguments {
+    nodes: Vec<NodeRef>,
+    expressions: Option<Vec<PlannedExpression>>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +230,8 @@ enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
     ConstructorOverloads(Box<super::classes::SourceClassPlan>),
     SourceClass(Box<SourceClassPlan>),
+    GenericSourceClass(SourceGenericClassNewPlan),
+    GenericLibrary(SourceGenericLibraryNewPlan),
     ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
     ClassUnion(SourceClassUnionConstructorPlan),
@@ -194,7 +239,20 @@ enum SourceNewTarget {
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
     DeclaredInterface(global_error::DeclaredConstructorPlan),
+    Library(Box<GlobalConstructorValuePlan>),
     GlobalPromise(SourceGlobalPromiseConstructorPlan),
+}
+
+#[derive(Clone, Debug)]
+struct SourceGenericClassNewPlan {
+    class: Box<SourceClassPlan>,
+    type_argument_nodes: Option<Vec<NodeRef>>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceGenericLibraryNewPlan {
+    library: Box<GlobalConstructorValuePlan>,
+    type_argument_nodes: Option<Vec<NodeRef>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,6 +335,7 @@ impl SourceGlobalDateInitializerPlan {
             additional_arguments: Vec::new(),
             parameter: None,
             executor: None,
+            expression_arguments: None,
         }
     }
 }
@@ -291,6 +350,175 @@ struct SourceGlobalPromiseConstructorPlan {
     parameter_annotation: NodeRef,
     return_annotation: NodeRef,
     executor: NodeRef,
+    type_argument: Option<NodeRef>,
+    array_targets: Option<CanonicalArrayTargets>,
+}
+
+/// Source-checked constructor context retained by its executor callable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourcePromiseExecutorProof {
+    construction: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    owner: SemanticSymbolId,
+    revision: NodeArenaRevision,
+    global: SourceGlobalPromiseConstructorPlan,
+    target: TypeId,
+    selected: SignatureId,
+    value_type: TypeId,
+    instance_type: TypeId,
+}
+
+impl SourcePromiseExecutorProof {
+    pub(super) fn from_source(
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        array_targets: CanonicalArrayTargets,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        target: TypeId,
+    ) -> Result<Self, SourceNewError> {
+        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(declaration));
+        if !source_promise_constructor_argument_arrow_is_exact(store, host, declaration)
+            .map_err(|_| invalid())?
+            || !host.symbol_matches(store, declaration, owner)
+        {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(construction)) = store.source_node_parent(declaration)
+        else {
+            return Err(invalid());
+        };
+        let NodeData::NewExpression(expression) = &host.node(construction).ok_or_else(invalid)?.data
+        else {
+            return Err(invalid());
+        };
+        let constructor = NodeRef::new(construction.arena, construction.file, expression.expression);
+        let symbol = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Promise"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let global = plan_global_promise_constructor(
+            store, host, construction, constructor, symbol, declaration, Some(array_targets),
+        )?;
+        let selected = resolved_global_promise_constructor_identity(store, constructor, symbol, &global)?
+            .ok_or_else(invalid)?;
+        let proof = Self {
+            construction,
+            constructor,
+            symbol,
+            owner,
+            revision: host.source(declaration).ok_or_else(invalid)?.0.revision(),
+            global,
+            target,
+            selected: selected.signature,
+            value_type: selected.value_type,
+            instance_type: selected.instance_type,
+        };
+        if !proof.is_exact(store, declaration, owner, target) {
+            return Err(invalid());
+        }
+        Ok(proof)
+    }
+
+    pub(super) fn callback(&self) -> NodeRef {
+        self.global.executor
+    }
+
+    pub(super) fn revision(&self) -> NodeArenaRevision {
+        self.revision
+    }
+
+    pub(super) fn target(&self) -> TypeId {
+        self.target
+    }
+
+    pub(super) fn source_is_exact<TypePayload, MapperPayload>(
+        &self,
+        store: &super::store::SemanticStore<TypePayload, MapperPayload>,
+    ) -> bool {
+        store.source_declaration_symbol(self.global.executor) == Some(self.owner)
+            && store.source_symbol_declarations_match(self.owner)
+            && store.symbol(self.owner).is_some_and(|owner| {
+                owner.flags() == SymbolFlags::FUNCTION
+                    && owner.check_flags() == CheckFlags::NONE
+                    && owner.name() == InternalSymbolName::Function.as_ref()
+                    && owner.declarations() == Some(&[self.global.executor])
+                    && owner.value_declaration() == Some(self.global.executor)
+                    && owner.members().is_none()
+                    && owner.exports().is_none()
+                    && owner.parent().is_none()
+                    && owner.export_symbol().is_none()
+                    && store.get_merged_symbol(self.owner) == Some(self.owner)
+            })
+            && store.source_node_kind(self.global.executor) == Some(SyntaxKind::ArrowFunction)
+            && store.source_node_kind(self.construction) == Some(SyntaxKind::NewExpression)
+            && store.source_node_parent(self.global.executor)
+                == Some(SourceNodeParent::Parent(self.construction))
+            && store.source_node_parent(self.constructor)
+                == Some(SourceNodeParent::Parent(self.construction))
+    }
+
+    pub(super) fn is_exact(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        target: TypeId,
+    ) -> bool {
+        if !self.source_is_exact(store)
+            || declaration != self.global.executor
+            || owner != self.owner
+            || target != self.target
+            || store.symbol_node_links(self.constructor).is_some_and(|links| {
+                links.resolved_symbol.is_some_and(|symbol| symbol != self.symbol)
+            })
+            || store.intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("Promise"))
+                .and_then(|symbol| store.get_merged_symbol(symbol)) != Some(self.symbol)
+        {
+            return false;
+        }
+        let Ok(Some(selected)) = resolved_global_promise_constructor_identity(
+            store, self.constructor, self.symbol, &self.global,
+        ) else {
+            return false;
+        };
+        selected.signature == self.selected
+            && selected.value_type == self.value_type
+            && selected.instance_type == self.instance_type
+            && exact_type_cache(store, self.constructor)
+                .is_ok_and(|cached| cached.is_none_or(|type_| type_ == self.value_type))
+            && exact_type_cache(store, self.construction)
+                .is_ok_and(|cached| cached.is_none_or(|type_| type_ == self.instance_type))
+            && exact_signature_cache(store, self.construction)
+                .is_ok_and(|cached| cached.is_none_or(|signature| signature == self.selected))
+            && resolved_promise_executor_context(store, self.construction, &self.global, self.instance_type)
+                .is_ok_and(|cached| cached == Some(target))
+    }
+}
+
+fn resolved_promise_executor_context(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    global: &SourceGlobalPromiseConstructorPlan,
+    instance_type: TypeId,
+) -> Result<Option<TypeId>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+    let executor = exact_type_cache(store, global.parameter_annotation)
+        .map_err(|()| invalid())?
+        .ok_or_else(invalid)?;
+    let formal = store.declared_type_links(global.type_parameter)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let instance = validate_direct_generic_reference(store, instance_type)
+        .map_err(|_| invalid())?;
+    super::instantiate::cached_instantiation_with_vector(
+        store, executor, &[formal], &instance.type_arguments, global.array_targets, None,
+    ).map_err(|_| invalid())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +575,50 @@ struct SourceNewParameter {
 }
 
 impl SourceDefaultNewPlan {
+    pub(super) fn is_library_constructor(&self) -> bool {
+        matches!(
+            &self.target,
+            SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_)
+        )
+    }
+
+    pub(super) fn expression_argument_nodes(&self) -> Option<&[NodeRef]> {
+        self.expression_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+    }
+
+    pub(super) fn checked_expression_arguments(&self) -> Option<&[PlannedExpression]> {
+        self.expression_arguments
+            .as_ref()
+            .and_then(|arguments| arguments.expressions.as_deref())
+    }
+
+    pub(super) fn set_expression_arguments(
+        &mut self,
+        expressions: Vec<PlannedExpression>,
+    ) -> Result<(), SourceNewError> {
+        let Some(arguments) = &mut self.expression_arguments else {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                self.node,
+            )));
+        };
+        if arguments.expressions.is_some()
+            || arguments.nodes.len() != expressions.len()
+            || arguments
+                .nodes
+                .iter()
+                .zip(&expressions)
+                .any(|(node, expression)| *node != expression.node)
+        {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                self.node,
+            )));
+        }
+        arguments.expressions = Some(expressions);
+        Ok(())
+    }
+
     pub(super) const fn node(&self) -> NodeRef {
         self.node
     }
@@ -357,6 +629,34 @@ impl SourceDefaultNewPlan {
 
     pub(super) const fn resolved_symbol(&self) -> SemanticSymbolId {
         self.resolved_symbol
+    }
+
+    /// Class preparation uses the exported owner, while source reads keep the local symbol.
+    pub(super) fn provider_symbol(&self) -> SemanticSymbolId {
+        match &self.target {
+            SourceNewTarget::Class(class) => class.symbol(),
+            SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+                class.symbol()
+            }
+            SourceNewTarget::GenericSourceClass(generic) => generic.class.symbol(),
+            _ => self.resolved_symbol,
+        }
+    }
+
+    pub(super) fn is_generic_source_class(&self) -> bool {
+        matches!(self.target, SourceNewTarget::GenericSourceClass(_))
+    }
+
+    pub(super) fn is_generic_library_constructor(&self) -> bool {
+        matches!(self.target, SourceNewTarget::GenericLibrary(_))
+    }
+
+    pub(super) fn written_type_argument_nodes(&self) -> Option<&[NodeRef]> {
+        match &self.target {
+            SourceNewTarget::GenericSourceClass(generic) => generic.type_argument_nodes.as_deref(),
+            SourceNewTarget::GenericLibrary(generic) => generic.type_argument_nodes.as_deref(),
+            _ => None,
+        }
     }
 
     pub(super) const fn requires_early_preparation(&self) -> bool {
@@ -402,13 +702,14 @@ impl SourceDefaultNewPlan {
     pub(super) fn promise_executor_contextual_type(
         &self,
         store: &CanonicalTypeMapperStore,
-    ) -> Option<TypeId> {
+    ) -> Result<Option<TypeId>, SourceNewError> {
         let SourceNewTarget::GlobalPromise(global) = &self.target else {
-            return None;
+            return Ok(None);
         };
-        store
-            .type_node_links(global.parameter_annotation)
-            .and_then(|links| links.resolved_type)
+        let Some(checked) = resolved_global_promise_constructor(store, self, global)? else {
+            return Ok(None);
+        };
+        resolved_promise_executor_context(store, self.node, global, checked.instance_type)
     }
 
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
@@ -416,7 +717,11 @@ impl SourceDefaultNewPlan {
     }
 
     pub(super) fn argument_nodes(&self) -> impl Iterator<Item = NodeRef> + '_ {
-        self.arguments().map(|argument| argument.node)
+        self.arguments().map(|argument| argument.node).chain(
+            self.expression_arguments
+                .iter()
+                .flat_map(|arguments| arguments.nodes.iter().copied()),
+        )
     }
 
     /// Returns the exact access or abstract-instantiation diagnostic for a class.
@@ -726,6 +1031,66 @@ pub(super) fn plan_direct_default_new_with_type_context(
     early_preparation: bool,
     type_context: Option<&super::classes::ClassTypeQueryContext>,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    plan_direct_default_new_with_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        prior_source_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        type_context,
+        None,
+    )
+}
+
+/// Uses the current source caller to admit a real default-library value.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_direct_default_new_with_source_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    let type_context = super::classes::ClassTypeQueryContext::new(globals, options);
+    plan_direct_default_new_with_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        prior_source_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        Some(&type_context),
+        Some((globals, options)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_direct_default_new_with_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    type_context: Option<&super::classes::ClassTypeQueryContext>,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
         .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(node)))?;
@@ -738,10 +1103,10 @@ pub(super) fn plan_direct_default_new_with_type_context(
     }
     let mut arguments = Vec::new();
     let mut executor = None;
+    let mut has_expression_arguments = false;
     let argument_start = match new_expression.arguments.as_ref() {
         Some(argument_nodes) => {
-            if argument_nodes.has_trailing_comma
-                || argument_nodes.range.start < record.range.start
+            if argument_nodes.range.start < record.range.start
                 || argument_nodes.range.end != record.range.end
                 || argument_nodes.range.end.get()
                     < argument_nodes.range.start.get().saturating_add(2)
@@ -774,6 +1139,18 @@ pub(super) fn plan_direct_default_new_with_type_context(
                         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
                     }
                     continue;
+                }
+                if argument_record.flags.0 != 0
+                    || argument_record.parent != Some(node.node)
+                    || argument_record.range.start <= argument_nodes.range.start
+                    || argument_record.range.end >= argument_nodes.range.end
+                    || !bound.contains(argument_node)
+                    || matches!(
+                        argument_record.kind,
+                        SyntaxKind::SpreadElement | SyntaxKind::OmittedExpression
+                    )
+                {
+                    return Err(unsupported(SourceNewUnsupported::Arguments(node)));
                 }
                 let value = match &argument_record.data {
                     NodeData::StringLiteral(literal)
@@ -833,7 +1210,10 @@ pub(super) fn plan_direct_default_new_with_type_context(
                         }
                         SourceNewArgumentValue::EmptyObject(Box::new(planned))
                     }
-                    _ => return Err(unsupported(SourceNewUnsupported::Arguments(node))),
+                    _ => {
+                        has_expression_arguments = true;
+                        continue;
+                    }
                 };
                 if argument_record.flags.0 != 0
                     || argument_record.parent != Some(node.node)
@@ -907,39 +1287,85 @@ pub(super) fn plan_direct_default_new_with_type_context(
             }));
         }
     };
-    let symbol = store
-        .get_merged_symbol(resolved_symbol)
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(resolved_symbol)))?;
-    if symbol != resolved_symbol {
-        return Err(invariant(SourceNewInvariant::MergedSymbol {
-            source: resolved_symbol,
-            target: symbol,
-        }));
-    }
+    let symbol = constructor_value_symbol(store, constructor, resolved_symbol)?;
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
-    if symbol_record.check_flags() != CheckFlags::NONE {
-        return Err(unsupported(SourceNewUnsupported::ConstructorClass {
-            node: constructor,
-            symbol,
-        }));
+    if let Some(class) = prior_source_classes.get(&symbol).filter(|class| {
+        symbol_record.flags() == SymbolFlags::CLASS && !class.type_parameters().is_empty()
+    }) {
+        return plan_generic_source_class_new(
+            store,
+            host,
+            node,
+            constructor,
+            resolved_symbol,
+            class,
+            early_preparation,
+        );
     }
-    let global_wrapper = matches!(identifier.text.as_str(), "Object" | "Boolean")
+    let mut library = source_context
+        .map(|(globals, options)| {
+            plan_global_constructor_value(store, host, globals, options, symbol)
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "provider_plan_literal",
+                        node,
+                        constructor,
+                        format_args!("provider={symbol:?} raw_error={error:?}"),
+                    );
+                    global_error::provider_error(constructor, symbol, error)
+                })
+        })
+        .transpose()?
+        .flatten();
+    let source_arguments = symbol_record.flags() == SymbolFlags::CLASS
+        && prior_source_classes
+            .get(&symbol)
+            .is_some_and(SourceClassPlan::has_checked_constructor_arguments);
+    let expression_argument_plan = || SourceNewExpressionArguments {
+        nodes: new_expression
+            .arguments
+            .as_ref()
+            .map_or_else(Vec::new, |arguments| {
+                arguments
+                    .nodes
+                    .iter()
+                    .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                    .collect()
+            }),
+        expressions: None,
+    };
+    let mut expression_arguments =
+        (source_arguments || library.is_some()).then(expression_argument_plan);
+    if source_arguments || library.is_some() {
+        if library.is_some() && executor.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        arguments.clear();
+        executor = None;
+        if new_expression.type_arguments.is_some() {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        }
+    }
+    let global_wrapper = !source_arguments
+        && matches!(identifier.text.as_str(), "Object" | "Boolean")
         && store
             .intrinsic_bootstrap()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
             .and_then(|globals| globals.get_source(&identifier.text))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
-    let global_array = identifier.text == "Array"
+    let global_array = !source_arguments
+        && identifier.text == "Array"
         && store
             .intrinsic_bootstrap()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
             .and_then(|globals| globals.get_source("Array"))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
-    let global_date = identifier.text == "Date"
+    let global_date = !source_arguments
+        && identifier.text == "Date"
         && store
             .intrinsic_bootstrap()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
@@ -947,13 +1373,65 @@ pub(super) fn plan_direct_default_new_with_type_context(
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
     let imported_class = import_bindings.contains_key(&resolved_symbol);
-    let global_promise = identifier.text == "Promise"
+    let global_promise = !source_arguments
+        && identifier.text == "Promise"
         && store
             .intrinsic_bootstrap()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
             .and_then(|globals| globals.get_source("Promise"))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
+    if !(source_arguments
+        || library.is_some()
+        || global_wrapper
+        || global_array
+        || global_date
+        || global_promise)
+        && let Some((globals, options)) = source_context
+        && let Some(named) = plan_global_named_constructor(store, host, globals, options, symbol)
+            .and_then(|named| match named {
+                Some(named) => Ok(Some(named)),
+                None => {
+                    plan_source_generic_constructor_value(store, host, globals, options, symbol)
+                }
+            })
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "provider_plan_named",
+                    node,
+                    constructor,
+                    format_args!("provider={symbol:?} raw_error={error:?}"),
+                );
+                global_error::provider_error(constructor, symbol, error)
+            })?
+    {
+        if named.is_named_generic() {
+            return plan_generic_library_new(
+                store,
+                host,
+                globals,
+                options,
+                node,
+                constructor,
+                resolved_symbol,
+                named,
+                early_preparation,
+            );
+        }
+        expression_arguments = Some(expression_argument_plan());
+        if executor.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        arguments.clear();
+        executor = None;
+        if new_expression.type_arguments.is_some() {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        }
+        library = Some(named);
+    }
+    if has_expression_arguments && !(source_arguments || library.is_some()) {
+        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+    }
     if executor.is_some() && !global_promise {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -965,7 +1443,8 @@ pub(super) fn plan_direct_default_new_with_type_context(
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
     if !global_array
-        && (arguments.len() > 1 || new_expression.type_arguments.is_some() && !imported_class)
+        && (arguments.len() > 1
+            || new_expression.type_arguments.is_some() && !imported_class && !global_promise)
     {
         return Err(unsupported(if new_expression.type_arguments.is_some() {
             SourceNewUnsupported::TypeArguments(node)
@@ -980,7 +1459,9 @@ pub(super) fn plan_direct_default_new_with_type_context(
     };
     let argument = arguments.first().cloned();
     let additional_arguments = arguments.into_iter().skip(1).collect::<Vec<_>>();
-    let (target, parameter) = if let Some(binding) = import_bindings.get(&resolved_symbol) {
+    let (target, parameter) = if let Some(library) = library {
+        (SourceNewTarget::Library(Box::new(library)), None)
+    } else if let Some(binding) = import_bindings.get(&resolved_symbol) {
         if symbol_record.flags() != SymbolFlags::ALIAS
             || binding.alias_symbol != resolved_symbol
             || binding.local_text != identifier.text
@@ -1042,7 +1523,15 @@ pub(super) fn plan_direct_default_new_with_type_context(
         {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
         }
-        let global = plan_global_promise_constructor(store, host, constructor, symbol, executor)?;
+        let global = plan_global_promise_constructor(
+            store,
+            host,
+            node,
+            constructor,
+            symbol,
+            executor,
+            source_context.map(|(globals, _)| CanonicalArrayTargets::from_global_types(globals)),
+        )?;
         (SourceNewTarget::GlobalPromise(global), None)
     } else if symbol_record.flags() == SymbolFlags::CLASS
         && let Some(class) = super::classes::plan_source_constructor_overload_class(
@@ -1064,11 +1553,11 @@ pub(super) fn plan_direct_default_new_with_type_context(
             }));
         }
         (SourceNewTarget::ConstructorOverloads(Box::new(class)), None)
-    } else if let Some(class) = prior_source_classes
-        .get(&symbol)
-        .filter(|class| symbol_record.flags() == SymbolFlags::CLASS && !class.has_object_base())
-    {
-        if !class.has_own_default_constructor() || early_preparation {
+    } else if let Some(class) = prior_source_classes.get(&symbol).filter(|class| {
+        symbol_record.flags() == SymbolFlags::CLASS
+            && (!class.has_object_base() || class.has_constructor_value_base())
+    }) {
+        if !(class.has_own_default_constructor() || source_arguments) || early_preparation {
             return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
         }
         if argument.is_some() || !additional_arguments.is_empty() || !type_arguments.is_empty() {
@@ -1196,16 +1685,39 @@ pub(super) fn plan_direct_default_new_with_type_context(
             &target,
             SourceNewTarget::Class(class) if class.constructor_minimum_argument_count() == 0
         );
-    if !matches!(
-        &target,
-        SourceNewTarget::ImportedClass(_) | SourceNewTarget::ConstructorOverloads(_)
-    ) && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
-        || argument
-            .as_ref()
-            .zip(parameter)
-            .is_some_and(|(argument, parameter)| {
-                !argument_matches_parameter(store, argument, parameter)
-            }))
+    let checked_class_arguments = source_context.is_some()
+        && !early_preparation
+        && parameter.is_some()
+        && additional_arguments.is_empty()
+        && argument.as_ref().is_some_and(|argument| {
+            matches!(
+                &argument.value,
+                SourceNewArgumentValue::String(_)
+                    | SourceNewArgumentValue::Number(_)
+                    | SourceNewArgumentValue::Boolean(_)
+            )
+        })
+        && matches!(
+            &target,
+            SourceNewTarget::Class(class)
+                if class.direct_plan().is_some()
+                    && !class.is_abstract()
+                    && class.constructor_visibility() == ClassConstructorVisibility::Public
+        );
+    if !checked_class_arguments
+        && !matches!(
+            &target,
+            SourceNewTarget::ImportedClass(_)
+                | SourceNewTarget::ConstructorOverloads(_)
+                | SourceNewTarget::SourceClass(_)
+        )
+        && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
+            || argument
+                .as_ref()
+                .zip(parameter)
+                .is_some_and(|(argument, parameter)| {
+                    !argument_matches_parameter(store, argument, parameter)
+                }))
     {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -1217,13 +1729,219 @@ pub(super) fn plan_direct_default_new_with_type_context(
         target,
         early_preparation,
         type_arguments,
-        argument,
+        argument: if checked_class_arguments {
+            None
+        } else {
+            argument
+        },
         additional_arguments,
         parameter,
         executor: None,
+        expression_arguments: if checked_class_arguments {
+            Some(expression_argument_plan())
+        } else {
+            expression_arguments
+        },
     };
-    preflight_default_new_cache(store, host, &plan)?;
+    preflight_default_new_cache_with_context(store, host, &plan, source_context)?;
     Ok(plan)
+}
+
+fn generic_source_class_type_argument_nodes(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    constructor: NodeRef,
+) -> Result<Option<Vec<NodeRef>>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+    let (arena, bound) = host.source(node).ok_or_else(invalid)?;
+    let record = host.node(node).ok_or_else(invalid)?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Err(invalid());
+    };
+    let Some(arguments) = &expression.type_arguments else {
+        return Ok(None);
+    };
+    let constructor_end = host.node(constructor).ok_or_else(invalid)?.range.end;
+    let argument_start = expression
+        .arguments
+        .as_ref()
+        .map_or(record.range.end, |arguments| arguments.range.start);
+    if arguments.range.start < constructor_end
+        || arguments.range.end > argument_start
+        || arguments.range.end < arguments.range.start
+    {
+        return Err(invalid());
+    }
+    let mut previous_end = arguments.range.start;
+    let mut nodes = Vec::with_capacity(arguments.nodes.len());
+    for &child in &arguments.nodes {
+        let child = NodeRef::new(node.arena, node.file, child);
+        let child_record = arena.get(child.node).ok_or_else(invalid)?;
+        if child_record.parent != Some(node.node)
+            || child_record.flags.0 != 0
+            || child_record.range.start < previous_end
+            || child_record.range.end > arguments.range.end
+            || !bound.contains(child)
+            || nodes.contains(&child)
+        {
+            return Err(invalid());
+        }
+        previous_end = child_record.range.end;
+        nodes.push(child);
+    }
+    Ok(Some(nodes))
+}
+
+fn plan_generic_source_class_new(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    class: &SourceClassPlan,
+    early_preparation: bool,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    if !class.has_generic_constructor() || early_preparation {
+        return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
+    }
+    let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+    let declaration = host.node(class.declaration()).ok_or_else(invalid)?;
+    let record = host.node(node).ok_or_else(invalid)?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Err(invalid());
+    };
+    if !class.declaration().is_for(node.arena, node.file)
+        || declaration.range.end > record.range.start
+    {
+        return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+            node: constructor,
+            symbol: class.symbol(),
+        }));
+    }
+    let type_argument_nodes = generic_source_class_type_argument_nodes(host, node, constructor)?;
+    let plan = SourceDefaultNewPlan {
+        node,
+        constructor,
+        resolved_symbol,
+        target: SourceNewTarget::GenericSourceClass(SourceGenericClassNewPlan {
+            class: Box::new(class.clone()),
+            type_argument_nodes,
+        }),
+        early_preparation,
+        type_arguments: Vec::new(),
+        argument: None,
+        additional_arguments: Vec::new(),
+        parameter: None,
+        executor: None,
+        expression_arguments: Some(SourceNewExpressionArguments {
+            nodes: expression
+                .arguments
+                .as_ref()
+                .map_or_else(Vec::new, |arguments| {
+                    arguments
+                        .nodes
+                        .iter()
+                        .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                        .collect()
+                }),
+            expressions: None,
+        }),
+    };
+    preflight_direct_default_new(store, host, &plan)?;
+    Ok(plan)
+}
+
+/// Keeps written type arguments and checked value arguments on the named owner.
+#[allow(clippy::too_many_arguments)]
+fn plan_generic_library_new(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    library: GlobalConstructorValuePlan,
+    early_preparation: bool,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    let type_argument_nodes = generic_source_class_type_argument_nodes(host, node, constructor)?;
+    let Some(NodeData::NewExpression(expression)) = host.node(node).map(|record| &record.data)
+    else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(node)));
+    };
+    let plan = SourceDefaultNewPlan {
+        node,
+        constructor,
+        resolved_symbol,
+        target: SourceNewTarget::GenericLibrary(SourceGenericLibraryNewPlan {
+            library: Box::new(library),
+            type_argument_nodes,
+        }),
+        early_preparation,
+        type_arguments: Vec::new(),
+        argument: None,
+        additional_arguments: Vec::new(),
+        parameter: None,
+        executor: None,
+        expression_arguments: Some(SourceNewExpressionArguments {
+            nodes: expression
+                .arguments
+                .as_ref()
+                .map_or_else(Vec::new, |arguments| {
+                    arguments
+                        .nodes
+                        .iter()
+                        .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                        .collect()
+                }),
+            expressions: None,
+        }),
+    };
+    preflight_direct_default_new_with_source_context(store, host, globals, options, &plan)?;
+    Ok(plan)
+}
+
+/// Follows an exported local value without changing its lexical symbol identity.
+fn constructor_value_symbol(
+    store: &CanonicalTypeMapperStore,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+) -> Result<SemanticSymbolId, SourceNewError> {
+    let symbol = store
+        .get_merged_symbol(resolved_symbol)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(resolved_symbol)))?;
+    if symbol != resolved_symbol {
+        return Err(invariant(SourceNewInvariant::MergedSymbol {
+            source: resolved_symbol,
+            target: symbol,
+        }));
+    }
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    if record.check_flags() != CheckFlags::NONE {
+        return Err(reject());
+    }
+    if record.flags() != SymbolFlags::EXPORT_VALUE {
+        return Ok(symbol);
+    }
+    let target = record.export_symbol().ok_or_else(reject)?;
+    let exported = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(target)))?;
+    if exported.flags() != SymbolFlags::CLASS
+        || exported.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(target) != Some(target)
+    {
+        return Err(reject());
+    }
+    Ok(target)
 }
 
 /// Retains the normal global Date constructor proof without publishing its cold type.
@@ -2027,10 +2745,17 @@ fn date_constructor_parameter_type_has_no_void(
 fn plan_global_promise_constructor(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
     constructor: NodeRef,
     symbol: SemanticSymbolId,
     executor: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceGlobalPromiseConstructorPlan, SourceNewError> {
+    let type_argument = match generic_source_class_type_argument_nodes(host, node, constructor)? {
+        None => None,
+        Some(arguments) if arguments.len() == 1 => arguments.first().copied(),
+        Some(_) => return Err(unsupported(SourceNewUnsupported::TypeArguments(node))),
+    };
     let reject = || {
         unsupported(SourceNewUnsupported::ConstructorClass {
             node: constructor,
@@ -2320,6 +3045,8 @@ fn plan_global_promise_constructor(
             parameter_annotation,
             return_annotation,
             executor,
+            type_argument,
+            array_targets,
         });
     }
 
@@ -3763,6 +4490,35 @@ pub(super) fn preflight_direct_default_new(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    preflight_direct_default_new_with_context(store, host, plan, None)
+}
+
+pub(super) fn preflight_direct_default_new_with_source_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    preflight_direct_default_new_with_context(store, host, plan, Some((globals, options)))
+}
+
+fn preflight_direct_default_new_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<(), SourceNewError> {
+    if !plan.is_generic_source_class()
+        && plan.expression_arguments.is_some()
+        && !matches!(&plan.target, SourceNewTarget::SourceClass(class) if class.has_checked_constructor_arguments())
+        && !matches!(&plan.target, SourceNewTarget::Class(_))
+        && !(plan.is_library_constructor() && source_context.is_some())
+    {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
     for argument in plan.arguments() {
         if let SourceNewArgumentValue::EmptyObject(object) = &argument.value {
             let actual = plan_object_literal(store, host, argument.node).map_err(|_| {
@@ -3779,6 +4535,17 @@ pub(super) fn preflight_direct_default_new(
         }
     }
     match &plan.target {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
+            let (globals, options) = source_context.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            resolve_library_new_candidates(store, host, globals, options, plan)?;
+        }
+        SourceNewTarget::GenericSourceClass(generic) => {
+            preflight_generic_source_class_plan(store, host, plan, generic)?;
+        }
         SourceNewTarget::ConstructorOverloads(class) => {
             if super::classes::plan_source_constructor_overload_class(
                 store,
@@ -3803,6 +4570,9 @@ pub(super) fn preflight_direct_default_new(
                 return Err(invariant(SourceNewInvariant::InvalidClassPlan(
                     class.declaration(),
                 )));
+            }
+            if plan.expression_arguments.is_some() {
+                preflight_direct_class_expression_arguments(host, plan, class)?;
             }
         }
         SourceNewTarget::ImportedClass(binding) => {
@@ -3954,12 +4724,23 @@ pub(super) fn preflight_direct_default_new(
             }
         }
         SourceNewTarget::GlobalPromise(expected) => {
+            if source_context.is_some_and(|(globals, _)| {
+                expected.array_targets.is_some_and(|targets| {
+                    targets != CanonicalArrayTargets::from_global_types(globals)
+                })
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
             let actual = plan_global_promise_constructor(
                 store,
                 host,
+                plan.node,
                 plan.constructor,
                 plan.resolved_symbol,
                 expected.executor,
+                expected.array_targets,
             )?;
             if actual != *expected
                 || plan.argument.is_some()
@@ -3975,7 +4756,7 @@ pub(super) fn preflight_direct_default_new(
             }
         }
     }
-    preflight_default_new_cache(store, host, plan)
+    preflight_default_new_cache_with_context(store, host, plan, source_context)
 }
 
 /// Revalidates every construction, prepares required constructor signatures,
@@ -4001,7 +4782,7 @@ pub(super) fn prepare_direct_default_news(
         if !seen.insert(plan.node) {
             return Err(invariant(SourceNewInvariant::DuplicatePlan(plan.node)));
         }
-        preflight_direct_default_new(store, host, plan)?;
+        preflight_direct_default_new_with_source_context(store, host, global_types, options, plan)?;
     }
 
     for plan in plans {
@@ -4016,8 +4797,35 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
+            SourceNewTarget::Library(library)
+            | SourceNewTarget::GenericLibrary(SourceGenericLibraryNewPlan { library, .. }) => {
+                prepare_global_constructor_candidates(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    library,
+                )
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "provider_prepare",
+                        plan.node,
+                        plan.constructor,
+                        format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+                    );
+                    global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+                })?;
+                resolve_library_new_candidates(store, host, global_types, options, plan)?
+                    .ok_or_else(|| {
+                        invariant(SourceNewInvariant::InvalidConstructorCache(
+                            plan.constructor,
+                        ))
+                    })?;
+            }
             SourceNewTarget::ConstructorOverloads(class) => {
-                super::classes::prepare_source_class_members_with_type_queries(
+                super::classes::prepare_source_class_constructor_header(
                     store,
                     host,
                     global_types,
@@ -4060,14 +4868,14 @@ pub(super) fn prepare_direct_default_news(
                     materialize_imported_generic_constructor(store, host, plan, &class)?;
                 }
             }
-            SourceNewTarget::GlobalPromise(global)
-                if resolved_global_promise_constructor(store, plan, global)?.is_none() =>
-            {
+            SourceNewTarget::GlobalPromise(global) => {
                 materialize_global_promise_constructor(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
+                    diagnostics,
                     plan,
                     global,
                 )?;
@@ -4126,6 +4934,11 @@ pub(super) fn prepare_direct_default_news(
                 .checked_add(usize::from(store.type_node_links(argument.node).is_none()))
                 .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
         }
+        for &argument in plan.written_type_argument_nodes().unwrap_or_default() {
+            argument_type_nodes = argument_type_nodes
+                .checked_add(usize::from(store.type_node_links(argument).is_none()))
+                .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
+        }
         signatures = signatures
             .checked_add(usize::from(store.signature_links(plan.node).is_none()))
             .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
@@ -4162,6 +4975,11 @@ pub(super) fn prepare_direct_default_news(
         for argument in &plan.type_arguments {
             if store.type_node_links(argument.node).is_none() {
                 assert!(store.ensure_type_node_links(argument.node));
+            }
+        }
+        for &argument in plan.written_type_argument_nodes().unwrap_or_default() {
+            if store.type_node_links(argument).is_none() {
+                assert!(store.ensure_type_node_links(argument));
             }
         }
     }
@@ -4689,9 +5507,26 @@ fn materialize_global_promise_constructor(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceDefaultNewPlan,
     global: &SourceGlobalPromiseConstructorPlan,
 ) -> Result<(), SourceNewError> {
+    let argument_type = match global.type_argument {
+        Some(node) => CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(node)?,
+        None => store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidConstructorCache(plan.constructor)))?
+            .unknown_type,
+    };
     if resolved_global_promise_constructor(store, plan, global)?.is_some() {
         return Ok(());
     }
@@ -4750,37 +5585,29 @@ fn materialize_global_promise_constructor(
     }
 
     let generic = execute_type_parameter(store, global.type_parameter);
-    let mut query_diagnostics = CanonicalCheckerDiagnostics::default();
     let (executor_type, return_type) = {
-        let mut query = CanonicalTypeQuery::new_with_global_types(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
-            &mut query_diagnostics,
+            session,
+            diagnostics,
         )?;
         (
             query.get_type_from_type_node(global.parameter_annotation)?,
             query.get_type_from_type_node(global.return_annotation)?,
         )
     };
-    if !query_diagnostics.is_empty() {
-        return Err(invalid());
-    }
     let expected_return =
         create_direct_generic_reference(store, promise_target, &[generic], ObjectFlags::NONE)
             .map_err(|_| invalid())?;
     if return_type != expected_return {
         return Err(invalid());
     }
-    let unknown = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .unknown_type;
     let instance_type =
-        create_direct_generic_reference(store, promise_target, &[unknown], ObjectFlags::NONE)
+        create_direct_generic_reference(store, promise_target, &[argument_type], ObjectFlags::NONE)
             .map_err(|_| invalid())?;
-
     let base = if let Some(signature) =
         exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
     {
@@ -4861,8 +5688,33 @@ fn materialize_global_promise_constructor(
         signature
     };
 
-    let key = type_list_key(&[unknown]);
-    match store.cached_signature(base, key, &[unknown]) {
+    let executor_plan =
+        plan_function_type(store, host, global.parameter_annotation, None, false, None)
+            .map_err(|_| invalid())?;
+    let [resolve, reject] = executor_plan.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    for annotation in [
+        global.parameter_annotation,
+        resolve.type_node,
+        reject.type_node,
+    ] {
+        let signature = exact_signature_cache(store, annotation)
+            .map_err(|()| invalid())?
+            .ok_or_else(invalid)?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)?;
+    }
+
+    let key = type_list_key(&[argument_type]);
+    match store.cached_signature(base, key, &[argument_type]) {
         CachedSignatureLookup::Hit(signature) => {
             if store
                 .signature(signature)
@@ -4874,14 +5726,14 @@ fn materialize_global_promise_constructor(
         }
         CachedSignatureLookup::Missing => {
             let mapper = store
-                .new_simple_type_mapper(generic, unknown)
+                .new_simple_type_mapper(generic, argument_type)
                 .ok_or_else(invalid)?;
             let signature = store
                 .instantiate_signature_ex(base, mapper, true)
                 .map_err(|_| invalid())?;
             if !store.try_reserve_cached_signatures(1)
                 || !store.set_signature_resolved_return_type(signature, Some(instance_type))
-                || !store.set_cached_signature(base, key, Box::new([unknown]), signature)
+                || !store.set_cached_signature(base, key, Box::new([argument_type]), signature)
             {
                 return Err(invalid());
             }
@@ -4890,6 +5742,15 @@ fn materialize_global_promise_constructor(
             return Err(invalid());
         }
     }
+    super::instantiate::instantiate_type_with_vector_and_session(
+        store,
+        executor_type,
+        &[generic],
+        &[argument_type],
+        global.array_targets,
+        session,
+    )
+    .map_err(|_| invalid())?;
 
     if resolved_global_promise_constructor(store, plan, global)?.is_none() {
         return Err(invalid());
@@ -5126,10 +5987,20 @@ pub(super) fn check_direct_default_new(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    if plan.expression_arguments.is_some() {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
-        SourceNewTarget::ConstructorOverloads(_) => {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                plan.node,
+            )));
+        }
+        SourceNewTarget::ConstructorOverloads(_) | SourceNewTarget::GenericSourceClass(_) => {
             return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
         }
         SourceNewTarget::SourceClass(class) => {
@@ -5238,12 +6109,15 @@ pub(super) fn check_source_constructor_overload_new(
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     plan: &SourceDefaultNewPlan,
+    session: &mut InstantiationSession,
 ) -> Result<Option<CheckedSourceConstructorOverloadNew>, SourceNewError> {
     let SourceNewTarget::ConstructorOverloads(class) = &plan.target else {
         return Ok(None);
     };
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
+    let existing_signature = exact_signature_cache(store, plan.node)
+        .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
     let group = super::classes::source_class_constructor_overloads(store, host, class.symbol())?
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
     let arguments = materialize_new_argument_types(store, plan)?;
@@ -5268,12 +6142,14 @@ pub(super) fn check_source_constructor_overload_new(
         type_argument_count: 0,
         has_spread_argument: false,
     };
-    let resolution = super::calls::resolve_direct_call_candidates(
+    let resolution = super::calls::resolve_direct_call_candidates_with_session(
         store,
         global_types,
         strict_function_types,
         request,
         &group.signatures,
+        existing_signature,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,
@@ -5293,6 +6169,7 @@ pub(super) fn check_source_constructor_overload_new(
         strict_function_types,
         request,
         &group.implementation,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,
@@ -5374,12 +6251,23 @@ fn publish_default_new_links(
     selected: CheckedSourceDefaultNew,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    publish_default_new_links_with_context(store, host, plan, selected, argument_types, None)
+}
+
+fn publish_default_new_links_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+    argument_types: &[TypeId],
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
     let CheckedSourceDefaultNew {
         value_type,
         instance_type,
         signature,
     } = selected;
-    preflight_publication_cache(
+    preflight_publication_cache_with_context(
         store,
         host,
         plan,
@@ -5387,6 +6275,7 @@ fn publish_default_new_links(
         instance_type,
         signature,
         argument_types,
+        source_context,
     )?;
 
     let symbol_links = SymbolNodeLinks {
@@ -5404,6 +6293,14 @@ fn publish_default_new_links(
         resolved_signature: ResolvedSignatureState::Resolved(signature),
         ..SignatureLinks::default()
     };
+    if plan.is_library_constructor()
+        && store.symbol_node_links(plan.constructor) == Some(&symbol_links)
+        && store.type_node_links(plan.constructor) == Some(&constructor_links)
+        && store.signature_links(plan.node) == Some(&signature_links)
+        && store.type_node_links(plan.node) == Some(&expression_links)
+    {
+        return Ok(selected);
+    }
     assert!(store.set_symbol_node_links(plan.constructor, symbol_links));
     assert!(store.set_type_node_links(plan.constructor, constructor_links));
     assert!(store.set_signature_links(plan.node, signature_links));
@@ -5441,8 +6338,11 @@ fn resolved_source_class_constructor(
     class: &SourceClassPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
     let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
-    if class.symbol() != plan.resolved_symbol
-        || !class.has_own_default_constructor()
+    preflight_exported_constructor_binding(store, host, plan)?;
+    let checked_arguments = class.has_checked_constructor_arguments();
+    if class.symbol() != plan.provider_symbol()
+        || !(class.has_own_default_constructor() || checked_arguments)
+        || checked_arguments != plan.expression_arguments.is_some()
         || plan.argument.is_some()
         || !plan.additional_arguments.is_empty()
         || !plan.type_arguments.is_empty()
@@ -5452,6 +6352,9 @@ fn resolved_source_class_constructor(
         || !source_class_plan_is_current(store, host, class)?
     {
         return Err(invalid());
+    }
+    if checked_arguments {
+        preflight_source_class_expression_arguments(host, plan)?;
     }
     let declaration = host.node(class.declaration()).ok_or_else(invalid)?;
     let expression = host.node(plan.node).ok_or_else(invalid)?;
@@ -5468,18 +6371,1647 @@ fn resolved_source_class_constructor(
         instance_type: members.shells().instance_type(),
         signature: members.default_construct_signature(),
     };
-    if authenticated_class_constructor_value(store, class.symbol())
-        != Some((selected.value_type, selected.signature))
+    // Completed source members also prove module-owned exported classes.
+    // The legacy constructor reader remains restricted to unexported owners.
+    if class.has_public_inherited_constructor() {
+        let candidates = super::classes::source_class_expression_constructor_candidates(
+            store,
+            host,
+            class.symbol(),
+        )?
+        .ok_or_else(invalid)?;
+        if candidates
+            .first()
+            .is_none_or(|callable| callable.signature != selected.signature)
+            || candidates.iter().any(|callable| {
+                callable.owner != selected.value_type
+                    || callable.return_type != Some(selected.instance_type)
+            })
+        {
+            return Err(invalid());
+        }
+    } else if plan.resolved_symbol == class.symbol()
+        && authenticated_class_constructor_value(store, class.symbol())
+            != Some((selected.value_type, selected.signature))
     {
         return Err(invalid());
     }
     Ok(Some(selected))
 }
 
+fn preflight_generic_source_class_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    generic: &SourceGenericClassNewPlan,
+) -> Result<(), SourceNewError> {
+    let class = &generic.class;
+    let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+    if !class.has_generic_constructor()
+        || class.type_query_context().is_none()
+        || plan.early_preparation
+        || plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.parameter.is_some()
+        || plan.executor.is_some()
+        || constructor_value_symbol(store, plan.constructor, plan.resolved_symbol)?
+            != class.symbol()
+        || !source_class_plan_is_current(store, host, class)?
+    {
+        return Err(invalid());
+    }
+    let declaration = host.node(class.declaration()).ok_or_else(invalid)?;
+    let expression = host.node(plan.node).ok_or_else(invalid)?;
+    if !class.declaration().is_for(plan.node.arena, plan.node.file)
+        || declaration.range.end > expression.range.start
+        || generic_source_class_type_argument_nodes(host, plan.node, plan.constructor)?
+            != generic.type_argument_nodes
+    {
+        return Err(invalid());
+    }
+    preflight_source_class_expression_arguments(host, plan)
+}
+
+fn generic_new_access_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    token: Option<&ClassBodyAccessToken>,
+) -> Result<Option<(u32, TypeId)>, SourceNewError> {
+    let SourceNewTarget::GenericSourceClass(generic) = &plan.target else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    };
+    let access = super::classes::source_class_constructor_access(
+        store,
+        host,
+        plan.node,
+        generic.class.symbol(),
+        token,
+    )?;
+    if !access.allowed() {
+        let code = match access.visibility() {
+            ClassConstructorVisibility::Private => 2673,
+            ClassConstructorVisibility::Protected => 2674,
+            ClassConstructorVisibility::Public => {
+                return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+                    generic.class.declaration(),
+                )));
+            }
+        };
+        return Ok(Some((code, access.declaring_type())));
+    }
+    Ok(generic
+        .class
+        .is_abstract()
+        .then_some((2511, access.declaring_type())))
+}
+
+/// Go's `resolveErrorCall` returns this existing bootstrap signature and error type.
+fn generic_new_error_signature(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<(SignatureId, TypeId), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let signature = bootstrap.unknown_signature;
+    let error_type =
+        generic_new_error_signature_return_type(store, signature)?.ok_or_else(invalid)?;
+    Ok((signature, error_type))
+}
+
+/// Reads the existing error-call sentinel without accepting another no-declaration signature.
+pub(super) fn generic_new_error_signature_return_type(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Result<Option<TypeId>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidConstructSignature(signature));
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Ok(None);
+    };
+    if signature != bootstrap.unknown_signature {
+        return Ok(None);
+    }
+    let error_type = bootstrap.error_type;
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    if record.flags() != SignatureFlags::NONE
+        || record.declaration().is_some()
+        || !record.type_parameters().is_empty()
+        || !record.parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.min_argument_count() != 0
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type() != Some(error_type)
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || store
+            .callable_signature_parameter_types(signature)
+            .is_some()
+        || store
+            .function_signature_return_annotation(signature)
+            .is_some()
+        || store.validate_union_constituent(error_type).is_err()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(error_type))
+}
+
+fn preflight_generic_new_signature(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    value_type: TypeId,
+    signature: SignatureId,
+    targets: Option<CanonicalArrayTargets>,
+    access_diagnostic: Option<(u32, TypeId)>,
+) -> Result<(), SourceNewError> {
+    if access_diagnostic.is_some() {
+        if generic_new_error_signature(store, plan.node)?.0 != signature {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                plan.node,
+            )));
+        }
+    } else {
+        preflight_generic_class_constructor_signature(store, value_type, signature, targets)
+            .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    }
+    Ok(())
+}
+
+/// Checks the real caller authority and saved New signature before any demand.
+pub(super) fn preflight_source_generic_class_new_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    access: Option<&ClassBodyAccessToken>,
+) -> Result<(), SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        preflight_direct_default_new_with_source_context(store, host, globals, options, plan)
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "required_preflight_error",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("error={error:?}"),
+                );
+                error
+            })?;
+        let candidates = resolve_library_new_candidates(store, host, globals, options, plan)
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "required_read_error",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("error={error:?}"),
+                );
+                error
+            })?
+            .ok_or_else(|| {
+                let error = unsupported(SourceNewUnsupported::Constructor(plan.constructor));
+                trace_constructor_failure(
+                    "required_candidates_missing",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("candidate_state=missing error={error:?}"),
+                );
+                error
+            })?;
+        if let Some(signature) = exact_signature_cache(store, plan.node)
+            .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?
+        {
+            preflight_generic_class_constructor_signature(
+                store,
+                candidates.value_type,
+                signature,
+                Some(CanonicalArrayTargets::from_global_types(globals)),
+            )
+            .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+        }
+        return Ok(());
+    }
+    preflight_direct_default_new(store, host, plan)?;
+    let SourceNewTarget::GenericSourceClass(generic) = &plan.target else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    };
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidClassPlan(
+            generic.class.declaration(),
+        ))
+    };
+    if generic.class.type_query_context() != Some(&ClassTypeQueryContext::new(globals, options)) {
+        return Err(invalid());
+    }
+    let existing = exact_signature_cache(store, plan.node)
+        .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
+    let targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    let constructors = super::classes::completed_source_class_constructors_with_context(
+        store,
+        host,
+        generic.class.symbol(),
+        targets,
+        options.into(),
+    )?
+    .ok_or_else(|| unsupported(SourceNewUnsupported::Constructor(plan.constructor)))?;
+    let access_diagnostic = generic_new_access_diagnostic(store, host, plan, access)?;
+    if let Some(signature) = existing {
+        preflight_generic_new_signature(
+            store,
+            plan,
+            constructors.members().shells().value_type(),
+            signature,
+            targets,
+            access_diagnostic,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_generic_new_arguments(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+) -> Result<(), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let arguments = plan.checked_expression_arguments().ok_or_else(invalid)?;
+    if arguments.len() != argument_types.len()
+        || plan
+            .written_type_argument_nodes()
+            .filter(|nodes| !nodes.is_empty())
+            .map(<[NodeRef]>::len)
+            != explicit_type_arguments
+                .filter(|types| !types.is_empty())
+                .map(<[TypeId]>::len)
+    {
+        return Err(invalid());
+    }
+    for (argument, &type_) in arguments.iter().zip(argument_types) {
+        if exact_type_cache(store, argument.node).map_err(|()| invalid())? != Some(type_) {
+            return Err(invalid());
+        }
+    }
+    if let (Some(nodes), Some(types)) =
+        (plan.written_type_argument_nodes(), explicit_type_arguments)
+    {
+        for (&node, &type_) in nodes.iter().zip(types) {
+            if store.type_payload(type_).is_none()
+                || exact_type_cache(store, node)
+                    .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(node)))?
+                    .is_some_and(|cached| cached != type_)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(node)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn generic_constructor_error(node: NodeRef, error: GenericMethodCallError) -> SourceNewError {
+    let mut record = [0u8; 1024];
+    let length = {
+        let mut buffer = &mut record[..1023];
+        let _ = std::io::Write::write_fmt(
+            &mut buffer,
+            format_args!(
+                "ts-rust-generic-constructor-error expression={node:?} raw_error={error:?}"
+            ),
+        );
+        1023 - buffer.len()
+    };
+    let length = std::str::from_utf8(&record[..length])
+        .map_or_else(|error| error.valid_up_to(), |_| length);
+    record[length] = b'\n';
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &record[..=length]);
+    match error {
+        GenericMethodCallError::Generic(GenericCallVectorError::Conditional(error)) => {
+            match error {
+                ConditionalTypeError::Relation(error) => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Relation(error),
+                },
+                ConditionalTypeError::Declared(error) => error.into(),
+                ConditionalTypeError::Instantiation(error) => generic_constructor_error(
+                    node,
+                    GenericMethodCallError::Generic(GenericCallVectorError::Instantiation(error)),
+                ),
+                ConditionalTypeError::MissingBootstrap => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Relation(
+                        super::RelationUnavailable::MissingBootstrap,
+                    ),
+                },
+                ConditionalTypeError::Capacity => invariant(SourceNewInvariant::Capacity(node)),
+                ConditionalTypeError::InvalidNode(node)
+                | ConditionalTypeError::InvalidTypeNodeCache(node) => {
+                    invariant(SourceNewInvariant::InvalidExpressionCache(node))
+                }
+                ConditionalTypeError::InvalidSignature(signature) => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Invariant(
+                        super::calls::DirectCallInvariant::InvalidSignature(signature),
+                    ),
+                },
+                ConditionalTypeError::InvalidType(_)
+                | ConditionalTypeError::InvalidTypeParameter(_)
+                | ConditionalTypeError::DuplicateTypeParameter(_)
+                | ConditionalTypeError::InvalidAlias(_)
+                | ConditionalTypeError::InvalidAliasSymbol(_)
+                | ConditionalTypeError::InvalidRoot(_)
+                | ConditionalTypeError::InvalidConditional(_)
+                | ConditionalTypeError::InvalidMapper(_)
+                | ConditionalTypeError::InvalidInstantiationArity { .. }
+                | ConditionalTypeError::InvalidInstantiationCache(_)
+                | ConditionalTypeError::InvalidConditionalResolution(_) => {
+                    invariant(SourceNewInvariant::InvalidExpressionCache(node))
+                }
+                ConditionalTypeError::UnsupportedInference { .. }
+                | ConditionalTypeError::TailRecursionLimit { .. }
+                | ConditionalTypeError::Constraint(_)
+                | ConditionalTypeError::Template(_)
+                | ConditionalTypeError::Tuple(_)
+                | ConditionalTypeError::Union(_) => {
+                    unsupported(SourceNewUnsupported::Arguments(node))
+                }
+            }
+        }
+        GenericMethodCallError::Relation(error)
+        | GenericMethodCallError::Direct(super::calls::DirectCallError::Relation(error))
+        | GenericMethodCallError::Generic(GenericCallVectorError::Relation(error))
+        | GenericMethodCallError::Generic(GenericCallVectorError::Inference(
+            super::inference::NakedTypeCandidateError::Relation(error),
+        )) => SourceNewError::Call {
+            node,
+            error: super::calls::DirectCallError::Relation(error),
+        },
+        GenericMethodCallError::Invalid(_)
+        | GenericMethodCallError::Direct(super::calls::DirectCallError::Invariant(_))
+        | GenericMethodCallError::Generic(GenericCallVectorError::Invariant(_)) => {
+            invariant(SourceNewInvariant::InvalidExpressionCache(node))
+        }
+        GenericMethodCallError::Unsupported(_)
+        | GenericMethodCallError::Direct(super::calls::DirectCallError::Unsupported(_))
+        | GenericMethodCallError::Generic(
+            GenericCallVectorError::Unsupported(_)
+            | GenericCallVectorError::Inference(_)
+            | GenericCallVectorError::Instantiation(_),
+        ) => unsupported(SourceNewUnsupported::Arguments(node)),
+    }
+}
+
+/// One checked request retained until every source diagnostic is prepared.
+pub(super) struct PreparedSourceGenericNew {
+    checked: CheckedSourceDefaultNew,
+    resolution: Option<GenericMethodCallResolution>,
+    access_diagnostic: Option<(u32, TypeId)>,
+    existing_signature: Option<SignatureId>,
+    argument_types: Vec<TypeId>,
+    explicit_type_arguments: Option<Vec<TypeId>>,
+}
+
+impl PreparedSourceGenericNew {
+    pub(super) fn resolution(&self) -> Option<&GenericMethodCallResolution> {
+        self.resolution.as_ref()
+    }
+
+    pub(super) const fn access_diagnostic(&self) -> Option<(u32, TypeId)> {
+        self.access_diagnostic
+    }
+}
+
+fn validate_generic_new_instance(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    origin: TypeId,
+    checked: CheckedSourceDefaultNew,
+    resolution: &GenericMethodCallResolution,
+    targets: Option<CanonicalArrayTargets>,
+) -> Result<(), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let GenericMethodCallSelection::Generic(selected) = &resolution.selected else {
+        return Err(invalid());
+    };
+    if selected.projection().callee != checked.value_type
+        || selected.projection().instantiation.signature != checked.signature
+        || preflight_generic_class_constructor_signature(
+            store,
+            checked.value_type,
+            checked.signature,
+            targets,
+        )
+        .map_err(|error| generic_constructor_error(plan.node, error.into()))?
+            != selected.projection().generic_signature
+        || store
+            .signature(checked.signature)
+            .and_then(Signature::resolved_return_type)
+            != Some(checked.instance_type)
+    {
+        return Err(invalid());
+    }
+    let reference =
+        validate_direct_generic_reference(store, checked.instance_type).map_err(|_| invalid())?;
+    if reference.target != origin
+        || reference.type_arguments != selected.projection().instantiation.type_arguments
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_generic_class_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    access: Option<&ClassBodyAccessToken>,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        return check_source_generic_library_new(
+            store,
+            host,
+            globals,
+            options,
+            session,
+            plan,
+            argument_types,
+            explicit_type_arguments,
+        );
+    }
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, access)?;
+    preflight_prepared_default_new_cache(store, host, plan)?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
+    let constructors = super::classes::completed_source_class_constructors_with_context(
+        store,
+        host,
+        plan.provider_symbol(),
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        options.into(),
+    )?
+    .ok_or_else(invalid)?;
+    let value_type = constructors.members().shells().value_type();
+    let origin = constructors.members().shells().instance_type();
+    if let Some(access_diagnostic) = generic_new_access_diagnostic(store, host, plan, access)? {
+        let (signature, instance_type) = generic_new_error_signature(store, plan.node)?;
+        if existing_signature.is_some_and(|existing| existing != signature) {
+            return Err(invalid());
+        }
+        return Ok(PreparedSourceGenericNew {
+            checked: CheckedSourceDefaultNew {
+                value_type,
+                instance_type,
+                signature,
+            },
+            resolution: None,
+            access_diagnostic: Some(access_diagnostic),
+            existing_signature,
+            argument_types: argument_types.to_vec(),
+            explicit_type_arguments: explicit_type_arguments.map(<[TypeId]>::to_vec),
+        });
+    }
+    let resolution = resolve_generic_class_constructor(
+        store,
+        globals,
+        options.strict_function_types,
+        GenericCallVectorRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            explicit_type_arguments,
+            has_spread_argument: false,
+            callee: value_type,
+            arguments: argument_types,
+        },
+        existing_signature,
+        session,
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error))?
+    .ok_or_else(|| unsupported(SourceNewUnsupported::Arguments(plan.node)))?;
+    let GenericMethodCallSelection::Generic(selected) = &resolution.selected else {
+        return Err(invalid());
+    };
+    let materialized = materialize_generic_call_vector_source(store, selected, existing_signature)
+        .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    let limit_mark = session.limit_event_mark();
+    let instance_type = demand_generic_call_vector_return_with_session(store, selected, session)
+        .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    if session.limit_event_occurred_since(limit_mark) {
+        return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+    }
+    let checked = CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature: materialized.call_signature,
+    };
+    validate_generic_new_instance(
+        store,
+        plan,
+        origin,
+        checked,
+        &resolution,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )?;
+    Ok(PreparedSourceGenericNew {
+        checked,
+        resolution: Some(resolution),
+        access_diagnostic: None,
+        existing_signature,
+        argument_types: argument_types.to_vec(),
+        explicit_type_arguments: explicit_type_arguments.map(<[TypeId]>::to_vec),
+    })
+}
+
+/// Publishes the exact prepared request only after diagnostic preparation succeeds.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_source_generic_class_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    _session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    access: Option<&ClassBodyAccessToken>,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    prepared: PreparedSourceGenericNew,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        return publish_source_generic_library_new(
+            store,
+            host,
+            globals,
+            options,
+            plan,
+            argument_types,
+            explicit_type_arguments,
+            prepared,
+        );
+    }
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, access)?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    if prepared.argument_types != argument_types
+        || prepared.explicit_type_arguments.as_deref() != explicit_type_arguments
+        || exact_signature_cache(store, plan.node).map_err(|()| invalid())?
+            != prepared.existing_signature
+        || generic_new_access_diagnostic(store, host, plan, access)? != prepared.access_diagnostic
+    {
+        return Err(invalid());
+    }
+    let constructors = super::classes::completed_source_class_constructors_with_context(
+        store,
+        host,
+        plan.provider_symbol(),
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        options.into(),
+    )?
+    .ok_or_else(invalid)?;
+    if constructors.members().shells().value_type() != prepared.checked.value_type {
+        return Err(invalid());
+    }
+    if let Some(resolution) = &prepared.resolution {
+        if prepared.access_diagnostic.is_some() {
+            return Err(invalid());
+        }
+        validate_generic_new_instance(
+            store,
+            plan,
+            constructors.members().shells().instance_type(),
+            prepared.checked,
+            resolution,
+            Some(CanonicalArrayTargets::from_global_types(globals)),
+        )?;
+        let GenericMethodCallSelection::Generic(selected) = &resolution.selected else {
+            return Err(invalid());
+        };
+        if materialize_generic_call_vector_source(store, selected, prepared.existing_signature)
+            .map_err(|error| generic_constructor_error(plan.node, error.into()))?
+            .call_signature
+            != prepared.checked.signature
+        {
+            return Err(invalid());
+        }
+    } else if prepared.access_diagnostic.is_none()
+        || generic_new_error_signature(store, plan.node)?
+            != (prepared.checked.signature, prepared.checked.instance_type)
+    {
+        return Err(invalid());
+    }
+    let checked = publish_default_new_links(store, host, plan, prepared.checked, argument_types)?;
+    if let (Some(nodes), Some(types)) =
+        (plan.written_type_argument_nodes(), explicit_type_arguments)
+    {
+        for (&node, &type_) in nodes.iter().zip(types) {
+            assert!(store.set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+        }
+    }
+    Ok(checked)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_generic_library_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    check_source_generic_library_new_with_context(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        plan,
+        argument_types,
+        explicit_type_arguments,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_source_generic_constructor_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    prefix: &[TypeId],
+    methods: &[GenericConstructorContextMethod],
+) -> Result<PreparedGenericConstructorContext, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    if !plan.is_generic_library_constructor()
+        || plan
+            .written_type_argument_nodes()
+            .is_some_and(|arguments| !arguments.is_empty())
+    {
+        return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+    }
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    let arguments = plan.checked_expression_arguments().ok_or_else(invalid)?;
+    if arguments.len() != prefix.len() + 1
+        || arguments
+            .iter()
+            .zip(prefix)
+            .any(|(argument, &type_)| exact_type_cache(store, argument.node) != Ok(Some(type_)))
+    {
+        return Err(invalid());
+    }
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
+    prepare_generic_constructor_context(
+        store,
+        globals,
+        options.strict_function_types,
+        GenericCallVectorRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            explicit_type_arguments: None,
+            has_spread_argument: false,
+            callee: candidates.value_type,
+            arguments: prefix,
+        },
+        existing_signature,
+        methods,
+        session,
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_generic_library_new_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    context: Option<&PreparedGenericConstructorContext>,
+) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
+    let limit_mark = session.limit_event_mark();
+    let resolution = resolve_generic_class_constructor_with_context(
+        store,
+        globals,
+        options.strict_function_types,
+        GenericCallVectorRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            explicit_type_arguments,
+            has_spread_argument: false,
+            callee: candidates.value_type,
+            arguments: argument_types,
+        },
+        existing_signature,
+        session,
+        context,
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error))?
+    .ok_or_else(|| unsupported(SourceNewUnsupported::Arguments(plan.node)))?;
+    let (signature, instance_type) = match &resolution.selected {
+        GenericMethodCallSelection::Generic(selected) => {
+            let materialized =
+                materialize_generic_call_vector_source(store, selected, existing_signature)
+                    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+            let result = demand_generic_call_vector_return_with_session(store, selected, session)
+                .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+            (materialized.call_signature, result)
+        }
+        GenericMethodCallSelection::Fixed {
+            signature,
+            return_type,
+        } => (*signature, *return_type),
+    };
+    if session.limit_event_occurred_since(limit_mark) {
+        return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+    }
+    preflight_generic_class_constructor_signature(
+        store,
+        candidates.value_type,
+        signature,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    Ok(PreparedSourceGenericNew {
+        checked: CheckedSourceDefaultNew {
+            value_type: candidates.value_type,
+            instance_type,
+            signature,
+        },
+        resolution: Some(resolution),
+        access_diagnostic: None,
+        existing_signature,
+        argument_types: argument_types.to_vec(),
+        explicit_type_arguments: explicit_type_arguments.map(<[TypeId]>::to_vec),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_source_generic_library_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    prepared: PreparedSourceGenericNew,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    if prepared.argument_types != argument_types
+        || prepared.explicit_type_arguments.as_deref() != explicit_type_arguments
+        || prepared.existing_signature
+            != exact_signature_cache(store, plan.node).map_err(|()| invalid())?
+        || prepared.access_diagnostic.is_some()
+        || prepared.checked.value_type != candidates.value_type
+    {
+        return Err(invalid());
+    }
+    let resolution = prepared.resolution.as_ref().ok_or_else(invalid)?;
+    let signature = match &resolution.selected {
+        GenericMethodCallSelection::Generic(selected) => {
+            materialize_generic_call_vector_source(store, selected, prepared.existing_signature)
+                .map_err(|error| generic_constructor_error(plan.node, error.into()))?
+                .call_signature
+        }
+        GenericMethodCallSelection::Fixed {
+            signature,
+            return_type,
+        } => {
+            if *return_type != prepared.checked.instance_type {
+                return Err(invalid());
+            }
+            *signature
+        }
+    };
+    if signature != prepared.checked.signature
+        || store
+            .signature(signature)
+            .and_then(Signature::resolved_return_type)
+            != Some(prepared.checked.instance_type)
+    {
+        return Err(invalid());
+    }
+    preflight_generic_class_constructor_signature(
+        store,
+        candidates.value_type,
+        signature,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    publish_default_new_links_with_context(
+        store,
+        host,
+        plan,
+        prepared.checked,
+        argument_types,
+        Some((globals, options)),
+    )
+}
+
+fn preflight_direct_class_expression_arguments(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    class: &ClassMemberQueryPlan,
+) -> Result<(), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    if class.direct_plan().is_none()
+        || class.is_abstract()
+        || class.constructor_visibility() != ClassConstructorVisibility::Public
+        || plan.early_preparation
+        || plan.parameter.is_none()
+        || plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.executor.is_some()
+    {
+        return Err(invalid());
+    }
+    let Some(arguments) = &plan.expression_arguments else {
+        return Err(invalid());
+    };
+    let [argument] = arguments.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let record = host.node(*argument).ok_or_else(invalid)?;
+    let literal = match &record.data {
+        NodeData::StringLiteral(value) => {
+            record.kind == SyntaxKind::StringLiteral && value.token_flags.0 == 0
+        }
+        NodeData::NumericLiteral(value) => {
+            record.kind == SyntaxKind::NumericLiteral && value.token_flags.0 == 0
+        }
+        NodeData::KeywordExpression(value) => {
+            matches!(
+                record.kind,
+                SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+            ) && value.flow_node.is_none()
+        }
+        _ => false,
+    };
+    if !literal {
+        return Err(invalid());
+    }
+    preflight_source_class_expression_arguments(host, plan)
+}
+
+fn preflight_source_class_expression_arguments(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let Some(arguments) = &plan.expression_arguments else {
+        return Err(invalid());
+    };
+    let record = host.node(plan.node).ok_or_else(invalid)?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Err(invalid());
+    };
+    let actual = expression
+        .arguments
+        .as_ref()
+        .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    if record.kind != SyntaxKind::NewExpression
+        || record.flags.0 != 0
+        || expression.facts != 0
+        || expression.expression != plan.constructor.node
+        || expression.type_arguments.is_some()
+            && !(plan.is_generic_source_class() || plan.is_generic_library_constructor())
+        || actual.len() != arguments.nodes.len()
+        || actual
+            .iter()
+            .zip(&arguments.nodes)
+            .any(|(&node, reference)| {
+                *reference != NodeRef::new(plan.node.arena, plan.node.file, node)
+            })
+        || arguments.expressions.as_ref().is_some_and(|expressions| {
+            expressions.len() != arguments.nodes.len()
+                || expressions
+                    .iter()
+                    .zip(&arguments.nodes)
+                    .any(|(expression, node)| expression.node != *node)
+        })
+    {
+        return Err(invalid());
+    }
+    let mut previous_end = host.node(plan.constructor).ok_or_else(invalid)?.range.end;
+    for &argument in &arguments.nodes {
+        let child = host.node(argument).ok_or_else(invalid)?;
+        if child.parent != Some(plan.node.node)
+            || child.flags.0 != 0
+            || child.range.start < previous_end
+            || child.range.end > record.range.end
+            || matches!(
+                child.kind,
+                SyntaxKind::SpreadElement | SyntaxKind::OmittedExpression
+            )
+            || host
+                .bound_file(argument)
+                .is_none_or(|bound| !bound.contains(argument))
+        {
+            return Err(invalid());
+        }
+        previous_end = child.range.end;
+    }
+    Ok(())
+}
+
+/// A transient view of the complete, source-proven library construct suffix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceLibraryConstructorCandidates {
+    pub(super) value_type: TypeId,
+    pub(super) callables: Vec<ValidatedSingleCallable>,
+}
+
+fn resolve_library_new_candidates(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Option<SourceLibraryConstructorCandidates>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let library = match &plan.target {
+        SourceNewTarget::Library(library) => library,
+        SourceNewTarget::GenericLibrary(generic) => {
+            if !generic.library.is_named_generic()
+                || generic_source_class_type_argument_nodes(host, plan.node, plan.constructor)?
+                    != generic.type_argument_nodes
+            {
+                return Err(invalid());
+            }
+            &generic.library
+        }
+        _ => return Err(invalid()),
+    };
+    if plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.parameter.is_some()
+        || plan.executor.is_some()
+        || library.value_symbol() != plan.resolved_symbol
+        || constructor_value_symbol(store, plan.constructor, plan.resolved_symbol)?
+            != plan.resolved_symbol
+    {
+        return Err(invalid());
+    }
+    preflight_source_class_expression_arguments(host, plan)?;
+    let (arena, bound) = host.source(plan.constructor).ok_or_else(invalid)?;
+    let record = host.node(plan.constructor).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid());
+    };
+    let expression = host.node(plan.node).ok_or_else(invalid)?;
+    let NodeData::NewExpression(new_expression) = &expression.data else {
+        return Err(invalid());
+    };
+    if !plan.constructor.is_for(plan.node.arena, plan.node.file)
+        || record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(plan.node.node)
+        || record.range.start < expression.range.start
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || !bound.contains(plan.constructor)
+        || !bound.contains(plan.node)
+        || new_expression.arguments.as_ref().is_some_and(|arguments| {
+            record.range.end > arguments.range.start
+                || arguments.range.end != expression.range.end
+                || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
+                || arena.source_text().is_some_and(|source| {
+                    let open = usize::try_from(arguments.range.start.get()).ok();
+                    let close = usize::try_from(arguments.range.end.get().saturating_sub(1)).ok();
+                    open.is_none_or(|open| source.as_bytes().get(open) != Some(&b'('))
+                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b')'))
+                })
+        })
+        || new_expression.arguments.is_none() && record.range.end != expression.range.end
+    {
+        return Err(invalid());
+    }
+    let mut callback_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|error| {
+                invariant(SourceNewInvariant::NameResolution {
+                    node: plan.constructor,
+                    error,
+                })
+            })?;
+    if resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(plan.constructor)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|error| {
+            invariant(SourceNewInvariant::NameResolution {
+                node: plan.constructor,
+                error,
+            })
+        })?
+        != Some(plan.resolved_symbol)
+    {
+        return Err(invalid());
+    }
+    validate_global_plan(store, host, globals, options, library).map_err(|error| {
+        trace_constructor_failure(
+            "provider_revalidate",
+            plan.node,
+            plan.constructor,
+            format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+        );
+        global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+    })?;
+    let Some(ready) = resolve_global_constructor_candidates(store, host, globals, options, library)
+        .map_err(|error| {
+            trace_constructor_failure(
+                "provider_read",
+                plan.node,
+                plan.constructor,
+                format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+            );
+            global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+        })?
+    else {
+        return Ok(None);
+    };
+    let value = ready.value();
+    let value_type = value.constructor_type();
+    let projection =
+        super::callable_sets::validate_stored_callable_set_projection(store, value_type, false)
+            .ok_or_else(invalid)?;
+    if value.value_symbol() != plan.resolved_symbol
+        || projection.owner != value_type
+        || ready.signatures().is_empty()
+        || projection.construct_signatures.len() != ready.signatures().len()
+        || library.construct_declarations().len() != ready.signatures().len()
+    {
+        return Err(invalid());
+    }
+    let mut callables = Vec::with_capacity(ready.signatures().len());
+    for ((signature, &projected), declaration) in ready
+        .signatures()
+        .iter()
+        .zip(projection.construct_signatures.iter())
+        .zip(library.construct_declarations())
+    {
+        let record = store.signature(projected).ok_or_else(invalid)?;
+        let mut parameters = store
+            .callable_signature_parameter_types(projected)
+            .ok_or_else(invalid)?
+            .to_vec();
+        if signature.value() != value
+            || signature.signature() != projected
+            || signature.declaration() != declaration
+            || record.declaration() != Some(declaration)
+            || !record.flags().contains(SignatureFlags::CONSTRUCT)
+            || record.flags().contains(SignatureFlags::ABSTRACT)
+            || !library.is_named_generic() && !record.type_parameters().is_empty()
+            || record.target().is_some()
+            || record.mapper().is_some()
+            || record.resolved_return_type() != Some(signature.return_type())
+            || parameters.len() != record.parameters().len()
+        {
+            return Err(invalid());
+        }
+        let rest_parameter = if record.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
+        let min_argument_count =
+            usize::try_from(record.min_argument_count()).map_err(|_| invalid())?;
+        if min_argument_count > parameters.len() {
+            return Err(invalid());
+        }
+        callables.push(ValidatedSingleCallable {
+            owner: value_type,
+            signature: projected,
+            parameters,
+            rest_parameter,
+            min_argument_count,
+            return_type: Some(signature.return_type()),
+            strict_variance_exempt: false,
+        });
+    }
+    Ok(Some(SourceLibraryConstructorCandidates {
+        value_type,
+        callables,
+    }))
+}
+
+/// Checks available producer facts. Flow-dependent types still need the executor.
+fn preflight_library_argument_caches(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    let Some(arguments) = plan.checked_expression_arguments() else {
+        return Ok(());
+    };
+    let mut pending = arguments.iter().collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(expression) = pending.pop() {
+        let node = expression.node;
+        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+        if !seen.insert(node)
+            || host.node(node).is_none()
+            || host
+                .bound_file(node)
+                .is_none_or(|bound| !bound.contains(node))
+        {
+            return Err(invalid());
+        }
+        let cached = exact_type_cache(store, node).map_err(|()| invalid())?;
+        let symbol = exact_symbol_cache(store, node).map_err(|()| invalid())?;
+        match &expression.kind {
+            PlannedExpressionKind::Call(_) => {
+                super::source_calls::preflight_call_links(store, node).map_err(|_| invalid())?;
+            }
+            PlannedExpressionKind::SuperCall(_) => {
+                super::source_calls::preflight_super_call_links(store, node)
+                    .map_err(|_| invalid())?;
+            }
+            _ => {
+                exact_signature_cache(store, node).map_err(|()| invalid())?;
+            }
+        }
+        if let PlannedExpressionKind::Identifier(read) = &expression.kind
+            && symbol.is_some_and(|symbol| symbol != read.resolved_symbol)
+        {
+            return Err(invalid());
+        }
+        if let PlannedExpressionKind::Object { plan: object, .. } = &expression.kind {
+            let state = object_literal_state(store, object).map_err(|_| invalid())?;
+            if cached.is_some_and(|cached| {
+                state.is_none_or(|state| !state.is_resolved() || state.type_id() != cached)
+            }) {
+                return Err(invalid());
+            }
+        }
+        if let PlannedExpressionKind::New(nested) = &expression.kind {
+            preflight_direct_default_new_with_source_context(
+                store, host, globals, options, nested,
+            )?;
+        }
+        if let Some(cached) = cached {
+            let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+            let regular = match &expression.kind {
+                PlannedExpressionKind::String(value) => {
+                    Some(bootstrap.cached_string_literal_type(value))
+                }
+                PlannedExpressionKind::Number { value, .. } => {
+                    Some(bootstrap.cached_number_literal_type(*value))
+                }
+                PlannedExpressionKind::BigInt { value, .. } => {
+                    Some(bootstrap.cached_bigint_literal_type(value))
+                }
+                PlannedExpressionKind::Boolean(value) => Some(Some(if *value {
+                    bootstrap.regular_true_type
+                } else {
+                    bootstrap.regular_false_type
+                })),
+                _ => None,
+            };
+            if let Some(regular) = regular {
+                let regular = regular.ok_or_else(invalid)?;
+                store
+                    .validate_union_constituent(regular)
+                    .map_err(|_| invalid())?;
+                let Some(TypeData::Literal(literal)) =
+                    store.type_payload(regular).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                if literal.regular_type != regular
+                    || cached != regular && literal.fresh_type != Some(cached)
+                {
+                    return Err(invalid());
+                }
+                store
+                    .validate_union_constituent(cached)
+                    .map_err(|_| invalid())?;
+            }
+            let known = match &expression.kind {
+                PlannedExpressionKind::Null => Some(bootstrap.null_widening_type),
+                PlannedExpressionKind::GlobalUndefined => Some(bootstrap.undefined_widening_type),
+                PlannedExpressionKind::RegularExpression(type_) => Some(*type_),
+                PlannedExpressionKind::Parenthesized(_)
+                    if expression.unparenthesized().node != node =>
+                {
+                    Some(
+                        exact_type_cache(store, expression.unparenthesized().node)
+                            .map_err(|()| invalid())?
+                            .ok_or_else(invalid)?,
+                    )
+                }
+                _ => None,
+            };
+            if known.is_some_and(|expected| expected != cached) {
+                return Err(invalid());
+            }
+        }
+        expression.new_argument_children(&mut pending);
+    }
+    Ok(())
+}
+
+/// Requires prepared use-site slots and validates every candidate before demand.
+pub(super) fn source_library_constructor_candidates(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<SourceLibraryConstructorCandidates, SourceNewError> {
+    preflight_direct_default_new_with_source_context(store, host, globals, options, plan)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    if plan.checked_expression_arguments().is_none() {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(|| {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    })
+}
+
+pub(super) fn source_constructor_argument_contextual_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    argument_index: usize,
+) -> Result<Option<TypeId>, SourceNewError> {
+    if !plan.is_library_constructor() {
+        return source_class_constructor_argument_contextual_type(
+            store,
+            host,
+            globals,
+            plan,
+            argument_index,
+        );
+    }
+    let candidates = source_library_constructor_candidates(store, host, globals, options, plan)?;
+    let arguments = plan
+        .checked_expression_arguments()
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
+    if argument_index >= arguments.len() {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let single = candidates.callables.len() == 1;
+    let candidates = candidates.callables.iter().filter(|candidate| {
+        single
+            || arguments.len() >= candidate.min_argument_count
+                && (candidate.rest_parameter.is_some()
+                    || arguments.len() <= candidate.parameters.len())
+    });
+    super::source_calls::common_fixed_argument_contextual_type(
+        store,
+        globals,
+        candidates,
+        argument_index,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })
+}
+
+/// Publishes only a selected original candidate after source diagnostics succeed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_source_library_expression_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    candidates: &SourceLibraryConstructorCandidates,
+    checked_arguments: &[CheckedExpressionTypes],
+    resolution: &super::calls::DirectCallResolution,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let current = source_library_constructor_candidates(store, host, globals, options, plan)?;
+    if &current != candidates
+        || !current.callables.iter().any(|candidate| {
+            candidate.signature == resolution.projection.signature
+                && candidate.return_type == Some(resolution.projection.return_type)
+        })
+    {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let selected = CheckedSourceDefaultNew {
+        value_type: current.value_type,
+        instance_type: resolution.projection.return_type,
+        signature: resolution.projection.signature,
+    };
+    let argument_cache_types = checked_arguments
+        .iter()
+        .map(CheckedExpressionTypes::raw)
+        .collect::<Vec<_>>();
+    publish_default_new_links_with_context(
+        store,
+        host,
+        plan,
+        selected,
+        &argument_cache_types,
+        Some((globals, options)),
+    )
+}
+
+pub(super) fn source_class_constructor_argument_contextual_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    plan: &SourceDefaultNewPlan,
+    argument_index: usize,
+) -> Result<Option<TypeId>, SourceNewError> {
+    let SourceNewTarget::SourceClass(class) = &plan.target else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    };
+    let selected =
+        resolved_source_class_constructor(store, host, plan, class)?.ok_or_else(|| {
+            invariant(SourceNewInvariant::InvalidConstructorCache(
+                plan.constructor,
+            ))
+        })?;
+    let candidates = super::classes::source_class_expression_constructor_candidates(
+        store,
+        host,
+        class.symbol(),
+    )?
+    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    if candidates
+        .first()
+        .is_none_or(|callable| callable.signature != selected.signature)
+        || candidates
+            .iter()
+            .any(|callable| callable.owner != selected.value_type)
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            selected.signature,
+        )));
+    }
+    let arity = plan
+        .expression_arguments
+        .as_ref()
+        .map_or(0, |arguments| arguments.nodes.len());
+    let mut contextual = None;
+    for callable in &candidates {
+        if class.has_public_inherited_constructor()
+            && (arity < callable.min_argument_count || arity > callable.parameters.len())
+        {
+            continue;
+        }
+        let Some(candidate) =
+            super::calls::try_get_type_at_position(store, Some(globals), callable, argument_index)
+                .map_err(|error| SourceNewError::Call {
+                    node: plan.node,
+                    error,
+                })?
+        else {
+            return Ok(None);
+        };
+        if contextual.is_some_and(|previous| previous != candidate) {
+            return Ok(None);
+        }
+        contextual = Some(candidate);
+    }
+    Ok(contextual)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_class_expression_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    session: &mut super::instantiate::InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+) -> Result<(CheckedSourceDefaultNew, super::calls::DirectCallResolution), SourceNewError> {
+    preflight_direct_default_new(store, host, plan)?;
+    if plan
+        .checked_expression_arguments()
+        .is_none_or(|arguments| arguments.len() != argument_types.len())
+    {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let (selected, candidates) = match &plan.target {
+        SourceNewTarget::SourceClass(class) => {
+            let selected =
+                resolved_source_class_constructor(store, host, plan, class)?.ok_or_else(|| {
+                    invariant(SourceNewInvariant::InvalidConstructorCache(
+                        plan.constructor,
+                    ))
+                })?;
+            let candidates = super::classes::source_class_expression_constructor_candidates(
+                store,
+                host,
+                class.symbol(),
+            )?
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+            (selected, candidates)
+        }
+        SourceNewTarget::Class(class) => {
+            let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+            let members = execute_nongeneric_class_member_query(store, host, class)?;
+            let selected = CheckedSourceDefaultNew {
+                value_type: members.shells().value_type(),
+                instance_type: members.shells().instance_type(),
+                signature: members.default_construct_signature(),
+            };
+            validate_selected_default_signature(
+                store,
+                host,
+                plan,
+                class,
+                selected.value_type,
+                selected.instance_type,
+                selected.signature,
+            )?;
+            let StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                ..
+            } = validate_stored_callable_set(store, selected.value_type)
+            else {
+                return Err(invalid());
+            };
+            if family != CallableFamily::DeclaredCallSignatures
+                || projection.owner != selected.value_type
+                || !projection.call_signatures.is_empty()
+                || projection.construct_signatures.as_ref()
+                    != std::slice::from_ref(&selected.signature)
+            {
+                return Err(invalid());
+            }
+            let signature = store.signature(selected.signature).ok_or_else(invalid)?;
+            let parameters = signature
+                .parameters()
+                .iter()
+                .map(|&parameter| {
+                    let links = store.value_symbol_links(parameter).ok_or_else(invalid)?;
+                    let type_ = links.resolved_type.ok_or_else(invalid)?;
+                    if links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        })
+                        || store.type_payload(type_).is_none()
+                    {
+                        return Err(invalid());
+                    }
+                    Ok(type_)
+                })
+                .collect::<Result<Vec<_>, SourceNewError>>()?;
+            let callable = ValidatedSingleCallable {
+                owner: selected.value_type,
+                signature: selected.signature,
+                parameters,
+                rest_parameter: None,
+                min_argument_count: usize::try_from(signature.min_argument_count())
+                    .map_err(|_| invalid())?,
+                return_type: signature.resolved_return_type(),
+                strict_variance_exempt: true,
+            };
+            (selected, vec![callable])
+        }
+        _ => {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                plan.node,
+            )));
+        }
+    };
+    if candidates
+        .first()
+        .is_none_or(|callable| callable.signature != selected.signature)
+        || candidates.iter().any(|callable| {
+            callable.owner != selected.value_type
+                || callable.return_type != Some(selected.instance_type)
+        })
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            selected.signature,
+        )));
+    }
+    let existing_signature = exact_signature_cache(store, plan.node)
+        .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
+    let resolution = super::calls::resolve_direct_call_candidates_with_session(
+        store,
+        globals,
+        strict_function_types,
+        super::calls::DirectCallRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee: selected.value_type,
+            arguments: argument_types,
+        },
+        &candidates,
+        existing_signature,
+        session,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })?;
+    if let Some(existing) = existing_signature
+        && existing != resolution.projection.signature
+    {
+        return Err(SourceNewError::Call {
+            node: plan.node,
+            error: super::calls::DirectCallInvariant::InvalidSignature(existing).into(),
+        });
+    }
+    if !candidates
+        .iter()
+        .any(|callable| callable.signature == resolution.projection.signature)
+        || resolution.projection.return_type != selected.instance_type
+    {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let selected = CheckedSourceDefaultNew {
+        signature: resolution.projection.signature,
+        ..selected
+    };
+    let checked = publish_default_new_links(store, host, plan, selected, argument_types)?;
+    Ok((checked, resolution))
+}
+
 fn preflight_prepared_default_new_cache(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    preflight_prepared_default_new_cache_with_context(store, host, plan, None)
+}
+
+fn preflight_prepared_default_new_cache_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
 ) -> Result<(), SourceNewError> {
     if store.symbol_node_links(plan.constructor).is_none()
         || store.type_node_links(plan.constructor).is_none()
@@ -5492,12 +8024,17 @@ fn preflight_prepared_default_new_cache(
             .type_arguments
             .iter()
             .any(|argument| store.type_node_links(argument.node).is_none())
+        || plan
+            .written_type_argument_nodes()
+            .unwrap_or_default()
+            .iter()
+            .any(|argument| store.type_node_links(*argument).is_none())
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
         )));
     }
-    preflight_default_new_cache(store, host, plan)
+    preflight_default_new_cache_with_context(store, host, plan, source_context)
 }
 
 fn resolved_declared_constructor(
@@ -6357,9 +8894,18 @@ fn resolved_global_promise_constructor(
     plan: &SourceDefaultNewPlan,
     global: &SourceGlobalPromiseConstructorPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    resolved_global_promise_constructor_identity(store, plan.constructor, plan.resolved_symbol, global)
+}
+
+fn resolved_global_promise_constructor_identity(
+    store: &CanonicalTypeMapperStore,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    global: &SourceGlobalPromiseConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
     let invalid = || {
         invariant(SourceNewInvariant::InvalidConstructorCache(
-            plan.constructor,
+            constructor,
         ))
     };
     let Some(value_type) = store
@@ -6371,13 +8917,13 @@ fn resolved_global_promise_constructor(
     if exact_type_cache(store, global.annotation)
         .map_err(|()| invalid())?
         .is_some_and(|cached| cached != value_type)
-        || exact_class_value_type(store, plan.resolved_symbol)?
+        || exact_class_value_type(store, resolved_symbol)?
             .is_some_and(|cached| cached != value_type)
     {
         return Err(invalid());
     }
     let Some(promise_target) = store
-        .declared_type_links(plan.resolved_symbol)
+        .declared_type_links(resolved_symbol)
         .and_then(|links| links.declared_type)
     else {
         return Ok(None);
@@ -6423,11 +8969,23 @@ fn resolved_global_promise_constructor(
             base,
         )));
     }
-    let unknown = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .unknown_type;
-    let selected = match store.cached_signature(base, type_list_key(&[unknown]), &[unknown]) {
+    let argument_type = match global.type_argument {
+        Some(node) => {
+            let Some(type_) = super::object_members::cached_planned_type_identity(store, node) else {
+                return Ok(None);
+            };
+            if !store.source_direct_type_annotation_is_exact(node, type_) {
+                return Err(invalid());
+            }
+            type_
+        }
+        None => store.intrinsic_bootstrap().ok_or_else(invalid)?.unknown_type,
+    };
+    let selected = match store.cached_signature(
+        base,
+        type_list_key(&[argument_type]),
+        &[argument_type],
+    ) {
         CachedSignatureLookup::Hit(signature) => signature,
         CachedSignatureLookup::Missing => return Ok(None),
         CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
@@ -6439,7 +8997,7 @@ fn resolved_global_promise_constructor(
     let instance =
         validate_direct_generic_reference(store, instance_type).map_err(|_| invalid())?;
     if instance.target != promise_target
-        || instance.type_arguments.as_slice() != [unknown]
+        || instance.type_arguments.as_slice() != [argument_type]
         || signature.flags() != SignatureFlags::CONSTRUCT
         || signature.declaration() != Some(global.declaration)
         || !signature.type_parameters().is_empty()
@@ -6450,6 +9008,19 @@ fn resolved_global_promise_constructor(
         return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
             selected,
         )));
+    }
+    if super::instantiate::cached_instantiation_with_vector(
+        store,
+        executor,
+        &[generic],
+        &[argument_type],
+        global.array_targets,
+        None,
+    )
+    .map_err(|_| invalid())?
+    .is_none()
+    {
+        return Ok(None);
     }
 
     Ok(Some(CheckedSourceDefaultNew {
@@ -6578,11 +9149,79 @@ fn resolved_global_array_constructor(
     }))
 }
 
+/// Rechecks the local/export attachment before a class construction can use cached results.
+fn preflight_exported_constructor_binding(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    let (symbol, declaration) = match &plan.target {
+        SourceNewTarget::Class(class) => (class.symbol(), class.declaration()),
+        SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+            (class.symbol(), class.declaration())
+        }
+        SourceNewTarget::GenericSourceClass(generic) => {
+            (generic.class.symbol(), generic.class.declaration())
+        }
+        _ => return Ok(()),
+    };
+    if plan.resolved_symbol == symbol {
+        return Ok(());
+    }
+    let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(declaration));
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    if constructor_value_symbol(store, plan.constructor, plan.resolved_symbol)? != symbol
+        || bound.local_symbol(declaration) != Some(plan.resolved_symbol)
+        || bound.symbol(declaration) != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    let NodeData::ClassDeclaration(class) = &host.node(declaration).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid());
+    };
+    if class.type_parameters.is_some() && !plan.is_generic_source_class() {
+        return Err(unsupported(SourceNewUnsupported::Constructor(
+            plan.constructor,
+        )));
+    }
+    match &plan.target {
+        SourceNewTarget::Class(class) => {
+            preflight_nongeneric_class_member_query(store, host, class)?;
+        }
+        SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+            if !source_class_plan_is_current(store, host, class)? {
+                return Err(invalid());
+            }
+        }
+        SourceNewTarget::GenericSourceClass(generic) => {
+            if !generic.class.has_generic_constructor()
+                || !source_class_plan_is_current(store, host, &generic.class)?
+            {
+                return Err(invalid());
+            }
+        }
+        _ => unreachable!("only local class targets have an exported constructor binding"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    preflight_default_new_cache_with_context(store, host, plan, None)
+}
+
+fn preflight_default_new_cache_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<(), SourceNewError> {
+    preflight_exported_constructor_binding(store, host, plan)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,
@@ -6629,6 +9268,123 @@ fn preflight_default_new_cache(
     }
 
     match &plan.target {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
+            let (globals, options) = source_context.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            let candidates = resolve_library_new_candidates(store, host, globals, options, plan)
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "cache_read_error",
+                        plan.node,
+                        plan.constructor,
+                        format_args!(
+                            "cached_constructor_symbol={constructor_symbol:?} cached_constructor_type={constructor_type:?} cached_result_type={result_type:?} cached_signature={signature:?} error={error:?}"
+                        ),
+                    );
+                    error
+                })?;
+            if plan.is_generic_library_constructor() {
+                let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+                if constructor_type.is_some_and(|type_| {
+                    candidates
+                        .as_ref()
+                        .is_none_or(|candidates| candidates.value_type != type_)
+                }) {
+                    return Err(invalid());
+                }
+                if let Some(signature) = signature {
+                    let candidates = candidates.as_ref().ok_or_else(invalid)?;
+                    if constructor_symbol != Some(plan.resolved_symbol)
+                        || constructor_type != Some(candidates.value_type)
+                        || store
+                            .signature(signature)
+                            .and_then(Signature::resolved_return_type)
+                            != result_type
+                    {
+                        return Err(invalid());
+                    }
+                    preflight_generic_class_constructor_signature(
+                        store,
+                        candidates.value_type,
+                        signature,
+                        Some(CanonicalArrayTargets::from_global_types(globals)),
+                    )
+                    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+                }
+                preflight_library_argument_caches(store, host, globals, options, plan)?;
+                return Ok(());
+            }
+            if constructor_type.is_some_and(|type_| {
+                candidates
+                    .as_ref()
+                    .is_none_or(|candidates| candidates.value_type != type_)
+            }) || signature.is_some_and(|signature| {
+                candidates.as_ref().is_none_or(|candidates| {
+                    !candidates.callables.iter().any(|candidate| {
+                        candidate.signature == signature && candidate.return_type == result_type
+                    })
+                })
+            }) || signature.is_some()
+                && (constructor_symbol != Some(plan.resolved_symbol) || constructor_type.is_none())
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+            preflight_library_argument_caches(store, host, globals, options, plan)?;
+        }
+        SourceNewTarget::GenericSourceClass(generic) => {
+            let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+            preflight_generic_source_class_plan(store, host, plan, generic)?;
+            let members = super::classes::completed_source_class_constructors(
+                store,
+                host,
+                generic.class.symbol(),
+            )?;
+            if constructor_type.is_some_and(|constructor| {
+                members
+                    .as_ref()
+                    .is_none_or(|members| members.members().shells().value_type() != constructor)
+            }) {
+                return Err(invalid());
+            }
+            if let Some(signature) = signature {
+                let members = members.as_ref().ok_or_else(invalid)?;
+                let value = members.members().shells().value_type();
+                let targets = generic
+                    .class
+                    .type_query_context()
+                    .ok_or_else(invalid)?
+                    .array_targets();
+                if constructor_symbol != Some(plan.resolved_symbol)
+                    || constructor_type != Some(value)
+                    || store
+                        .signature(signature)
+                        .and_then(Signature::resolved_return_type)
+                        != result_type
+                {
+                    return Err(invalid());
+                }
+                if store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| signature == bootstrap.unknown_signature)
+                {
+                    // Source execution repeats the access proof with its actual body token.
+                    generic_new_error_signature(store, plan.node)?;
+                } else {
+                    preflight_generic_class_constructor_signature(
+                        store,
+                        value,
+                        signature,
+                        Some(targets),
+                    )
+                    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+                }
+            }
+        }
         SourceNewTarget::ConstructorOverloads(class) => {
             let group =
                 super::classes::source_class_constructor_overloads(store, host, class.symbol())?;
@@ -6655,12 +9411,28 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::SourceClass(class) => {
             let resolved = resolved_source_class_constructor(store, host, plan, class)?;
+            let candidates = if class.has_public_inherited_constructor() && resolved.is_some() {
+                super::classes::source_class_expression_constructor_candidates(
+                    store,
+                    host,
+                    class.symbol(),
+                )?
+            } else {
+                None
+            };
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
                 resolved.is_none_or(|resolved| result != resolved.instance_type)
             }) || signature.is_some_and(|signature| {
-                resolved.is_none_or(|resolved| signature != resolved.signature)
+                candidates.as_ref().map_or_else(
+                    || resolved.is_none_or(|resolved| signature != resolved.signature),
+                    |candidates| {
+                        !candidates
+                            .iter()
+                            .any(|callable| callable.signature == signature)
+                    },
+                )
             }) {
                 return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
                     plan.node,
@@ -6825,7 +9597,8 @@ fn preflight_default_new_cache(
     Ok(())
 }
 
-fn preflight_publication_cache(
+#[allow(clippy::too_many_arguments)]
+fn preflight_publication_cache_with_context(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
@@ -6833,8 +9606,9 @@ fn preflight_publication_cache(
     instance_type: TypeId,
     signature: SignatureId,
     argument_types: &[TypeId],
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
 ) -> Result<(), SourceNewError> {
-    preflight_prepared_default_new_cache(store, host, plan)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, source_context)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,
@@ -6849,7 +9623,7 @@ fn preflight_publication_cache(
         .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
     let selected = exact_signature_cache(store, plan.node)
         .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
-    if plan.arguments().count() != argument_types.len() {
+    if plan.argument_nodes().count() != argument_types.len() {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
         )));
@@ -6863,6 +9637,18 @@ fn preflight_publication_cache(
             return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
                 argument.node,
             )));
+        }
+    }
+    if let Some(arguments) = plan.checked_expression_arguments() {
+        for (argument, &argument_type) in arguments.iter().zip(argument_types) {
+            if exact_type_cache(store, argument.node).map_err(|()| {
+                invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+            })? != Some(argument_type)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    argument.node,
+                )));
+            }
         }
     }
     if constructor_symbol.is_some_and(|symbol| symbol != plan.resolved_symbol)
@@ -7170,6 +9956,810 @@ mod tests {
         production::GlobalMergeCompletion,
     };
 
+    const LIBRARY_EXPRESSION_NEW_DECLARATIONS: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface BuildResult { value: string; } ",
+        "interface OtherResult { value: number; } ",
+        "declare var BuildValue: { prototype: BuildResult; ",
+        "new(): BuildResult; new(value?: number): OtherResult; empty(): BuildResult; };",
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn library_zero_argument_plan(
+        source: &ParseResult,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        options: CanonicalCheckerOptions,
+        node: NodeRef,
+    ) -> SourceDefaultNewPlan {
+        let mut plan = plan_direct_default_new_with_source_context(
+            &source.arena,
+            bound,
+            store,
+            host,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            node,
+            false,
+            globals,
+            options,
+        )
+        .unwrap();
+        assert!(plan.is_library_constructor());
+        assert_eq!(plan.expression_argument_nodes(), Some(&[][..]));
+        plan.set_expression_arguments(Vec::new()).unwrap();
+        plan
+    }
+
+    #[test]
+    fn library_expression_new_revalidates_complete_candidates_and_saved_pairs() {
+        let library = parse_source_file(LIBRARY_EXPRESSION_NEW_DECLARATIONS);
+        let source = parse_source_file("const value = new BuildValue();");
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        for damage in 0..9 {
+            let library_file = FileId::new(202_800);
+            let file = FileId::new(202_801);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, file);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let globals = context.global_types().clone();
+            let options = context.options();
+            let (node, constructor) = variable_new(&source, file, "value");
+            let plan = library_zero_argument_plan(
+                &source,
+                &source_bound,
+                context.store(),
+                &host,
+                &globals,
+                options,
+                node,
+            );
+            let candidates = source_library_constructor_candidates(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan,
+            )
+            .unwrap();
+            assert_eq!(candidates.callables.len(), 2);
+            assert_ne!(
+                candidates.callables[0].return_type,
+                candidates.callables[1].return_type
+            );
+            let selected = candidates.callables[0].signature;
+            let later = candidates.callables[1].signature;
+            let return_type = candidates.callables[0].return_type.unwrap();
+            let other_return = candidates.callables[1].return_type.unwrap();
+            assert_eq!(
+                exact_signature_cache(context.store(), node),
+                Ok(Some(selected))
+            );
+            assert_eq!(
+                exact_type_cache(context.store(), node),
+                Ok(Some(return_type))
+            );
+            let parameter = context.store().signature(later).unwrap().parameters()[0];
+            let original_parameter = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .clone();
+            let original_symbol = context
+                .store()
+                .symbol_node_links(constructor)
+                .unwrap()
+                .clone();
+            let original_constructor = context
+                .store()
+                .type_node_links(constructor)
+                .unwrap()
+                .clone();
+            let original_result = context.store().type_node_links(node).unwrap().clone();
+            let original_signature = context.store().signature_links(node).unwrap().clone();
+            let original_members = context
+                .store()
+                .type_payload(candidates.value_type)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let owner = context
+                .store()
+                .type_payload(return_type)
+                .and_then(TypeRecord::symbol)
+                .unwrap();
+            let primitive = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let before = format!("{:?}", context.store());
+            preflight_direct_default_new_with_source_context(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan,
+            )
+            .unwrap();
+            assert_eq!(format!("{:?}", context.store()), before);
+
+            let store = context.store_mut_for_test();
+            match damage {
+                0 => assert!(store.set_symbol_node_links(
+                    constructor,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(owner)
+                    }
+                )),
+                1 => assert!(store.set_type_node_links(
+                    constructor,
+                    TypeNodeLinks {
+                        resolved_type: Some(primitive),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                2 => assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(other_return),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                3 => assert!(store.set_signature_links(
+                    node,
+                    SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(later),
+                        ..SignatureLinks::default()
+                    }
+                )),
+                4 => assert!(store.set_type_node_links(node, TypeNodeLinks::default())),
+                5 => assert!(store.set_signature_links(node, SignatureLinks::default())),
+                6 => assert!(store.set_signature_resolved_return_type(later, Some(return_type))),
+                7 => assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(primitive),
+                        ..original_parameter.clone()
+                    }
+                )),
+                8 => assert!(store.set_structured_type_members(
+                    candidates.value_type,
+                    original_members.members,
+                    original_members.properties.clone(),
+                    Some(Vec::new()),
+                    Some(vec![later, selected]),
+                    original_members.index_infos.clone(),
+                )),
+                _ => unreachable!(),
+            }
+            let damaged = format!("{store:?}");
+            let mut session = InstantiationSession::new(Default::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert!(matches!(
+                    preflight_direct_default_new_with_source_context(
+                        store, &host, &globals, options, &plan
+                    ),
+                    Err(SourceNewError::Invariant(_)) | Err(SourceNewError::DeclaredType(_)),
+                ));
+                assert!(
+                    prepare_direct_default_news(
+                        store,
+                        &host,
+                        &globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        std::slice::from_ref(&plan),
+                    )
+                    .is_err()
+                );
+                assert_eq!(format!("{store:?}"), damaged);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+                assert!(diagnostics.is_empty());
+            }
+            match damage {
+                0 => assert!(store.set_symbol_node_links(constructor, original_symbol)),
+                1 => assert!(store.set_type_node_links(constructor, original_constructor)),
+                2 | 4 => assert!(store.set_type_node_links(node, original_result)),
+                3 | 5 => assert!(store.set_signature_links(node, original_signature)),
+                6 => assert!(store.set_signature_resolved_return_type(later, Some(other_return))),
+                7 => assert!(store.set_value_symbol_links(parameter, original_parameter)),
+                8 => assert!(store.set_structured_type_members(
+                    candidates.value_type,
+                    original_members.members,
+                    original_members.properties.clone(),
+                    Some(Vec::new()),
+                    original_members.signatures.clone(),
+                    original_members.index_infos.clone(),
+                )),
+                _ => unreachable!(),
+            }
+            let restored = format!("{store:?}");
+            let checked = super::super::source_calls::check_source_library_expression_new(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                &plan,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(checked.signature, selected);
+            assert_eq!(checked.instance_type, return_type);
+            assert_eq!(checked.value_type, candidates.value_type);
+            assert_eq!(format!("{store:?}"), restored);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn library_expression_new_batch_preflights_later_nodes_before_preparation() {
+        let library = parse_source_file(LIBRARY_EXPRESSION_NEW_DECLARATIONS);
+        let source =
+            parse_source_file("const first = new BuildValue(); const second = new BuildValue();");
+        let library_file = FileId::new(202_802);
+        let file = FileId::new(202_803);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let first = variable_new(&source, file, "first").0;
+        let (second, constructor) = variable_new(&source, file, "second");
+        let plans = [first, second].map(|node| {
+            library_zero_argument_plan(
+                &source,
+                &source_bound,
+                context.store(),
+                &host,
+                &globals,
+                options,
+                node,
+            )
+        });
+        let value_symbol = plans[0].resolved_symbol();
+        let foreign = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .global_this_symbol;
+        let store = context.store_mut_for_test();
+        assert!(store.set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(foreign)
+            }
+        ));
+        let damaged = format!("{store:?}");
+        let mut session = InstantiationSession::new(Default::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_direct_default_news(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    &plans,
+                ),
+                Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    constructor
+                )))
+            );
+            assert_eq!(format!("{store:?}"), damaged);
+            assert!(
+                store
+                    .value_symbol_links(value_symbol)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(store.type_node_links(first).is_none());
+            assert!(store.signature_links(first).is_none());
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert!(diagnostics.is_empty());
+        }
+        assert!(store.set_symbol_node_links(constructor, SymbolNodeLinks::default()));
+        prepare_direct_default_news(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &plans,
+        )
+        .unwrap();
+        for plan in &plans {
+            let checked = super::super::source_calls::check_source_library_expression_new(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                plan,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                exact_signature_cache(store, plan.node),
+                Ok(Some(checked.signature))
+            );
+            assert_eq!(
+                exact_type_cache(store, plan.node),
+                Ok(Some(checked.instance_type))
+            );
+        }
+        let warm = format!("{store:?}");
+        prepare_direct_default_news(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &plans,
+        )
+        .unwrap();
+        assert_eq!(format!("{store:?}"), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn library_expression_new_keeps_current_array_authority_on_warm_reads() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } ",
+            "declare var BuildValue: { prototype: BuildResult; ",
+            "new(values?: string[]): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue();");
+        let library_file = FileId::new(202_804);
+        let file = FileId::new(202_805);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        context.check_source_file(file).unwrap();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, _) = variable_new(&source, file, "value");
+        let plan = library_zero_argument_plan(
+            &source,
+            &source_bound,
+            context.store(),
+            &host,
+            &globals,
+            options,
+            node,
+        );
+        let candidates =
+            source_library_constructor_candidates(context.store(), &host, &globals, options, &plan)
+                .unwrap();
+        let [callable] = candidates.callables.as_slice() else {
+            panic!("one real constructor")
+        };
+        let array = callable.parameters[0];
+        let reference = context
+            .store()
+            .canonical_array_reference(&globals, array)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.element_type,
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        let TypeData::TypeReference(record) = context
+            .store()
+            .type_payload(reference.base_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("real canonical Array reference")
+        };
+        assert_eq!(record.object.target, Some(globals.array_type));
+        let other = global_object_constructor_context(
+            &library,
+            &source,
+            FileId::new(202_806),
+            FileId::new(202_807),
+        );
+        let mut missing = globals.clone();
+        missing.array_type = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_generic_type;
+        let mut foreign = globals.clone();
+        foreign.array_type = other.global_types().array_type;
+        for invalid_globals in [&missing, &foreign] {
+            let before = format!("{:?}", context.store());
+            let mut session = InstantiationSession::new(Default::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert!(
+                    preflight_direct_default_new_with_source_context(
+                        context.store(),
+                        &host,
+                        invalid_globals,
+                        options,
+                        &plan,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    prepare_direct_default_news(
+                        context.store_mut_for_test(),
+                        &host,
+                        invalid_globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        std::slice::from_ref(&plan),
+                    )
+                    .is_err()
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            source_library_constructor_candidates(context.store(), &host, &globals, options, &plan),
+            Ok(candidates)
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+    }
+
+    #[test]
+    fn library_expression_new_preparation_uses_the_spent_source_caller() {
+        use crate::semantic::{
+            array_types::CanonicalArrayTargets,
+            instantiate::{InstantiationLimits, instantiate_type_with_vector_and_session},
+        };
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } ",
+            "type Payload<T> = T[]; ",
+            "declare var BuildValue: { prototype: BuildResult; ",
+            "new(values?: Payload<string>): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue();");
+        let library_file = FileId::new(202_808);
+        let file = FileId::new(202_809);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, constructor) = variable_new(&source, file, "value");
+        let plan = library_zero_argument_plan(
+            &source,
+            &source_bound,
+            context.store(),
+            &host,
+            &globals,
+            options,
+            node,
+        );
+        let parameter_node = library
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &library.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == "Payload").then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    alias.type_parameters.as_ref()?.nodes[0],
+                ))
+            })
+            .unwrap();
+        let parameter_symbol = library_bound.symbol(parameter_node).unwrap();
+        let store = context.store_mut_for_test();
+        let parameter = execute_type_parameter(store, parameter_symbol);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut caller,
+            ),
+            Ok(number)
+        );
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            (1, 1, 0)
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            prepare_direct_default_news(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &mut diagnostics,
+                std::slice::from_ref(&plan),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(exact_type_cache(store, constructor), Ok(None));
+        assert_eq!(exact_type_cache(store, node), Ok(None));
+        assert_eq!(exact_signature_cache(store, node), Ok(None));
+        assert!(
+            store
+                .value_symbol_links(plan.resolved_symbol())
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn library_expression_new_preflights_nested_literal_facts_without_semantic_replay() {
+        use crate::semantic::source::PlannedObjectMember;
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } interface Init { count: number; } ",
+            "declare var BuildValue: { prototype: BuildResult; new(value: string, init: Init): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue('ready', { count: 1 });");
+        let library_file = FileId::new(202_810);
+        let file = FileId::new(202_811);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, _) = variable_new(&source, file, "value");
+        let mut plan = plan_direct_default_new_with_source_context(
+            &source.arena,
+            &source_bound,
+            context.store(),
+            &host,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            node,
+            false,
+            &globals,
+            options,
+        )
+        .unwrap();
+        let [text, object] = plan.expression_argument_nodes().unwrap() else {
+            panic!("two actual arguments")
+        };
+        let (text, object) = (*text, *object);
+        let NodeData::StringLiteral(text_data) = &source.arena.get(text.node).unwrap().data else {
+            panic!("the original string argument")
+        };
+        let NodeData::ObjectLiteralExpression(object_data) =
+            &source.arena.get(object.node).unwrap().data
+        else {
+            panic!("the original object argument")
+        };
+        let [property] = object_data.properties.nodes.as_slice() else {
+            panic!("one real property")
+        };
+        let NodeData::PropertyAssignment(property) = &source.arena.get(*property).unwrap().data
+        else {
+            panic!("one assignment")
+        };
+        let value = NodeRef::new(source.arena.id(), file, property.initializer);
+        let NodeData::NumericLiteral(number) = &source.arena.get(value.node).unwrap().data else {
+            panic!("the actual numeric value")
+        };
+        let object_plan = plan_object_literal(context.store(), &host, object).unwrap();
+        plan.set_expression_arguments(vec![
+            PlannedExpression::new(text, PlannedExpressionKind::String(text_data.text.clone())),
+            PlannedExpression::new(
+                object,
+                PlannedExpressionKind::Object {
+                    plan: object_plan,
+                    properties: vec![PlannedObjectMember::Eager(PlannedExpression::new(
+                        value,
+                        PlannedExpressionKind::Number {
+                            value: ts_jsnum::from_string(&number.text),
+                            unary_operand: None,
+                        },
+                    ))],
+                },
+            ),
+        ])
+        .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let store = context.store_mut_for_test();
+        assert!(store.set_type_node_links(
+            value,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = format!("{store:?}");
+        let mut caller = InstantiationSession::new(Default::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_direct_default_news(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                    std::slice::from_ref(&plan),
+                ),
+                Err(invariant(SourceNewInvariant::InvalidExpressionCache(value)))
+            );
+            assert_eq!(format!("{store:?}"), before);
+            assert!(
+                store
+                    .value_symbol_links(plan.resolved_symbol())
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(store.signature_links(node).is_none());
+            assert!(store.type_node_links(node).is_none());
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+        assert!(store.set_type_node_links(value, TypeNodeLinks::default()));
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let correct = context.store().type_node_links(value).unwrap().clone();
+        let original_pair = (
+            context.store().type_node_links(node).cloned(),
+            context.store().signature_links(node).cloned(),
+        );
+        assert!(context.store_mut_for_test().set_type_node_links(
+            value,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            preflight_direct_default_new_with_source_context(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan
+            ),
+            Err(invariant(SourceNewInvariant::InvalidExpressionCache(value)))
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+        assert_eq!(
+            (
+                context.store().type_node_links(node).cloned(),
+                context.store().signature_links(node).cloned()
+            ),
+            original_pair
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(value, correct)
+        );
+        preflight_direct_default_new_with_source_context(
+            context.store(),
+            &host,
+            &globals,
+            options,
+            &plan,
+        )
+        .unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_node_links(node).cloned(),
+                context.store().signature_links(node).cloned()
+            ),
+            original_pair
+        );
+    }
+
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
@@ -7213,6 +10803,32 @@ mod tests {
             .unwrap();
         binder
             .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn exported_class_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/exported-construction.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(
             binder.finish(),
@@ -7627,6 +11243,953 @@ mod tests {
             None,
         ));
         (context, object, owner, value_type, object_type, signature)
+    }
+
+    #[test]
+    fn exported_class_new_plans_revalidate_the_actual_local_edge_without_publication() {
+        enum Family {
+            Class,
+            Source,
+            Overloads,
+        }
+        for (source, family) in [
+            (
+                "export class Model { value!: string; } export class Other {} const model = new Model();",
+                Family::Class,
+            ),
+            (
+                "export class Model { read() { return 1; } } export class Other {} const model = new Model();",
+                Family::Source,
+            ),
+            (
+                "export class Model { constructor(); constructor(value: string); constructor(value?: string) {} } export class Other {} const model = new Model();",
+                Family::Overloads,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(202_422);
+            let mut context = exported_class_context(&parsed, file);
+            let owner = class_symbol(&parsed, file, &context, "Model");
+            let other = class_symbol(&parsed, file, &context, "Other");
+            let declaration = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let bound = context.file(file).unwrap().1.clone();
+            let local = bound.local_symbol(declaration).unwrap();
+            let local_record = context.store().symbol(local).unwrap().clone();
+            assert_ne!(local, owner);
+            assert_eq!(local_record.flags(), SymbolFlags::EXPORT_VALUE);
+            assert_eq!(local_record.export_symbol(), Some(owner));
+            let (construction, constructor) = variable_new(&parsed, file, "model");
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let cold = format!("{:?}", context.store());
+            let mut classes = HashMap::new();
+            let mut source_classes = HashMap::new();
+            match family {
+                Family::Class => {
+                    classes.insert(
+                        owner,
+                        super::super::classes::plan_nongeneric_class_members(
+                            context.store(),
+                            &host,
+                            owner,
+                        )
+                        .unwrap(),
+                    );
+                }
+                Family::Source => {
+                    source_classes.insert(
+                        owner,
+                        super::super::classes::plan_source_class_members(
+                            context.store(),
+                            &host,
+                            owner,
+                        )
+                        .unwrap(),
+                    );
+                }
+                Family::Overloads => {}
+            }
+            let plan = plan_direct_default_new(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                &classes,
+                &source_classes,
+                &HashMap::new(),
+                construction,
+                false,
+            )
+            .unwrap();
+            assert!(match family {
+                Family::Class => matches!(plan.target, SourceNewTarget::Class(_)),
+                Family::Source => matches!(plan.target, SourceNewTarget::SourceClass(_)),
+                Family::Overloads =>
+                    matches!(plan.target, SourceNewTarget::ConstructorOverloads(_)),
+            });
+            assert_eq!(plan.resolved_symbol(), local);
+            assert_eq!(plan.provider_symbol(), owner);
+            assert_eq!(format!("{:?}", context.store()), cold);
+            assert!(context.store().symbol_node_links(constructor).is_none());
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().signature_links(construction).is_none());
+
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                Some(other),
+            ));
+            let damaged = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    preflight_default_new_cache(context.store(), &host, &plan),
+                    Err(invariant(SourceNewInvariant::InvalidClassPlan(declaration))),
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                local_record.export_symbol(),
+            ));
+            let restored = format!("{:?}", context.store());
+            assert_eq!(
+                preflight_default_new_cache(context.store(), &host, &plan),
+                Ok(())
+            );
+            assert_eq!(format!("{:?}", context.store()), restored);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let parsed = parse_source_file(
+            "export class Model<T> { value!: string; } const model = new Model();",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_423);
+        let context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (construction, constructor) = variable_new(&parsed, file, "model");
+        let cold = format!("{:?}", context.store());
+        let class =
+            super::super::classes::plan_nongeneric_class_members(context.store(), &host, owner)
+                .unwrap();
+        assert_eq!(
+            plan_direct_default_new(
+                &parsed.arena,
+                bound,
+                context.store(),
+                &host,
+                &HashMap::from([(owner, class)]),
+                &HashMap::new(),
+                &HashMap::new(),
+                construction,
+                false,
+            )
+            .unwrap_err(),
+            unsupported(SourceNewUnsupported::Constructor(constructor)),
+        );
+        assert_eq!(format!("{:?}", context.store()), cold);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn exported_class_new_keeps_lexical_links_and_rejects_a_class_symbol_in_the_cache() {
+        let parsed = parse_source_file(
+            "export class Model { read() { return 1; } } const model = new Model();",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_424);
+        let mut context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let declaration = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let local = bound.local_symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (construction, constructor) = variable_new(&parsed, file, "model");
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let members = completed_source_class_members(context.store(), &host, owner)
+            .unwrap()
+            .unwrap();
+        let value = members.shells().value_type();
+        let instance = members.shells().instance_type();
+        let signature = members.default_construct_signature();
+        assert!(authenticated_class_constructor_value(context.store(), owner).is_none());
+        assert_eq!(
+            context.store().type_payload(value).unwrap().symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type,
+            Some(instance)
+        );
+        assert_ne!(local, owner);
+        assert_eq!(
+            context.store().symbol_node_links(constructor),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(local)
+            })
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(constructor)
+                .unwrap()
+                .resolved_type,
+            Some(value)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(construction)
+                .unwrap()
+                .resolved_type,
+            Some(instance)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(construction)
+                .unwrap()
+                .resolved_signature,
+            ResolvedSignatureState::Resolved(signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(instance)
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+                context.store().type_node_links(constructor).cloned(),
+                context.store().type_node_links(construction).cloned(),
+                context.store().signature_links(construction).cloned(),
+            )
+        };
+        let warm = snapshot(&context);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner)
+            }
+        ));
+        let damaged = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.recheck_source_file(file),
+                Err(SourceCheckError::Call(constructor))
+            );
+            assert_eq!(snapshot(&context), damaged);
+            assert_eq!(
+                context.store().symbol_node_links(constructor),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(owner)
+                })
+            );
+        }
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(local)
+            }
+        ));
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        let restored = completed_source_class_members(context.store(), &host, owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                restored.shells().value_type(),
+                restored.shells().instance_type(),
+                restored.default_construct_signature()
+            ),
+            (value, instance, signature),
+        );
+    }
+
+    fn generic_new_plan_for_test(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        owner: SemanticSymbolId,
+        construction: NodeRef,
+    ) -> SourceDefaultNewPlan {
+        let host = context.declared_type_host().unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let type_context = ClassTypeQueryContext::new(context.global_types(), context.options());
+        let class = super::super::classes::plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&type_context),
+        )
+        .unwrap();
+        plan_direct_default_new_with_type_context(
+            &parsed.arena,
+            bound,
+            context.store(),
+            &host,
+            &HashMap::new(),
+            &HashMap::from([(owner, class)]),
+            &HashMap::new(),
+            construction,
+            false,
+            Some(&type_context),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generic_source_new_keeps_late_publication_and_the_spent_caller() {
+        use crate::semantic::classes::{
+            finish_source_class_members, plan_source_class_members_with_type_context,
+            prepare_source_class_members_with_type_queries,
+        };
+        use crate::semantic::instantiate::{InstantiationLimits, instantiate_type_with_session};
+
+        let parsed =
+            parse_source_file("export class Defaults<T = string> {} const item = new Defaults();");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(204_210);
+        let mut context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Defaults");
+        let (construction, constructor) = variable_new(&parsed, file, "item");
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let type_context = ClassTypeQueryContext::new(&globals, options);
+        let class = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&type_context),
+        )
+        .unwrap();
+        assert!(class.bodies().is_empty());
+        let mut setup_session = InstantiationSession::new(InstantiationLimits::default());
+        let mut setup_diagnostics = CanonicalCheckerDiagnostics::default();
+        let prepared_class = prepare_source_class_members_with_type_queries(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut setup_session,
+            &mut setup_diagnostics,
+            &class,
+        )
+        .unwrap();
+        let members = finish_source_class_members(
+            context.store_mut_for_test(),
+            &host,
+            &class,
+            &prepared_class,
+        )
+        .unwrap();
+        assert!(setup_diagnostics.is_empty());
+        let mut plan = generic_new_plan_for_test(&context, &parsed, file, owner, construction);
+        assert!(plan.is_generic_source_class());
+        plan.set_expression_arguments(Vec::new()).unwrap();
+        prepare_direct_default_news(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut setup_session,
+            &mut setup_diagnostics,
+            std::slice::from_ref(&plan),
+        )
+        .unwrap();
+        let prepared = check_source_generic_class_new(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut setup_session,
+            &plan,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        let checked = prepared.checked;
+        assert!(prepared.access_diagnostic().is_none());
+        assert!(prepared.resolution().unwrap().diagnostic.is_none());
+        assert_eq!(
+            exact_signature_cache(context.store(), construction),
+            Ok(None)
+        );
+        assert_eq!(exact_type_cache(context.store(), construction), Ok(None));
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reference =
+            validate_direct_generic_reference(context.store(), checked.instance_type).unwrap();
+        assert_eq!(reference.target, members.shells().instance_type());
+        assert_eq!(reference.type_arguments, [string]);
+        let original = members.default_construct_signature();
+        let original_record = context.store().signature(original).unwrap();
+        let [formal] = original_record.type_parameters() else {
+            panic!("the real default constructor must retain its one class formal")
+        };
+        let formal = *formal;
+        let mapper = context
+            .store()
+            .signature(checked.signature)
+            .unwrap()
+            .mapper()
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature(checked.signature)
+                .unwrap()
+                .target(),
+            Some(original)
+        );
+        let old_symbol = context
+            .store()
+            .symbol_node_links(constructor)
+            .unwrap()
+            .clone();
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner)
+            },
+        ));
+        let damaged = format!("{:?}", context.store());
+        assert_eq!(
+            publish_source_generic_class_new(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut setup_session,
+                &plan,
+                None,
+                &[],
+                None,
+                prepared,
+            ),
+            Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                constructor
+            )))
+        );
+        assert_eq!(format!("{:?}", context.store()), damaged);
+        assert_eq!(
+            exact_signature_cache(context.store(), construction),
+            Ok(None)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(constructor, old_symbol)
+        );
+
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_session(
+                context.store_mut_for_test(),
+                formal,
+                mapper,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut caller,
+            ),
+            Ok(string)
+        );
+        let spent = (caller.query_count(), caller.total_count());
+        assert_eq!(spent, (1, 1));
+        let limit_mark = caller.limit_event_mark();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        let prepared = check_source_generic_class_new(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &plan,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(prepared.checked, checked);
+        assert_eq!(
+            exact_signature_cache(context.store(), construction),
+            Ok(None)
+        );
+        assert_eq!(
+            publish_source_generic_class_new(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &plan,
+                None,
+                &[],
+                None,
+                prepared,
+            ),
+            Ok(checked)
+        );
+        assert_eq!((caller.query_count(), caller.total_count()), spent);
+        assert!(!caller.limit_event_occurred_since(limit_mark));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert_eq!(
+            exact_signature_cache(context.store(), construction),
+            Ok(Some(checked.signature))
+        );
+        assert_eq!(
+            exact_type_cache(context.store(), construction),
+            Ok(Some(checked.instance_type))
+        );
+        context.check_source_file(file).unwrap();
+        let warm = format!("{:?}", context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(format!("{:?}", context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn generic_source_new_rejects_changed_cached_requests_and_returns() {
+        use crate::semantic::instantiate::InstantiationLimits;
+
+        let parsed = parse_source_file(concat!(
+            "export class Box<T> {} ",
+            "const text = new Box<string>(); const count = new Box<number>();",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(204_211);
+        let mut context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Box");
+        let (text, _) = variable_new(&parsed, file, "text");
+        let (count, _) = variable_new(&parsed, file, "count");
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let text_signature = exact_signature_cache(context.store(), text)
+            .unwrap()
+            .unwrap();
+        let count_signature = exact_signature_cache(context.store(), count)
+            .unwrap()
+            .unwrap();
+        let text_result = exact_type_cache(context.store(), text).unwrap().unwrap();
+        let count_result = exact_type_cache(context.store(), count).unwrap().unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut plan = generic_new_plan_for_test(&context, &parsed, file, owner, text);
+        plan.set_expression_arguments(Vec::new()).unwrap();
+        let [written] = plan.written_type_argument_nodes().unwrap() else {
+            panic!("the first New must retain its real written string argument")
+        };
+        let written = *written;
+        assert_eq!(host.node(written).unwrap().kind, SyntaxKind::StringKeyword);
+        assert_eq!(exact_type_cache(context.store(), written), Ok(Some(string)));
+        let (original_target, original_mapper) = {
+            let signature = context.store().signature(text_signature).unwrap();
+            (signature.target(), signature.mapper())
+        };
+        let count_mapper = context
+            .store()
+            .signature(count_signature)
+            .unwrap()
+            .mapper()
+            .unwrap();
+        assert_ne!(original_mapper, Some(count_mapper));
+        assert_eq!(
+            original_target,
+            context.store().signature(count_signature).unwrap().target()
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(
+                    text_signature,
+                    original_target,
+                    Some(count_mapper),
+                )
+        );
+        let damaged = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                preflight_source_generic_class_new_with_context(
+                    context.store(),
+                    &host,
+                    &globals,
+                    options,
+                    &plan,
+                    None,
+                ),
+                Err(invariant(SourceNewInvariant::InvalidExpressionCache(text)))
+            );
+            assert_eq!(format!("{:?}", context.store()), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(text_signature, original_target, original_mapper,)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(text_signature, Some(number),)
+        );
+        let damaged = format!("{:?}", context.store());
+        assert_eq!(
+            preflight_source_generic_class_new_with_context(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan,
+                None,
+            ),
+            Err(invariant(SourceNewInvariant::InvalidExpressionCache(text)))
+        );
+        assert_eq!(format!("{:?}", context.store()), damaged);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(text_signature, Some(text_result),)
+        );
+
+        let saved_signature = context.store().signature_links(text).unwrap().clone();
+        let saved_type = context.store().type_node_links(text).unwrap().clone();
+        assert!(context.store_mut_for_test().set_signature_links(
+            text,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(count_signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(context.store_mut_for_test().set_type_node_links(
+            text,
+            TypeNodeLinks {
+                resolved_type: Some(count_result),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let damaged = format!("{:?}", context.store());
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        for _ in 0..2 {
+            let error = check_source_generic_class_new(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &plan,
+                None,
+                &[],
+                Some(&[string]),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                invariant(SourceNewInvariant::InvalidExpressionCache(text))
+            );
+            assert_eq!(format!("{:?}", context.store()), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(text, saved_signature)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(text, saved_type)
+        );
+
+        let saved_written = context.store().type_node_links(written).unwrap().clone();
+        assert!(context.store_mut_for_test().set_type_node_links(
+            written,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let damaged = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                preflight_generic_new_arguments(context.store(), &plan, &[], Some(&[string])),
+                Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    written
+                )))
+            );
+            assert_eq!(format!("{:?}", context.store()), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(written, saved_written)
+        );
+        context.recheck_source_file(file).unwrap();
+        let warm = format!("{:?}", context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(format!("{:?}", context.store()), warm);
+        assert_eq!(
+            exact_signature_cache(context.store(), text),
+            Ok(Some(text_signature))
+        );
+        assert_eq!(
+            exact_type_cache(context.store(), text),
+            Ok(Some(text_result))
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn generic_source_new_access_errors_keep_the_real_error_signature() {
+        let parsed = parse_source_file(concat!(
+            "class Secret<T> { private constructor(value: T) {} } ",
+            "abstract class Abstract<T> {} ",
+            "const secret = new Secret<string>('kept'); ",
+            "const abstractValue = new Abstract<number>();",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(204_212);
+        let mut context = context(&parsed, file);
+        let secret = class_symbol(&parsed, file, &context, "Secret");
+        let abstract_owner = class_symbol(&parsed, file, &context, "Abstract");
+        let (secret_new, _) = variable_new(&parsed, file, "secret");
+        let (abstract_new, _) = variable_new(&parsed, file, "abstractValue");
+        let unknown_signature = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .unknown_signature;
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        context.check_source_file(file).unwrap();
+        let diagnostics = context.diagnostics().clone();
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2673, 2511]
+        );
+        assert_eq!(diagnostics.as_slice()[0].node, Some(secret_new));
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.arguments,
+            ["Secret<T>".to_owned()]
+        );
+        assert_eq!(diagnostics.as_slice()[1].node, Some(abstract_new));
+        assert!(diagnostics.as_slice()[1].diagnostic.arguments.is_empty());
+        for (owner, new) in [(secret, secret_new), (abstract_owner, abstract_new)] {
+            assert_eq!(
+                exact_signature_cache(context.store(), new),
+                Ok(Some(unknown_signature))
+            );
+            assert_eq!(exact_type_cache(context.store(), new), Ok(Some(error_type)));
+            let host = context.declared_type_host().unwrap();
+            let constructors = super::super::classes::completed_source_class_constructors(
+                context.store(),
+                &host,
+                owner,
+            )
+            .unwrap()
+            .unwrap();
+            let origin = constructors.members().shells().instance_type();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(origin).unwrap().data()
+            else {
+                panic!("the error must preserve its real class origin")
+            };
+            let TypeCacheState::Allocated(instantiations) =
+                &interface.reference.object.instantiations
+            else {
+                panic!("the class origin must retain its canonical self cache")
+            };
+            let formals = interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap();
+            assert_eq!(instantiations.len(), 1);
+            assert_eq!(instantiations.get(&type_list_key(formals)), Some(&origin));
+            let explicit = if owner == secret {
+                context.store().intrinsic_bootstrap().unwrap().string_type
+            } else {
+                context.store().intrinsic_bootstrap().unwrap().number_type
+            };
+            for callable in constructors.signatures() {
+                assert_eq!(
+                    context.store().cached_signature(
+                        callable.signature,
+                        type_list_key(&[explicit]),
+                        &[explicit]
+                    ),
+                    CachedSignatureLookup::Missing
+                );
+            }
+        }
+        assert_eq!(
+            context.get_return_type_of_signature(unknown_signature),
+            Ok(error_type)
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let plan = generic_new_plan_for_test(&context, &parsed, file, secret, secret_new);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(unknown_signature, Some(number))
+        );
+        let damaged = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                generic_new_error_signature_return_type(context.store(), unknown_signature),
+                Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+                    unknown_signature
+                )))
+            );
+            assert_eq!(
+                preflight_source_generic_class_new_with_context(
+                    context.store(),
+                    &host,
+                    &globals,
+                    options,
+                    &plan,
+                    None,
+                ),
+                Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    secret_new
+                )))
+            );
+            assert_eq!(format!("{:?}", context.store()), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(unknown_signature, Some(error_type))
+        );
+        context.recheck_source_file(file).unwrap();
+        let warm = format!("{:?}", context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(format!("{:?}", context.store()), warm);
+        assert_eq!(context.diagnostics(), &diagnostics);
+
+        let method_parsed = parse_source_file(concat!(
+            "class Secret<T> { private constructor(value: T) {} } ",
+            "class Caller { make(): unknown { return new Secret<number>(1); } }",
+        ));
+        assert!(method_parsed.diagnostics.is_empty());
+        let method_file = FileId::new(204_213);
+        let mut method_context = self::context(&method_parsed, method_file);
+        let method_new = method_parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    method_parsed.arena.id(),
+                    method_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        method_context.check_source_file(method_file).unwrap();
+        let method_diagnostics = method_context.diagnostics().clone();
+        let [diagnostic] = method_diagnostics.as_slice() else {
+            panic!("the real private access must report one constructor diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(method_new));
+        assert_eq!(diagnostic.diagnostic.code(), 2673);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Secret<T>".to_owned()]);
+        let bootstrap = method_context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            exact_signature_cache(method_context.store(), method_new),
+            Ok(Some(bootstrap.unknown_signature))
+        );
+        assert_eq!(
+            exact_type_cache(method_context.store(), method_new),
+            Ok(Some(bootstrap.error_type))
+        );
+        let method_warm = format!("{:?}", method_context.store());
+        for _ in 0..2 {
+            method_context.recheck_source_file(method_file).unwrap();
+            assert_eq!(format!("{:?}", method_context.store()), method_warm);
+            assert_eq!(method_context.diagnostics(), &method_diagnostics);
+        }
     }
 
     #[test]

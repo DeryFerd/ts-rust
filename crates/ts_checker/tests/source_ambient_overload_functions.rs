@@ -5,10 +5,27 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
-    SymbolNodeLinks, TypeData, UnsupportedSourceSyntax,
+    SignatureId, SymbolNodeLinks, TypeData, TypeId, UnsupportedSourceSyntax,
+    type_records::StructuredTypeData,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn checker_options() -> CanonicalCheckerOptions {
     CanonicalCheckerOptions {
@@ -124,6 +141,374 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
         .source_file(file)
         .and_then(|source| context.store().source_file_links(source))
         .is_some_and(|links| links.type_checked)
+}
+
+const ERASURE_PROVIDER: FileId = FileId::new(2_459);
+const ERASURE_CONSUMER: FileId = FileId::new(2_460);
+
+struct ErasureInputs {
+    provider: ParseResult,
+    consumer: ParseResult,
+}
+
+impl ErasureInputs {
+    fn new(source: &str) -> Self {
+        let boundary = source.find("type Actual =").expect("Actual alias boundary");
+        let (provider, consumer) = source.split_at(boundary);
+        let provider = parse_source_file(provider);
+        let consumer = parse_source_file(consumer);
+        assert!(provider.diagnostics.is_empty(), "{:?}", provider.diagnostics);
+        assert!(consumer.diagnostics.is_empty(), "{:?}", consumer.diagnostics);
+        Self { provider, consumer }
+    }
+
+    fn context(&self) -> CanonicalCheckerContext<'_> {
+        let files = [
+            (ERASURE_PROVIDER, &self.provider, "\"/project/erasure.d.ts\"", true),
+            (ERASURE_CONSUMER, &self.consumer, "\"/project/erasure.ts\"", false),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, declaration_file) in files {
+            binder.bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration_file,
+                    CanonicalModuleState::Script,
+                ),
+            ).unwrap();
+        }
+        for (file, parsed, _, _) in files {
+            binder.bind_typescript_declaration_slice(&parsed.arena, file).unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            files.into_iter().map(|(file, parsed, _, _)| (file, &parsed.arena)).collect(),
+            checker_options(),
+        ).unwrap()
+    }
+}
+
+fn erasure_alias(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed.arena.iter().find_map(|(_, record)| {
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else { return None };
+        let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data
+        else { return None };
+        (name.text == expected)
+            .then_some(NodeRef::new(parsed.arena.id(), file, alias.type_))
+    }).unwrap_or_else(|| panic!("missing alias {expected}"))
+}
+
+fn erasure_rows(context: &CanonicalCheckerContext<'_>, type_: TypeId) -> Vec<SignatureId> {
+    let data = structured_data(context.store().type_payload(type_).unwrap().data()).unwrap();
+    data.signatures.as_ref().unwrap()[..data.call_signature_count].to_vec()
+}
+
+fn erasure_shell(context: &CanonicalCheckerContext<'_>, original: SignatureId) -> SignatureId {
+    let store = context.store();
+    let original_record = store.signature(original).unwrap();
+    assert!(!original_record.type_parameters().is_empty());
+    let rows = store.signatures().filter_map(|(id, row)| {
+        (row.target() == Some(original)
+            && row.type_parameters().is_empty()
+            && row.mapper().is_some()).then_some(id)
+    }).collect::<Vec<_>>();
+    let [erased] = rows.as_slice() else {
+        panic!("one erased row must remain for {original:?}: {rows:?}")
+    };
+    let erased = *erased;
+    let row = store.signature(erased).unwrap();
+    assert_ne!(erased, original);
+    assert_eq!(row.declaration(), original_record.declaration());
+    assert_eq!(row.min_argument_count(), original_record.min_argument_count());
+    assert_eq!(row.has_rest_parameter(), original_record.has_rest_parameter());
+    let mapper = row.mapper().unwrap();
+    let bootstrap = store.intrinsic_bootstrap().unwrap();
+    for &formal in original_record.type_parameters() {
+        assert_eq!(store.map_type(mapper, formal), Some(bootstrap.any_type));
+    }
+    for concrete in [bootstrap.string_type, bootstrap.number_type, bootstrap.boolean_type] {
+        assert_eq!(store.map_type(mapper, concrete), Some(concrete));
+    }
+    erased
+}
+
+fn erasure_parameter(
+    context: &CanonicalCheckerContext<'_>,
+    signature: SignatureId,
+    index: usize,
+) -> Option<TypeId> {
+    let parameter = context.store().signature(signature).unwrap().parameters()[index];
+    context.store().value_symbol_links(parameter).and_then(|links| links.resolved_type)
+}
+
+fn erasure_field(context: &CanonicalCheckerContext<'_>, type_: TypeId, name: &str) -> TypeId {
+    let store = context.store();
+    let data = structured_data(store.type_payload(type_).unwrap().data()).unwrap();
+    let member = data.properties.as_ref().unwrap().iter().copied().find(|&member| {
+        store.symbol(member).unwrap().name().as_utf8() == Some(name)
+    }).unwrap_or_else(|| panic!("missing field {name}"));
+    store.value_symbol_links(member).and_then(|links| links.resolved_type).unwrap()
+}
+
+fn erasure_snapshot(
+    context: &CanonicalCheckerContext<'_>,
+    file: FileId,
+) -> impl std::fmt::Debug + PartialEq + use<> {
+    let store = context.store();
+    (
+        [store.type_len(), store.signature_len(), store.mapper_len(), store.symbol_len()],
+        context.diagnostics().clone(),
+        store.relation_state_snapshot(),
+        store.signatures().map(|(id, row)| (
+            id,
+            (row.flags(), row.min_argument_count(), row.resolved_min_argument_count(),
+                row.declaration(), row.type_parameters().to_vec(), row.target(),
+                row.mapper(), row.resolved_return_type(), row.resolved_type_predicate()),
+            (row.parameters().to_vec(), row.this_parameter(), row.isolated_signature_type()),
+        )).collect::<Vec<_>>(),
+        store.symbol_store().symbols().map(|(symbol, _)| {
+            (symbol, store.value_symbol_links(symbol).cloned())
+        }).collect::<Vec<_>>(),
+        [ERASURE_PROVIDER, file].into_iter().flat_map(|file| {
+            let arena = context.file(file).unwrap().0;
+            arena.iter().map(move |(id, _)| {
+                let node = NodeRef::new(arena.id(), file, id);
+                (node, store.node_links(node).cloned(), store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(), store.signature_links(node).cloned())
+            })
+        }).collect::<Vec<_>>(),
+    )
+}
+
+#[allow(clippy::too_many_lines)] // Keep cold order, identity, and replay together.
+fn check_erasure_relations<const N: usize>(
+    source: &str,
+    name: &str,
+    targets: [(&str, bool); N],
+    observe: impl Fn(&mut CanonicalCheckerContext<'_>, TypeId, &[NodeRef], [TypeId; N]),
+) {
+    let inputs = ErasureInputs::new(source);
+    let file = ERASURE_CONSUMER;
+    let declarations = function_declarations(&inputs.provider, ERASURE_PROVIDER, name);
+    assert_eq!(declarations.len(), 2);
+    let actual_node = erasure_alias(&inputs.consumer, file, "Actual");
+    let target_nodes = targets.map(|(name, _)| erasure_alias(&inputs.consumer, file, name));
+    for first in (0..N).map(Some).chain(std::iter::once(None)) {
+        let mut context = inputs.context();
+        if first.is_none() {
+            context.check_source_file(file).unwrap();
+            assert!(is_type_checked(&context, file));
+        }
+        assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+        let actual = context.get_type_from_type_node(actual_node).unwrap();
+        let types = target_nodes.map(|node| context.get_type_from_type_node(node).unwrap());
+        let owner = merged_symbol(&context, ERASURE_PROVIDER, declarations[0]);
+        assert_eq!(context.store().type_payload(actual).unwrap().symbol(), Some(owner));
+        if let Some(index) = first {
+            let data = structured_data(context.store().type_payload(actual).unwrap().data()).unwrap();
+            assert!(data.signatures.is_none());
+            assert!(!is_type_checked(&context, file));
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(targets[index].1));
+            assert!(!is_type_checked(&context, file));
+            assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+            assert!(context.diagnostics().is_empty());
+            assert!(context.store().type_resolution_is_empty());
+            let before = erasure_snapshot(&context, file);
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(targets[index].1));
+            assert_eq!(erasure_snapshot(&context, file), before);
+        }
+        for (index, (_, expected)) in targets.iter().enumerate() {
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(*expected));
+        }
+        let originals = declarations.iter().map(|&node| {
+            signature_for_declaration(&context, node)
+        }).collect::<Vec<_>>();
+        assert_eq!(erasure_rows(&context, actual), originals);
+        for (&declaration, &signature) in declarations.iter().zip(&originals) {
+            let row = context.store().signature(signature).unwrap();
+            assert_eq!(row.declaration(), Some(declaration));
+            assert_eq!(row.target(), None);
+            assert_eq!(row.mapper(), None);
+        }
+        observe(&mut context, actual, &declarations, types);
+        assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+        if first.is_some() {
+            assert!(!is_type_checked(&context, file));
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().type_resolution_is_empty());
+        context.check_source_file(file).unwrap();
+        assert!(is_type_checked(&context, file));
+        assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+        for (index, (_, expected)) in targets.iter().enumerate() {
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(*expected));
+        }
+        observe(&mut context, actual, &declarations, types);
+        assert_eq!(context.get_type_from_type_node(actual_node), Ok(actual));
+        assert_eq!(erasure_rows(&context, actual), originals);
+        assert!(context.diagnostics().is_empty());
+        let before = erasure_snapshot(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert!(is_type_checked(&context, file));
+            assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+            assert_eq!(context.get_type_from_type_node(actual_node), Ok(actual));
+            assert_eq!(target_nodes.map(|node| context.get_type_from_type_node(node).unwrap()), types);
+            assert_eq!(erasure_rows(&context, actual), originals);
+            for (index, (_, expected)) in targets.iter().enumerate() {
+                assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(*expected));
+            }
+            observe(&mut context, actual, &declarations, types);
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(erasure_snapshot(&context, file), before);
+        }
+    }
+}
+
+#[test]
+fn source_generic_overload_erasure_keeps_concrete_returns_and_namespace_properties() {
+    let source = concat!(
+        "declare function select<T extends string>(value: T): { item: T; fixed: number };\n",
+        "declare function select(value: number, required: boolean): boolean;\n",
+        "declare namespace select { const label: string; }\n",
+        "type Actual = typeof select;\n",
+        "type Good = { (value: boolean): { item: boolean; fixed: number }; label: string };\n",
+        "type WrongReturn = { (value: boolean): { item: boolean; fixed: string }; label: string };\n",
+        "type WrongProperty = { (value: boolean): { item: boolean; fixed: number }; label: number };\n",
+    );
+    check_erasure_relations(source, "select",
+        [("Good", true), ("WrongReturn", false), ("WrongProperty", false)],
+        |context, actual, declarations, types| {
+            let original = signature_for_declaration(context, declarations[0]);
+            let erased = erasure_shell(context, original);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (any, number) = (bootstrap.any_type, bootstrap.number_type);
+            assert_eq!(erasure_parameter(context, erased, 0), Some(any));
+            let original_row = context.store().signature(original).unwrap();
+            let formal = original_row.type_parameters()[0];
+            let template = original_row.resolved_return_type().unwrap();
+            let result = context.store().signature(erased).unwrap().resolved_return_type().unwrap();
+            assert_eq!(erasure_field(context, template, "item"), formal);
+            assert_eq!(erasure_field(context, result, "item"), any);
+            assert_eq!(erasure_field(context, result, "fixed"), number);
+            assert_eq!(context.is_type_comparable_to(actual, types[0]), Ok(true));
+            assert_eq!(context.is_type_comparable_to(actual, types[1]), Ok(false));
+        });
+}
+
+#[test]
+fn target_generic_overload_erasure_keeps_the_concrete_return_field() {
+    let source = concat!(
+        "declare function receive(value: boolean): { item: number; fixed: string };\n",
+        "declare function receive(value: number, required: boolean): boolean;\n",
+        "type Actual = typeof receive;\n",
+        "type Good = <U extends string>(value: U) => { item: U; fixed: string };\n",
+        "type Wrong = <U extends string>(value: U) => { item: U; fixed: number };\n",
+    );
+    check_erasure_relations(source, "receive", [("Good", true), ("Wrong", false)],
+        |context, _, _, types| {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (any, string, number) =
+                (bootstrap.any_type, bootstrap.string_type, bootstrap.number_type);
+            for (index, expected) in [string, number].into_iter().enumerate() {
+                let rows = erasure_rows(context, types[index]);
+                let [original] = rows.as_slice() else { panic!("one generic target row") };
+                let erased = erasure_shell(context, *original);
+                assert_eq!(erasure_parameter(context, erased, 0), Some(any));
+                let result = context.store().signature(erased).unwrap().resolved_return_type().unwrap();
+                assert_eq!(erasure_field(context, result, "fixed"), expected);
+                if index == 0 {
+                    assert_eq!(erasure_field(context, result, "item"), any);
+                }
+                assert_eq!(erasure_rows(context, types[index]), rows);
+            }
+        });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the reached and skipped edge sequence visible.
+fn erased_overload_returns_and_unreached_parameters_stay_lazy() {
+    let source = concat!(
+        "declare function lazy<T extends string>(value: T): { item: T; fixed: number };\n",
+        "declare function lazy<U>(value: U, required: boolean): U;\n",
+        "type Actual = typeof lazy;\n",
+        "type Discard = (value: boolean) => void;\n",
+        "type Read = (value: boolean) => { item: boolean; fixed: number };\n",
+        "type Wrong = (value: boolean) => { item: boolean; fixed: string };\n",
+    );
+    let inputs = ErasureInputs::new(source);
+    let file = ERASURE_CONSUMER;
+    let declarations = function_declarations(&inputs.provider, ERASURE_PROVIDER, "lazy");
+    assert_eq!(declarations.len(), 2);
+    let return_nodes = declarations.iter().map(|declaration| {
+        let NodeData::FunctionDeclaration(function) =
+            &inputs.provider.arena.get(declaration.node).unwrap().data else { unreachable!() };
+        NodeRef::new(inputs.provider.arena.id(), ERASURE_PROVIDER, function.type_.unwrap())
+    }).collect::<Vec<_>>();
+    let nodes = ["Actual", "Discard", "Read", "Wrong"]
+        .map(|name| erasure_alias(&inputs.consumer, file, name));
+    let mut context = inputs.context();
+    let [actual, discard, read, wrong] = nodes
+        .map(|node| context.get_type_from_type_node(node).unwrap());
+    assert_eq!(context.is_type_assignable_to(actual, discard), Ok(true));
+    let originals = declarations.iter().map(|&node| signature_for_declaration(&context, node))
+        .collect::<Vec<_>>();
+    let erased = erasure_shell(&context, originals[0]);
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    let (any, number) = (bootstrap.any_type, bootstrap.number_type);
+    assert_eq!(erasure_parameter(&context, erased, 0), Some(any));
+    for original in &originals {
+        assert_eq!(context.store().signature(*original).unwrap().resolved_return_type(), None);
+    }
+    assert_eq!(context.store().signature(erased).unwrap().resolved_return_type(), None);
+    assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+    for &node in &return_nodes {
+        assert!(context.store().type_node_links(node)
+            .is_none_or(|links| links.resolved_type.is_none()));
+    }
+    assert!(!is_type_checked(&context, file));
+    assert!(context.diagnostics().is_empty());
+    assert!(context.store().type_resolution_is_empty());
+    let before = erasure_snapshot(&context, file);
+    assert_eq!(context.is_type_assignable_to(actual, discard), Ok(true));
+    assert_eq!(erasure_snapshot(&context, file), before);
+
+    assert_eq!(context.is_type_assignable_to(actual, read), Ok(true));
+    let first = context.store().signature(originals[0]).unwrap();
+    let formal = first.type_parameters()[0];
+    let template = first.resolved_return_type().unwrap();
+    let result = context.store().signature(erased).unwrap().resolved_return_type().unwrap();
+    assert_eq!(erasure_field(&context, template, "item"), formal);
+    assert_eq!(erasure_field(&context, result, "item"), any);
+    assert_eq!(erasure_field(&context, result, "fixed"), number);
+    assert_eq!(context.store().type_node_links(return_nodes[0]).unwrap().resolved_type, Some(template));
+    assert_eq!(context.store().signature(originals[1]).unwrap().resolved_return_type(), None);
+    assert!(context.store().type_node_links(return_nodes[1])
+        .is_none_or(|links| links.resolved_type.is_none()));
+
+    assert_eq!(context.is_type_assignable_to(actual, wrong), Ok(false));
+    let later = erasure_shell(&context, originals[1]);
+    assert_eq!(erasure_parameter(&context, later, 0), None);
+    assert_eq!(context.store().signature(later).unwrap().resolved_return_type(), None);
+    assert_eq!(context.store().signature(originals[1]).unwrap().resolved_return_type(), None);
+    assert!(context.store().type_node_links(return_nodes[1])
+        .is_none_or(|links| links.resolved_type.is_none()));
+    assert_eq!(erasure_rows(&context, actual), originals);
+    assert!(!is_type_checked(&context, ERASURE_PROVIDER));
+    assert!(!is_type_checked(&context, file));
+    assert!(context.diagnostics().is_empty());
+    assert!(context.store().type_resolution_is_empty());
+    let before = erasure_snapshot(&context, file);
+    assert_eq!(context.is_type_assignable_to(actual, read), Ok(true));
+    assert_eq!(context.is_type_assignable_to(actual, wrong), Ok(false));
+    assert_eq!(erasure_snapshot(&context, file), before);
+    check_erasure_relations(source, "lazy",
+        [("Discard", true), ("Read", true), ("Wrong", false)], |_, _, _, _| {});
 }
 
 #[test]
@@ -411,7 +796,9 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
 }
 
 #[test]
-fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
+#[allow(clippy::too_many_lines)]
+fn failed_multi_overloads_keep_marked_recovery_out_of_public_candidates() {
+    use ts_checker::semantic::signatures::SignatureFlags;
     let parsed = parse_source_file(concat!(
         "declare function parse(value: number, radix: number): string;\n",
         "declare function parse(value: string): number;\n",
@@ -427,7 +814,7 @@ fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
         panic!("fixture must retain one successful and one failed call")
     };
 
-    assert!(context.check_source_file(file).is_err());
+    context.check_source_file(file).unwrap();
 
     assert!(declarations.iter().all(|declaration| {
         context
@@ -437,10 +824,112 @@ fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
     }));
     assert!(context.store().signature_links(*good).is_some());
     assert!(context.store().type_node_links(*good).is_some());
-    assert!(context.store().signature_links(*bad).is_none());
-    assert!(context.store().type_node_links(*bad).is_none());
-    assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
+    let visible = declarations
+        .iter()
+        .map(|declaration| signature_for_declaration(&context, *declaration))
+        .collect::<Vec<_>>();
+    let recovered = signature_for_declaration(&context, *bad);
+    assert!(!visible.contains(&recovered));
+    let record = context.store().signature(recovered).unwrap();
+    assert_eq!(
+        record.flags(),
+        SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+    );
+    assert_eq!(record.declaration(), Some(declarations[0]));
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.parameters().len(), 2);
+    let source_parameters = context.store().signature(visible[0]).unwrap().parameters();
+    for (parameter, source) in record.parameters().iter().zip(source_parameters) {
+        assert_ne!(parameter, source);
+        let links = context.store().value_symbol_links(*parameter).unwrap();
+        assert_eq!(links.target, Some(*source));
+        assert_eq!(
+            context.store().symbol(*parameter).unwrap().declarations(),
+            context.store().symbol(*source).unwrap().declarations()
+        );
+    }
+    let parameter_types = record
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            let type_ = context
+                .store()
+                .value_symbol_links(*parameter)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            context.type_to_string(type_).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameter_types, ["string | number", "number"]);
+    let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+    assert_eq!(record.resolved_return_type(), Some(never));
+    assert_eq!(
+        context.store().type_node_links(*bad).unwrap().resolved_type,
+        Some(never)
+    );
+    let callable = context
+        .get_type_at_location(call_callee(&parsed, file, *bad))
+        .unwrap();
+    let members = match context.store().type_payload(callable).unwrap().data() {
+        data @ TypeData::Object(_) => structured_data(data).unwrap(),
+        _ => panic!("expected the source callable's structured type"),
+    };
+    assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));
+    assert_eq!(members.call_signature_count, visible.len());
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("only the one matching arity reports an argument error")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2345);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Argument of type 'boolean' is not assignable to parameter of type 'string'."
+    );
+    let argument = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::TrueKeyword).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    assert_eq!(diagnostic.node, Some(argument));
+    assert!(diagnostic.range_override.is_none());
+    assert!(diagnostic.related_information.is_empty());
+    assert!(is_type_checked(&context, file));
+    let cold = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().mapper_len(),
+        context.store().symbol_len(),
+        context.store().signature_links(*good).cloned(),
+        context.store().type_node_links(*good).cloned(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().signature_links(*good).cloned(),
+            context.store().type_node_links(*good).cloned(),
+            context.diagnostics().clone()
+        ),
+        cold
+    );
+    assert_eq!(signature_for_declaration(&context, *bad), recovered);
+    assert_eq!(
+        declarations
+            .iter()
+            .map(|declaration| signature_for_declaration(&context, *declaration))
+            .collect::<Vec<_>>(),
+        visible
+    );
 }
 
 #[test]

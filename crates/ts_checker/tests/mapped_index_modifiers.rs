@@ -595,7 +595,12 @@ fn deep_mapped_templates_stay_lazy_before_value_demand() {
             panic!("the alias must keep a lazy mapped shell")
         };
         assert_eq!(result_type.object.target, Some(original));
-        assert_eq!(result_type.template_type, original_type.template_type);
+        if tail.is_empty() {
+            // The original target retains the input while Result stays deferred.
+            assert!(result_type.template_type.is_none());
+        } else {
+            assert_eq!(result_type.template_type, original_type.template_type);
+        }
         for property in result_type
             .object
             .structured
@@ -820,4 +825,132 @@ fn assert_recovered_wrapper_graph(context: &CanonicalCheckerContext<'_>, mut res
     }
     assert_eq!(depth, 100);
     assert_eq!(result, store.intrinsic_bootstrap().unwrap().error_type);
+}
+
+#[test]
+fn mapped_value_recovery_keeps_native_assignment_errors() {
+    fn recovered_wrapper_ids(
+        parsed: &ParseResult,
+        checker: &CanonicalCheckerContext<'_>,
+    ) -> Vec<TypeId> {
+        let store = checker.store();
+        let wrapper_declaration = parsed.arena.iter().find_map(|(node, record)| {
+            let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                return None;
+            };
+            (name.text == "Wrapper")
+                .then_some(NodeRef::new(parsed.arena.id(), FILE, node))
+        }).unwrap();
+        let wrapper_symbol = checker.file(FILE).unwrap().1.symbol(wrapper_declaration).unwrap();
+        let wrapper_target = store.declared_type_links(wrapper_symbol).unwrap().declared_type.unwrap();
+        let mapped = alias_type(parsed, checker, "Mapped");
+        let TypeData::Mapped(owner) = store.type_payload(mapped).unwrap().data() else {
+            panic!("the recovered property must keep its mapped owner");
+        };
+        let symbol = store.symbol_table(owner.object.structured.members.unwrap())
+            .unwrap().get_source("value").unwrap();
+        assert!(owner.object.structured.properties.as_deref().unwrap().contains(&symbol));
+        let mut value = store.value_symbol_links(symbol).unwrap().resolved_type.unwrap();
+        let mut ids = Vec::new();
+        while let TypeData::TypeReference(reference) = store.type_payload(value).unwrap().data() {
+            assert!(ids.len() < 128, "the wrapper walk must remain bounded");
+            assert!(!ids.contains(&value), "the recovered graph must have no cycle");
+            assert_eq!(reference.object.target, Some(wrapper_target));
+            let [argument] = reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("each canonical Wrapper must keep one argument");
+            };
+            ids.push(value);
+            value = *argument;
+        }
+        assert_eq!(ids.len(), 100);
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        assert_eq!(value, bootstrap.error_type);
+        assert_ne!(value, bootstrap.any_type);
+        ids.push(value);
+        ids
+    }
+
+    type ExpectedDiagnostic<'a> = (u32, u32, u32, &'a str, &'a [&'a str], &'a [&'a str]);
+    let cases: &[(&str, &str, &[ExpectedDiagnostic<'_>])] = &[
+        (
+            r#"nonhomomorphic-same-assignment"#,
+            r#"interface Wrapper<Value> { value: Value } type Mapped = { [Key in 'value']: Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Key>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> }; declare const source: Mapped; const target: { value: number } = source;"#,
+            &[
+                (1028, 6, 2322, r#"Type 'Mapped' is not assignable to type '{ value: number; }'.
+  Types of property 'value' are incompatible.
+    Type 'Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapp...' is not assignable to type 'number'."#, &[r#"Mapped"#, r#"{ value: number; }"#], &[r#"  Types of property 'value' are incompatible."#, r#"    Type 'Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapp...' is not assignable to type 'number'."#]),
+                (1028, 6, 2589, r#"Type instantiation is excessively deep and possibly infinite."#, &[], &[]),
+            ],
+        ),
+        (
+            r#"nonhomomorphic-later-mismatch"#,
+            r#"interface Wrapper<Value> { value: Value } type Mapped = { [Key in 'value']: Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Key>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> }; declare const source: Mapped; const target: { value: Wrapper<unknown> } = source; const mismatch: number = 'text';"#,
+            &[
+                (1028, 6, 2589, r#"Type instantiation is excessively deep and possibly infinite."#, &[], &[]),
+                (1080, 8, 2322, r#"Type 'string' is not assignable to type 'number'."#, &[r#"string"#, r#"number"#], &[]),
+            ],
+        ),
+        (
+            r#"homomorphic-same-assignment"#,
+            r#"interface Wrapper<Value> { value: Value } interface Shape { value: number } type Deep<Model> = { [Key in keyof Model]: Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Model[Key]>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> }; type Mapped = Deep<Shape>; declare const source: Mapped; const target: { value: number } = source;"#,
+            &[
+                (1105, 6, 2322, r#"Type 'Deep<Shape>' is not assignable to type '{ value: number; }'.
+  Types of property 'value' are incompatible.
+    Type 'Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapp...' is not assignable to type 'number'."#, &[r#"Deep<Shape>"#, r#"{ value: number; }"#], &[r#"  Types of property 'value' are incompatible."#, r#"    Type 'Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapp...' is not assignable to type 'number'."#]),
+                (1105, 6, 2589, r#"Type instantiation is excessively deep and possibly infinite."#, &[], &[]),
+            ],
+        ),
+        (
+            r#"homomorphic-later-mismatch"#,
+            r#"interface Wrapper<Value> { value: Value } interface Shape { value: number } type Deep<Model> = { [Key in keyof Model]: Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Wrapper<Model[Key]>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> }; type Mapped = Deep<Shape>; declare const source: Mapped; const target: { value: Wrapper<unknown> } = source; const mismatch: number = 'text';"#,
+            &[
+                (1105, 6, 2589, r#"Type instantiation is excessively deep and possibly infinite."#, &[], &[]),
+                (1157, 8, 2322, r#"Type 'string' is not assignable to type 'number'."#, &[r#"string"#, r#"number"#], &[]),
+            ],
+        ),
+    ];
+    for &(label, source, expected) in cases {
+        let parsed = parse_source_file(source);
+        let mut checker = context(&parsed, true, false);
+        checker.check_source_file(FILE).unwrap();
+        let mut actual = checker.diagnostics().as_slice().iter().map(|entry| {
+            let node = entry.node.expect("each source error must keep its real anchor");
+            assert_eq!(node.file, FILE);
+            assert_eq!(node.arena, parsed.arena.id());
+            let range = entry.range_override.map(|range| range.range())
+                .unwrap_or_else(|| parsed.arena.get(node.node).unwrap().range);
+            assert_eq!(entry.diagnostic.category(), ts_diagnostics::Category::Error);
+            assert!(entry.related_information.is_empty());
+            (
+                range.start.get(),
+                range.end.get() - range.start.get(),
+                entry.diagnostic.code(),
+                entry.diagnostic.render().unwrap(),
+                entry.diagnostic.arguments.clone(),
+                entry.diagnostic.details.clone(),
+            )
+        }).collect::<Vec<_>>();
+        actual.sort_by_key(|entry| (entry.0, entry.1, entry.2));
+        assert_eq!(actual.len(), expected.len(), "{label}");
+        for (actual, &(start, length, code, message, arguments, details)) in
+            actual.iter().zip(expected)
+        {
+            assert_eq!((actual.0, actual.1, actual.2), (start, length, code), "{label}");
+            assert_eq!(actual.3, message, "{label}");
+            assert_eq!(actual.4, arguments.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>(), "{label}");
+            assert_eq!(actual.5, details.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>(), "{label}");
+        }
+        let wrapper_ids = recovered_wrapper_ids(&parsed, &checker);
+        let warm_counts = counts(&checker);
+        let diagnostics = checker.diagnostics().clone();
+        for _ in 0..2 {
+            checker.recheck_source_file(FILE).unwrap();
+            assert_eq!(counts(&checker), warm_counts, "{label}");
+            assert_eq!(checker.diagnostics(), &diagnostics, "{label}");
+            assert_eq!(recovered_wrapper_ids(&parsed, &checker), wrapper_ids, "{label}");
+        }
+    }
 }

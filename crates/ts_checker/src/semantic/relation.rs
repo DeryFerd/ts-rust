@@ -6,9 +6,9 @@
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Relation-key construction is
 //! deliberately capability-gated: the canonical graph can produce exact
 //! simple keys and fully resolved generic keys whenever the depth-limited
-//! encoding does not need a constraint query (notably `ignoreConstraints`),
-//! but it cannot yet distinguish an unresolved type-parameter constraint from
-//! an absent one. That case returns an error before a cache key is exposed.
+//! encoding does not need a constraint query (notably `ignoreConstraints`).
+//! Source-class proofs can also establish an absent constraint on an original
+//! formal. Other unresolved constraints return an error before a key is exposed.
 
 use std::{collections::HashMap, ops};
 
@@ -18,6 +18,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     ids::TypeId,
+    mapper::CanonicalTypeMapperStore,
     store::SemanticStore,
     type_records::{CacheHashKey, TypeData, TypeRecord, TypeReferenceData},
     types::{ObjectFlags, TypeFlags},
@@ -344,6 +345,30 @@ fn type_reference_data(record: &TypeRecord) -> Option<&TypeReferenceData> {
         TypeData::Interface(data) => Some(&data.reference),
         TypeData::Tuple(data) => Some(&data.interface.reference),
         _ => None,
+    }
+}
+
+impl CanonicalTypeMapperStore {
+    /// Uses the current source-class proof for original unconstrained formals.
+    pub(super) fn relation_key_with_source_class_parameters(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+        is_identity: bool,
+        ignore_constraints: bool,
+    ) -> Result<BuiltRelationKey, RelationKeyUnavailable> {
+        self.relation_key_with_constraint_query(
+            source,
+            target,
+            intersection_state,
+            is_identity,
+            ignore_constraints,
+            |parameter| {
+                super::classes::source_class_unconstrained_type_parameter(self, parameter)
+                    .then_some(TypeParameterConstraintState::Unconstrained)
+            },
+        )
     }
 }
 

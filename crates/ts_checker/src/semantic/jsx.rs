@@ -13098,14 +13098,15 @@ mod runtime_tests {
         let react_bound = files.remove(&react_file).unwrap();
         let consumer_bound = files.remove(&consumer_file).unwrap();
         let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
-        for (parsed, file) in [
-            (&dom, dom_file),
-            (&react, react_file),
-            (&consumer, consumer_file),
+        for (parsed, file, bound) in [
+            (&dom, dom_file, &dom_bound),
+            (&react, react_file, &react_bound),
+            (&consumer, consumer_file, &consumer_bound),
         ] {
-            store
+            let source = store
                 .register_source_file(&parsed.arena, parsed.source_file, file)
                 .unwrap();
+            assert!(store.register_source_file_facts(source, bound.source_facts().unwrap()));
         }
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())

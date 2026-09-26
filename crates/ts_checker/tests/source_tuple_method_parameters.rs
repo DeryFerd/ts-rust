@@ -8,10 +8,27 @@ use ts_checker::semantic::{
     IntrinsicBootstrapOptions, SignatureId, SourceCheckError, TypeData, TypeId,
     UnsupportedSourceSyntax,
     signatures::{ElementFlags, SignatureFlags},
+    type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
 const FILE: FileId = FileId::new(0);
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
@@ -408,19 +425,178 @@ fn tuple_methods_compare_class_and_interface_members_without_implements() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep both method ownership proofs and replay with the unchanged source.
+fn tuple_method_implements_keeps_real_signatures_and_canonical_parameter() {
+    let parsed = parse_source_file(concat!(
+        "interface Shape { take(pair: [number, string]): void; } ",
+        "class Receiver implements Shape { take(pair: [number, string]): void {} }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let classes = nodes(&parsed, SyntaxKind::ClassDeclaration);
+    let interfaces = nodes(&parsed, SyntaxKind::InterfaceDeclaration);
+    let required_methods = nodes(&parsed, SyntaxKind::MethodSignature);
+    let annotations = nodes(&parsed, SyntaxKind::TupleType);
+    assert_eq!(classes.len(), 1);
+    assert_eq!(interfaces.len(), 1);
+    assert_eq!(required_methods.len(), 1);
+    assert_eq!(annotations.len(), 2);
+    let method = method(&parsed, "take");
+    let mut context = context(&parsed);
+    let owner = symbol(&context, classes[0]);
+    let contract = symbol(&context, interfaces[0]);
+    let member = symbol(&context, method.declaration);
+    let required = symbol(&context, required_methods[0]);
+    assert_ne!(member, required);
+    assert!(context.store().declared_type_links(owner).is_none());
+    assert!(context.store().value_symbol_links(owner).is_none());
+    let cold = counts(&context);
+
+    context.check_source_file(FILE).unwrap();
+
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    let identities = tuple_parameter(&mut context, &method);
+    let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+    let shape = context.get_declared_type_of_symbol(contract).unwrap();
+    assert_ne!(receiver, shape);
+    for (type_, owner, member) in [(receiver, owner, member), (shape, contract, required)] {
+        let record = context.store().type_payload(type_).unwrap();
+        assert_eq!(record.symbol(), Some(owner));
+        assert_eq!(
+            structured_data(record.data())
+                .unwrap()
+                .properties
+                .as_deref(),
+            Some(&[member][..]),
+        );
+        let symbol = context.store().symbol(member).unwrap();
+        assert_eq!(symbol.parent(), Some(owner));
+        let members = context.store().symbol(owner).unwrap().members().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol_table(members)
+                .unwrap()
+                .get(symbol.name()),
+            Some(member),
+        );
+    }
+    let required_signature = context
+        .store()
+        .signature_links(required_methods[0])
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    assert_ne!(required_signature, identities.0);
+    let signature = context.store().signature(required_signature).unwrap();
+    assert_eq!(signature.declaration(), Some(required_methods[0]));
+    assert_eq!(signature.flags(), SignatureFlags::NONE);
+    assert_eq!(signature.min_argument_count(), 1);
+    assert!(signature.type_parameters().is_empty());
+    let NodeData::MethodSignatureDeclaration(required_method) =
+        &parsed.arena.get(required_methods[0].node).unwrap().data
+    else {
+        panic!("the interface retains its method declaration")
+    };
+    let [parameter] = required_method.parameters.nodes.as_slice() else {
+        panic!("the interface method keeps its one source parameter")
+    };
+    let parameter = NodeRef::new(parsed.arena.id(), FILE, *parameter);
+    let parameter_symbol = symbol(&context, parameter);
+    assert_eq!(signature.parameters(), &[parameter_symbol]);
+    assert_eq!(
+        context
+            .store()
+            .symbol(parameter_symbol)
+            .unwrap()
+            .declarations(),
+        Some(&[parameter][..])
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .resolved_type,
+        Some(identities.1),
+    );
+    for annotation in &annotations {
+        assert_eq!(
+            context.get_type_from_type_node(*annotation).unwrap(),
+            identities.1
+        );
+    }
+    let void_type = context.store().intrinsic_bootstrap().unwrap().void_type;
+    assert_eq!(
+        context
+            .get_return_type_of_signature(required_signature)
+            .unwrap(),
+        void_type
+    );
+    assert_eq!(
+        context.get_return_type_of_signature(identities.0).unwrap(),
+        void_type
+    );
+    assert!(context.is_type_assignable_to(receiver, shape).unwrap());
+    assert!(counts(&context).0 > cold.0);
+    assert!(counts(&context).2 > cold.2);
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        (
+            counts(context),
+            context.diagnostics().clone(),
+            [owner, contract, member, required].map(|symbol| {
+                (
+                    context.store().declared_type_links(symbol).cloned(),
+                    context.store().value_symbol_links(symbol).cloned(),
+                )
+            }),
+            [method.declaration, required_methods[0]]
+                .map(|node| context.store().signature_links(node).cloned()),
+        )
+    };
+    let warm = snapshot(&context);
+    for _ in 0..2 {
+        context.check_source_file(FILE).unwrap();
+        context.recheck_source_file(FILE).unwrap();
+        assert_eq!(
+            context.get_declared_type_of_symbol(owner).unwrap(),
+            receiver
+        );
+        assert_eq!(
+            context.get_declared_type_of_symbol(contract).unwrap(),
+            shape
+        );
+        assert_eq!(tuple_parameter(&mut context, &method), identities);
+        for annotation in &annotations {
+            assert_eq!(
+                context.get_type_at_location(*annotation).unwrap(),
+                identities.1
+            );
+        }
+        assert_eq!(
+            context
+                .get_return_type_of_signature(required_signature)
+                .unwrap(),
+            void_type
+        );
+        assert!(context.is_type_assignable_to(receiver, shape).unwrap());
+        assert_eq!(snapshot(&context), warm);
+    }
+}
+
+#[test]
 fn later_tuple_method_forms_keep_explicit_class_boundaries() {
-    // The upstream fixture needs overloads, implements, and a tuple-union rest parameter.
-    // Generic methods are also outside this slice.
+    // Ambient overloads, tuple-union rest parameters, and generic methods remain outside this slice.
     let cases = [
         "class GenericMethod { take<T>(pair: [T, string]): void {} }",
         concat!(
             "declare class Overloaded { ",
             "take(pair: [number, string]): void; ",
             "take(pair: [string, number]): void; }",
-        ),
-        concat!(
-            "interface Shape { take(pair: [number, string]): void; } ",
-            "class Receiver implements Shape { take(pair: [number, string]): void {} }",
         ),
         "declare class RestUnion { take(...args: [number] | [number, string]): void; }",
     ];

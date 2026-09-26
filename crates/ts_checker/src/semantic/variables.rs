@@ -68,7 +68,7 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) value_symbol: SemanticSymbolId,
 }
 
-/// One authenticated global read backed by an ambient declaration in another script.
+/// One authenticated global read backed by an ambient declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCrossFileGlobalRead {
     pub(super) type_node: NodeRef,
@@ -76,6 +76,7 @@ pub(super) struct PlannedCrossFileGlobalRead {
 }
 
 /// One computed object binding whose symbol belongs to the binding element.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedComputedBindingElement {
     pub(super) declaration: NodeRef,
@@ -105,6 +106,7 @@ pub(super) struct PlannedObjectBindingElement {
     pub(super) initializer: Option<NodeRef>,
     pub(super) rest: bool,
     pub(super) excluded_properties: Vec<String>,
+    pub(super) excluded_computed_keys: Vec<NodeRef>,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -389,6 +391,7 @@ fn plan_variable_declaration(
 }
 
 /// Proves one top-level `{ [key]: name }` binding without publishing its type.
+#[cfg(test)]
 pub(super) fn plan_top_level_computed_binding_element(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -603,6 +606,210 @@ pub(super) fn plan_top_level_object_binding_elements(
     )
 }
 
+/// Proves flat const bindings against the callable's real lexical scope.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Validates one scoped binding declaration.
+pub(super) fn plan_callable_object_binding_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<(VariableBindingKind, Vec<PlannedObjectBindingElement>), VariablePlanError> {
+    let (binding, pattern) = plan_callable_binding_declaration(
+        arena, bound, store, declaration, callable, statement_parent, block_scope,
+    )?;
+    let elements = plan_object_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        false,
+        ObjectBindingScope {
+            statement_parent,
+            container: callable,
+            block_scope,
+        },
+    )?;
+    if elements.is_empty()
+        || elements.iter().any(|element| {
+            element.initializer.is_some()
+                || element.computed_key.is_some()
+                || !element.parent_properties.is_empty()
+        })
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    Ok((binding, elements))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn plan_callable_binding_declaration(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<(VariableBindingKind, NodeRef), VariablePlanError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || [declaration, callable, statement_parent, block_scope]
+            .iter()
+            .any(|node| !node.is_for(arena.id(), bound.file_id()))
+        || !matches!(
+            arena.get(callable.node).map(|node| node.kind),
+            Some(
+                SyntaxKind::ArrowFunction
+                    | SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::FunctionExpression
+            )
+        )
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+    let record = arena
+        .get(declaration.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ));
+    };
+    let list = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let list_record = arena
+        .get(list.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let statement = list_record
+        .parent
+        .map(|node| NodeRef::new(list.arena, list.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let statement_record = binding_child_node(arena, store, statement, statement_parent)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(statement).into());
+    };
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(list).into());
+    };
+    let binding = match list_record.flags.0 {
+        flags if flags == VariableBindingKind::Const.declaration_flags() => {
+            VariableBindingKind::Const
+        }
+        flags if flags == VariableBindingKind::Let.declaration_flags() => VariableBindingKind::Let,
+        _ => {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(declaration),
+            ));
+        }
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.modifiers.is_some()
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_data.declarations.nodes.as_slice() != [declaration.node]
+        || list_data.declarations.range != list_record.range
+        || list_data.declarations.has_trailing_comma
+        || list_data.facts != 0
+        || variable.type_.is_some()
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ));
+    }
+    let initializer = variable
+        .initializer
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ))?;
+    let initializer_record = binding_child_node(arena, store, initializer, declaration)?;
+    let pattern = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let pattern_record = binding_child_node(arena, store, pattern, declaration)?;
+    if pattern_record.range.end > initializer_record.range.start
+        || bound.container(declaration) != Some(callable)
+        || bound.block_scope_container(declaration) != Some(block_scope)
+        || bound.container(initializer) != Some(callable)
+        || bound.block_scope_container(initializer) != Some(block_scope)
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+    Ok((binding, pattern))
+}
+
+/// Reuses the scoped binding proof for a write to one actual binding element.
+pub(super) fn plan_callable_object_binding_element(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    element: NodeRef,
+    callable: NodeRef,
+) -> Result<(VariableBindingKind, PlannedObjectBindingElement), VariablePlanError> {
+    let invalid = || VariableInvariant::InvalidBindingPattern(element);
+    if !element.is_for(arena.id(), bound.file_id())
+        || bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(element.node).ok_or_else(invalid)?;
+    let NodeData::BindingElement(binding) = &record.data else {
+        return Err(invalid().into());
+    };
+    let reference = |node| NodeRef::new(element.arena, element.file, node);
+    let pattern = reference(record.parent.ok_or_else(invalid)?);
+    let pattern_record = arena.get(pattern.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::BindingElement
+        || pattern_record.kind != SyntaxKind::ObjectBindingPattern
+    {
+        return Err(invalid().into());
+    }
+    let declaration = reference(pattern_record.parent.ok_or_else(invalid)?);
+    let list = arena
+        .get(declaration.node)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let statement = arena
+        .get(list)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let parent = arena
+        .get(statement)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    let (kind, elements) = plan_callable_object_binding_elements(
+        arena,
+        bound,
+        store,
+        declaration,
+        callable,
+        reference(parent),
+        scope,
+    )?;
+    let element = elements
+        .into_iter()
+        .find(|planned| {
+            planned.element == element
+                && Some(planned.name.node) == binding.name
+                && bound.symbol(element) == Some(planned.symbol)
+        })
+        .ok_or_else(invalid)?;
+    Ok((kind, element))
+}
+
 pub(super) fn plan_class_object_binding_elements(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -660,14 +867,48 @@ pub(super) fn plan_class_object_binding_elements(
     )
 }
 
-/// Proves flat object bindings on a nongeneric function's annotated parameter.
-/// Named annotations need the callable planner's separate target and type proof.
+/// Proves flat object bindings on a nongeneric function or contextual arrow.
+/// The caller proves the parameter's annotated or contextual parent type.
 pub(super) fn plan_function_object_parameter_bindings(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     function: NodeRef,
     parameter: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false, false)
+}
+
+/// Proves generic function bindings whose annotations use the source type query.
+pub(super) fn plan_generic_function_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    parameter: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false, true)
+}
+
+/// Proves written object parameters without changing the contextual arrow route.
+pub(super) fn plan_typed_arrow_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    arrow: NodeRef,
+    parameter: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, arrow, parameter, true, false)
+}
+
+fn plan_callable_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    parameter: NodeRef,
+    typed_arrow: bool,
+    queried_generic_function: bool,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
@@ -681,38 +922,93 @@ pub(super) fn plan_function_object_parameter_bindings(
     let function_record = arena
         .get(function.node)
         .ok_or(VariableInvariant::InvalidBindingPattern(function))?;
-    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(function),
-        ));
-    };
-    if function_record.kind != SyntaxKind::FunctionDeclaration
-        || function_record.flags.0 != 0
-        || function_data.type_parameters.is_some()
-        || function_data.asterisk_token.is_some()
-        || function_data.body.is_none()
+    if function_record.flags.0 != 0
         || bound
             .source_facts()
             .is_none_or(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        || (typed_arrow || queried_generic_function)
+            && bound
+                .source_facts()
+                .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
     {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::BindingPattern(function),
         ));
     }
-    if function_data.full_signature.is_some()
-        || function_data.next_container.is_some()
-        || function_data.symbol.is_some()
-        || function_data.local_symbol.is_some()
-        || function_data.flow_node.is_some()
-        || function_data.end_flow_node.is_some()
-        || function_data.return_flow_node.is_some()
-        || function_data.facts != 0
-        || function_data.parameters.range.start < function_record.range.start
-        || function_data.parameters.range.end > function_record.range.end
+    let (parameters, body, modifiers, contextual_arrow) = match &function_record.data {
+        NodeData::FunctionDeclaration(data)
+            if function_record.kind == SyntaxKind::FunctionDeclaration && !typed_arrow =>
+        {
+            let generic_shape_valid = if queried_generic_function {
+                data.type_.is_some()
+                    && data
+                        .type_parameters
+                        .as_ref()
+                        .is_some_and(|parameters| !parameters.nodes.is_empty())
+            } else {
+                data.type_parameters.is_none()
+            };
+            if !generic_shape_valid
+                || data.asterisk_token.is_some()
+                || data.body.is_none()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(function),
+                ));
+            }
+            if data.full_signature.is_some()
+                || data.next_container.is_some()
+                || data.symbol.is_some()
+                || data.local_symbol.is_some()
+                || data.flow_node.is_some()
+                || data.end_flow_node.is_some()
+                || data.return_flow_node.is_some()
+                || data.facts != 0
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(function).into());
+            }
+            (
+                &data.parameters,
+                data.body
+                    .ok_or(VariableInvariant::InvalidBindingPattern(function))?,
+                data.modifiers.as_ref(),
+                false,
+            )
+        }
+        NodeData::ArrowFunction(data) if function_record.kind == SyntaxKind::ArrowFunction => {
+            if queried_generic_function
+                || data.type_parameters.is_some()
+                || data.modifiers.is_some()
+                || data.asterisk_token.is_some()
+                || !typed_arrow && data.type_.is_some()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(function),
+                ));
+            }
+            if data.full_signature.is_some()
+                || data.next_container.is_some()
+                || data.symbol.is_some()
+                || data.flow_node.is_some()
+                || data.end_flow_node.is_some()
+                || data.facts != 0
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(function).into());
+            }
+            (&data.parameters, data.body, None, !typed_arrow)
+        }
+        _ => {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(function),
+            ));
+        }
+    };
+    if parameters.range.start < function_record.range.start
+        || parameters.range.end > function_record.range.end
     {
         return Err(VariableInvariant::InvalidBindingPattern(function).into());
     }
-    if let Some(modifiers) = &function_data.modifiers {
+    if let Some(modifiers) = modifiers {
         let mut kinds = Vec::with_capacity(modifiers.list.nodes.len());
         for modifier in &modifiers.list.nodes {
             let modifier = NodeRef::new(function.arena, function.file, *modifier);
@@ -775,10 +1071,9 @@ pub(super) fn plan_function_object_parameter_bindings(
         || parameter_record.flags.0 != 0
         || parameter_data.symbol.is_some()
         || parameter_data.facts != 0
-        || parameter_record.range.start < function_data.parameters.range.start
-        || parameter_record.range.end > function_data.parameters.range.end
-        || function_data
-            .parameters
+        || parameter_record.range.start < parameters.range.start
+        || parameter_record.range.end > parameters.range.end
+        || parameters
             .nodes
             .iter()
             .filter(|node| **node == parameter.node)
@@ -799,60 +1094,90 @@ pub(super) fn plan_function_object_parameter_bindings(
             VariableUnsupported::BindingPattern(parameter),
         ));
     }
-    let annotation = parameter_data
-        .type_
-        .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
-        .ok_or(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(parameter),
-        ))?;
-    let annotation_record = binding_child_node(arena, store, annotation, parameter)?;
-    if annotation_record.flags.0 != 0 {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(annotation),
-        ));
-    }
-    match (&annotation_record.data, annotation_record.kind) {
-        (NodeData::TypeLiteralNode(literal), SyntaxKind::TypeLiteral)
-            if literal.symbol.is_none() => {}
-        (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference)
-            if reference.type_arguments.is_none() =>
-        {
-            let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
-            let name_record = binding_child_node(arena, store, name, annotation)?;
-            let NodeData::Identifier(identifier) = &name_record.data else {
-                return Err(VariablePlanError::Unsupported(
-                    VariableUnsupported::BindingPattern(name),
-                ));
-            };
-            if name_record.kind != SyntaxKind::Identifier
-                || name_record.flags.0 != 0
-                || name_record.range != annotation_record.range
-                || identifier.flow_node.is_some()
-                || identifier.text.is_empty()
-            {
-                return Err(VariableInvariant::InvalidBindingPattern(name).into());
-            }
+    let annotation_record = if contextual_arrow {
+        if parameter_data.type_.is_some() {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(parameter),
+            ));
         }
-        _ => {
+        None
+    } else {
+        let annotation = parameter_data
+            .type_
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+            .ok_or(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(parameter),
+            ))?;
+        let annotation_record = binding_child_node(arena, store, annotation, parameter)?;
+        if annotation_record.flags.0 != 0 {
             return Err(VariablePlanError::Unsupported(
                 VariableUnsupported::BindingPattern(annotation),
             ));
         }
-    }
-    let body = NodeRef::new(
-        function.arena,
-        function.file,
-        function_data
-            .body
-            .ok_or(VariableInvariant::InvalidBindingPattern(function))?,
-    );
+        match (&annotation_record.data, annotation_record.kind) {
+            (NodeData::TypeLiteralNode(literal), SyntaxKind::TypeLiteral)
+                if literal.symbol.is_none() => {}
+            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference) => {
+                let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+                let name_record = binding_child_node(arena, store, name, annotation)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(name),
+                    ));
+                };
+                if name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.range.start != annotation_record.range.start
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Err(VariableInvariant::InvalidBindingPattern(name).into());
+                }
+                if let Some(arguments) = &reference.type_arguments {
+                    if typed_arrow || arguments.nodes.is_empty() {
+                        return Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(annotation),
+                        ));
+                    }
+                    if arguments.range.start < name_record.range.end
+                        || arguments.range.end > annotation_record.range.end
+                    {
+                        return Err(VariableInvariant::InvalidBindingPattern(annotation).into());
+                    }
+                    let mut previous_end = arguments.range.start;
+                    for argument in &arguments.nodes {
+                        let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
+                        let record = binding_child_node(arena, store, argument, annotation)?;
+                        if record.flags.0 != 0
+                            || record.range.start < previous_end
+                            || record.range.end > arguments.range.end
+                        {
+                            return Err(VariableInvariant::InvalidBindingPattern(argument).into());
+                        }
+                        previous_end = record.range.end;
+                    }
+                } else if name_record.range.end != annotation_record.range.end {
+                    return Err(VariableInvariant::InvalidBindingPattern(name).into());
+                }
+            }
+            _ => {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(annotation),
+                ));
+            }
+        }
+        Some(annotation_record)
+    };
+    let body = NodeRef::new(function.arena, function.file, body);
     let body_record = binding_child_node(arena, store, body, function)?;
-    if body_record.kind != SyntaxKind::Block || !matches!(body_record.data, NodeData::Block(_)) {
+    if function_record.kind == SyntaxKind::FunctionDeclaration
+        && (body_record.kind != SyntaxKind::Block
+            || !matches!(body_record.data, NodeData::Block(_)))
+    {
         return Err(VariableInvariant::InvalidBindingPattern(body).into());
     }
 
-    let index = function_data
-        .parameters
+    let index = parameters
         .nodes
         .iter()
         .position(|node| *node == parameter.node)
@@ -890,7 +1215,7 @@ pub(super) fn plan_function_object_parameter_bindings(
             VariableUnsupported::BindingPattern(pattern),
         ));
     }
-    if pattern_record.range.end > annotation_record.range.start
+    if annotation_record.is_some_and(|annotation| pattern_record.range.end > annotation.range.start)
         || bound.container(pattern) != Some(function)
         || bound.block_scope_container(pattern) != Some(function)
         || bound.symbol(pattern).is_some()
@@ -910,7 +1235,7 @@ pub(super) fn plan_function_object_parameter_bindings(
             .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
         let name_record = binding_child_node(arena, store, name, element)?;
         if binding.dot_dot_dot_token.is_some()
-            || binding.initializer.is_some()
+            || binding.initializer.is_some() && !queried_generic_function
             || name_record.kind != SyntaxKind::Identifier
         {
             return Err(VariablePlanError::Unsupported(
@@ -921,6 +1246,11 @@ pub(super) fn plan_function_object_parameter_bindings(
             let property = NodeRef::new(element.arena, element.file, property);
             let property_record = binding_child_node(arena, store, property, element)?;
             if let NodeData::ComputedPropertyName(computed) = &property_record.data {
+                if typed_arrow {
+                    return Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(property),
+                    ));
+                }
                 let key = NodeRef::new(property.arena, property.file, computed.expression);
                 let key_record = binding_child_node(arena, store, key, property)?;
                 if !matches!(
@@ -928,6 +1258,8 @@ pub(super) fn plan_function_object_parameter_bindings(
                     SyntaxKind::StringLiteral
                         | SyntaxKind::NumericLiteral
                         | SyntaxKind::NoSubstitutionTemplateLiteral
+                        | SyntaxKind::Identifier
+                        | SyntaxKind::CallExpression
                 ) {
                     return Err(VariablePlanError::Unsupported(
                         VariableUnsupported::BindingPattern(key),
@@ -1121,7 +1453,7 @@ fn plan_object_binding_pattern(
     }
 
     let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
-    let mut has_dynamic_computed_property = false;
+    let mut excluded_computed_keys = Vec::new();
     for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
         let element = NodeRef::new(pattern.arena, pattern.file, *element);
         let element_record = binding_child_node(arena, store, element, pattern)?;
@@ -1203,6 +1535,12 @@ fn plan_object_binding_pattern(
                     {
                         key.text.clone()
                     }
+                    NodeData::BigIntLiteral(key)
+                        if key_record.kind == SyntaxKind::BigIntLiteral
+                            && key.token_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
                     NodeData::NoSubstitutionTemplateLiteral(key)
                         if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
                             && key.token_flags.0 == 0
@@ -1279,7 +1617,6 @@ fn plan_object_binding_pattern(
                 || pattern_data.elements.has_trailing_comma
                 || data.property_name.is_some()
                 || initializer.is_some()
-                || has_dynamic_computed_property
             {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(element),
@@ -1356,13 +1693,21 @@ fn plan_object_binding_pattern(
             return Err(VariableInvariant::InvalidBindingPattern(element).into());
         }
         if !rest {
-            has_dynamic_computed_property |= computed_key.is_some_and(|key| {
+            if let Some(key) = computed_key.filter(|key| {
                 matches!(
-                    store.source_node_kind(key),
-                    Some(SyntaxKind::Identifier | SyntaxKind::CallExpression)
+                    store.source_node_kind(*key),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::CallExpression
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                    )
                 )
-            });
-            excluded_properties.push(property_name.clone());
+            }) {
+                excluded_computed_keys.push(key);
+            } else {
+                excluded_properties.push(property_name.clone());
+            }
         }
         planned.push(PlannedObjectBindingElement {
             element,
@@ -1374,6 +1719,11 @@ fn plan_object_binding_pattern(
             rest,
             excluded_properties: if rest {
                 excluded_properties.clone()
+            } else {
+                Vec::new()
+            },
+            excluded_computed_keys: if rest {
+                excluded_computed_keys.clone()
             } else {
                 Vec::new()
             },
@@ -1392,6 +1742,88 @@ pub(super) fn plan_top_level_array_binding_elements(
     declaration: NodeRef,
     binding: VariableBindingKind,
     exported: bool,
+) -> Result<Vec<PlannedArrayBindingElement>, VariablePlanError> {
+    let source = bound.source_file();
+    plan_array_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        exported,
+        ArrayBindingScope {
+            statement_parent: source,
+            container: source,
+            block_scope: source,
+        },
+    )
+}
+
+/// Proves flat const array bindings without omissions, defaults, or rest.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_callable_array_binding_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<(VariableBindingKind, Vec<PlannedArrayBindingElement>), VariablePlanError> {
+    let (binding, pattern) = plan_callable_binding_declaration(
+        arena, bound, store, declaration, callable, statement_parent, block_scope,
+    )?;
+    if binding != VariableBindingKind::Const {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    let elements = plan_array_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        false,
+        ArrayBindingScope {
+            statement_parent,
+            container: callable,
+            block_scope,
+        },
+    )?;
+    let Some(NodeData::BindingPattern(pattern_data)) =
+        arena.get(pattern.node).map(|record| &record.data)
+    else {
+        return Err(VariableInvariant::InvalidBindingPattern(pattern).into());
+    };
+    if elements.is_empty()
+        || elements.len() != pattern_data.elements.nodes.len()
+        || elements.iter().enumerate().any(|(index, element)| {
+            element.index != index || element.initializer.is_some() || element.rest
+        })
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    Ok((binding, elements))
+}
+
+struct ArrayBindingScope {
+    statement_parent: NodeRef,
+    container: NodeRef,
+    block_scope: NodeRef,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_array_binding_elements_at_scope(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+    scope: ArrayBindingScope,
 ) -> Result<Vec<PlannedArrayBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
@@ -1418,8 +1850,7 @@ pub(super) fn plan_top_level_array_binding_elements(
         .parent
         .map(|node| NodeRef::new(list.arena, list.file, node))
         .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
-    let source = bound.source_file();
-    let statement_record = binding_child_node(arena, store, statement, source)?;
+    let statement_record = binding_child_node(arena, store, statement, scope.statement_parent)?;
     let NodeData::VariableStatement(statement_data) = &statement_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(statement).into());
     };
@@ -1575,10 +2006,10 @@ pub(super) fn plan_top_level_array_binding_elements(
         )?;
         let local = bound.local_symbol(element).unwrap_or(symbol);
         if !names.insert(symbol)
-            || bound.container(element) != Some(source)
-            || bound.block_scope_container(element) != Some(source)
+            || bound.container(element) != Some(scope.container)
+            || bound.block_scope_container(element) != Some(scope.block_scope)
             || bound
-                .locals(source)
+                .locals(scope.block_scope)
                 .and_then(|locals| store.symbol_table(locals))
                 .and_then(|locals| locals.get_source(&identifier.text))
                 != Some(local)
@@ -1684,6 +2115,50 @@ pub(super) fn plan_identifier_read(
 }
 
 /// Authenticates an explicitly annotated ambient declaration in the global scope.
+pub(super) fn plan_ambient_global_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+) -> Result<Option<PlannedCrossFileGlobalRead>, VariablePlanError> {
+    let Some(routed) = resolve_cross_file_global_value_symbol(arena, bound, store, host, node, name)?
+    else {
+        return Ok(None);
+    };
+    if store.symbol(routed.target).is_some_and(|record| {
+        record.flags().intersects(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        )
+    }) {
+        validate_value_links(store, routed.target)?;
+    }
+    let Some(value) = super::declared_values::plan_ambient_global_value(store, host, routed.target)
+        .map_err(VariablePlanError::DeclaredType)?
+    else {
+        return Ok(None);
+    };
+    if store.symbol_node_links(node).is_some_and(|links| {
+        links.resolved_symbol.is_some_and(|cached| cached != routed.resolved)
+    }) {
+        return Err(VariableInvariant::InvalidSymbolNodeCache {
+            node,
+            cached: store.symbol_node_links(node).and_then(|links| links.resolved_symbol),
+            expected: routed.resolved,
+        }
+        .into());
+    }
+    Ok(Some(PlannedCrossFileGlobalRead {
+        type_node: value.annotation,
+        read: PlannedIdentifierRead {
+            resolved_symbol: routed.resolved,
+            value_symbol: routed.target,
+        },
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_cross_file_global_identifier_read(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1783,32 +2258,39 @@ fn resolve_cross_file_global_value_symbol(
     node: NodeRef,
     name: &str,
 ) -> Result<Option<RoutedValueSymbol>, VariablePlanError> {
+    let Some(global) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(name))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(VariablePlanError::DeclaredType)?;
     let mut name_lookup =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
             .map_err(|error| name_resolution_error(node, error))?;
-    let Some(resolved) = name_lookup
-        .resolve(
+    let resolved = match name_lookup.resolve(
             Some(CanonicalResolutionLocation::Bound(node)),
             name,
             SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
             None,
             false,
             false,
-        )
-        .map_err(|error| name_resolution_error(node, error))?
-    else {
+        ) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(name_resolution_error(node, error)),
+    };
+    if store.get_merged_symbol(resolved) != Some(global) {
         return Ok(None);
     };
     let routed = route_value_symbol(store, node, resolved)?;
-    let global = store
-        .intrinsic_bootstrap()
-        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .and_then(|globals| globals.get_source(name))
-        .and_then(|symbol| store.get_merged_symbol(symbol));
-    Ok((routed.export_local.is_none() && global == Some(routed.target)).then_some(routed))
+    Ok((routed.export_local.is_none() && global == routed.target).then_some(routed))
 }
 
 fn authenticated_cross_file_global_declaration(
@@ -2056,7 +2538,7 @@ fn plan_identifier_read_worker(
             },
         ));
     }
-    if variable_binding_flags(flags).is_none() {
+    if authenticated_variable_binding_flags(store, routed.target).is_none() {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node,
@@ -2352,6 +2834,12 @@ fn route_value_symbol(
         if record.flags() != SymbolFlags::EXPORT_VALUE
             || record.check_flags() != CheckFlags::NONE
             || !matches!(record.declarations(), Some([_]))
+                && !record.export_symbol().is_some_and(|target| {
+                    record.declarations().is_some_and(|declarations| {
+                        store.source_exported_overload_local(target, declarations) == Some(resolved)
+                            || merged_type_value_export_local_is_exact(store, resolved, target)
+                    })
+                })
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()
@@ -2406,7 +2894,7 @@ fn validate_variable_target(
     let record = store
         .symbol(symbol)
         .ok_or(VariableInvariant::InvalidSymbol(symbol))?;
-    if variable_binding_flags(record.flags()) != Some(expected_flags) {
+    if authenticated_variable_binding_flags(store, symbol) != Some(expected_flags) {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node: declaration,
@@ -2479,6 +2967,128 @@ fn variable_binding_flags(flags: SymbolFlags) -> Option<SymbolFlags> {
     (flags.without(allowed) == SymbolFlags::NONE).then_some(binding)
 }
 
+/// Selects the two namespaces without changing the binder's flags or declaration order.
+pub(super) fn merged_type_value_declarations(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<(NodeRef, NodeRef)> {
+    let record = store.symbol(symbol)?;
+    let binding = record.flags().without(SymbolFlags::TYPE_ALIAS);
+    if !record.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || !matches!(
+            binding,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+        )
+        || record.check_flags() != CheckFlags::NONE
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || store.source_symbol_flags(symbol) != Some(record.flags())
+    {
+        return None;
+    }
+    let [first, second] = record.declarations()? else {
+        return None;
+    };
+    let (value, alias) = match (
+        store.source_node_kind(*first)?,
+        store.source_node_kind(*second)?,
+    ) {
+        (SyntaxKind::VariableDeclaration, SyntaxKind::TypeAliasDeclaration) => (*first, *second),
+        (SyntaxKind::TypeAliasDeclaration, SyntaxKind::VariableDeclaration) => (*second, *first),
+        _ => return None,
+    };
+    if !value.is_for(alias.arena, alias.file) || record.value_declaration() != Some(value) {
+        return None;
+    }
+    for declaration in [value, alias] {
+        let name = store
+            .source_direct_children(declaration)?
+            .into_iter()
+            .find(|child| store.source_node_kind(*child) == Some(SyntaxKind::Identifier))?;
+        if store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_identifier_text(name) != record.name().as_utf8()
+        {
+            return None;
+        }
+    }
+    let SourceNodeParent::Parent(source) = store.source_node_parent(alias)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(list) = store.source_node_parent(value)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(statement) = store.source_node_parent(list)? else {
+        return None;
+    };
+    if store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+        || store.source_node_parent(statement) != Some(SourceNodeParent::Parent(source))
+    {
+        return None;
+    }
+    Some((value, alias))
+}
+
+fn authenticated_variable_binding_flags(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<SymbolFlags> {
+    let flags = store.symbol(symbol)?.flags();
+    variable_binding_flags(flags).or_else(|| {
+        merged_type_value_declarations(store, symbol).map(|_| flags & SymbolFlags::VARIABLE)
+    })
+}
+
+fn merged_type_value_export_local_is_exact(
+    store: &CanonicalTypeMapperStore,
+    local: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> bool {
+    let Some((_, _)) = merged_type_value_declarations(store, target) else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    local_record.flags() == SymbolFlags::EXPORT_VALUE
+        && local_record.export_symbol() == Some(target)
+        && local_record.declarations()
+            == store.symbol(target).and_then(|record| record.declarations())
+        && store.source_symbol_declarations_match(local)
+        && store.source_symbol_flags(local) == Some(SymbolFlags::EXPORT_VALUE)
+}
+
+pub(super) fn merged_type_value_read(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    resolved: SemanticSymbolId,
+) -> Option<PlannedIdentifierRead> {
+    let routed = route_value_symbol(store, node, resolved).ok()?;
+    let (value, alias) = merged_type_value_declarations(store, routed.target)?;
+    if !value.is_for(bound.source_file().arena, bound.source_file().file)
+        || bound.symbol(value) != Some(routed.target)
+        || bound.symbol(alias) != Some(routed.target)
+        || bound.local_symbol(value) != routed.export_local
+        || bound.local_symbol(alias) != routed.export_local
+    {
+        return None;
+    }
+    if let Some(local) = routed.export_local {
+        let name = store.symbol(routed.target)?.name().as_utf8()?;
+        validate_export_local(store, local, value, routed.target, name).ok()?;
+    }
+    validate_target_parent(bound, store, routed.target, routed.export_local.is_some()).ok()?;
+    Some(PlannedIdentifierRead {
+        resolved_symbol: resolved,
+        value_symbol: routed.target,
+    })
+}
+
 fn is_nonambient_variable_declaration(
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
@@ -2518,6 +3128,11 @@ fn single_variable_declaration(
     allow_parameter: bool,
     allow_recovered_redeclarations: bool,
 ) -> Result<NodeRef, VariablePlanError> {
+    if flags.contains(SymbolFlags::TYPE_ALIAS) {
+        return merged_type_value_declarations(store, symbol)
+            .map(|(value, _)| value)
+            .ok_or_else(|| VariableInvariant::InvalidSymbolShape(symbol).into());
+    }
     if allow_parameter
         && flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE
         && let Some(parameter) = declarations.first().copied()
@@ -2559,6 +3174,14 @@ fn single_variable_declaration(
             Some(SyntaxKind::ModuleDeclaration)
                 if flags.contains(SymbolFlags::NAMESPACE_MODULE) => {}
             _ => {
+                if store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
+                    && flags.contains(SymbolFlags::INTERFACE)
+                    && let Some(owner) = store
+                        .source_global_interface_value_owner(symbol)
+                        .map_err(VariablePlanError::DeclaredType)?
+                {
+                    return Ok(owner.value_declaration());
+                }
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::NonUniqueDeclaration {
                         node,
@@ -2586,6 +3209,7 @@ fn validate_export_local(
         || record.check_flags() != CheckFlags::NONE
         || record.name().as_bytes() != name.as_bytes()
         || record.declarations() != Some(&[declaration])
+            && !merged_type_value_export_local_is_exact(store, local, target)
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()
@@ -3294,18 +3918,18 @@ mod tests {
 
     #[test]
     fn typed_function_object_parameters_reject_unsupported_binding_shapes() {
-        for (index, source) in [
-            "function read({ value }: { value: number } = { value: 1 }) {}",
-            "function read({ value = 1 }: { value?: number }) {}",
-            "function read({ ...rest }: { value: number }) {}",
-            "function read({ [key]: value }: { value: number }) {}",
-            "function read({ nested: { value } }: { nested: { value: number } }) {}",
-            "function read({ value }) {}",
-            "function read<T>({ value }: { value: number }) {}",
-            "declare function read({ value }: { value: number }): void;",
-            "declare namespace Scope { function read({ value }: { value: number }) {} }",
-            "type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}",
-            "namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}",
+        for (index, (source, retains_computed_key)) in [
+            ("function read({ value }: { value: number } = { value: 1 }) {}", false),
+            ("function read({ value = 1 }: { value?: number }) {}", false),
+            ("function read({ ...rest }: { value: number }) {}", false),
+            ("function read({ [key]: value }: { value: number }) {}", true),
+            ("function read({ nested: { value } }: { nested: { value: number } }) {}", false),
+            ("function read({ value }) {}", false),
+            ("function read<T>({ value }: { value: number }) {}", false),
+            ("declare function read({ value }: { value: number }): void;", false),
+            ("declare namespace Scope { function read({ value }: { value: number }) {} }", false),
+            ("type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}", false),
+            ("namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}", false),
         ]
         .into_iter()
         .enumerate()
@@ -3317,21 +3941,42 @@ mod tests {
                 fixture.store.symbol_len(),
                 fixture.store.checker_link_allocated_lengths(),
             );
-            assert!(
-                matches!(
-                    plan_function_object_parameter_bindings(
-                        &fixture.parsed.arena,
-                        &fixture.bound,
-                        &fixture.store,
-                        function,
-                        parameter,
-                    ),
-                    Err(VariablePlanError::Unsupported(
-                        VariableUnsupported::BindingPattern(_)
-                    )),
-                ),
-                "{source}"
+            let result = plan_function_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                function,
+                parameter,
             );
+            if retains_computed_key {
+                let planned = result.unwrap();
+                let [binding] = planned.as_slice() else {
+                    panic!("expected one computed parameter binding")
+                };
+                let NodeData::ComputedPropertyName(computed) =
+                    &fixture.parsed.arena.get(binding.property.node).unwrap().data
+                else {
+                    panic!("expected the original computed property name")
+                };
+                let key = NodeRef::new(function.arena, function.file, computed.expression);
+                assert_eq!(binding.computed_key, Some(key));
+                assert_eq!(
+                    fixture.store.source_node_parent(key),
+                    Some(SourceNodeParent::Parent(binding.property)),
+                );
+                assert!(fixture.store.type_node_links(key).is_none());
+                assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(_)
+                        )),
+                    ),
+                    "{source}"
+                );
+            }
             assert_eq!(
                 (
                     fixture.store.type_len(),
@@ -3561,6 +4206,214 @@ mod tests {
                 poisoned,
             );
         }
+    }
+
+    fn arrow_object_parameters(fixture: &BindingFixture) -> Vec<(NodeRef, NodeRef)> {
+        fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ArrowFunction(arrow) = &record.data else {
+                    return None;
+                };
+                let parameter = arrow.parameters.nodes.iter().find(|parameter| {
+                    let Some(NodeData::ParameterDeclaration(parameter)) = fixture
+                        .parsed
+                        .arena
+                        .get(**parameter)
+                        .map(|record| &record.data)
+                    else {
+                        return false;
+                    };
+                    fixture
+                        .parsed
+                        .arena
+                        .get(parameter.name)
+                        .is_some_and(|record| record.kind == SyntaxKind::ObjectBindingPattern)
+                })?;
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, *parameter),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_preserve_parent_and_leaf_owners() {
+        let fixture = binding_fixture(
+            concat!(
+                "const read = (prefix: number, ",
+                "{ value, renamed: alias }: { value: number; renamed?: string }, ",
+                "fallback: number = value): number => fallback;",
+            ),
+            202_901,
+        );
+        let parameters = arrow_object_parameters(&fixture);
+        let [(arrow, parameter)] = parameters.as_slice() else {
+            panic!("expected one arrow object parameter")
+        };
+        let (arrow, parameter) = (*arrow, *parameter);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let planned = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            arrow,
+            parameter,
+        )
+        .unwrap();
+        let parent = fixture.bound.symbol(parameter).unwrap();
+        let owner = fixture.store.symbol(parent).unwrap();
+        assert_eq!(owner.name().as_utf8(), Some("__1"));
+        assert_eq!(owner.declarations(), Some(&[parameter][..]));
+        assert_eq!(owner.value_declaration(), Some(parameter));
+        assert_eq!(
+            fixture.store.source_node_kind(arrow),
+            Some(SyntaxKind::ArrowFunction),
+        );
+        assert_eq!(fixture.bound.container(parameter), Some(arrow));
+        assert_eq!(fixture.bound.block_scope_container(parameter), Some(arrow));
+        let locals = fixture
+            .bound
+            .locals(arrow)
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .unwrap();
+        for (binding, property, name) in [
+            (&planned[0], "value", "value"),
+            (&planned[1], "renamed", "alias"),
+        ] {
+            assert_eq!(binding.property_name, property);
+            assert_ne!(binding.symbol, parent);
+            assert_eq!(fixture.bound.symbol(binding.element), Some(binding.symbol));
+            assert_eq!(fixture.bound.container(binding.name), Some(arrow));
+            assert_eq!(
+                fixture.bound.block_scope_container(binding.name),
+                Some(arrow),
+            );
+            assert_eq!(locals.get_source(name), Some(binding.symbol));
+            assert_eq!(
+                fixture.store.symbol(binding.symbol).unwrap().declarations(),
+                Some(&[binding.element][..]),
+            );
+            assert!(binding.computed_key.is_none());
+            assert!(binding.initializer.is_none());
+            assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+        }
+        assert!(
+            plan_function_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                arrow,
+                parameter,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_reject_foreign_leaf_and_cache_links() {
+        let mut fixture = binding_fixture(
+            concat!(
+                "const read = ({ value }: { value: number }): number => value; ",
+                "const other = ({ value }: { value: string }): string => value;",
+            ),
+            202_902,
+        );
+        let parameters = arrow_object_parameters(&fixture);
+        let [(arrow, parameter), (other_arrow, other_parameter)] = parameters.as_slice() else {
+            panic!("expected two distinct arrow parameters")
+        };
+        let bindings = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            *arrow,
+            *parameter,
+        )
+        .unwrap();
+        let other_bindings = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            *other_arrow,
+            *other_parameter,
+        )
+        .unwrap();
+        let binding = &bindings[0];
+        let other = other_bindings[0].symbol;
+        assert_ne!(binding.symbol, other);
+        let locals = fixture.bound.locals(*arrow).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("value"), other),
+            Some(Some(binding.symbol)),
+        );
+        let before = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_typed_arrow_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                *arrow,
+                *parameter,
+            ),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidBindingPattern(binding.element),
+            )),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("value"), binding.symbol),
+            Some(Some(other)),
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(number),
+            write_type: Some(number),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(binding.symbol, poisoned.clone())
+        );
+        let before = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_typed_arrow_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                *arrow,
+                *parameter,
+            ),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidValueLinks(binding.symbol),
+            )),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
+        assert_eq!(
+            fixture.store.value_symbol_links(binding.symbol),
+            Some(&poisoned),
+        );
+        assert!(fixture.store.value_symbol_links(other).is_none());
     }
 
     #[test]
@@ -3905,19 +4758,28 @@ mod tests {
             fixture.store.checker_link_allocated_lengths(),
         );
 
-        assert!(matches!(
-            plan_top_level_object_binding_elements(
-                &fixture.parsed.arena,
-                &fixture.bound,
-                &fixture.store,
-                declaration,
-                VariableBindingKind::Const,
-                false,
-            ),
-            Err(VariablePlanError::Unsupported(
-                VariableUnsupported::BindingPattern(_)
-            ))
-        ));
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+        let [selected, rest] = planned.as_slice() else {
+            panic!("expected one computed binding and its rest binding")
+        };
+        let key = selected.computed_key.unwrap();
+        assert_eq!(rest.excluded_computed_keys, vec![key]);
+        assert!(rest.excluded_properties.is_empty());
+        assert_eq!(
+            fixture.store.source_node_parent(key),
+            Some(SourceNodeParent::Parent(selected.property)),
+        );
+        for binding in &planned {
+            assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+        }
         assert_eq!(
             (
                 fixture.store.type_len(),

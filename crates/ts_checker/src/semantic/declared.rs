@@ -91,6 +91,7 @@ pub struct DeclaredTypeHost<'a> {
     sources: DeclaredTypeSources<'a>,
     name_resolution: DeclaredNameResolution,
     module_resolutions: Option<&'a CanonicalModuleResolutionManifest>,
+    program_file_order: Option<&'a [FileId]>,
 }
 
 /// A source rejected while constructing a [`DeclaredTypeHost`].
@@ -199,6 +200,7 @@ impl<'a> DeclaredTypeHost<'a> {
             sources: DeclaredTypeSources::Registry(sources),
             name_resolution: DeclaredNameResolution::GlobalsMerged(completion.name_resolution()),
             module_resolutions: None,
+            program_file_order: None,
         })
     }
 
@@ -252,6 +254,7 @@ impl<'a> DeclaredTypeHost<'a> {
             sources: DeclaredTypeSources::Retained(retained),
             name_resolution,
             module_resolutions: None,
+            program_file_order: None,
         })
     }
 
@@ -265,6 +268,20 @@ impl<'a> DeclaredTypeHost<'a> {
 
     pub(super) const fn module_resolutions(&self) -> Option<&'a CanonicalModuleResolutionManifest> {
         self.module_resolutions
+    }
+
+    /// Borrows the canonical context's original Program order.
+    pub(super) fn with_program_file_order(mut self, order: &'a [FileId]) -> Self {
+        self.program_file_order = Some(order);
+        self
+    }
+
+    pub(super) const fn program_file_order(&self) -> Option<&'a [FileId]> {
+        self.program_file_order
+    }
+
+    pub(super) fn has_program_file(&self, file: FileId) -> bool {
+        self.sources.get(file).is_some()
     }
 
     pub(super) fn alias_target_host<'host>(
@@ -385,6 +402,18 @@ pub enum DeclaredTypeUnavailable {
         symbol: SemanticSymbolId,
         declared_type: TypeId,
     },
+    InvalidGlobalThisSymbol(SemanticSymbolId),
+    GlobalThisProgramOrderUnavailable(TypeId),
+    InvalidGlobalThisMembers(TypeId),
+    InvalidGlobalThisMember {
+        receiver: TypeId,
+        symbol: SemanticSymbolId,
+    },
+    UnsupportedGlobalThisMember {
+        receiver: TypeId,
+        symbol: SemanticSymbolId,
+    },
+    GlobalThisCapacity(TypeId),
 }
 
 /// Exact declared-type failure domain for the currently installed cut.
@@ -485,6 +514,26 @@ struct InterfacePlan {
     type_parameters: Vec<SemanticSymbolId>,
     outer_type_parameter_count: usize,
     has_this_type: bool,
+    ambient_class_heritage: Option<super::source_imports::SourceAmbientClassHeritage>,
+}
+
+/// The declarations that contribute to one class or interface instance type.
+/// This plan does not resolve bases or read named member annotations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassInterfaceSourcePlan {
+    pub symbol: SemanticSymbolId,
+    pub declarations: Vec<NodeRef>,
+    pub class_declaration: Option<NodeRef>,
+    pub outer_type_parameters: Vec<SemanticSymbolId>,
+    pub local_type_parameters: Vec<ClassInterfaceTypeParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassInterfaceTypeParameter {
+    pub symbol: SemanticSymbolId,
+    pub declarations: Vec<NodeRef>,
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
 }
 
 #[derive(Debug)]
@@ -583,7 +632,13 @@ pub(super) fn cached_interface_type(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<TypeId>, DeclaredTypeError> {
-    cached_class_or_interface_type(store, symbol, ObjectFlags::INTERFACE)
+    let cached = cached_class_or_interface_type(store, symbol, ObjectFlags::INTERFACE)?;
+    if let Some(type_) = cached
+        && let Some(proof) = store.source_ambient_class_heritage(type_)
+    {
+        proof.validate_current(store, type_)?;
+    }
+    Ok(cached)
 }
 
 fn cached_class_or_interface_type(
@@ -1183,9 +1238,188 @@ fn preflight_interface_identity(
             type_parameters,
             outer_type_parameter_count,
             has_this_type: false,
+            ambient_class_heritage: None,
         },
         interface_declarations,
     ))
+}
+
+/// Uses the same formals as declared identity creation, including merged owners.
+pub(super) fn plan_class_interface_source(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<ClassInterfaceSourcePlan, DeclaredTypeError> {
+    let invalid = || unavailable(DeclaredTypeUnavailable::MissingDeclarations(symbol));
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || !owner
+            .flags()
+            .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        || !store.source_merged_symbol_declarations_in_order(symbol)
+        || owner.check_flags() != ts_binder::CheckFlags::NONE
+    {
+        return Err(invalid());
+    }
+    let (parameters, outer_count, class_declaration) = if owner.flags().contains(SymbolFlags::CLASS)
+    {
+        let plan = preflight_class_plan(store, host, symbol)?;
+        (
+            plan.type_parameters,
+            plan.outer_type_parameter_count,
+            owner.value_declaration(),
+        )
+    } else {
+        let (plan, _) = preflight_interface_identity(store, host, symbol)?;
+        (plan.type_parameters, plan.outer_type_parameter_count, None)
+    };
+    let mut declarations = Vec::new();
+    for &declaration in owner.declarations().ok_or_else(invalid)? {
+        let record = preflight_node(store, host, declaration)?;
+        if !host.symbol_matches(store, declaration, symbol) {
+            return Err(invalid());
+        }
+        if matches!(
+            record.data,
+            NodeData::ClassDeclaration(_)
+                | NodeData::ClassExpression(_)
+                | NodeData::InterfaceDeclaration(_)
+        ) {
+            if declarations.contains(&declaration) {
+                return Err(invalid());
+            }
+            declarations.push(declaration);
+        }
+    }
+    if declarations.is_empty()
+        || class_declaration.is_some_and(|class| !declarations.contains(&class))
+    {
+        return Err(invalid());
+    }
+    let members = owner.members().and_then(|table| store.symbol_table(table));
+    let mut local_type_parameters = Vec::new();
+    for &parameter in &parameters[outer_count..] {
+        let record = store.symbol(parameter).ok_or_else(invalid)?;
+        if record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_PARAMETER
+            || record.check_flags() != ts_binder::CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_parent_of_symbol(parameter) != Some(symbol)
+            || members
+                .and_then(|table| table.get(record.name()))
+                .and_then(|raw| store.get_merged_symbol(raw))
+                != Some(parameter)
+        {
+            return Err(invalid());
+        }
+        let mut parameter_declarations = Vec::new();
+        for &declaration in &declarations {
+            let declaration_record = preflight_node(store, host, declaration)?;
+            let written = match &declaration_record.data {
+                NodeData::ClassDeclaration(data) => data.type_parameters.as_ref(),
+                NodeData::ClassExpression(data) => data.type_parameters.as_ref(),
+                NodeData::InterfaceDeclaration(data) => data.type_parameters.as_ref(),
+                _ => None,
+            };
+            for &node in written.into_iter().flat_map(|list| &list.nodes) {
+                let node = NodeRef::new(declaration.arena, declaration.file, node);
+                if host.symbol_matches(store, node, parameter) {
+                    parameter_declarations.push(node);
+                }
+            }
+        }
+        if parameter_declarations.is_empty()
+            || record.declarations() != Some(parameter_declarations.as_slice())
+        {
+            return Err(invalid());
+        }
+        let mut plan = ClassInterfaceTypeParameter {
+            symbol: parameter,
+            declarations: parameter_declarations.clone(),
+            constraint: None,
+            default_type: None,
+        };
+        for &declaration in &parameter_declarations {
+            let record = preflight_node(store, host, declaration)?;
+            let NodeData::TypeParameterDeclaration(data) = &record.data else {
+                return Err(invalid());
+            };
+            let parent = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                record.parent.ok_or_else(invalid)?,
+            );
+            if !declarations.contains(&parent)
+                || !host.symbol_matches(store, declaration, parameter)
+            {
+                return Err(invalid());
+            }
+            let parent_record = preflight_node(store, host, parent)?;
+            let written_parameters = match &parent_record.data {
+                NodeData::ClassDeclaration(data) => data.type_parameters.as_ref(),
+                NodeData::ClassExpression(data) => data.type_parameters.as_ref(),
+                NodeData::InterfaceDeclaration(data) => data.type_parameters.as_ref(),
+                _ => None,
+            }
+            .ok_or_else(invalid)?;
+            if written_parameters
+                .nodes
+                .iter()
+                .filter(|node| **node == declaration.node)
+                .count()
+                != 1
+            {
+                return Err(invalid());
+            }
+            for (written, selected) in [
+                (data.constraint, &mut plan.constraint),
+                (data.default_type, &mut plan.default_type),
+            ] {
+                if let Some(written) = written {
+                    let node = NodeRef::new(declaration.arena, declaration.file, written);
+                    if preflight_node(store, host, node)?.parent != Some(declaration.node) {
+                        return Err(invalid());
+                    }
+                    selected.get_or_insert(node);
+                }
+            }
+        }
+        local_type_parameters.push(plan);
+    }
+    if let Some(cached) = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+    {
+        let Some(TypeData::Interface(data)) = store.type_payload(cached).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let cached_parameters = data
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap_or_default();
+        if data.outer_type_parameter_count != outer_count
+            || cached_parameters.len() != parameters.len()
+            || cached_parameters
+                .iter()
+                .zip(&parameters)
+                .any(|(&type_, &parameter)| {
+                    cached_ordinary_type_parameter_owner(store, type_) != Some(parameter)
+                })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(ClassInterfaceSourcePlan {
+        symbol,
+        declarations,
+        class_declaration,
+        outer_type_parameters: parameters[..outer_count].to_vec(),
+        local_type_parameters,
+    })
 }
 
 fn cached_class_or_interface_has_this_type(
@@ -1289,15 +1523,17 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         self.events
             .push(RecursiveInterfacePlanEvent::PublishShell(node));
 
+        let mut ambient_class_heritage = None;
         let has_this_type = if has_type_parameters {
             true
         } else {
-            self.interface_requires_this_type(&declarations)?
+            self.interface_requires_this_type(symbol, &declarations, &mut ambient_class_heritage)?
         };
         let RecursiveInterfacePlanNode::Interface(plan) = &mut self.nodes[node] else {
             unreachable!("interface planning inserted an interface node")
         };
         plan.has_this_type = has_this_type;
+        plan.ambient_class_heritage = ambient_class_heritage;
         self.states
             .insert(symbol, RecursiveInterfacePlanState::Complete(has_this_type));
         self.events.push(RecursiveInterfacePlanEvent::Finish(node));
@@ -1306,7 +1542,9 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
 
     fn interface_requires_this_type(
         &mut self,
+        owner: SemanticSymbolId,
         declarations: &[NodeRef],
+        ambient_class_heritage: &mut Option<super::source_imports::SourceAmbientClassHeritage>,
     ) -> Result<bool, DeclaredTypeError> {
         for declaration in declarations {
             let declaration_node = preflight_node(self.store, self.host, *declaration)?;
@@ -1375,8 +1613,13 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
                         *declaration,
                         expression,
                         &mut HashSet::new(),
-                    )? && self.heritage_requires_this_type(expression)?
-                    {
+                    )? && self.heritage_requires_this_type(
+                        owner,
+                        *declaration,
+                        heritage,
+                        expression,
+                        ambient_class_heritage,
+                    )? {
                         return Ok(true);
                     }
                 }
@@ -1390,10 +1633,49 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
 
     fn heritage_requires_this_type(
         &mut self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+        heritage: NodeRef,
         expression: NodeRef,
+        ambient_class_heritage: &mut Option<super::source_imports::SourceAmbientClassHeritage>,
     ) -> Result<bool, DeclaredTypeError> {
-        let mut callback_host = self.host.name_resolver_host(self.store)?;
-        let base_symbol = callback_host.resolve_entity_name(expression, SymbolFlags::TYPE)?;
+        // Cold type imports need the same owner proof as direct heritage planning.
+        let imported = if self.store.source_node_kind(expression) == Some(SyntaxKind::Identifier) {
+            super::source_imports::plan_source_interface_heritage_type_import(
+                self.store,
+                self.host,
+                declaration,
+                owner,
+                heritage,
+            )
+            .map_err(|error| match error {
+                super::source_imports::SourceImportError::DeclaredType(error) => error,
+                _ => unavailable(DeclaredTypeUnavailable::InvalidInterfaceDeclaration(
+                    declaration,
+                )),
+            })?
+        } else {
+            None
+        };
+        let base_symbol = if let Some(imported) = imported {
+            Some(imported)
+        } else {
+            let mut callback_host = self.host.name_resolver_host(self.store)?;
+            match callback_host.resolve_entity_name(expression, SymbolFlags::TYPE) {
+                Ok(symbol) => symbol,
+                Err(error @ CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                    if self.store.source_node_kind(expression) == Some(SyntaxKind::Identifier) =>
+                {
+                    Some(
+                        super::source_imports::authenticated_ambient_module_import_alias_target(
+                            self.store, self.host, expression, alias,
+                        )
+                        .ok_or(error)?,
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let Some(base_symbol) = base_symbol else {
             return Ok(true);
         };
@@ -1412,6 +1694,18 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
             ));
         }
         if !flags.contains(SymbolFlags::INTERFACE) {
+            if flags.contains(SymbolFlags::CLASS) {
+                *ambient_class_heritage =
+                    super::source_imports::plan_source_ambient_class_heritage(
+                        self.store,
+                        self.host,
+                        owner,
+                        declaration,
+                        heritage,
+                        expression,
+                        base_symbol,
+                    )?;
+            }
             return Ok(true);
         }
         self.plan_class_or_interface(base_symbol)
@@ -1534,6 +1828,11 @@ fn execute_recursive_interface_plan(
                     );
                 }
                 assert!(store.finish_declared_type_initialization(symbol));
+                if let RecursiveInterfacePlanNode::Interface(plan) = &mut plan.nodes[node]
+                    && let Some(proof) = plan.ambient_class_heritage.take()
+                {
+                    assert!(store.publish_source_ambient_class_heritage(declared_type, proof));
+                }
             }
         }
     }
@@ -1583,6 +1882,19 @@ pub(super) fn get_declared_class_interface_or_type_parameter(
             return Ok(Some(declared_type));
         }
         let plan = RecursiveInterfacePlanner::plan(store, host, symbol)?;
+        let ambient_class_count = plan
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(node, RecursiveInterfacePlanNode::Interface(plan)
+                    if plan.ambient_class_heritage.is_some())
+            })
+            .count();
+        if !store.try_reserve_source_ambient_class_heritages(ambient_class_count) {
+            return Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::LiteralTypeCapacity,
+            ));
+        }
         return Ok(Some(execute_recursive_interface_plan(store, plan)));
     }
     if flags.contains(SymbolFlags::TYPE_PARAMETER) {
@@ -3757,5 +4069,221 @@ mod tests {
         ));
         assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, parameter, argument);
         assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, interface, declared_type);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real import covers failed proof and both provider this states.
+    fn cold_named_import_heritage_keeps_provider_this_and_atomic_failure() {
+        use crate::semantic::links::{AliasSymbolLinks, AliasTargetState};
+        use crate::semantic::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
+        };
+
+        for (provider_source, has_this) in [
+            ("export interface Base { value: string }", false),
+            ("export interface Base { value: this }", true),
+        ] {
+            let source = parse_source_file(concat!(
+                "import type { Base as ImportedBase } from './base';\n",
+                "interface Plain {}\n",
+                "interface Derived extends Plain, ImportedBase {}\n",
+            ));
+            let provider = parse_source_file(provider_source);
+            let file = FileId::new(17);
+            let provider_file = FileId::new(18);
+            let sources = [
+                (file, &source, "\"/project/derived.ts\""),
+                (provider_file, &provider, "\"/project/base.ts\""),
+            ];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed, path) in sources {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(path),
+                            CanonicalSourceLanguage::TypeScript,
+                            false,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed, _) in sources {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let (symbols, files) = binder.finish().try_into_parts().unwrap();
+            let specifier = source
+                .arena
+                .iter()
+                .find_map(|(_, node)| match &node.data {
+                    NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        import.module_specifier,
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            let manifest = validate_module_resolution_manifest(
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        specifier,
+                        CanonicalResolvedModuleInput::new(
+                            provider_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    ),
+                ]),
+                &symbols,
+                sources
+                    .iter()
+                    .map(|(file, parsed, _)| (*file, &parsed.arena, &files[file])),
+            )
+            .unwrap();
+            let mut store = TestStore::from_symbol_store(symbols);
+            for (file, parsed, _) in sources {
+                let source_file = store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .unwrap();
+                assert!(
+                    store.register_source_file_facts(
+                        source_file,
+                        files[&file].source_facts().unwrap(),
+                    )
+                );
+            }
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            let find_node = |parsed: &ParseResult, file, kind, name: &str| {
+                let node = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(id, node)| {
+                        (node.kind == kind && declaration_name(&parsed.arena, node) == Some(name))
+                            .then_some(id)
+                    })
+                    .unwrap();
+                NodeRef::new(parsed.arena.id(), file, node)
+            };
+            let plain_node = find_node(&source, file, SyntaxKind::InterfaceDeclaration, "Plain");
+            let derived_node =
+                find_node(&source, file, SyntaxKind::InterfaceDeclaration, "Derived");
+            let base_node = find_node(
+                &provider,
+                provider_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Base",
+            );
+            let import_node = find_node(&source, file, SyntaxKind::ImportSpecifier, "ImportedBase");
+            let symbol = |store: &TestStore, node: NodeRef| {
+                store
+                    .get_merged_symbol(files[&node.file].symbol(node).unwrap())
+                    .unwrap()
+            };
+            let plain = symbol(&store, plain_node);
+            let derived = symbol(&store, derived_node);
+            let base = symbol(&store, base_node);
+            let alias = symbol(&store, import_node);
+            assert_ne!(alias, base);
+            assert_eq!(
+                files[&provider_file].contains_this(base_node),
+                Some(has_this)
+            );
+            let order = [file, provider_file];
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources
+                    .iter()
+                    .map(|(file, parsed, _)| (&parsed.arena, &files[file])),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap()
+            .with_module_resolutions(&manifest)
+            .with_program_file_order(&order);
+
+            let cold_alias = AliasSymbolLinks::default();
+            let bad_alias = AliasSymbolLinks {
+                alias_target: AliasTargetState::Resolved(plain),
+                ..cold_alias.clone()
+            };
+            assert!(store.set_alias_symbol_links(alias, bad_alias.clone()));
+            let counts = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let failed_counts = counts(&store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.get_declared_type_of_symbol(&host, derived),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidInterfaceDeclaration(derived_node)
+                    )),
+                );
+                assert_eq!(counts(&store), failed_counts);
+                assert_eq!(store.alias_symbol_links(alias), Some(&bad_alias));
+                for symbol in [plain, derived, base] {
+                    assert!(store.declared_type_links(symbol).is_none());
+                }
+            }
+
+            assert!(store.set_alias_symbol_links(alias, cold_alias.clone()));
+            let derived_type = store.get_declared_type_of_symbol(&host, derived).unwrap();
+            let plain_type = store
+                .declared_type_links(plain)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let base_type = store
+                .declared_type_links(base)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert!(interface_data(&store, plain_type).this_type.is_none());
+            for (symbol, type_) in [(derived, derived_type), (base, base_type)] {
+                assert_eq!(store.type_payload(type_).unwrap().symbol(), Some(symbol));
+                let this_type = interface_data(&store, type_).this_type;
+                assert_eq!(this_type.is_some(), has_this);
+                if let Some(this_type) = this_type {
+                    assert_eq!(
+                        store.type_payload(this_type).unwrap().symbol(),
+                        Some(symbol)
+                    );
+                    let parameter = type_parameter_data(&store, this_type);
+                    assert!(parameter.is_this_type);
+                    assert_eq!(parameter.constraint, Some(type_));
+                }
+            }
+            if has_this {
+                assert_ne!(
+                    interface_data(&store, derived_type).this_type,
+                    interface_data(&store, base_type).this_type,
+                );
+            }
+            assert_eq!(store.alias_symbol_links(alias), Some(&cold_alias));
+            let warm_counts = counts(&store);
+            for _ in 0..2 {
+                for (symbol, type_) in [
+                    (derived, derived_type),
+                    (base, base_type),
+                    (plain, plain_type),
+                ] {
+                    assert_eq!(store.get_declared_type_of_symbol(&host, symbol), Ok(type_));
+                }
+                assert_eq!(counts(&store), warm_counts);
+                assert_eq!(store.alias_symbol_links(alias), Some(&cold_alias));
+            }
+        }
     }
 }

@@ -7,7 +7,11 @@
 //! allocated-empty slices, while explicit `HashMap` states preserve nil versus
 //! allocated-empty maps without turning checker hot paths into linear scans.
 
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
@@ -68,11 +72,23 @@ pub(super) fn type_list_key(types: &[TypeId]) -> CacheHashKey {
 }
 
 /// Nil versus allocated state of an upstream type-instantiation map.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum TypeCacheState {
     #[default]
     Unallocated,
     Allocated(HashMap<CacheHashKey, TypeId>),
+}
+
+impl fmt::Debug for TypeCacheState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unallocated => formatter.write_str("Unallocated"),
+            Self::Allocated(entries) => formatter
+                .debug_tuple("Allocated")
+                .field(&entries.iter().collect::<BTreeMap<_, _>>())
+                .finish(),
+        }
+    }
 }
 
 /// Nil versus allocated state of `map[*Type]*Type`.
@@ -109,9 +125,16 @@ pub struct TypeAlias {
     id: TypeAliasId,
     symbol: Option<SemanticSymbolId>,
     type_arguments: Option<Vec<TypeId>>,
+    imported_body: Option<Arc<super::source_imports::SourceAliasBodyTypeImportPlan>>,
 }
 
 impl TypeAlias {
+    pub(super) fn imported_body(
+        &self,
+    ) -> Option<&super::source_imports::SourceAliasBodyTypeImportPlan> {
+        self.imported_body.as_deref()
+    }
+
     #[must_use]
     pub const fn id(&self) -> TypeAliasId {
         self.id
@@ -154,6 +177,8 @@ pub struct ObjectTypeData {
     pub target: Option<TypeId>,
     pub mapper: Option<TypeMapperId>,
     pub instantiations: TypeCacheState,
+    pub(super) source_computed_literal:
+        Option<std::sync::Arc<super::object_members::SourceComputedObjectLiteralOrigin>>,
 }
 
 /// Deferred or resolved instantiation of an interface/tuple target.
@@ -621,6 +646,36 @@ pub struct TypeRecord {
 }
 
 impl TypeRecord {
+    pub(super) fn attach_source_computed_literal(
+        &mut self,
+        origin: std::sync::Arc<super::object_members::SourceComputedObjectLiteralOrigin>,
+    ) -> bool {
+        if self.id != origin.type_id()
+            || self.symbol != Some(origin.owner())
+            || self.flags != TypeFlags::OBJECT
+            || self.alias.is_some()
+            || !self.object_flags.contains(
+                ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::MEMBERS_RESOLVED,
+            )
+        {
+            return false;
+        }
+        let TypeData::Object(object) = &mut self.data else {
+            return false;
+        };
+        if object.source_computed_literal.is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+        {
+            return false;
+        }
+        object.source_computed_literal = Some(origin);
+        true
+    }
+
     #[must_use]
     pub const fn id(&self) -> TypeId {
         self.id
@@ -654,6 +709,43 @@ impl TypeRecord {
 
 /// Canonical store specialization used by subsequent type-checker modules.
 pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, MapperPayload>;
+
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Retains the host-proved origin only on the original imported wrapper result.
+    pub(super) fn retain_type_alias_imported_body(
+        &mut self,
+        result: TypeId,
+        proof: Arc<super::source_imports::SourceAliasBodyTypeImportPlan>,
+    ) -> bool {
+        let Some(record) = self.type_payload(result) else {
+            return false;
+        };
+        let Some(alias) = record.alias() else {
+            return false;
+        };
+        if !matches!(record.data(), TypeData::Object(object)
+            if object.target.is_some() && object.mapper.is_some())
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED)
+            || proof.validate_wrapper_identity(self, alias).is_err()
+        {
+            return false;
+        }
+        let Some(identity) = self.type_alias_payload(alias) else {
+            return false;
+        };
+        if let Some(existing) = identity.imported_body.as_ref() {
+            return existing.as_ref() == proof.as_ref();
+        }
+        self.type_alias_payload_mut(alias)
+            .expect("the alias identity was checked")
+            .imported_body = Some(proof);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+}
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn type_is_exact_callable_object(&self, type_: TypeId) -> bool {
@@ -709,6 +801,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             id,
             symbol,
             type_arguments: None,
+            imported_body: None,
         }))
     }
 
@@ -1341,6 +1434,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 
     pub fn set_type_alias(&mut self, id: TypeId, alias: Option<TypeAliasId>) -> bool {
         if !self.valid_record_alias(alias) {
+            return false;
+        }
+        if alias.and_then(|alias| self.type_alias(alias)).is_some_and(|alias| alias.imported_body().is_some())
+            && self.type_payload(id).is_none_or(|record| {
+                !record.object_flags().contains(ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED)
+                    || !matches!(record.data(), TypeData::Object(object) if object.target.is_some() && object.mapper.is_some())
+            })
+        {
             return false;
         }
         let Some(current) = self.type_payload(id).map(TypeRecord::alias) else {
@@ -2479,6 +2580,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             TypeData::Literal(data)
                 if record.flags == flags && Self::literal_values_are_equal(&data.value, value)
         )
+    }
+
+    /// Checks the record header without resolving its members or operands.
+    pub(super) fn type_record_header_is_valid(&self, type_: TypeId) -> bool {
+        self.type_payload(type_).is_some_and(|record| {
+            Self::valid_type_flags_for_record(record, record.flags)
+                && Self::valid_object_flags_for_record(record, record.object_flags)
+        })
     }
 
     fn valid_type_flags_for_record(record: &TypeRecord, flags: TypeFlags) -> bool {

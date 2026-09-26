@@ -1,8 +1,9 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
 use super::super::{
-    completed_source_class_method_type, completed_source_class_property_type,
-    emit_standard_class_fields, validate_index_type_cache,
+    ClassPropertyPlan, ClassTypeQueryContext, completed_source_class_method_type,
+    completed_source_class_property_type, emit_standard_class_fields, plan_property_with_body_mode,
+    preflight_source_class_annotation, validate_index_type_cache,
 };
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
@@ -40,6 +41,7 @@ struct AnnotatedMemberPlan {
     annotation: NodeRef,
     method: bool,
     readonly: bool,
+    source_property: Option<ClassPropertyPlan>,
 }
 
 fn annotation_type_if_ready(
@@ -83,7 +85,7 @@ fn annotation_type_if_ready(
                     .and_then(|links| links.declared_type)
             } else if owner.flags() == SymbolFlags::CLASS {
                 let class = plan_class_query(store, host, symbol)?;
-                class_query_shell_state(store, &class)?.instance
+                class_query_shell_state(store, host, &class)?.instance
             } else if owner.flags() == SymbolFlags::INTERFACE
                 && preflight_class_or_interface_reference(
                     store,
@@ -132,7 +134,7 @@ fn member_binding(
     let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(symbol));
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let class = plan_class_query(store, host, record.parent().ok_or_else(invalid)?)?;
-    class_query_shell_state(store, &class)?;
+    class_query_shell_state(store, host, &class)?;
     let [declaration] = record.declarations().unwrap_or_default() else {
         let declaration = record.value_declaration().unwrap_or(class.declaration);
         return Err(unsupported(ClassUnsupported::Member {
@@ -171,12 +173,40 @@ fn plan_annotated_member(
             kind: record.kind,
         })
     };
+    let source_property = match &record.data {
+        NodeData::PropertyDeclaration(property) if property.postfix_token.is_some() => {
+            let owner = store
+                .symbol(class.symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            let property = plan_property_with_body_mode(
+                store,
+                host,
+                class.symbol,
+                declaration,
+                owner.members(),
+                owner.exports().ok_or_else(reject)?,
+                true,
+            )?;
+            if !property.optional && !property.definite
+                || property.initializer_node.is_some()
+                || !property.definite
+                    && !matches!(
+                        preflight_node(store, host, property.type_node)?.data,
+                        NodeData::TypeReferenceNode(_)
+                    )
+            {
+                return Err(reject());
+            }
+            Some(property)
+        }
+        _ => None,
+    };
     let (name, annotation, modifiers, method) = match &record.data {
         NodeData::PropertyDeclaration(property)
             if record.kind == SyntaxKind::PropertyDeclaration
                 && property.symbol.is_none()
                 && property.facts == 0
-                && property.postfix_token.is_none() =>
+                && (property.postfix_token.is_none() || source_property.is_some()) =>
         {
             (
                 property.name,
@@ -244,7 +274,9 @@ fn plan_annotated_member(
             annotation,
         )));
     }
-    annotation_type_if_ready(store, host, annotation)?;
+    if source_property.is_none() {
+        annotation_type_if_ready(store, host, annotation)?;
+    }
     Ok(AnnotatedMemberPlan {
         class,
         declaration,
@@ -252,6 +284,7 @@ fn plan_annotated_member(
         annotation,
         method,
         readonly,
+        source_property,
     })
 }
 
@@ -264,7 +297,7 @@ fn initialized_type_if_ready(
     let symbol = match &record.data {
         NodeData::NewExpression(_) => {
             let plan = default_new_query_plan(store, host, node)?;
-            return Ok(class_query_shell_state(store, &plan)?.instance);
+            return Ok(class_query_shell_state(store, host, &plan)?.instance);
         }
         NodeData::PropertyAccessExpression(_) => {
             class_query_reference_symbol(store, host, node)?
@@ -383,7 +416,7 @@ fn default_new_query_plan(
     {
         return Err(reject());
     }
-    class_query_shell_state(store, &plan)?;
+    class_query_shell_state(store, host, &plan)?;
     Ok(plan)
 }
 
@@ -431,6 +464,24 @@ impl ClassValueQuery<'_, '_, '_> {
             self.diagnostics,
         )?
         .get_type_from_type_node(node)?)
+    }
+
+    fn member_annotation_type_if_ready(
+        &self,
+        plan: &AnnotatedMemberPlan,
+    ) -> Result<Option<TypeId>, ClassError> {
+        if plan.source_property.is_some() {
+            return Ok(preflight_source_class_annotation(
+                self.store,
+                self.host,
+                self.global_types,
+                self.options.into(),
+                plan.annotation,
+                plan.class.symbol,
+            )?
+            .cached_type(self.store, self.host, Some(self.global_types))?);
+        }
+        annotation_type_if_ready(self.store, self.host, plan.annotation)
     }
 
     fn value_type(
@@ -532,7 +583,8 @@ impl ClassValueQuery<'_, '_, '_> {
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, ClassError> {
-        self.member_type_inner(symbol, &mut HashSet::new())
+        let type_ = self.member_type_inner(symbol, &mut HashSet::new())?;
+        self.read_type(symbol, type_)
     }
 
     fn member_type_inner(
@@ -560,7 +612,12 @@ impl ClassValueQuery<'_, '_, '_> {
         symbol: SemanticSymbolId,
         active: &mut HashSet<SemanticSymbolId>,
     ) -> Result<TypeId, ClassError> {
-        if let Some(type_) = completed_source_class_method_type(self.store, self.host, symbol)? {
+        if let Some(type_) = completed_source_class_method_type(
+            self.store,
+            self.host,
+            symbol,
+            &ClassTypeQueryContext::new(self.global_types, self.options),
+        )? {
             return Ok(type_);
         }
         match plan_selected_class_member(self.store, self.host, symbol) {
@@ -581,7 +638,7 @@ impl ClassValueQuery<'_, '_, '_> {
         if plan_annotated_member(self.store, self.host, plan.symbol)? != *plan {
             return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
         }
-        let ready = annotation_type_if_ready(self.store, self.host, plan.annotation)?;
+        let ready = self.member_annotation_type_if_ready(plan)?;
         if let Some(links) = self.store.value_symbol_links(plan.symbol)
             && links != &ValueSymbolLinks::default()
         {
@@ -638,8 +695,20 @@ impl ClassValueQuery<'_, '_, '_> {
         {
             return Err(invalid());
         }
-        let type_ = self.annotation_type(plan.annotation)?;
-        if annotation_type_if_ready(self.store, self.host, plan.annotation)? != Some(type_) {
+        let type_ = if plan.source_property.is_some() {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                self.store,
+                self.host,
+                self.global_types,
+                self.options,
+                self.session,
+                self.diagnostics,
+            )?
+            .get_type_from_source_class_annotation(plan.annotation, plan.class.symbol)?
+        } else {
+            self.annotation_type(plan.annotation)?
+        };
+        if self.member_annotation_type_if_ready(plan)? != Some(type_) {
             return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
                 plan.annotation,
             )));
@@ -718,6 +787,37 @@ impl ClassValueQuery<'_, '_, '_> {
         }
         let name = NodeRef::new(declaration.arena, declaration.file, property.name);
         let name_record = preflight_node(self.store, self.host, name)?;
+        if name_record.kind == SyntaxKind::PrivateIdentifier
+            && let Some(initializer) = property.initializer
+            && self.store.source_node_kind(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                initializer,
+            )) == Some(SyntaxKind::ObjectLiteralExpression)
+        {
+            let owner = self
+                .store
+                .symbol(class.symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            let planned = plan_property_with_body_mode(
+                self.store,
+                self.host,
+                class.symbol,
+                declaration,
+                owner.members(),
+                owner.exports().ok_or_else(reject)?,
+                true,
+            )?;
+            return completed_source_class_property_type(
+                self.store,
+                self.host,
+                class.symbol,
+                symbol,
+                declaration,
+                planned.type_node,
+            )?
+            .ok_or_else(reject);
+        }
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(reject());
         };
@@ -1106,7 +1206,7 @@ impl ClassValueQuery<'_, '_, '_> {
         let owner = bound_symbol(self.store, self.host, initializer)
             .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(initializer)))?;
         let class = plan_class_query(self.store, self.host, owner)?;
-        let state = class_query_shell_state(self.store, &class)?;
+        let state = class_query_shell_state(self.store, self.host, &class)?;
         let symbol = bound_symbol(self.store, self.host, declaration)
             .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
         let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(symbol));

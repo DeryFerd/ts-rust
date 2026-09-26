@@ -934,7 +934,10 @@ fn is_expression_node(
                             .is_some_and(|operator| operator.kind == SyntaxKind::InKeyword)
             )
         }),
-        SyntaxKind::QualifiedName => is_qualified_expression(arena, node_id, parent),
+        SyntaxKind::QualifiedName => {
+            is_qualified_expression(arena, node_id, parent)
+                || is_class_heritage_expression(arena, node_id)
+        }
         SyntaxKind::Identifier => {
             parent.is_some_and(|parent| parent.kind == SyntaxKind::TypeQuery)
                 || is_jsx_tag(node_id, parent)
@@ -949,6 +952,58 @@ fn is_expression_node(
         }
         _ => false,
     }
+}
+
+fn is_class_heritage_expression(arena: &NodeArena, mut node_id: NodeId) -> bool {
+    // Go parses class heritage names as property-access expressions. This
+    // parser retains entity names instead. Follow only their real expression
+    // edges; type arguments and unrelated qualified type names stay excluded.
+    for _ in 0..arena.len() {
+        let Some(parent_id) = arena.get(node_id).and_then(|node| node.parent) else {
+            return false;
+        };
+        let Some(parent) = arena.get(parent_id) else {
+            return false;
+        };
+        match &parent.data {
+            NodeData::QualifiedName(name) if name.left == node_id => {}
+            NodeData::CallExpression(call) if call.expression == node_id => {}
+            NodeData::PropertyAccessExpression(access) if access.expression == node_id => {}
+            NodeData::ElementAccessExpression(access) if access.expression == node_id => {}
+            NodeData::ExpressionWithTypeArguments(expression)
+                if expression.expression == node_id =>
+            {
+                let Some(clause_id) = parent.parent else {
+                    return false;
+                };
+                let Some(clause) = arena.get(clause_id) else {
+                    return false;
+                };
+                let NodeData::HeritageClause(heritage) = &clause.data else {
+                    return false;
+                };
+                if !matches!(
+                    heritage.token,
+                    SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+                ) || !heritage.types.nodes.contains(&parent_id)
+                {
+                    return false;
+                }
+                let Some(owner) = clause.parent.and_then(|owner| arena.get(owner)) else {
+                    return false;
+                };
+                let clauses = match &owner.data {
+                    NodeData::ClassDeclaration(class) => class.heritage_clauses.as_ref(),
+                    NodeData::ClassExpression(class) => class.heritage_clauses.as_ref(),
+                    _ => return false,
+                };
+                return clauses.is_some_and(|clauses| clauses.nodes.contains(&clause_id));
+            }
+            _ => return false,
+        }
+        node_id = parent_id;
+    }
+    false
 }
 
 fn is_qualified_expression<'arena>(
@@ -1073,6 +1128,10 @@ pub(super) fn declaration_name(parent: &Node) -> Option<NodeId> {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/class_heritage_artifact_rows.rs"]
+mod class_heritage_artifact_rows;
+
+#[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, SyntaxKind};
     use ts_checker::semantic::{
@@ -1087,9 +1146,69 @@ mod tests {
 
     use super::{
         ArtifactRenderError, SemanticArtifactError, SemanticArtifactKind, SemanticArtifactWalk,
-        declaration_full_start, ecma_line_and_utf16_column, render_baseline, render_program,
-        source_files, walk_program,
+        declaration_full_start, ecma_line_and_utf16_column, is_class_heritage_expression,
+        render_baseline, render_program, source_files, walk_program,
     };
+
+    #[test]
+    fn class_heritage_expression_requires_actual_parent_and_list_membership() {
+        let source =
+            "class Child extends Names.Base<Names.Argument> {}\nclass Other extends Names.Other {}";
+        let parsed = ts_parser::parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty());
+        let named = |text: &str| {
+            parsed
+                .arena
+                .iter()
+                .find(|(_, node)| {
+                    node.kind == SyntaxKind::QualifiedName
+                        && &source[node.range.start.get() as usize..node.range.end.get() as usize]
+                            == text
+                })
+                .unwrap()
+                .0
+        };
+        let base = named("Names.Base");
+        let argument = named("Names.Argument");
+        let other = named("Names.Other");
+        let reference = parsed.arena.get(base).unwrap().parent.unwrap();
+        let clause = parsed.arena.get(reference).unwrap().parent.unwrap();
+        let owner = parsed.arena.get(clause).unwrap().parent.unwrap();
+        let other_reference = parsed.arena.get(other).unwrap().parent.unwrap();
+        let other_clause = parsed.arena.get(other_reference).unwrap().parent.unwrap();
+        let other_owner = parsed.arena.get(other_clause).unwrap().parent.unwrap();
+        assert!(is_class_heritage_expression(&parsed.arena, base));
+        assert!(!is_class_heritage_expression(&parsed.arena, argument));
+
+        for damaged in [base, reference, clause, owner] {
+            let mut arena = parsed.arena.clone();
+            match damaged {
+                node if node == base => arena.get_mut(base).unwrap().parent = Some(other_reference),
+                node if node == reference => {
+                    arena.get_mut(reference).unwrap().parent = Some(other_clause);
+                }
+                node if node == clause => {
+                    arena.get_mut(clause).unwrap().parent = Some(other_owner);
+                }
+                _ => {
+                    let NodeData::ClassDeclaration(class) = &mut arena.get_mut(owner).unwrap().data
+                    else {
+                        panic!("expected the actual class owner");
+                    };
+                    class.heritage_clauses.as_mut().unwrap().nodes.clear();
+                }
+            }
+            assert!(!is_class_heritage_expression(&arena, base));
+            assert!(is_class_heritage_expression(&arena, other));
+            *arena.get_mut(damaged).unwrap() = parsed.arena.get(damaged).unwrap().clone();
+            assert!(is_class_heritage_expression(&arena, base));
+        }
+
+        let mut arena = parsed.arena.clone();
+        arena.get_mut(argument).unwrap().parent = Some(reference);
+        assert!(!is_class_heritage_expression(&arena, argument));
+        assert!(is_class_heritage_expression(&arena, base));
+    }
 
     #[test]
     fn class_query_errors_keep_unsupported_and_invariant_outcomes_separate() {

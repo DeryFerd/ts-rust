@@ -667,7 +667,43 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             if let Some(locals) = self.bound.locals(self.node_ref(current))
                 && !self.is_global_source_file(current)
             {
-                let candidate = self.lookup(locals, name, meaning)?;
+                let candidate = self.lookup(locals, name, meaning);
+                if let Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) =
+                    &candidate
+                {
+                    use std::io::Write as _;
+
+                    let origin = original_location
+                        .and_then(|location| self.bound_node(location))
+                        .and_then(|node| self.arena.get(node))
+                        .map(|node| (node.kind, node.range));
+                    let adjusted = self.node_ref(current);
+                    let mut bytes = [0_u8; 1024];
+                    let mut line = std::io::Cursor::new(&mut bytes[..1000]);
+                    let mut truncated = write!(
+                        line,
+                        "PATHE_ALIAS_LOOKUP site=bound-locals alias={alias:?} original={original_location:?} original_ast={origin:?} current={current_location:?} adjusted={adjusted:?} locals={locals:?} meaning={} is_use={is_use} exclude_globals={exclude_globals} name_truncated={} name=\"",
+                        meaning.bits(),
+                        name.chars().nth(32).is_some(),
+                    )
+                    .is_err();
+                    for character in name.chars().take(32) {
+                        for escaped in character.escape_default() {
+                            truncated |= write!(line, "{escaped}").is_err();
+                        }
+                    }
+                    truncated |= write!(line, "\"").is_err();
+                    let length = usize::try_from(line.position())
+                        .expect("alias trace fits its fixed buffer");
+                    let suffix: &[u8] = if truncated {
+                        b" record_truncated=1\n"
+                    } else {
+                        b" record_truncated=0\n"
+                    };
+                    bytes[length..length + suffix.len()].copy_from_slice(suffix);
+                    let _ = std::io::stderr().write_all(&bytes[..length + suffix.len()]);
+                }
+                let candidate = candidate?;
                 if let Some(candidate) = candidate {
                     let mut use_result = true;
                     let record = self

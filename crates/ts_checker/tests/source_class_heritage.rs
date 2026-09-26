@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, ClassError, ClassUnsupported,
-    SourceCheckError, TypeData, UnsupportedSourceSyntax,
+    DeclaredTypeError, SourceCheckError, TypeData, TypeNodeUnavailable, UnsupportedSourceSyntax,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
@@ -404,12 +404,39 @@ fn later_bad_derived_plan_keeps_every_earlier_class_cold_across_retries() {
     );
 
     for _ in 0..2 {
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Class(_)
+        let result = context.check_source_file(file);
+        let declaration = class_declaration(&parsed, file, "Bad");
+        let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("Bad remains a class declaration")
+        };
+        let missing_annotation = class
+            .members
+            .nodes
+            .iter()
+            .find_map(|&member| {
+                let NodeData::PropertyDeclaration(property) = &parsed.arena.get(member)?.data
+                else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(property.name)?.data else {
+                    return None;
+                };
+                (name.text == "second").then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    property.type_?,
+                ))
+            })
+            .expect("Bad.second retains its type annotation");
+        assert_eq!(
+            result,
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::MissingTypeReference(
+                    missing_annotation
+                ))
             ))
-        ));
+        );
         assert_eq!(
             (
                 context.store().type_len(),

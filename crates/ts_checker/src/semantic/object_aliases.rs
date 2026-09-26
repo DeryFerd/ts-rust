@@ -5,23 +5,34 @@
 //! literals retain only a mapper from lexical parameters to arguments. Member and
 //! property-value publication has separate validation in `instantiated_members`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use ts_ast::{NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
 use super::{
-    CanonicalTypeMapperStore, TypeId, TypeMapperId,
-    declared::cached_ordinary_type_parameter_owner,
+    CanonicalTypeMapperStore, DeclaredTypeHost, TypeId, TypeMapperId,
+    array_types::CanonicalArrayTargets,
+    declared::{cached_ordinary_type_parameter_owner, preflight_node},
+    functions::{self, FunctionTypePlan, FunctionTypeState},
+    indexed_access_types::SourceAliasIndexedBoundPlan,
     instantiate::PropertyObjectAliasRecovery,
     links::{SourceFileRef, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperKind,
-    object_members::PlannedProperty,
+    object_members::{
+        PlannedProperty, PropertyObjectPlan, SourceAliasClosedObject, cached_planned_type_identity,
+        source_alias_closed_object,
+    },
     relater::RelationUnavailable,
+    source_imports::SourcePropertyTypeImportPlan,
     store::{SemanticStore, SourceNodeParent},
-    type_nodes::type_alias_instantiation_cache_key,
+    type_nodes::{
+        SourceAliasOperandSource, normalize_bigint_literal, normalize_numeric_separators,
+        type_alias_instantiation_cache_key,
+    },
     type_records::{
-        CacheHashKey, ObjectTypeData, TypeCacheState, TypeData, TypeRecord, type_list_key,
+        CacheHashKey, LiteralValue, ObjectTypeData, TypeCacheState, TypeData, TypeRecord,
+        type_list_key,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -175,6 +186,1140 @@ pub(super) struct ClosedTypeAliasSourceHeader {
     pub(super) source_symbol: SemanticSymbolId,
     pub(super) alias_declaration: NodeRef,
     pub(super) alias_symbol: SemanticSymbolId,
+}
+
+/// A query-local proof of one real alias bound or default and its consumed children.
+#[derive(Clone, Debug)]
+pub(super) struct SourceAliasOperandGraph {
+    source: SourceAliasOperandSource,
+    node: NodeRef,
+    type_: TypeId,
+    path: Vec<(NodeRef, NodeRef)>,
+    nodes: BTreeMap<NodeRef, SourceAliasOperandNode>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceAliasOperandNode {
+    type_: TypeId,
+    kind: SyntaxKind,
+    parent: SourceNodeParent,
+    children: Vec<NodeRef>,
+    closed: bool,
+    proof: SourceAliasOperandProof,
+}
+
+#[derive(Clone, Debug)]
+enum SourceAliasOperandProof {
+    Intrinsic,
+    Literal(LiteralValue),
+    Parameter(SemanticSymbolId),
+    Parenthesized(NodeRef),
+    Named {
+        symbol: SemanticSymbolId,
+        body: NodeRef,
+        import: Option<SourcePropertyTypeImportPlan>,
+    },
+    Object {
+        object: Box<SourceAliasClosedObject>,
+        children: Vec<NodeRef>,
+        alias: Option<SemanticSymbolId>,
+    },
+    Function(Box<FunctionTypePlan>),
+    Union {
+        children: Vec<NodeRef>,
+        alias: Option<SemanticSymbolId>,
+    },
+    Array {
+        element: NodeRef,
+        named_target: Option<SemanticSymbolId>,
+        readonly: bool,
+    },
+    StringMapping {
+        symbol: SemanticSymbolId,
+        argument: NodeRef,
+    },
+    Template {
+        texts: Vec<String>,
+        placeholders: Vec<NodeRef>,
+        spans: Vec<(NodeRef, NodeRef, NodeRef)>,
+    },
+    Indexed(Box<SourceAliasIndexedBoundPlan>),
+}
+
+impl SourceAliasOperandGraph {
+    pub(super) fn source(&self) -> &SourceAliasOperandSource {
+        &self.source
+    }
+
+    pub(super) fn matches_operand(
+        &self,
+        source: &SourceAliasOperandSource,
+        node: NodeRef,
+        type_: TypeId,
+    ) -> bool {
+        self.source == *source
+            && source.root() == node
+            && self.node == node
+            && self.type_ == type_
+    }
+
+    pub(super) fn validate_retained(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        source_type: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<(), RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(source_type);
+        self.source
+            .validate_retained(store)
+            .map_err(|_| invalid())?;
+        if source_type != self.type_
+            || source_alias_operand_path(store, &self.source, self.node)? != self.path
+        {
+            return Err(invalid());
+        }
+        self.validate_node(store, self.node, array_targets, &mut HashSet::new())
+    }
+
+    /// The source indexed reader can check its object before its own result exists.
+    pub(super) fn validate_closed_object(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        node: NodeRef,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<(), RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+        self.source
+            .validate_retained(store)
+            .map_err(|_| invalid())?;
+        let row = self.nodes.get(&node).ok_or_else(invalid)?;
+        if row.type_ != type_
+            || !row.closed
+            || !matches!(
+                store.type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Object(_))
+            )
+        {
+            return Err(invalid());
+        }
+        self.validate_node(store, node, array_targets, &mut HashSet::new())
+    }
+
+    /// Only source results and their canonical union constituents enter this mapper.
+    pub(super) fn mapping_type_is_closed(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<bool, RelationUnavailable> {
+        self.validate_retained(store, self.type_, array_targets)?;
+        if self.nodes.values().any(|row| row.type_ == type_) {
+            return self.closed_semantic_child(store, type_, &mut HashSet::new());
+        }
+        for row in self.nodes.values() {
+            let mut pending = vec![row.type_];
+            let mut seen = HashSet::new();
+            while let Some(parent) = pending.pop() {
+                if !seen.insert(parent) {
+                    continue;
+                }
+                let Some(TypeData::Union(union)) = store.type_payload(parent).map(TypeRecord::data)
+                else {
+                    continue;
+                };
+                if union.union.types.contains(&type_) || union.origin == Some(type_) {
+                    return self.closed_semantic_child(store, type_, &mut HashSet::new());
+                }
+                pending.extend_from_slice(&union.union.types);
+                pending.extend(union.origin);
+            }
+        }
+        Err(RelationUnavailable::InvalidStructuredMembers(type_))
+    }
+
+    fn closed_semantic_child(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+        if !active.insert(type_) {
+            return Err(invalid());
+        }
+        let closed = match store.type_payload(type_).ok_or_else(invalid)?.data() {
+            TypeData::Intrinsic(_) | TypeData::Literal(_) => true,
+            TypeData::TypeParameter(_) => {
+                if !self.nodes.values().any(|row| {
+                    row.type_ == type_ && matches!(row.proof, SourceAliasOperandProof::Parameter(_))
+                }) {
+                    return Err(invalid());
+                }
+                false
+            }
+            TypeData::Union(union) => {
+                let mut closed = true;
+                for child in &union.union.types {
+                    closed &= self.closed_semantic_child(store, *child, active)?;
+                }
+                closed
+            }
+            TypeData::TypeReference(reference) => {
+                if !self.nodes.values().any(|row| {
+                    row.type_ == type_ && matches!(row.proof, SourceAliasOperandProof::Array { .. })
+                }) {
+                    return Err(invalid());
+                }
+                let Some([element]) = reference.resolved_type_arguments.as_deref() else {
+                    return Err(invalid());
+                };
+                self.closed_semantic_child(store, *element, active)?
+            }
+            _ => self
+                .nodes
+                .values()
+                .find(|row| row.type_ == type_)
+                .filter(|row| row.closed)
+                .map(|_| true)
+                .ok_or_else(invalid)?,
+        };
+        active.remove(&type_);
+        Ok(closed)
+    }
+
+    fn child_type(&self, node: NodeRef) -> Result<TypeId, RelationUnavailable> {
+        self.nodes
+            .get(&node)
+            .map(|row| row.type_)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(self.type_))
+    }
+
+    #[allow(clippy::too_many_lines)] // Each source form rechecks its own existing result reader.
+    fn validate_node(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        node: NodeRef,
+        array_targets: Option<CanonicalArrayTargets>,
+        active: &mut HashSet<NodeRef>,
+    ) -> Result<(), RelationUnavailable> {
+        let row = self
+            .nodes
+            .get(&node)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(self.type_))?;
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(row.type_);
+        if !active.insert(node)
+            || store.source_node_kind(node) != Some(row.kind)
+            || store.source_node_parent(node) != Some(row.parent)
+            || store.source_direct_children(node).as_deref() != Some(row.children.as_slice())
+            || row.children.iter().any(|&child| {
+                store.source_node_parent(child) != Some(SourceNodeParent::Parent(node))
+            })
+            || !source_alias_node_result_matches(store, node, row.type_)
+        {
+            return Err(invalid());
+        }
+        let mut children = Vec::new();
+        let valid = match &row.proof {
+            SourceAliasOperandProof::Intrinsic => {
+                store.source_type_node_result_is_exact(node, row.type_, &[])
+                    || row.kind == SyntaxKind::LiteralType
+                        && store
+                            .source_child_with_kind(node, SyntaxKind::NullKeyword)
+                            .is_some()
+            }
+            SourceAliasOperandProof::Literal(value) => {
+                source_alias_literal_matches(store, row.type_, value)
+                    && store
+                        .symbol_node_links(node)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+            }
+            SourceAliasOperandProof::Parameter(symbol) => {
+                source_alias_parameter_matches(store, &self.source, node, row.type_, *symbol)
+            }
+            SourceAliasOperandProof::Parenthesized(child) => {
+                children.push(*child);
+                row.children.as_slice() == [*child]
+                    && self.child_type(*child)? == row.type_
+                    && store
+                        .symbol_node_links(node)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+            }
+            SourceAliasOperandProof::Named {
+                symbol,
+                body,
+                import,
+            } => {
+                children.push(*body);
+                let header = property_object_alias_identity_source_header(store, *symbol)?;
+                header.parameters.is_empty()
+                    && store.source_direct_type_annotation(header.alias_declaration) == Some(*body)
+                    && self.child_type(*body)? == row.type_
+                    && source_alias_reference_matches(store, node, *symbol, import.as_ref())
+                    && super::object_members::cached_alias_reference_annotation_matches(
+                        store,
+                        *symbol,
+                        &[],
+                        row.type_,
+                    )
+            }
+            SourceAliasOperandProof::Object {
+                object,
+                children: object_children,
+                alias,
+            } => {
+                children.extend_from_slice(object_children);
+                object.validate_retained(store).map_err(|_| invalid())?;
+                source_alias_direct_owner(store, node)? == *alias
+                    && children
+                        .iter()
+                        .all(|child| self.nodes.get(child).is_some_and(|row| row.closed))
+            }
+            SourceAliasOperandProof::Function(function) => {
+                children.push(function.return_type);
+                let expected_return = self.child_type(function.return_type)?;
+                let FunctionTypeState::Resolved { type_, signature } =
+                    functions::function_type_state(store, function, false)
+                        .map_err(|_| invalid())?
+                else {
+                    return Err(invalid());
+                };
+                row.children.as_slice() == [function.return_type]
+                    && type_ == row.type_
+                    && store.source_declaration_belongs_to_symbol(node, function.symbol)
+                    && store.source_symbol_declarations_match(function.symbol)
+                    && store.source_declaration_belongs_to_symbol(node, function.call_symbol)
+                    && store.source_symbol_declarations_match(function.call_symbol)
+                    && source_alias_direct_owner(store, node)? == function.alias_symbol
+                    && !store.signature_has_circular_return_type(signature)
+                    && store.signature(signature).is_some_and(|signature| {
+                        signature
+                            .resolved_return_type()
+                            .is_none_or(|actual| actual == expected_return)
+                    })
+                    && self
+                        .nodes
+                        .get(&function.return_type)
+                        .is_some_and(|row| row.closed)
+            }
+            SourceAliasOperandProof::Union {
+                children: union_children,
+                alias,
+            } => {
+                children.extend_from_slice(union_children);
+                for child in &children {
+                    self.validate_node(store, *child, array_targets, active)?;
+                }
+                let types = children
+                    .iter()
+                    .map(|&child| self.child_type(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                children.clear();
+                source_alias_direct_owner(store, node)? == *alias
+                    && store
+                        .cached_annotation_union_type(&types, alias.map(|symbol| (symbol, &[][..])))
+                        .map_err(|_| invalid())?
+                        == Some(row.type_)
+            }
+            SourceAliasOperandProof::Array {
+                element,
+                named_target,
+                readonly,
+            } => {
+                children.push(*element);
+                let targets = array_targets.ok_or(
+                    RelationUnavailable::UnavailableCanonicalArrayTarget(row.type_),
+                )?;
+                let reference = store
+                    .canonical_array_reference_with_targets(targets, row.type_)
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?;
+                let syntax = match named_target {
+                    None => {
+                        row.kind == SyntaxKind::ArrayType && row.children.as_slice() == [*element]
+                    }
+                    Some(symbol) => {
+                        let target = if *readonly {
+                            targets.readonly_array_type()
+                        } else {
+                            targets.array_type()
+                        };
+                        store.type_payload(target).and_then(TypeRecord::symbol) == Some(*symbol)
+                            && store
+                                .symbol_node_links(node)
+                                .and_then(|links| links.resolved_symbol)
+                                == Some(*symbol)
+                            && matches!(row.children.as_slice(), [name, argument]
+                                if *argument == *element
+                                    && store.source_node_kind(*name) == Some(SyntaxKind::Identifier)
+                                    && store.source_identifier_text(*name) == store.symbol(*symbol).and_then(|record| record.name().as_utf8())
+                                    && store.symbol_node_links(*name).and_then(|links| links.resolved_symbol).is_none_or(|cached| cached == *symbol))
+                    }
+                };
+                syntax
+                    && reference.element_type == self.child_type(*element)?
+                    && reference.readonly == *readonly
+                    && !reference.array_literal
+            }
+            SourceAliasOperandProof::StringMapping { symbol, argument } => {
+                children.push(*argument);
+                source_alias_string_mapping_matches(store, node, *symbol)
+                    && store
+                        .cached_resolved_string_mapping_type(*symbol, self.child_type(*argument)?)
+                        .map_err(|_| invalid())?
+                        == Some(row.type_)
+            }
+            SourceAliasOperandProof::Template {
+                texts,
+                placeholders,
+                spans,
+            } => {
+                children.extend_from_slice(placeholders);
+                let types = placeholders
+                    .iter()
+                    .map(|&child| self.child_type(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                spans.iter().all(|&(span, placeholder, literal)| {
+                    store.source_node_kind(span) == Some(SyntaxKind::TemplateLiteralTypeSpan)
+                        && store.source_node_parent(span) == Some(SourceNodeParent::Parent(node))
+                        && store.source_node_parent(placeholder)
+                            == Some(SourceNodeParent::Parent(span))
+                        && store.source_node_parent(literal) == Some(SourceNodeParent::Parent(span))
+                        && store.source_direct_children(span).as_deref()
+                            == Some(&[placeholder, literal][..])
+                }) && store
+                    .cached_resolved_template_literal_type(texts, &types)
+                    .map_err(|_| invalid())?
+                    == Some(row.type_)
+            }
+            SourceAliasOperandProof::Indexed(plan) => {
+                children.extend([plan.object(), plan.index()]);
+                super::indexed_access_types::cached_source_alias_indexed_bound(
+                    store,
+                    plan,
+                    self,
+                    self.child_type(plan.object())?,
+                    self.child_type(plan.index())?,
+                    array_targets,
+                )
+                .map_err(|_| invalid())?
+                    == Some(row.type_)
+            }
+        };
+        if !valid {
+            return Err(invalid());
+        }
+        for child in children {
+            self.validate_node(store, child, array_targets, active)?;
+        }
+        active.remove(&node);
+        Ok(())
+    }
+}
+
+fn source_alias_operand_path(
+    store: &CanonicalTypeMapperStore,
+    source: &SourceAliasOperandSource,
+    mut child: NodeRef,
+) -> Result<Vec<(NodeRef, NodeRef)>, RelationUnavailable> {
+    let invalid = || RelationUnavailable::Symbol(source.alias());
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    while child != source.root() {
+        if !seen.insert(child) {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(child) else {
+            return Err(invalid());
+        };
+        let children = store.source_direct_children(parent).ok_or_else(invalid)?;
+        let valid = match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType | SyntaxKind::ArrayType) => {
+                children.as_slice() == [child]
+            }
+            Some(SyntaxKind::UnionType) => children.len() >= 2 && children.contains(&child),
+            Some(SyntaxKind::IndexedAccessType) => children.len() == 2 && children.contains(&child),
+            _ => false,
+        };
+        if !valid || parent.arena != source.root().arena || parent.file != source.root().file {
+            return Err(invalid());
+        }
+        path.push((child, parent));
+        child = parent;
+    }
+    Ok(path)
+}
+
+fn source_alias_direct_owner(
+    store: &CanonicalTypeMapperStore,
+    mut node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+    let mut seen = HashSet::new();
+    while let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(node) {
+        if !seen.insert(node) {
+            return Err(RelationUnavailable::MissingBootstrap);
+        }
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType)
+                if store.source_direct_children(parent).as_deref() == Some(&[node][..]) =>
+            {
+                node = parent
+            }
+            Some(SyntaxKind::TypeAliasDeclaration)
+                if store.source_direct_type_annotation(parent) == Some(node) =>
+            {
+                let alias = bound_declaration_symbol(store, parent)
+                    .ok_or(RelationUnavailable::MissingBootstrap)?;
+                let header = property_object_alias_identity_source_header(store, alias)?;
+                if header.alias_declaration != parent || !header.parameters.is_empty() {
+                    return Err(RelationUnavailable::Symbol(alias));
+                }
+                return Ok(Some(alias));
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn source_alias_parameter_matches(
+    store: &CanonicalTypeMapperStore,
+    source: &SourceAliasOperandSource,
+    node: NodeRef,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(index) = source
+        .parameters()
+        .iter()
+        .position(|pair| *pair == source.parameter())
+    else {
+        return false;
+    };
+    source.parameters()[..index]
+        .iter()
+        .any(|&(declaration, parameter)| {
+            parameter == symbol
+                && cached_ordinary_type_parameter_owner(store, type_) == Some(symbol)
+                && store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    == Some(type_)
+                && store.source_declaration_symbol(declaration) == Some(symbol)
+        })
+        && source_alias_reference_matches(store, node, symbol, None)
+}
+
+fn source_alias_reference_matches(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    import: Option<&SourcePropertyTypeImportPlan>,
+) -> bool {
+    let Some(children) = store.source_direct_children(node) else {
+        return false;
+    };
+    let [name] = children.as_slice() else {
+        return false;
+    };
+    if store.source_node_kind(node) != Some(SyntaxKind::TypeReference)
+        || store.source_node_kind(*name) != Some(SyntaxKind::Identifier)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return false;
+    }
+    if let Some(import) = import {
+        return import.annotation() == node
+            && import.target_symbol() == symbol
+            && import.validate_retained(store).is_ok();
+    }
+    store
+        .symbol_node_links(node)
+        .and_then(|links| links.resolved_symbol)
+        == Some(symbol)
+        && store
+            .symbol_node_links(*name)
+            .and_then(|links| links.resolved_symbol)
+            .is_none_or(|cached| cached == symbol)
+        && store.symbol(symbol).is_some_and(|record| {
+            record.name().as_utf8() == store.source_identifier_text(*name)
+                && record.declarations().is_some_and(|declarations| {
+                    declarations.iter().all(|declaration| {
+                        declaration.file == node.file && declaration.arena == node.arena
+                    })
+                })
+        })
+}
+
+fn source_alias_string_mapping_matches(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some([declaration]) = record.declarations() else {
+        return false;
+    };
+    let Some(body) = store.source_direct_type_annotation(*declaration) else {
+        return false;
+    };
+    store.source_node_kind(body) == Some(SyntaxKind::IntrinsicKeyword)
+        && store.string_mapping_kind(symbol).is_ok()
+        && record.flags() == SymbolFlags::TYPE_ALIAS
+        && record.check_flags() == CheckFlags::NONE
+        && store.source_declaration_belongs_to_symbol(*declaration, symbol)
+        && store.source_symbol_declarations_match(symbol)
+        && store.source_global_bindings().and_then(|bindings| bindings.get(record.name())).is_some_and(|binding| binding.symbol == symbol)
+        && store.symbol_node_links(node).and_then(|links| links.resolved_symbol) == Some(symbol)
+        && store.source_direct_children(node).is_some_and(|children| {
+            matches!(children.as_slice(), [name, _]
+                if store.source_identifier_text(*name) == record.name().as_utf8()
+                    && store.symbol_node_links(*name).and_then(|links| links.resolved_symbol).is_none_or(|cached| cached == symbol))
+        })
+}
+
+fn source_alias_literal_matches(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    value: &LiteralValue,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Literal(literal) = record.data() else {
+        return false;
+    };
+    let (cached, flags) = match value {
+        LiteralValue::String(value) => (
+            bootstrap.cached_string_literal_type(value),
+            TypeFlags::STRING_LITERAL,
+        ),
+        LiteralValue::Number(value) => (
+            bootstrap.cached_number_literal_type(*value),
+            TypeFlags::NUMBER_LITERAL,
+        ),
+        LiteralValue::Boolean(value) => (
+            Some(if *value {
+                bootstrap.regular_true_type
+            } else {
+                bootstrap.regular_false_type
+            }),
+            TypeFlags::BOOLEAN_LITERAL,
+        ),
+        LiteralValue::BigInt(value) => (
+            bootstrap.cached_bigint_literal_type(value),
+            TypeFlags::BIG_INT_LITERAL,
+        ),
+        LiteralValue::ComputedEnum => return false,
+    };
+    cached == Some(type_)
+        && literal.value == *value
+        && literal.regular_type == type_
+        && record.flags() == flags
+        && record.object_flags() == ObjectFlags::NONE
+        && record.symbol().is_none()
+        && record.alias().is_none()
+}
+
+#[allow(clippy::too_many_arguments)] // The current query owns all source and child capabilities.
+pub(super) fn build_source_alias_operand_graph(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    operand: &SourceAliasOperandSource,
+    node: NodeRef,
+    source_type: TypeId,
+    objects: &[PropertyObjectPlan],
+    imports: &[SourcePropertyTypeImportPlan],
+    indexed: &[SourceAliasIndexedBoundPlan],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceAliasOperandGraph, RelationUnavailable> {
+    operand
+        .validate_retained(store)
+        .map_err(|_| RelationUnavailable::Symbol(operand.alias()))?;
+    let mut graph = SourceAliasOperandGraph {
+        source: operand.clone(),
+        node,
+        type_: source_type,
+        path: source_alias_operand_path(store, operand, node)?,
+        nodes: BTreeMap::new(),
+    };
+    SourceAliasOperandGraphBuilder {
+        store,
+        host,
+        objects,
+        imports,
+        indexed,
+        array_targets,
+        active: HashSet::new(),
+        graph: &mut graph,
+    }
+    .read(node, source_type, false)?;
+    graph.validate_retained(store, source_type, array_targets)?;
+    Ok(graph)
+}
+
+struct SourceAliasOperandGraphBuilder<'a, 'host> {
+    store: &'a CanonicalTypeMapperStore,
+    host: &'a DeclaredTypeHost<'host>,
+    objects: &'a [PropertyObjectPlan],
+    imports: &'a [SourcePropertyTypeImportPlan],
+    indexed: &'a [SourceAliasIndexedBoundPlan],
+    array_targets: Option<CanonicalArrayTargets>,
+    active: HashSet<NodeRef>,
+    graph: &'a mut SourceAliasOperandGraph,
+}
+
+impl SourceAliasOperandGraphBuilder<'_, '_> {
+    fn read_child(&mut self, node: NodeRef, closed: bool) -> Result<TypeId, RelationUnavailable> {
+        let type_ = source_alias_cached_child(self.store, node).ok_or(
+            RelationUnavailable::InvalidStructuredMembers(self.graph.type_),
+        )?;
+        self.read(node, type_, closed)?;
+        Ok(type_)
+    }
+
+    #[allow(clippy::too_many_lines)] // This records existing source results without another evaluator.
+    fn read(
+        &mut self,
+        node: NodeRef,
+        type_: TypeId,
+        closed: bool,
+    ) -> Result<(), RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+        if let Some(row) = self.graph.nodes.get(&node) {
+            return if row.type_ == type_ && (!closed || row.closed) {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        if !self.active.insert(node) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+        }
+        let record = preflight_node(self.store, self.host, node).map_err(|_| invalid())?;
+        let children = self
+            .store
+            .source_direct_children(node)
+            .ok_or_else(invalid)?;
+        let parent = self.store.source_node_parent(node).ok_or_else(invalid)?;
+        if self.store.source_node_kind(node) != Some(record.kind)
+            || !source_alias_node_result_matches(self.store, node, type_)
+            || children.iter().any(|&child| {
+                self.store.source_node_parent(child) != Some(SourceNodeParent::Parent(node))
+            })
+        {
+            return Err(invalid());
+        }
+        let mut row_closed = true;
+        let proof = match &record.data {
+            NodeData::KeywordTypeNode(_) if record.kind != SyntaxKind::IntrinsicKeyword => {
+                SourceAliasOperandProof::Intrinsic
+            }
+            NodeData::LiteralTypeNode(literal) => {
+                let literal = NodeRef::new(node.arena, node.file, literal.literal);
+                if self.store.source_node_parent(literal) != Some(SourceNodeParent::Parent(node)) {
+                    return Err(invalid());
+                }
+                match source_alias_literal_value(self.store, self.host, literal)
+                    .map_err(|_| invalid())?
+                {
+                    Some(value) => SourceAliasOperandProof::Literal(value),
+                    None => SourceAliasOperandProof::Intrinsic,
+                }
+            }
+            NodeData::ParenthesizedTypeNode(inner) => {
+                let child = NodeRef::new(node.arena, node.file, inner.type_);
+                if self.read_child(child, closed)? != type_ {
+                    return Err(invalid());
+                }
+                row_closed = self.graph.nodes[&child].closed;
+                SourceAliasOperandProof::Parenthesized(child)
+            }
+            NodeData::TypeReferenceNode(reference) => {
+                let name = NodeRef::new(node.arena, node.file, reference.type_name);
+                let symbol = self
+                    .store
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol)
+                    .ok_or_else(invalid)?;
+                let arguments = reference
+                    .type_arguments
+                    .as_ref()
+                    .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+                let import = self
+                    .imports
+                    .iter()
+                    .find(|plan| plan.annotation() == node)
+                    .cloned();
+                if let Some(import) = &import {
+                    import
+                        .validate_retained(self.store)
+                        .map_err(|_| invalid())?;
+                } else {
+                    let mut resolver = self
+                        .host
+                        .name_resolver_host(self.store)
+                        .map_err(|_| invalid())?;
+                    let resolved = resolver
+                        .resolve_entity_name(name, SymbolFlags::TYPE)
+                        .map_err(|_| invalid())?;
+                    if resolved.and_then(|symbol| self.store.get_merged_symbol(symbol))
+                        != Some(symbol)
+                    {
+                        return Err(invalid());
+                    }
+                }
+                if arguments.is_empty()
+                    && cached_ordinary_type_parameter_owner(self.store, type_) == Some(symbol)
+                {
+                    if closed
+                        || !source_alias_parameter_matches(
+                            self.store,
+                            &self.graph.source,
+                            node,
+                            type_,
+                            symbol,
+                        )
+                    {
+                        return Err(invalid());
+                    }
+                    row_closed = false;
+                    SourceAliasOperandProof::Parameter(symbol)
+                } else if arguments.len() == 1
+                    && import.is_none()
+                    && source_alias_string_mapping_matches(self.store, node, symbol)
+                {
+                    let argument = NodeRef::new(node.arena, node.file, arguments[0]);
+                    self.read_child(argument, true)?;
+                    SourceAliasOperandProof::StringMapping { symbol, argument }
+                } else if arguments.len() == 1
+                    && import.is_none()
+                    && let Some(targets) = self.array_targets
+                    && let Some(array) = self
+                        .store
+                        .canonical_array_reference_with_targets(targets, type_)
+                        .map_err(|_| invalid())?
+                {
+                    let element = NodeRef::new(node.arena, node.file, arguments[0]);
+                    if self.read_child(element, closed)? != array.element_type {
+                        return Err(invalid());
+                    }
+                    row_closed = self.graph.nodes[&element].closed;
+                    SourceAliasOperandProof::Array {
+                        element,
+                        named_target: Some(symbol),
+                        readonly: array.readonly,
+                    }
+                } else {
+                    if !arguments.is_empty() {
+                        return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                    }
+                    let symbol = import
+                        .as_ref()
+                        .map_or(symbol, SourcePropertyTypeImportPlan::target_symbol);
+                    let header = property_object_alias_identity_source_header(self.store, symbol)?;
+                    if !header.parameters.is_empty() {
+                        return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                    }
+                    let body = self
+                        .store
+                        .source_direct_type_annotation(header.alias_declaration)
+                        .ok_or_else(invalid)?;
+                    if self.read_child(body, true)? != type_ {
+                        return Err(invalid());
+                    }
+                    SourceAliasOperandProof::Named {
+                        symbol,
+                        body,
+                        import,
+                    }
+                }
+            }
+            NodeData::TypeLiteralNode(_) => {
+                let plans = self
+                    .objects
+                    .iter()
+                    .filter(|plan| plan.node == node)
+                    .collect::<Vec<_>>();
+                let [plan] = plans.as_slice() else {
+                    return Err(invalid());
+                };
+                let plan = (**plan).clone();
+                let alias = source_alias_direct_owner(self.store, node)?;
+                if plan.alias_symbol != alias {
+                    return Err(invalid());
+                }
+                let mut object_children = Vec::new();
+                let mut properties = Vec::new();
+                for property in &plan.properties {
+                    properties.push(self.read_child(property.type_node, true)?);
+                    object_children.push(property.type_node);
+                }
+                let mut indexes = Vec::new();
+                for index in &plan.indexes {
+                    indexes.push((
+                        self.read_child(index.key_type_node, true)?,
+                        self.read_child(index.value_type_node, true)?,
+                    ));
+                    object_children.extend([index.key_type_node, index.value_type_node]);
+                }
+                let object = source_alias_closed_object(
+                    self.store, self.host, &plan, type_, properties, indexes,
+                )
+                .map_err(|_| invalid())?;
+                SourceAliasOperandProof::Object {
+                    object: Box::new(object),
+                    children: object_children,
+                    alias,
+                }
+            }
+            NodeData::FunctionTypeNode(_) => {
+                let function = functions::plan_function_type(
+                    self.store,
+                    self.host,
+                    node,
+                    source_alias_direct_owner(self.store, node)?,
+                    false,
+                    self.array_targets,
+                )
+                .map_err(|_| invalid())?;
+                if !function.alias_parameters.is_empty()
+                    || !function.type_parameters.is_empty()
+                    || !function.parameters.is_empty()
+                    || function.type_predicate.is_some()
+                {
+                    return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                }
+                self.read_child(function.return_type, true)?;
+                SourceAliasOperandProof::Function(Box::new(function))
+            }
+            NodeData::UnionTypeNode(union) => {
+                let mut union_children = Vec::new();
+                for &child in &union.types.nodes {
+                    let child = NodeRef::new(node.arena, node.file, child);
+                    self.read_child(child, closed)?;
+                    row_closed &= self.graph.nodes[&child].closed;
+                    union_children.push(child);
+                }
+                if union_children != children || union_children.len() < 2 {
+                    return Err(invalid());
+                }
+                SourceAliasOperandProof::Union {
+                    children: union_children,
+                    alias: source_alias_direct_owner(self.store, node)?,
+                }
+            }
+            NodeData::ArrayTypeNode(array) => {
+                let element = NodeRef::new(node.arena, node.file, array.element_type);
+                self.read_child(element, closed)?;
+                row_closed = self.graph.nodes[&element].closed;
+                SourceAliasOperandProof::Array {
+                    element,
+                    named_target: None,
+                    readonly: false,
+                }
+            }
+            NodeData::TemplateLiteralTypeNode(template) => {
+                let head = NodeRef::new(node.arena, node.file, template.head);
+                let NodeData::TemplateHead(head_data) =
+                    &preflight_node(self.store, self.host, head)
+                        .map_err(|_| invalid())?
+                        .data
+                else {
+                    return Err(invalid());
+                };
+                if self.store.source_node_parent(head) != Some(SourceNodeParent::Parent(node))
+                    || template.template_spans.nodes.is_empty()
+                {
+                    return Err(invalid());
+                }
+                let mut texts = vec![head_data.text.clone()];
+                let mut placeholders = Vec::new();
+                let mut spans = Vec::new();
+                for (index, &span) in template.template_spans.nodes.iter().enumerate() {
+                    let span = NodeRef::new(node.arena, node.file, span);
+                    let NodeData::TemplateLiteralTypeSpan(data) =
+                        &preflight_node(self.store, self.host, span)
+                            .map_err(|_| invalid())?
+                            .data
+                    else {
+                        return Err(invalid());
+                    };
+                    let placeholder = NodeRef::new(node.arena, node.file, data.type_);
+                    let literal = NodeRef::new(node.arena, node.file, data.literal);
+                    let text = match &preflight_node(self.store, self.host, literal)
+                        .map_err(|_| invalid())?
+                        .data
+                    {
+                        NodeData::TemplateMiddle(data)
+                            if index + 1 < template.template_spans.nodes.len() =>
+                        {
+                            &data.text
+                        }
+                        NodeData::TemplateTail(data)
+                            if index + 1 == template.template_spans.nodes.len() =>
+                        {
+                            &data.text
+                        }
+                        _ => return Err(invalid()),
+                    };
+                    texts.push(text.clone());
+                    self.read_child(placeholder, true)?;
+                    placeholders.push(placeholder);
+                    spans.push((span, placeholder, literal));
+                }
+                SourceAliasOperandProof::Template {
+                    texts,
+                    placeholders,
+                    spans,
+                }
+            }
+            NodeData::IndexedAccessTypeNode(_) => {
+                let plans = self
+                    .indexed
+                    .iter()
+                    .filter(|plan| plan.node() == node)
+                    .collect::<Vec<_>>();
+                let [plan] = plans.as_slice() else {
+                    return Err(invalid());
+                };
+                let plan = (**plan).clone();
+                if plan.source() != &self.graph.source {
+                    return Err(invalid());
+                }
+                self.read_child(plan.object(), true)?;
+                self.read_child(plan.index(), true)?;
+                SourceAliasOperandProof::Indexed(Box::new(plan))
+            }
+            _ => return Err(RelationUnavailable::UnsupportedStructuredType(type_)),
+        };
+        self.graph.nodes.insert(
+            node,
+            SourceAliasOperandNode {
+                type_,
+                kind: record.kind,
+                parent,
+                children,
+                closed: row_closed,
+                proof,
+            },
+        );
+        self.active.remove(&node);
+        self.graph
+            .validate_node(self.store, node, self.array_targets, &mut HashSet::new())
+    }
+}
+
+fn source_alias_node_result_matches(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+) -> bool {
+    if store.source_node_kind(node) == Some(SyntaxKind::ParenthesizedType) {
+        source_alias_cached_child(store, node) == Some(type_)
+    } else {
+        store.source_direct_type_annotation_is_exact(node, type_)
+    }
+}
+
+fn source_alias_cached_child(store: &CanonicalTypeMapperStore, node: NodeRef) -> Option<TypeId> {
+    let mut child = node;
+    let mut wrappers = Vec::new();
+    while store.source_node_kind(child) == Some(SyntaxKind::ParenthesizedType) {
+        if wrappers.contains(&child) {
+            return None;
+        }
+        let children = store.source_direct_children(child)?;
+        let [inner] = children.as_slice() else {
+            return None;
+        };
+        if store.source_node_parent(*inner) != Some(SourceNodeParent::Parent(child)) {
+            return None;
+        }
+        wrappers.push(child);
+        child = *inner;
+    }
+    let type_ = if store.source_node_kind(child) == Some(SyntaxKind::LiteralType)
+        && store
+            .source_child_with_kind(child, SyntaxKind::NullKeyword)
+            .is_some()
+    {
+        store.intrinsic_bootstrap()?.null_type
+    } else {
+        cached_planned_type_identity(store, child)?
+    };
+    let exact = TypeNodeLinks {
+        resolved_type: Some(type_),
+        outer_type_parameters: None,
+    };
+    wrappers
+        .iter()
+        .all(|&wrapper| {
+            store
+                .type_node_links(wrapper)
+                .is_none_or(|links| links == &TypeNodeLinks::default() || links == &exact)
+                && store
+                    .symbol_node_links(wrapper)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())
+        })
+        .then_some(type_)
+}
+
+fn source_alias_literal_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<LiteralValue>, ()> {
+    let record = preflight_node(store, host, node).map_err(|_| ())?;
+    let value = match &record.data {
+        NodeData::KeywordExpression(_) if record.kind == SyntaxKind::NullKeyword => {
+            return Ok(None);
+        }
+        NodeData::KeywordExpression(_) if record.kind == SyntaxKind::TrueKeyword => {
+            LiteralValue::Boolean(true)
+        }
+        NodeData::KeywordExpression(_) if record.kind == SyntaxKind::FalseKeyword => {
+            LiteralValue::Boolean(false)
+        }
+        NodeData::StringLiteral(data) if data.token_flags.0 == 0 => {
+            LiteralValue::String(data.text.clone())
+        }
+        NodeData::NoSubstitutionTemplateLiteral(data)
+            if data.token_flags.0 == 0 && data.template_flags.0 == 0 =>
+        {
+            LiteralValue::String(data.text.clone())
+        }
+        NodeData::NumericLiteral(data) if data.token_flags.0 == 0 => {
+            let value = ts_jsnum::from_string(&normalize_numeric_separators(&data.text).ok_or(())?);
+            if value.is_nan() {
+                return Err(());
+            }
+            LiteralValue::Number(value)
+        }
+        NodeData::BigIntLiteral(data) if data.token_flags.0 == 0 => LiteralValue::BigInt(
+            ts_jsnum::PseudoBigInt::parse_valid(&normalize_bigint_literal(&data.text).ok_or(())?),
+        ),
+        NodeData::PrefixUnaryExpression(prefix) if prefix.operator == SyntaxKind::MinusToken => {
+            let operand = NodeRef::new(node.arena, node.file, prefix.operand);
+            if store.source_node_parent(operand) != Some(SourceNodeParent::Parent(node)) {
+                return Err(());
+            }
+            match source_alias_literal_value(store, host, operand)? {
+                Some(LiteralValue::Number(value)) => LiteralValue::Number(-value),
+                Some(LiteralValue::BigInt(value)) => {
+                    LiteralValue::BigInt(ts_jsnum::PseudoBigInt::new(&value.base10_value, true))
+                }
+                _ => return Err(()),
+            }
+        }
+        _ => return Err(()),
+    };
+    Ok(Some(value))
 }
 
 struct SourceSyntax {
@@ -601,7 +1746,10 @@ fn inline_source_syntax<M>(
                 }
                 root = parent;
             }
-            SyntaxKind::IntersectionType if children.len() >= 2 => {
+            kind @ (SyntaxKind::IntersectionType | SyntaxKind::UnionType)
+                if children.len() >= 2
+                    && (intersection || kind == SyntaxKind::IntersectionType) =>
+            {
                 let mut previous = None;
                 for child in children {
                     let start = store.source_node_start(child)?;
@@ -1875,6 +3023,30 @@ fn source_symbols<M>(
     Ok(Some((source_symbol, alias_symbol)))
 }
 
+/// Selects the declaration's primary symbol and checks its local/export binding.
+pub(super) fn source_alias_declaration_symbol<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    declaration: NodeRef,
+) -> Option<SemanticSymbolId> {
+    let alias = bound_declaration_symbol(store, declaration)?;
+    validate_source_alias_binding(store, declaration, alias).ok()?;
+    Some(alias)
+}
+
+/// Checks the primary source binding and its complete local/export relation.
+pub(super) fn validate_source_alias_binding<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    declaration: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<(), RelationUnavailable> {
+    if bound_declaration_symbol(store, declaration) != Some(alias)
+        || !store.source_declaration_belongs_to_symbol(declaration, alias)
+    {
+        return Err(RelationUnavailable::Symbol(alias));
+    }
+    validate_alias_binding(store, declaration, alias)
+}
+
 fn validate_alias_binding<M>(
     store: &SemanticStore<TypeRecord, M>,
     declaration: NodeRef,
@@ -2152,6 +3324,7 @@ fn validate_source_header<M>(
         || object.target.is_some()
         || object.mapper.is_some()
         || alias.symbol() != Some(source.alias_symbol)
+        || alias.imported_body().is_some()
         || alias.type_arguments() != Some(source.parameters.as_slice())
         || store
             .type_node_links(source.syntax.declaration)
@@ -2205,6 +3378,7 @@ fn validate_raw_instance_fields(
         || object.target != Some(target)
         || object.instantiations != TypeCacheState::Unallocated
         || alias.type_arguments().is_some() == identity_arguments.is_empty()
+        || identity_symbol == source.alias_symbol && alias.imported_body().is_some()
         || arguments == source.parameters
             && identity_symbol == source.alias_symbol
             && identity_arguments == arguments
@@ -2252,6 +3426,18 @@ fn validate_instance_header_without_request(
 ) -> Result<PropertyObjectAliasInstanceHeader, RelationUnavailable> {
     let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
     let header = validate_raw_instance_header(store, source, target, type_)?;
+    let identity = store
+        .type_payload(type_)
+        .and_then(TypeRecord::alias)
+        .ok_or_else(invalid)?;
+    if let Some(proof) = store
+        .type_alias(identity)
+        .and_then(|alias| alias.imported_body())
+    {
+        proof
+            .validate_wrapper_identity(store, identity)
+            .map_err(|_| invalid())?;
+    }
     if header.identity_symbol == source.alias_symbol {
         if header.identity_arguments.len() != source.parameters.len() {
             return Err(invalid());
@@ -2572,6 +3758,89 @@ fn original_identity_source_argument(
     ))
 }
 
+fn identity_source_default_argument(
+    store: &CanonicalTypeMapperStore,
+    header: &PropertyObjectAliasSourceHeader,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(TypeId, IdentitySourceArgument), RelationUnavailable> {
+    let invalid = || RelationUnavailable::Symbol(symbol);
+    if !header.parameters.contains(&(declaration, symbol))
+        || store.source_node_parent(declaration)
+            != Some(SourceNodeParent::Parent(header.alias_declaration))
+    {
+        return Err(invalid());
+    }
+    let annotations = store
+        .source_alias_type_parameter_annotations(declaration)
+        .ok_or_else(invalid)?;
+    let default_node = annotations.default_type.ok_or_else(invalid)?;
+    let (default_type, argument) = original_identity_source_argument(store, header, default_node)?;
+    if !matches!(argument, IdentitySourceArgument::Fixed(_)) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(default_type));
+    }
+    let parameter = source_parameter(store, declaration, header.alias_symbol)?;
+    let Some(TypeData::TypeParameter(data)) = store.type_payload(parameter).map(TypeRecord::data)
+    else {
+        return Err(invalid());
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let constraint = annotations
+        .constraint
+        .map(|node| {
+            original_identity_source_argument(store, header, node).map(|(type_, _)| {
+                if type_ == bootstrap.any_type {
+                    bootstrap.unknown_type
+                } else {
+                    type_
+                }
+            })
+        })
+        .transpose()?;
+    if data.is_this_type
+        || data.target.is_some()
+        || data.mapper.is_some()
+        || data
+            .resolved_default_type
+            .is_some_and(|cached| cached != default_type)
+        || match constraint {
+            Some(expected) => data.constraint != Some(expected),
+            None => data
+                .constraint
+                .is_some_and(|cached| cached != bootstrap.no_constraint_type),
+        }
+    {
+        return Err(invalid());
+    }
+    Ok((default_type, argument))
+}
+
+/// Checks filled slots against closed defaults on the referenced alias's own parameters.
+/// This read-only proof does not check the provider declaration's diagnostics.
+pub(super) fn validate_property_object_alias_source_defaults(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    supplied_count: usize,
+    effective_arguments: &[TypeId],
+) -> Result<(), RelationUnavailable> {
+    let header = property_object_alias_identity_source_header(store, symbol)?;
+    if supplied_count > header.parameters.len()
+        || effective_arguments.len() != header.parameters.len()
+    {
+        return Err(RelationUnavailable::Symbol(symbol));
+    }
+    for (index, &(declaration, parameter)) in
+        header.parameters.iter().enumerate().skip(supplied_count)
+    {
+        let (expected, _) =
+            identity_source_default_argument(store, &header, declaration, parameter)?;
+        if effective_arguments[index] != expected {
+            return Err(RelationUnavailable::Symbol(parameter));
+        }
+    }
+    Ok(())
+}
+
 /// Wrapper RHS references form one chain. Fold it from the original source
 /// without recursively validating a projection or any instantiation map.
 #[allow(clippy::too_many_lines)] // Keep source, header, and exact cache-row checks together.
@@ -2609,22 +3878,36 @@ fn identity_source_mapping(
             .and_then(|links| links.resolved_symbol)
             .ok_or_else(invalid)?;
         let referenced_header = property_object_alias_identity_source_header(store, referenced)?;
+        let identity = store
+            .type_payload(declared_type)
+            .and_then(TypeRecord::alias)
+            .ok_or_else(invalid)?;
+        let imported = super::source_imports::validate_stored_alias_body_wrapper_import(
+            store,
+            identity,
+            symbol,
+            header.alias_declaration,
+            reference.node,
+            referenced,
+        )
+        .map_err(|_| invalid())?;
         if store.type_node_links(reference.node)
             != Some(&TypeNodeLinks {
                 resolved_type: Some(declared_type),
                 outer_type_parameters: None,
             })
-            || store.source_identifier_text(reference.name)
-                != store
-                    .symbol(referenced)
-                    .and_then(|record| record.name().as_utf8())
+            || !imported
+                && store.source_identifier_text(reference.name)
+                    != store
+                        .symbol(referenced)
+                        .and_then(|record| record.name().as_utf8())
             || header.parameters.iter().any(|(_, parameter)| {
                 store
                     .symbol(*parameter)
                     .and_then(|record| record.name().as_utf8())
                     == store.source_identifier_text(reference.name)
             })
-            || reference.arguments.len() != referenced_header.parameters.len()
+            || reference.arguments.len() > referenced_header.parameters.len()
             || store
                 .type_node_links(reference.name)
                 .is_some_and(|links| links != &TypeNodeLinks::default())
@@ -2633,7 +3916,7 @@ fn identity_source_mapping(
                 .is_some_and(|links| {
                     links
                         .resolved_symbol
-                        .is_some_and(|cached| cached != referenced)
+                        .is_some_and(|cached| cached != referenced && !imported)
                 })
         {
             return Err(invalid());
@@ -2654,13 +3937,27 @@ fn identity_source_mapping(
         if store.source_direct_type_annotation(header.alias_declaration) != Some(reference.body) {
             return Err(invalid());
         }
-        let mut arguments = Vec::with_capacity(reference.arguments.len());
+        let mut arguments = Vec::with_capacity(referenced_header.parameters.len());
         let mut original_arguments = Vec::with_capacity(reference.arguments.len());
         for argument in &reference.arguments {
             let (type_, source_argument) =
                 original_identity_source_argument(store, &header, *argument)?;
             original_arguments.push(type_);
             arguments.push(source_argument);
+        }
+        // Defaults fill physical slots. The request key keeps only written arguments.
+        for &(declaration, parameter) in referenced_header
+            .parameters
+            .iter()
+            .skip(reference.arguments.len())
+        {
+            let (_, argument) = identity_source_default_argument(
+                store,
+                &referenced_header,
+                declaration,
+                parameter,
+            )?;
+            arguments.push(argument);
         }
         let request = object_identity_cache_key(store, &original_arguments, symbol, &parameters)?;
         if store
@@ -3139,6 +4436,812 @@ fn append_alias_arguments(
         arguments.extend_from_slice(alias.type_arguments().unwrap_or_default());
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) mod source_alias_bound_test_support {
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
+        CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+        CanonicalResolvedModuleInput, IntrinsicBootstrapOptions, links::AliasTargetState,
+        object_members::plan_type_literal, source_imports::plan_source_property_type_import,
+        type_nodes::plan_source_alias_operand_source,
+    };
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    pub(in crate::semantic) const SOURCE: FileId = FileId::new(48_930);
+    const STATUS: FileId = FileId::new(48_931);
+    const OTHER_STATUS: FileId = FileId::new(48_932);
+    const ES5: FileId = FileId::new(48_933);
+    const DECORATORS: FileId = FileId::new(48_934);
+    const LEGACY: FileId = FileId::new(48_935);
+
+    // The closed declarations retain the original Hono source. Only the final
+    // alias uses select the bound and default operations under test.
+    const SOURCE_TEXT: &str = r#"import type { StatusCode } from './utils/http-status'
+
+export type Bindings = object
+export type Variables = object
+
+export type BlankEnv = {}
+export type Env = {
+  Bindings?: Bindings
+  Variables?: Variables
+}
+
+export type Input = {
+  in?: {}
+  out?: {}
+  outputFormat?: ResponseFormat
+}
+
+export type Schema = {
+  [Path: string]: {
+    [Method: `$${Lowercase<string>}`]: Endpoint
+  }
+}
+
+export type Endpoint = {
+  input: any
+  output: any
+  outputFormat: ResponseFormat
+  status: StatusCode
+}
+
+export type KnownResponseFormat = 'json' | 'text' | 'redirect'
+export type ResponseFormat = KnownResponseFormat | string
+
+type EnvBound<T extends Env = Env> = unknown;
+type SchemaBound<T extends Schema = Schema> = unknown;
+type InputBound<T extends Input | Input['in'] = Input> = unknown;
+type OutputBound<T extends Input['out']> = unknown;
+type Dependent<T extends Env, U extends T = T> = U;
+type ArrayDefault<T extends Env, U = T[]> = U;
+type WrappedEnv = (Env);
+type WrappedProperty = { value: (WrappedEnv) };
+type WrappedBound<T extends ((WrappedProperty))> = unknown;
+"#;
+
+    const STATUS_TEXT: &str = r#"/**
+ * @module
+ * HTTP Status utility.
+ */
+
+export type InfoStatusCode = 100 | 101 | 102 | 103
+export type SuccessStatusCode = 200 | 201 | 202 | 203 | 204 | 205 | 206 | 207 | 208 | 226
+export type DeprecatedStatusCode = 305 | 306
+export type RedirectStatusCode = 300 | 301 | 302 | 303 | 304 | DeprecatedStatusCode | 307 | 308
+export type ClientErrorStatusCode =
+  | 400
+  | 401
+  | 402
+  | 403
+  | 404
+  | 405
+  | 406
+  | 407
+  | 408
+  | 409
+  | 410
+  | 411
+  | 412
+  | 413
+  | 414
+  | 415
+  | 416
+  | 417
+  | 418
+  | 421
+  | 422
+  | 423
+  | 424
+  | 425
+  | 426
+  | 428
+  | 429
+  | 431
+  | 451
+export type ServerErrorStatusCode = 500 | 501 | 502 | 503 | 504 | 505 | 506 | 507 | 508 | 510 | 511
+
+/**
+ * `UnofficialStatusCode` can be used to specify an unofficial status code.
+ * @example
+ *
+ * ```ts
+ * app.get('/unknown', (c) => {
+ *   return c.text("Unknown Error", 520 as UnofficialStatusCode)
+ * })
+ * ```
+ */
+export type UnofficialStatusCode = -1
+
+/**
+ * @deprecated
+ * Use `UnofficialStatusCode` instead.
+ */
+export type UnOfficalStatusCode = UnofficialStatusCode
+
+/**
+ * If you want to use an unofficial status, use `UnofficialStatusCode`.
+ */
+export type StatusCode =
+  | InfoStatusCode
+  | SuccessStatusCode
+  | RedirectStatusCode
+  | ClientErrorStatusCode
+  | ServerErrorStatusCode
+  | UnofficialStatusCode
+
+export type ContentlessStatusCode = 101 | 204 | 205 | 304
+export type ContentfulStatusCode = Exclude<StatusCode, ContentlessStatusCode>
+"#;
+
+    pub(in crate::semantic) type Sources<'a> = [(FileId, &'a ParseResult, &'a str, bool)];
+
+    pub(in crate::semantic) fn with_fixture(
+        work: impl FnOnce(&mut CanonicalCheckerContext<'_>, &Sources<'_>),
+    ) {
+        let source = parse_source_file(SOURCE_TEXT);
+        let status = parse_source_file(STATUS_TEXT);
+        let other = parse_source_file(STATUS_TEXT);
+        let es5 = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let decorators =
+            parse_source_file(include_str!("../../../ts_bundled/libs/lib.decorators.d.ts"));
+        let legacy = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.decorators.legacy.d.ts"
+        ));
+        let files = [
+            (SOURCE, &source, "\"/project/types.ts\"", false),
+            (STATUS, &status, "\"/project/utils/http-status.ts\"", false),
+            (OTHER_STATUS, &other, "\"/other/http-status.ts\"", false),
+            (ES5, &es5, "\"/lib/lib.es5.d.ts\"", true),
+            (
+                DECORATORS,
+                &decorators,
+                "\"/lib/lib.decorators.d.ts\"",
+                true,
+            ),
+            (LEGACY, &legacy, "\"/lib/lib.decorators.legacy.d.ts\"", true),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed, path, library) in &files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        library,
+                        library,
+                        if library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for &(file, parsed, _, _) in &files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifier = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportDeclaration(import) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    source.arena.id(),
+                    SOURCE,
+                    import.module_specifier,
+                ))
+            })
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|&(file, parsed, _, _)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+                name_resolution: CanonicalNameResolverOptions {
+                    emit_target: ts_options::ScriptTarget::Es2022,
+                    ..CanonicalNameResolverOptions::default()
+                },
+                module_kind: ts_options::ModuleKind::Es2020,
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        STATUS,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        work(&mut context, &files);
+    }
+
+    pub(in crate::semantic) fn alias(files: &Sources<'_>, file: FileId, name: &str) -> NodeRef {
+        let parsed = files.iter().find(|row| row.0 == file).unwrap().1;
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(data) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(data.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap()
+    }
+
+    pub(in crate::semantic) fn operand(
+        context: &CanonicalCheckerContext<'_>,
+        files: &Sources<'_>,
+        name: &str,
+        index: usize,
+        default: bool,
+    ) -> NodeRef {
+        let owner = alias(files, SOURCE, name);
+        let parameter = context
+            .store()
+            .source_direct_children(owner)
+            .unwrap()
+            .into_iter()
+            .filter(|&node| {
+                context.store().source_node_kind(node) == Some(SyntaxKind::TypeParameter)
+            })
+            .nth(index)
+            .unwrap();
+        let annotation = context
+            .store()
+            .source_alias_type_parameter_annotations(parameter)
+            .unwrap();
+        if default {
+            annotation.default_type.unwrap()
+        } else {
+            annotation.constraint.unwrap()
+        }
+    }
+
+    pub(in crate::semantic) fn graph(
+        context: &CanonicalCheckerContext<'_>,
+        files: &Sources<'_>,
+        node: NodeRef,
+        type_: TypeId,
+    ) -> SourceAliasOperandGraph {
+        let store = context.store();
+        let host = context
+            .declared_type_host()
+            .unwrap()
+            .with_module_resolutions(context.module_resolutions());
+        let source = plan_source_alias_operand_source(store, &host, node)
+            .unwrap()
+            .unwrap();
+        let mut objects = Vec::new();
+        for &(file, parsed, _, library) in files {
+            if library {
+                continue;
+            }
+            for (id, record) in parsed.arena.iter() {
+                let node = NodeRef::new(parsed.arena.id(), file, id);
+                if record.kind == SyntaxKind::TypeLiteral
+                    && store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .is_some()
+                {
+                    objects.push(
+                        plan_type_literal(
+                            store,
+                            &host,
+                            node,
+                            source_alias_direct_owner(store, node).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        let imports = objects
+            .iter()
+            .flat_map(|plan| &plan.properties)
+            .filter_map(|property| {
+                plan_source_property_type_import(store, &host, property.type_node).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let parsed = files.iter().find(|row| row.0 == node.file).unwrap().1;
+        let indexed = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, record)| {
+                let child = NodeRef::new(parsed.arena.id(), node.file, id);
+                if record.kind != SyntaxKind::IndexedAccessType
+                    || source_alias_operand_path(store, &source, child).is_err()
+                {
+                    return None;
+                }
+                Some(
+                    super::super::indexed_access_types::plan_source_alias_indexed_bound(
+                        store, &host, &source, child,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        build_source_alias_operand_graph(
+            store,
+            &host,
+            &source,
+            node,
+            type_,
+            &objects,
+            &imports,
+            &indexed,
+            Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            )),
+        )
+        .unwrap()
+    }
+
+    pub(in crate::semantic) fn prepare_graph(
+        context: &mut CanonicalCheckerContext<'_>,
+        files: &Sources<'_>,
+        node: NodeRef,
+    ) -> (TypeId, SourceAliasOperandGraph) {
+        let type_ = context.get_type_from_type_node(node).unwrap();
+        (type_, graph(context, files, node, type_))
+    }
+
+    pub(in crate::semantic) fn without_closed_object(
+        graph: &SourceAliasOperandGraph,
+    ) -> SourceAliasOperandGraph {
+        let mut changed = graph.clone();
+        let node = changed
+            .nodes
+            .iter()
+            .find_map(|(&node, row)| {
+                matches!(row.proof, SourceAliasOperandProof::Object { .. }).then_some(node)
+            })
+            .unwrap();
+        changed.nodes.remove(&node);
+        changed
+    }
+
+    fn assert_rejected_without_writes(
+        store: &CanonicalTypeMapperStore,
+        graph: &SourceAliasOperandGraph,
+        targets: CanonicalArrayTargets,
+    ) {
+        let before = format!("{store:?}");
+        let error = graph
+            .validate_retained(store, graph.type_, Some(targets))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RelationUnavailable::InvalidStructuredMembers(_) | RelationUnavailable::Symbol(_)
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                graph.validate_retained(store, graph.type_, Some(targets)),
+                Err(error)
+            );
+            assert_eq!(format!("{store:?}"), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both real index levels, their closed leaves, and the same source query.
+    fn source_alias_bound_graph_keeps_schema_indexes_and_input_empty_leaves() {
+        with_fixture(|context, files| {
+            let schema_node = operand(context, files, "SchemaBound", 0, false);
+            let (schema, schema_graph) = prepare_graph(context, files, schema_node);
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let indexes =
+                schema_graph
+                    .nodes
+                    .iter()
+                    .filter_map(|(&node, row)| {
+                        let data = context
+                            .store()
+                            .type_payload(row.type_)?
+                            .data()
+                            .structured()?;
+                        (row.kind == SyntaxKind::TypeLiteral && data.index_infos.is_some())
+                            .then_some((node, row.type_, data.index_infos.clone().unwrap()))
+                    })
+                    .collect::<Vec<_>>();
+            assert_eq!(indexes.len(), 2);
+            let schema_owner =
+                bound_declaration_symbol(context.store(), alias(files, SOURCE, "Schema")).unwrap();
+            let record = context.store().type_payload(schema).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .type_alias(record.alias().unwrap())
+                    .unwrap()
+                    .symbol(),
+                Some(schema_owner)
+            );
+            for (node, object, infos) in &indexes {
+                let [id] = infos.as_slice() else {
+                    panic!("one source index stays one slot");
+                };
+                let info = context.store().index_info(*id).unwrap();
+                let declaration = info.declaration().unwrap();
+                assert_eq!(
+                    context.store().source_node_parent(declaration),
+                    Some(SourceNodeParent::Parent(*node))
+                );
+                assert_eq!(
+                    context.store().source_node_kind(declaration),
+                    Some(SyntaxKind::IndexSignature)
+                );
+                assert_eq!(info.index_symbol(), None);
+                assert!(!info.is_readonly());
+                assert!(info.components().is_empty());
+                let parameter = context
+                    .store()
+                    .source_child_with_kind(declaration, SyntaxKind::Parameter)
+                    .unwrap();
+                let symbol = context
+                    .store()
+                    .source_declaration_symbol(parameter)
+                    .unwrap();
+                assert_eq!(
+                    context.store().symbol(symbol).unwrap().flags(),
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                );
+                assert_ne!(symbol, schema_graph.source.parameter().1);
+                let key = context
+                    .store()
+                    .source_direct_type_annotation(parameter)
+                    .unwrap();
+                let value = context
+                    .store()
+                    .source_direct_type_annotation(declaration)
+                    .unwrap();
+                assert_eq!(schema_graph.child_type(key), Ok(info.key_type()));
+                assert_eq!(schema_graph.child_type(value), Ok(info.value_type()));
+                if *object != schema {
+                    assert_eq!(context.store().type_payload(*object).unwrap().alias(), None);
+                }
+            }
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let mapping = schema_graph
+                .nodes
+                .values()
+                .find(|row| matches!(row.proof, SourceAliasOperandProof::StringMapping { .. }))
+                .unwrap();
+            let TypeData::StringMapping(data) =
+                context.store().type_payload(mapping.type_).unwrap().data()
+            else {
+                panic!("the key keeps its real mapping");
+            };
+            assert_eq!(data.target, string);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(mapping.type_)
+                    .unwrap()
+                    .symbol(),
+                bound_declaration_symbol(context.store(), alias(files, ES5, "Lowercase"))
+            );
+            let template = schema_graph
+                .nodes
+                .values()
+                .find(|row| matches!(row.proof, SourceAliasOperandProof::Template { .. }))
+                .unwrap();
+            let TypeData::TemplateLiteral(data) =
+                context.store().type_payload(template.type_).unwrap().data()
+            else {
+                panic!("the key keeps its real template");
+            };
+            assert_eq!(data.texts, ["$", ""]);
+            assert_eq!(data.types, [mapping.type_]);
+            let response_body = context
+                .store()
+                .source_direct_type_annotation(alias(files, SOURCE, "ResponseFormat"))
+                .unwrap();
+            assert_eq!(schema_graph.child_type(response_body), Ok(string));
+            assert!(matches!(
+                schema_graph.nodes[&response_body].proof,
+                SourceAliasOperandProof::Union { .. }
+            ));
+            let import = schema_graph
+                .nodes
+                .values()
+                .find_map(|row| match &row.proof {
+                    SourceAliasOperandProof::Named {
+                        import: Some(import),
+                        ..
+                    } => Some(import),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                import.target_symbol(),
+                bound_declaration_symbol(context.store(), alias(files, STATUS, "StatusCode"))
+                    .unwrap()
+            );
+            import.validate_retained(context.store()).unwrap();
+            let status = context
+                .store()
+                .type_alias_links(import.target_symbol())
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Union(status_union) =
+                context.store().type_payload(status).unwrap().data()
+            else {
+                panic!("all original numeric status members remain");
+            };
+            assert_eq!(status_union.union.types.len(), 64);
+            let input_node = operand(context, files, "InputBound", 0, false);
+            let (input, input_graph) = prepare_graph(context, files, input_node);
+            let empty = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_type_literal_type;
+            let empty_nodes = input_graph
+                .nodes
+                .iter()
+                .filter(|(_, row)| row.kind == SyntaxKind::TypeLiteral && row.type_ == empty)
+                .map(|(&node, _)| node)
+                .collect::<Vec<_>>();
+            assert_eq!(empty_nodes.len(), 2);
+            for node in &empty_nodes {
+                input_graph
+                    .validate_closed_object(context.store(), *node, empty, Some(targets))
+                    .unwrap();
+            }
+            let snapshot = format!("{:?}", context.store());
+            for _ in 0..2 {
+                schema_graph
+                    .validate_retained(context.store(), schema, Some(targets))
+                    .unwrap();
+                input_graph
+                    .validate_retained(context.store(), input, Some(targets))
+                    .unwrap();
+                assert!(
+                    schema_graph
+                        .mapping_type_is_closed(context.store(), schema, Some(targets))
+                        .unwrap()
+                );
+                assert_eq!(format!("{:?}", context.store()), snapshot);
+            }
+            assert!(context.diagnostics().is_empty());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged consumed row is restored before the next read-only check.
+    fn source_alias_bound_graph_rejects_changed_import_union_and_index_rows() {
+        with_fixture(|context, files| {
+            let node = operand(context, files, "SchemaBound", 0, false);
+            let (_, graph) = prepare_graph(context, files, node);
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let object_rows =
+                graph
+                    .nodes
+                    .iter()
+                    .filter_map(|(&node, row)| {
+                        let data = context
+                            .store()
+                            .type_payload(row.type_)?
+                            .data()
+                            .structured()?;
+                        (row.kind == SyntaxKind::TypeLiteral && data.index_infos.is_some())
+                            .then_some((node, row.type_, data.clone()))
+                    })
+                    .collect::<Vec<_>>();
+            assert_eq!(object_rows.len(), 2);
+            for (_, object, members) in &object_rows {
+                let original = members.index_infos.as_deref().unwrap()[0];
+                let info = context.store().index_info(original).unwrap();
+                let (key, value, readonly, declaration) = (
+                    info.key_type(),
+                    info.value_type(),
+                    info.is_readonly(),
+                    info.declaration(),
+                );
+                for changed in 0..5 {
+                    let store = context.store_mut_for_test();
+                    let replacement = store
+                        .alloc_index_info(
+                            if changed == 0 { number } else { key },
+                            if changed == 1 { number } else { value },
+                            if changed == 2 { !readonly } else { readonly },
+                            if changed == 3 { None } else { declaration },
+                            Vec::new(),
+                        )
+                        .unwrap();
+                    assert!(store.set_structured_type_members(
+                        *object,
+                        members.members,
+                        members.properties.clone(),
+                        None,
+                        None,
+                        Some(vec![replacement])
+                    ));
+                    assert_rejected_without_writes(store, &graph, targets);
+                    assert!(store.set_structured_type_members(
+                        *object,
+                        members.members,
+                        members.properties.clone(),
+                        None,
+                        None,
+                        members.index_infos.clone()
+                    ));
+                    graph
+                        .validate_retained(store, graph.type_, Some(targets))
+                        .unwrap();
+                }
+            }
+            let nested = object_rows
+                .iter()
+                .find(|(_, type_, _)| *type_ != graph.type_)
+                .unwrap()
+                .0;
+            let mapping_argument = graph
+                .nodes
+                .values()
+                .find_map(|row| match row.proof {
+                    SourceAliasOperandProof::StringMapping { argument, .. } => Some(argument),
+                    _ => None,
+                })
+                .unwrap();
+            let removed_literal = graph.nodes.iter().find_map(|(&node, row)| matches!(&row.proof, SourceAliasOperandProof::Literal(LiteralValue::String(value)) if value == "json").then_some(node)).unwrap();
+            for changed in [nested, mapping_argument, removed_literal] {
+                let store = context.store_mut_for_test();
+                let original = store.type_node_links(changed).cloned().unwrap_or_default();
+                assert!(store.set_type_node_links(
+                    changed,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        outer_type_parameters: None
+                    }
+                ));
+                assert_rejected_without_writes(store, &graph, targets);
+                assert!(store.set_type_node_links(changed, original));
+                graph
+                    .validate_retained(store, graph.type_, Some(targets))
+                    .unwrap();
+            }
+            let import = graph
+                .nodes
+                .values()
+                .find_map(|row| match &row.proof {
+                    SourceAliasOperandProof::Named {
+                        import: Some(import),
+                        ..
+                    } => Some(import.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let other =
+                bound_declaration_symbol(context.store(), alias(files, OTHER_STATUS, "StatusCode"))
+                    .unwrap();
+            let other_type = context.get_declared_type_of_symbol(other).unwrap();
+            let original_type = context
+                .store()
+                .type_alias_links(import.target_symbol())
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let (TypeData::Union(original_union), TypeData::Union(other_union)) = (
+                context.store().type_payload(original_type).unwrap().data(),
+                context.store().type_payload(other_type).unwrap().data(),
+            ) else {
+                panic!("both real providers have the same complete numeric shape");
+            };
+            assert_eq!(original_union.union.types, other_union.union.types);
+            assert_ne!(other, import.target_symbol());
+            let store = context.store_mut_for_test();
+            let original = store
+                .alias_symbol_links(import.alias_symbol())
+                .unwrap()
+                .clone();
+            let mut changed = original.clone();
+            changed.alias_target = AliasTargetState::Resolved(other);
+            changed.immediate_target = Some(other);
+            assert!(store.set_alias_symbol_links(import.alias_symbol(), changed));
+            assert_rejected_without_writes(store, &graph, targets);
+            assert!(store.set_alias_symbol_links(import.alias_symbol(), original));
+            graph
+                .validate_retained(store, graph.type_, Some(targets))
+                .unwrap();
+            assert_rejected_without_writes(store, &without_closed_object(&graph), targets);
+
+            let wrapped_node = operand(context, files, "WrappedBound", 0, false);
+            let (wrapped, wrapped_graph) = prepare_graph(context, files, wrapped_node);
+            let wrappers = wrapped_graph
+                .nodes
+                .iter()
+                .filter_map(|(&node, row)| {
+                    (row.kind == SyntaxKind::ParenthesizedType).then_some((node, row.type_))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(wrappers.len(), 4);
+            let before = format!("{:?}", context.store());
+            for &(node, type_) in &wrappers {
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .is_none_or(|links| links == &TypeNodeLinks::default())
+                );
+                assert_eq!(
+                    source_alias_cached_child(context.store(), node),
+                    Some(type_)
+                );
+            }
+            wrapped_graph
+                .validate_retained(context.store(), wrapped, Some(targets))
+                .unwrap();
+            assert_eq!(format!("{:?}", context.store()), before);
+            let store = context.store_mut_for_test();
+            for (node, type_) in wrappers {
+                assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        outer_type_parameters: None
+                    }
+                ));
+                wrapped_graph
+                    .validate_retained(store, wrapped, Some(targets))
+                    .unwrap();
+                for changed in [
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        outer_type_parameters: None,
+                    },
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        outer_type_parameters: Some(Vec::new()),
+                    },
+                ] {
+                    assert!(store.set_type_node_links(node, changed));
+                    assert_eq!(source_alias_cached_child(store, node), None);
+                    assert_rejected_without_writes(store, &wrapped_graph, targets);
+                }
+                assert!(store.set_type_node_links(node, TypeNodeLinks::default()));
+                wrapped_graph
+                    .validate_retained(store, wrapped, Some(targets))
+                    .unwrap();
+            }
+            assert!(context.diagnostics().is_empty());
+        });
+    }
 }
 
 #[cfg(test)]

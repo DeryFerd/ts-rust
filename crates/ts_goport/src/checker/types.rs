@@ -1,0 +1,2206 @@
+//! Port of Go `checker/types.go`: `Type`, `TypeData` and every type struct,
+//! `Signature`, `IndexInfo`, `TypePredicate`, `TypeAlias`, `ConditionalRoot`,
+//! `TupleElementInfo`, and every `*Links` struct.
+//!
+//! PORT: the Go flag and enum types declared in `types.go` (`ParseFlags`,
+//! `SignatureKind`, `ContextFlags`, `TypeFormatFlags`, `SymbolFormatFlags`,
+//! `ExternalEmitHelpers`, `VarianceFlags`, `AccessFlags`, `NodeCheckFlags`,
+//! `TypeFlags`, `ObjectFlags`, `ElementFlags`, `IndexFlags`,
+//! `SignatureFlags`, `TypePredicateKind`, `Ternary`,
+//! `MembersOrExportsResolutionKind`) are generated in `crate::flags`. This
+//! file only adds the Go constants the generator did not emit.
+//!
+//! PORT: Go `TypeId` and `SignatureId` are the arena handles in `crate::core`.
+//!
+//! PORT: all Go struct fields are `pub` so other port files can read and
+//! write them like Go code in the same package does.
+
+use crate::prelude::*;
+use ts_jsnum::{Number, PseudoBigInt};
+
+/// An immutable list shared by reference count. It works like a Go slice
+/// over an array that is never written again: a clone or a sub-slice copies
+/// no elements. An empty list does not allocate.
+///
+/// PORT: Go returns resolved member, signature, index info and type argument
+/// slices without a copy. Callers read the list through `Deref<[T]>`.
+pub struct SharedList<T> {
+    items: Option<Rc<[T]>>,
+    start: u32,
+    end: u32,
+}
+
+impl<T> SharedList<T> {
+    /// The sub-list `range` of this list, sharing the same storage.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        assert!(range.start <= range.end && range.end <= self.len());
+        if range.is_empty() {
+            return Self::default();
+        }
+        Self {
+            items: self.items.clone(),
+            start: self.start + range.start as u32,
+            end: self.start + range.end as u32,
+        }
+    }
+}
+
+impl<T> Clone for SharedList<T> {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.clone(),
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+impl<T> Default for SharedList<T> {
+    fn default() -> Self {
+        Self {
+            items: None,
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for SharedList<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match &self.items {
+            Some(items) => &items[self.start as usize..self.end as usize],
+            None => &[],
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for SharedList<T> {
+    fn from(items: Vec<T>) -> Self {
+        if items.is_empty() {
+            return Self::default();
+        }
+        let end = u32::try_from(items.len()).expect("list too long");
+        Self {
+            items: Some(items.into()),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl<T: Clone> From<&[T]> for SharedList<T> {
+    fn from(items: &[T]) -> Self {
+        if items.is_empty() {
+            return Self::default();
+        }
+        let end = u32::try_from(items.len()).expect("list too long");
+        Self {
+            items: Some(items.into()),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SharedList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Eq> Eq for SharedList<T> {}
+
+impl<'a, T> IntoIterator for &'a SharedList<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T: Copy> IntoIterator for SharedList<T> {
+    type Item = T;
+    type IntoIter = SharedListIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let back = self.len();
+        SharedListIter {
+            list: self,
+            front: 0,
+            back,
+        }
+    }
+}
+
+/// The owning iterator of a `SharedList`. It yields copies of the elements.
+pub struct SharedListIter<T> {
+    list: SharedList<T>,
+    front: usize,
+    back: usize,
+}
+
+impl<T: Copy> Iterator for SharedListIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        let item = self.list[self.front];
+        self.front += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.back - self.front;
+        (n, Some(n))
+    }
+}
+
+impl<T: Copy> DoubleEndedIterator for SharedListIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.list[self.back])
+    }
+}
+
+impl<T: Copy> ExactSizeIterator for SharedListIter<T> {}
+
+// PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is an untyped constant
+// outside the generated `TypeFormatFlags` block.
+impl TypeFormatFlags {
+    pub const NODE_BUILDER_FLAGS_MASK: Self = Self(
+        Self::NO_TRUNCATION.0
+            | Self::WRITE_ARRAY_AS_GENERIC_TYPE.0
+            | Self::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS.0
+            | Self::USE_STRUCTURAL_FALLBACK.0
+            | Self::WRITE_TYPE_ARGUMENTS_OF_SIGNATURE.0
+            | Self::USE_FULLY_QUALIFIED_TYPE.0
+            | Self::SUPPRESS_ANY_RETURN_TYPE.0
+            | Self::MULTILINE_OBJECT_LITERALS.0
+            | Self::WRITE_CLASS_EXPRESSION_AS_TYPE_LITERAL.0
+            | Self::USE_TYPE_OF_FUNCTION.0
+            | Self::OMIT_PARAMETER_MODIFIERS.0
+            | Self::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE.0
+            | Self::ALLOW_UNIQUE_ES_SYMBOL_TYPE.0
+            | Self::IN_TYPE_ALIAS.0
+            | Self::USE_INSTANTIATION_EXPRESSIONS.0
+            | Self::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE.0
+            | Self::NO_TYPE_REDUCTION.0
+            | Self::OMIT_THIS_PARAMETER.0,
+    );
+}
+
+// Go: checker/types.go:152 externalHelpersModuleNameText
+pub const EXTERNAL_HELPERS_MODULE_NAME_TEXT: &str = "tslib";
+
+// Links for referenced symbols
+
+// Go: checker/types.go:163 SymbolReferenceLinks
+#[derive(Clone, Debug, Default)]
+pub struct SymbolReferenceLinks {
+    pub reference_kinds: SymbolFlags, // Flags for the meanings of the symbol that were referenced
+}
+
+// Links for value symbols
+
+// Go: checker/types.go:169 ValueSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct ValueSymbolLinks {
+    pub resolved_type: TypeId, // Type of value symbol
+    pub write_type: TypeId,
+    pub target: SymbolId,
+    pub mapper: MapperId,
+    pub name_type: TypeId,
+    pub containing_type: TypeId, // Mapped type for mapped type property, containing union or intersection type for synthetic property
+    pub function_or_constructor_checked: bool,
+}
+
+// Additional links for mapped symbols
+
+// Go: checker/types.go:181 MappedSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct MappedSymbolLinks {
+    pub key_type: TypeId,           // Key type for mapped type member
+    pub synthetic_origin: SymbolId, // For a property on a mapped or spread type, points back to the original property
+}
+
+// Additional links for deferred type symbols
+
+// Go: checker/types.go:188 DeferredSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct DeferredSymbolLinks {
+    pub parent: TypeId,            // Source union/intersection of a deferred type
+    pub constituents: Vec<TypeId>, // Calculated list of constituents for a deferred type
+    pub write_constituents: Vec<TypeId>, // Constituents of a deferred `writeType`
+}
+
+// Links for alias symbols
+
+// Go: checker/types.go:196 AliasSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct AliasSymbolLinks {
+    pub immediate_target: SymbolId, // Immediate target of an alias. May be another alias. Do not access directly, use `checker.getImmediateAliasedSymbol` instead.
+    pub alias_target: SymbolId,     // Resolved (non-alias) target of an alias
+    pub referenced: bool, // True if alias symbol has been referenced as a value that can be emitted
+    pub type_only_declaration: Node, // First resolved alias declaration that makes the symbol only usable in type constructs
+}
+
+// Links for module symbols
+
+// Go: checker/types.go:205 ModuleSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct ModuleSymbolLinks {
+    pub resolved_exports: SymbolTable, // Resolved exports of module or combined early- and late-bound static members of a class.
+    // PORT: Go nil map is an empty map here. Go only reads it with lookups.
+    pub type_only_export_star_map: FxHashMap<String, Node>, // Set on a module symbol when some of its exports were resolved through a 'export type * from "mod"' declaration
+    pub exports_checked: bool,
+}
+
+// Go: checker/types.go:211 ReverseMappedSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct ReverseMappedSymbolLinks {
+    pub property_type: TypeId,
+    pub mapped_type: TypeId,     // References a mapped type
+    pub constraint_type: TypeId, // References an index type
+}
+
+// Links for late-bound symbols
+
+// Go: checker/types.go:219 LateBoundLinks
+#[derive(Clone, Debug, Default)]
+pub struct LateBoundLinks {
+    pub late_symbol: SymbolId,
+}
+
+// Links for export type symbols
+
+// Go: checker/types.go:225 ExportTypeLinks
+#[derive(Clone, Debug, Default)]
+pub struct ExportTypeLinks {
+    pub target: SymbolId,         // Target symbol
+    pub originating_import: Node, // Import declaration which produced the symbol, present if the symbol is marked as uncallable but had call signatures in `resolveESModuleSymbol`
+}
+
+// Links for type aliases
+
+// Go: checker/types.go:232 TypeAliasLinks
+#[derive(Clone, Default)]
+pub struct TypeAliasLinks {
+    pub declared_type: TypeId,
+    pub type_parameters: Vec<TypeId>, // Type parameters of type alias (undefined if non-generic)
+    // PORT: Go nil map (non-generic alias) is `None`.
+    pub instantiations: Option<CacheKeyMap<TypeId>>, // Instantiations of generic type alias (undefined if non-generic)
+    pub is_constructor_declared_property: bool,
+}
+
+// Links for declared types (type parameters, class types, interface types, enums)
+
+// Go: checker/types.go:241 DeclaredTypeLinks
+#[derive(Clone, Debug, Default)]
+pub struct DeclaredTypeLinks {
+    pub declared_type: TypeId,
+    pub interface_checked: bool,
+    pub index_signatures_checked: bool,
+    pub type_parameters_checked: bool,
+    pub enum_checked: bool,
+}
+
+// Links for switch clauses
+
+// Go: checker/types.go:251 ExhaustiveState
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExhaustiveState(pub u8);
+
+#[allow(non_upper_case_globals)]
+impl ExhaustiveState {
+    pub const UNKNOWN: Self = Self(0); // Exhaustive state not computed
+    pub const COMPUTING: Self = Self(1); // Exhaustive state computation in progress
+    pub const FALSE: Self = Self(2); // Switch statement is not exhaustive
+    pub const TRUE: Self = Self(3); // Switch statement is exhaustive
+}
+
+// Go: checker/types.go:260 SwitchStatementLinks
+#[derive(Clone, Debug, Default)]
+pub struct SwitchStatementLinks {
+    pub exhaustive_state: ExhaustiveState, // Switch statement exhaustiveness
+    pub switch_types_computed: bool,
+    pub witnesses_computed: bool,
+    pub switch_types: Vec<TypeId>,
+    pub witnesses: Vec<String>,
+}
+
+// Go: checker/types.go:268 ArrayLiteralLinks
+#[derive(Clone, Debug, Default)]
+pub struct ArrayLiteralLinks {
+    pub indices_computed: bool,
+    pub first_spread_index: i32, // Index of first spread expression (or -1 if none)
+    pub last_spread_index: i32,  // Index of last spread expression (or -1 if none)
+}
+
+// Links for late-binding containers
+
+// Go: checker/types.go:283 MembersAndExportsLinks
+/// Indexed by `MembersOrExportsResolutionKind` (`links[kind.0 as usize]`).
+pub type MembersAndExportsLinks = [SymbolTable; 2];
+
+// Links for synthetic spread properties
+
+// Go: checker/types.go:287 SpreadLinks
+#[derive(Clone, Debug, Default)]
+pub struct SpreadLinks {
+    pub left_spread: SymbolId,  // Left source for synthetic spread property
+    pub right_spread: SymbolId, // Right source for synthetic spread property
+}
+
+// Links for variances of type aliases and interface types
+
+// Go: checker/types.go:294 VarianceLinks
+#[derive(Clone, Debug, Default)]
+pub struct VarianceLinks {
+    pub variances: SharedList<VarianceFlags>,
+}
+
+// Go: checker/types.go:312 MarkedAssignmentSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct MarkedAssignmentSymbolLinks {
+    pub last_assignment_pos: i32,
+    pub has_definite_assignment: bool, // Symbol is definitely assigned somewhere
+}
+
+// Go: checker/types.go:317 accessibleChainCacheKey
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct AccessibleChainCacheKey {
+    pub use_only_external_aliasing: bool,
+    pub location: Node,
+    pub meaning: SymbolFlags,
+}
+
+// Go: checker/types.go:323 ContainingSymbolLinks
+#[derive(Clone, Debug, Default)]
+pub struct ContainingSymbolLinks {
+    // PORT: Go keys by `ast.NodeId` of the file node; the `Node` handle of
+    // the file is the same identity here.
+    pub extended_containers_by_file: FxHashMap<Node, Vec<SymbolId>>, // Symbols of nodes which which logically contain this one, cached by file the request is made within
+    // PORT: Go `*[]*ast.Symbol`; nil pointer is `None`.
+    pub extended_containers: Option<Vec<SymbolId>>, // Containers (other than the parent) which this symbol is aliased in
+    pub accessible_chain_cache: FxHashMap<AccessibleChainCacheKey, Vec<SymbolId>>,
+}
+
+// Common links
+
+// Go: checker/types.go:362 NodeLinks
+#[derive(Clone, Default)]
+pub struct NodeLinks {
+    pub flags: NodeCheckFlags, // Set of flags specific to Node
+    pub declaration_requires_scope_change: Tristate, // Set by `useOuterVariableScopeInParameter` in checker when downlevel emit would change the name resolution scope inside of a parameter.
+    pub has_reported_statement_in_ambient_context: bool, // Cache boolean if we report statements in ambient context
+}
+
+// Go: checker/types.go:368 SymbolNodeLinks
+#[derive(Clone, Debug, Default)]
+pub struct SymbolNodeLinks {
+    pub resolved_symbol: SymbolId, // Resolved symbol associated with node
+}
+
+// Go: checker/types.go:372 TypeNodeLinks
+#[derive(Clone, Debug, Default)]
+pub struct TypeNodeLinks {
+    pub resolved_type: TypeId, // Resolved type associated with node
+    pub outer_type_parameters: SharedList<TypeId>, // Outer type parameters of anonymous object type
+}
+
+// Links for enum members
+
+// Go: checker/types.go:379 EnumMemberLinks
+#[derive(Clone, Default)]
+pub struct EnumMemberLinks {
+    pub value: EvaluatorResult, // Constant value of enum member
+}
+
+// Links for assertion expressions
+
+// Go: checker/types.go:385 AssertionLinks
+#[derive(Clone, Debug, Default)]
+pub struct AssertionLinks {
+    pub expr_type: TypeId, // Assertion expression type
+}
+
+// SourceFile links
+
+// Go: checker/types.go:391 SourceFileLinks
+#[derive(Clone, Debug, Default)]
+pub struct SourceFileLinks {
+    pub type_checked: bool,
+    pub unused_checked: bool,
+    pub external_helpers_module: SymbolId,
+    pub requested_external_emit_helpers: ExternalEmitHelpers,
+    pub deferred_nodes: IndexSet<Node>,
+    pub identifier_check_nodes: Vec<Node>,
+    pub local_jsx_namespace: String,
+    pub local_jsx_fragment_namespace: String,
+    pub local_jsx_factory: Node,
+    pub local_jsx_fragment_factory: Node,
+    pub jsx_fragment_type: TypeId,
+}
+
+// Signature specific links
+
+// Go: checker/types.go:407 SignatureLinks
+#[derive(Clone, Debug, Default)]
+pub struct SignatureLinks {
+    pub resolved_signature: SignatureId, // Cached signature of signature node or call expression
+    pub effects_signature: SignatureId,  // Signature with possible control flow effects
+    pub decorator_signature: SignatureId, // Signature for decorator as if invoked by the runtime
+}
+
+// Go: checker/types.go:502 typeFlagNames
+static TYPE_FLAG_NAMES: [(TypeFlags, &str); 29] = [
+    (TypeFlags::ANY, "Any"),
+    (TypeFlags::UNKNOWN, "Unknown"),
+    (TypeFlags::UNDEFINED, "Undefined"),
+    (TypeFlags::NULL, "Null"),
+    (TypeFlags::VOID, "Void"),
+    (TypeFlags::STRING, "String"),
+    (TypeFlags::NUMBER, "Number"),
+    (TypeFlags::BIG_INT, "BigInt"),
+    (TypeFlags::BOOLEAN, "Boolean"),
+    (TypeFlags::ES_SYMBOL, "ESSymbol"),
+    (TypeFlags::STRING_LITERAL, "StringLiteral"),
+    (TypeFlags::NUMBER_LITERAL, "NumberLiteral"),
+    (TypeFlags::BIG_INT_LITERAL, "BigIntLiteral"),
+    (TypeFlags::BOOLEAN_LITERAL, "BooleanLiteral"),
+    (TypeFlags::UNIQUE_ES_SYMBOL, "UniqueESSymbol"),
+    (TypeFlags::ENUM_LITERAL, "EnumLiteral"),
+    (TypeFlags::ENUM, "Enum"),
+    (TypeFlags::NON_PRIMITIVE, "NonPrimitive"),
+    (TypeFlags::NEVER, "Never"),
+    (TypeFlags::TYPE_PARAMETER, "TypeParameter"),
+    (TypeFlags::OBJECT, "Object"),
+    (TypeFlags::INDEX, "Index"),
+    (TypeFlags::TEMPLATE_LITERAL, "TemplateLiteral"),
+    (TypeFlags::STRING_MAPPING, "StringMapping"),
+    (TypeFlags::SUBSTITUTION, "Substitution"),
+    (TypeFlags::INDEXED_ACCESS, "IndexedAccess"),
+    (TypeFlags::CONDITIONAL, "Conditional"),
+    (TypeFlags::UNION, "Union"),
+    (TypeFlags::INTERSECTION, "Intersection"),
+];
+
+// FormatTypeFlags returns the individual flag names as a slice of strings.
+// Go: checker/types.go:538 FormatTypeFlags
+pub fn format_type_flags(flags: TypeFlags) -> Vec<String> {
+    let mut result: Vec<String> = Vec::with_capacity(flags.0.count_ones() as usize);
+    for (flag, name) in TYPE_FLAG_NAMES.iter() {
+        if flags.intersects(*flag) {
+            result.push((*name).to_string());
+        }
+    }
+    if result.is_empty() {
+        result.push("None".to_string());
+    }
+    result
+}
+
+// String returns a pipe-separated string of flag names.
+// PORT: Go `String()` methods on flag types become `Display` impls so Go
+// `%v` formatting ports to `{}`.
+// Go: checker/types.go:552 TypeFlags.String
+impl std::fmt::Display for TypeFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format_type_flags(*self).join("|"))
+    }
+}
+
+// Go: checker/types.go:556 VarianceFlags.String
+impl std::fmt::Display for VarianceFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variance = *self & VarianceFlags::VARIANCE_MASK;
+        let mut result = match variance {
+            VarianceFlags::INVARIANT => "in out".to_string(),
+            VarianceFlags::BIVARIANT => "[bivariant]".to_string(),
+            VarianceFlags::CONTRAVARIANT => "in".to_string(),
+            VarianceFlags::COVARIANT => "out".to_string(),
+            VarianceFlags::INDEPENDENT => "[independent]".to_string(),
+            _ => String::new(),
+        };
+        if self.intersects(VarianceFlags::UNMEASURABLE) {
+            result += " (unmeasurable)";
+        } else if self.intersects(VarianceFlags::UNRELIABLE) {
+            result += " (unreliable)";
+        }
+        f.write_str(&result)
+    }
+}
+
+// TypeAlias
+
+// Go: checker/types.go:645 TypeAlias
+#[derive(Clone, Debug, Default)]
+pub struct TypeAlias {
+    pub symbol: SymbolId,
+    pub type_arguments: Vec<TypeId>,
+}
+
+impl TypeAlias {
+    // Go: checker/types.go:650 TypeAlias.Symbol
+    pub fn symbol(&self) -> SymbolId {
+        self.symbol
+    }
+
+    // Go: checker/types.go:657 TypeAlias.TypeArguments
+    pub fn type_arguments(&self) -> &[TypeId] {
+        &self.type_arguments
+    }
+}
+
+/// Go calls `(*TypeAlias).Symbol()` and `TypeArguments()` on nil aliases and
+/// gets nil. `Type::alias` is `Option<Rc<TypeAlias>>`, so this trait gives the
+/// same nil-safe calls: `ty.alias.symbol()`, `ty.alias.type_arguments()`.
+pub trait TypeAliasExt {
+    fn symbol(&self) -> SymbolId;
+    fn type_arguments(&self) -> &[TypeId];
+}
+
+impl TypeAliasExt for Option<Rc<TypeAlias>> {
+    // Go: checker/types.go:650 TypeAlias.Symbol
+    fn symbol(&self) -> SymbolId {
+        match self {
+            None => SymbolId::NIL,
+            Some(a) => a.symbol,
+        }
+    }
+
+    // Go: checker/types.go:657 TypeAlias.TypeArguments
+    fn type_arguments(&self) -> &[TypeId] {
+        match self {
+            None => &[],
+            Some(a) => &a.type_arguments,
+        }
+    }
+}
+
+// Type
+
+// PORT: Go `Type.checker` is dropped; every type lives in the arena of the
+// checker that created it. Go `TypeBase` (the embedded `Type` inside each data
+// struct) disappears: `Type` owns its `data`.
+// Go: checker/types.go:666 Type
+#[derive(Clone, Default)]
+pub struct Type {
+    pub flags: TypeFlags,
+    pub object_flags: ObjectFlags,
+    pub id: TypeId,
+    pub symbol: SymbolId,
+    pub alias: Option<Rc<TypeAlias>>,
+    pub data: TypeData, // Type specific data
+}
+
+#[cold]
+#[inline(never)]
+fn type_cast_panic(want: &str) -> ! {
+    panic!("interface conversion: TypeData is not {want}")
+}
+
+impl Type {
+    // Go: checker/types.go:676 Type.Id
+    #[inline]
+    pub fn id(&self) -> TypeId {
+        self.id
+    }
+
+    // Go: checker/types.go:680 Type.Flags
+    #[inline]
+    pub fn flags(&self) -> TypeFlags {
+        self.flags
+    }
+
+    // Go: checker/types.go:684 Type.ObjectFlags
+    #[inline]
+    pub fn object_flags(&self) -> ObjectFlags {
+        self.object_flags
+    }
+
+    // Casts for concrete struct types
+
+    // Go: checker/types.go:690 Type.AsIntrinsicType
+    #[inline]
+    pub fn as_intrinsic_type(&self) -> &IntrinsicType {
+        match &self.data {
+            TypeData::Intrinsic(d) => d,
+            _ => type_cast_panic("IntrinsicType"),
+        }
+    }
+    #[inline]
+    pub fn as_intrinsic_type_mut(&mut self) -> &mut IntrinsicType {
+        match &mut self.data {
+            TypeData::Intrinsic(d) => d,
+            _ => type_cast_panic("IntrinsicType"),
+        }
+    }
+
+    // Go: checker/types.go:691 Type.AsLiteralType
+    #[inline]
+    pub fn as_literal_type(&self) -> &LiteralType {
+        match &self.data {
+            TypeData::Literal(d) => d,
+            _ => type_cast_panic("LiteralType"),
+        }
+    }
+    #[inline]
+    pub fn as_literal_type_mut(&mut self) -> &mut LiteralType {
+        match &mut self.data {
+            TypeData::Literal(d) => d,
+            _ => type_cast_panic("LiteralType"),
+        }
+    }
+
+    // Go: checker/types.go:692 Type.AsUniqueESSymbolType
+    #[inline]
+    pub fn as_unique_es_symbol_type(&self) -> &UniqueESSymbolType {
+        match &self.data {
+            TypeData::UniqueESSymbol(d) => d,
+            _ => type_cast_panic("UniqueESSymbolType"),
+        }
+    }
+    #[inline]
+    pub fn as_unique_es_symbol_type_mut(&mut self) -> &mut UniqueESSymbolType {
+        match &mut self.data {
+            TypeData::UniqueESSymbol(d) => d,
+            _ => type_cast_panic("UniqueESSymbolType"),
+        }
+    }
+
+    // Go: checker/types.go:693 Type.AsTupleType
+    #[inline]
+    pub fn as_tuple_type(&self) -> &TupleType {
+        match &self.data {
+            TypeData::Tuple(d) => d,
+            _ => type_cast_panic("TupleType"),
+        }
+    }
+    #[inline]
+    pub fn as_tuple_type_mut(&mut self) -> &mut TupleType {
+        match &mut self.data {
+            TypeData::Tuple(d) => d,
+            _ => type_cast_panic("TupleType"),
+        }
+    }
+
+    // Go: checker/types.go:694 Type.AsInstantiationExpressionType
+    #[inline]
+    pub fn as_instantiation_expression_type(&self) -> &InstantiationExpressionType {
+        match &self.data {
+            TypeData::InstantiationExpression(d) => d,
+            _ => type_cast_panic("InstantiationExpressionType"),
+        }
+    }
+    #[inline]
+    pub fn as_instantiation_expression_type_mut(&mut self) -> &mut InstantiationExpressionType {
+        match &mut self.data {
+            TypeData::InstantiationExpression(d) => d,
+            _ => type_cast_panic("InstantiationExpressionType"),
+        }
+    }
+
+    // Go: checker/types.go:697 Type.AsMappedType
+    #[inline]
+    pub fn as_mapped_type(&self) -> &MappedType {
+        match &self.data {
+            TypeData::Mapped(d) => d,
+            _ => type_cast_panic("MappedType"),
+        }
+    }
+    #[inline]
+    pub fn as_mapped_type_mut(&mut self) -> &mut MappedType {
+        match &mut self.data {
+            TypeData::Mapped(d) => d,
+            _ => type_cast_panic("MappedType"),
+        }
+    }
+
+    // Go: checker/types.go:698 Type.AsReverseMappedType
+    #[inline]
+    pub fn as_reverse_mapped_type(&self) -> &ReverseMappedType {
+        match &self.data {
+            TypeData::ReverseMapped(d) => d,
+            _ => type_cast_panic("ReverseMappedType"),
+        }
+    }
+    #[inline]
+    pub fn as_reverse_mapped_type_mut(&mut self) -> &mut ReverseMappedType {
+        match &mut self.data {
+            TypeData::ReverseMapped(d) => d,
+            _ => type_cast_panic("ReverseMappedType"),
+        }
+    }
+
+    // Go: checker/types.go:699 Type.AsEvolvingArrayType
+    #[inline]
+    pub fn as_evolving_array_type(&self) -> &EvolvingArrayType {
+        match &self.data {
+            TypeData::EvolvingArray(d) => d,
+            _ => type_cast_panic("EvolvingArrayType"),
+        }
+    }
+    #[inline]
+    pub fn as_evolving_array_type_mut(&mut self) -> &mut EvolvingArrayType {
+        match &mut self.data {
+            TypeData::EvolvingArray(d) => d,
+            _ => type_cast_panic("EvolvingArrayType"),
+        }
+    }
+
+    // Go: checker/types.go:700 Type.AsTypeParameter
+    #[inline]
+    pub fn as_type_parameter(&self) -> &TypeParameter {
+        match &self.data {
+            TypeData::TypeParameter(d) => d,
+            _ => type_cast_panic("TypeParameter"),
+        }
+    }
+    #[inline]
+    pub fn as_type_parameter_mut(&mut self) -> &mut TypeParameter {
+        match &mut self.data {
+            TypeData::TypeParameter(d) => d,
+            _ => type_cast_panic("TypeParameter"),
+        }
+    }
+
+    // Go: checker/types.go:701 Type.AsUnionType
+    #[inline]
+    pub fn as_union_type(&self) -> &UnionType {
+        match &self.data {
+            TypeData::Union(d) => d,
+            _ => type_cast_panic("UnionType"),
+        }
+    }
+    #[inline]
+    pub fn as_union_type_mut(&mut self) -> &mut UnionType {
+        match &mut self.data {
+            TypeData::Union(d) => d,
+            _ => type_cast_panic("UnionType"),
+        }
+    }
+
+    // Go: checker/types.go:702 Type.AsIntersectionType
+    #[inline]
+    pub fn as_intersection_type(&self) -> &IntersectionType {
+        match &self.data {
+            TypeData::Intersection(d) => d,
+            _ => type_cast_panic("IntersectionType"),
+        }
+    }
+    #[inline]
+    pub fn as_intersection_type_mut(&mut self) -> &mut IntersectionType {
+        match &mut self.data {
+            TypeData::Intersection(d) => d,
+            _ => type_cast_panic("IntersectionType"),
+        }
+    }
+
+    // Go: checker/types.go:703 Type.AsIndexType
+    #[inline]
+    pub fn as_index_type(&self) -> &IndexType {
+        match &self.data {
+            TypeData::Index(d) => d,
+            _ => type_cast_panic("IndexType"),
+        }
+    }
+    #[inline]
+    pub fn as_index_type_mut(&mut self) -> &mut IndexType {
+        match &mut self.data {
+            TypeData::Index(d) => d,
+            _ => type_cast_panic("IndexType"),
+        }
+    }
+
+    // Go: checker/types.go:704 Type.AsIndexedAccessType
+    #[inline]
+    pub fn as_indexed_access_type(&self) -> &IndexedAccessType {
+        match &self.data {
+            TypeData::IndexedAccess(d) => d,
+            _ => type_cast_panic("IndexedAccessType"),
+        }
+    }
+    #[inline]
+    pub fn as_indexed_access_type_mut(&mut self) -> &mut IndexedAccessType {
+        match &mut self.data {
+            TypeData::IndexedAccess(d) => d,
+            _ => type_cast_panic("IndexedAccessType"),
+        }
+    }
+
+    // Go: checker/types.go:705 Type.AsTemplateLiteralType
+    #[inline]
+    pub fn as_template_literal_type(&self) -> &TemplateLiteralType {
+        match &self.data {
+            TypeData::TemplateLiteral(d) => d,
+            _ => type_cast_panic("TemplateLiteralType"),
+        }
+    }
+    #[inline]
+    pub fn as_template_literal_type_mut(&mut self) -> &mut TemplateLiteralType {
+        match &mut self.data {
+            TypeData::TemplateLiteral(d) => d,
+            _ => type_cast_panic("TemplateLiteralType"),
+        }
+    }
+
+    // Go: checker/types.go:706 Type.AsStringMappingType
+    #[inline]
+    pub fn as_string_mapping_type(&self) -> &StringMappingType {
+        match &self.data {
+            TypeData::StringMapping(d) => d,
+            _ => type_cast_panic("StringMappingType"),
+        }
+    }
+    #[inline]
+    pub fn as_string_mapping_type_mut(&mut self) -> &mut StringMappingType {
+        match &mut self.data {
+            TypeData::StringMapping(d) => d,
+            _ => type_cast_panic("StringMappingType"),
+        }
+    }
+
+    // Go: checker/types.go:707 Type.AsSubstitutionType
+    #[inline]
+    pub fn as_substitution_type(&self) -> &SubstitutionType {
+        match &self.data {
+            TypeData::Substitution(d) => d,
+            _ => type_cast_panic("SubstitutionType"),
+        }
+    }
+    #[inline]
+    pub fn as_substitution_type_mut(&mut self) -> &mut SubstitutionType {
+        match &mut self.data {
+            TypeData::Substitution(d) => d,
+            _ => type_cast_panic("SubstitutionType"),
+        }
+    }
+
+    // Go: checker/types.go:708 Type.AsConditionalType
+    #[inline]
+    pub fn as_conditional_type(&self) -> &ConditionalType {
+        match &self.data {
+            TypeData::Conditional(d) => d,
+            _ => type_cast_panic("ConditionalType"),
+        }
+    }
+    #[inline]
+    pub fn as_conditional_type_mut(&mut self) -> &mut ConditionalType {
+        match &mut self.data {
+            TypeData::Conditional(d) => d,
+            _ => type_cast_panic("ConditionalType"),
+        }
+    }
+
+    // Casts for embedded struct types
+    // PORT: Go returns nil for kinds without the embedded struct, and the
+    // caller then panics on field access. These panic at the cast instead.
+    // Use `self.data.as_x()` (returns `Option`) for Go nil checks.
+
+    // Go: checker/types.go:712 Type.AsConstrainedType
+    #[inline]
+    pub fn as_constrained_type(&self) -> &ConstrainedType {
+        self.data
+            .as_constrained_type()
+            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+    }
+    #[inline]
+    pub fn as_constrained_type_mut(&mut self) -> &mut ConstrainedType {
+        self.data
+            .as_constrained_type_mut()
+            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+    }
+
+    // Go: checker/types.go:713 Type.AsStructuredType
+    #[inline]
+    pub fn as_structured_type(&self) -> &StructuredType {
+        self.data
+            .as_structured_type()
+            .unwrap_or_else(|| type_cast_panic("StructuredType"))
+    }
+    #[inline]
+    pub fn as_structured_type_mut(&mut self) -> &mut StructuredType {
+        self.data
+            .as_structured_type_mut()
+            .unwrap_or_else(|| type_cast_panic("StructuredType"))
+    }
+
+    // Go: checker/types.go:714 Type.AsObjectType
+    #[inline]
+    pub fn as_object_type(&self) -> &ObjectType {
+        self.data
+            .as_object_type()
+            .unwrap_or_else(|| type_cast_panic("ObjectType"))
+    }
+    #[inline]
+    pub fn as_object_type_mut(&mut self) -> &mut ObjectType {
+        self.data
+            .as_object_type_mut()
+            .unwrap_or_else(|| type_cast_panic("ObjectType"))
+    }
+
+    // Go: checker/types.go:715 Type.AsTypeReference
+    #[inline(always)]
+    pub fn as_type_reference(&self) -> &TypeReference {
+        self.data
+            .as_type_reference()
+            .unwrap_or_else(|| type_cast_panic("TypeReference"))
+    }
+    #[inline]
+    pub fn as_type_reference_mut(&mut self) -> &mut TypeReference {
+        self.data
+            .as_type_reference_mut()
+            .unwrap_or_else(|| type_cast_panic("TypeReference"))
+    }
+
+    // Go: checker/types.go:716 Type.AsInterfaceType
+    #[inline]
+    pub fn as_interface_type(&self) -> &InterfaceType {
+        self.data
+            .as_interface_type()
+            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
+    }
+    #[inline]
+    pub fn as_interface_type_mut(&mut self) -> &mut InterfaceType {
+        self.data
+            .as_interface_type_mut()
+            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
+    }
+
+    // Go: checker/types.go:717 Type.AsUnionOrIntersectionType
+    #[inline]
+    pub fn as_union_or_intersection_type(&self) -> &UnionOrIntersectionType {
+        self.data
+            .as_union_or_intersection_type()
+            .unwrap_or_else(|| type_cast_panic("UnionOrIntersectionType"))
+    }
+    #[inline]
+    pub fn as_union_or_intersection_type_mut(&mut self) -> &mut UnionOrIntersectionType {
+        self.data
+            .as_union_or_intersection_type_mut()
+            .unwrap_or_else(|| type_cast_panic("UnionOrIntersectionType"))
+    }
+
+    // PORT: Go returns a fresh slice (`[]*Type{t}`) for the default case, so
+    // this returns an owned `Vec`.
+    // Go: checker/types.go:721 Type.Distributed
+    pub fn distributed(&self) -> Vec<TypeId> {
+        if self.flags.intersects(TypeFlags::UNION) {
+            return self.as_union_type().union_or_intersection.types.to_vec();
+        } else if self.flags.intersects(TypeFlags::NEVER) {
+            return Vec::new();
+        }
+        vec![self.id]
+    }
+
+    // Common accessors
+
+    // Go: checker/types.go:733 Type.Target
+    #[inline]
+    pub fn target(&self) -> TypeId {
+        if self.flags.intersects(TypeFlags::OBJECT) {
+            return self.as_object_type().target;
+        } else if self.flags.intersects(TypeFlags::TYPE_PARAMETER) {
+            return self.as_type_parameter().target;
+        } else if self.flags.intersects(TypeFlags::INDEX) {
+            return self.as_index_type().target;
+        } else if self.flags.intersects(TypeFlags::STRING_MAPPING) {
+            return self.as_string_mapping_type().target;
+        } else if self.flags.intersects(TypeFlags::OBJECT)
+            && self.object_flags.intersects(ObjectFlags::MAPPED)
+        {
+            // PORT: unreachable in Go too (the first case already matches).
+            return self.as_mapped_type().object.target;
+        }
+        panic!("Unhandled case in Type.Target")
+    }
+
+    // Go: checker/types.go:749 Type.Mapper
+    #[inline]
+    pub fn mapper(&self) -> MapperId {
+        if self.flags.intersects(TypeFlags::OBJECT) {
+            return self.as_object_type().mapper;
+        } else if self.flags.intersects(TypeFlags::TYPE_PARAMETER) {
+            return self.as_type_parameter().mapper;
+        } else if self.flags.intersects(TypeFlags::CONDITIONAL) {
+            return self.as_conditional_type().mapper;
+        }
+        panic!("Unhandled case in Type.Mapper")
+    }
+
+    // Go: checker/types.go:761 Type.Types
+    #[inline(always)]
+    pub fn types(&self) -> &[TypeId] {
+        if self.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+            return &self.as_union_or_intersection_type().types;
+        } else if self.flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            return &self.as_template_literal_type().types;
+        }
+        panic!("Unhandled case in Type.Types")
+    }
+
+    /// `types()` as a shared list. The clone copies no elements, so callers
+    /// can keep it across checker calls that need `&mut self`.
+    pub fn types_list(&self) -> SharedList<TypeId> {
+        if self.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+            return self.as_union_or_intersection_type().types.clone();
+        } else if self.flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            return self.as_template_literal_type().types.clone();
+        }
+        panic!("Unhandled case in Type.Types")
+    }
+
+    // PORT: Go `TargetInterfaceType()` and `TargetTupleType()` follow the
+    // target pointer into another type. They need the arena, so they are
+    // `Checker` methods: `self.target_interface_type(t)`,
+    // `self.target_tuple_type(t)` (defined below).
+
+    // Go: checker/types.go:779 Type.Symbol
+    pub fn symbol(&self) -> SymbolId {
+        self.symbol
+    }
+
+    // Go: checker/types.go:783 Type.Alias
+    pub fn alias(&self) -> Option<Rc<TypeAlias>> {
+        self.alias.clone()
+    }
+
+    // Go: checker/types.go:787 Type.IsUnion
+    pub fn is_union(&self) -> bool {
+        self.flags.intersects(TypeFlags::UNION)
+    }
+
+    // Go: checker/types.go:791 Type.IsString
+    pub fn is_string(&self) -> bool {
+        self.flags.intersects(TypeFlags::STRING)
+    }
+
+    // Go: checker/types.go:795 Type.IsIntersection
+    pub fn is_intersection(&self) -> bool {
+        self.flags.intersects(TypeFlags::INTERSECTION)
+    }
+
+    // Go: checker/types.go:799 Type.IsStringLiteral
+    pub fn is_string_literal(&self) -> bool {
+        self.flags.intersects(TypeFlags::STRING_LITERAL)
+    }
+
+    // Go: checker/types.go:803 Type.IsNumberLiteral
+    pub fn is_number_literal(&self) -> bool {
+        self.flags.intersects(TypeFlags::NUMBER_LITERAL)
+    }
+
+    // Go: checker/types.go:807 Type.IsBigIntLiteral
+    pub fn is_big_int_literal(&self) -> bool {
+        self.flags.intersects(TypeFlags::BIG_INT_LITERAL)
+    }
+
+    // Go: checker/types.go:811 Type.IsEnumLiteral
+    pub fn is_enum_literal(&self) -> bool {
+        self.flags.intersects(TypeFlags::ENUM_LITERAL)
+    }
+
+    // Go: checker/types.go:815 Type.IsBooleanLike
+    pub fn is_boolean_like(&self) -> bool {
+        self.flags.intersects(TypeFlags::BOOLEAN_LIKE)
+    }
+
+    // Go: checker/types.go:819 Type.IsStringLike
+    pub fn is_string_like(&self) -> bool {
+        self.flags.intersects(TypeFlags::STRING_LIKE)
+    }
+
+    // Go: checker/types.go:823 Type.IsClass
+    pub fn is_class(&self) -> bool {
+        self.object_flags.intersects(ObjectFlags::CLASS)
+    }
+
+    // Go: checker/types.go:827 Type.IsTypeParameter
+    pub fn is_type_parameter(&self) -> bool {
+        self.flags.intersects(TypeFlags::TYPE_PARAMETER)
+    }
+
+    // Go: checker/types.go:831 Type.IsIndex
+    pub fn is_index(&self) -> bool {
+        self.flags.intersects(TypeFlags::INDEX)
+    }
+
+    // PORT: Go `Type.IsTupleType()` only wraps the package function
+    // `isTupleType` (a `Checker` method `is_tuple_type(t)` in the checker
+    // port) and only `ls` calls it. It is skipped as a language-service API.
+}
+
+impl Checker {
+    // Go: checker/types.go:771 Type.TargetInterfaceType
+    pub fn target_interface_type(&self, t: TypeId) -> &InterfaceType {
+        let target = self.ty(t).as_type_reference().object.target;
+        self.ty(target).as_interface_type()
+    }
+
+    // Go: checker/types.go:775 Type.TargetTupleType
+    pub fn target_tuple_type(&self, t: TypeId) -> &TupleType {
+        let target = self.ty(t).as_type_reference().object.target;
+        self.ty(target).as_tuple_type()
+    }
+}
+
+// TypeData
+
+// PORT: Go `TypeData` is an interface over pointers to the concrete structs
+// below. Here it is an enum that owns the concrete struct. The Go interface
+// methods `AsConstrainedType` ... `AsUnionOrIntersectionType` return `None`
+// where Go returns nil. Go `AsType()` has no port: `Type` owns its data.
+// PORT: the large variants are boxed so `Type` stays small in the arena.
+// Interface, tuple, mapped, reverse mapped, evolving array and instantiation
+// expression types are rare; union and intersection data is large.
+// Go: checker/types.go:841 TypeData
+#[derive(Clone)]
+pub enum TypeData {
+    Intrinsic(IntrinsicType),
+    Literal(LiteralType),
+    UniqueESSymbol(UniqueESSymbolType),
+    TypeParameter(TypeParameter),
+    Index(IndexType),
+    IndexedAccess(IndexedAccessType),
+    TemplateLiteral(TemplateLiteralType),
+    StringMapping(StringMappingType),
+    Substitution(SubstitutionType),
+    Conditional(ConditionalType),
+    Object(ObjectType),
+    TypeReference(TypeReference),
+    Interface(Box<InterfaceType>),
+    Tuple(Box<TupleType>),
+    InstantiationExpression(Box<InstantiationExpressionType>),
+    Mapped(Box<MappedType>),
+    ReverseMapped(Box<ReverseMappedType>),
+    EvolvingArray(Box<EvolvingArrayType>),
+    Union(Box<UnionType>),
+    Intersection(Box<IntersectionType>),
+}
+
+// PORT: the arena keeps a dummy `Type` at index 0, so `TypeData` needs a
+// default. It has no Go counterpart.
+impl Default for TypeData {
+    fn default() -> Self {
+        TypeData::Intrinsic(IntrinsicType::default())
+    }
+}
+
+impl TypeData {
+    // Go: checker/types.go:858 TypeBase.AsConstrainedType
+    #[inline]
+    pub fn as_constrained_type(&self) -> Option<&ConstrainedType> {
+        match self {
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueESSymbol(_) => None,
+            TypeData::TypeParameter(d) => Some(&d.constrained),
+            TypeData::Index(d) => Some(&d.constrained),
+            TypeData::IndexedAccess(d) => Some(&d.constrained),
+            TypeData::TemplateLiteral(d) => Some(&d.constrained),
+            TypeData::StringMapping(d) => Some(&d.constrained),
+            TypeData::Substitution(d) => Some(&d.constrained),
+            TypeData::Conditional(d) => Some(&d.constrained),
+            _ => self.as_structured_type().map(|s| &s.constrained),
+        }
+    }
+
+    #[inline]
+    pub fn as_constrained_type_mut(&mut self) -> Option<&mut ConstrainedType> {
+        match self {
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueESSymbol(_) => None,
+            TypeData::TypeParameter(d) => Some(&mut d.constrained),
+            TypeData::Index(d) => Some(&mut d.constrained),
+            TypeData::IndexedAccess(d) => Some(&mut d.constrained),
+            TypeData::TemplateLiteral(d) => Some(&mut d.constrained),
+            TypeData::StringMapping(d) => Some(&mut d.constrained),
+            TypeData::Substitution(d) => Some(&mut d.constrained),
+            TypeData::Conditional(d) => Some(&mut d.constrained),
+            TypeData::Union(d) => Some(&mut d.union_or_intersection.structured.constrained),
+            TypeData::Intersection(d) => Some(&mut d.union_or_intersection.structured.constrained),
+            TypeData::Object(d) => Some(&mut d.structured.constrained),
+            TypeData::InstantiationExpression(d) => Some(&mut d.object.structured.constrained),
+            TypeData::Mapped(d) => Some(&mut d.object.structured.constrained),
+            TypeData::ReverseMapped(d) => Some(&mut d.object.structured.constrained),
+            TypeData::EvolvingArray(d) => Some(&mut d.object.structured.constrained),
+            TypeData::TypeReference(d) => Some(&mut d.object.structured.constrained),
+            TypeData::Interface(d) => Some(&mut d.reference.object.structured.constrained),
+            TypeData::Tuple(d) => Some(&mut d.interface.reference.object.structured.constrained),
+        }
+    }
+
+    // Go: checker/types.go:859 TypeBase.AsStructuredType
+    #[inline]
+    pub fn as_structured_type(&self) -> Option<&StructuredType> {
+        match self {
+            TypeData::Union(d) => Some(&d.union_or_intersection.structured),
+            TypeData::Intersection(d) => Some(&d.union_or_intersection.structured),
+            _ => self.as_object_type().map(|o| &o.structured),
+        }
+    }
+
+    #[inline]
+    pub fn as_structured_type_mut(&mut self) -> Option<&mut StructuredType> {
+        match self {
+            TypeData::Union(d) => Some(&mut d.union_or_intersection.structured),
+            TypeData::Intersection(d) => Some(&mut d.union_or_intersection.structured),
+            TypeData::Object(d) => Some(&mut d.structured),
+            TypeData::InstantiationExpression(d) => Some(&mut d.object.structured),
+            TypeData::Mapped(d) => Some(&mut d.object.structured),
+            TypeData::ReverseMapped(d) => Some(&mut d.object.structured),
+            TypeData::EvolvingArray(d) => Some(&mut d.object.structured),
+            TypeData::TypeReference(d) => Some(&mut d.object.structured),
+            TypeData::Interface(d) => Some(&mut d.reference.object.structured),
+            TypeData::Tuple(d) => Some(&mut d.interface.reference.object.structured),
+            _ => None,
+        }
+    }
+
+    // Go: checker/types.go:860 TypeBase.AsObjectType
+    #[inline]
+    pub fn as_object_type(&self) -> Option<&ObjectType> {
+        match self {
+            TypeData::Object(d) => Some(d),
+            TypeData::InstantiationExpression(d) => Some(&d.object),
+            TypeData::Mapped(d) => Some(&d.object),
+            TypeData::ReverseMapped(d) => Some(&d.object),
+            TypeData::EvolvingArray(d) => Some(&d.object),
+            _ => self.as_type_reference().map(|r| &r.object),
+        }
+    }
+
+    #[inline]
+    pub fn as_object_type_mut(&mut self) -> Option<&mut ObjectType> {
+        match self {
+            TypeData::Object(d) => Some(d),
+            TypeData::InstantiationExpression(d) => Some(&mut d.object),
+            TypeData::Mapped(d) => Some(&mut d.object),
+            TypeData::ReverseMapped(d) => Some(&mut d.object),
+            TypeData::EvolvingArray(d) => Some(&mut d.object),
+            TypeData::TypeReference(d) => Some(&mut d.object),
+            TypeData::Interface(d) => Some(&mut d.reference.object),
+            TypeData::Tuple(d) => Some(&mut d.interface.reference.object),
+            _ => None,
+        }
+    }
+
+    // Go: checker/types.go:861 TypeBase.AsTypeReference
+    #[inline]
+    pub fn as_type_reference(&self) -> Option<&TypeReference> {
+        match self {
+            TypeData::TypeReference(d) => Some(d),
+            _ => self.as_interface_type().map(|i| &i.reference),
+        }
+    }
+
+    #[inline]
+    pub fn as_type_reference_mut(&mut self) -> Option<&mut TypeReference> {
+        match self {
+            TypeData::TypeReference(d) => Some(d),
+            TypeData::Interface(d) => Some(&mut d.reference),
+            TypeData::Tuple(d) => Some(&mut d.interface.reference),
+            _ => None,
+        }
+    }
+
+    // Go: checker/types.go:862 TypeBase.AsInterfaceType
+    #[inline]
+    pub fn as_interface_type(&self) -> Option<&InterfaceType> {
+        match self {
+            TypeData::Interface(d) => Some(d),
+            TypeData::Tuple(d) => Some(&d.interface),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_interface_type_mut(&mut self) -> Option<&mut InterfaceType> {
+        match self {
+            TypeData::Interface(d) => Some(d),
+            TypeData::Tuple(d) => Some(&mut d.interface),
+            _ => None,
+        }
+    }
+
+    // Go: checker/types.go:863 TypeBase.AsUnionOrIntersectionType
+    #[inline]
+    pub fn as_union_or_intersection_type(&self) -> Option<&UnionOrIntersectionType> {
+        match self {
+            TypeData::Union(d) => Some(&d.union_or_intersection),
+            TypeData::Intersection(d) => Some(&d.union_or_intersection),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_union_or_intersection_type_mut(&mut self) -> Option<&mut UnionOrIntersectionType> {
+        match self {
+            TypeData::Union(d) => Some(&mut d.union_or_intersection),
+            TypeData::Intersection(d) => Some(&mut d.union_or_intersection),
+            _ => None,
+        }
+    }
+}
+
+// IntrinsicTypeData
+
+// Go: checker/types.go:867 IntrinsicType
+#[derive(Clone, Debug, Default)]
+pub struct IntrinsicType {
+    pub intrinsic_name: String,
+}
+
+impl IntrinsicType {
+    // Go: checker/types.go:872 IntrinsicType.IntrinsicName
+    pub fn intrinsic_name(&self) -> &str {
+        &self.intrinsic_name
+    }
+}
+
+// LiteralTypeData
+
+/// Go `any` value of a literal type or evaluator result:
+/// `string | jsnum.Number | bool | jsnum.PseudoBigInt`. Go `nil` (a computed
+/// enum value) is `Option::None` around this.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiteralValue {
+    String(String),
+    Number(Number),
+    Bool(bool),
+    PseudoBigInt(PseudoBigInt),
+}
+
+// Go: checker/types.go:876 LiteralType
+#[derive(Clone, Debug, Default)]
+pub struct LiteralType {
+    pub value: Option<LiteralValue>, // string | jsnum.Number | bool | PseudoBigInt | nil (computed enum)
+    pub fresh_type: TypeId,          // Fresh version of type
+    pub regular_type: TypeId,        // Regular version of type
+}
+
+impl LiteralType {
+    // Go: checker/types.go:883 LiteralType.Value
+    pub fn value(&self) -> Option<&LiteralValue> {
+        self.value.as_ref()
+    }
+
+    // Go: checker/types.go:887 LiteralType.FreshType
+    pub fn fresh_type(&self) -> TypeId {
+        self.fresh_type
+    }
+
+    // Go: checker/types.go:891 LiteralType.RegularType
+    pub fn regular_type(&self) -> TypeId {
+        self.regular_type
+    }
+
+    // Formats the raw value like Go `%v` on `LiteralType.value`. A nil value
+    // (computed enum) prints as Go's `<nil>`.
+    // Go: checker/checker.go:26996 indexType.AsLiteralType().value
+    pub fn value_arg(&self) -> String {
+        match &self.value {
+            Some(value) => value.to_string(),
+            None => "<nil>".to_string(),
+        }
+    }
+
+    // PORT: Go `ValueToString(nil)` panics; unwrapping here panics the same way.
+    // Go: checker/types.go:895 LiteralType.String
+    pub fn string(&self) -> String {
+        value_to_string(
+            self.value
+                .as_ref()
+                .expect("unhandled value type in valueToString"),
+        )
+    }
+}
+
+// PORT: Go passes a literal type's raw `value` (an `any`) as a diagnostic
+// argument, and diagnostics format arguments with `%v`. This `Display` impl
+// gives the same text: a string prints raw (no quotes), a number uses its
+// `String()`, a bool prints true/false and a bigint prints with no `n`.
+// Go: diagnostics/diagnostics.go:146 fmt.Sprintf("%v", arg)
+impl std::fmt::Display for LiteralValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralValue::String(value) => f.write_str(value),
+            LiteralValue::Number(value) => write!(f, "{value}"),
+            LiteralValue::Bool(value) => write!(f, "{value}"),
+            LiteralValue::PseudoBigInt(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+// UniqueESSymbolTypeData
+
+// Go: checker/types.go:901 UniqueESSymbolType
+#[derive(Clone, Debug, Default)]
+pub struct UniqueESSymbolType {
+    pub name: String,
+}
+
+// ConstrainedType (type with computed base constraint)
+
+// Go: checker/types.go:908 ConstrainedType
+#[derive(Clone, Debug, Default)]
+pub struct ConstrainedType {
+    pub resolved_base_constraint: TypeId,
+}
+
+// StructuredType (base of all types with members)
+
+// Go: checker/types.go:917 StructuredType
+#[derive(Clone, Debug, Default)]
+pub struct StructuredType {
+    pub constrained: ConstrainedType,
+    pub members: SymbolTable,
+    pub properties: SharedList<SymbolId>,
+    pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
+    pub call_signature_count: i32,           // Count of call signatures
+    pub index_infos: SharedList<IndexInfoId>,
+
+    pub object_type_without_abstract_construct_signatures: TypeId,
+}
+
+impl StructuredType {
+    // Go: checker/types.go:930 StructuredType.CallSignatures
+    pub fn call_signatures(&self) -> &[SignatureId] {
+        &self.signatures[..self.call_signature_count as usize]
+    }
+
+    // Go: checker/types.go:934 StructuredType.ConstructSignatures
+    pub fn construct_signatures(&self) -> &[SignatureId] {
+        &self.signatures[self.call_signature_count as usize..]
+    }
+
+    // Go: checker/types.go:938 StructuredType.Properties
+    pub fn properties(&self) -> &[SymbolId] {
+        &self.properties
+    }
+}
+
+// Except for tuple type references and reverse mapped types, all object types have an associated symbol.
+// Possible object type instances are listed in the following.
+
+// InterfaceType:
+// ObjectFlagsClass: Originating non-generic class type
+// ObjectFlagsClass|ObjectFlagsReference: Originating generic class type
+// ObjectFlagsInterface: Originating non-generic interface type
+// ObjectFlagsInterface|ObjectFlagsReference: Originating generic interface type
+
+// TupleType:
+// ObjectFlagsReference|ObjectFlagsTuple: Originating generic tuple type (synthesized)
+
+// TypeReference
+// ObjectFlagsReference: Instantiated generic class, interface, or tuple type
+
+// ObjectType:
+// ObjectFlagsAnonymous: Originating anonymous object type
+// ObjectFlagsAnonymous|ObjectFlagsInstantiated: Instantiated anonymous object type
+
+// MappedType:
+// ObjectFlagsMapped: Originating mapped type
+// ObjectFlagsMapped|ObjectFlagsInstantiated: Instantiated mapped type
+
+// InstantiationExpressionType:
+// ObjectFlagsAnonymous|ObjectFlagsInstantiationExpression: Originating instantiation expression type
+// ObjectFlagsAnonymous|ObjectFlagsInstantiated|ObjectFlagsInstantiationExpression: Instantiated instantiation expression type
+
+// ReverseMappedType:
+// ObjectFlagsAnonymous|ObjectFlagsReverseMapped: Reverse mapped type
+
+// EvolvingArrayType:
+// ObjectFlagsEvolvingArray: Evolving array type
+
+// Go: checker/types.go:975 ObjectType
+#[derive(Clone, Default)]
+pub struct ObjectType {
+    pub structured: StructuredType,
+    pub target: TypeId,   // Target of instantiated type
+    pub mapper: MapperId, // Type mapper for instantiated type
+    // PORT: Go nil map is `None`; Go creates it lazily.
+    pub instantiations: Option<CacheKeyMap<TypeId>>, // Map of type instantiations
+}
+
+// TypeReference (instantiation of an InterfaceType)
+
+// Go: checker/types.go:986 TypeReference
+#[derive(Clone, Default)]
+pub struct TypeReference {
+    pub object: ObjectType,
+    pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
+    pub resolved_type_arguments: SharedList<TypeId>,
+}
+
+// InterfaceType (when generic, serves as reference to instantiation of itself)
+
+// Go: checker/types.go:996 InterfaceType
+#[derive(Clone, Default)]
+pub struct InterfaceType {
+    pub reference: TypeReference,
+    pub all_type_parameters: Vec<TypeId>, // Type parameters (outer + local + thisType)
+    pub outer_type_parameter_count: i32,  // Count of outer type parameters
+    pub this_type: TypeId,                // The "this" type (nil if none)
+    pub base_types_resolved: bool,
+    pub declared_members_resolved: bool,
+    pub resolved_base_constructor_type: TypeId,
+    pub resolved_base_types: Vec<TypeId>,
+    pub declared_members: SymbolTable, // Declared members
+    pub declared_call_signatures: Vec<SignatureId>, // Declared call signatures
+    pub declared_construct_signatures: Vec<SignatureId>, // Declared construct signatures
+    pub declared_index_infos: Vec<IndexInfoId>, // Declared index signatures
+}
+
+impl InterfaceType {
+    // Go: checker/types.go:1013 InterfaceType.OuterTypeParameters
+    pub fn outer_type_parameters(&self) -> &[TypeId] {
+        if self.all_type_parameters.is_empty() {
+            return &[];
+        }
+        &self.all_type_parameters[..self.outer_type_parameter_count as usize]
+    }
+
+    // Go: checker/types.go:1020 InterfaceType.LocalTypeParameters
+    pub fn local_type_parameters(&self) -> &[TypeId] {
+        if self.all_type_parameters.is_empty() {
+            return &[];
+        }
+        &self.all_type_parameters
+            [self.outer_type_parameter_count as usize..self.all_type_parameters.len() - 1]
+    }
+
+    // Go: checker/types.go:1027 InterfaceType.TypeParameters
+    pub fn type_parameters(&self) -> &[TypeId] {
+        if self.all_type_parameters.is_empty() {
+            return &[];
+        }
+        &self.all_type_parameters[..self.all_type_parameters.len() - 1]
+    }
+}
+
+// TupleType
+
+// Go: checker/types.go:1050 TupleElementInfo
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TupleElementInfo {
+    pub flags: ElementFlags,
+    pub labeled_declaration: Node, // NamedTupleMember | ParameterDeclaration | nil
+}
+
+impl TupleElementInfo {
+    // Go: checker/types.go:1055 TupleElementInfo.TupleElementFlags
+    pub fn tuple_element_flags(&self) -> ElementFlags {
+        self.flags
+    }
+
+    // Go: checker/types.go:1056 TupleElementInfo.LabeledDeclaration
+    pub fn labeled_declaration(&self) -> Node {
+        self.labeled_declaration
+    }
+}
+
+// Go: checker/types.go:1058 TupleType
+#[derive(Clone, Default)]
+pub struct TupleType {
+    pub interface: InterfaceType,
+    pub element_infos: Vec<TupleElementInfo>,
+    pub min_length: i32,   // Number of required or variadic elements
+    pub fixed_length: i32, // Number of initial required or optional elements
+    pub combined_flags: ElementFlags,
+    pub readonly: bool,
+}
+
+impl TupleType {
+    // Go: checker/types.go:1067 TupleType.FixedLength
+    pub fn fixed_length(&self) -> i32 {
+        self.fixed_length
+    }
+
+    // Go: checker/types.go:1068 TupleType.IsReadonly
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    // Go: checker/types.go:1069 TupleType.ElementFlags
+    pub fn element_flags(&self) -> Vec<ElementFlags> {
+        let mut element_flags = vec![ElementFlags::NONE; self.element_infos.len()];
+        for (i, info) in self.element_infos.iter().enumerate() {
+            element_flags[i] = info.flags;
+        }
+        element_flags
+    }
+
+    // Go: checker/types.go:1076 TupleType.ElementInfos
+    pub fn element_infos(&self) -> &[TupleElementInfo] {
+        &self.element_infos
+    }
+}
+
+// InstantiationExpressionType
+
+// Go: checker/types.go:1080 InstantiationExpressionType
+#[derive(Clone, Default)]
+pub struct InstantiationExpressionType {
+    pub object: ObjectType,
+    pub node: Node,
+}
+
+// MappedType
+
+// Go: checker/types.go:1087 MappedType
+#[derive(Clone, Default)]
+pub struct MappedType {
+    pub object: ObjectType,
+    pub declaration: Node, // *ast.MappedTypeNode
+    pub type_parameter: TypeId,
+    pub constraint_type: TypeId,
+    pub name_type: TypeId,
+    pub template_type: TypeId,
+    pub modifiers_type: TypeId,
+    pub resolved_apparent_type: TypeId,
+    pub contains_error: bool,
+}
+
+// ReverseMappedType
+
+// Go: checker/types.go:1101 ReverseMappedType
+#[derive(Clone, Default)]
+pub struct ReverseMappedType {
+    pub object: ObjectType,
+    pub source: TypeId,
+    pub mapped_type: TypeId,
+    pub constraint_type: TypeId,
+}
+
+// EvolvingArrayType
+
+// Go: checker/types.go:1110 EvolvingArrayType
+#[derive(Clone, Default)]
+pub struct EvolvingArrayType {
+    pub object: ObjectType,
+    pub element_type: TypeId,
+    pub final_array_type: TypeId,
+}
+
+// UnionOrIntersectionTypeData
+
+// Go: checker/types.go:1118 UnionOrIntersectionType
+#[derive(Clone, Debug, Default)]
+pub struct UnionOrIntersectionType {
+    pub structured: StructuredType,
+    pub types: SharedList<TypeId>,
+    pub property_cache: SymbolTable,
+    pub property_cache_without_function_property_augment: SymbolTable,
+    pub resolved_properties: SharedList<SymbolId>,
+}
+
+impl UnionOrIntersectionType {
+    // Go: checker/types.go:1128 UnionOrIntersectionType.Types
+    pub fn types(&self) -> &[TypeId] {
+        &self.types
+    }
+}
+
+// UnionType
+
+// Go: checker/types.go:1134 UnionType
+#[derive(Clone, Debug, Default)]
+pub struct UnionType {
+    pub union_or_intersection: UnionOrIntersectionType,
+    pub resolved_reduced_type: TypeId,
+    pub regular_type: TypeId,
+    pub origin: TypeId, // Denormalized union, intersection, or index type in which union originates
+    pub key_property_name: String, // Property with unique unit type that exists in every object/intersection in union type
+    // PORT: Go nil map is `None`.
+    pub constituent_map: Option<FxHashMap<TypeId, TypeId>>, // Constituents keyed by unit type discriminants
+}
+
+// IntersectionType
+
+// Go: checker/types.go:1145 IntersectionType
+#[derive(Clone, Debug, Default)]
+pub struct IntersectionType {
+    pub union_or_intersection: UnionOrIntersectionType,
+    pub resolved_apparent_type: TypeId,
+    pub unique_literal_filled_instantiation: TypeId, // Instantiation with type parameters mapped to never type
+}
+
+// TypeParameter
+
+// Go: checker/types.go:1153 TypeParameter
+#[derive(Clone, Debug, Default)]
+pub struct TypeParameter {
+    pub constrained: ConstrainedType,
+    pub constraint: TypeId,
+    pub target: TypeId,
+    pub mapper: MapperId,
+    pub is_this_type: bool,
+    pub resolved_default_type: TypeId,
+}
+
+impl TypeParameter {
+    // Go: checker/types.go:1162 TypeParameter.IsThisType
+    pub fn is_this_type(&self) -> bool {
+        self.is_this_type
+    }
+}
+
+// IndexType
+
+// Go: checker/types.go:1177 IndexType
+#[derive(Clone, Debug, Default)]
+pub struct IndexType {
+    pub constrained: ConstrainedType,
+    pub target: TypeId,
+    pub index_flags: IndexFlags,
+}
+
+impl IndexType {
+    // Go: checker/types.go:1183 IndexType.Target
+    pub fn target(&self) -> TypeId {
+        self.target
+    }
+}
+
+// IndexedAccessType
+
+// Go: checker/types.go:1187 IndexedAccessType
+#[derive(Clone, Debug, Default)]
+pub struct IndexedAccessType {
+    pub constrained: ConstrainedType,
+    pub object_type: TypeId,
+    pub index_type: TypeId,
+    pub access_flags: AccessFlags, // Only includes AccessFlags.Persistent
+}
+
+impl IndexedAccessType {
+    // Go: checker/types.go:1194 IndexedAccessType.ObjectType
+    pub fn object_type(&self) -> TypeId {
+        self.object_type
+    }
+
+    // Go: checker/types.go:1195 IndexedAccessType.IndexType
+    pub fn index_type(&self) -> TypeId {
+        self.index_type
+    }
+}
+
+// PORT: Go shares the `texts` and `types` slices; `Rc<[_]>` makes the
+// clones cheap. The contents never change after creation.
+// Go: checker/types.go:1197 TemplateLiteralType
+#[derive(Clone, Debug, Default)]
+pub struct TemplateLiteralType {
+    pub constrained: ConstrainedType,
+    pub texts: Rc<[String]>,       // Always one element longer than types
+    pub types: SharedList<TypeId>, // Always at least one element
+}
+
+impl TemplateLiteralType {
+    // Go: checker/types.go:1203 TemplateLiteralType.Texts
+    pub fn texts(&self) -> &[String] {
+        &self.texts
+    }
+
+    // Go: checker/types.go:1204 TemplateLiteralType.Types
+    pub fn types(&self) -> &[TypeId] {
+        &self.types
+    }
+}
+
+// Go: checker/types.go:1206 StringMappingType
+#[derive(Clone, Debug, Default)]
+pub struct StringMappingType {
+    pub constrained: ConstrainedType,
+    pub target: TypeId,
+}
+
+impl StringMappingType {
+    // Go: checker/types.go:1211 StringMappingType.Target
+    pub fn target(&self) -> TypeId {
+        self.target
+    }
+}
+
+// Go: checker/types.go:1213 SubstitutionType
+#[derive(Clone, Debug, Default)]
+pub struct SubstitutionType {
+    pub constrained: ConstrainedType,
+    pub base_type: TypeId,  // Target type
+    pub constraint: TypeId, // Constraint that target type is known to satisfy
+}
+
+impl SubstitutionType {
+    // Go: checker/types.go:1219 SubstitutionType.BaseType
+    pub fn base_type(&self) -> TypeId {
+        self.base_type
+    }
+
+    // Go: checker/types.go:1220 SubstitutionType.SubstConstraint
+    pub fn subst_constraint(&self) -> TypeId {
+        self.constraint
+    }
+}
+
+// PORT: Go shares one `*ConditionalRoot` between a conditional type and all
+// its instantiations and mutates `instantiations`, so `ConditionalType.root`
+// is `Rc<RefCell<ConditionalRoot>>`.
+// Go: checker/types.go:1222 ConditionalRoot
+#[derive(Clone, Default)]
+pub struct ConditionalRoot {
+    pub node: Node, // *ast.ConditionalTypeNode
+    pub check_type: TypeId,
+    pub extends_type: TypeId,
+    pub is_distributive: bool,
+    pub infer_type_parameters: Vec<TypeId>,
+    pub outer_type_parameters: Vec<TypeId>,
+    // PORT: Go nil map is `None`.
+    pub instantiations: Option<CacheKeyMap<TypeId>>,
+    pub alias: Option<Rc<TypeAlias>>,
+}
+
+// Go: checker/types.go:1233 ConditionalType
+#[derive(Clone, Default)]
+pub struct ConditionalType {
+    pub constrained: ConstrainedType,
+    pub root: Rc<RefCell<ConditionalRoot>>,
+    pub check_type: TypeId,
+    pub extends_type: TypeId,
+    pub resolved_true_type: TypeId,
+    pub resolved_false_type: TypeId,
+    pub resolved_inferred_true_type: TypeId, // The `trueType` instantiated with the `combinedMapper`, if present
+    pub resolved_default_constraint: TypeId,
+    pub resolved_constraint_of_distributive: TypeId,
+    pub mapper: MapperId,
+    pub combined_mapper: MapperId,
+}
+
+impl ConditionalType {
+    // Go: checker/types.go:1247 ConditionalType.CheckType
+    pub fn check_type(&self) -> TypeId {
+        self.check_type
+    }
+
+    // Go: checker/types.go:1248 ConditionalType.ExtendsType
+    pub fn extends_type(&self) -> TypeId {
+        self.extends_type
+    }
+}
+
+// Signature
+
+// Go: checker/types.go:1276 Signature
+#[derive(Clone, Debug, Default)]
+pub struct Signature {
+    pub id: SignatureId,
+    pub flags: SignatureFlags,
+    pub min_argument_count: i32,
+    pub resolved_min_argument_count: i32,
+    pub declaration: Node,
+    pub type_parameters: Vec<TypeId>,
+    // PORT: Go compares signature type parameter lists by slice identity
+    // (`core.Same` in compareSignaturesRelated). A Rust signature owns its
+    // `Vec`, so a list that Go shares between signatures (cloneSignature,
+    // class local type parameters, inferred type parameters, ...) carries
+    // the same nonzero origin here. 0 means the list belongs only to this
+    // signature. See `Checker::same_signature_type_parameters`.
+    pub type_parameters_origin: u32,
+    pub parameters: Vec<SymbolId>,
+    pub this_parameter: SymbolId,
+    pub resolved_return_type: TypeId,
+    pub resolved_type_predicate: TypePredicateId,
+    pub target: SignatureId,
+    pub mapper: MapperId,
+    pub isolated_signature_type: TypeId,
+    // PORT: Go `*CompositeSignature` is created once and only read; nil is `None`.
+    pub composite: Option<Rc<CompositeSignature>>,
+}
+
+impl Signature {
+    // Go: checker/types.go:1293 Signature.Id
+    pub fn id(&self) -> SignatureId {
+        self.id
+    }
+
+    // Go: checker/types.go:1297 Signature.Flags
+    pub fn flags(&self) -> SignatureFlags {
+        self.flags
+    }
+
+    // Go: checker/types.go:1301 Signature.TypeParameters
+    pub fn type_parameters(&self) -> &[TypeId] {
+        &self.type_parameters
+    }
+
+    // Go: checker/types.go:1305 Signature.Declaration
+    pub fn declaration(&self) -> Node {
+        self.declaration
+    }
+
+    // Go: checker/types.go:1309 Signature.Target
+    pub fn target(&self) -> SignatureId {
+        self.target
+    }
+
+    // Go: checker/types.go:1313 Signature.ThisParameter
+    pub fn this_parameter(&self) -> SymbolId {
+        self.this_parameter
+    }
+
+    // Go: checker/types.go:1317 Signature.Parameters
+    pub fn parameters(&self) -> &[SymbolId] {
+        &self.parameters
+    }
+
+    // Go: checker/types.go:1321 Signature.HasRestParameter
+    pub fn has_rest_parameter(&self) -> bool {
+        self.flags.intersects(SignatureFlags::HAS_REST_PARAMETER)
+    }
+
+    // Go: checker/types.go:1325 Signature.MinArgumentCount
+    pub fn min_argument_count(&self) -> i32 {
+        self.min_argument_count
+    }
+}
+
+// Go: checker/types.go:1329 CompositeSignature
+#[derive(Clone, Debug, Default)]
+pub struct CompositeSignature {
+    pub is_union: bool,               // True for union, false for intersection
+    pub signatures: Vec<SignatureId>, // Individual signatures
+}
+
+// Go: checker/types.go:1343 TypePredicate
+#[derive(Clone, Debug, Default)]
+pub struct TypePredicate {
+    pub kind: TypePredicateKind,
+    pub parameter_index: i32,
+    pub parameter_name: String,
+    // PORT: Go field `t`.
+    pub t: TypeId,
+}
+
+impl TypePredicate {
+    // Go: checker/types.go:1350 TypePredicate.Type
+    pub fn type_(&self) -> TypeId {
+        self.t
+    }
+
+    // Go: checker/types.go:1354 TypePredicate.Kind
+    pub fn kind(&self) -> TypePredicateKind {
+        self.kind
+    }
+
+    // Go: checker/types.go:1358 TypePredicate.ParameterIndex
+    pub fn parameter_index(&self) -> i32 {
+        self.parameter_index
+    }
+
+    // Go: checker/types.go:1362 TypePredicate.ParameterName
+    pub fn parameter_name(&self) -> &str {
+        &self.parameter_name
+    }
+}
+
+// IndexInfo
+
+// Go: checker/types.go:1368 IndexInfo
+#[derive(Clone, Debug, Default)]
+pub struct IndexInfo {
+    pub key_type: TypeId,
+    pub value_type: TypeId,
+    pub is_readonly: bool,
+    pub declaration: Node,      // IndexSignatureDeclaration
+    pub index_symbol: SymbolId, // Synthetic property symbol for this index signature
+    pub components: Vec<Node>,  // ElementWithComputedPropertyName
+}
+
+impl IndexInfo {
+    // Go: checker/types.go:1377 IndexInfo.KeyType
+    pub fn key_type(&self) -> TypeId {
+        self.key_type
+    }
+
+    // Go: checker/types.go:1381 IndexInfo.ValueType
+    pub fn value_type(&self) -> TypeId {
+        self.value_type
+    }
+
+    // Go: checker/types.go:1385 IndexInfo.IsReadonly
+    pub fn is_readonly(&self) -> bool {
+        self.is_readonly
+    }
+
+    // Go: checker/types.go:1389 IndexInfo.Declaration
+    pub fn declaration(&self) -> Node {
+        self.declaration
+    }
+}
+
+/*
+ * Ternary values are defined such that
+ * x & y picks the lesser in the order False < Unknown < Maybe < True, and
+ * x | y picks the greater in the order False < Unknown < Maybe < True.
+ * Generally, Ternary.Maybe is used as the result of a relation that depends on itself, and
+ * Ternary.Unknown is used as the result of a variance check that depends on itself. We make
+ * a distinction because we don't want to cache circular variance check results.
+ */
+// PORT: `Ternary` itself is generated in `crate::flags` (a `go_enum!`).
+// These operators give Go's `x & y` and `x | y` on the underlying int8.
+impl std::ops::BitAnd for Ternary {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl std::ops::BitAndAssign for Ternary {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl std::ops::BitOr for Ternary {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Ternary {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+// PORT: Go `TypeComparer` is a func value stored in checker fields and
+// inference contexts, so it is an `Rc<dyn Fn>` that gets the checker first.
+// Go: checker/types.go:1410 TypeComparer
+pub type TypeComparer = Rc<dyn Fn(&mut Checker, TypeId, TypeId, bool) -> Ternary>;
+
+// Go: checker/types.go:1412 LanguageFeatureMinimumTargetMap
+#[derive(Clone, Copy, Debug)]
+pub struct LanguageFeatureMinimumTargetMap {
+    pub exponentiation: ScriptTarget,
+    pub async_functions: ScriptTarget,
+    pub for_await_of: ScriptTarget,
+    pub async_generators: ScriptTarget,
+    pub async_iteration: ScriptTarget,
+    pub object_spread_rest: ScriptTarget,
+    pub regular_expression_flags_dot_all: ScriptTarget,
+    pub bindingless_catch: ScriptTarget,
+    pub big_int: ScriptTarget,
+    pub nullish_coalesce: ScriptTarget,
+    pub optional_chaining: ScriptTarget,
+    pub logical_assignment: ScriptTarget,
+    pub top_level_await: ScriptTarget,
+    pub class_fields: ScriptTarget,
+    pub private_names_and_class_static_blocks: ScriptTarget,
+    pub regular_expression_flags_has_indices: ScriptTarget,
+    pub shebang_comments: ScriptTarget,
+    pub using_and_await_using: ScriptTarget,
+    pub class_and_class_element_decorators: ScriptTarget,
+    pub regular_expression_flags_unicode_sets: ScriptTarget,
+}
+
+// PORT: Go package var `LanguageFeatureMinimumTarget` is never mutated, so
+// it is a Rust const.
+// Go: checker/types.go:1435 LanguageFeatureMinimumTarget
+pub const LANGUAGE_FEATURE_MINIMUM_TARGET: LanguageFeatureMinimumTargetMap =
+    LanguageFeatureMinimumTargetMap {
+        exponentiation: ScriptTarget::ES2016,
+        async_functions: ScriptTarget::ES2017,
+        for_await_of: ScriptTarget::ES2018,
+        async_generators: ScriptTarget::ES2018,
+        async_iteration: ScriptTarget::ES2018,
+        object_spread_rest: ScriptTarget::ES2018,
+        regular_expression_flags_dot_all: ScriptTarget::ES2018,
+        bindingless_catch: ScriptTarget::ES2019,
+        big_int: ScriptTarget::ES2020,
+        nullish_coalesce: ScriptTarget::ES2020,
+        optional_chaining: ScriptTarget::ES2020,
+        logical_assignment: ScriptTarget::ES2021,
+        top_level_await: ScriptTarget::ES2022,
+        class_fields: ScriptTarget::ES2022,
+        private_names_and_class_static_blocks: ScriptTarget::ES2022,
+        regular_expression_flags_has_indices: ScriptTarget::ES2022,
+        shebang_comments: ScriptTarget::ES_NEXT,
+        using_and_await_using: ScriptTarget::ES_NEXT,
+        class_and_class_element_decorators: ScriptTarget::ES_NEXT,
+        regular_expression_flags_unicode_sets: ScriptTarget::ES_NEXT,
+    };
+
+// Aliases for types
+// Go: checker/types.go:1459 StringLiteralType
+pub type StringLiteralType = Type;
+
+// PORT: no Go counterpart. Go allocates each `Type` and `TypeMapper` on its
+// own; the port keeps them in index arenas. A plain `Vec` arena doubles and
+// copies every entry when it grows, and keeps up to half its capacity unused.
+// `ChunkedArena` stores entries in fixed-size chunks, so growing it never
+// moves an entry. Index 0 is the nil dummy, like the other arenas.
+pub struct ChunkedArena<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
+}
+
+const ARENA_CHUNK_SHIFT: usize = 12;
+const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
+const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
+
+impl<T> ChunkedArena<T> {
+    /// Creates an arena that holds only `nil`, the dummy entry at index 0.
+    pub fn with_nil(nil: T) -> Self {
+        let mut arena = ChunkedArena {
+            chunks: Vec::new(),
+            len: 0,
+        };
+        arena.push(nil);
+        arena
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, value: T) {
+        if self.len & ARENA_CHUNK_MASK == 0 {
+            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+        }
+        let chunk = self.chunks.last_mut().expect("arena chunk");
+        chunk.push(value);
+        self.len += 1;
+    }
+}
+
+impl<T> std::ops::Index<usize> for ChunkedArena<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    }
+}

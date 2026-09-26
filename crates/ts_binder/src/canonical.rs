@@ -344,6 +344,12 @@ enum ModuleInstanceState {
     ConstEnumOnly,
 }
 
+impl ModuleInstanceState {
+    fn has_value_symbol(self) -> bool {
+        self != Self::NonInstantiated
+    }
+}
+
 impl CanonicalPatternAmbientModule {
     #[must_use]
     pub fn pattern(&self) -> &str {
@@ -2551,7 +2557,7 @@ impl CanonicalBinder {
         facts: &CanonicalSourceFileFacts,
         state: ModuleInstanceState,
     ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
-        let instantiated = state != ModuleInstanceState::NonInstantiated;
+        let instantiated = state.has_value_symbol();
         self.declare_symbol_and_add_to_symbol_table(
             arena,
             file,
@@ -3792,6 +3798,27 @@ pub fn module_declaration_has_value_meaning(arena: &NodeArena, node: NodeId) -> 
         Some(NodeData::ModuleDeclaration(_))
     ) && (is_ambient_module(arena, node)
         || get_module_instance_state(arena, node) == ModuleInstanceState::Instantiated)
+}
+
+/// Returns the local export marker for a namespace declaration.
+/// Ambient modules have no local export placeholder. Const-enum-only namespaces do.
+#[must_use]
+pub fn module_declaration_local_export_flags(
+    arena: &NodeArena,
+    node: NodeId,
+) -> Option<SymbolFlags> {
+    if !matches!(
+        arena.get(node).map(|node| &node.data),
+        Some(NodeData::ModuleDeclaration(_))
+    ) || is_ambient_module(arena, node)
+    {
+        return None;
+    }
+    Some(if get_module_instance_state(arena, node).has_value_symbol() {
+        SymbolFlags::EXPORT_VALUE
+    } else {
+        SymbolFlags::NONE
+    })
 }
 
 fn get_module_instance_state(arena: &NodeArena, node: NodeId) -> ModuleInstanceState {

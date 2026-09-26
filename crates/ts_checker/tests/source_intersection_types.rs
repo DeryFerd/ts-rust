@@ -4,8 +4,9 @@ use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, TypeData, TypeId,
-    TypeNodeUnavailable, TypeRecord, ValueSymbolLinks, type_records::IntersectionTypeData,
+    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, IntrinsicBootstrapOptions,
+    TypeData, TypeId, TypeNodeUnavailable, TypeRecord, ValueSymbolLinks,
+    type_records::{IntersectionTypeData, TypeAlias},
     types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
@@ -661,5 +662,549 @@ fn unsupported_intersection_syntax_fails_before_semantic_writes() {
             "{label}",
         );
         assert_eq!(context.get_type_from_type_node(rhs), Err(first), "{label}");
+    }
+}
+
+fn strict_intersection_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/strict-intersection-types.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+fn query_intersection_alias(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    name: &str,
+) -> TypeId {
+    let owner = symbol(
+        parsed,
+        file,
+        context,
+        SyntaxKind::TypeAliasDeclaration,
+        name,
+    );
+    let type_ = context
+        .get_type_from_type_node(alias_rhs(parsed, file, name))
+        .unwrap();
+    assert_eq!(context.get_declared_type_of_symbol(owner), Ok(type_));
+    assert_eq!(declared_type(context, owner), type_);
+    type_
+}
+
+fn assert_intersection_replay(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    aliases: &[(&str, TypeId)],
+    reductions: &[(&str, TypeId)],
+) {
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [
+                store.type_len(),
+                store.type_alias_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            store.relation_state_snapshot(),
+            parsed
+                .arena
+                .iter()
+                .map(|(node, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, node);
+                    (
+                        store.node_links(node).cloned(),
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            aliases
+                .iter()
+                .map(|(_, type_)| {
+                    let record = store.type_payload(*type_).unwrap();
+                    let (union, intersection) = match record.data() {
+                        TypeData::Union(data) => (Some(data.clone()), None),
+                        TypeData::Intersection(data) => (None, Some(data.clone())),
+                        data => panic!("expected a retained union or intersection, got {data:?}"),
+                    };
+                    (
+                        record.flags(),
+                        record.object_flags(),
+                        record.alias(),
+                        union,
+                        intersection,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            store
+                .source_file_links(context.source_file(file).unwrap())
+                .cloned(),
+            context.diagnostics().clone(),
+        )
+    };
+    let before = snapshot(context);
+    for _ in 0..2 {
+        for &(name, type_) in aliases.iter().rev() {
+            assert_eq!(query_intersection_alias(context, parsed, file, name), type_);
+        }
+        for &(name, primitive) in reductions.iter().rev() {
+            assert_eq!(
+                query_intersection_alias(context, parsed, file, name),
+                primitive
+            );
+        }
+        context.check_source_file(file).unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(context), before);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn primitive_empty_intersections_keep_order_aliases_and_native_relations() {
+    let source = concat!(
+        "type Text = string & {};\n",
+        "type TextAgain = string & {};\n",
+        "type ReverseText = {} & string;\n",
+        "type Numeric = number & {};\n",
+        "type ReverseNumeric = {} & number;\n",
+        "type Empty = {};\n",
+        "type ReducedText = string & Empty;\n",
+        "type ReducedNumeric = Empty & number;\n",
+        "const text: Text = 'value';\n",
+        "const numeric: Numeric = 42;\n",
+        "const reverseText: ReverseText = text;\n",
+        "const reverseNumeric: ReverseNumeric = numeric;\n",
+        "const directText: string & {} = text;\n",
+        "const directNumeric: number & {} = numeric;\n",
+        "const plainText: string = text;\n",
+        "const plainNumeric: number = numeric;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_930);
+    for source_first in [false, true] {
+        let mut context = strict_intersection_context(&parsed, file);
+        if source_first {
+            context.check_source_file(file).unwrap();
+        }
+        let aliases = [
+            "Text",
+            "TextAgain",
+            "ReverseText",
+            "Numeric",
+            "ReverseNumeric",
+        ]
+        .map(|name| {
+            (
+                name,
+                query_intersection_alias(&mut context, &parsed, file, name),
+            )
+        });
+        let [
+            (_, text),
+            (_, text_again),
+            (_, reverse_text),
+            (_, numeric),
+            (_, reverse_numeric),
+        ] = aliases;
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let empty = bootstrap.empty_type_literal_type;
+        assert_eq!(
+            query_intersection_alias(&mut context, &parsed, file, "ReducedText"),
+            string,
+        );
+        assert_eq!(
+            query_intersection_alias(&mut context, &parsed, file, "ReducedNumeric"),
+            number,
+        );
+        for (type_, expected) in [
+            (text, [string, empty]),
+            (text_again, [string, empty]),
+            (reverse_text, [empty, string]),
+            (numeric, [number, empty]),
+            (reverse_numeric, [empty, number]),
+        ] {
+            assert_eq!(
+                intersection_data(&context, type_).intersection.types,
+                expected
+            );
+        }
+        for (name, type_) in aliases {
+            let owner = symbol(
+                &parsed,
+                file,
+                &context,
+                SyntaxKind::TypeAliasDeclaration,
+                name,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(type_)
+                    .and_then(TypeRecord::alias)
+                    .and_then(|alias| context.store().type_alias(alias))
+                    .and_then(TypeAlias::symbol),
+                Some(owner),
+            );
+            assert_eq!(context.type_to_string(type_).unwrap(), name);
+        }
+        assert_ne!(text, text_again);
+        assert_ne!(text, reverse_text);
+        assert_ne!(numeric, reverse_numeric);
+        assert_eq!(context.is_type_identical_to(text, text_again), Ok(true));
+        assert_eq!(context.is_type_identical_to(text, reverse_text), Ok(true));
+        assert_eq!(
+            context.is_type_identical_to(numeric, reverse_numeric),
+            Ok(true)
+        );
+        for (intersection, primitive) in [(text, string), (numeric, number)] {
+            assert_eq!(
+                context.is_type_assignable_to(intersection, primitive),
+                Ok(true)
+            );
+            assert_eq!(
+                context.is_type_assignable_to(primitive, intersection),
+                Ok(true)
+            );
+        }
+        assert_eq!(context.is_type_assignable_to(number, text), Ok(false));
+        assert_eq!(context.is_type_assignable_to(string, numeric), Ok(false));
+        assert_eq!(
+            intersection_data(
+                &context,
+                variable_type(&parsed, file, &context, "directText")
+            )
+            .intersection
+            .types,
+            [string, empty],
+        );
+        assert_eq!(
+            intersection_data(
+                &context,
+                variable_type(&parsed, file, &context, "directNumeric")
+            )
+            .intersection
+            .types,
+            [number, empty],
+        );
+        assert_intersection_replay(
+            &mut context,
+            &parsed,
+            file,
+            &aliases,
+            &[("ReducedText", string), ("ReducedNumeric", number)],
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn primitive_empty_intersection_union_keeps_literals_and_reports_number_assignment() {
+    let source = concat!(
+        "type Open = 'known' | (string & {});\n",
+        "const good: Open = 'another';\n",
+        "const known: Open = 'known';\n",
+        "const bad: Open = 42;\n",
+        "type CustomHeader = string & {};\n",
+        "type NamedOpen = 'known' | CustomHeader;\n",
+        "const namedGood: NamedOpen = 'another';\n",
+        "const namedKnown: NamedOpen = 'known';\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_931);
+    for source_first in [false, true] {
+        let mut context = strict_intersection_context(&parsed, file);
+        if source_first {
+            context.check_source_file(file).unwrap();
+        }
+        let open = query_intersection_alias(&mut context, &parsed, file, "Open");
+        let custom_header = query_intersection_alias(&mut context, &parsed, file, "CustomHeader");
+        let named_open = query_intersection_alias(&mut context, &parsed, file, "NamedOpen");
+        context.check_source_file(file).unwrap();
+        let TypeData::Union(union) = context.store().type_payload(open).unwrap().data() else {
+            panic!("the literal and open string must remain separate union constituents")
+        };
+        let constituents = union.union.types.clone();
+        assert_eq!(constituents.len(), 2);
+        let intersection = constituents
+            .iter()
+            .copied()
+            .find(|type_| {
+                matches!(
+                    context.store().type_payload(*type_).unwrap().data(),
+                    TypeData::Intersection(_)
+                )
+            })
+            .unwrap();
+        let literal = *constituents
+            .iter()
+            .find(|type_| **type_ != intersection)
+            .unwrap();
+        assert_eq!(context.type_to_string(literal).unwrap(), "\"known\"");
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        assert_eq!(
+            intersection_data(&context, intersection).intersection.types,
+            [string, bootstrap.empty_type_literal_type],
+        );
+        assert_eq!(context.type_to_string(open).unwrap(), "Open");
+        assert_eq!(context.is_type_assignable_to(string, open), Ok(true));
+        assert_eq!(context.is_type_assignable_to(number, open), Ok(false));
+        let TypeData::Union(named_union) = context.store().type_payload(named_open).unwrap().data()
+        else {
+            panic!("the named intersection must remain a union constituent")
+        };
+        assert_eq!(named_union.union.types.len(), 2);
+        assert!(named_union.union.types.contains(&custom_header));
+        assert!(named_union.union.types.contains(&literal));
+        assert_eq!(
+            context.type_to_string(custom_header).unwrap(),
+            "CustomHeader"
+        );
+        assert_eq!(context.type_to_string(named_open).unwrap(), "NamedOpen");
+        assert_eq!(context.is_type_assignable_to(string, named_open), Ok(true));
+        assert_eq!(context.is_type_assignable_to(number, named_open), Ok(false));
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["42", "Open"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type '42' is not assignable to type 'Open'.",
+        );
+        let bad = declaration(&parsed, file, SyntaxKind::VariableDeclaration, "bad");
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(bad.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            diagnostic.node,
+            Some(NodeRef::new(bad.arena, file, variable.name))
+        );
+        assert_eq!(diagnostic.range_override, None);
+        assert!(diagnostic.related_information.is_empty());
+        assert_intersection_replay(
+            &mut context,
+            &parsed,
+            file,
+            &[
+                ("Open", open),
+                ("CustomHeader", custom_header),
+                ("NamedOpen", named_open),
+            ],
+            &[],
+        );
+    }
+}
+
+#[test]
+fn primitive_empty_intersections_reject_null_and_undefined_with_strict_null_checks() {
+    let source = concat!(
+        "type Text = string & {};\n",
+        "type Numeric = number & {};\n",
+        "const nullText: Text = null;\n",
+        "const undefinedText: Text = undefined;\n",
+        "const nullNumeric: Numeric = null;\n",
+        "const undefinedNumeric: Numeric = undefined;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_932);
+    for source_first in [false, true] {
+        let mut context = strict_intersection_context(&parsed, file);
+        if source_first {
+            context.check_source_file(file).unwrap();
+        }
+        let text = query_intersection_alias(&mut context, &parsed, file, "Text");
+        let numeric = query_intersection_alias(&mut context, &parsed, file, "Numeric");
+        context.check_source_file(file).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let null = bootstrap.null_type;
+        let undefined = bootstrap.undefined_type;
+        for target in [text, numeric] {
+            assert_eq!(context.is_type_assignable_to(null, target), Ok(false));
+            assert_eq!(context.is_type_assignable_to(undefined, target), Ok(false));
+        }
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        for (diagnostic, (name, source, target, primitive)) in diagnostics.iter().zip([
+            ("nullText", "null", "Text", "string"),
+            ("undefinedText", "undefined", "Text", "string"),
+            ("nullNumeric", "null", "Numeric", "number"),
+            ("undefinedNumeric", "undefined", "Numeric", "number"),
+        ]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, [source, target]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Type '{source}' is not assignable to type '{target}'.\n  Type '{source}' is not assignable to type '{primitive}'."
+                ),
+            );
+            let node = declaration(&parsed, file, SyntaxKind::VariableDeclaration, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(node.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                diagnostic.node,
+                Some(NodeRef::new(node.arena, file, variable.name))
+            );
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+        }
+        assert_intersection_replay(
+            &mut context,
+            &parsed,
+            file,
+            &[("Text", text), ("Numeric", numeric)],
+            &[],
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn target_intersection_diagnostics_keep_the_first_failed_member_and_replay() {
+    let source = concat!(
+        "type Count = { value: number };\n",
+        "type Tag = { tag: string };\n",
+        "type Both = Count & Tag;\n",
+        "type Reversed = Tag & Count;\n",
+        "type WrongCount = { value: string; tag: string };\n",
+        "type WrongTag = { value: number; tag: number };\n",
+        "declare const wrongCount: WrongCount;\n",
+        "declare const wrongTag: WrongTag;\n",
+        "const badCount: Both = wrongCount;\n",
+        "const badReversed: Reversed = wrongCount;\n",
+        "const badTag: Both = wrongTag;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_933);
+    for source_first in [false, true] {
+        let mut context = strict_intersection_context(&parsed, file);
+        if source_first {
+            context.check_source_file(file).unwrap();
+        }
+        let aliases = ["Both", "Reversed"].map(|name| {
+            (
+                name,
+                query_intersection_alias(&mut context, &parsed, file, name),
+            )
+        });
+        let [count, tag, wrong_count, wrong_tag] = ["Count", "Tag", "WrongCount", "WrongTag"]
+            .map(|name| query_intersection_alias(&mut context, &parsed, file, name));
+        assert_eq!(
+            intersection_data(&context, aliases[0].1).intersection.types,
+            [count, tag],
+        );
+        assert_eq!(
+            intersection_data(&context, aliases[1].1).intersection.types,
+            [tag, count],
+        );
+        context.check_source_file(file).unwrap();
+        for (source, target, expected) in [
+            (wrong_count, count, false),
+            (wrong_count, tag, true),
+            (wrong_tag, count, true),
+            (wrong_tag, tag, false),
+        ] {
+            assert_eq!(context.is_type_assignable_to(source, target), Ok(expected));
+        }
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        for (diagnostic, (name, source, target, member, property, actual, expected)) in
+            diagnostics.iter().zip([
+                (
+                    "badCount",
+                    "WrongCount",
+                    "Both",
+                    "Count",
+                    "value",
+                    "string",
+                    "number",
+                ),
+                (
+                    "badReversed",
+                    "WrongCount",
+                    "Reversed",
+                    "Count",
+                    "value",
+                    "string",
+                    "number",
+                ),
+                (
+                    "badTag", "WrongTag", "Both", "Tag", "tag", "number", "string",
+                ),
+            ])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, [source, target]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Type '{source}' is not assignable to type '{target}'.\n  Type '{source}' is not assignable to type '{member}'.\n    Types of property '{property}' are incompatible.\n      Type '{actual}' is not assignable to type '{expected}'."
+                ),
+            );
+            let node = declaration(&parsed, file, SyntaxKind::VariableDeclaration, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(node.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                diagnostic.node,
+                Some(NodeRef::new(node.arena, file, variable.name))
+            );
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+        }
+        assert_intersection_replay(&mut context, &parsed, file, &aliases, &[]);
     }
 }

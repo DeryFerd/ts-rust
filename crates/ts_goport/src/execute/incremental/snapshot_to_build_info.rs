@@ -1,0 +1,626 @@
+//! Port of execute/incremental/snapshottobuildinfo.go.
+//!
+//! PORT: Go `*compiler.Program` is the installed program (plan D1). Go nil
+//! slices in `BuildInfo` are `None`: a Go `append` to a nil slice or a
+//! `core.Map` of a non-empty slice makes `Some`, and nothing appended (or a
+//! `core.Map` of a nil or empty `slices.Collect`) stays `None`.
+
+use super::build_info::*;
+use super::checker_access::*;
+use super::hash::FileInfo;
+use super::hash::*;
+use super::snapshot::*;
+use crate::frontend::prelude::*;
+use crate::program::source_file_may_be_emitted;
+
+/// Go `core.Map` over a slice that is nil when empty (`slices.Collect`,
+/// diagnostic chains, message args).
+fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
+    if items.is_empty() { None } else { Some(items) }
+}
+
+// Go: incremental/snapshottobuildinfo.go:18 snapshotToBuildInfo
+#[must_use]
+pub fn snapshot_to_build_info(snapshot: &Snapshot, build_info_file_name: &str) -> BuildInfo {
+    let build_info = BuildInfo {
+        version: version().to_string(),
+        ..BuildInfo::default()
+    };
+    let mut to = ToBuildInfo {
+        snapshot,
+        build_info,
+        build_info_directory: get_directory_path(build_info_file_name),
+        compare_paths_options: ComparePathsOptions {
+            current_directory: get_current_directory().to_string(),
+            use_case_sensitive_file_names: use_case_sensitive_file_names(),
+        },
+        file_name_to_file_id: FxHashMap::default(),
+        file_names_to_file_id_list_id: FxHashMap::default(),
+        roots: IndexMap::default(),
+    };
+
+    if snapshot.options.is_incremental() {
+        to.collect_root_files();
+        to.set_file_info_and_emit_signatures();
+        to.set_root_of_incremental_program();
+        to.set_compiler_options();
+        to.set_referenced_map();
+        to.set_change_file_set();
+        to.set_semantic_diagnostics();
+        to.set_emit_diagnostics();
+        to.set_affected_files_pending_emit();
+        if !snapshot.latest_changed_dts_file.is_empty() {
+            to.build_info.latest_changed_dts_file =
+                to.relative_to_build_info(&snapshot.latest_changed_dts_file);
+        }
+    } else {
+        to.set_root_of_non_incremental_program();
+    }
+    to.build_info.errors = snapshot.has_errors.is_true();
+    to.build_info.semantic_errors = snapshot.has_semantic_errors;
+    to.build_info.check_pending = snapshot.check_pending;
+    to.build_info
+}
+
+// Go: incremental/snapshottobuildinfo.go:57 toBuildInfo
+// PORT: Go `roots map[*ast.SourceFile]tspath.Path` is an `IndexMap`; Go
+// sorts its keys before use.
+struct ToBuildInfo<'a> {
+    snapshot: &'a Snapshot,
+    build_info: BuildInfo,
+    build_info_directory: String,
+    compare_paths_options: ComparePathsOptions,
+    file_name_to_file_id: FxHashMap<String, BuildInfoFileId>,
+    file_names_to_file_id_list_id: FxHashMap<String, BuildInfoFileIdListId>,
+    roots: IndexMap<Node, Path>,
+}
+
+impl ToBuildInfo<'_> {
+    // Go: incremental/snapshottobuildinfo.go:68 relativeToBuildInfo
+    fn relative_to_build_info(&self, path: &str) -> String {
+        ensure_path_is_non_module_name(&get_relative_path_from_directory(
+            &self.build_info_directory,
+            path,
+            &self.compare_paths_options,
+        ))
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:72 toFileId
+    fn to_file_id(&mut self, path: &Path) -> BuildInfoFileId {
+        let mut file_id = self
+            .file_name_to_file_id
+            .get(path.as_str())
+            .copied()
+            .unwrap_or_default();
+        if file_id.0 == 0 {
+            let name = match get_default_lib_file(path) {
+                Some(lib_file) if !lib_file.replaced => lib_file.name.clone(),
+                _ => self.relative_to_build_info(path),
+            };
+            let file_names = self.build_info.file_names.get_or_insert_with(Vec::new);
+            file_names.push(name);
+            file_id = BuildInfoFileId(file_names.len() as i32);
+            self.file_name_to_file_id.insert(path.0.clone(), file_id);
+        }
+        file_id
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:86 toFileIdListId
+    fn to_file_id_list_id(&mut self, set: &IndexSet<Path>) -> BuildInfoFileIdListId {
+        let mut file_ids: Vec<BuildInfoFileId> =
+            set.iter().map(|path| self.to_file_id(path)).collect();
+        file_ids.sort();
+        let key = file_ids
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut file_id_list_id = self
+            .file_names_to_file_id_list_id
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
+        if file_id_list_id.0 == 0 {
+            let file_ids_list = self.build_info.file_ids_list.get_or_insert_with(Vec::new);
+            file_ids_list.push(file_ids);
+            file_id_list_id = BuildInfoFileIdListId(file_ids_list.len() as i32);
+            self.file_names_to_file_id_list_id
+                .insert(key, file_id_list_id);
+        }
+        file_id_list_id
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:103 toRelativeToBuildInfoCompilerOptionValue
+    fn to_relative_to_build_info_compiler_option_value(
+        &self,
+        option: &CommandLineOption,
+        v: CompilerOptionsValue,
+    ) -> CompilerOptionsValue {
+        if option.kind == CommandLineOptionKind::LIST {
+            if option
+                .elements()
+                .is_some_and(|elements| elements.is_file_path)
+            {
+                if let CompilerOptionsValue::StringList(arr) = &v {
+                    return CompilerOptionsValue::StringList(
+                        arr.iter()
+                            .map(|item| self.relative_to_build_info(item))
+                            .collect(),
+                    );
+                }
+            }
+        } else if option.is_file_path {
+            if let CompilerOptionsValue::String(str_) = &v {
+                if !str_.is_empty() {
+                    return CompilerOptionsValue::String(self.relative_to_build_info(str_));
+                }
+            }
+        }
+        v
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:118 toBuildInfoDiagnosticsFromFileNameDiagnostics
+    fn to_build_info_diagnostics_from_file_name_diagnostics(
+        &mut self,
+        diagnostics: &[BuildInfoDiagnosticWithFileName],
+    ) -> Vec<BuildInfoDiagnostic> {
+        diagnostics
+            .iter()
+            .map(|d| {
+                let mut file = BuildInfoFileId::default();
+                if !d.file.is_empty() {
+                    file = self.to_file_id(&d.file);
+                }
+                BuildInfoDiagnostic {
+                    file,
+                    no_file: d.no_file,
+                    pos: d.pos,
+                    end: d.end,
+                    code: d.code,
+                    category: d.category,
+                    message_key: d.message_key.clone(),
+                    message_args: non_empty(d.message_args.clone()),
+                    message_chain: non_empty(
+                        self.to_build_info_diagnostics_from_file_name_diagnostics(&d.message_chain),
+                    ),
+                    related_information: non_empty(
+                        self.to_build_info_diagnostics_from_file_name_diagnostics(
+                            &d.related_information,
+                        ),
+                    ),
+                    reports_unnecessary: d.reports_unnecessary,
+                    reports_deprecated: d.reports_deprecated,
+                    skipped_on_no_emit: d.skipped_on_no_emit,
+                    repopulate_info: to_build_info_repopulate_info(d.repopulate_info.as_deref()),
+                }
+            })
+            .collect()
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:143 toBuildInfoDiagnosticsFromDiagnostics
+    fn to_build_info_diagnostics_from_diagnostics(
+        &mut self,
+        file_path: &Path,
+        diagnostics: &[Diagnostic],
+    ) -> Vec<BuildInfoDiagnostic> {
+        diagnostics
+            .iter()
+            .map(|d| {
+                let mut file = BuildInfoFileId::default();
+                let mut no_file = false;
+                if d.file().is_nil() {
+                    no_file = true;
+                } else if source_file_info(d.file()).path != file_path.as_str() {
+                    file = self.to_file_id(&Path(source_file_info(d.file()).path.clone()));
+                }
+                BuildInfoDiagnostic {
+                    file,
+                    no_file,
+                    pos: d.loc().pos(),
+                    end: d.loc().end(),
+                    code: d.code(),
+                    category: d.category() as i32,
+                    message_key: d.message_key().to_string(),
+                    message_args: non_empty(d.message_args().to_vec()),
+                    message_chain: non_empty(
+                        self.to_build_info_diagnostics_from_diagnostics(
+                            file_path,
+                            d.message_chain(),
+                        ),
+                    ),
+                    related_information: non_empty(
+                        self.to_build_info_diagnostics_from_diagnostics(
+                            file_path,
+                            d.related_information(),
+                        ),
+                    ),
+                    reports_unnecessary: d.reports_unnecessary(),
+                    reports_deprecated: d.reports_deprecated(),
+                    skipped_on_no_emit: d.skipped_on_no_emit(),
+                    repopulate_info: to_build_info_repopulate_info(d.repopulate_info().as_deref()),
+                }
+            })
+            .collect()
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:183 toBuildInfoDiagnosticsOfFile
+    fn to_build_info_diagnostics_of_file(
+        &mut self,
+        file_path: &Path,
+        diags: &DiagnosticsOrBuildInfoDiagnosticsWithFileName,
+    ) -> Option<BuildInfoDiagnosticsOfFile> {
+        if let Some(diagnostics) = diags.diagnostics.as_ref().filter(|d| !d.is_empty()) {
+            return Some(BuildInfoDiagnosticsOfFile {
+                file_id: self.to_file_id(file_path),
+                diagnostics: self
+                    .to_build_info_diagnostics_from_diagnostics(file_path, diagnostics),
+            });
+        }
+        if !diags.build_info_diagnostics.is_empty() {
+            return Some(BuildInfoDiagnosticsOfFile {
+                file_id: self.to_file_id(file_path),
+                diagnostics: self.to_build_info_diagnostics_from_file_name_diagnostics(
+                    &diags.build_info_diagnostics,
+                ),
+            });
+        }
+        None
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:199 collectRootFiles
+    fn collect_root_files(&mut self) {
+        for file_name in command_line().file_names() {
+            let redirect = get_parse_file_redirect(file_name);
+            let file = if !redirect.is_empty() {
+                get_source_file(&redirect)
+            } else {
+                get_source_file(file_name)
+            };
+            if file.is_some() {
+                self.roots.insert(
+                    file,
+                    to_path(
+                        file_name,
+                        &self.compare_paths_options.current_directory,
+                        self.compare_paths_options.use_case_sensitive_file_names,
+                    ),
+                );
+            }
+        }
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:213 setFileInfoAndEmitSignatures
+    fn set_file_info_and_emit_signatures(&mut self) {
+        let snapshot = self.snapshot;
+        let mut file_infos = Vec::new();
+        for file in source_files() {
+            let file_path = Path(source_file_info(file).path.clone());
+            let info = snapshot
+                .file_infos
+                .get(&file_path)
+                .expect("file info of a program file");
+            let file_id = self.to_file_id(&file_path);
+            //  tryAddRoot(key, fileId);
+            let stored_name = self.build_info.file_names.as_ref().expect("fileNames")
+                [(file_id.0 - 1) as usize]
+                .clone();
+            if stored_name != self.relative_to_build_info(&file_path) {
+                let lib_file = get_default_lib_file(&file_path);
+                if lib_file.is_none_or(|lib_file| lib_file.replaced || stored_name != lib_file.name)
+                {
+                    panic!(
+                        "File name at index {} does not match expected relative path or libName: {} != {}",
+                        file_id.0 - 1,
+                        stored_name,
+                        self.relative_to_build_info(&file_path)
+                    );
+                }
+            }
+            if snapshot.options.composite.is_true()
+                && !is_json_source_file(file)
+                && source_file_may_be_emitted(file, false)
+            {
+                match snapshot.emit_signatures.get(&file_path) {
+                    None => {
+                        self.build_info
+                            .emit_signatures
+                            .get_or_insert_with(Vec::new)
+                            .push(BuildInfoEmitSignature {
+                                file_id,
+                                ..Default::default()
+                            });
+                    }
+                    Some(emit_signature) if emit_signature.signature != info.signature => {
+                        let mut incremental_emit_signature = BuildInfoEmitSignature {
+                            file_id,
+                            ..Default::default()
+                        };
+                        if !emit_signature.signature.is_empty() {
+                            incremental_emit_signature.signature = emit_signature.signature.clone();
+                        } else {
+                            let first = &emit_signature
+                                .signature_with_different_options
+                                .as_ref()
+                                .expect("signatureWithDifferentOptions")[0];
+                            if *first == info.signature {
+                                incremental_emit_signature.differs_only_in_dts_map = true;
+                            } else {
+                                incremental_emit_signature.signature = first.clone();
+                                incremental_emit_signature.differs_in_options = true;
+                            }
+                        }
+                        self.build_info
+                            .emit_signatures
+                            .get_or_insert_with(Vec::new)
+                            .push(incremental_emit_signature);
+                    }
+                    Some(_) => {}
+                }
+            }
+            file_infos.push(new_build_info_file_info(info));
+        }
+        self.build_info.file_infos = Some(file_infos);
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:246 setRootOfIncrementalProgram
+    fn set_root_of_incremental_program(&mut self) {
+        let mut keys: Vec<(Node, BuildInfoFileId)> = Vec::with_capacity(self.roots.len());
+        let files: Vec<Node> = self.roots.keys().copied().collect();
+        for file in files {
+            let id = self.to_file_id(&Path(source_file_info(file).path.clone()));
+            keys.push((file, id));
+        }
+        keys.sort_by_key(|&(_, id)| id);
+        for (file, _) in keys {
+            let root_path = self.roots[&file].clone();
+            let root = self.to_file_id(&root_path);
+            let resolved = self.to_file_id(&Path(source_file_info(file).path.clone()));
+            match &mut self.build_info.root {
+                None => {
+                    // First fileId as is
+                    self.build_info.root = Some(vec![BuildInfoRoot {
+                        start: resolved,
+                        ..Default::default()
+                    }]);
+                }
+                Some(roots) => {
+                    let last = roots.last_mut().expect("a root");
+                    if last.end.0 == resolved.0 - 1 {
+                        // If its [..., last = [start, end = fileId - 1]], update last to [start, fileId]
+                        last.end = resolved;
+                    } else if last.end.0 == 0 && last.start.0 == resolved.0 - 1 {
+                        // If its [..., last = start = fileId - 1 ], update last to [start, fileId]
+                        last.end = resolved;
+                    } else {
+                        roots.push(BuildInfoRoot {
+                            start: resolved,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            if root != resolved {
+                self.build_info
+                    .resolved_root
+                    .get_or_insert_with(Vec::new)
+                    .push(BuildInfoResolvedRoot { resolved, root });
+            }
+        }
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:278 setCompilerOptions
+    // PORT: Go tests each option field with `reflect.Value.IsZero`; see
+    // `is_zero_compiler_option_value`.
+    fn set_compiler_options(&mut self) {
+        let options = self.snapshot.options;
+        let field_values = compiler_options_field_values(options);
+        let mut values: Vec<(&'static CommandLineOption, CompilerOptionsValue)> = Vec::new();
+        for_each_compiler_option_value(
+            options,
+            &|option| option.affects_build_info,
+            &mut |option, value, i| {
+                if is_zero_compiler_option_value(field_values[i].0, &value, options) {
+                    return false;
+                }
+                values.push((option, value));
+                false
+            },
+        );
+        for (option, value) in values {
+            // Make it relative to buildInfo directory if file path
+            let value = self.to_relative_to_build_info_compiler_option_value(option, value);
+            self.build_info
+                .options
+                .get_or_insert_with(IndexMap::default)
+                .insert(option.name.to_string(), value);
+        }
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:297 setReferencedMap
+    fn set_referenced_map(&mut self) {
+        let snapshot = self.snapshot;
+        let mut keys = snapshot.referenced_map.get_paths_with_references();
+        keys.sort();
+        let entries: Vec<BuildInfoReferenceMapEntry> = keys
+            .iter()
+            .map(|file_path| {
+                let references = snapshot
+                    .referenced_map
+                    .get_references(file_path)
+                    .expect("references of a key");
+                BuildInfoReferenceMapEntry {
+                    file_id: self.to_file_id(file_path),
+                    file_id_list_id: self.to_file_id_list_id(references),
+                }
+            })
+            .collect();
+        self.build_info.referenced_map = non_empty(entries);
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:309 setChangeFileSet
+    fn set_change_file_set(&mut self) {
+        let mut files: Vec<Path> = self.snapshot.changed_files_set.iter().cloned().collect();
+        files.sort();
+        let ids: Vec<BuildInfoFileId> = files.iter().map(|file| self.to_file_id(file)).collect();
+        self.build_info.change_file_set = non_empty(ids);
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:315 setSemanticDiagnostics
+    fn set_semantic_diagnostics(&mut self) {
+        let snapshot = self.snapshot;
+        for file in source_files() {
+            let file_path = Path(source_file_info(file).path.clone());
+            match snapshot.semantic_diagnostics_per_file.get(&file_path) {
+                None => {
+                    if !snapshot.changed_files_set.contains(&file_path) {
+                        let file_id = self.to_file_id(&file_path);
+                        self.build_info
+                            .semantic_diagnostics_per_file
+                            .get_or_insert_with(Vec::new)
+                            .push(BuildInfoSemanticDiagnostic {
+                                file_id,
+                                ..Default::default()
+                            });
+                    }
+                }
+                Some(value) => {
+                    let diagnostics = self.to_build_info_diagnostics_of_file(&file_path, value);
+                    if diagnostics.is_some() {
+                        self.build_info
+                            .semantic_diagnostics_per_file
+                            .get_or_insert_with(Vec::new)
+                            .push(BuildInfoSemanticDiagnostic {
+                                diagnostics,
+                                ..Default::default()
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:335 setEmitDiagnostics
+    // PORT: Go `core.Map` keeps a nil entry for a file whose cached list is
+    // empty (it marshals as `null`); the port never stores an empty list
+    // (Go stores only non-empty emit diagnostics too), so it drops `None`.
+    fn set_emit_diagnostics(&mut self) {
+        let snapshot = self.snapshot;
+        let mut files: Vec<Path> = snapshot.emit_diagnostics_per_file.keys().cloned().collect();
+        files.sort();
+        let mut entries = Vec::with_capacity(files.len());
+        for file_path in &files {
+            let value = &snapshot.emit_diagnostics_per_file[file_path];
+            match self.to_build_info_diagnostics_of_file(file_path, value) {
+                Some(entry) => entries.push(entry),
+                None => unported!("setEmitDiagnostics: nil BuildInfoDiagnosticsOfFile entry"),
+            }
+        }
+        self.build_info.emit_diagnostics_per_file = non_empty(entries);
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:344 setAffectedFilesPendingEmit
+    fn set_affected_files_pending_emit(&mut self) {
+        let snapshot = self.snapshot;
+        let mut files: Vec<Path> = snapshot
+            .affected_files_pending_emit
+            .keys()
+            .cloned()
+            .collect();
+        files.sort();
+        let full_emit_kind = get_file_emit_kind(snapshot.options);
+        for file_path in &files {
+            let file = get_source_file_by_path(file_path);
+            if file.is_nil() || !source_file_may_be_emitted(file, false) {
+                continue;
+            }
+            let pending_emit = snapshot.affected_files_pending_emit[file_path];
+            let file_id = self.to_file_id(file_path);
+            self.build_info
+                .affected_files_pending_emit
+                .get_or_insert_with(Vec::new)
+                .push(BuildInfoFilePendingEmit {
+                    file_id,
+                    emit_kind: if pending_emit == full_emit_kind {
+                        FileEmitKind::NONE
+                    } else {
+                        pending_emit
+                    },
+                });
+        }
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:363 setRootOfNonIncrementalProgram
+    fn set_root_of_non_incremental_program(&mut self) {
+        let roots = command_line()
+            .file_names()
+            .iter()
+            .map(|file_name| BuildInfoRoot {
+                non_incremental: self.relative_to_build_info(&to_path(
+                    file_name,
+                    &self.compare_paths_options.current_directory,
+                    self.compare_paths_options.use_case_sensitive_file_names,
+                )),
+                ..Default::default()
+            })
+            .collect();
+        self.build_info.root = Some(roots);
+    }
+}
+
+// Go: incremental/snapshottobuildinfo.go:165 toBuildInfoRepopulateInfo
+#[must_use]
+pub fn to_build_info_repopulate_info(
+    info: Option<&RepopulateDiagnosticInfo>,
+) -> Option<BuildInfoRepopulateInfo> {
+    let info = info?;
+    Some(BuildInfoRepopulateInfo {
+        kind: info.kind,
+        module_reference: info.module_reference.clone(),
+        mode: info.mode,
+        package_name: info.package_name.clone(),
+    })
+}
+
+/// Go `reflect.Value.IsZero` for one `core.CompilerOptions` field, as
+/// `setCompilerOptions` uses it.
+// PORT: `compiler_options_field_values` lists `Lib` and `TypeRoots` (Go
+// `[]string`, Rust `Option<Vec<String>>`) as lists, so those two read the
+// field: `None` is the Go nil slice. Other Go slice fields are Rust `Vec`s,
+// which cannot tell a nil slice from an empty one; empty counts as zero.
+#[must_use]
+pub fn is_zero_compiler_option_value(
+    field_name: &str,
+    value: &CompilerOptionsValue,
+    options: &CompilerOptions,
+) -> bool {
+    use CompilerOptionsValue as V;
+    match field_name {
+        "Lib" => return options.lib.is_none(),
+        "TypeRoots" => return options.type_roots.is_none(),
+        _ => {}
+    }
+    match value {
+        V::Nil | V::EmptyStruct => true,
+        V::Bool(b) => !*b,
+        V::Int(i) => *i == 0,
+        V::Number(n) => n.to_bits() == 0,
+        V::String(s) => s.is_empty(),
+        V::Message(_) => false,
+        V::Tristate(t) => *t == Tristate::Unknown,
+        V::ScriptTarget(v) => *v == Default::default(),
+        V::ModuleKind(v) => *v == Default::default(),
+        V::ModuleResolutionKind(v) => *v == Default::default(),
+        V::ModuleDetectionKind(v) => *v == Default::default(),
+        V::JsxEmit(v) => *v == Default::default(),
+        V::NewLineKind(v) => *v == Default::default(),
+        V::WatchFileKind(v) => *v == Default::default(),
+        V::WatchDirectoryKind(v) => *v == Default::default(),
+        V::PollingKind(v) => *v == Default::default(),
+        V::List(v) => v.is_empty(),
+        V::Map(v) => v.is_empty(),
+        V::StringList(v) => v.is_empty(),
+        V::Paths(v) => v.is_none(),
+        V::IntPtr(v) => v.is_none(),
+    }
+}

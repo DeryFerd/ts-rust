@@ -142,14 +142,33 @@ struct JavaScriptJsDocCallableType {
 
 struct JavaScriptJsDocCallableParameter {
     name: String,
+    name_range: TextRange,
+    range: TextRange,
     type_: JavaScriptJsDocCallableType,
 }
 
+#[derive(Clone)]
+struct JavaScriptJsDocCallableTemplate {
+    name: String,
+    name_range: TextRange,
+    list_range: TextRange,
+}
+
 struct JavaScriptJsDocCallableSignature {
-    template_name: String,
-    template_range: TextRange,
+    template: Option<JavaScriptJsDocCallableTemplate>,
     parameters: Vec<JavaScriptJsDocCallableParameter>,
     return_type: JavaScriptJsDocCallableType,
+}
+
+struct JavaScriptJsDocOverload {
+    range: TextRange,
+    parameters_range: TextRange,
+    signature: JavaScriptJsDocCallableSignature,
+}
+
+struct JavaScriptJsDocOverloadGroup {
+    implementation: JavaScriptJsDocCallableSignature,
+    overloads: Vec<JavaScriptJsDocOverload>,
 }
 
 /// Parse a TypeScript source file into the generated arena-backed AST.
@@ -407,11 +426,11 @@ pub fn parse_jsdoc_comment(source: &str) -> JsDocParseResult {
     }
 }
 
-fn javascript_jsdoc_typedefs(
+fn javascript_jsdoc_comment_ranges(
     source: &str,
     trivia_start: usize,
     statement_start: usize,
-) -> Vec<JavaScriptJsDocTypedef> {
+) -> Vec<(usize, usize)> {
     let mut comment_ranges = Vec::new();
     let mut end = statement_start;
     while let Some(prefix) = source.get(trivia_start..end) {
@@ -432,9 +451,18 @@ fn javascript_jsdoc_typedefs(
         end = start;
     }
     comment_ranges.reverse();
+    comment_ranges
+}
 
+fn javascript_jsdoc_typedefs(
+    source: &str,
+    trivia_start: usize,
+    statement_start: usize,
+) -> Vec<JavaScriptJsDocTypedef> {
     let mut typedefs = Vec::new();
-    for (comment_start, comment_end) in comment_ranges {
+    for (comment_start, comment_end) in
+        javascript_jsdoc_comment_ranges(source, trivia_start, statement_start)
+    {
         let comment = &source[comment_start..comment_end];
         if !comment.contains("@typedef") {
             continue;
@@ -528,7 +556,11 @@ fn javascript_jsdoc_callable_signature(
                     return None;
                 }
                 let name = javascript_jsdoc_identifier(source, body_start, comment_end)?;
-                template = Some((token_value(&name), name.range));
+                template = Some(JavaScriptJsDocCallableTemplate {
+                    name: token_value(&name),
+                    name_range: name.range,
+                    list_range: name.range,
+                });
             }
             "param" | "arg" | "argument" => {
                 let type_ = javascript_jsdoc_callable_type(source, body_start, comment_end)?;
@@ -538,6 +570,8 @@ fn javascript_jsdoc_callable_signature(
                 let name = javascript_jsdoc_identifier(source, next, comment_end)?;
                 parameters.push(JavaScriptJsDocCallableParameter {
                     name: token_value(&name),
+                    name_range: name.range,
+                    range: name.range,
                     type_,
                 });
             }
@@ -554,12 +588,135 @@ fn javascript_jsdoc_callable_signature(
             _ => {}
         }
     }
-    let (template_name, template_range) = template?;
+    let template = Some(template?);
     Some(JavaScriptJsDocCallableSignature {
-        template_name,
-        template_range,
+        template,
         parameters,
         return_type: return_type?,
+    })
+}
+
+// Go reparses overloads from every adjacent comment and host tags from the last.
+#[allow(clippy::too_many_lines)] // Keep host and overload tag transitions together.
+fn javascript_jsdoc_overload_group(
+    source: &str,
+    trivia_start: usize,
+    statement_start: usize,
+) -> Option<JavaScriptJsDocOverloadGroup> {
+    let comments = javascript_jsdoc_comment_ranges(source, trivia_start, statement_start);
+    let mut overloads = Vec::new();
+    let mut implementation = None;
+    for (index, &(comment_start, comment_end)) in comments.iter().enumerate() {
+        let tags = javascript_jsdoc_callable_tags(source.get(comment_start..comment_end)?)?;
+        let mut template = None;
+        let mut host_parameters = Vec::new();
+        let mut host_return = None;
+        let mut current: Option<(TextRange, Vec<JavaScriptJsDocCallableParameter>)> = None;
+        for (tag_index, tag) in tags.iter().enumerate() {
+            let tag_start =
+                comment_start.checked_add(usize::try_from(tag.range.start.get()).ok()?)?;
+            let body_start =
+                comment_start.checked_add(usize::try_from(tag.range.end.get()).ok()?)?;
+            let tag_end =
+                tags.get(tag_index + 1)
+                    .map_or(Some(comment_end.checked_sub(2)?), |next| {
+                        comment_start.checked_add(
+                            usize::try_from(next.range.start.get())
+                                .ok()?
+                                .checked_sub(1)?,
+                        )
+                    })?;
+            let tag_range = text_range(tag_start.checked_sub(1)?, tag_end);
+            match token_value(tag).as_str() {
+                "template" if tag_index == 0 => {
+                    let name = javascript_jsdoc_identifier(source, body_start, tag_end)?;
+                    let tail = source.get(usize::try_from(name.range.end.get()).ok()?..tag_end)?;
+                    if !tail
+                        .chars()
+                        .all(|character| character.is_whitespace() || character == '*')
+                    {
+                        return None;
+                    }
+                    template = Some(JavaScriptJsDocCallableTemplate {
+                        name: token_value(&name),
+                        name_range: name.range,
+                        list_range: tag_range,
+                    });
+                }
+                "overload" => {
+                    if current.is_some() {
+                        return None;
+                    }
+                    current = Some((text_range(tag_start, body_start), Vec::new()));
+                }
+                "param" | "arg" | "argument" => {
+                    let type_ = javascript_jsdoc_callable_type(source, body_start, comment_end)?;
+                    if type_.range.end.get() as usize >= tag_end {
+                        return None;
+                    }
+                    let name = javascript_jsdoc_identifier(
+                        source,
+                        usize::try_from(type_.closing_brace.get())
+                            .ok()?
+                            .checked_add(1)?,
+                        tag_end,
+                    )?;
+                    let parameter = JavaScriptJsDocCallableParameter {
+                        name: token_value(&name),
+                        name_range: name.range,
+                        range: tag_range,
+                        type_,
+                    };
+                    if let Some((_, parameters)) = &mut current {
+                        parameters.push(parameter);
+                    } else {
+                        host_parameters.push(parameter);
+                    }
+                }
+                "return" | "returns" => {
+                    let return_type =
+                        javascript_jsdoc_callable_type(source, body_start, comment_end)?;
+                    if return_type.range.end.get() as usize >= tag_end {
+                        return None;
+                    }
+                    if let Some((range, parameters)) = current.take() {
+                        let parameters_start = parameters
+                            .first()
+                            .map_or(tag_range.start, |parameter| parameter.range.start);
+                        overloads.push(JavaScriptJsDocOverload {
+                            range,
+                            parameters_range: TextRange::new(parameters_start, tag_range.start),
+                            signature: JavaScriptJsDocCallableSignature {
+                                template: template.clone(),
+                                parameters,
+                                return_type,
+                            },
+                        });
+                    } else if host_return.replace(return_type).is_some() {
+                        return None;
+                    }
+                }
+                // Bounds, optional/rest parameters and other hosted tags need
+                // separate source proofs before they can enter this path.
+                _ => return None,
+            }
+        }
+        if current.is_some() {
+            return None;
+        }
+        if index + 1 == comments.len() {
+            implementation = Some(JavaScriptJsDocCallableSignature {
+                template,
+                parameters: host_parameters,
+                return_type: host_return?,
+            });
+        } else if !host_parameters.is_empty() || host_return.is_some() {
+            return None;
+        }
+    }
+    (!overloads.is_empty()).then_some(JavaScriptJsDocOverloadGroup {
+        implementation: implementation?,
+        overloads,
     })
 }
 
@@ -1159,6 +1316,7 @@ impl<'a> Parser<'a> {
             }
             let before = (self.current.kind, self.current.range);
             let mut jsdoc_signature = None;
+            let mut jsdoc_overloads = None;
             if self.javascript_file
                 && terminator == SyntaxKind::EndOfFile
                 && self
@@ -1174,6 +1332,9 @@ impl<'a> Parser<'a> {
                 jsdoc_signature = self.arena.source_text().and_then(|source| {
                     javascript_jsdoc_callable_signature(source, trivia_start, statement_start)
                 });
+                jsdoc_overloads = self.arena.source_text().and_then(|source| {
+                    javascript_jsdoc_overload_group(source, trivia_start, statement_start)
+                });
                 for typedef in typedefs {
                     if let Some(alias) = self.parse_javascript_jsdoc_typedef(typedef) {
                         statements.push(alias);
@@ -1181,8 +1342,13 @@ impl<'a> Parser<'a> {
                 }
             }
             let statement = self.parse_statement();
+            if let Some(group) = jsdoc_overloads
+                && let Some(overloads) = self.reparse_javascript_jsdoc_overloads(statement, group)
+            {
+                statements.extend(overloads);
+            }
             if let Some(signature) = jsdoc_signature {
-                self.attach_javascript_jsdoc_arrow_signature(statement, signature);
+                self.attach_javascript_jsdoc_callable_signature(statement, signature);
             }
             statements.push(statement);
             if before == (self.current.kind, self.current.range) {
@@ -1234,36 +1400,53 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn javascript_jsdoc_arrow_parameters(
+    fn javascript_jsdoc_callable_parameters(
         &self,
         statement: NodeId,
         signature: &JavaScriptJsDocCallableSignature,
     ) -> Option<(NodeId, Vec<NodeId>)> {
-        let NodeData::VariableStatement(statement_data) = &self.arena.get(statement)?.data else {
-            return None;
-        };
-        let NodeData::VariableDeclarationList(declarations) =
-            &self.arena.get(statement_data.declaration_list)?.data
-        else {
-            return None;
-        };
-        let [declaration] = declarations.declarations.nodes.as_slice() else {
-            return None;
-        };
-        let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data else {
-            return None;
-        };
-        let arrow = variable.initializer?;
-        let NodeData::ArrowFunction(function) = &self.arena.get(arrow)?.data else {
-            return None;
-        };
-        if function.type_parameters.is_some()
-            || function.type_.is_some()
-            || function.parameters.nodes.len() != signature.parameters.len()
+        let (callable, parameters, type_parameters, return_type) =
+            match &self.arena.get(statement)?.data {
+                NodeData::FunctionDeclaration(function) if function.body.is_some() => (
+                    statement,
+                    &function.parameters,
+                    function.type_parameters.as_ref(),
+                    function.type_,
+                ),
+                NodeData::VariableStatement(statement_data) => {
+                    let NodeData::VariableDeclarationList(declarations) =
+                        &self.arena.get(statement_data.declaration_list)?.data
+                    else {
+                        return None;
+                    };
+                    let [declaration] = declarations.declarations.nodes.as_slice() else {
+                        return None;
+                    };
+                    let NodeData::VariableDeclaration(variable) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    let arrow = variable.initializer?;
+                    let NodeData::ArrowFunction(function) = &self.arena.get(arrow)?.data else {
+                        return None;
+                    };
+                    (
+                        arrow,
+                        &function.parameters,
+                        function.type_parameters.as_ref(),
+                        function.type_,
+                    )
+                }
+                _ => return None,
+            };
+        if type_parameters.is_some()
+            || return_type.is_some()
+            || parameters.nodes.len() != signature.parameters.len()
         {
             return None;
         }
-        let parameters = function.parameters.nodes.clone();
+        let parameters = parameters.nodes.clone();
         if parameters
             .iter()
             .zip(&signature.parameters)
@@ -1283,59 +1466,69 @@ impl<'a> Parser<'a> {
         {
             return None;
         }
-        Some((arrow, parameters))
+        Some((callable, parameters))
     }
 
-    fn attach_javascript_jsdoc_arrow_signature(
+    fn attach_javascript_jsdoc_callable_signature(
         &mut self,
         statement: NodeId,
         signature: JavaScriptJsDocCallableSignature,
     ) {
-        let Some((arrow, parameters)) =
-            self.javascript_jsdoc_arrow_parameters(statement, &signature)
+        let Some((callable, parameters)) =
+            self.javascript_jsdoc_callable_parameters(statement, &signature)
         else {
             return;
         };
 
-        let mut annotations = Vec::with_capacity(signature.parameters.len());
-        for annotation in &signature.parameters {
-            let Some(type_) = self.parse_javascript_jsdoc_type(
-                annotation.type_.range,
-                annotation.type_.closing_brace,
-            ) else {
-                return;
-            };
-            annotations.push(type_);
-        }
-        let Some(return_type) = self.parse_javascript_jsdoc_type(
-            signature.return_type.range,
-            signature.return_type.closing_brace,
-        ) else {
+        let Some((annotations, return_type)) =
+            self.parse_javascript_jsdoc_signature_types(&signature)
+        else {
             return;
         };
-        let name = self.alloc_node(
-            SyntaxKind::Identifier,
-            signature.template_range,
-            NodeData::Identifier(Box::new(IdentifierData {
-                flow_node: None,
-                text: signature.template_name,
-            })),
-            &[],
+        self.attach_parsed_javascript_jsdoc_signature(
+            callable,
+            &parameters,
+            signature,
+            annotations,
+            return_type,
         );
-        let type_parameter = self.alloc_node_with_flags(
-            SyntaxKind::TypeParameter,
-            NodeFlags::REPARSED,
-            signature.template_range,
-            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
-                constraint: None,
-                default_type: None,
-                expression: None,
-                symbol: None,
-                modifiers: None,
-                name,
-            })),
-            &[name],
-        );
+    }
+
+    fn parse_javascript_jsdoc_signature_types(
+        &mut self,
+        signature: &JavaScriptJsDocCallableSignature,
+    ) -> Option<(Vec<NodeId>, NodeId)> {
+        let mut annotations = Vec::with_capacity(signature.parameters.len());
+        for annotation in &signature.parameters {
+            let type_ = self.parse_javascript_jsdoc_type(
+                annotation.type_.range,
+                annotation.type_.closing_brace,
+            )?;
+            annotations.push(type_);
+        }
+        let return_type = self.parse_javascript_jsdoc_type(
+            signature.return_type.range,
+            signature.return_type.closing_brace,
+        )?;
+        Some((annotations, return_type))
+    }
+
+    fn attach_parsed_javascript_jsdoc_signature(
+        &mut self,
+        callable: NodeId,
+        parameters: &[NodeId],
+        signature: JavaScriptJsDocCallableSignature,
+        annotations: Vec<NodeId>,
+        return_type: NodeId,
+    ) {
+        let type_parameters = signature.template.map(|template| {
+            let parameters = self.reparse_javascript_jsdoc_template(template);
+            self.arena
+                .get_mut(parameters.nodes[0])
+                .expect("the type parameter was allocated")
+                .parent = Some(callable);
+            parameters
+        });
         for (parameter, annotation) in parameters.iter().copied().zip(annotations) {
             let Some(annotation_node) = self.arena.get_mut(annotation) else {
                 return;
@@ -1351,22 +1544,192 @@ impl<'a> Parser<'a> {
         }
         if let Some(node) = self.arena.get_mut(return_type) {
             node.flags = NodeFlags::REPARSED;
-            node.parent = Some(arrow);
+            node.parent = Some(callable);
         }
-        if let Some(node) = self.arena.get_mut(type_parameter) {
-            node.parent = Some(arrow);
+        match self.arena.get_mut(callable).map(|node| &mut node.data) {
+            Some(NodeData::ArrowFunction(function)) => {
+                function.type_parameters = type_parameters;
+                function.type_ = Some(return_type);
+            }
+            Some(NodeData::FunctionDeclaration(function)) => {
+                function.type_parameters = type_parameters;
+                function.type_ = Some(return_type);
+            }
+            _ => unreachable!("the source-owned callable was checked before reparsing"),
         }
-        let Some(NodeData::ArrowFunction(function)) =
-            self.arena.get_mut(arrow).map(|node| &mut node.data)
-        else {
-            return;
-        };
-        function.type_parameters = Some(NodeList {
-            range: signature.template_range,
-            nodes: vec![type_parameter],
+    }
+
+    fn reparse_javascript_jsdoc_template(
+        &mut self,
+        template: JavaScriptJsDocCallableTemplate,
+    ) -> NodeList {
+        let name = self.alloc_node(
+            SyntaxKind::Identifier,
+            template.name_range,
+            NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: template.name,
+            })),
+            &[],
+        );
+        let parameter = self.alloc_node_with_flags(
+            SyntaxKind::TypeParameter,
+            NodeFlags::REPARSED,
+            template.name_range,
+            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
+                constraint: None,
+                default_type: None,
+                expression: None,
+                symbol: None,
+                modifiers: None,
+                name,
+            })),
+            &[name],
+        );
+        NodeList {
+            range: template.list_range,
+            nodes: vec![parameter],
             has_trailing_comma: false,
-        });
-        function.type_ = Some(return_type);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep each cloned declaration and its children together.
+    fn reparse_javascript_jsdoc_overloads(
+        &mut self,
+        statement: NodeId,
+        group: JavaScriptJsDocOverloadGroup,
+    ) -> Option<Vec<NodeId>> {
+        let record = self.arena.get(statement)?;
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return None;
+        };
+        if function.modifiers.is_some()
+            || function.asterisk_token.is_some()
+            || function.body.is_none()
+        {
+            return None;
+        }
+        let name = self.arena.get(function.name?)?;
+        let NodeData::Identifier(identifier) = &name.data else {
+            return None;
+        };
+        let name_range = name.range;
+        let name_text = identifier.text.clone();
+        let (callable, host_parameters) =
+            self.javascript_jsdoc_callable_parameters(statement, &group.implementation)?;
+        if host_parameters.iter().any(|id| {
+            !matches!(self.arena.get(*id).map(|node| &node.data), Some(NodeData::ParameterDeclaration(parameter))
+                if parameter.modifiers.is_none() && parameter.initializer.is_none()
+                    && parameter.dot_dot_dot_token.is_none() && parameter.question_token.is_none())
+        }) {
+            return None;
+        }
+        let (host_annotations, host_return) =
+            self.parse_javascript_jsdoc_signature_types(&group.implementation)?;
+        let mut parsed = Vec::with_capacity(group.overloads.len());
+        for overload in group.overloads {
+            let (annotations, return_type) =
+                self.parse_javascript_jsdoc_signature_types(&overload.signature)?;
+            parsed.push((overload, annotations, return_type));
+        }
+        let mut declarations = Vec::with_capacity(parsed.len());
+        for (overload, annotations, return_type) in parsed {
+            let type_parameters = overload
+                .signature
+                .template
+                .map(|template| self.reparse_javascript_jsdoc_template(template));
+            let name = self.alloc_node_with_flags(
+                SyntaxKind::Identifier,
+                NodeFlags::REPARSED,
+                name_range,
+                NodeData::Identifier(Box::new(IdentifierData {
+                    flow_node: None,
+                    text: name_text.clone(),
+                })),
+                &[],
+            );
+            let mut parameters = Vec::with_capacity(annotations.len());
+            for (parameter, type_) in overload.signature.parameters.into_iter().zip(annotations) {
+                self.mark_javascript_jsdoc_reparsed(type_);
+                let name = self.alloc_node_with_flags(
+                    SyntaxKind::Identifier,
+                    NodeFlags::REPARSED,
+                    parameter.name_range,
+                    NodeData::Identifier(Box::new(IdentifierData {
+                        flow_node: None,
+                        text: parameter.name,
+                    })),
+                    &[],
+                );
+                parameters.push(self.alloc_node_with_flags(
+                    SyntaxKind::Parameter,
+                    NodeFlags::REPARSED,
+                    parameter.range,
+                    NodeData::ParameterDeclaration(Box::new(ParameterDeclarationData {
+                        dot_dot_dot_token: None,
+                        initializer: None,
+                        question_token: None,
+                        symbol: None,
+                        type_: Some(type_),
+                        facts: 0,
+                        modifiers: None,
+                        name,
+                    })),
+                    &[name, type_],
+                ));
+            }
+            self.mark_javascript_jsdoc_reparsed(return_type);
+            let mut children = vec![name];
+            if let Some(type_parameters) = &type_parameters {
+                children.extend(type_parameters.nodes.iter().copied());
+            }
+            children.extend(parameters.iter().copied());
+            children.push(return_type);
+            declarations.push(self.alloc_node_with_flags(
+                SyntaxKind::FunctionDeclaration,
+                NodeFlags::REPARSED,
+                overload.range,
+                NodeData::FunctionDeclaration(Box::new(FunctionDeclarationData {
+                    asterisk_token: None,
+                    body: None,
+                    end_flow_node: None,
+                    flow_node: None,
+                    full_signature: None,
+                    local_symbol: None,
+                    locals: SymbolTable,
+                    next_container: None,
+                    parameters: NodeList {
+                        range: overload.parameters_range,
+                        nodes: parameters,
+                        has_trailing_comma: false,
+                    },
+                    return_flow_node: None,
+                    symbol: None,
+                    type_: Some(return_type),
+                    type_parameters,
+                    facts: 0,
+                    modifiers: None,
+                    name: Some(name),
+                })),
+                &children,
+            ));
+        }
+        self.attach_parsed_javascript_jsdoc_signature(
+            callable,
+            &host_parameters,
+            group.implementation,
+            host_annotations,
+            host_return,
+        );
+        Some(declarations)
+    }
+
+    fn mark_javascript_jsdoc_reparsed(&mut self, node: NodeId) {
+        self.arena
+            .get_mut(node)
+            .expect("the reparsed type was allocated")
+            .flags
+            .0 |= NodeFlags::REPARSED.0;
     }
 
     fn parse_javascript_jsdoc_type(
@@ -2682,6 +3045,7 @@ impl<'a> Parser<'a> {
         }
         let start = self.consume().range.start;
         let mut parameters = Vec::new();
+        let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::GreaterThanToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -2760,6 +3124,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::GreaterThanToken;
         }
         let end = if self.current.kind == SyntaxKind::GreaterThanToken {
             self.consume().range.end
@@ -2770,7 +3135,7 @@ impl<'a> Parser<'a> {
         Some(NodeList {
             range: TextRange::new(start, end),
             nodes: parameters,
-            has_trailing_comma: false,
+            has_trailing_comma,
         })
     }
 
@@ -3184,7 +3549,10 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            if !signature_only && self.current.kind == SyntaxKind::FunctionKeyword {
+            if !signature_only
+                && self.current.kind == SyntaxKind::FunctionKeyword
+                && !self.class_function_keyword_starts_member()
+            {
                 self.error_current("Declaration expected.");
                 recovered_at_statement = true;
                 break;
@@ -3259,19 +3627,43 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        let end = if recovered_at_statement {
+        let end = self.class_members_end(recovered_at_statement);
+        NodeList {
+            range: TextRange::new(start, end),
+            nodes: members,
+            has_trailing_comma: false,
+        }
+    }
+
+    fn class_members_end(&mut self, recovered_at_statement: bool) -> TextPos {
+        if recovered_at_statement {
             self.current.full_start
         } else if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
             self.error_current("Expected '}'.");
             self.current.range.start
-        };
-        NodeList {
-            range: TextRange::new(start, end),
-            nodes: members,
-            has_trailing_comma: false,
         }
+    }
+
+    fn class_function_keyword_starts_member(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let next = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        next.flags.contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            || matches!(
+                next.kind,
+                SyntaxKind::OpenParenToken
+                    | SyntaxKind::LessThanToken
+                    | SyntaxKind::ExclamationToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::EqualsToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::SemicolonToken
+                    | SyntaxKind::CloseBraceToken
+                    | SyntaxKind::EndOfFile
+            )
     }
 
     fn class_var_keyword_starts_recovered_statement(&mut self) -> bool {
@@ -7172,8 +7564,8 @@ impl<'a> Parser<'a> {
             return false;
         }
         let checkpoint = self.scanner.mark();
-        let mut depth = 1_u32;
         let mut delimiter_depth = 0_u32;
+        let mut result = false;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
@@ -7189,21 +7581,14 @@ impl<'a> Parser<'a> {
                     delimiter_depth -= 1;
                 }
                 SyntaxKind::SemicolonToken if delimiter_depth == 0 => break,
-                SyntaxKind::LessThanToken => depth += 1,
-                SyntaxKind::GreaterThanToken => {
-                    depth -= 1;
-                    if depth == 0 {
-                        token = self.scanner.scan();
-                        break;
-                    }
-                }
                 _ => {}
             }
+            let closing_token = (token.kind == SyntaxKind::GreaterThanToken).then_some(token.range);
             token = self.scanner.scan();
-        }
-        self.scanner.rewind(checkpoint);
-        depth == 0
-            && (token.kind == SyntaxKind::OpenParenToken
+            let Some(closing_token) = closing_token else {
+                continue;
+            };
+            if (token.kind == SyntaxKind::OpenParenToken
                 || matches!(
                     token.kind,
                     SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead
@@ -7231,6 +7616,33 @@ impl<'a> Parser<'a> {
                         | SyntaxKind::SatisfiesKeyword
                         | SyntaxKind::ExclamationToken
                 ))
+                && self.type_arguments_match_closing_token(closing_token)
+            {
+                result = true;
+                break;
+            }
+        }
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn type_arguments_match_closing_token(&self, closing: TextRange) -> bool {
+        let start = self.current.range.start;
+        let Some(mut probe) = self.generic_arrow_lookahead_parser(start, closing.end) else {
+            return false;
+        };
+        if probe.current.kind == SyntaxKind::LessThanLessThanToken {
+            probe.current = probe.scanner.rescan_less_than_token();
+        }
+        let Some((_, Some(parsed_closing))) = probe.parse_type_arguments_with_closing_token()
+        else {
+            return false;
+        };
+        // Recoverable type errors stay in the live parse. Only the actual delimiter
+        // and complete candidate span decide this isolated lookahead.
+        start.get() + parsed_closing.start.get() == closing.start.get()
+            && start.get() + parsed_closing.end.get() == closing.end.get()
+            && probe.current.kind == SyntaxKind::EndOfFile
     }
 
     fn parse_await_expression(&mut self) -> NodeId {
@@ -7528,6 +7940,9 @@ impl<'a> Parser<'a> {
         {
             return false;
         }
+        if let Some(result) = self.parenthesized_arrow_prefix() {
+            return result;
+        }
         let checkpoint = self.scanner.mark();
         let mut parenthesis_depth = 1_u32;
         let mut brace_depth = 0_u32;
@@ -7653,6 +8068,52 @@ impl<'a> Parser<'a> {
         }
         self.scanner.rewind(checkpoint);
         false
+    }
+
+    // None keeps the existing lookahead for an uncertain parameter head.
+    fn parenthesized_arrow_prefix(&mut self) -> Option<bool> {
+        let checkpoint = self.scanner.mark();
+        let first = self.scanner.scan().kind;
+        let result = match first {
+            SyntaxKind::CloseParenToken => Some(matches!(
+                self.scanner.scan().kind,
+                SyntaxKind::EqualsGreaterThanToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::OpenBraceToken
+            )),
+            SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken => None,
+            SyntaxKind::DotDotDotToken => Some(true),
+            _ => {
+                let next = self.scanner.scan().kind;
+                if first.is_modifier()
+                    && first != SyntaxKind::AsyncKeyword
+                    && self.token_is_identifier_in_current_context(next)
+                {
+                    Some(next != SyntaxKind::AsKeyword)
+                } else if !self.token_is_identifier_in_current_context(first)
+                    && first != SyntaxKind::ThisKeyword
+                {
+                    Some(false)
+                } else {
+                    match next {
+                        SyntaxKind::ColonToken => Some(true),
+                        SyntaxKind::QuestionToken => Some(matches!(
+                            self.scanner.scan().kind,
+                            SyntaxKind::ColonToken
+                                | SyntaxKind::CommaToken
+                                | SyntaxKind::EqualsToken
+                                | SyntaxKind::CloseParenToken
+                        )),
+                        SyntaxKind::CommaToken
+                        | SyntaxKind::EqualsToken
+                        | SyntaxKind::CloseParenToken => None,
+                        _ => Some(false),
+                    }
+                }
+            }
+        };
+        self.scanner.rewind(checkpoint);
+        result
     }
 
     fn is_parenthesized_function_type(&mut self) -> bool {
@@ -9820,7 +10281,6 @@ impl<'a> Parser<'a> {
                 .current
                 .flags
                 .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
-                && (self.is_index_signature() || self.line_broken_bracket_starts_method())
             {
                 break;
             }
@@ -9872,31 +10332,6 @@ impl<'a> Parser<'a> {
             NodeData::JsDocNonNullableType(Box::new(JsDocNonNullableTypeData { type_: type_node })),
             &[type_node],
         )
-    }
-
-    fn line_broken_bracket_starts_method(&mut self) -> bool {
-        if self.current.kind != SyntaxKind::OpenBracketToken {
-            return false;
-        }
-        let checkpoint = self.scanner.mark();
-        let name = self.scanner.scan().kind;
-        let close = self.scanner.scan().kind;
-        let mut next = self.scanner.scan().kind;
-        if matches!(
-            next,
-            SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken
-        ) {
-            next = self.scanner.scan().kind;
-        }
-        self.scanner.rewind(checkpoint);
-        matches!(
-            name,
-            SyntaxKind::Identifier
-                | SyntaxKind::StringLiteral
-                | SyntaxKind::NumericLiteral
-                | SyntaxKind::BigIntLiteral
-        ) && close == SyntaxKind::CloseBracketToken
-            && matches!(next, SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken)
     }
 
     fn next_token_starts_type(&mut self) -> bool {
@@ -10627,11 +11062,12 @@ impl<'a> Parser<'a> {
         ) {
             let dot_dot_dot_token = (self.current.kind == SyntaxKind::DotDotDotToken)
                 .then(|| self.consume_token_node());
-            let named = self.current.kind == SyntaxKind::Identifier
+            let named = (self.current.kind == SyntaxKind::Identifier
+                || self.current.kind.is_keyword())
                 && (self.next_token_kind() == SyntaxKind::ColonToken
                     || self.next_tokens_are(SyntaxKind::QuestionToken, SyntaxKind::ColonToken));
             if named {
-                let name = self.parse_identifier("Expected a tuple element name.");
+                let name = self.parse_identifier_name("Expected a tuple element name.");
                 let question_token = (self.current.kind == SyntaxKind::QuestionToken)
                     .then(|| self.consume_token_node());
                 self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
@@ -10709,6 +11145,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_arguments(&mut self) -> Option<NodeList> {
+        self.parse_type_arguments_with_closing_token()
+            .map(|(arguments, _)| arguments)
+    }
+
+    fn parse_type_arguments_with_closing_token(&mut self) -> Option<(NodeList, Option<TextRange>)> {
         if self.current.kind != SyntaxKind::LessThanToken {
             return None;
         }
@@ -10725,19 +11166,26 @@ impl<'a> Parser<'a> {
             self.bump();
             has_trailing_comma = self.current.kind == SyntaxKind::GreaterThanToken;
         }
-        let end = if self.current.kind == SyntaxKind::GreaterThanToken {
-            self.consume().range.end
+        let (end, closing_token) = if self.current.kind == SyntaxKind::GreaterThanToken {
+            let closing_token = self.consume().range;
+            (closing_token.end, Some(closing_token))
         } else {
             self.error_current("Expected '>'.");
-            arguments
-                .last()
-                .map_or(self.current.range.start, |id| self.node_end(*id))
+            (
+                arguments
+                    .last()
+                    .map_or(self.current.range.start, |id| self.node_end(*id)),
+                None,
+            )
         };
-        Some(NodeList {
-            range: TextRange::new(start, end),
-            nodes: arguments,
-            has_trailing_comma,
-        })
+        Some((
+            NodeList {
+                range: TextRange::new(start, end),
+                nodes: arguments,
+                has_trailing_comma,
+            },
+            closing_token,
+        ))
     }
 
     fn parse_type_arguments_of_type_reference(&mut self) -> Option<NodeList> {
@@ -11133,6 +11581,8 @@ fn is_type_start_kind(kind: SyntaxKind) -> bool {
                 | SyntaxKind::OpenBracketToken
                 | SyntaxKind::OpenParenToken
                 | SyntaxKind::LessThanToken
+                | SyntaxKind::BarToken
+                | SyntaxKind::AmpersandToken
                 | SyntaxKind::TemplateHead
                 | SyntaxKind::StringLiteral
                 | SyntaxKind::NumericLiteral
@@ -19929,6 +20379,140 @@ export as namespace GlobalName;
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::VariableStatement
         );
+    }
+
+    #[test]
+    fn keyword_tuple_labels_preserve_required_optional_and_rest_members() {
+        let result = parse_source_file(concat!(
+            "type Required = [type: number, code: number, id: number]; ",
+            "type Modifiers = [new?: number, ...type: string[]];",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let expected: &[&[(&str, SyntaxKind, bool, bool)]] = &[
+            &[
+                ("type", SyntaxKind::NumberKeyword, false, false),
+                ("code", SyntaxKind::NumberKeyword, false, false),
+                ("id", SyntaxKind::NumberKeyword, false, false),
+            ],
+            &[
+                ("new", SyntaxKind::NumberKeyword, true, false),
+                ("type", SyntaxKind::ArrayType, false, true),
+            ],
+        ];
+        assert_eq!(statements.len(), expected.len());
+        for (&statement, expected_members) in statements.iter().zip(expected) {
+            let NodeData::TypeAliasDeclaration(alias) = &result.arena.get(statement).unwrap().data
+            else {
+                panic!("expected type alias");
+            };
+            let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data
+            else {
+                panic!("expected tuple type");
+            };
+            assert_eq!(tuple.elements.nodes.len(), expected_members.len());
+            for (&element, &(name, kind, optional, rest)) in
+                tuple.elements.nodes.iter().zip(expected_members.iter())
+            {
+                let node = result.arena.get(element).unwrap();
+                assert_eq!(node.kind, SyntaxKind::NamedTupleMember);
+                assert_eq!(node.parent, Some(alias.type_));
+                let NodeData::NamedTupleMember(member) = &node.data else {
+                    panic!("expected named tuple member");
+                };
+                let label = result.arena.get(member.name).unwrap();
+                assert_eq!(label.kind, SyntaxKind::Identifier);
+                assert_eq!(label.parent, Some(element));
+                let NodeData::Identifier(identifier) = &label.data else {
+                    panic!("expected tuple label identifier");
+                };
+                assert_eq!(identifier.text, name);
+                assert_eq!(
+                    member
+                        .question_token
+                        .map(|id| result.arena.get(id).unwrap().kind),
+                    optional.then_some(SyntaxKind::QuestionToken),
+                );
+                assert_eq!(
+                    member
+                        .dot_dot_dot_token
+                        .map(|id| result.arena.get(id).unwrap().kind),
+                    rest.then_some(SyntaxKind::DotDotDotToken),
+                );
+                let type_node = result.arena.get(member.type_).unwrap();
+                assert_eq!(type_node.kind, kind);
+                assert_eq!(type_node.parent, Some(element));
+                if let NodeData::ArrayTypeNode(array) = &type_node.data {
+                    assert_eq!(
+                        result.arena.get(array.element_type).unwrap().kind,
+                        SyntaxKind::StringKeyword,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_tuple_labels_keep_unnamed_type_forms() {
+        let result = parse_source_file("type Plain = [number, string?, ...boolean[]];");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::TypeAliasDeclaration(alias) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected type alias");
+        };
+        let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data else {
+            panic!("expected tuple type");
+        };
+        assert_eq!(tuple.elements.nodes.len(), 3);
+        assert_eq!(
+            result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
+            SyntaxKind::NumberKeyword,
+        );
+        let optional = result.arena.get(tuple.elements.nodes[1]).unwrap();
+        assert_eq!(optional.kind, SyntaxKind::OptionalType);
+        let NodeData::OptionalTypeNode(optional) = &optional.data else {
+            panic!("expected optional type");
+        };
+        assert_eq!(
+            result.arena.get(optional.type_).unwrap().kind,
+            SyntaxKind::StringKeyword,
+        );
+        let rest = result.arena.get(tuple.elements.nodes[2]).unwrap();
+        assert_eq!(rest.kind, SyntaxKind::RestType);
+        let NodeData::RestTypeNode(rest) = &rest.data else {
+            panic!("expected rest type");
+        };
+        let array = result.arena.get(rest.type_).unwrap();
+        assert_eq!(array.kind, SyntaxKind::ArrayType);
+        let NodeData::ArrayTypeNode(array) = &array.data else {
+            panic!("expected array type");
+        };
+        assert_eq!(
+            result.arena.get(array.element_type).unwrap().kind,
+            SyntaxKind::BooleanKeyword,
+        );
+    }
+
+    #[test]
+    fn keyword_tuple_labels_require_a_colon() {
+        let result = parse_source_file("type Bad = [type? number];");
+        assert!(!result.diagnostics.is_empty());
+        let NodeData::TypeAliasDeclaration(alias) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected type alias");
+        };
+        let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data else {
+            panic!("expected tuple type");
+        };
+        assert!(tuple.elements.nodes.iter().all(|element| {
+            result.arena.get(*element).unwrap().kind != SyntaxKind::NamedTupleMember
+        }));
     }
 
     #[test]

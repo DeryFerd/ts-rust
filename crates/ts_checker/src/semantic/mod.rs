@@ -31,9 +31,12 @@ mod enums;
 pub mod formatter;
 mod functions;
 mod generic_calls;
+mod generic_method_calls;
+mod generic_types;
 mod global_types;
 mod helper_signatures;
 pub mod ids;
+mod in_operators;
 mod indexed_access_types;
 mod inference;
 mod instantiate;
@@ -80,6 +83,7 @@ mod source_meta;
 mod source_meta_invariants_wave152;
 mod source_namespaces;
 mod source_new;
+mod source_object_rest;
 mod source_overloads;
 mod source_properties;
 mod source_statements;
@@ -175,7 +179,7 @@ pub use production::{
     CanonicalCheckerOptions, CanonicalGlobalInitializationError, CanonicalImportCallMode,
 };
 pub use reference_types::DirectGenericReferenceError;
-pub use relater::RelationUnavailable;
+pub use relater::{RelationSignatureEdge, RelationUnavailable, SourceSignatureInstantiationRequest};
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
     RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,
@@ -190,7 +194,7 @@ pub use source_meta::SourceMetaError;
 pub use store::SemanticStore;
 pub use symbol_display::SymbolDisplayError;
 pub use tuple_types::EmptyTupleTypeError;
-pub use type_nodes::TypeNodeUnavailable;
+pub use type_nodes::{AwaitedTypeError, TypeNodeUnavailable};
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;
 pub use variables::{VariableInvariant, VariableUnsupported};

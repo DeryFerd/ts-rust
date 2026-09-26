@@ -10,33 +10,59 @@
 //! type-parameter pairs have a separate deferred constructor. Recursive named
 //! operands retain an authenticated, allocation-free syntax proof so the
 //! type-node owner can issue the pinned generic and tuple cycle diagnostics.
-//! Other named operands, optional properties, overlapping non-string indexes,
-//! union keys, tuples, and apparent types remain explicit concrete boundaries.
+//! The source type query uses the shared operand syntax proof for other named
+//! operands, then resolves their selected value with its actual source context.
+//! Overlapping non-string indexes, general union keys, tuples, and apparent
+//! types remain boundaries of this concrete planner.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
 //! object and returns an existing value type, so this concrete path never
 //! allocates an `IndexedAccessType` or mutates a checker cache.
+//!
+//! A separate sealed alias-bound plan admits one own string-keyed property of
+//! a closed named object. Its source read uses the existing optional union
+//! operation without changing the declared property or the nil-access path.
+//! Named nongeneric interfaces also support `I[keyof I]`. That plan keeps the
+//! merged member proof and uses the canonical keyof and union caches.
 
 use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
-use ts_binder::SemanticSymbolId;
+use ts_binder::{
+    CanonicalNameResolver, CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+};
 use ts_jsnum::Number;
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    bootstrap::LiteralTypeCacheError,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
+    array_types::CanonicalArrayTargets,
+    bootstrap::{IntrinsicBootstrapOptions, LiteralTypeCacheError},
     callable_sets::{StoredCallableSetValidation, validate_stored_declared_method_callable_set},
-    declared::{cached_ordinary_type_parameter_owner, preflight_node},
-    links::ValueSymbolLinks,
-    object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
-    type_nodes::normalize_numeric_separators,
+    declared::{
+        cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference, preflight_node,
+    },
+    instantiate::{self, InstantiationError, InstantiationSession},
+    keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type_with_array_targets},
+    links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
+    object_aliases::{self, ClosedTypeAliasSourceHeader, SourceAliasOperandGraph},
+    object_members::{
+        self, PlannedProperty, PropertyObjectError, PropertyObjectPlan, PropertyObjectState,
+    },
+    store::SourceNodeParent,
+    type_nodes::{SourceAliasOperandSource, normalize_numeric_separators},
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{AccessFlags, TypeFlags},
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
+
+/// Checked source operands for the shared indexed-type operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IndexedAccessTypePlan {
+    pub object: NodeRef,
+    pub index: NodeRef,
+}
 
 /// Concrete key forms for which applicable index selection is allocation-free.
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +179,762 @@ impl ConcreteIndexedAccessPlan {
     pub(super) const fn index(&self) -> NodeRef {
         self.index
     }
+}
+
+/// A closed interface read keeps both references and the whole merged owner.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct NamedInterfaceKeyofIndexedAccessPlan {
+    node: NodeRef,
+    object: NodeRef,
+    index: NodeRef,
+    keyof_object: NodeRef,
+    object_plan: PropertyObjectPlan,
+    alias: Option<SemanticSymbolId>,
+}
+
+impl NamedInterfaceKeyofIndexedAccessPlan {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.object_plan.symbol
+    }
+
+    pub(super) const fn object(&self) -> NodeRef {
+        self.object
+    }
+
+    pub(super) const fn index(&self) -> NodeRef {
+        self.index
+    }
+}
+
+/// Admits the actual same-owner keyof read, including merged interfaces.
+pub(super) fn plan_named_interface_keyof_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    alias: Option<SemanticSymbolId>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NamedInterfaceKeyofIndexedAccessPlan>, ConcreteIndexedAccessError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    };
+    let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+    let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+    let object_record = preflight_node(store, host, object)?;
+    let index_record = preflight_node(store, host, index)?;
+    let NodeData::TypeOperatorNode(operator) = &index_record.data else {
+        return Ok(None);
+    };
+    if object_record.kind != SyntaxKind::TypeReference
+        || index_record.kind != SyntaxKind::TypeOperator
+        || operator.operator != SyntaxKind::KeyOfKeyword
+    {
+        return Ok(None);
+    }
+    let keyof_object = NodeRef::new(node.arena, node.file, operator.type_);
+    let keyof_record = preflight_node(store, host, keyof_object)?;
+    if record.kind != SyntaxKind::IndexedAccessType
+        || record.flags.0 != 0
+        || index_record.flags.0 != 0
+        || object == index
+        || object_record.parent != Some(node.node)
+        || index_record.parent != Some(node.node)
+        || keyof_record.parent != Some(index.node)
+        || object_record.range.start != record.range.start
+        || object_record.range.end > index_record.range.start
+        || index_record.range.end >= record.range.end
+        || keyof_record.range.start < index_record.range.start
+        || keyof_record.range.end != index_record.range.end
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    }
+    if [node, index].into_iter().any(|operand| {
+        store
+            .symbol_node_links(operand)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    }) {
+        return Err(ConcreteIndexedAccessError::InvalidCache(node));
+    }
+    let symbol = named_interface_indexed_reference(store, host, object)?;
+    if named_interface_indexed_reference(store, host, keyof_object)? != symbol {
+        return Err(ConcreteIndexedAccessError::UnsupportedIndex(index));
+    }
+    let object_plan = object_members::plan_interface(store, host, symbol)?;
+    if !object_plan.methods.is_empty()
+        || !object_plan.accessors.is_empty()
+        || !object_plan.call_signatures.is_empty()
+        || !object_plan.indexes.is_empty()
+        || !object_plan.spreads.is_empty()
+        || object_plan.heritage.is_some()
+        || object_plan.properties.iter().any(|property| {
+            store.source_node_kind(property.name_node) == Some(SyntaxKind::ComputedPropertyName)
+        })
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(object));
+    }
+    if let Some(property) = object_plan
+        .properties
+        .iter()
+        .find(|property| property.optional)
+    {
+        return Err(ConcreteIndexedAccessError::OptionalProperty {
+            node,
+            property: property.symbol,
+        });
+    }
+    let plan = NamedInterfaceKeyofIndexedAccessPlan {
+        node,
+        object,
+        index,
+        keyof_object,
+        object_plan,
+        alias,
+    };
+    if validate_parent_links(store, node)?.is_some() {
+        let object_type = object_members::cached_planned_type_identity(store, object)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(object))?;
+        let index_type = object_members::cached_planned_type_identity(store, index)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(index))?;
+        cached_named_interface_keyof_indexed_access(
+            store, &plan, object_type, index_type, array_targets,
+        )?;
+    }
+    Ok(Some(plan))
+}
+
+fn named_interface_indexed_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, ConcreteIndexedAccessError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    };
+    if reference.type_arguments.is_some() {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    }
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    };
+    if record.kind != SyntaxKind::TypeReference
+        || record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(node.node)
+        || name_record.range != record.range
+        || identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    }
+    let (arena, bound) = host
+        .source(node)
+        .ok_or(ConcreteIndexedAccessError::InvalidSyntax(node))?;
+    let mut name_host = host
+        .name_resolver_host(store)
+        .map_err(DeclaredTypeError::from)?;
+    let symbol = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut name_host)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(node))?;
+    let flags = store
+        .symbol(symbol)
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(node))?
+        .flags();
+    if flags.without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || preflight_class_or_interface_reference(store, host, symbol, flags)? != 0
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    }
+    Ok(symbol)
+}
+
+fn named_interface_keyof_value_types(
+    store: &CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, ConcreteIndexedAccessError> {
+    let invalid = || ConcreteIndexedAccessError::InvalidCache(plan.node);
+    if !matches!(object_members::interface_state(store, &plan.object_plan, object_type)?,
+        PropertyObjectState::Resolved(actual) if actual == object_type)
+        || object_members::cached_planned_type_identity(store, plan.object) != Some(object_type)
+        || object_members::cached_planned_type_identity(store, plan.keyof_object)
+            != Some(object_type)
+        || object_members::cached_planned_type_identity(store, plan.index) != Some(index_type)
+    {
+        return Err(invalid());
+    }
+    let keyof = plan_nongeneric_keyof_type_with_array_targets(store, object_type, array_targets)
+        .map_err(|_| invalid())?;
+    if cached_nongeneric_keyof_type(store, &keyof).map_err(|_| invalid())? != Some(index_type) {
+        return Err(invalid());
+    }
+    plan.object_plan
+        .properties
+        .iter()
+        .map(|property| {
+            store
+                .value_symbol_links(property.symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| {
+                    store.type_payload(*type_).is_some()
+                        && object_members::cached_planned_type_identity(store, property.type_node)
+                            == Some(*type_)
+                })
+                .ok_or_else(invalid)
+        })
+        .collect()
+}
+
+pub(super) fn cached_named_interface_keyof_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, ConcreteIndexedAccessError> {
+    let types =
+        named_interface_keyof_value_types(store, plan, object_type, index_type, array_targets)?;
+    let expected = store.cached_literal_union_type_with_alias(
+        &types,
+        plan.alias.map(|symbol| (symbol, &[][..])),
+        array_targets,
+    )?;
+    if validate_parent_links(store, plan.node)?.is_some_and(|cached| Some(cached) != expected) {
+        return Err(ConcreteIndexedAccessError::InvalidCache(plan.node));
+    }
+    Ok(expected)
+}
+
+/// Uses the read union operation with the caller's session and alias identity.
+pub(super) fn finish_named_interface_keyof_indexed_access(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, ConcreteIndexedAccessError> {
+    if let Some(cached) = cached_named_interface_keyof_indexed_access(
+        store, plan, object_type, index_type, array_targets,
+    )? {
+        return Ok(cached);
+    }
+    let types =
+        named_interface_keyof_value_types(store, plan, object_type, index_type, array_targets)?;
+    store
+        .literal_union_type_with_alias_and_array_targets_and_session(
+            &types,
+            plan.alias.map(|symbol| (symbol, &[][..])),
+            array_targets,
+            session,
+        )
+        .map_err(Into::into)
+}
+
+/// This read has a real indexed type node. It is not the mapper's nil-access read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceAliasIndexedReadMode {
+    SourceTypeNode,
+}
+
+/// The source owner and selected member stay separate from the resolved graph.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SourceAliasIndexedBoundPlan {
+    source: SourceAliasOperandSource,
+    node: NodeRef,
+    role_path: Vec<NodeRef>,
+    object: NodeRef,
+    object_name: NodeRef,
+    object_source: ClosedTypeAliasSourceHeader,
+    object_plan: PropertyObjectPlan,
+    index: NodeRef,
+    key: ConcreteIndexKey,
+    property: PlannedProperty,
+    read_mode: SourceAliasIndexedReadMode,
+    options: IntrinsicBootstrapOptions,
+}
+
+/// Only an authenticated source plan can produce this property read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceAliasIndexedSelection {
+    property: SemanticSymbolId,
+    value_type: TypeId,
+    optional: bool,
+    read_mode: SourceAliasIndexedReadMode,
+}
+
+impl SourceAliasIndexedSelection {
+    pub(super) const fn property(self) -> SemanticSymbolId {
+        self.property
+    }
+
+    pub(super) const fn value_type(self) -> TypeId {
+        self.value_type
+    }
+
+    pub(super) const fn optional(self) -> bool {
+        self.optional
+    }
+
+    pub(super) const fn read_mode(self) -> SourceAliasIndexedReadMode {
+        self.read_mode
+    }
+}
+
+impl SourceAliasIndexedBoundPlan {
+    pub(super) const fn node(&self) -> NodeRef {
+        self.node
+    }
+
+    pub(super) const fn object(&self) -> NodeRef {
+        self.object
+    }
+
+    pub(super) const fn object_literal(&self) -> NodeRef {
+        self.object_source.declaration
+    }
+
+    pub(super) const fn object_plan(&self) -> &PropertyObjectPlan {
+        &self.object_plan
+    }
+
+    pub(super) const fn index(&self) -> NodeRef {
+        self.index
+    }
+
+    pub(super) const fn source(&self) -> &SourceAliasOperandSource {
+        &self.source
+    }
+
+    fn validate_retained(
+        &self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Result<(), ConcreteIndexedAccessError> {
+        self.source.validate_retained(store)?;
+        let invalid = || ConcreteIndexedAccessError::InvalidCache(self.node);
+        if store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.options)
+            != Some(self.options)
+            || source_alias_indexed_role_path(store, &self.source, self.node)? != self.role_path
+            || store.source_node_kind(self.node) != Some(SyntaxKind::IndexedAccessType)
+            || store.source_direct_children(self.node).as_deref()
+                != Some(&[self.object, self.index])
+            || store.source_node_kind(self.object) != Some(SyntaxKind::TypeReference)
+            || store.source_direct_children(self.object).as_deref() != Some(&[self.object_name])
+            || store.source_node_parent(self.object_name)
+                != Some(SourceNodeParent::Parent(self.object))
+            || store.source_node_parent(self.object) != Some(SourceNodeParent::Parent(self.node))
+            || store.source_node_parent(self.index) != Some(SourceNodeParent::Parent(self.node))
+            || object_aliases::closed_type_alias_source_header(
+                store,
+                self.object_source.declaration,
+            )
+            .map_err(|_| invalid())?
+                != Some(self.object_source.clone())
+            || self.object_plan.node != self.object_source.declaration
+            || self.object_plan.symbol != self.object_source.source_symbol
+            || self.object_plan.alias_symbol != Some(self.object_source.alias_symbol)
+            || store.source_identifier_text(self.object_name)
+                != store
+                    .symbol(self.object_source.alias_symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+        {
+            return Err(invalid());
+        }
+        validate_source_alias_reference_links(store, self.object, self.object_source.alias_symbol)?;
+        validate_source_alias_reference_links(
+            store,
+            self.object_name,
+            self.object_source.alias_symbol,
+        )?;
+        validate_existing_index_links(store, self.index, &self.key)?;
+        validate_parent_links(store, self.node)?;
+        Ok(())
+    }
+
+    /// Rechecks the full object before the shared mapper selects its property.
+    pub(super) fn checked_selection(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        graph: &SourceAliasOperandGraph,
+        object: TypeId,
+        key: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<SourceAliasIndexedSelection, ConcreteIndexedAccessError> {
+        self.validate_retained(store)?;
+        let invalid = || ConcreteIndexedAccessError::InvalidCache(self.object);
+        if graph.source() != &self.source {
+            return Err(invalid());
+        }
+        graph
+            .validate_closed_object(store, self.object, object, array_targets)
+            .map_err(|_| invalid())?;
+        if !matches!(
+            object_members::type_literal_state(store, &self.object_plan)?,
+            Some(PropertyObjectState::Resolved(type_)) if type_ == object
+        ) || store.type_node_links(self.object)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(object),
+                outer_type_parameters: None,
+            })
+            || store
+                .symbol_node_links(self.object)
+                .and_then(|links| links.resolved_symbol)
+                != Some(self.object_source.alias_symbol)
+            || store
+                .type_alias_links(self.object_source.alias_symbol)
+                .is_none_or(|links| {
+                    links.declared_type != Some(object)
+                        || links.type_parameters.is_some()
+                        || links.instantiations.is_some()
+                        || links.is_constructor_declared_property
+                })
+        {
+            return Err(invalid());
+        }
+        validate_index_type(store, &self.key, key)?;
+        if store.type_node_links(self.index)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(key),
+                outer_type_parameters: None,
+            })
+        {
+            return Err(ConcreteIndexedAccessError::InvalidCache(self.index));
+        }
+        let Some(property) = self
+            .object_plan
+            .properties
+            .iter()
+            .find(|property| property.symbol == self.property.symbol)
+        else {
+            return Err(invalid());
+        };
+        if property != &self.property
+            || !matches!(&self.key, ConcreteIndexKey::StringLiteral { value, .. }
+                if property.name.as_utf8() == Some(value.as_str()))
+            || !store.source_declaration_belongs_to_symbol(property.declaration, property.symbol)
+            || !store.source_symbol_declarations_match(property.symbol)
+            || store.symbol(property.symbol).is_none_or(|record| {
+                record.flags().contains(SymbolFlags::OPTIONAL) != property.optional
+                    || record.value_declaration() != Some(property.declaration)
+            })
+        {
+            return Err(invalid());
+        }
+        let value_type = store
+            .value_symbol_links(property.symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        store
+            .type_payload(value_type)
+            .ok_or(ConcreteIndexedAccessError::InvalidType(value_type))?;
+        Ok(SourceAliasIndexedSelection {
+            property: property.symbol,
+            value_type,
+            optional: property.optional,
+            read_mode: self.read_mode,
+        })
+    }
+}
+
+fn source_alias_indexed_role_path(
+    store: &CanonicalTypeMapperStore,
+    source: &SourceAliasOperandSource,
+    node: NodeRef,
+) -> Result<Vec<NodeRef>, ConcreteIndexedAccessError> {
+    let invalid = || ConcreteIndexedAccessError::InvalidSyntax(node);
+    if node.arena != source.root().arena || node.file != source.root().file {
+        return Err(invalid());
+    }
+    let mut path = vec![node];
+    let mut current = node;
+    while current != source.root() {
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(current) else {
+            return Err(invalid());
+        };
+        if path.contains(&parent) {
+            return Err(invalid());
+        }
+        let children = store.source_direct_children(parent).ok_or_else(invalid)?;
+        let valid = match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType) => children == [current],
+            Some(SyntaxKind::UnionType) => {
+                children.len() >= 2
+                    && children.iter().filter(|child| **child == current).count() == 1
+                    && children.iter().all(|child| {
+                        store.source_node_parent(*child) == Some(SourceNodeParent::Parent(parent))
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid());
+        }
+        path.push(parent);
+        current = parent;
+    }
+    Ok(path)
+}
+
+fn validate_source_alias_reference_links(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<(), ConcreteIndexedAccessError> {
+    if store
+        .symbol_node_links(node)
+        .and_then(|links| links.resolved_symbol)
+        .is_some_and(|symbol| symbol != alias || store.get_merged_symbol(symbol) != Some(alias))
+        || store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+    {
+        return Err(ConcreteIndexedAccessError::InvalidCache(node));
+    }
+    Ok(())
+}
+
+/// Plans only a same-file closed object alias and its one actual own string key.
+#[allow(clippy::too_many_lines)] // Source ownership, syntax and selected member form one proof.
+pub(super) fn plan_source_alias_indexed_bound(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: &SourceAliasOperandSource,
+    node: NodeRef,
+) -> Result<SourceAliasIndexedBoundPlan, ConcreteIndexedAccessError> {
+    source.validate_retained(store)?;
+    let role_path = source_alias_indexed_role_path(store, source, node)?;
+    let record = preflight_node(store, host, node)?;
+    let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    };
+    let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+    let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+    let object_record = preflight_node(store, host, object)?;
+    let index_record = preflight_node(store, host, index)?;
+    if record.kind != SyntaxKind::IndexedAccessType
+        || record.flags.0 & NODE_FLAG_JSDOC != 0
+        || object == index
+        || object_record.parent != Some(node.node)
+        || index_record.parent != Some(node.node)
+        || object_record.range.start != record.range.start
+        || object_record.range.end > index_record.range.start
+        || index_record.range.end >= record.range.end
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    }
+    let NodeData::TypeReferenceNode(reference) = &object_record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    };
+    if object_record.kind != SyntaxKind::TypeReference
+        || object_record.flags.0 & NODE_FLAG_JSDOC != 0
+        || reference.type_arguments.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    }
+    let object_name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, object_name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 & NODE_FLAG_JSDOC != 0
+        || name_record.parent != Some(object.node)
+        || name_record.range != object_record.range
+        || identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(object));
+    }
+    let (arena, bound) = host
+        .source(object)
+        .ok_or(ConcreteIndexedAccessError::InvalidSyntax(object))?;
+    let mut name_host = host
+        .name_resolver_host(store)
+        .map_err(DeclaredTypeError::from)?;
+    let alias = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut name_host)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(object_name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(object))?;
+    let Some([alias_declaration]) = store.symbol(alias).and_then(|symbol| {
+        (symbol.flags() == SymbolFlags::TYPE_ALIAS)
+            .then(|| symbol.declarations())
+            .flatten()
+    }) else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    };
+    if alias_declaration.arena != node.arena || alias_declaration.file != node.file {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    }
+    let alias_record = preflight_node(store, host, *alias_declaration)?;
+    let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(
+            *alias_declaration,
+        ));
+    };
+    if alias_record.kind != SyntaxKind::TypeAliasDeclaration || alias_data.type_parameters.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(object));
+    }
+    let alias_body = NodeRef::new(node.arena, node.file, alias_data.type_);
+    let (object_literal, wrappers) =
+        direct_type_literal(store, host, alias_body).map_err(|error| match error {
+            DirectTypeLiteralError::Declared(error) => {
+                ConcreteIndexedAccessError::DeclaredType(error)
+            }
+            DirectTypeLiteralError::Invalid(node) => {
+                ConcreteIndexedAccessError::InvalidSyntax(node)
+            }
+            DirectTypeLiteralError::Unsupported(node) => {
+                ConcreteIndexedAccessError::UnsupportedObject(node)
+            }
+        })?;
+    validate_transparent_object_links(store, &wrappers)?;
+    let object_source = object_aliases::closed_type_alias_source_header(store, object_literal)
+        .map_err(|_| ConcreteIndexedAccessError::InvalidCache(object))?
+        .filter(|header| {
+            header.alias_symbol == alias && header.alias_declaration == *alias_declaration
+        })
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(object))?;
+    let object_plan = object_members::plan_type_literal(store, host, object_literal, Some(alias))?;
+    if !object_plan.methods.is_empty()
+        || !object_plan.accessors.is_empty()
+        || !object_plan.call_signatures.is_empty()
+        || !object_plan.indexes.is_empty()
+        || !object_plan.spreads.is_empty()
+        || object_plan.heritage.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+            object_literal,
+        ));
+    }
+    let key = classify_index(store, host, index)?;
+    let ConcreteIndexKey::StringLiteral { value, .. } = &key else {
+        return Err(ConcreteIndexedAccessError::UnsupportedIndex(index));
+    };
+    let property = object_plan
+        .properties
+        .iter()
+        .find(|property| property.name.as_utf8() == Some(value.as_str()))
+        .cloned()
+        .ok_or(ConcreteIndexedAccessError::MissingProperty(index))?;
+    let plan = SourceAliasIndexedBoundPlan {
+        source: source.clone(),
+        node,
+        role_path,
+        object,
+        object_name,
+        object_source,
+        object_plan,
+        index,
+        key,
+        property,
+        read_mode: SourceAliasIndexedReadMode::SourceTypeNode,
+        options: store
+            .intrinsic_bootstrap()
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(node))?
+            .options,
+    };
+    plan.validate_retained(store)?;
+    Ok(plan)
+}
+
+/// Uses the existing property read and union producer with the current caller.
+pub(super) fn finish_source_alias_indexed_bound_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    graph: &SourceAliasOperandGraph,
+    object: TypeId,
+    key: TypeId,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if store
+        .type_node_links(plan.node)
+        .is_some_and(|links| links.resolved_type.is_some())
+    {
+        cached_source_alias_indexed_bound(
+            store,
+            plan,
+            graph,
+            object,
+            key,
+            globals.map(CanonicalArrayTargets::from_global_types),
+        )?
+        .ok_or(InstantiationError::InvalidType(object))?;
+    }
+    let result = instantiate::resolve_source_alias_indexed_read_with_session(
+        store, plan, graph, object, key, globals, session,
+    )?;
+    validate_source_alias_indexed_parent_result(store, plan, result)?;
+    Ok(result)
+}
+
+/// Reads the same selected member and source read mode without publication.
+pub(super) fn cached_source_alias_indexed_bound(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    graph: &SourceAliasOperandGraph,
+    object: TypeId,
+    key: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let result = instantiate::cached_source_alias_indexed_read(
+        store,
+        plan,
+        graph,
+        object,
+        key,
+        array_targets,
+    )?;
+    if let Some(result) = result {
+        validate_source_alias_indexed_parent_result(store, plan, result)?;
+    } else if store
+        .type_node_links(plan.node)
+        .is_some_and(|links| links.resolved_type.is_some())
+    {
+        return Err(InstantiationError::InvalidType(object));
+    }
+    Ok(result)
+}
+
+fn validate_source_alias_indexed_parent_result(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    result: TypeId,
+) -> Result<(), InstantiationError> {
+    if validate_parent_links(store, plan.node)
+        .map_err(|_| InstantiationError::InvalidType(result))?
+        .is_some_and(|cached| cached != result)
+    {
+        return Err(InstantiationError::InvalidType(result));
+    }
+    Ok(())
 }
 
 /// Syntax, capability, or warm-cache failure for the concrete A11a leaf.
@@ -344,17 +1126,12 @@ pub(super) fn plan_recursive_indexed_access(
     }
 }
 
-/// Preflights one complete concrete indexed-access dependency closure.
-///
-/// The returned plan has already selected one required property or one exact
-/// source-declared index-signature slot. A warm parent is accepted only when
-/// its fully resolved object and canonical literal key reproduce the cached
-/// result exactly.
-pub(super) fn plan_concrete_indexed_access(
+/// Checks the indexed type node and its two operand edges without reading values.
+pub(super) fn plan_indexed_access_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
-) -> Result<ConcreteIndexedAccessPlan, ConcreteIndexedAccessError> {
+) -> Result<IndexedAccessTypePlan, ConcreteIndexedAccessError> {
     let record = preflight_node(store, host, node)?;
     let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
         return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
@@ -377,6 +1154,16 @@ pub(super) fn plan_concrete_indexed_access(
         return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
     }
 
+    Ok(IndexedAccessTypePlan { object, index })
+}
+
+/// Selects one required property or exact source index from a concrete type literal.
+pub(super) fn plan_concrete_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<ConcreteIndexedAccessPlan, ConcreteIndexedAccessError> {
+    let IndexedAccessTypePlan { object, index } = plan_indexed_access_type(store, host, node)?;
     let (object_literal, object_wrappers) =
         direct_type_literal(store, host, object).map_err(|error| match error {
             DirectTypeLiteralError::Declared(error) => {
@@ -1497,6 +2284,586 @@ mod tests {
             },
         ));
         type_
+    }
+
+    fn alias_bound_context<'a>(
+        parsed: &'a ParseResult,
+        library: Option<&'a ParseResult>,
+        intrinsic: IntrinsicBootstrapOptions,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        let sources = library
+            .map(|library| (FileId::new(1), library, true))
+            .into_iter()
+            .chain([(FileId::new(0), parsed, false)])
+            .collect::<Vec<_>>();
+        for &(file, parsed, is_library) in &sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if is_library {
+                            "\"/lib/lib.es5.d.ts\""
+                        } else {
+                            "\"/project/source-alias-indexed.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .iter()
+                .map(|&(file, parsed, _)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn alias_bound_nodes(parsed: &ParseResult) -> Vec<NodeRef> {
+        let mut nodes = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexedAccessType).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), FileId::new(0), node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|(start, _)| *start);
+        nodes.into_iter().map(|(_, node)| node).collect()
+    }
+
+    fn alias_bound_plan_and_graph(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        library: Option<&ParseResult>,
+        node: NodeRef,
+    ) -> (
+        super::SourceAliasIndexedBoundPlan,
+        crate::semantic::object_aliases::SourceAliasOperandGraph,
+        TypeId,
+        TypeId,
+    ) {
+        use crate::semantic::{
+            object_aliases::{build_source_alias_operand_graph, closed_type_alias_source_header},
+            object_members::plan_type_literal,
+            production::GlobalMergeCompletion,
+            type_nodes::plan_source_alias_operand_source,
+        };
+
+        let sources = library
+            .map(|library| (&library.arena, context.file(FileId::new(1)).unwrap().1))
+            .into_iter()
+            .chain([(&parsed.arena, context.file(FileId::new(0)).unwrap().1)]);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources,
+            GlobalMergeCompletion::for_test(ts_binder::CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store();
+        let source = plan_source_alias_operand_source(store, &host, node)
+            .unwrap()
+            .unwrap();
+        let plan = super::plan_source_alias_indexed_bound(store, &host, &source, node).unwrap();
+        let objects = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(0),
+                    node,
+                ))
+            })
+            .map(|node| {
+                let alias = closed_type_alias_source_header(store, node)
+                    .unwrap()
+                    .map(|source| source.alias_symbol);
+                plan_type_literal(store, &host, node, alias).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let object = store
+            .type_node_links(plan.object())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let key = store
+            .type_node_links(plan.index())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let targets = library.map(|_| {
+            crate::semantic::array_types::CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            )
+        });
+        let graph = build_source_alias_operand_graph(
+            store,
+            &host,
+            &source,
+            plan.object(),
+            object,
+            &objects,
+            &[],
+            &[],
+            targets,
+        )
+        .unwrap();
+        (plan, graph, object, key)
+    }
+
+    fn assert_alias_bound_optional_type(
+        store: &CanonicalTypeMapperStore,
+        raw: TypeId,
+        read: TypeId,
+        optional: bool,
+    ) {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        if optional && bootstrap.options.strict_null_checks {
+            let TypeData::Union(union) = store.type_payload(read).unwrap().data() else {
+                panic!("the optional source read must add undefined")
+            };
+            let mut expected = vec![raw, bootstrap.undefined_type];
+            expected.sort_unstable();
+            assert_eq!(union.union.types, expected);
+            if bootstrap.options.exact_optional_property_types {
+                assert_ne!(bootstrap.missing_type, bootstrap.undefined_type);
+                assert!(!union.union.types.contains(&bootstrap.missing_type));
+            }
+        } else {
+            assert_eq!(read, raw);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The same source read is checked under each null option and Array authority.
+    fn source_alias_indexed_bounds_keep_optional_read_mode_and_array_authority() {
+        use crate::semantic::{
+            array_types::CanonicalArrayTargets,
+            instantiate::{InstantiationLimits, InstantiationSession},
+        };
+
+        let parsed = parse_source_file(concat!(
+            "type Input = { in?: {}; out?: {} }; ",
+            "type Required = { value: {} }; ",
+            "type In<T extends Input['in']> = T; ",
+            "type Out<T extends Input['out']> = T; ",
+            "type Default<T = Input['out']> = T; ",
+            "type Needed<T extends Required['value']> = T;",
+        ));
+        let nodes = alias_bound_nodes(&parsed);
+        assert_eq!(nodes.len(), 4);
+        for strict_null_checks in [false, true] {
+            for exact_optional_property_types in [false, true] {
+                let options = IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types,
+                };
+                let mut context = alias_bound_context(&parsed, None, options);
+                for (slot, &node) in nodes.iter().enumerate() {
+                    assert!(context.store().type_node_links(node).is_none());
+                    let read = context.get_type_from_type_node(node).unwrap();
+                    let (plan, graph, object, key) =
+                        alias_bound_plan_and_graph(&context, &parsed, None, node);
+                    let raw = context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .empty_type_literal_type;
+                    assert_eq!(
+                        context
+                            .store()
+                            .type_node_links(plan.property.type_node)
+                            .unwrap()
+                            .resolved_type,
+                        Some(raw),
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(plan.property.symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(raw),
+                    );
+                    assert_eq!(plan.property.optional, slot < 3);
+                    assert_alias_bound_optional_type(context.store(), raw, read, slot < 3);
+                    let selected = plan
+                        .checked_selection(context.store(), &graph, object, key, None)
+                        .unwrap();
+                    assert_eq!(selected.property(), plan.property.symbol);
+                    assert_eq!(selected.value_type(), raw);
+                    assert_eq!(selected.optional(), slot < 3);
+                    assert_eq!(
+                        selected.read_mode(),
+                        super::SourceAliasIndexedReadMode::SourceTypeNode
+                    );
+                    let warm = format!("{:?}", context.store());
+                    for _ in 0..2 {
+                        assert_eq!(
+                            super::cached_source_alias_indexed_bound(
+                                context.store(),
+                                &plan,
+                                &graph,
+                                object,
+                                key,
+                                None,
+                            ),
+                            Ok(Some(read)),
+                        );
+                        assert_eq!(format!("{:?}", context.store()), warm);
+                    }
+                    assert_eq!(context.get_type_from_type_node(node), Ok(read));
+                    assert_eq!(
+                        context.get_type_from_type_node(plan.property.type_node),
+                        Ok(raw)
+                    );
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let parsed = parse_source_file(concat!(
+            "type Input = { values?: number[]; readonlyValues?: ReadonlyArray<string> }; ",
+            "type Mutable<T extends Input['values']> = T; ",
+            "type ReadonlyBound<T extends Input['readonlyValues']> = T;",
+        ));
+        let options = IntrinsicBootstrapOptions {
+            strict_null_checks: true,
+            exact_optional_property_types: true,
+        };
+        let mut context = alias_bound_context(&parsed, Some(&library), options);
+        let foreign = alias_bound_context(&parsed, Some(&library), options);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let foreign_targets = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        for (slot, node) in alias_bound_nodes(&parsed).into_iter().enumerate() {
+            let read = context.get_type_from_type_node(node).unwrap();
+            let (plan, graph, object, key) =
+                alias_bound_plan_and_graph(&context, &parsed, Some(&library), node);
+            let raw = context
+                .store()
+                .value_symbol_links(plan.property.symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference_with_targets(targets, raw)
+                .unwrap()
+                .unwrap();
+            assert_eq!(array.readonly, slot == 1);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                array.element_type,
+                if slot == 0 {
+                    bootstrap.number_type
+                } else {
+                    bootstrap.string_type
+                }
+            );
+            assert_alias_bound_optional_type(context.store(), raw, read, true);
+
+            // A cached concrete read does not spend a new instantiation request.
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(
+                super::finish_source_alias_indexed_bound_with_session(
+                    context.store_mut_for_test(),
+                    &plan,
+                    &graph,
+                    object,
+                    key,
+                    Some(&globals),
+                    &mut caller,
+                ),
+                Ok(read),
+            );
+            let warm = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    super::cached_source_alias_indexed_bound(
+                        context.store(),
+                        &plan,
+                        &graph,
+                        object,
+                        key,
+                        Some(targets),
+                    ),
+                    Ok(Some(read)),
+                );
+                assert_eq!(
+                    super::finish_source_alias_indexed_bound_with_session(
+                        context.store_mut_for_test(),
+                        &plan,
+                        &graph,
+                        object,
+                        key,
+                        Some(&globals),
+                        &mut caller,
+                    ),
+                    Ok(read),
+                );
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+                assert_eq!(format!("{:?}", context.store()), warm);
+                for invalid_targets in [None, Some(foreign_targets)] {
+                    assert!(
+                        super::cached_source_alias_indexed_bound(
+                            context.store(),
+                            &plan,
+                            &graph,
+                            object,
+                            key,
+                            invalid_targets,
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(format!("{:?}", context.store()), warm);
+                }
+                for invalid_globals in [None, Some(foreign.global_types())] {
+                    assert!(
+                        super::finish_source_alias_indexed_bound_with_session(
+                            context.store_mut_for_test(),
+                            &plan,
+                            &graph,
+                            object,
+                            key,
+                            invalid_globals,
+                            &mut caller,
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(
+                        (
+                            caller.query_count(),
+                            caller.total_count(),
+                            caller.limit_event_count()
+                        ),
+                        (0, 0, 0)
+                    );
+                    assert_eq!(format!("{:?}", context.store()), warm);
+                }
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restoration use the same original source and caches.
+    fn source_alias_indexed_bound_replay_rejects_wrong_member_and_result() {
+        use crate::semantic::{
+            instantiate::{InstantiationLimits, InstantiationSession},
+            links::{SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks},
+        };
+
+        let parsed = parse_source_file(concat!(
+            "type Input = { in?: {}; out?: string }; ",
+            "type Subject<T extends Input | Input['in']> = T; ",
+            "type Other<T extends Input['out']> = T;",
+        ));
+        let nodes = alias_bound_nodes(&parsed);
+        let mut context = alias_bound_context(
+            &parsed,
+            None,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+        );
+        let expected = context.get_type_from_type_node(nodes[0]).unwrap();
+        context.get_type_from_type_node(nodes[1]).unwrap();
+        let (plan, graph, object, key) =
+            alias_bound_plan_and_graph(&context, &parsed, None, nodes[0]);
+        let (other, other_graph, _, wrong_key) =
+            alias_bound_plan_and_graph(&context, &parsed, None, nodes[1]);
+        assert_ne!(plan.source(), other.source());
+        assert_ne!(key, wrong_key);
+        assert_eq!(plan.role_path.len(), 2);
+        let globals = context.global_types().clone();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            super::finish_source_alias_indexed_bound_with_session(
+                store,
+                &plan,
+                &graph,
+                object,
+                key,
+                Some(&globals),
+                &mut caller,
+            ),
+            Ok(expected)
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let old_alias = store
+            .type_alias_links(plan.object_source.alias_symbol)
+            .cloned()
+            .unwrap();
+        let old_reference = store.symbol_node_links(plan.object).cloned().unwrap();
+        let old_property = store
+            .value_symbol_links(plan.property.symbol)
+            .cloned()
+            .unwrap();
+        let old_key = store.type_node_links(plan.index).cloned().unwrap();
+        let old_parent = store.type_node_links(plan.node).cloned().unwrap();
+        let old_flags = store.symbol(plan.property.symbol).unwrap().flags();
+        let old_checks = store.symbol(plan.property.symbol).unwrap().check_flags();
+        for damage in 0..6 {
+            match damage {
+                0 => assert!(store.set_type_alias_links(
+                    plan.object_source.alias_symbol,
+                    TypeAliasLinks {
+                        declared_type: Some(number),
+                        ..old_alias.clone()
+                    }
+                )),
+                1 => assert!(store.set_symbol_node_links(
+                    plan.object,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(plan.source.alias()),
+                    }
+                )),
+                2 => assert!(store.set_value_symbol_links(
+                    plan.property.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..old_property.clone()
+                    }
+                )),
+                3 => assert!(store.set_type_node_links(
+                    plan.index,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong_key),
+                        ..old_key.clone()
+                    }
+                )),
+                4 => assert!(store.set_symbol_flags(
+                    plan.property.symbol,
+                    old_flags.without(SymbolFlags::OPTIONAL),
+                    old_checks
+                )),
+                5 => assert!(store.set_type_node_links(
+                    plan.node,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..old_parent.clone()
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let poisoned = format!("{store:?}");
+            let budget = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    super::cached_source_alias_indexed_bound(
+                        store, &plan, &graph, object, key, None
+                    )
+                    .is_err(),
+                    "damage {damage}"
+                );
+                assert!(
+                    super::finish_source_alias_indexed_bound_with_session(
+                        store,
+                        &plan,
+                        &graph,
+                        object,
+                        key,
+                        Some(&globals),
+                        &mut caller,
+                    )
+                    .is_err(),
+                    "damage {damage}"
+                );
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    budget
+                );
+                assert_eq!(format!("{store:?}"), poisoned);
+            }
+            assert!(store.set_type_alias_links(plan.object_source.alias_symbol, old_alias.clone()));
+            assert!(store.set_symbol_node_links(plan.object, old_reference.clone()));
+            assert!(store.set_value_symbol_links(plan.property.symbol, old_property.clone()));
+            assert!(store.set_type_node_links(plan.index, old_key.clone()));
+            assert!(store.set_symbol_flags(plan.property.symbol, old_flags, old_checks));
+            assert!(store.set_type_node_links(plan.node, old_parent.clone()));
+            assert_eq!(
+                super::cached_source_alias_indexed_bound(store, &plan, &graph, object, key, None),
+                Ok(Some(expected))
+            );
+        }
+        let warm = format!("{store:?}");
+        assert!(
+            super::cached_source_alias_indexed_bound(store, &plan, &other_graph, object, key, None)
+                .is_err()
+        );
+        assert!(
+            super::cached_source_alias_indexed_bound(store, &plan, &graph, object, wrong_key, None)
+                .is_err()
+        );
+        for change_member in [false, true] {
+            let mut invalid = plan.clone();
+            if change_member {
+                invalid.property = other.property.clone();
+            } else {
+                invalid.options.strict_null_checks = false;
+            }
+            assert!(
+                super::cached_source_alias_indexed_bound(
+                    store, &invalid, &graph, object, key, None,
+                )
+                .is_err()
+            );
+            assert!(
+                super::finish_source_alias_indexed_bound_with_session(
+                    store,
+                    &invalid,
+                    &graph,
+                    object,
+                    key,
+                    Some(&globals),
+                    &mut caller,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(format!("{store:?}"), warm);
+        assert_eq!(context.get_type_from_type_node(nodes[0]), Ok(expected));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

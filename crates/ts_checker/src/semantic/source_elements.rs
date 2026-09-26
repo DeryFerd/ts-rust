@@ -12,12 +12,15 @@
 //! Array bindings also read authenticated own numeric interface indexes.
 //! Authenticated evolving-array element assignments reuse the same index
 //! validation. Named global Object and Function properties retain their declared
-//! values. Other writes and generic indexed access types stay typed boundaries.
+//! values. Ordinary writes select a real property by its literal or unique-symbol
+//! key. Compound writes and deferred generic indexed access stay typed boundaries.
 
 use std::collections::HashSet;
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId};
+use ts_binder::{
+    CheckFlags, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -247,7 +250,12 @@ fn plan_direct_source_element_syntax_worker(
         && operator.kind.is_assignment_operator()
     {
         let actual = NodeRef::new(node.arena, node.file, parent);
-        if assignment != Some(actual) || operator.kind != SyntaxKind::EqualsToken {
+        if assignment != Some(actual)
+            || !matches!(
+                operator.kind,
+                SyntaxKind::EqualsToken | SyntaxKind::QuestionQuestionEqualsToken
+            )
+        {
             return Err(SourceElementError::Unsupported(
                 SourceElementUnsupported::Write(node),
             ));
@@ -366,7 +374,10 @@ pub(super) fn check_direct_source_element_with_source<E>(
 where
     E: From<SourceElementError> + From<SourceCheckError>,
 {
-    if !plan.optional && !is_cold_direct_nongeneric_interface(store, receiver_type) {
+    let unique_key = classify_indices(store, index_type)?
+        .iter()
+        .any(|index| matches!(index.shape, IndexShape::UniqueSymbol(_)));
+    if !plan.optional && !unique_key && !is_cold_direct_nongeneric_interface(store, receiver_type) {
         return check_direct_source_element(
             store,
             host,
@@ -389,14 +400,14 @@ where
         index_type,
         false,
         |store, receiver, name| {
-            if is_cold_direct_nongeneric_interface(store, receiver) {
+            if name.is_late_bound() || is_cold_direct_nongeneric_interface(store, receiver) {
                 object_members::resolve_object_property_by_key_with_source(
                     store,
                     host,
                     global_types,
                     options,
                     receiver,
-                    ts_binder::EscapedNameRef::source(name),
+                    name,
                     session,
                     diagnostics,
                 )
@@ -431,6 +442,50 @@ pub(super) fn check_direct_source_element_write(
         index_type,
         true,
         resolve_stored_source_element_property,
+    )
+}
+
+/// Uses the caller's member mapper and limits for an ordinary element write.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_direct_source_element_write_with_source<E>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    index_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<CheckedSourceElement, E>
+where
+    E: From<SourceElementError> + From<SourceCheckError>,
+{
+    check_direct_source_element_worker(
+        store,
+        host,
+        Some(global_types),
+        CanonicalArrayTargets::from_global_types(global_types),
+        options,
+        plan,
+        receiver_type,
+        index_type,
+        true,
+        |store, receiver, name| match object_members::resolve_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        ) {
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::StructuredIndexInfos(_),
+            )) => Ok(None),
+            result => result.map_err(E::from),
+        },
     )
 }
 
@@ -806,7 +861,7 @@ fn array_like_interface_members_are_cold(
     Ok(true)
 }
 
-fn array_binding_name_and_index(
+pub(super) fn array_binding_name_and_index(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     binding: NodeRef,
@@ -1240,7 +1295,10 @@ fn check_computed_binding_element_worker(
             SourceElementUnsupported::IndexType(index_type),
         ));
     }
-    if matches!(index.shape, IndexShape::Literal { .. }) {
+    if matches!(
+        index.shape,
+        IndexShape::Literal { .. } | IndexShape::UniqueSymbol(_)
+    ) {
         return Err(SourceElementError::Unsupported(
             SourceElementUnsupported::IndexType(index_type),
         ));
@@ -1252,7 +1310,9 @@ fn check_computed_binding_element_worker(
             IndexShape::Number | IndexShape::Any => signatures.number.or(signatures.string),
             IndexShape::Invalid if index_type == never => signatures.number.or(signatures.string),
             IndexShape::Invalid => None,
-            IndexShape::Literal { .. } => unreachable!("literal keys use property lookup"),
+            IndexShape::Literal { .. } | IndexShape::UniqueSymbol(_) => {
+                unreachable!("literal and symbol keys use property lookup")
+            }
         };
         if let Some(value) = value {
             validate_computed_binding_index_annotations(
@@ -1590,9 +1650,14 @@ fn check_direct_source_element_with_array_targets(
 fn resolve_stored_source_element_property(
     store: &mut CanonicalTypeMapperStore,
     receiver_type: TypeId,
-    name: &str,
+    name: EscapedNameRef<'_>,
 ) -> Result<Option<ResolvedOwnProperty>, SourceElementError> {
-    match store.resolved_own_property(receiver_type, name) {
+    let property = if let Some(name) = name.as_utf8() {
+        store.resolved_own_property(receiver_type, name)
+    } else {
+        store.resolved_own_property_by_key(receiver_type, name)
+    };
+    match property {
         Err(RelationUnavailable::StructuredIndexInfos(_)) => Ok(None),
         result => result.map_err(Into::into),
     }
@@ -1613,12 +1678,69 @@ fn check_direct_source_element_worker<E, F>(
 ) -> Result<CheckedSourceElement, E>
 where
     E: From<SourceElementError>,
-    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+    F: FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        EscapedNameRef<'_>,
+    ) -> Result<Option<ResolvedOwnProperty>, E>,
 {
     if store.type_payload(receiver_type).is_none() {
         return Err(SourceElementError::InvalidType(receiver_type).into());
     }
     let indices = classify_indices(store, index_type)?;
+    let nullish_write = write
+        && host
+            .node(plan.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeRef::new(plan.node.arena, plan.node.file, parent))
+            .and_then(|parent| host.node(parent))
+            .is_some_and(|node| {
+                matches!(&node.data, NodeData::BinaryExpression(binary)
+            if binary.left == plan.node.node
+                && host.node(NodeRef::new(plan.node.arena, plan.node.file, binary.operator_token))
+                    .is_some_and(|token| token.kind == SyntaxKind::QuestionQuestionEqualsToken))
+            });
+    if write
+        && (indices.len() != 1
+            || store.type_payload(receiver_type).is_some_and(|record| {
+                record.flags().intersects(TypeFlags::UNION)
+                    || record.object_flags().intersects(ObjectFlags::CLASS)
+                    || record
+                        .symbol()
+                        .and_then(|owner| store.symbol(owner))
+                        .is_some_and(|owner| {
+                            owner
+                                .flags()
+                                .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+                        })
+            }))
+    {
+        return Err(unsupported_access(plan.node).into());
+    }
+    if write {
+        let index = &indices[0];
+        if nullish_write {
+            let array = store
+                .canonical_array_reference_with_targets(array_targets, receiver_type)
+                .map_err(SourceElementError::from)?;
+            if (array.is_some() || is_string_receiver(store, receiver_type)?)
+                && !index.is_number_applicable()
+            {
+                return Err(unsupported_access(plan.node).into());
+            }
+        }
+        if let Some(tuple) = store
+            .canonical_tuple_shape(receiver_type)
+            .map_err(|_| SourceElementError::InvalidType(receiver_type))?
+            && (tuple.is_readonly()
+                || !matches!(index.shape, IndexShape::Literal { numeric_name: true })
+                || tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+                || options.intrinsic.exact_optional_property_types
+                    && tuple.combined_flags().intersects(ElementFlags::OPTIONAL))
+        {
+            return Err(unsupported_access(plan.node).into());
+        }
+    }
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(RelationUnavailable::MissingBootstrap)
@@ -1651,6 +1773,8 @@ where
                     error,
                     string,
                     undefined,
+                    options,
+                    write,
                     &mut resolve_ordinary_property,
                 )?;
                 if indices.len() != 1 && resolution.diagnostic.is_some() {
@@ -1709,7 +1833,7 @@ where
     } else {
         resolution.type_
     };
-    let type_ = if propagate_undefined && type_ != any && type_ != error && type_ != undefined {
+    let mut type_ = if propagate_undefined && type_ != any && type_ != error && type_ != undefined {
         element_union_type(
             store,
             global_types,
@@ -1721,7 +1845,7 @@ where
         type_
     };
 
-    let diagnostic = prepare_element_diagnostic(
+    let mut diagnostic = prepare_element_diagnostic(
         store,
         host,
         global_types,
@@ -1731,8 +1855,125 @@ where
         index_type,
         resolution.diagnostic,
     )?;
+    if write && diagnostic.is_none() {
+        if let Some(symbol) = resolution.property
+            && (resolution.readonly
+                || store.symbol(symbol).is_some_and(|property| {
+                    property.check_flags().contains(CheckFlags::READONLY)
+                        || property.flags().contains(SymbolFlags::ENUM_MEMBER)
+                        || property.flags().contains(SymbolFlags::GET_ACCESSOR)
+                            && !property.flags().contains(SymbolFlags::SET_ACCESSOR)
+                }))
+        {
+            let name = element_property_display_name(store, host, plan.node, symbol)?;
+            diagnostic = Some(CanonicalCheckerDiagnostic {
+                node: Some(plan.index.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2540).ok_or(SourceElementError::MissingDiagnostic(2540))?,
+                    [name],
+                ),
+                related_information: Vec::new(),
+            });
+            type_ = error;
+        } else if resolution
+            .property
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|property| {
+                property
+                    .flags()
+                    .intersects(SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR)
+                    || nullish_write
+                        && property.flags().contains(SymbolFlags::OPTIONAL)
+                        && options.intrinsic.exact_optional_property_types
+            })
+        {
+            return Err(unsupported_access(plan.node).into());
+        } else if nullish_index_is_readonly(store, array_targets, receiver_type, &indices)? {
+            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+            if options.no_error_truncation {
+                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+            }
+            let name = if let Some(globals) = global_types {
+                type_to_string_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    globals,
+                    receiver_type,
+                    flags,
+                )
+                .map_err(SourceElementError::from)?
+            } else {
+                type_to_string_with_host_and_flags(store, host, receiver_type, flags)
+                    .map_err(SourceElementError::from)?
+            };
+            diagnostic = Some(CanonicalCheckerDiagnostic {
+                node: Some(plan.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2542).ok_or(SourceElementError::MissingDiagnostic(2542))?,
+                    [name],
+                ),
+                related_information: Vec::new(),
+            });
+        }
+    }
     publish_element_links(store, plan.node, resolution.property, type_)?;
     Ok(CheckedSourceElement { type_, diagnostic })
+}
+
+fn nullish_index_is_readonly(
+    store: &CanonicalTypeMapperStore,
+    array_targets: CanonicalArrayTargets,
+    receiver: TypeId,
+    indices: &[ClassifiedIndex],
+) -> Result<bool, SourceElementError> {
+    if let Some(array) = store.canonical_array_reference_with_targets(array_targets, receiver)? {
+        return Ok(array.readonly);
+    }
+    if let Some(tuple) = store
+        .canonical_tuple_shape(receiver)
+        .map_err(|_| SourceElementError::InvalidType(receiver))?
+    {
+        return Ok(tuple.is_readonly());
+    }
+    if is_string_receiver(store, receiver)? {
+        return Ok(true);
+    }
+    let Some(signatures) = resolved_index_signature_surface(store, receiver)? else {
+        return Ok(false);
+    };
+    let TypeData::Object(object) = store
+        .type_payload(receiver)
+        .ok_or(SourceElementError::InvalidType(receiver))?
+        .data()
+    else {
+        return Err(SourceElementError::InvalidType(receiver));
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    for index in indices {
+        let key = if index.is_number_applicable()
+            && signatures.number.is_some()
+            && !matches!(index.shape, IndexShape::Any)
+        {
+            bootstrap.number_type
+        } else if signatures.string.is_some() {
+            bootstrap.string_type
+        } else {
+            bootstrap.number_type
+        };
+        for info in object.structured.index_infos.iter().flatten() {
+            let info = store
+                .index_info(*info)
+                .ok_or(SourceElementError::InvalidType(receiver))?;
+            if info.key_type() == key && info.is_readonly() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn receiver_continues_optional_chain(arena: &NodeArena, receiver: &ts_ast::Node) -> bool {
@@ -1821,12 +2062,29 @@ fn resolve_element_index<E, F>(
     error: TypeId,
     string: TypeId,
     undefined: TypeId,
+    options: CanonicalCheckerOptions,
+    write: bool,
     resolve_ordinary_property: &mut F,
 ) -> Result<ElementResolution, E>
 where
     E: From<SourceElementError>,
-    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+    F: FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        EscapedNameRef<'_>,
+    ) -> Result<Option<ResolvedOwnProperty>, E>,
 {
+    if let IndexShape::UniqueSymbol(index_type) = index.shape {
+        if receiver_type == error || receiver_type == any {
+            return Ok(ElementResolution::success(receiver_type, None));
+        }
+        let key = unique_symbol_index_key(store, index_type)?.to_owned();
+        let property = resolve_ordinary_property(store, receiver_type, key.as_ref())?.ok_or(
+            SourceElementError::Unsupported(SourceElementUnsupported::IndexType(index_type)),
+        )?;
+        return resolved_property_element(store, global_types, options, plan, property, write)
+            .map_err(E::from);
+    }
     Ok(if receiver_type == error {
         ElementResolution::success(error, None)
     } else if let Some(enumeration) =
@@ -1870,6 +2128,8 @@ where
             index,
             any,
             error,
+            options,
+            write,
             resolve_ordinary_property,
         )?
     })
@@ -1881,6 +2141,7 @@ enum IndexShape {
     String,
     Number,
     Literal { numeric_name: bool },
+    UniqueSymbol(TypeId),
     Invalid,
 }
 
@@ -1899,7 +2160,7 @@ impl ClassifiedIndex {
     }
 
     fn is_string_or_number(&self) -> bool {
-        !matches!(self.shape, IndexShape::Invalid)
+        !matches!(self.shape, IndexShape::Invalid | IndexShape::UniqueSymbol(_))
     }
 }
 
@@ -1956,6 +2217,15 @@ fn classify_index(
         .type_payload(index_type)
         .ok_or(SourceElementError::InvalidType(index_type))?;
     let flags = record.flags();
+    if flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+        || matches!(record.data(), TypeData::UniqueEsSymbol(_))
+    {
+        unique_symbol_index_key(store, index_type)?;
+        return Ok(ClassifiedIndex {
+            shape: IndexShape::UniqueSymbol(index_type),
+            property_name: None,
+        });
+    }
     if flags.intersects(TypeFlags::ENUM_LIKE) {
         if enums::canonical_enum_type_owner(store, index_type).is_none() {
             return Err(SourceElementError::Literal(
@@ -1997,7 +2267,6 @@ fn classify_index(
     }
     if flags.intersects(
         TypeFlags::ES_SYMBOL
-            | TypeFlags::UNIQUE_ES_SYMBOL
             | TypeFlags::UNION
             | TypeFlags::INTERSECTION
             | TypeFlags::TYPE_PARAMETER
@@ -2034,6 +2303,48 @@ fn classify_index(
         },
         property_name: Some(name),
     })
+}
+
+/// Verifies the stored unique name against its actual canonical key symbol.
+fn unique_symbol_index_key(
+    store: &CanonicalTypeMapperStore,
+    index_type: TypeId,
+) -> Result<EscapedNameRef<'_>, SourceElementError> {
+    let invalid = || SourceElementError::InvalidType(index_type);
+    let record = store.type_payload(index_type).ok_or_else(invalid)?;
+    let TypeData::UniqueEsSymbol(unique) = record.data() else {
+        return Err(invalid());
+    };
+    let symbol = record.symbol().ok_or_else(invalid)?;
+    let key = store.symbol(symbol).ok_or_else(invalid)?;
+    let global_id = store
+        .symbol_store()
+        .assigned_global_symbol_id(symbol)
+        .ok_or_else(invalid)?;
+    let suffix = unique
+        .name
+        .as_bytes()
+        .strip_prefix(b"\xFE@")
+        .and_then(|name| name.strip_prefix(key.name().as_bytes()))
+        .and_then(|name| name.strip_prefix(b"@"));
+    if record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+        || record.object_flags() != ObjectFlags::NONE
+        || record.alias().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !key
+            .flags()
+            .intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::PROPERTY)
+        || key.value_declaration().is_none()
+        || store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(index_type),
+                ..ValueSymbolLinks::default()
+            })
+        || suffix != Some(global_id.to_string().as_bytes())
+    {
+        return Err(invalid());
+    }
+    Ok(unique.name.as_ref())
 }
 
 fn is_numeric_literal_name(name: &str) -> bool {
@@ -2075,6 +2386,7 @@ struct ElementResolution {
     property: Option<SemanticSymbolId>,
     diagnostic: Option<ElementDiagnostic>,
     from_index_signature: bool,
+    readonly: bool,
 }
 
 impl ElementResolution {
@@ -2084,6 +2396,7 @@ impl ElementResolution {
             property,
             diagnostic: None,
             from_index_signature: false,
+            readonly: false,
         }
     }
 
@@ -2093,6 +2406,7 @@ impl ElementResolution {
             property: None,
             diagnostic: None,
             from_index_signature: true,
+            readonly: false,
         }
     }
 
@@ -2102,6 +2416,7 @@ impl ElementResolution {
             property: None,
             diagnostic: Some(diagnostic),
             from_index_signature: false,
+            readonly: false,
         }
     }
 }
@@ -2183,11 +2498,17 @@ fn resolve_object_element<E, F>(
     index: &ClassifiedIndex,
     any_type: TypeId,
     error_type: TypeId,
+    options: CanonicalCheckerOptions,
+    write: bool,
     resolve_ordinary_property: &mut F,
 ) -> Result<ElementResolution, E>
 where
     E: From<SourceElementError>,
-    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+    F: FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        EscapedNameRef<'_>,
+    ) -> Result<Option<ResolvedOwnProperty>, E>,
 {
     if matches!(index.shape, IndexShape::Invalid) {
         return Ok(ElementResolution::diagnostic(
@@ -2225,18 +2546,11 @@ where
         let own = if callable {
             None
         } else {
-            resolve_ordinary_property(store, receiver_type, name)?
+            resolve_ordinary_property(store, receiver_type, EscapedNameRef::source(name))?
         };
         if let Some(property) = own {
-            let type_ = optional_element_read_type(
-                store,
-                global_types,
-                plan.node,
-                property.symbol,
-                property.type_,
-                property.optional,
-            )?;
-            return Ok(ElementResolution::success(type_, Some(property.symbol)));
+            return resolved_property_element(store, global_types, options, plan, property, write)
+                .map_err(E::from);
         }
         if let Some(global_types) = global_types {
             for target in callable
@@ -2245,15 +2559,15 @@ where
                 .chain(std::iter::once(global_types.object_type))
             {
                 if let Some(property) = global_prototype_property(store, host, target, name)? {
-                    let type_ = optional_element_read_type(
+                    return resolved_property_element(
                         store,
                         Some(global_types),
-                        plan.node,
-                        property.symbol,
-                        property.type_,
-                        property.optional,
-                    )?;
-                    return Ok(ElementResolution::success(type_, Some(property.symbol)));
+                        options,
+                        plan,
+                        property,
+                        write,
+                    )
+                    .map_err(E::from);
                 }
             }
         }
@@ -2321,6 +2635,92 @@ where
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn resolved_property_element(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    plan: &SourceElementPlan,
+    property: ResolvedOwnProperty,
+    write: bool,
+) -> Result<ElementResolution, SourceElementError> {
+    let type_ = if write && options.intrinsic.exact_optional_property_types {
+        property.type_
+    } else {
+        optional_element_read_type(
+            store,
+            global_types,
+            plan.node,
+            property.symbol,
+            property.type_,
+            property.optional,
+        )?
+    };
+    Ok(ElementResolution {
+        readonly: property.readonly,
+        ..ElementResolution::success(type_, Some(property.symbol))
+    })
+}
+
+fn element_property_display_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<String, SourceElementError> {
+    let invalid = || SourceElementError::InvalidCache(access);
+    let property = store.symbol(symbol).ok_or_else(invalid)?;
+    if let Some(name) = property.name().as_utf8() {
+        return Ok(name.to_owned());
+    }
+    let key_type = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.name_type)
+        .ok_or_else(invalid)?;
+    if unique_symbol_index_key(store, key_type)? != property.name() {
+        return Err(invalid());
+    }
+    let declaration = property.value_declaration().ok_or_else(invalid)?;
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let name = match &record.data {
+        NodeData::PropertyDeclaration(property) => property.name,
+        NodeData::PropertySignatureDeclaration(property) => property.name,
+        NodeData::MethodDeclaration(method) => method.name,
+        NodeData::MethodSignatureDeclaration(method) => method.name,
+        _ => return Err(invalid()),
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+        return Err(invalid());
+    };
+    let expression = NodeRef::new(declaration.arena, declaration.file, computed.expression);
+    let expression_record = host.node(expression).ok_or_else(invalid)?;
+    if name_record.kind != SyntaxKind::ComputedPropertyName
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+        || expression_record.parent != Some(name.node)
+        || expression_record.range.start < name_record.range.start
+        || expression_record.range.end > name_record.range.end
+        || store
+            .type_node_links(expression)
+            .and_then(|links| links.resolved_type)
+            != Some(key_type)
+        || store
+            .symbol_node_links(expression)
+            .and_then(|links| links.resolved_symbol)
+            != store.type_payload(key_type).and_then(TypeRecord::symbol)
+    {
+        return Err(invalid());
+    }
+    let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+    let source = arena.source_text().ok_or_else(invalid)?;
+    source
+        .get(name_record.range.start.get() as usize..name_record.range.end.get() as usize)
+        .map(str::to_owned)
+        .ok_or_else(invalid)
 }
 
 fn source_callable_has_no_own_properties(
@@ -2689,7 +3089,7 @@ fn enum_has_numeric_index(
     Ok(false)
 }
 
-fn unchecked_index_read_type(
+pub(super) fn unchecked_index_read_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     options: CanonicalCheckerOptions,
@@ -2799,19 +3199,52 @@ struct ResolvedIndexSignatures {
     number: Option<TypeId>,
 }
 
+#[allow(clippy::too_many_lines)] // Source-owned indexes and declared indexes keep separate proofs.
 fn resolved_index_signature_surface(
     store: &CanonicalTypeMapperStore,
     receiver_type: TypeId,
 ) -> Result<Option<ResolvedIndexSignatures>, SourceElementError> {
+    let indexed_rest = super::source_object_rest::validate(store, receiver_type)?;
     let record = store
         .type_payload(receiver_type)
         .ok_or(SourceElementError::InvalidType(receiver_type))?;
     let TypeData::Object(object) = record.data() else {
         return Ok(None);
     };
+    let computed = object.source_computed_literal.is_some()
+        || super::object_members::source_object_requires_computed_proof(store, receiver_type);
+    if computed
+        && !super::object_members::source_computed_object_receiver_is_exact(store, receiver_type)
+    {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexSignatureSurface(receiver_type),
+        ));
+    }
     let Some(index_infos) = object.structured.index_infos.as_deref() else {
         return Ok(None);
     };
+    if computed || indexed_rest {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let mut result = ResolvedIndexSignatures {
+            string: None,
+            number: None,
+        };
+        for index in index_infos {
+            let info = store
+                .index_info(*index)
+                .ok_or(SourceElementError::InvalidType(receiver_type))?;
+            if info.key_type() == bootstrap.string_type {
+                result.string = Some(info.value_type());
+            } else if info.key_type() == bootstrap.number_type {
+                result.number = Some(info.value_type());
+            } else {
+                return Err(SourceElementError::InvalidType(receiver_type));
+            }
+        }
+        return Ok(Some(result));
+    }
     let object_flags = record.object_flags();
     if index_infos.is_empty()
         || record.flags() != TypeFlags::OBJECT
@@ -6962,3 +7395,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "source_elements_computed_index_tests.rs"]
+mod computed_index_tests;

@@ -9,12 +9,19 @@ use ts_ast::NodeRef;
 use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 
 use super::{
+    array_types::CanonicalArrayTargets,
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set_with_array_targets,
+    },
     ids::{
         IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
     links::ValueSymbolLinks,
-    mapper::CanonicalTypeMapperStore,
+    mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
+    relater::{
+        RelationSignatureEdge, RelationUnavailable, SourceSignatureInstantiationRequest,
+    },
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
@@ -447,7 +454,232 @@ struct SignatureInstantiationPlan {
     combined_symbol_mapper_count: usize,
 }
 
+/// A validated selected slot. Its cached value still needs mapping replay.
+pub(super) struct RelationSignatureInstantiationPlan {
+    pub(super) mapper: TypeMapperId,
+    pub(super) parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+    pub(super) cached: Option<TypeId>,
+    slot: RelationSignatureInstantiationSlot,
+}
+
+enum RelationSignatureInstantiationSlot {
+    Symbol {
+        original: SemanticSymbolId,
+        instantiated: SemanticSymbolId,
+    },
+    Return,
+}
+
 impl CanonicalTypeMapperStore {
+    /// Validates one original public call row and one selected erased slot.
+    /// This does not resolve a type, map an edge, or fill an original symbol.
+    pub(super) fn relation_signature_instantiation_plan(
+        &self,
+        request: SourceSignatureInstantiationRequest,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<RelationSignatureInstantiationPlan, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(request.owner);
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let any = bootstrap.any_type;
+        let error = bootstrap.error_type;
+        if [request.source, request.target, request.owner, request.template, any]
+            .into_iter()
+            .any(|type_| self.type_payload(type_).is_none())
+            || request.template == error
+        {
+            return Err(invalid());
+        }
+
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(self, request.owner, array_targets)
+        else {
+            return Err(invalid());
+        };
+        let mut rows = projection
+            .call_signatures
+            .iter()
+            .filter(|row| row.signature == request.original);
+        let original = rows.next().ok_or_else(invalid)?;
+        if projection.owner != request.owner
+            || original.owner != request.owner
+            || rows.next().is_some()
+        {
+            return Err(invalid());
+        }
+        let mapper =
+            self.validate_relation_erased_signature(original, request.erased, array_targets)?;
+        let source = self.signature(request.original).ok_or_else(invalid)?;
+        let erased = self.signature(request.erased).ok_or_else(invalid)?;
+        let parameters = source.type_parameters().to_vec();
+        let mut seen = HashSet::with_capacity(parameters.len());
+        if parameters.is_empty()
+            || parameters.iter().any(|parameter| {
+                !seen.insert(*parameter)
+                    || self.type_payload(*parameter).is_none_or(|record| {
+                        record.flags() != TypeFlags::TYPE_PARAMETER
+                            || !matches!(record.data(), TypeData::TypeParameter(_))
+                    })
+            })
+        {
+            return Err(invalid());
+        }
+        let arguments = vec![any; parameters.len()];
+        if self.type_mapper_has_exact_endpoints(mapper, &parameters, &arguments) != Some(true) {
+            return Err(invalid());
+        }
+
+        let raw_parameter_count = original
+            .parameters
+            .len()
+            .checked_add(usize::from(original.rest_parameter.is_some()))
+            .ok_or_else(invalid)?;
+        if source.parameters().len() != raw_parameter_count
+            || erased.parameters().len() != raw_parameter_count
+            || source.has_rest_parameter() != original.rest_parameter.is_some()
+            || erased.has_rest_parameter() != source.has_rest_parameter()
+        {
+            return Err(invalid());
+        }
+
+        let symbol_slot = |source_symbol: SemanticSymbolId,
+                           erased_symbol: SemanticSymbolId|
+         -> Result<
+            (RelationSignatureInstantiationSlot, Option<TypeId>),
+            RelationUnavailable,
+        > {
+            if self
+                .value_symbol_links(source_symbol)
+                .and_then(|links| links.resolved_type)
+                .is_some_and(|type_| type_ != request.template)
+                || !self.instantiated_signature_symbol_matches(
+                    source_symbol,
+                    erased_symbol,
+                    mapper,
+                )
+            {
+                return Err(invalid());
+            }
+            let links = self.value_symbol_links(erased_symbol).ok_or_else(invalid)?;
+            Ok((
+                RelationSignatureInstantiationSlot::Symbol {
+                    original: source_symbol,
+                    instantiated: erased_symbol,
+                },
+                links.resolved_type,
+            ))
+        };
+        let (slot, cached) = match request.edge {
+            RelationSignatureEdge::Parameter(index) => {
+                let template = if let Some(type_) = original.parameters.get(index) {
+                    *type_
+                } else if index == original.parameters.len() {
+                    original.rest_parameter.ok_or_else(invalid)?
+                } else {
+                    return Err(invalid());
+                };
+                if template != request.template {
+                    return Err(invalid());
+                }
+                let source_symbol = *source.parameters().get(index).ok_or_else(invalid)?;
+                let erased_symbol = *erased.parameters().get(index).ok_or_else(invalid)?;
+                symbol_slot(source_symbol, erased_symbol)?
+            }
+            RelationSignatureEdge::This => {
+                let source_symbol = source.this_parameter().ok_or_else(invalid)?;
+                let erased_symbol = erased.this_parameter().ok_or_else(invalid)?;
+                if self
+                    .value_symbol_links(source_symbol)
+                    .and_then(|links| links.resolved_type)
+                    != Some(request.template)
+                {
+                    return Err(invalid());
+                }
+                symbol_slot(source_symbol, erased_symbol)?
+            }
+            RelationSignatureEdge::Return => {
+                if original.return_type != Some(request.template)
+                    || source.resolved_return_type() != Some(request.template)
+                {
+                    return Err(invalid());
+                }
+                (
+                    RelationSignatureInstantiationSlot::Return,
+                    erased.resolved_return_type(),
+                )
+            }
+        };
+        if cached.is_some_and(|type_| type_ == error || self.type_payload(type_).is_none()) {
+            return Err(invalid());
+        }
+        Ok(RelationSignatureInstantiationPlan {
+            mapper,
+            parameters,
+            arguments,
+            cached,
+            slot,
+        })
+    }
+
+    /// Publishes one selected value after the caller replays its exact mapping.
+    /// Existing values must match. Reused original symbols are never written.
+    pub(super) fn publish_relation_signature_instantiation_result(
+        &mut self,
+        request: SourceSignatureInstantiationRequest,
+        array_targets: Option<CanonicalArrayTargets>,
+        result: TypeId,
+    ) -> Result<(), RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(request.owner);
+        let plan = self.relation_signature_instantiation_plan(request, array_targets)?;
+        let error = self
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .error_type;
+        if result == error || self.type_payload(result).is_none() {
+            return Err(invalid());
+        }
+        if let Some(cached) = plan.cached {
+            return if cached == result {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        let published = match plan.slot {
+            RelationSignatureInstantiationSlot::Symbol {
+                original,
+                instantiated,
+            } => {
+                if original == instantiated {
+                    return Err(invalid());
+                }
+                let mut links = self
+                    .value_symbol_links(instantiated)
+                    .cloned()
+                    .ok_or_else(invalid)?;
+                if links.resolved_type.is_some() {
+                    return Err(invalid());
+                }
+                links.resolved_type = Some(result);
+                self.set_value_symbol_links(instantiated, links)
+            }
+            RelationSignatureInstantiationSlot::Return => {
+                self.set_signature_resolved_return_type(request.erased, Some(result))
+            }
+        };
+        if !published
+            || self
+                .relation_signature_instantiation_plan(request, array_targets)?
+                .cached
+                != Some(result)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Instantiates a signature while retaining fresh generic parameters.
     ///
     /// Parameter symbols, predicates, and return types stay unresolved until
@@ -702,11 +934,20 @@ impl CanonicalTypeMapperStore {
         &self,
         symbol: SemanticSymbolId,
     ) -> Result<SignatureSymbolPlan, SignatureInstantiationError> {
+        self.prepare_instantiated_signature_symbol_with_reuse(symbol, true)
+    }
+
+    fn prepare_instantiated_signature_symbol_with_reuse(
+        &self,
+        symbol: SemanticSymbolId,
+        allow_reuse: bool,
+    ) -> Result<SignatureSymbolPlan, SignatureInstantiationError> {
         let source = self
             .symbol(symbol)
             .ok_or(SignatureInstantiationError::InvalidSymbol(symbol))?;
         let links = self.value_symbol_links(symbol);
-        if let Some(resolved_type) = links.and_then(|links| links.resolved_type)
+        if allow_reuse
+            && let Some(resolved_type) = links.and_then(|links| links.resolved_type)
             && !self.signature_type_could_contain_variables(resolved_type, &mut HashSet::new())?
             && (!source.flags().contains(SymbolFlags::SET_ACCESSOR)
                 || links
@@ -767,6 +1008,66 @@ impl CanonicalTypeMapperStore {
             data,
             name_type: links.and_then(|links| links.name_type),
         })
+    }
+
+    /// Checks an existing reused symbol or its exact instantiated-symbol header.
+    pub(super) fn instantiated_signature_symbol_matches(
+        &self,
+        source: SemanticSymbolId,
+        instantiated: SemanticSymbolId,
+        mapper: TypeMapperId,
+    ) -> bool {
+        if self.mapper_payload(mapper).is_none() {
+            return false;
+        }
+        let Ok(plan) = self.prepare_instantiated_signature_symbol_with_reuse(
+            source,
+            source == instantiated,
+        ) else {
+            return false;
+        };
+        let (target, previous_mapper, data, name_type) = match plan {
+            SignatureSymbolPlan::Reuse(expected) => return instantiated == expected,
+            SignatureSymbolPlan::Instantiate {
+                target,
+                previous_mapper,
+                data,
+                name_type,
+            } => (target, previous_mapper, data, name_type),
+        };
+        let Some(record) = self.symbol(instantiated) else {
+            return false;
+        };
+        let Some(links) = self.value_symbol_links(instantiated) else {
+            return false;
+        };
+        let mapper_matches = match previous_mapper {
+            None => links.mapper == Some(mapper),
+            Some(previous) => links.mapper.is_some_and(|actual| {
+                self.type_mapper_is_exact_composite(actual, previous, mapper)
+            }),
+        };
+        instantiated != source
+            && instantiated != target
+            && record.flags() == data.flags
+            && record.check_flags() == data.check_flags
+            && record.name() == data.name.as_ref()
+            && record.declarations() == data.declarations.as_deref()
+            && record.value_declaration() == data.value_declaration
+            && record.parent() == data.parent
+            && record.members() == data.members
+            && record.exports() == data.exports
+            && record.export_symbol() == data.export_symbol
+            && self.get_merged_symbol(instantiated) == Some(instantiated)
+            && mapper_matches
+            && links
+                == &ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    target: Some(target),
+                    mapper: links.mapper,
+                    name_type,
+                    ..ValueSymbolLinks::default()
+                }
     }
 
     fn publish_instantiated_signature_symbol(

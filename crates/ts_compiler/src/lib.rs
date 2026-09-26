@@ -18,7 +18,9 @@ pub use project_graph::{
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    convert::Infallible,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use ts_ast::{FileId, Node, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
@@ -331,6 +333,202 @@ pub enum CanonicalProgramCheckError {
         node: NodeRef,
     },
     DiagnosticFormat(FormatError),
+}
+
+/// Whether a diagnostic observer requests another census operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusControl {
+    Continue,
+    Stop,
+}
+
+/// The actual operation, independent of the returned error's classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusPhase {
+    Load,
+    Preparation,
+    Binding,
+    Context,
+    Source,
+    PostSource,
+}
+
+/// Root indices refer to the Program input roster, without census deduplication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusAttempt {
+    Ordinary,
+    Root(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusLoadDisposition {
+    Ready,
+    ConfigUnavailable,
+    NoCheck,
+}
+
+/// Original source policy, never a census-specific exclusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusSkipReason {
+    NoCheck,
+    DefaultLibrary,
+    DeclarationFile,
+    NoCheckDirective,
+    UncheckedJavaScript,
+}
+
+/// A completed source call does not establish an empty diagnostic set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusOutcome {
+    Complete,
+    Skipped(CanonicalCensusSkipReason),
+    Unloaded,
+    Failure {
+        phase: CanonicalCensusPhase,
+        error: CanonicalProgramCheckError,
+    },
+}
+
+/// Which retained records a partial census payload contains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusDiagnosticScope {
+    Program,
+    RawContext,
+}
+
+/// Diagnostic records are separate from source-check completion.
+///
+/// Raw context records include full-graph bind and global diagnostics before
+/// checker issuance order. They have not passed through comment directives or
+/// the complete post-source collector and are not final Program diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusDiagnostics {
+    CompleteProgram {
+        records: Vec<ProgramDiagnostic>,
+    },
+    CompleteSourceContext {
+        records: Vec<ProgramDiagnostic>,
+    },
+    Partial {
+        scope: CanonicalCensusDiagnosticScope,
+        records: Vec<ProgramDiagnostic>,
+        conversion_error: Option<CanonicalProgramCheckError>,
+    },
+    UnavailableBeforeContext,
+    Skipped(CanonicalCensusSkipReason),
+    Unattempted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusCompletion {
+    Complete,
+    LoadUnavailable,
+    NoCheck,
+    PreparationFailed,
+    Stopped,
+}
+
+/// Owned events from a diagnostic-only, serial cold-root census.
+///
+/// Phase completion records a returned operation, not a successful check.
+/// Only an attempt outcome describes its result. Missing outcomes remain
+/// incomplete, including when an observer stops after a phase event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusEvent {
+    LoadStarted,
+    Loaded {
+        disposition: CanonicalCensusLoadDisposition,
+        roots: Option<Vec<ProgramGraphRoot>>,
+        elapsed: Duration,
+    },
+    LoadFailed {
+        error: CanonicalProgramCheckError,
+        elapsed: Duration,
+    },
+    AttemptStarted {
+        attempt: CanonicalCensusAttempt,
+    },
+    PhaseStarted {
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+    },
+    PhaseFinished {
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+        elapsed: Duration,
+    },
+    AttemptFinished {
+        attempt: CanonicalCensusAttempt,
+        outcome: CanonicalCensusOutcome,
+        diagnostics: CanonicalCensusDiagnostics,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Debug)]
+enum CanonicalObservedCheckError<E> {
+    Failure {
+        phase: CanonicalCensusPhase,
+        error: CanonicalProgramCheckError,
+    },
+    Observer(E),
+    Stopped,
+}
+
+#[derive(Debug)]
+enum CanonicalCensusObservationError<E> {
+    Error(E),
+    Stopped,
+}
+
+impl<E> From<CanonicalCensusObservationError<E>> for CanonicalObservedCheckError<E> {
+    fn from(error: CanonicalCensusObservationError<E>) -> Self {
+        match error {
+            CanonicalCensusObservationError::Error(error) => Self::Observer(error),
+            CanonicalCensusObservationError::Stopped => Self::Stopped,
+        }
+    }
+}
+
+fn observe_canonical_census<E>(
+    program: Option<&Program>,
+    event: CanonicalCensusEvent,
+    observer: &mut impl FnMut(
+        Option<&Program>,
+        CanonicalCensusEvent,
+    ) -> Result<CanonicalCensusControl, E>,
+) -> Result<(), CanonicalCensusObservationError<E>> {
+    match observer(program, event).map_err(CanonicalCensusObservationError::Error)? {
+        CanonicalCensusControl::Continue => Ok(()),
+        CanonicalCensusControl::Stop => Err(CanonicalCensusObservationError::Stopped),
+    }
+}
+
+fn canonical_census_outcome<E>(
+    result: Result<CanonicalCensusOutcome, CanonicalObservedCheckError<E>>,
+) -> Result<CanonicalCensusOutcome, CanonicalCensusObservationError<E>> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(CanonicalObservedCheckError::Failure { phase, error }) => {
+            Ok(CanonicalCensusOutcome::Failure { phase, error })
+        }
+        Err(CanonicalObservedCheckError::Observer(error)) => {
+            Err(CanonicalCensusObservationError::Error(error))
+        }
+        Err(CanonicalObservedCheckError::Stopped) => Err(CanonicalCensusObservationError::Stopped),
+    }
+}
+
+fn census_preparation_failed(outcome: &CanonicalCensusOutcome) -> bool {
+    matches!(
+        outcome,
+        CanonicalCensusOutcome::Failure {
+            phase: CanonicalCensusPhase::Preparation
+                | CanonicalCensusPhase::Binding
+                | CanonicalCensusPhase::Context,
+            ..
+        }
+    )
 }
 
 /// A helper dependency could not provide an exact export, value, or signature.
@@ -840,6 +1038,7 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
     match error {
         DeclaredTypeUnavailable::UnsupportedDeclaredType(_)
         | DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
+        | DeclaredTypeUnavailable::UnsupportedGlobalThisMember { .. }
         | DeclaredTypeUnavailable::UnsupportedOuterTypeParameterContext { .. } => true,
         DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized
         | DeclaredTypeUnavailable::SymbolNotOwned(_)
@@ -853,6 +1052,11 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
         | DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable
         | DeclaredTypeUnavailable::InvalidTypeParameterSymbol(_)
         | DeclaredTypeUnavailable::InvalidTypeParameterDeclaration(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisSymbol(_)
+        | DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisMembers(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisMember { .. }
+        | DeclaredTypeUnavailable::GlobalThisCapacity(_)
         | DeclaredTypeUnavailable::InvalidCachedDeclaredType { .. } => false,
     }
 }
@@ -860,6 +1064,9 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
 fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
     match error {
         TypeNodeUnavailable::NamespaceAlias { error, .. } => alias_error_is_unsupported(*error),
+        TypeNodeUnavailable::OrdinaryImportTarget { reason, .. } => {
+            alias_target_error_is_unsupported(*reason)
+        }
         TypeNodeUnavailable::UnsupportedSyntax { .. }
         | TypeNodeUnavailable::JsDoc(_)
         | TypeNodeUnavailable::QualifiedTypeReference(_)
@@ -873,6 +1080,9 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasInstantiationUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported { .. }
+        | TypeNodeUnavailable::SourceMappedMembersDemand { .. }
+        | TypeNodeUnavailable::SourceMappedValueDemand { .. }
+        | TypeNodeUnavailable::SourceIndexedDiagnosticDemand { .. }
         | TypeNodeUnavailable::CircularGenericAliasDefault { .. }
         | TypeNodeUnavailable::JsDocTypeAlias(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
@@ -967,6 +1177,15 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::UnresolvedPropertyType(_)
         | RelationUnavailable::StrictOptionalProperty(_)
         | RelationUnavailable::UnresolvedGlobalObject(_)
+        | RelationUnavailable::GlobalThisMembersDemand { .. }
+        | RelationUnavailable::GlobalThisValueDemand { .. }
+        | RelationUnavailable::NamespaceValueDemand { .. }
+        | RelationUnavailable::SourceInterfaceHeaderDemand { .. }
+        | RelationUnavailable::SourceInterfaceAliasDemand { .. }
+        | RelationUnavailable::SourceSignatureReturnDemand { .. }
+        | RelationUnavailable::SourceSignatureInstantiationDemand(_)
+        | RelationUnavailable::SourceMappedMembersDemand { .. }
+        | RelationUnavailable::SourceMappedValueDemand { .. }
         | RelationUnavailable::StructuralRelation { .. } => true,
         RelationUnavailable::CanonicalGlobalType(error) => {
             global_type_initialization_error_is_unsupported(error)
@@ -1838,6 +2057,12 @@ struct CanonicalCheckedSource<'arena> {
     runtime: CanonicalReplayJsxRuntime,
 }
 
+struct CanonicalPreparedChecker<'arena> {
+    context: CanonicalCheckerContext<'arena>,
+    bind_diagnostics: Vec<ProgramDiagnostic>,
+    check_files: Vec<(FileId, String, bool, bool)>,
+}
+
 #[derive(Debug)]
 enum CanonicalReplayJsxRuntime {
     Preserve,
@@ -1992,7 +2217,7 @@ impl Program {
                     || (program.options.check_js && !program.options.allow_js_specified))
                 && is_javascript_file_name(&file_name)
             {
-                let display_name = relative_path(&program.current_directory, &file_name);
+                let display_name = ts_path::normalize_slashes(root_name);
                 program
                     .diagnostics
                     .push(javascript_file_not_allowed_diagnostic(&display_name));
@@ -3044,6 +3269,25 @@ impl Program {
         config_path: &str,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
+        let (mut program, disposition) =
+            Self::load_canonical_config_program(file_system, config_path)?;
+        if disposition == CanonicalCensusLoadDisposition::ConfigUnavailable {
+            return Ok((program, None));
+        }
+        let mut result = None;
+        if !program.options.no_check {
+            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
+            program.diagnostics.extend(diagnostics);
+            result = Some(query_result);
+        }
+        program.diagnostics.sort_by(compare_program_diagnostics);
+        Ok((program, result))
+    }
+
+    fn load_canonical_config_program(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+    ) -> Result<(Self, CanonicalCensusLoadDisposition), CanonicalProgramCheckError> {
         let ProgramConfigInputs {
             config_path,
             current_directory,
@@ -3072,7 +3316,7 @@ impl Program {
                         checker: ProgramChecker::Canonical,
                         ..Self::default()
                     },
-                    None,
+                    CanonicalCensusLoadDisposition::ConfigUnavailable,
                 ));
             }
         };
@@ -3099,14 +3343,282 @@ impl Program {
             program.diagnostics.extend(output_diagnostics);
         }
         program.add_config_diagnostics(diagnostics);
-        let mut result = None;
-        if !program.options.no_check {
-            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
-            program.diagnostics.extend(diagnostics);
-            result = Some(query_result);
+        let disposition = if program.options.no_check {
+            CanonicalCensusLoadDisposition::NoCheck
+        } else {
+            CanonicalCensusLoadDisposition::Ready
+        };
+        Ok((program, disposition))
+    }
+
+    /// Diagnoses cold roots with complete fresh bindings and original inputs.
+    ///
+    /// The normal-order control uses the ordinary checker with a no-op query
+    /// callback. Each eligible cold root then gets its own complete context.
+    /// Contexts are dropped before attempt outcomes are observed. The scoped
+    /// Program borrow is for reporting only, and is never a checked Program.
+    /// Cold attempts retain raw context diagnostics, not complete Program
+    /// diagnostics. They do not collect artifacts or run source replay.
+    ///
+    /// Observers can stop between events. An error stops immediately without
+    /// another callback. A caller must open its output before this call and
+    /// flush events as they arrive to retain evidence on process interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns the observer's error unchanged. Compiler failures are owned
+    /// event payloads, with their actual phase kept separate from their code.
+    pub fn run_canonical_root_census<E>(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        mut observer: impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, E> {
+        match Self::run_canonical_root_census_observed(file_system, config_path, &mut observer) {
+            Ok(completion) => Ok(completion),
+            Err(CanonicalCensusObservationError::Error(error)) => Err(error),
+            Err(CanonicalCensusObservationError::Stopped) => Ok(CanonicalCensusCompletion::Stopped),
         }
-        program.diagnostics.sort_by(compare_program_diagnostics);
-        Ok((program, result))
+    }
+
+    fn run_canonical_root_census_observed<E>(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, CanonicalCensusObservationError<E>> {
+        observe_canonical_census(None, CanonicalCensusEvent::LoadStarted, observer)?;
+        let started = Instant::now();
+        let (program, disposition) =
+            match Self::load_canonical_config_program(file_system, config_path) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    observe_canonical_census(
+                        None,
+                        CanonicalCensusEvent::LoadFailed {
+                            error,
+                            elapsed: started.elapsed(),
+                        },
+                        observer,
+                    )?;
+                    return Ok(CanonicalCensusCompletion::LoadUnavailable);
+                }
+            };
+        let elapsed = started.elapsed();
+        let roots = (disposition != CanonicalCensusLoadDisposition::ConfigUnavailable)
+            .then(|| program.project_graph_snapshot().roots);
+        observe_canonical_census(
+            Some(&program),
+            CanonicalCensusEvent::Loaded {
+                disposition,
+                roots: roots.clone(),
+                elapsed,
+            },
+            observer,
+        )?;
+        let Some(roots) = roots else {
+            return Ok(CanonicalCensusCompletion::LoadUnavailable);
+        };
+        program.run_canonical_census_attempts(roots, observer)
+    }
+
+    fn run_canonical_census_attempts<E>(
+        &self,
+        roots: Vec<ProgramGraphRoot>,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, CanonicalCensusObservationError<E>> {
+        let attempt = CanonicalCensusAttempt::Ordinary;
+        let started = Instant::now();
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::AttemptStarted { attempt },
+            observer,
+        )?;
+        let mut diagnostics = CanonicalCensusDiagnostics::UnavailableBeforeContext;
+        let outcome = if self.options.no_check {
+            diagnostics = CanonicalCensusDiagnostics::Skipped(CanonicalCensusSkipReason::NoCheck);
+            CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::NoCheck)
+        } else {
+            canonical_census_outcome(
+                self.check_program_canonical_observed(
+                    |_, _| (),
+                    attempt,
+                    observer,
+                    Some(&mut diagnostics),
+                )
+                .map(|(records, ())| {
+                    diagnostics = CanonicalCensusDiagnostics::CompleteProgram {
+                        records: self.canonical_diagnostic_snapshot(&records),
+                    };
+                    CanonicalCensusOutcome::Complete
+                }),
+            )?
+        };
+        let preparation_failed = census_preparation_failed(&outcome);
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::AttemptFinished {
+                attempt,
+                outcome,
+                diagnostics,
+                elapsed: started.elapsed(),
+            },
+            observer,
+        )?;
+        if preparation_failed {
+            return Ok(CanonicalCensusCompletion::PreparationFailed);
+        }
+
+        for (index, root) in roots.into_iter().enumerate() {
+            let attempt = CanonicalCensusAttempt::Root(index);
+            let started = Instant::now();
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::AttemptStarted { attempt },
+                observer,
+            )?;
+            let mut diagnostics = CanonicalCensusDiagnostics::UnavailableBeforeContext;
+            let outcome = match root.file_id {
+                Some(file) => canonical_census_outcome(self.check_canonical_census_root(
+                    file,
+                    attempt,
+                    observer,
+                    &mut diagnostics,
+                ))?,
+                None => {
+                    diagnostics = CanonicalCensusDiagnostics::Unattempted;
+                    CanonicalCensusOutcome::Unloaded
+                }
+            };
+            let preparation_failed = census_preparation_failed(&outcome);
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::AttemptFinished {
+                    attempt,
+                    outcome,
+                    diagnostics,
+                    elapsed: started.elapsed(),
+                },
+                observer,
+            )?;
+            if preparation_failed {
+                return Ok(CanonicalCensusCompletion::PreparationFailed);
+            }
+        }
+        Ok(if self.options.no_check {
+            CanonicalCensusCompletion::NoCheck
+        } else {
+            CanonicalCensusCompletion::Complete
+        })
+    }
+
+    fn check_canonical_census_root<E>(
+        &self,
+        file: FileId,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+        diagnostics: &mut CanonicalCensusDiagnostics,
+    ) -> Result<CanonicalCensusOutcome, CanonicalObservedCheckError<E>> {
+        let Some(source) = self.source_file_by_id(file) else {
+            *diagnostics = CanonicalCensusDiagnostics::Unattempted;
+            return Ok(CanonicalCensusOutcome::Unloaded);
+        };
+        if self.options.no_check {
+            *diagnostics = CanonicalCensusDiagnostics::Skipped(CanonicalCensusSkipReason::NoCheck);
+            return Ok(CanonicalCensusOutcome::Skipped(
+                CanonicalCensusSkipReason::NoCheck,
+            ));
+        }
+        if let Some(reason) = self
+            .canonical_source_header_skip(
+                source.is_default_library,
+                ts_path::is_declaration_file(&source.file_name),
+            )
+            .or_else(|| {
+                self.canonical_source_text_skip(
+                    is_javascript_file_name(&source.file_name),
+                    &source.source_text,
+                )
+            })
+        {
+            *diagnostics = CanonicalCensusDiagnostics::Skipped(reason);
+            return Ok(CanonicalCensusOutcome::Skipped(reason));
+        }
+        let CanonicalPreparedChecker {
+            mut context,
+            bind_diagnostics,
+            ..
+        } = self.prepare_canonical_checker_observed(attempt, observer)?;
+        let result =
+            self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
+                self.check_canonical_source(&mut context, source)
+                    .map(|_| ())
+            });
+        if let Err(error) = result {
+            if matches!(&error, CanonicalObservedCheckError::Failure { .. }) {
+                *diagnostics =
+                    self.canonical_census_context_diagnostics(&context, &bind_diagnostics, false);
+            }
+            return Err(error);
+        }
+        *diagnostics = self.canonical_census_context_diagnostics(&context, &bind_diagnostics, true);
+        drop(context);
+        Ok(CanonicalCensusOutcome::Complete)
+    }
+
+    /// Copies only records that the context already owns, without checker queries.
+    fn canonical_census_context_diagnostics(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        bind_diagnostics: &[ProgramDiagnostic],
+        source_complete: bool,
+    ) -> CanonicalCensusDiagnostics {
+        let mut records = bind_diagnostics.to_vec();
+        let converted = (|| {
+            if !self.source_files.is_empty() {
+                for diagnostic in context.global_type_diagnostics() {
+                    records.push(self.canonical_program_diagnostic(
+                        diagnostic.node,
+                        None,
+                        &diagnostic.diagnostic,
+                        std::iter::empty(),
+                    )?);
+                }
+            }
+            for diagnostic in context.diagnostics().as_slice() {
+                records.push(
+                    self.canonical_program_diagnostic(
+                        diagnostic.node,
+                        diagnostic.range_override,
+                        &diagnostic.diagnostic,
+                        diagnostic
+                            .related_information
+                            .iter()
+                            .map(|related| (related.node, &related.diagnostic)),
+                    )?,
+                );
+            }
+            Ok::<_, CanonicalProgramCheckError>(())
+        })();
+        if source_complete && converted.is_ok() {
+            CanonicalCensusDiagnostics::CompleteSourceContext { records }
+        } else {
+            CanonicalCensusDiagnostics::Partial {
+                scope: CanonicalCensusDiagnosticScope::RawContext,
+                records,
+                conversion_error: converted.err(),
+            }
+        }
     }
 
     fn from_config_with_overrides(
@@ -3449,6 +3961,75 @@ impl Program {
         node.is_for(source.parse.arena.id(), source.id)
             .then(|| source.parse.arena.get(node.node))
             .flatten()
+    }
+
+    /// Loads a config Program graph (roots, default libraries and automatic
+    /// type roots) and runs no checker. The `ts_goport` crate binds and
+    /// checks this graph itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config uses project references.
+    // The error type is shared with the existing canonical loaders.
+    #[allow(clippy::result_large_err)]
+    pub fn load_config_graph_unchecked(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+    ) -> Result<Self, CanonicalProgramCheckError> {
+        Self::load_canonical_config_program(file_system, config_path).map(|(program, _)| program)
+    }
+
+    /// Returns file identities in the pinned Go `Program.SourceFiles()` order:
+    /// default libraries by priority, then files in dependency order.
+    #[must_use]
+    pub fn semantic_source_order(&self) -> Vec<FileId> {
+        self.canonical_semantic_sources()
+            .into_iter()
+            .map(|source| source.id)
+            .collect()
+    }
+
+    /// Returns the Node module format implied for one source file.
+    #[must_use]
+    pub fn implied_node_format(&self, file: FileId) -> Option<ModuleKind> {
+        self.source_file_by_id(file)
+            .map(|source| source.implied_node_format)
+    }
+
+    /// Returns the default module resolution mode for imports in one file.
+    #[must_use]
+    pub fn default_module_resolution_mode(&self, file: FileId) -> Option<ModuleFormat> {
+        let source = self.source_file_by_id(file)?;
+        match self.canonical_emit_module_mode(source) {
+            CanonicalModuleResolutionMode::CommonJs => Some(ModuleFormat::CommonJs),
+            CanonicalModuleResolutionMode::Esm => Some(ModuleFormat::Esm),
+            CanonicalModuleResolutionMode::None => None,
+        }
+    }
+
+    /// Returns the loaded target of one module specifier, keyed like the
+    /// graph loader: canonical containing file, specifier text and mode.
+    #[must_use]
+    pub fn resolved_module_file(
+        &self,
+        containing_file: FileId,
+        specifier: &str,
+        mode: Option<ModuleFormat>,
+    ) -> Option<&SourceFile> {
+        let source = self.source_file_by_id(containing_file)?;
+        let key = ResolvedModuleKey {
+            containing_file: canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            ),
+            specifier: specifier.to_owned(),
+            mode,
+        };
+        let target = self.resolved_modules.get(&key)?;
+        self.file_index
+            .get(target)
+            .and_then(|index| self.source_files.get(*index))
     }
 
     /// Emits modern JavaScript for all implementation source files currently
@@ -5050,111 +5631,284 @@ impl Program {
         sources
     }
 
-    #[allow(clippy::too_many_lines)]
     fn check_program_canonical<T>(
         &self,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
-        let mut binder = CanonicalBinder::new();
-        let sources = self.canonical_semantic_sources();
-        let source_facts = sources
-            .iter()
-            .map(|source| canonical_source_file_facts(source, &self.options))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for (source, facts) in sources.iter().zip(source_facts) {
-            binder
-                .bind_source_file_with_facts(
-                    &source.parse.arena,
-                    source.parse.source_file,
-                    source.id,
-                    facts,
-                )
-                .map_err(|error| CanonicalProgramCheckError::Bind {
-                    file_name: source.file_name.clone(),
-                    error,
-                })?;
-        }
-
-        for source in &sources {
-            let result = if is_javascript_file_name(&source.file_name) {
-                binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
-            } else {
-                binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
-            };
-            result.map_err(|error| CanonicalProgramCheckError::DeclarationBind {
-                file_name: source.file_name.clone(),
-                error,
-            })?;
-        }
-
-        let mut bind_diagnostics = Vec::new();
-        for source in &sources {
-            // Keep declaration files bound so their symbols remain available
-            // to importers, but mirror pinned SkipTypeChecking by suppressing
-            // their bind diagnostics together with checker diagnostics.
-            if self.options.skip_lib_check && ts_path::is_declaration_file(&source.file_name)
-                || source_check_js_directive(&source.source_text) == Some(false)
-            {
-                continue;
+        match self.check_program_canonical_observed(
+            queries,
+            CanonicalCensusAttempt::Ordinary,
+            &mut |_, _| Ok::<_, Infallible>(CanonicalCensusControl::Continue),
+            None,
+        ) {
+            Ok(result) => Ok(result),
+            Err(CanonicalObservedCheckError::Failure { error, .. }) => Err(error),
+            Err(CanonicalObservedCheckError::Observer(never)) => match never {},
+            Err(CanonicalObservedCheckError::Stopped) => {
+                unreachable!("the ordinary checker observer never stops")
             }
-            let bound = binder.file(source.id).ok_or_else(|| {
-                CanonicalProgramCheckError::MissingBoundFile {
-                    file_name: source.file_name.clone(),
-                    file: source.id,
+        }
+    }
+
+    fn check_program_canonical_observed<T, E>(
+        &self,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+        census_diagnostics: Option<&mut CanonicalCensusDiagnostics>,
+    ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalObservedCheckError<E>> {
+        let CanonicalPreparedChecker {
+            mut context,
+            bind_diagnostics,
+            check_files,
+        } = self.prepare_canonical_checker_observed(attempt, observer)?;
+        let checked_sources = match self.observe_canonical_phase(
+            attempt,
+            CanonicalCensusPhase::Source,
+            observer,
+            || self.check_canonical_sources(&mut context, check_files),
+        ) {
+            Ok(checked_sources) => checked_sources,
+            Err(error) => {
+                if matches!(&error, CanonicalObservedCheckError::Failure { .. })
+                    && let Some(diagnostics) = census_diagnostics
+                {
+                    *diagnostics = self.canonical_census_context_diagnostics(
+                        &context,
+                        &bind_diagnostics,
+                        false,
+                    );
                 }
-            })?;
-            for diagnostic in bound.diagnostics() {
-                bind_diagnostics.push(
-                    self.canonical_program_diagnostic(
-                        Some(diagnostic.node),
-                        None,
-                        &diagnostic.diagnostic,
-                        diagnostic
-                            .related_information
-                            .iter()
-                            .map(|related| (Some(related.node), &related.diagnostic)),
-                    )?,
-                );
+                return Err(error);
             }
-            self.add_top_level_await_identifier_diagnostics(source, bound, &mut bind_diagnostics)?;
-            if bound
-                .source_facts()
-                .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
-            {
-                bind_diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
-            }
-        }
+        };
+        self.observe_canonical_phase(attempt, CanonicalCensusPhase::PostSource, observer, || {
+            self.finish_canonical_check(
+                context,
+                bind_diagnostics,
+                checked_sources,
+                queries,
+                census_diagnostics,
+            )
+        })
+    }
 
-        let ordered_arenas = sources
-            .iter()
-            .map(|source| (source.id, &source.parse.arena))
-            .collect();
-        let check_files = sources
-            .iter()
-            .filter(|source| !source.is_default_library)
-            .map(|source| {
-                (
-                    source.id,
-                    source.file_name.clone(),
-                    ts_path::is_declaration_file(&source.file_name),
-                    is_javascript_file_name(&source.file_name),
-                )
+    fn observe_canonical_phase<T, E>(
+        &self,
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+        operation: impl FnOnce() -> Result<T, CanonicalProgramCheckError>,
+    ) -> Result<T, CanonicalObservedCheckError<E>> {
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseStarted { attempt, phase },
+            observer,
+        )?;
+        let started = Instant::now();
+        let result = operation();
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseFinished {
+                attempt,
+                phase,
+                elapsed: started.elapsed(),
+            },
+            observer,
+        )?;
+        result.map_err(|error| CanonicalObservedCheckError::Failure { phase, error })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep complete binding and context construction in order.
+    fn prepare_canonical_checker_observed<E>(
+        &self,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalPreparedChecker<'_>, CanonicalObservedCheckError<E>> {
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseStarted {
+                attempt,
+                phase: CanonicalCensusPhase::Preparation,
+            },
+            observer,
+        )?;
+        let started = Instant::now();
+        let result = (|| {
+            let (
+                bindings,
+                ordered_arenas,
+                options,
+                module_resolutions,
+                bind_diagnostics,
+                check_files,
+            ) = self.observe_canonical_phase(
+                attempt,
+                CanonicalCensusPhase::Binding,
+                observer,
+                || {
+                    let mut binder = CanonicalBinder::new();
+                    let sources = self.canonical_semantic_sources();
+                    let source_facts = sources
+                        .iter()
+                        .map(|source| canonical_source_file_facts(source, &self.options))
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    for (source, facts) in sources.iter().zip(source_facts) {
+                        binder
+                            .bind_source_file_with_facts(
+                                &source.parse.arena,
+                                source.parse.source_file,
+                                source.id,
+                                facts,
+                            )
+                            .map_err(|error| CanonicalProgramCheckError::Bind {
+                                file_name: source.file_name.clone(),
+                                error,
+                            })?;
+                    }
+
+                    for source in &sources {
+                        let result = if is_javascript_file_name(&source.file_name) {
+                            binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
+                        } else {
+                            binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
+                        };
+                        result.map_err(|error| CanonicalProgramCheckError::DeclarationBind {
+                            file_name: source.file_name.clone(),
+                            error,
+                        })?;
+                    }
+
+                    let mut bind_diagnostics = Vec::new();
+                    for source in &sources {
+                        // Keep declaration files bound so their symbols remain available
+                        // to importers, but mirror pinned SkipTypeChecking by suppressing
+                        // their bind diagnostics together with checker diagnostics.
+                        if self.options.skip_lib_check
+                            && ts_path::is_declaration_file(&source.file_name)
+                            || source_check_js_directive(&source.source_text) == Some(false)
+                        {
+                            continue;
+                        }
+                        let bound = binder.file(source.id).ok_or_else(|| {
+                            CanonicalProgramCheckError::MissingBoundFile {
+                                file_name: source.file_name.clone(),
+                                file: source.id,
+                            }
+                        })?;
+                        for diagnostic in bound.diagnostics() {
+                            bind_diagnostics.push(
+                                self.canonical_program_diagnostic(
+                                    Some(diagnostic.node),
+                                    None,
+                                    &diagnostic.diagnostic,
+                                    diagnostic
+                                        .related_information
+                                        .iter()
+                                        .map(|related| (Some(related.node), &related.diagnostic)),
+                                )?,
+                            );
+                        }
+                        self.add_top_level_await_identifier_diagnostics(
+                            source,
+                            bound,
+                            &mut bind_diagnostics,
+                        )?;
+                        if bound
+                            .source_facts()
+                            .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
+                        {
+                            bind_diagnostics
+                                .extend(self.canonical_commonjs_object_collisions(source)?);
+                        }
+                    }
+
+                    let ordered_arenas = sources
+                        .iter()
+                        .map(|source| (source.id, &source.parse.arena))
+                        .collect::<Vec<_>>();
+                    let check_files = sources
+                        .iter()
+                        .filter(|source| !source.is_default_library)
+                        .map(|source| {
+                            (
+                                source.id,
+                                source.file_name.clone(),
+                                ts_path::is_declaration_file(&source.file_name),
+                                is_javascript_file_name(&source.file_name),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let options = self.canonical_checker_options();
+                    let module_resolutions = self.canonical_module_resolution_manifest()?;
+                    Ok((
+                        binder.finish(),
+                        ordered_arenas,
+                        options,
+                        module_resolutions,
+                        bind_diagnostics,
+                        check_files,
+                    ))
+                },
+            )?;
+            let context = self.observe_canonical_phase(
+                attempt,
+                CanonicalCensusPhase::Context,
+                observer,
+                || {
+                    CanonicalCheckerContext::new_with_module_resolutions(
+                        bindings,
+                        ordered_arenas,
+                        options,
+                        module_resolutions,
+                    )
+                    .map_err(CanonicalProgramCheckError::Context)
+                },
+            )?;
+            Ok::<_, CanonicalObservedCheckError<E>>(CanonicalPreparedChecker {
+                context,
+                bind_diagnostics,
+                check_files,
             })
-            .collect::<Vec<_>>();
-        let options = self.canonical_checker_options();
-        let module_resolutions = self.canonical_module_resolution_manifest()?;
-        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
-            binder.finish(),
-            ordered_arenas,
-            options,
-            module_resolutions,
-        )
-        .map_err(CanonicalProgramCheckError::Context)?;
+        })();
+        if !matches!(
+            &result,
+            Err(CanonicalObservedCheckError::Observer(_) | CanonicalObservedCheckError::Stopped)
+        ) {
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::PhaseFinished {
+                    attempt,
+                    phase: CanonicalCensusPhase::Preparation,
+                    elapsed: started.elapsed(),
+                },
+                observer,
+            )?;
+        }
+        result
+    }
 
+    fn check_canonical_sources<'arena>(
+        &'arena self,
+        context: &mut CanonicalCheckerContext<'arena>,
+        check_files: Vec<(FileId, String, bool, bool)>,
+    ) -> Result<Vec<CanonicalCheckedSource<'arena>>, CanonicalProgramCheckError> {
         let mut checked_sources = Vec::new();
         for (file, file_name, is_declaration_file, is_javascript_file) in check_files {
-            if is_declaration_file && self.options.skip_lib_check {
+            if self
+                .canonical_source_header_skip(false, is_declaration_file)
+                .is_some()
+            {
                 continue;
             }
             let source = self.source_file_by_id(file).ok_or_else(|| {
@@ -5163,85 +5917,294 @@ impl Program {
                     file,
                 }
             })?;
-            let check_directive = source_check_js_directive(&source.source_text);
-            if check_directive == Some(false)
-                || is_javascript_file && !check_directive.unwrap_or(self.options.check_js)
+            if self
+                .canonical_source_text_skip(is_javascript_file, &source.source_text)
+                .is_some()
             {
                 continue;
             }
-            let runtime_pragma = source_jsx_pragma_value(&source.source_text, "@jsxRuntime");
-            let runtime_module = self.options.jsx_runtime_module_specifier_for_source(
-                runtime_pragma,
-                source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
-            );
-            let runtime = if let Some(module_specifier) = runtime_module.as_deref() {
-                let containing = canonicalize(
-                    &source.file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let resolved_module = self
-                    .resolved_modules
-                    .get(&ResolvedModuleKey::new(
-                        containing,
-                        module_specifier.to_owned(),
-                        CanonicalModuleResolutionMode::Esm,
-                    ))
-                    .and_then(|target| self.file_index.get(target))
-                    .and_then(|index| self.source_files.get(*index))
-                    .and_then(|target| context.file(target.id))
-                    .and_then(|(_, bound)| bound.symbol(bound.source_file()));
-                CanonicalJsxRuntimeEvidence::Automatic {
-                    module_specifier,
-                    resolved_module,
-                }
-            } else if runtime_pragma == Some("classic")
-                || self.options.jsx == ts_options::JsxEmit::React
-            {
-                let factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsx ");
-                let fragment_factory_pragma =
-                    source_jsx_pragma_value(&source.source_text, "@jsxFrag")
-                        .or_else(|| source_jsx_pragma_value(&source.source_text, "@jsxfrag"));
-                CanonicalJsxRuntimeEvidence::Classic {
-                    factory_namespace: self.options.jsx_factory_namespace_for_source(
-                        factory_pragma,
-                        fragment_factory_pragma,
-                        false,
-                    ),
-                    fragment_factory_namespace: self.options.jsx_factory_namespace_for_source(
-                        factory_pragma,
-                        fragment_factory_pragma,
-                        true,
-                    ),
-                    fragment_factory_required: self.options.jsx_factory.is_some()
-                        && self.options.jsx_fragment_factory.is_none()
-                        && fragment_factory_pragma.is_none(),
-                    fragment_factory_pragma_required: factory_pragma.is_some()
-                        && self.options.jsx_fragment_factory.is_none()
-                        && fragment_factory_pragma.is_none(),
-                }
-            } else {
-                CanonicalJsxRuntimeEvidence::Preserve
-            };
-            context
-                .check_source_file_with_jsx_runtime(file, runtime)
-                .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
-            checked_sources.push(CanonicalCheckedSource {
-                source,
-                runtime: runtime.into(),
-            });
+            checked_sources.push(self.check_canonical_source(context, source)?);
         }
+        Ok(checked_sources)
+    }
 
-        let diagnostics =
-            self.canonical_checker_diagnostics(&mut context, &bind_diagnostics, &checked_sources)?;
+    fn canonical_source_header_skip(
+        &self,
+        is_default_library: bool,
+        is_declaration_file: bool,
+    ) -> Option<CanonicalCensusSkipReason> {
+        if is_default_library {
+            Some(CanonicalCensusSkipReason::DefaultLibrary)
+        } else if is_declaration_file && self.options.skip_lib_check {
+            Some(CanonicalCensusSkipReason::DeclarationFile)
+        } else {
+            None
+        }
+    }
+
+    fn canonical_source_text_skip(
+        &self,
+        is_javascript_file: bool,
+        source_text: &str,
+    ) -> Option<CanonicalCensusSkipReason> {
+        let check_directive = source_check_js_directive(source_text);
+        if check_directive == Some(false) {
+            Some(CanonicalCensusSkipReason::NoCheckDirective)
+        } else if is_javascript_file && !check_directive.unwrap_or(self.options.check_js) {
+            Some(CanonicalCensusSkipReason::UncheckedJavaScript)
+        } else {
+            None
+        }
+    }
+
+    fn check_canonical_source<'arena>(
+        &'arena self,
+        context: &mut CanonicalCheckerContext<'arena>,
+        source: &'arena SourceFile,
+    ) -> Result<CanonicalCheckedSource<'arena>, CanonicalProgramCheckError> {
+        let runtime_pragma = source_jsx_pragma_value(&source.source_text, "@jsxRuntime");
+        let runtime_module = self.options.jsx_runtime_module_specifier_for_source(
+            runtime_pragma,
+            source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
+        );
+        let runtime = if let Some(module_specifier) = runtime_module.as_deref() {
+            let containing = canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let resolved_module = self
+                .resolved_modules
+                .get(&ResolvedModuleKey::new(
+                    containing,
+                    module_specifier.to_owned(),
+                    CanonicalModuleResolutionMode::Esm,
+                ))
+                .and_then(|target| self.file_index.get(target))
+                .and_then(|index| self.source_files.get(*index))
+                .and_then(|target| context.file(target.id))
+                .and_then(|(_, bound)| bound.symbol(bound.source_file()));
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module,
+            }
+        } else if runtime_pragma == Some("classic")
+            || self.options.jsx == ts_options::JsxEmit::React
+        {
+            let factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsx ");
+            let fragment_factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsxFrag")
+                .or_else(|| source_jsx_pragma_value(&source.source_text, "@jsxfrag"));
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: self.options.jsx_factory_namespace_for_source(
+                    factory_pragma,
+                    fragment_factory_pragma,
+                    false,
+                ),
+                fragment_factory_namespace: self.options.jsx_factory_namespace_for_source(
+                    factory_pragma,
+                    fragment_factory_pragma,
+                    true,
+                ),
+                fragment_factory_required: self.options.jsx_factory.is_some()
+                    && self.options.jsx_fragment_factory.is_none()
+                    && fragment_factory_pragma.is_none(),
+                fragment_factory_pragma_required: factory_pragma.is_some()
+                    && self.options.jsx_fragment_factory.is_none()
+                    && fragment_factory_pragma.is_none(),
+            }
+        } else {
+            CanonicalJsxRuntimeEvidence::Preserve
+        };
+        let query_observation = ts_checker::semantic::CanonicalTypeMapperStore::current_query_producer_scope(
+            &source.file_name,
+            || NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
+            |node| {
+                let file = self.source_file_by_id(node.file)?;
+                let record = self.node(node)?;
+                Some((file.file_name.as_str(), record.kind, record.range))
+            },
+        );
+        context
+            .check_source_file_with_jsx_runtime(source.id, runtime)
+            .map_err(|error| {
+                if let Some(observation) = &query_observation {
+                    observation.escaping(&error, context.store());
+                }
+                if let SourceCheckError::DeclaredType(DeclaredTypeError::NameResolution(
+                    CanonicalNameResolutionError::AliasResolutionUnavailable(alias),
+                )) = &error
+                {
+                    self.trace_terminal_alias_failure(context, &source.file_name, *alias);
+                }
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: source.file_name.clone(),
+                    error,
+                }
+            })?;
+        Ok(CanonicalCheckedSource {
+            source,
+            runtime: runtime.into(),
+        })
+    }
+
+    fn terminal_alias_trace_text(text: &str) -> serde_json::Value {
+        let end = text
+            .char_indices()
+            .nth(256)
+            .map_or(text.len(), |(index, _)| index);
+        serde_json::json!({ "text": &text[..end], "truncated": end < text.len() })
+    }
+
+    fn terminal_alias_trace_symbol(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        symbol: ts_binder::SemanticSymbolId,
+    ) -> serde_json::Value {
+        let symbols = context.store().symbol_store();
+        let Some(record) = symbols.symbol(symbol) else {
+            return serde_json::json!({ "identity": format!("{symbol:?}"), "unavailable": "symbol_not_owned" });
+        };
+        let declarations = record.declarations().unwrap_or(&[]);
+        let locations = declarations
+            .iter()
+            .take(8)
+            .map(|reference| {
+                let read = || -> Result<serde_json::Value, &'static str> {
+                    let (arena, bound) = context
+                        .file(reference.file)
+                        .ok_or("context_file_unavailable")?;
+                    if !reference.is_for(arena.id(), bound.file_id())
+                        || !bound.declarations_complete()
+                        || bound.node_arena_revision() != arena.revision()
+                        || !bound.contains(*reference)
+                        || !symbols.contains_node_ref(*reference)
+                    {
+                        return Err("node_binding_unavailable");
+                    }
+                    let source = self
+                        .source_file_by_id(reference.file)
+                        .ok_or("program_file_unavailable")?;
+                    if !std::ptr::eq(arena, &source.parse.arena)
+                        || bound.source_file().node != source.parse.source_file
+                    {
+                        return Err("program_arena_mismatch");
+                    }
+                    if bound.symbol(*reference) != Some(symbol)
+                        && bound.local_symbol(*reference) != Some(symbol)
+                    {
+                        return Err("raw_declaration_symbol_mismatch");
+                    }
+                    let node = arena.get(reference.node).ok_or("node_unavailable")?;
+                    if node.range.start > node.range.end
+                        || node.range.end.get() as usize > source.source_text.len()
+                    {
+                        return Err("node_range_unavailable");
+                    }
+                    Ok(serde_json::json!({
+                        "file": Self::terminal_alias_trace_text(&source.file_name),
+                        "kind": format!("{:?}", node.kind),
+                        "startByte": node.range.start.get(), "endByte": node.range.end.get(),
+                        "rawBinderOwnerMatched": true,
+                    }))
+                };
+                read().unwrap_or_else(|reason| serde_json::json!({ "unavailable": reason }))
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "identity": format!("{symbol:?}"), "flags": format!("{:?}", record.flags()),
+            "name": record.name().as_utf8().map(Self::terminal_alias_trace_text)
+                .unwrap_or_else(|| serde_json::json!({ "unavailable": "non_utf8_symbol_name" })),
+            "declarationsAvailable": record.declarations().is_some(),
+            "declarationCount": declarations.len(), "declarationsTruncated": declarations.len() > 8,
+            "declarations": locations,
+            "mergedIdentity": { "unavailable": "observing_accessor_excluded" },
+            "importExportOwner": { "unavailable": "not_collected_in_minimal_trace" },
+            "moduleSpecifier": { "unavailable": "not_collected_in_minimal_trace" },
+        })
+    }
+
+    // Diagnostic-only: read retained failure facts without running checker queries.
+    fn trace_terminal_alias_failure(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        root_file: &str,
+        alias: ts_binder::SemanticSymbolId,
+    ) {
+        use std::io::Write as _;
+
+        let links = context.store().alias_symbol_links(alias);
+        let (state, target) = match links.map(|links| links.alias_target) {
+            None => ("missing", None),
+            Some(AliasTargetState::Unresolved) => ("unresolved", None),
+            Some(AliasTargetState::Unknown) => ("unknown", None),
+            Some(AliasTargetState::Resolved(target)) => ("resolved", Some(target)),
+        };
+        let record = serde_json::json!({
+            "event": "terminal_alias_unavailable", "schemaVersion": 1,
+            "rootFile": Self::terminal_alias_trace_text(root_file),
+            "error": "DeclaredType.NameResolution.AliasResolutionUnavailable",
+            "snapshot": "current_after_source_error", "useSite": { "unavailable": "not_in_returned_error" },
+            "alias": self.terminal_alias_trace_symbol(context, alias),
+            "aliasLinks": {
+                "state": state,
+                "rawImmediateTargetIdentity": links.and_then(|links| links.immediate_target).map(|target| format!("{target:?}")),
+                "rawTypeOnlyDeclarationIdentity": links.and_then(|links| links.type_only_declaration).map(|node| format!("{node:?}")),
+                "referenced": links.map(|links| links.referenced),
+                "target": target.map(|target| self.terminal_alias_trace_symbol(context, target)),
+            },
+        });
+        let Ok(mut bytes) = serde_json::to_vec(&record) else {
+            return;
+        };
+        if bytes.len() > 65_536 {
+            let fallback = serde_json::json!({
+                "event": "terminal_alias_unavailable", "schemaVersion": 1,
+                "rootFile": Self::terminal_alias_trace_text(root_file),
+                "aliasIdentity": format!("{alias:?}"), "aliasLinkState": state,
+                "snapshot": "current_after_source_error", "unavailable": "record_byte_limit", "truncated": true,
+            });
+            let Ok(fallback) = serde_json::to_vec(&fallback) else {
+                return;
+            };
+            bytes = fallback;
+        }
+        bytes.push(b'\n');
+        let _ = std::io::stderr().lock().write_all(&bytes);
+    }
+
+    fn finish_canonical_check<'arena, T>(
+        &'arena self,
+        mut context: CanonicalCheckerContext<'arena>,
+        bind_diagnostics: Vec<ProgramDiagnostic>,
+        checked_sources: Vec<CanonicalCheckedSource<'arena>>,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+        census_diagnostics: Option<&mut CanonicalCensusDiagnostics>,
+    ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
+        let diagnostics = match self.canonical_checker_diagnostics(
+            &mut context,
+            &bind_diagnostics,
+            &checked_sources,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                if let Some(diagnostics) = census_diagnostics {
+                    // The collector's local compiler-generated prefix is unavailable.
+                    *diagnostics = self.canonical_census_context_diagnostics(
+                        &context,
+                        &bind_diagnostics,
+                        false,
+                    );
+                }
+                return Err(error);
+            }
+        };
         let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
         for ((enclosing, target), specifier) in &self.package_display_specifiers {
             if let Some(source) = self
                 .source_file(target)
                 .filter(|source| source_is_external_module(source))
                 && let Some(enclosing) = self.source_file_by_id(*enclosing)
-            {
-                context
+                && let Err(error) = context
                     .set_module_display_specifier(
                         NodeRef::new(
                             enclosing.parse.arena.id(),
@@ -5256,7 +6219,16 @@ impl Program {
                         error: SourceCheckError::TypeDisplayUnavailable(
                             TypeDisplayUnavailable::SymbolDisplay(error),
                         ),
-                    })?;
+                    })
+            {
+                if let Some(diagnostics) = census_diagnostics {
+                    *diagnostics = CanonicalCensusDiagnostics::Partial {
+                        scope: CanonicalCensusDiagnosticScope::Program,
+                        records: cold_diagnostics,
+                        conversion_error: None,
+                    };
+                }
+                return Err(error);
             }
         }
         let mut canonical_queries = CanonicalProgramQueries {
@@ -6494,6 +7466,16 @@ impl Program {
                         range_override,
                     });
                 }
+                None if anchor.kind == SyntaxKind::ReturnStatement => {
+                    // Go GetErrorRangeForNode selects the first token, after trivia.
+                    let start = anchor.range.start.get() as usize;
+                    if !source.source_text.is_char_boundary(start) {
+                        return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(node));
+                    }
+                    let mut scanner = Scanner::new(&source.source_text);
+                    scanner.reset_token_state(start);
+                    scanner.scan().range
+                }
                 None => anchor.range,
             };
             (Some(source.file_name.clone()), Some(range))
@@ -7642,6 +8624,155 @@ fn reference_attribute_value<'source>(
             .map_or(candidate.len(), |(i, _)| i)..];
     }
     None
+}
+
+// Go: tsoptions/enummaps.go:11 LibMap
+const LIB_MAP: &[(&str, &str)] = &[
+    // JavaScript only
+    ("es5", "lib.es5.d.ts"),
+    ("es6", "lib.es2015.d.ts"),
+    ("es2015", "lib.es2015.d.ts"),
+    ("es7", "lib.es2016.d.ts"),
+    ("es2016", "lib.es2016.d.ts"),
+    ("es2017", "lib.es2017.d.ts"),
+    ("es2018", "lib.es2018.d.ts"),
+    ("es2019", "lib.es2019.d.ts"),
+    ("es2020", "lib.es2020.d.ts"),
+    ("es2021", "lib.es2021.d.ts"),
+    ("es2022", "lib.es2022.d.ts"),
+    ("es2023", "lib.es2023.d.ts"),
+    ("es2024", "lib.es2024.d.ts"),
+    ("es2025", "lib.es2025.d.ts"),
+    ("esnext", "lib.esnext.d.ts"),
+    // Host only
+    ("dom", "lib.dom.d.ts"),
+    ("dom.iterable", "lib.dom.iterable.d.ts"),
+    ("dom.asynciterable", "lib.dom.asynciterable.d.ts"),
+    ("webworker", "lib.webworker.d.ts"),
+    (
+        "webworker.importscripts",
+        "lib.webworker.importscripts.d.ts",
+    ),
+    ("webworker.iterable", "lib.webworker.iterable.d.ts"),
+    (
+        "webworker.asynciterable",
+        "lib.webworker.asynciterable.d.ts",
+    ),
+    ("scripthost", "lib.scripthost.d.ts"),
+    // ES2015 and later By-feature options
+    ("es2015.core", "lib.es2015.core.d.ts"),
+    ("es2015.collection", "lib.es2015.collection.d.ts"),
+    ("es2015.generator", "lib.es2015.generator.d.ts"),
+    ("es2015.iterable", "lib.es2015.iterable.d.ts"),
+    ("es2015.promise", "lib.es2015.promise.d.ts"),
+    ("es2015.proxy", "lib.es2015.proxy.d.ts"),
+    ("es2015.reflect", "lib.es2015.reflect.d.ts"),
+    ("es2015.symbol", "lib.es2015.symbol.d.ts"),
+    (
+        "es2015.symbol.wellknown",
+        "lib.es2015.symbol.wellknown.d.ts",
+    ),
+    ("es2016.array.include", "lib.es2016.array.include.d.ts"),
+    ("es2016.intl", "lib.es2016.intl.d.ts"),
+    ("es2017.arraybuffer", "lib.es2017.arraybuffer.d.ts"),
+    ("es2017.date", "lib.es2017.date.d.ts"),
+    ("es2017.object", "lib.es2017.object.d.ts"),
+    ("es2017.sharedmemory", "lib.es2017.sharedmemory.d.ts"),
+    ("es2017.string", "lib.es2017.string.d.ts"),
+    ("es2017.intl", "lib.es2017.intl.d.ts"),
+    ("es2017.typedarrays", "lib.es2017.typedarrays.d.ts"),
+    ("es2018.asyncgenerator", "lib.es2018.asyncgenerator.d.ts"),
+    ("es2018.asynciterable", "lib.es2018.asynciterable.d.ts"),
+    ("es2018.intl", "lib.es2018.intl.d.ts"),
+    ("es2018.promise", "lib.es2018.promise.d.ts"),
+    ("es2018.regexp", "lib.es2018.regexp.d.ts"),
+    ("es2019.array", "lib.es2019.array.d.ts"),
+    ("es2019.object", "lib.es2019.object.d.ts"),
+    ("es2019.string", "lib.es2019.string.d.ts"),
+    ("es2019.symbol", "lib.es2019.symbol.d.ts"),
+    ("es2019.intl", "lib.es2019.intl.d.ts"),
+    ("es2020.bigint", "lib.es2020.bigint.d.ts"),
+    ("es2020.date", "lib.es2020.date.d.ts"),
+    ("es2020.promise", "lib.es2020.promise.d.ts"),
+    ("es2020.sharedmemory", "lib.es2020.sharedmemory.d.ts"),
+    ("es2020.string", "lib.es2020.string.d.ts"),
+    (
+        "es2020.symbol.wellknown",
+        "lib.es2020.symbol.wellknown.d.ts",
+    ),
+    ("es2020.intl", "lib.es2020.intl.d.ts"),
+    ("es2020.number", "lib.es2020.number.d.ts"),
+    ("es2021.promise", "lib.es2021.promise.d.ts"),
+    ("es2021.string", "lib.es2021.string.d.ts"),
+    ("es2021.weakref", "lib.es2021.weakref.d.ts"),
+    ("es2021.intl", "lib.es2021.intl.d.ts"),
+    ("es2022.array", "lib.es2022.array.d.ts"),
+    ("es2022.error", "lib.es2022.error.d.ts"),
+    ("es2022.intl", "lib.es2022.intl.d.ts"),
+    ("es2022.object", "lib.es2022.object.d.ts"),
+    ("es2022.string", "lib.es2022.string.d.ts"),
+    ("es2022.regexp", "lib.es2022.regexp.d.ts"),
+    ("es2023.array", "lib.es2023.array.d.ts"),
+    ("es2023.collection", "lib.es2023.collection.d.ts"),
+    ("es2023.intl", "lib.es2023.intl.d.ts"),
+    ("es2024.arraybuffer", "lib.es2024.arraybuffer.d.ts"),
+    ("es2024.collection", "lib.es2024.collection.d.ts"),
+    ("es2024.object", "lib.es2024.object.d.ts"),
+    ("es2024.promise", "lib.es2024.promise.d.ts"),
+    ("es2024.regexp", "lib.es2024.regexp.d.ts"),
+    ("es2024.sharedmemory", "lib.es2024.sharedmemory.d.ts"),
+    ("es2024.string", "lib.es2024.string.d.ts"),
+    ("es2025.collection", "lib.es2025.collection.d.ts"),
+    ("es2025.float16", "lib.es2025.float16.d.ts"),
+    ("es2025.intl", "lib.es2025.intl.d.ts"),
+    ("es2025.iterator", "lib.es2025.iterator.d.ts"),
+    ("es2025.promise", "lib.es2025.promise.d.ts"),
+    ("es2025.regexp", "lib.es2025.regexp.d.ts"),
+    // Fallback for backward compatibility
+    ("esnext.asynciterable", "lib.es2018.asynciterable.d.ts"),
+    ("esnext.symbol", "lib.es2019.symbol.d.ts"),
+    ("esnext.bigint", "lib.es2020.bigint.d.ts"),
+    ("esnext.weakref", "lib.es2021.weakref.d.ts"),
+    ("esnext.object", "lib.es2024.object.d.ts"),
+    ("esnext.regexp", "lib.es2024.regexp.d.ts"),
+    ("esnext.string", "lib.es2024.string.d.ts"),
+    ("esnext.float16", "lib.es2025.float16.d.ts"),
+    ("esnext.iterator", "lib.es2025.iterator.d.ts"),
+    ("esnext.promise", "lib.es2025.promise.d.ts"),
+    // ESNext By-feature options
+    ("esnext.array", "lib.esnext.array.d.ts"),
+    ("esnext.collection", "lib.esnext.collection.d.ts"),
+    ("esnext.date", "lib.esnext.date.d.ts"),
+    ("esnext.decorators", "lib.esnext.decorators.d.ts"),
+    ("esnext.disposable", "lib.esnext.disposable.d.ts"),
+    ("esnext.error", "lib.esnext.error.d.ts"),
+    ("esnext.intl", "lib.esnext.intl.d.ts"),
+    ("esnext.sharedmemory", "lib.esnext.sharedmemory.d.ts"),
+    ("esnext.temporal", "lib.esnext.temporal.d.ts"),
+    ("esnext.typedarrays", "lib.esnext.typedarrays.d.ts"),
+    // Decorators
+    ("decorators", "lib.decorators.d.ts"),
+    ("decorators.legacy", "lib.decorators.legacy.d.ts"),
+];
+
+// Go: tsoptions/enummaps.go:132 GetLibFileName
+// Checks if `lib_name` is a valid lib name or lib file name and converts a lib
+// name to its file name. Used for `compilerOptions.lib` entries and for
+// `/// <reference lib="..." />` directives.
+// PORT: Go returns `(string, bool)`; this returns `Option<String>`. Go
+// `tspath.ToFileNameLowerCase` is approximated by `to_lowercase`; lib names
+// are ASCII.
+#[must_use]
+pub fn tsoptions_get_lib_file_name(lib_name: &str) -> Option<String> {
+    let lib_name = lib_name.to_lowercase();
+    // Go: LibFilesSet.Has(libName)
+    if LIB_MAP.iter().any(|(_, file)| *file == lib_name) {
+        return Some(lib_name);
+    }
+    LIB_MAP
+        .iter()
+        .find(|(key, _)| *key == lib_name)
+        .map(|(_, file)| (*file).to_owned())
 }
 
 fn bundled_library_name(name: &str) -> String {
@@ -11886,6 +13017,547 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 }
 
 #[cfg(test)]
+mod census_tests {
+    use std::convert::Infallible;
+
+    use ts_checker::semantic::SourceCheckError;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    use super::{
+        CanonicalCensusAttempt, CanonicalCensusCompletion, CanonicalCensusControl,
+        CanonicalCensusEvent, CanonicalCensusLoadDisposition, CanonicalCensusOutcome,
+        CanonicalCensusPhase, CanonicalCensusSkipReason, CanonicalPreparedChecker,
+        CanonicalProgramCheckError, CanonicalReplayJsxRuntime, Program, ProgramChecker,
+    };
+
+    fn project(config: &str, files: &[(&str, &str)]) -> MemoryFileSystem {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        for (name, source) in files {
+            fs.write_file(&format!("/project/{name}"), source).unwrap();
+        }
+        fs
+    }
+
+    fn collect(fs: &MemoryFileSystem) -> (CanonicalCensusCompletion, Vec<CanonicalCensusEvent>) {
+        let mut events = Vec::new();
+        let completion =
+            Program::run_canonical_root_census(fs, "/project/tsconfig.json", |_, event| {
+                events.push(event);
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap();
+        (completion, events)
+    }
+
+    fn outcome(
+        events: &[CanonicalCensusEvent],
+        selected: CanonicalCensusAttempt,
+    ) -> &CanonicalCensusOutcome {
+        events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalCensusEvent::AttemptFinished {
+                    attempt, outcome, ..
+                } if *attempt == selected => Some(outcome),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn prepare(program: &Program) -> CanonicalPreparedChecker<'_> {
+        program
+            .prepare_canonical_checker_observed(CanonicalCensusAttempt::Ordinary, &mut |_, _| {
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn census_keeps_two_returned_root_failures_separate_from_normal_order() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["first.ts","second.ts"]}"#,
+            &[
+                ("first.ts", "function* first() { yield 1; }"),
+                ("second.ts", "function* second() { yield 2; }"),
+            ],
+        );
+        let mut called = false;
+        let normal = Program::try_from_config_with_canonical_checker_and_queries(
+            &fs,
+            "/project/tsconfig.json",
+            |_, _| called = true,
+        )
+        .unwrap_err();
+        assert!(!called);
+        assert!(normal.is_unsupported_boundary());
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Ordinary),
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+        );
+        for (index, name) in ["first.ts", "second.ts"].into_iter().enumerate() {
+            let CanonicalCensusOutcome::Failure {
+                phase: CanonicalCensusPhase::Source,
+                error:
+                    CanonicalProgramCheckError::SourceCheck {
+                        file_name,
+                        error: SourceCheckError::Unsupported(_),
+                    },
+            } = outcome(&events, CanonicalCensusAttempt::Root(index))
+            else {
+                panic!("the actual generator call must fail: {events:?}");
+            };
+            assert_eq!(file_name, &format!("/project/{name}"));
+        }
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            CanonicalCensusEvent::PhaseStarted {
+                attempt: CanonicalCensusAttempt::Root(_),
+                phase: CanonicalCensusPhase::PostSource
+            }
+        )));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the failed memo state and both fresh full-graph controls together.
+    fn census_rebinds_every_file_after_a_failed_source_with_memo_state() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true,"skipLibCheck":true},"files":["broken.ts","reader.ts","globals.d.ts"]}"#,
+            &[
+                (
+                    "broken.ts",
+                    concat!(
+                        "interface Matcher { m<T extends string>(value: T): T; ",
+                        "m<T extends number>(value: T): T; m(left: boolean, right: boolean): boolean; }\n",
+                        "declare const matcher: Matcher;\nconst wrong: string = 0;\nconst bad = matcher.m(true);\n",
+                    ),
+                ),
+                ("reader.ts", "const received: number = available; received;"),
+                ("globals.d.ts", "declare const available: number;"),
+            ],
+        );
+        let (program, disposition) =
+            Program::load_canonical_config_program(&fs, "/project/tsconfig.json").unwrap();
+        assert_eq!(disposition, CanonicalCensusLoadDisposition::Ready);
+        let broken = program.source_file("/project/broken.ts").unwrap();
+        let reader = program.source_file("/project/reader.ts").unwrap();
+        let globals = program.source_file("/project/globals.d.ts").unwrap();
+        let mut failed = prepare(&program);
+        let before = (
+            failed.context.store().type_len(),
+            failed.context.store().symbol_len(),
+            failed.context.store().signature_len(),
+            failed.context.store().mapper_len(),
+            failed.context.store().type_resolution_len(),
+        );
+        let error = program
+            .check_canonical_source(&mut failed.context, broken)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CanonicalProgramCheckError::SourceCheck {
+                    error: SourceCheckError::Call(_),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_ne!(
+            before,
+            (
+                failed.context.store().type_len(),
+                failed.context.store().symbol_len(),
+                failed.context.store().signature_len(),
+                failed.context.store().mapper_len(),
+                failed.context.store().type_resolution_len(),
+            )
+        );
+        assert!(failed.context.diagnostics().is_empty());
+        let (_, failed_globals) = failed.context.file(globals.id).unwrap();
+        let available = failed
+            .context
+            .store()
+            .symbol_table(failed.context.globals())
+            .unwrap()
+            .get_source("available")
+            .unwrap();
+        assert!(failed_globals.declarations_complete());
+        drop(failed);
+
+        let mut counts = Vec::new();
+        for _ in 0..2 {
+            let mut fresh = prepare(&program);
+            assert_eq!(
+                fresh.context.file_order(),
+                program
+                    .canonical_semantic_sources()
+                    .iter()
+                    .map(|source| source.id)
+                    .collect::<Vec<_>>()
+            );
+            for source in program.source_files() {
+                let (arena, bound) = fresh.context.file(source.id).unwrap();
+                assert_eq!(arena.id(), source.parse.arena.id());
+                assert!(bound.declarations_complete());
+            }
+            // This checks the opaque store brand, not a numeric ID across runs.
+            assert!(fresh.context.store().symbol(available).is_none());
+            assert_eq!(
+                before,
+                (
+                    fresh.context.store().type_len(),
+                    fresh.context.store().symbol_len(),
+                    fresh.context.store().signature_len(),
+                    fresh.context.store().mapper_len(),
+                    fresh.context.store().type_resolution_len(),
+                )
+            );
+            program
+                .check_canonical_source(&mut fresh.context, reader)
+                .unwrap();
+            assert!(fresh.context.diagnostics().is_empty());
+            let broken_source = fresh.context.source_file(broken.id).unwrap();
+            assert!(
+                fresh
+                    .context
+                    .store()
+                    .source_file_links(broken_source)
+                    .is_none_or(|links| !links.type_checked)
+            );
+            counts.push((
+                fresh.context.store().type_len(),
+                fresh.context.store().signature_len(),
+                fresh.context.store().symbol_len(),
+                fresh.context.store().mapper_len(),
+                fresh.context.store().type_resolution_len(),
+            ));
+        }
+        assert_eq!(counts[0], counts[1]);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert!(matches!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            CanonicalCensusOutcome::Failure { .. }
+        ));
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(1)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(2)),
+            &CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::DeclarationFile)
+        );
+    }
+
+    #[test]
+    fn census_preserves_original_source_policy_and_no_check() {
+        let fs = project(
+            r#"{"compilerOptions":{"lib":["es5"],"noEmit":true,"skipLibCheck":true,"allowJs":true,"checkJs":false},"files":["good.ts","decl.d.ts","off.ts","off.js","/__typescript/lib/lib.es5.d.ts"]}"#,
+            &[
+                ("good.ts", "const good: number = 1;"),
+                ("decl.d.ts", "declare const declared: number;"),
+                ("off.ts", "// @ts-nocheck\nfunction* omitted() { yield 1; }"),
+                ("off.js", "function* ignored() { yield 1; }"),
+            ],
+        );
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        for (index, reason) in [
+            (1, CanonicalCensusSkipReason::DeclarationFile),
+            (2, CanonicalCensusSkipReason::NoCheckDirective),
+            (3, CanonicalCensusSkipReason::UncheckedJavaScript),
+            (4, CanonicalCensusSkipReason::DefaultLibrary),
+        ] {
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(index)),
+                &CanonicalCensusOutcome::Skipped(reason)
+            );
+            assert!(!events.iter().any(|event| matches!(event,
+                CanonicalCensusEvent::PhaseStarted { attempt: CanonicalCensusAttempt::Root(actual), .. } if *actual == index
+            )));
+        }
+        fs.write_file("/project/tsconfig.json",
+            r#"{"compilerOptions":{"noCheck":true,"noEmit":true,"allowJs":true},"files":["good.ts","off.js"]}"#).unwrap();
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::NoCheck);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CanonicalCensusEvent::PhaseStarted { .. }))
+        );
+        for attempt in [
+            CanonicalCensusAttempt::Ordinary,
+            CanonicalCensusAttempt::Root(0),
+            CanonicalCensusAttempt::Root(1),
+        ] {
+            assert_eq!(
+                outcome(&events, attempt),
+                &CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::NoCheck)
+            );
+        }
+    }
+
+    #[test]
+    fn census_preserves_duplicate_and_unloaded_program_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const value: number = 1;")
+            .unwrap();
+        let mut program = Program::new_unchecked_with_options_and_checker(
+            &fs,
+            "/project",
+            &[
+                "input.ts".to_owned(),
+                "input.ts".to_owned(),
+                "missing.ts".to_owned(),
+            ],
+            ts_options::CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                ..ts_options::CompilerOptions::default()
+            },
+            ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(&fs);
+        let roots = program.project_graph_snapshot().roots;
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[0], roots[1]);
+        assert!(roots[2].file_id.is_none());
+        let mut events = Vec::new();
+        let completion = program
+            .run_canonical_census_attempts(roots, &mut |_, event| {
+                events.push(event);
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap();
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(1)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(2)),
+            &CanonicalCensusOutcome::Unloaded
+        );
+    }
+
+    #[test]
+    fn census_distinguishes_load_binding_and_context_failures() {
+        let fs = MemoryFileSystem::new(true);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::LoadUnavailable);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CanonicalCensusEvent::LoadStarted,
+                CanonicalCensusEvent::Loaded {
+                    disposition: CanonicalCensusLoadDisposition::ConfigUnavailable,
+                    roots: None,
+                    ..
+                }
+            ]
+        ));
+
+        let fs = project(r#"{"files":[],"references":[{"path":"./other"}]}"#, &[]);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::LoadUnavailable);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CanonicalCensusEvent::LoadStarted,
+                CanonicalCensusEvent::LoadFailed {
+                    error: CanonicalProgramCheckError::ProjectReferencesUnsupported { .. },
+                    ..
+                }
+            ]
+        ));
+
+        for (config, files, phase) in [
+            (
+                r#"{"compilerOptions":{"noLib":true,"noEmit":true,"resolveJsonModule":true,"module":"ESNext","moduleResolution":"Bundler"},"files":["input.json"]}"#,
+                vec![("input.json", "{\"value\":1}")],
+                CanonicalCensusPhase::Binding,
+            ),
+            (
+                r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["input.ts"]}"#,
+                vec![("input.ts", "var undefined: number;")],
+                CanonicalCensusPhase::Context,
+            ),
+        ] {
+            let fs = project(config, &files);
+            let (completion, events) = collect(&fs);
+            assert_eq!(
+                completion,
+                CanonicalCensusCompletion::PreparationFailed,
+                "{events:?}"
+            );
+            assert!(matches!(outcome(&events, CanonicalCensusAttempt::Ordinary),
+                CanonicalCensusOutcome::Failure { phase: actual, .. } if *actual == phase));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                CanonicalCensusEvent::AttemptStarted {
+                    attempt: CanonicalCensusAttempt::Root(_)
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn census_observer_error_and_stop_end_before_the_next_operation() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["a.ts","b.ts"]}"#,
+            &[
+                ("a.ts", "const a: number = 1;"),
+                ("b.ts", "const b: number = 2;"),
+            ],
+        );
+        for fail in [false, true] {
+            let mut events = Vec::new();
+            let mut stopped = false;
+            let result =
+                Program::run_canonical_root_census(&fs, "/project/tsconfig.json", |_, event| {
+                    assert!(
+                        !stopped,
+                        "the observer must not be called after cancellation"
+                    );
+                    stopped = matches!(
+                        event,
+                        CanonicalCensusEvent::AttemptStarted {
+                            attempt: CanonicalCensusAttempt::Root(1)
+                        }
+                    );
+                    events.push(event);
+                    if stopped {
+                        if fail {
+                            Err("output failed")
+                        } else {
+                            Ok(CanonicalCensusControl::Stop)
+                        }
+                    } else {
+                        Ok(CanonicalCensusControl::Continue)
+                    }
+                });
+            assert!(stopped);
+            assert_eq!(
+                result,
+                if fail {
+                    Err("output failed")
+                } else {
+                    Ok(CanonicalCensusCompletion::Stopped)
+                }
+            );
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(0)),
+                &CanonicalCensusOutcome::Complete
+            );
+            assert!(matches!(
+                events.last(),
+                Some(CanonicalCensusEvent::AttemptStarted {
+                    attempt: CanonicalCensusAttempt::Root(1)
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn census_uses_classic_and_automatic_jsx_from_each_fresh_context() {
+        let fs = project(
+            r#"{"compilerOptions":{"lib":["es5"],"noEmit":true,"skipLibCheck":true,"jsx":"react-jsx","module":"ESNext","moduleResolution":"Bundler"},"files":["classic.tsx","auto.tsx"]}"#,
+            &[
+                (
+                    "classic.tsx",
+                    "/** @jsxRuntime classic */\n/** @jsx Custom.h */\ndeclare const Custom: any;\nconst first = <div />;",
+                ),
+                ("auto.tsx", "const second = <div />;"),
+                ("node_modules/react/jsx-runtime.d.ts", "export {};"),
+            ],
+        );
+        let (program, _) =
+            Program::load_canonical_config_program(&fs, "/project/tsconfig.json").unwrap();
+        let classic = program.source_file("/project/classic.tsx").unwrap();
+        let automatic = program.source_file("/project/auto.tsx").unwrap();
+        let target = program
+            .source_file("/project/node_modules/react/jsx-runtime.d.ts")
+            .unwrap();
+        let mut previous_symbol = None;
+        for _ in 0..2 {
+            let mut prepared = prepare(&program);
+            let checked = program
+                .check_canonical_source(&mut prepared.context, classic)
+                .unwrap();
+            assert!(
+                matches!(checked.runtime, CanonicalReplayJsxRuntime::Classic { ref factory_namespace, .. } if factory_namespace == "Custom")
+            );
+            drop(prepared);
+            let mut fresh = prepare(&program);
+            if let Some(previous) = previous_symbol {
+                assert!(fresh.context.store().symbol(previous).is_none());
+            }
+            let expected = fresh.context.file(target.id).unwrap().1;
+            let expected = expected.symbol(expected.source_file()).unwrap();
+            let checked = program
+                .check_canonical_source(&mut fresh.context, automatic)
+                .unwrap();
+            assert!(
+                matches!(checked.runtime, CanonicalReplayJsxRuntime::Automatic { ref module_specifier, resolved_module: Some(symbol) }
+                if module_specifier == "react/jsx-runtime" && symbol == expected)
+            );
+            previous_symbol = Some(expected);
+        }
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        for index in 0..2 {
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(index)),
+                &CanonicalCensusOutcome::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn census_completion_does_not_claim_zero_diagnostics_or_change_normal_callbacks() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true,"strict":true},"files":["input.ts"]}"#,
+            &[("input.ts", "const wrong: number = 'text';")],
+        );
+        let mut calls = 0;
+        let (program, snapshot) = Program::try_from_config_with_canonical_checker_and_queries(
+            &fs,
+            "/project/tsconfig.json",
+            |_, queries| {
+                calls += 1;
+                queries.cold_diagnostic_snapshot()
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(program.diagnostics(), snapshot.unwrap());
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2322))
+        );
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Ordinary),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            &CanonicalCensusOutcome::Complete
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
@@ -12155,6 +13827,159 @@ mod tests {
             }
         );
         assert!(!class_error.is_unsupported_boundary());
+    }
+
+    #[test]
+    fn canonical_program_classifies_global_this_failures_and_relation_demands() {
+        let parsed = parse_source_file("const value: number = 1;");
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), FileId::new(7), parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let receiver = bootstrap.empty_object_type;
+        let symbol = bootstrap.undefined_symbol;
+        let signature = bootstrap.any_signature;
+        let source_error = |error| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error,
+        };
+        for (reason, unsupported) in [
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisSymbol(symbol),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(receiver),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisMembers(receiver),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisMember { receiver, symbol },
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::UnsupportedGlobalThisMember { receiver, symbol },
+                true,
+            ),
+            (DeclaredTypeUnavailable::GlobalThisCapacity(receiver), false),
+        ] {
+            let error = source_error(SourceCheckError::DeclaredType(
+                DeclaredTypeError::Unavailable(reason),
+            ));
+            assert_eq!(
+                error.failure_class(),
+                if unsupported {
+                    CanonicalProgramCheckFailureClass::Unsupported {
+                        capability_code: "T05.DECLARED_TYPE",
+                    }
+                } else {
+                    CanonicalProgramCheckFailureClass::Fatal {
+                        invariant_code: "INV.SOURCE.DECLARED_TYPE",
+                    }
+                },
+                "{reason:?}",
+            );
+            assert_eq!(error.is_unsupported_boundary(), unsupported);
+        }
+        for demand in [
+            RelationUnavailable::GlobalThisMembersDemand { receiver },
+            RelationUnavailable::GlobalThisValueDemand {
+                receiver,
+                member: symbol,
+            },
+            RelationUnavailable::SourceInterfaceHeaderDemand { receiver },
+            RelationUnavailable::SourceInterfaceAliasDemand {
+                receiver,
+                alias: symbol,
+                root: node,
+            },
+            RelationUnavailable::SourceSignatureReturnDemand {
+                source: receiver,
+                source_signature: signature,
+                target: receiver,
+                target_signature: signature,
+                signature,
+                global_member: Some((receiver, symbol, receiver)),
+            },
+        ] {
+            let error = source_error(SourceCheckError::RelationUnavailable(demand));
+            assert_eq!(
+                error.failure_class(),
+                CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "R01.RELATION",
+                },
+                "{error:?}",
+            );
+            assert!(error.is_unsupported_boundary());
+        }
+    }
+
+    #[test]
+    fn canonical_program_ordinary_import_classification_keeps_the_target_reason() {
+        use ts_checker::semantic::alias::CanonicalAliasTargetUnavailable;
+
+        let parsed = parse_source_file("import type { T } from './target';");
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), FileId::new(7), parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let symbol = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .undefined_symbol;
+        for (reason, unsupported) in [
+            (
+                CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::TargetProviderUnavailable,
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(node),
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::InvalidAliasLinks(symbol),
+                false,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::ForeignDeclaration(node),
+                false,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::MalformedDeclaration(node),
+                false,
+            ),
+        ] {
+            let error = CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::OrdinaryImportTarget { node, reason },
+                )),
+            };
+            assert_eq!(
+                super::alias_target_error_is_unsupported(reason),
+                unsupported
+            );
+            assert_eq!(
+                error.failure_class(),
+                if unsupported {
+                    CanonicalProgramCheckFailureClass::Unsupported {
+                        capability_code: "T06.TYPE_NODE",
+                    }
+                } else {
+                    CanonicalProgramCheckFailureClass::Fatal {
+                        invariant_code: "INV.SOURCE.DECLARED_TYPE",
+                    }
+                },
+                "{reason:?}",
+            );
+            assert_eq!(error.is_unsupported_boundary(), unsupported);
+        }
     }
 
     #[test]
@@ -15140,6 +16965,66 @@ mod tests {
         ordered.sort_by(super::compare_program_diagnostics);
         assert_eq!(ordered[0].range, Some(exact_range));
         assert_eq!(ordered[1].range, Some(later_range));
+    }
+
+    #[test]
+    fn canonical_program_return_diagnostic_selects_keyword_and_preserves_override() {
+        for text in [
+            "function value(): number {\n  /* π */ return 'no';\n}",
+            "function value(): void {\n  // before the statement\n  return;\n}",
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.ts", text).unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    no_check: true,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            assert!(source.parse.diagnostics.is_empty());
+            let (id, record) = source
+                .parse
+                .arena
+                .iter()
+                .find(|(_, record)| matches!(record.data, NodeData::ReturnStatement(_)))
+                .unwrap();
+            let anchor = source.node_ref(id).unwrap();
+            let start = u32::try_from(text.find("return").unwrap()).unwrap();
+            let keyword = TextRange::new(TextPos::new(start), TextPos::new(start + 6));
+            let diagnostic =
+                Diagnostic::with_arguments(message_by_code(2322).unwrap(), ["string", "number"]);
+            let converted = program
+                .canonical_program_diagnostic(
+                    Some(anchor),
+                    None,
+                    &diagnostic,
+                    [(Some(anchor), &diagnostic)],
+                )
+                .unwrap();
+            assert_eq!(converted.file_name.as_deref(), Some("/project/input.ts"));
+            assert_eq!(converted.range, Some(keyword));
+            assert_eq!(converted.related_information.len(), 1);
+            assert_eq!(converted.related_information[0].range, Some(keyword));
+            assert_eq!(&text[start as usize..(start + 6) as usize], "return");
+            assert!(record.range.end > keyword.end);
+
+            let overridden = program
+                .canonical_program_diagnostic(
+                    Some(anchor),
+                    Some(CanonicalCheckerDiagnosticRange::new(anchor, record.range)),
+                    &diagnostic,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            assert_eq!(overridden.range, Some(record.range));
+            assert_eq!(overridden.code, converted.code);
+            assert_eq!(overridden.message, converted.message);
+        }
     }
 
     #[test]
@@ -25204,5 +27089,436 @@ export function create() { return new M.Value(); }"#,
             percent_encode_source_map_url("../maps/① file[one].js.map"),
             "../maps/%E2%91%A0%20file%5Bone%5D.js.map"
         );
+    }
+
+    mod interface_condition_headers {
+        use ts_ast::NodeRef;
+        use ts_binder::{SemanticSymbolId, SymbolFlags};
+        use ts_checker::semantic::{
+            CanonicalCheckerDiagnostics, NodeLinks, RelationStateSnapshot, SignatureLinks,
+            SourceFileLinks, SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks,
+        };
+
+        use super::{
+            CanonicalProgramQueries, Category, CompilerOptions, FileSystem, MemoryFileSystem,
+            NodeData, Program, ScriptTarget, SourceFile, SyntaxKind,
+        };
+        use crate::ProgramDiagnostic;
+
+        const PROVIDER: &str = concat!(
+            "interface DeferredCallback { new (); }\n",
+            "interface Error {\n",
+            "  untyped;\n",
+            "  callback: DeferredCallback;\n",
+            "  inspect(): void;\n",
+            "}\n",
+        );
+        const CONSUMER: &str = concat!(
+            "class Holder {\n",
+            "  value?: Error;\n",
+            "  observe(): void {\n",
+            "    const before = this.value;\n",
+            "    if (this.value) { const present = this.value; }\n",
+            "    else { const absent = this.value; }\n",
+            "    const after = this.value;\n",
+            "  }\n",
+            "}\n",
+        );
+
+        fn only_node(source: &SourceFile, kind: SyntaxKind) -> NodeRef {
+            let nodes = source
+                .parse
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == kind)
+                .map(|(id, _)| source.node_ref(id).unwrap())
+                .collect::<Vec<_>>();
+            let [node] = nodes.as_slice() else {
+                panic!("expected one {kind:?}")
+            };
+            *node
+        }
+
+        fn property(source: &SourceFile, expected: &str) -> (NodeRef, Option<NodeRef>) {
+            source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(_, node)| {
+                    let NodeData::PropertyDeclaration(data) = &node.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &source.parse.arena.get(data.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected).then(|| {
+                        (
+                            source.node_ref(data.name).unwrap(),
+                            data.type_.and_then(|id| source.node_ref(id)),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing property {expected}"))
+        }
+
+        fn local_read(source: &SourceFile, expected: &str) -> NodeRef {
+            source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(_, node)| {
+                    let NodeData::VariableDeclaration(data) = &node.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &source.parse.arena.get(data.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected)
+                        .then(|| source.node_ref(data.initializer.unwrap()).unwrap())
+                })
+                .unwrap_or_else(|| panic!("missing local {expected}"))
+        }
+
+        fn raw_type(queries: &CanonicalProgramQueries<'_>, node: NodeRef) -> TypeId {
+            queries
+                .context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap_or_else(|| panic!("missing checked type at {node:?}"))
+        }
+
+        fn assert_merged_error_owner(
+            program: &Program,
+            queries: &CanonicalProgramQueries<'_>,
+            owner: SemanticSymbolId,
+        ) {
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            let library = program
+                .source_files()
+                .iter()
+                .find(|source| {
+                    source.is_default_library && source.file_name.ends_with("/lib.es5.d.ts")
+                })
+                .unwrap();
+            assert_eq!(
+                library.source_text,
+                include_str!("../../ts_bundled/libs/lib.es5.d.ts")
+            );
+            let record = queries.context.store().symbol(owner).unwrap();
+            assert!(record.flags().contains(
+                SymbolFlags::INTERFACE
+                    | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::TRANSIENT
+            ));
+            let [original, value, added] = record.declarations().unwrap() else {
+                panic!("expected the real merged Error declarations")
+            };
+            for (declaration, source, kind) in [
+                (original, library, SyntaxKind::InterfaceDeclaration),
+                (value, library, SyntaxKind::VariableDeclaration),
+                (added, provider, SyntaxKind::InterfaceDeclaration),
+            ] {
+                assert!(declaration.is_for(source.parse.arena.id(), source.id));
+                let node = source.parse.arena.get(declaration.node).unwrap();
+                assert_eq!(node.kind, kind);
+                let name = match &node.data {
+                    NodeData::InterfaceDeclaration(data) => data.name,
+                    NodeData::VariableDeclaration(data) => data.name,
+                    _ => unreachable!(),
+                };
+                let NodeData::Identifier(identifier) = &source.parse.arena.get(name).unwrap().data
+                else {
+                    unreachable!()
+                };
+                assert_eq!(identifier.text, "Error");
+                let raw = queries
+                    .context
+                    .file(source.id)
+                    .unwrap()
+                    .1
+                    .symbol(*declaration)
+                    .unwrap();
+                assert_eq!(
+                    queries.context.store().get_merged_symbol(raw).unwrap(),
+                    owner
+                );
+            }
+            assert_eq!(record.value_declaration(), Some(*value));
+            assert_eq!(
+                queries
+                    .context
+                    .store()
+                    .symbol_table(queries.context.globals())
+                    .unwrap()
+                    .get_source("Error"),
+                Some(owner)
+            );
+        }
+
+        fn assert_condition_reads(program: &Program, queries: &CanonicalProgramQueries<'_>) {
+            let source = program.source_file("/project/condition.ts").unwrap();
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            assert_eq!(source.source_text, CONSUMER);
+            assert_eq!(provider.source_text, PROVIDER);
+            let (name, annotation) = property(source, "value");
+            let type_ = raw_type(queries, annotation.unwrap());
+            let record = queries.context.store().type_payload(type_).unwrap();
+            assert!(matches!(record.data(), TypeData::Interface(_)));
+            assert_merged_error_owner(program, queries, record.symbol().unwrap());
+            let undefined = queries
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_type;
+            let optional = raw_type(queries, local_read(source, "before"));
+            let TypeData::Union(union) = queries
+                .context
+                .store()
+                .type_payload(optional)
+                .unwrap()
+                .data()
+            else {
+                panic!("expected the optional field read")
+            };
+            let mut members = union.union.types.clone();
+            members.sort_unstable();
+            let mut expected = [type_, undefined];
+            expected.sort_unstable();
+            assert_eq!(members, expected);
+            assert_eq!(raw_type(queries, local_read(source, "present")), type_);
+            assert_eq!(raw_type(queries, local_read(source, "absent")), undefined);
+            assert_eq!(raw_type(queries, local_read(source, "after")), optional);
+            let field = source
+                .node_ref(source.parse.arena.get(name.node).unwrap().parent.unwrap())
+                .unwrap();
+            let symbol = queries
+                .context
+                .file(source.id)
+                .unwrap()
+                .1
+                .symbol(field)
+                .unwrap();
+            assert_eq!(
+                queries
+                    .context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+        }
+
+        fn assert_diagnostics(
+            program: &Program,
+            queries: &CanonicalProgramQueries<'_>,
+            skip: bool,
+        ) -> Vec<ProgramDiagnostic> {
+            let cold = queries.cold_diagnostic_snapshot();
+            assert_eq!(queries.has_diagnostics(), !skip);
+            if skip {
+                assert!(cold.is_empty(), "{cold:?}");
+                assert!(queries.context.diagnostics().is_empty());
+                return cold;
+            }
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            let expected = [
+                (
+                    only_node(provider, SyntaxKind::ConstructSignature),
+                    7013,
+                    "new ();",
+                    "Construct signature, which lacks return-type annotation, implicitly has an 'any' return type.",
+                ),
+                (
+                    property(provider, "untyped").0,
+                    7008,
+                    "untyped",
+                    "Member 'untyped' implicitly has an 'any' type.",
+                ),
+            ];
+            assert_eq!(cold.len(), expected.len(), "{cold:?}");
+            let raw = queries.context.diagnostics().as_slice();
+            assert_eq!(raw.len(), expected.len());
+            for ((diagnostic, raw), (node, code, text, message)) in
+                cold.iter().zip(raw).zip(expected)
+            {
+                let range = provider.parse.arena.get(node.node).unwrap().range;
+                assert_eq!(
+                    &PROVIDER[range.start.get() as usize..range.end.get() as usize],
+                    text
+                );
+                assert_eq!(
+                    diagnostic.file_name.as_deref(),
+                    Some("/project/provider.d.ts")
+                );
+                assert_eq!(diagnostic.range, Some(range));
+                assert_eq!(diagnostic.code, Some(code));
+                assert_eq!(diagnostic.category, Category::Error);
+                assert_eq!(diagnostic.message, message);
+                assert!(diagnostic.related_information.is_empty());
+                assert_eq!(raw.node, Some(node));
+                assert_eq!(raw.range_override, None);
+                assert_eq!(raw.diagnostic.code(), code);
+                assert_eq!(raw.diagnostic.render().unwrap(), message);
+                assert!(raw.related_information.is_empty());
+            }
+            cold
+        }
+
+        type NodePublication = (
+            NodeRef,
+            Option<NodeLinks>,
+            Option<TypeNodeLinks>,
+            Option<SymbolNodeLinks>,
+            Option<SignatureLinks>,
+        );
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct Publication {
+            counts: [usize; 9],
+            relation: RelationStateSnapshot,
+            nodes: Vec<NodePublication>,
+            sources: Vec<Option<SourceFileLinks>>,
+            diagnostics: CanonicalCheckerDiagnostics,
+        }
+
+        fn publication(program: &Program, queries: &CanonicalProgramQueries<'_>) -> Publication {
+            let store = queries.context.store();
+            Publication {
+                counts: [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.type_predicate_len(),
+                    store.index_info_len(),
+                    store.type_resolution_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                relation: store.relation_state_snapshot(),
+                nodes: program
+                    .source_files()
+                    .iter()
+                    .flat_map(|source| {
+                        source.parse.arena.iter().map(move |(id, _)| {
+                            let node = source.node_ref(id).unwrap();
+                            (
+                                node,
+                                store.node_links(node).cloned(),
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                                store.signature_links(node).cloned(),
+                            )
+                        })
+                    })
+                    .collect(),
+                sources: program
+                    .source_files()
+                    .iter()
+                    .map(|source| {
+                        store
+                            .source_file_links(queries.context.source_file(source.id).unwrap())
+                            .cloned()
+                    })
+                    .collect(),
+                diagnostics: queries.context.diagnostics().clone(),
+            }
+        }
+
+        fn run_case(skip: bool, provider_first: bool) {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/provider.d.ts", PROVIDER).unwrap();
+            fs.write_file("/project/condition.ts", CONSUMER).unwrap();
+            let roots = if provider_first {
+                ["provider.d.ts".to_owned(), "condition.ts".to_owned()]
+            } else {
+                ["condition.ts".to_owned(), "provider.d.ts".to_owned()]
+            };
+            let (program, cold) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &roots,
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    target: ScriptTarget::Es2022,
+                    strict: true,
+                    no_emit: true,
+                    skip_lib_check: skip,
+                    ..CompilerOptions::default()
+                },
+                |program, queries| {
+                    let provider = program.source_file("/project/provider.d.ts").unwrap();
+                    let consumer = program.source_file("/project/condition.ts").unwrap();
+                    let actual = queries
+                        .checked_sources
+                        .iter()
+                        .map(|checked| checked.source.file_name.clone())
+                        .collect::<Vec<_>>();
+                    let expected = roots
+                        .iter()
+                        .filter(|name| !skip || !name.ends_with(".d.ts"))
+                        .map(|name| format!("/project/{name}"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                    let provider_links = queries
+                        .context
+                        .store()
+                        .source_file_links(queries.context.source_file(provider.id).unwrap());
+                    assert_eq!(
+                        provider_links.is_some_and(|links| links.type_checked),
+                        !skip
+                    );
+                    assert!(
+                        queries
+                            .context
+                            .store()
+                            .source_file_links(queries.context.source_file(consumer.id).unwrap())
+                            .unwrap()
+                            .type_checked
+                    );
+                    let callback = property(provider, "callback").1.unwrap();
+                    if skip {
+                        assert_eq!(provider_links, None);
+                        assert_eq!(queries.context.store().type_node_links(callback), None);
+                        assert_eq!(
+                            queries.context.store().signature_links(only_node(
+                                provider,
+                                SyntaxKind::ConstructSignature
+                            )),
+                            None
+                        );
+                    }
+                    assert_condition_reads(program, queries);
+                    let cold = assert_diagnostics(program, queries, skip);
+                    let before = publication(program, queries);
+                    for _ in 0..2 {
+                        assert_eq!(queries.replay_sources().unwrap(), cold);
+                        assert_eq!(queries.cold_diagnostic_snapshot(), cold);
+                        assert_condition_reads(program, queries);
+                        assert_eq!(publication(program, queries), before);
+                    }
+                    if skip {
+                        assert_eq!(queries.context.store().type_node_links(callback), None);
+                    }
+                    cold
+                },
+            )
+            .unwrap();
+            assert_eq!(cold.as_deref(), Some(program.diagnostics()));
+        }
+
+        #[test]
+        fn skip_lib_check_keeps_lazy_condition_headers_and_provider_diagnostic_owners() {
+            for skip in [false, true] {
+                for provider_first in [false, true] {
+                    run_case(skip, provider_first);
+                }
+            }
+        }
     }
 }

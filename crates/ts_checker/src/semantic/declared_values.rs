@@ -81,6 +81,9 @@ pub(super) fn plan_declared_value(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<DeclaredValuePlan, DeclaredTypeError> {
+    if let Some(plan) = plan_ambient_global_value(store, host, symbol)? {
+        return Ok(plan);
+    }
     let invalid = || invalid_value(symbol);
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let declarations = record.declarations().ok_or_else(invalid)?;
@@ -160,7 +163,11 @@ pub(super) fn plan_declared_value(
             };
             let bound = host.bound_file(declaration).ok_or_else(invalid)?;
             let block_scoped = list_node.flags.0 & 3 != 0;
-            plan_variable_owner(store, host, symbol, declaration, statement)?;
+            let namespace_variable =
+                global_callable_namespace_variable(store, host, symbol, declaration, statement);
+            if !namespace_variable {
+                plan_variable_owner(store, host, symbol, declaration, statement)?;
+            }
             if list_node.kind != SyntaxKind::VariableDeclarationList
                 || list_node.flags.0 & !3 != 0
                 || declarations
@@ -172,7 +179,7 @@ pub(super) fn plan_declared_value(
                     != 1
                 || statement_node.kind != SyntaxKind::VariableStatement
                 || statement_data.declaration_list != list.node
-                || statement_node.parent != Some(bound.source_file().node)
+                || !namespace_variable && statement_node.parent != Some(bound.source_file().node)
                 || block_scoped != record.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
             {
                 return Err(invalid());
@@ -258,6 +265,17 @@ pub(super) fn plan_declared_value(
     {
         return Err(invalid());
     }
+    plan_declared_value_cache(store, symbol, annotation, readonly)
+}
+
+pub(super) fn plan_declared_value_cache(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    annotation: NodeRef,
+    readonly: Option<bool>,
+) -> Result<DeclaredValuePlan, DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
     let links = store
         .value_symbol_links(symbol)
         .cloned()
@@ -290,6 +308,736 @@ pub(super) fn plan_declared_value(
         readonly,
         cached_type: links.resolved_type,
     })
+}
+
+/// Reads the selected library value without removing any global augmentation.
+/// The saved declaration order, not the mutable value selector, admits this route.
+pub(super) fn plan_global_type_literal_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, Some(SyntaxKind::TypeLiteral))
+}
+
+/// A named constructor keeps the same selected value and complete global merge.
+pub(super) fn plan_global_named_constructor_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, Some(SyntaxKind::TypeReference))
+}
+
+/// Reads a script-origin ambient global through its complete saved merge.
+pub(super) fn plan_ambient_global_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, None)
+}
+
+#[allow(clippy::too_many_lines)] // The complete merge and selected source form one proof.
+fn plan_global_annotated_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    library_annotation_kind: Option<SyntaxKind>,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let Some(globals) = store.source_global_bindings() else {
+        return Ok(None);
+    };
+    let Some(original) = globals.iter().find(|entry| entry.symbol == symbol) else {
+        return Ok(None);
+    };
+    let declarations = original.declarations().unwrap_or_default();
+    let Some(selected) = declarations
+        .iter()
+        .copied()
+        .find(|&node| store.source_node_kind(node) == Some(SyntaxKind::VariableDeclaration))
+    else {
+        return Ok(None);
+    };
+    let Some(annotation) = store.source_direct_type_annotation(selected) else {
+        return Ok(None);
+    };
+    if let Some(kind) = library_annotation_kind {
+        if !store.source_is_default_library_declaration(selected)
+            || store.source_node_kind(annotation) != Some(kind)
+        {
+            return Ok(None);
+        }
+    } else {
+        let Some(facts) = host.bound_file(selected).and_then(|bound| bound.source_facts()) else {
+            return Ok(None);
+        };
+        if !facts.is_declaration_file() || facts.is_external_or_common_js_module() {
+            return Ok(None);
+        }
+    }
+    // The type-side and value-side readers share this ordered mixed-owner proof.
+    // The variable-only route retains its complete host proof below.
+    let mixed = store.source_global_interface_value_owner(symbol)?;
+    let (table, table_symbol, selected, annotation) = mixed.as_ref().map_or(
+        (globals.table, original.table_symbol, selected, annotation),
+        |owner| {
+            (
+                owner.globals_table(),
+                owner.table_symbol(),
+                owner.value_declaration(),
+                owner.value_annotation(),
+            )
+        },
+    );
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || store.get_merged_symbol(table_symbol) != Some(symbol)
+        || globals
+            .get(record.name())
+            .is_none_or(|entry| entry.symbol != symbol || entry.table_symbol != table_symbol)
+        || store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.globals != table)
+        || store
+            .symbol_table(table)
+            .and_then(|table| table.get(record.name()))
+            != Some(table_symbol)
+        || record.flags() != original.flags
+        || record.declarations() != Some(declarations)
+        || !store.source_merged_symbol_declarations_match(symbol)
+        || record.value_declaration() != Some(selected)
+        || record.check_flags() != CheckFlags::NONE
+        || record.parent().is_some()
+        || record.exports().is_some()
+            && !declarations.iter().any(|&declaration| {
+                store.source_node_kind(declaration) == Some(SyntaxKind::ModuleDeclaration)
+            })
+        || record.export_symbol().is_some()
+        || !record.flags().contains(SymbolFlags::INTERFACE) && record.members().is_some()
+    {
+        return Err(invalid());
+    }
+    let mut flags = SymbolFlags::NONE;
+    let mut namespaces = Vec::new();
+    for &declaration in declarations {
+        let node = preflight_node(store, host, declaration)?;
+        let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+        let facts = bound.source_facts().ok_or_else(invalid)?;
+        if !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || store.source_file_rank(declaration.file).is_none()
+            || !host.symbol_matches(store, declaration, symbol)
+            || node.flags.0 != 0
+        {
+            return Err(invalid());
+        }
+        match &node.data {
+            NodeData::VariableDeclaration(_) if node.kind == SyntaxKind::VariableDeclaration => {
+                flags |= plan_global_variable_declaration(store, host, symbol, declaration)?;
+            }
+            NodeData::ModuleDeclaration(_) if node.kind == SyntaxKind::ModuleDeclaration => {
+                flags |= plan_global_namespace_declaration(store, host, symbol, declaration)?;
+                namespaces.push(declaration);
+            }
+            NodeData::InterfaceDeclaration(interface)
+                if node.kind == SyntaxKind::InterfaceDeclaration =>
+            {
+                flags |= SymbolFlags::INTERFACE;
+                let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+                let name_node = preflight_node(store, host, name)?;
+                if name_node.kind != SyntaxKind::Identifier
+                    || name_node.flags.0 != 0
+                    || name_node.parent != Some(declaration.node)
+                    || !matches!(&name_node.data, NodeData::Identifier(name)
+                        if name.flow_node.is_none()
+                            && record.name().as_utf8() == Some(name.text.as_str()))
+                    || interface.symbol.is_some()
+                    || interface.local_symbol.is_some()
+                    || interface.flow_node.is_some()
+                    || if facts.is_external_module()
+                        || node.parent != Some(bound.source_file().node)
+                    {
+                        !store.source_global_interface_augmentation_is_exact(symbol, declaration)
+                    } else {
+                        node.parent != Some(bound.source_file().node)
+                    }
+                {
+                    return Err(invalid());
+                }
+                if node.parent != Some(bound.source_file().node) {
+                    let block = node.parent.ok_or_else(invalid)?;
+                    let module = preflight_node(
+                        store,
+                        host,
+                        NodeRef::new(declaration.arena, declaration.file, block),
+                    )?
+                    .parent
+                    .ok_or_else(invalid)?;
+                    plan_global_augmentation_parent(
+                        store,
+                        host,
+                        symbol,
+                        NodeRef::new(declaration.arena, declaration.file, module),
+                    )?;
+                }
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    if flags != record.flags().without(SymbolFlags::TRANSIENT)
+        || flags.contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+            && (flags.contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                || flags.contains(SymbolFlags::INTERFACE))
+    {
+        return Err(invalid());
+    }
+    if !namespaces.is_empty()
+        && store
+            .validate_source_merged_namespace_exports(symbol, &namespaces)
+            .is_none()
+    {
+        return Err(invalid());
+    }
+    plan_declared_value_cache(store, symbol, annotation, None).map(Some)
+}
+
+/// Keeps the namespace contribution without using it as the variable's value type.
+fn plan_global_namespace_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<SymbolFlags, DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let node = preflight_node(store, host, declaration)?;
+    let NodeData::ModuleDeclaration(namespace) = &node.data else {
+        return Err(invalid());
+    };
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let raw = bound.symbol(declaration).ok_or_else(invalid)?;
+    let raw_record = store.symbol(raw).ok_or_else(invalid)?;
+    let flags = raw_record.flags() & (SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE);
+    let name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
+    let name_node = preflight_node(store, host, name)?;
+    let body = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        namespace.body.ok_or_else(invalid)?,
+    );
+    let body_node = preflight_node(store, host, body)?;
+    if node.kind != SyntaxKind::ModuleDeclaration
+        || node.flags.0 != 0
+        || !matches!(
+            namespace.keyword,
+            SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword
+        )
+        || namespace.symbol.is_some()
+        || namespace.local_symbol.is_some()
+        || namespace.asterisk_token.is_some()
+        || namespace.flow_node.is_some()
+        || namespace.end_flow_node.is_some()
+        || namespace.next_container.is_some()
+        || namespace.facts != 0
+        || store.get_merged_symbol(raw) != Some(symbol)
+        || !flags.intersects(SymbolFlags::MODULE)
+        || name_node.kind != SyntaxKind::Identifier
+        || name_node.flags.0 != 0
+        || name_node.parent != Some(declaration.node)
+        || !matches!(&name_node.data, NodeData::Identifier(name)
+            if name.flow_node.is_none()
+                && owner.name().as_utf8() == Some(name.text.as_str()))
+        || body_node.parent != Some(declaration.node)
+        || body_node.range.start < name_node.range.end
+        || body_node.range.end > node.range.end
+        || !matches!(&body_node.data,
+            NodeData::ModuleBlock(block) if body_node.kind == SyntaxKind::ModuleBlock
+                && body_node.flags.0 == 0 && block.facts == 0
+                && !block.statements.has_trailing_comma)
+            && !matches!(&body_node.data,
+                NodeData::ModuleDeclaration(_) if body_node.kind == SyntaxKind::ModuleDeclaration)
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &namespace.modifiers {
+        if modifiers.flags.0 != 0 || modifiers.list.has_trailing_comma {
+            return Err(invalid());
+        }
+        let mut exported = false;
+        let mut declared = false;
+        for &modifier in &modifiers.list.nodes {
+            let modifier = NodeRef::new(declaration.arena, declaration.file, modifier);
+            let token = preflight_node(store, host, modifier)?;
+            if token.parent != Some(declaration.node)
+                || token.flags.0 != 0
+                || !matches!(token.data, NodeData::Token(_))
+            {
+                return Err(invalid());
+            }
+            match token.kind {
+                SyntaxKind::ExportKeyword if !exported && !declared => exported = true,
+                SyntaxKind::DeclareKeyword if !declared => declared = true,
+                _ => return Err(invalid()),
+            }
+        }
+    }
+    if node.parent != Some(bound.source_file().node)
+        || bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_external_module())
+    {
+        plan_global_value_augmentation(store, host, symbol, declaration, declaration)?;
+    } else {
+        let source = preflight_node(store, host, bound.source_file())?;
+        if !matches!(&source.data, NodeData::SourceFile(source)
+            if source.statements.nodes.iter().filter(|&&node| node == declaration.node).count() == 1)
+            || bound.local_symbol(declaration).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(flags)
+}
+
+#[allow(clippy::too_many_lines)] // Variable syntax and its script or augmentation edge are inseparable.
+fn plan_global_variable_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<SymbolFlags, DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let node = preflight_node(store, host, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &node.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_node = preflight_node(store, host, name)?;
+    let annotation = variable
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let annotation_node = preflight_node(store, host, annotation)?;
+    let list = node
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let list_node = preflight_node(store, host, list)?;
+    let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
+        return Err(invalid());
+    };
+    let statement = list_node
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let statement_node = preflight_node(store, host, statement)?;
+    let NodeData::VariableStatement(statement_data) = &statement_node.data else {
+        return Err(invalid());
+    };
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    if variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || name_node.kind != SyntaxKind::Identifier
+        || name_node.flags.0 != 0
+        || name_node.parent != Some(declaration.node)
+        || !matches!(&name_node.data, NodeData::Identifier(name)
+            if name.flow_node.is_none()
+                && owner.name().as_utf8() == Some(name.text.as_str()))
+        || annotation_node.flags.0 != 0
+        || annotation_node.parent != Some(declaration.node)
+        || store.source_direct_type_annotation(declaration) != Some(annotation)
+        || name_node.range.start < node.range.start
+        || name_node.range.end > annotation_node.range.start
+        || annotation_node.range.end > node.range.end
+        || list_node.kind != SyntaxKind::VariableDeclarationList
+        || !matches!(list_node.flags.0, 0..=2)
+        || list_data.declarations.has_trailing_comma
+        || list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|&&node| node == declaration.node)
+            .count()
+            != 1
+        || statement_node.kind != SyntaxKind::VariableStatement
+        || statement_node.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &statement_data.modifiers {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(invalid());
+        };
+        let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+        let modifier_node = preflight_node(store, host, modifier)?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_node.kind != SyntaxKind::DeclareKeyword
+            || modifier_node.flags.0 != 0
+            || modifier_node.parent != Some(statement.node)
+            || !matches!(modifier_node.data, NodeData::Token(_))
+        {
+            return Err(invalid());
+        }
+    }
+    if statement_node.parent != Some(bound.source_file().node)
+        || bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_external_module())
+    {
+        plan_global_value_augmentation(store, host, symbol, declaration, statement)?;
+    } else {
+        let source = preflight_node(store, host, bound.source_file())?;
+        if statement_node.parent != Some(bound.source_file().node)
+            || !matches!(&source.data, NodeData::SourceFile(source)
+                if source.statements.nodes.iter().filter(|&&node| node == statement.node).count() == 1)
+            || bound.local_symbol(declaration).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(if list_node.flags.0 == 0 {
+        SymbolFlags::FUNCTION_SCOPED_VARIABLE
+    } else {
+        SymbolFlags::BLOCK_SCOPED_VARIABLE
+    })
+}
+
+#[allow(clippy::too_many_lines)] // The raw export, local placeholder and global merge are distinct owners.
+fn plan_global_value_augmentation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    statement: NodeRef,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let statement_node = preflight_node(store, host, statement)?;
+    let block = statement_node
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let block_node = preflight_node(store, host, block)?;
+    let NodeData::ModuleBlock(block_data) = &block_node.data else {
+        return Err(invalid());
+    };
+    let module = block_node
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let module_node = preflight_node(store, host, module)?;
+    let NodeData::ModuleDeclaration(module_data) = &module_node.data else {
+        return Err(invalid());
+    };
+    plan_global_augmentation_parent(store, host, symbol, module)?;
+    let name = NodeRef::new(module.arena, module.file, module_data.name);
+    let namespace = bound
+        .symbol(module)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let namespace_record = store.symbol(namespace).ok_or_else(invalid)?;
+    let raw = bound.symbol(declaration).ok_or_else(invalid)?;
+    let raw_record = store.symbol(raw).ok_or_else(invalid)?;
+    let local = bound.local_symbol(declaration).ok_or_else(invalid)?;
+    let local_record = store.symbol(local).ok_or_else(invalid)?;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    let raw_declarations = declarations
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            candidate.is_for(declaration.arena, declaration.file)
+                && bound.symbol(candidate) == Some(raw)
+        })
+        .collect::<Vec<_>>();
+    let local_declarations = declarations
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            candidate.is_for(declaration.arena, declaration.file)
+                && bound.local_symbol(candidate) == Some(local)
+        })
+        .collect::<Vec<_>>();
+    let raw_flags = raw_record.flags();
+    let allowed_flags = SymbolFlags::VARIABLE
+        | SymbolFlags::INTERFACE
+        | SymbolFlags::MODULE
+        | SymbolFlags::CONST_ENUM_ONLY_MODULE;
+    let local_flags = if raw_flags.intersects(SymbolFlags::VALUE) {
+        SymbolFlags::EXPORT_VALUE
+    } else {
+        SymbolFlags::NONE
+    };
+    let namespaces = declarations
+        .iter()
+        .copied()
+        .filter(|&declaration| {
+            store.source_node_kind(declaration) == Some(SyntaxKind::ModuleDeclaration)
+        })
+        .collect::<Vec<_>>();
+    if block_node.kind != SyntaxKind::ModuleBlock
+        || block_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&node| node == statement.node)
+            .count()
+            != 1
+        || module_node.kind != SyntaxKind::ModuleDeclaration
+        || module_data.keyword != SyntaxKind::GlobalKeyword
+        || module_data.body != Some(block.node)
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|augmentation| augmentation.name() == name)
+        || store.source_identifier_text(name) != Some("global")
+        || !namespace_record.flags().intersects(SymbolFlags::MODULE)
+        || namespace_record.flags().without(SymbolFlags::TRANSIENT)
+            != store.source_symbol_flags(namespace).ok_or_else(invalid)?
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || namespace_record.name() != InternalSymbolName::Global.as_ref()
+        || !store.source_symbol_declarations_match(namespace)
+        || !store.source_symbol_export_table_matches(namespace)
+        || !store.source_declaration_belongs_to_symbol(module, namespace)
+        || namespace_record
+            .exports()
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(owner.name()))
+            != Some(raw)
+        || raw == symbol
+        || store.get_merged_symbol(raw) != Some(symbol)
+        || raw_flags.without(allowed_flags) != SymbolFlags::NONE
+        || !store.source_raw_symbol_declarations_match(raw)
+        || !store.source_symbol_export_table_matches(raw)
+        || raw_record.check_flags() != CheckFlags::NONE
+        || raw_record.name() != owner.name()
+        || raw_record.declarations() != Some(raw_declarations.as_slice())
+        || raw_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(namespace)
+        || raw_record.exports().is_some()
+            && (namespaces.is_empty()
+                || store
+                    .validate_source_merged_namespace_exports(symbol, &namespaces)
+                    .is_none())
+        || raw_record.export_symbol().is_some()
+        || !raw_flags.contains(SymbolFlags::INTERFACE) && raw_record.members().is_some()
+        || local == raw
+        || local == symbol
+        || store.get_merged_symbol(local) != Some(local)
+        || local_record.flags() != local_flags
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name() != owner.name()
+        || local_declarations != raw_declarations
+        || local_record.declarations() != Some(local_declarations.as_slice())
+        || !store.source_symbol_declarations_match(local)
+        || local_record.value_declaration().is_some()
+        || local_record.parent().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.export_symbol() != Some(raw)
+        || store
+            .value_symbol_links(local)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Checks the written ambient-module parent without querying a contributed value.
+#[allow(clippy::too_many_lines)] // The syntax and raw binder module must agree before selecting its global scope.
+fn plan_global_augmentation_parent(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    module: NodeRef,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let bound = host.bound_file(module).ok_or_else(invalid)?;
+    let source = bound.source_file();
+    if !store.source_global_augmentation_parent_is_exact(module, source) {
+        return Err(invalid());
+    }
+    let node = preflight_node(store, host, module)?;
+    let NodeData::ModuleDeclaration(global) = &node.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(module.arena, module.file, global.name);
+    if global.keyword != SyntaxKind::GlobalKeyword
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|origin| origin.name() == name)
+    {
+        return Err(invalid());
+    }
+    if node.parent == Some(source.node) {
+        return Ok(());
+    }
+    let parent = NodeRef::new(module.arena, module.file, node.parent.ok_or_else(invalid)?);
+    let parent_node = preflight_node(store, host, parent)?;
+    let NodeData::ModuleBlock(block) = &parent_node.data else {
+        return Err(invalid());
+    };
+    let outer = NodeRef::new(
+        module.arena,
+        module.file,
+        parent_node.parent.ok_or_else(invalid)?,
+    );
+    let outer_node = preflight_node(store, host, outer)?;
+    let NodeData::ModuleDeclaration(ambient) = &outer_node.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(module.arena, module.file, ambient.name);
+    let name_node = preflight_node(store, host, name)?;
+    let NodeData::StringLiteral(literal) = &name_node.data else {
+        return Err(invalid());
+    };
+    let raw = bound.symbol(outer).ok_or_else(invalid)?;
+    let owner = store.get_merged_symbol(raw).ok_or_else(invalid)?;
+    let outer_record = store.symbol(owner).ok_or_else(invalid)?;
+    if outer_node.kind != SyntaxKind::ModuleDeclaration
+        || outer_node.flags.0 != 0
+        || outer_node.parent != Some(source.node)
+        || ambient.keyword != SyntaxKind::ModuleKeyword
+        || ambient.body != Some(parent.node)
+        || ambient.symbol.is_some()
+        || ambient.local_symbol.is_some()
+        || ambient.facts != 0
+        || ambient.asterisk_token.is_some()
+        || ambient.flow_node.is_some()
+        || ambient.end_flow_node.is_some()
+        || ambient.next_container.is_some()
+        || parent_node.flags.0 != 0
+        || block
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&child| child == module.node)
+            .count()
+            != 1
+        || bound.container(module) != Some(outer)
+        || bound.container(outer) != Some(source)
+        || bound.local_symbol(outer).is_some()
+        || store.source_declaration_symbol(outer) != Some(owner)
+        || name_node.kind != SyntaxKind::StringLiteral
+        || name_node.flags.0 != 0
+        || name_node.parent != Some(outer.node)
+        || literal.token_flags.0 != 0
+        || literal.text.is_empty()
+        || outer_record.name().as_utf8() != Some(format!("\"{}\"", literal.text).as_str())
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &ambient.modifiers {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(invalid());
+        };
+        let modifier = preflight_node(
+            store,
+            host,
+            NodeRef::new(outer.arena, outer.file, *modifier),
+        )?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier.kind != SyntaxKind::DeclareKeyword
+            || modifier.flags.0 != 0
+            || modifier.parent != Some(outer.node)
+            || !matches!(modifier.data, NodeData::Token(_))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn global_callable_namespace_variable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    statement: NodeRef,
+) -> bool {
+    let Some(owner) = store.get_parent_of_symbol(symbol) else {
+        return false;
+    };
+    if store
+        .source_global_function_namespace_declarations(owner)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(statement_node) = host.node(statement) else {
+        return false;
+    };
+    let NodeData::VariableStatement(variable) = &statement_node.data else {
+        return false;
+    };
+    let Some(block) = statement_node
+        .parent
+        .map(|node| NodeRef::new(statement.arena, statement.file, node))
+    else {
+        return false;
+    };
+    let Some(block_node) = host.node(block) else {
+        return false;
+    };
+    let NodeData::ModuleBlock(block_data) = &block_node.data else {
+        return false;
+    };
+    let Some(module) = block_node
+        .parent
+        .map(|node| NodeRef::new(block.arena, block.file, node))
+    else {
+        return false;
+    };
+    let Some(NodeData::ModuleDeclaration(module_data)) = host.node(module).map(|node| &node.data)
+    else {
+        return false;
+    };
+    statement_node.flags.0 == 0
+        && variable.flow_node.is_none()
+        && variable.facts == 0
+        && module_data.body == Some(block.node)
+        && bound.symbol(module).and_then(|raw| store.get_merged_symbol(raw)) == Some(owner)
+        && block_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&node| node == statement.node)
+            .count() == 1
+        && store.symbol(symbol).is_some_and(|value| {
+            value.declarations() == Some(&[declaration])
+                && bound.local_symbol(declaration).is_none_or(|local| {
+                    store.symbol(local).is_some_and(|local| {
+                        local.flags() == SymbolFlags::EXPORT_VALUE
+                            && local.check_flags() == CheckFlags::NONE
+                            && local.name() == value.name()
+                            && local.declarations() == Some(&[declaration])
+                            && local.value_declaration().is_none()
+                            && local.parent().is_none()
+                            && local.members().is_none()
+                            && local.exports().is_none()
+                            && local.export_symbol() == bound.symbol(declaration)
+                    })
+                })
+        })
 }
 
 fn plan_variable_owner(
@@ -461,7 +1209,6 @@ fn plan_property_owner(
             if parent_node.kind == SyntaxKind::InterfaceDeclaration =>
         {
             if !owner_record.flags().contains(SymbolFlags::INTERFACE)
-                || owner_record.flags().contains(SymbolFlags::CLASS)
                 || interface
                     .members
                     .nodes
@@ -473,6 +1220,34 @@ fn plan_property_owner(
                 return Err(invalid());
             }
             preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+            if owner_record.flags().contains(SymbolFlags::CLASS) {
+                super::declared::plan_class_interface_source(store, host, owner)?;
+            }
+        }
+        NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_) => {
+            let members = match &parent_node.data {
+                NodeData::ClassDeclaration(class) => &class.members,
+                NodeData::ClassExpression(class) => &class.members,
+                _ => unreachable!(),
+            };
+            let source = super::declared::plan_class_interface_source(store, host, owner)?;
+            if source.class_declaration != Some(parent)
+                || members
+                    .nodes
+                    .iter()
+                    .filter(|member| **member == declaration.node)
+                    .count()
+                    != 1
+                || host.source(declaration).is_some_and(|(arena, _)| {
+                    ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        declaration.node,
+                        SyntaxKind::StaticKeyword,
+                    )
+                })
+            {
+                return Err(invalid());
+            }
         }
         NodeData::TypeLiteralNode(literal) if parent_node.kind == SyntaxKind::TypeLiteral => {
             let receiver = store
@@ -631,6 +1406,25 @@ fn preflight_source_property_object_rhs(
                     }
                 }
                 intersection = true;
+                current = parent;
+            }
+            NodeData::UnionTypeNode(parts)
+                if intersection
+                    && parent_node.kind == SyntaxKind::UnionType
+                    && parts
+                        .types
+                        .nodes
+                        .iter()
+                        .filter(|&&child| child == current.node)
+                        .count()
+                        == 1 =>
+            {
+                for &child in &parts.types.nodes {
+                    let child = NodeRef::new(parent.arena, parent.file, child);
+                    if preflight_node(store, host, child)?.parent != Some(parent.node) {
+                        return Err(invalid());
+                    }
+                }
                 current = parent;
             }
             NodeData::TypeAliasDeclaration(alias)
@@ -851,7 +1645,7 @@ pub(super) fn selected_property_object_alias_property(
     projection: &PropertyObjectAliasProjection,
     index: usize,
 ) -> Result<SelectedDeclaredProperty, RelationUnavailable> {
-    selected_planned_property_object_property(
+    selected_planned_declared_property(
         store,
         projection.target,
         projection.declaration,
@@ -870,7 +1664,7 @@ pub(super) fn selected_source_property_object_property(
     if let Some(alias) = projection.as_direct_alias() {
         return selected_property_object_alias_property(store, alias, index);
     }
-    selected_planned_property_object_property(
+    selected_planned_declared_property(
         store,
         projection.target(),
         projection.declaration(),
@@ -880,7 +1674,8 @@ pub(super) fn selected_source_property_object_property(
     )
 }
 
-fn selected_planned_property_object_property(
+/// Checks one planned property's source and cached value after owner validation.
+pub(super) fn selected_planned_declared_property(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
     declaration: NodeRef,
@@ -999,10 +1794,14 @@ fn cold_member_names_are_exact(
     for &declaration in declarations {
         if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
             if store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
-                && record.value_declaration() == Some(declaration)
                 && record
                     .flags()
                     .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                && (record.value_declaration() == Some(declaration)
+                    || store
+                        .source_global_interface_value_owner(owner)
+                        .map_err(|_| invalid())?
+                        .is_some_and(|proof| proof.variables().contains(&declaration)))
             {
                 continue;
             }

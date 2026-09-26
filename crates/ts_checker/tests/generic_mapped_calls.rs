@@ -824,6 +824,174 @@ fn selected_fields_alias_calls_do_not_depend_on_the_utility_name() {
 }
 
 #[test]
+fn generic_pick_alias_forwards_concrete_property_reads_cold_and_warm() {
+    let fixture = Fixture::new(
+        concat!(
+            "// @target: es2015\n",
+            "type Forward<Model, Keys extends keyof Model> = Pick<Model, Keys>;\n",
+            "interface Item { a: number; b: string; }\n",
+            "declare const selected: Forward<Item, 'b'>;\n",
+            "const good: string = selected.b;\n",
+            "const bad: number = selected.b;\n",
+        ),
+        "generic-pick-forwarding.ts",
+    );
+    let arena = &fixture.source.arena;
+    let variable = |expected: &str| {
+        arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then_some((
+                    NodeRef::new(arena.id(), SOURCE_FILE, variable.name),
+                    variable
+                        .type_
+                        .map(|node| NodeRef::new(arena.id(), SOURCE_FILE, node)),
+                ))
+            })
+            .unwrap()
+    };
+    let (selected_name, Some(annotation)) = variable("selected") else {
+        panic!("selected must retain its concrete Forward annotation");
+    };
+    let (bad_name, _) = variable("bad");
+    let properties = arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                arena.id(),
+                SOURCE_FILE,
+                node,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(properties.len(), 2);
+    let mut checker = fixture.context();
+    assert!(
+        checker
+            .store()
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+            .is_none()
+    );
+    checker.check_source_file(SOURCE_FILE).unwrap();
+    let diagnostics = checker.diagnostics().clone();
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected one assignment diagnostic: {diagnostics:?}");
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2322);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type 'string' is not assignable to type 'number'."
+    );
+    assert_eq!(diagnostic.node, Some(bad_name));
+    assert_eq!(diagnostic.range_override, None);
+    let forward = alias_owner(&mut checker, "Forward");
+    let pick = alias_owner(&mut checker, "Pick");
+    let symbolic = checker.get_declared_type_of_symbol(forward).unwrap();
+    let parameters = checker
+        .store()
+        .type_alias_links(forward)
+        .unwrap()
+        .type_parameters
+        .clone()
+        .unwrap();
+    assert_eq!(
+        alias_arguments(&checker, symbolic, forward).as_slice(),
+        parameters.as_slice()
+    );
+    let concrete = checker.get_type_at_location(selected_name).unwrap();
+    assert_ne!(concrete, symbolic);
+    assert_eq!(
+        checker.get_type_from_type_node(annotation).unwrap(),
+        concrete
+    );
+    let [object, key] = alias_arguments(&checker, concrete, forward);
+    assert_regular_literal(&checker, key, "b");
+    let item = checker
+        .store()
+        .symbol_table(checker.globals())
+        .unwrap()
+        .get_source("Item")
+        .unwrap();
+    assert_eq!(checker.get_declared_type_of_symbol(item).unwrap(), object);
+    let string = checker.store().intrinsic_bootstrap().unwrap().string_type;
+    for property in &properties {
+        assert_eq!(checker.get_type_at_location(*property).unwrap(), string);
+    }
+    let mapped = match checker.store().type_payload(concrete).unwrap().data() {
+        TypeData::Mapped(mapped) => mapped.clone(),
+        _ => panic!("Forward<Item, 'b'> must keep its mapped identity"),
+    };
+    let [property] = mapped.object.structured.properties.as_deref().unwrap() else {
+        panic!("the concrete forwarding result must select only b");
+    };
+    assert_eq!(
+        checker.store().symbol(*property).unwrap().name().as_utf8(),
+        Some("b")
+    );
+    assert_eq!(
+        checker
+            .store()
+            .value_symbol_links(*property)
+            .unwrap()
+            .resolved_type,
+        Some(string)
+    );
+    let declarations = checker.get_symbol_declarations(*property).unwrap().to_vec();
+    let forward_links = checker.store().type_alias_links(forward).unwrap().clone();
+    let pick_links = checker.store().type_alias_links(pick).unwrap().clone();
+    let symbolic_record = match checker.store().type_payload(symbolic).unwrap().data() {
+        TypeData::Mapped(mapped) => mapped.clone(),
+        _ => panic!("Forward must keep its generic mapped identity"),
+    };
+    let before = counts(&checker);
+    for _ in 0..2 {
+        checker.recheck_source_file(SOURCE_FILE).unwrap();
+        assert_eq!(
+            checker.get_type_at_location(selected_name).unwrap(),
+            concrete
+        );
+        assert_eq!(
+            checker.get_type_from_type_node(annotation).unwrap(),
+            concrete
+        );
+        for property in &properties {
+            assert_eq!(checker.get_type_at_location(*property).unwrap(), string);
+        }
+        assert_eq!(
+            checker.get_declared_type_of_symbol(forward).unwrap(),
+            symbolic
+        );
+        assert_eq!(
+            checker.store().type_payload(symbolic).unwrap().data(),
+            &TypeData::Mapped(symbolic_record.clone())
+        );
+        assert_eq!(
+            checker.store().type_payload(concrete).unwrap().data(),
+            &TypeData::Mapped(mapped.clone())
+        );
+        assert_eq!(
+            checker.get_symbol_declarations(*property).unwrap(),
+            declarations.as_slice()
+        );
+        assert_eq!(
+            checker.store().type_alias_links(forward),
+            Some(&forward_links)
+        );
+        assert_eq!(checker.store().type_alias_links(pick), Some(&pick_links));
+        assert_eq!(checker.diagnostics(), &diagnostics);
+        assert_eq!(counts(&checker), before);
+    }
+    assert!(checker.global_type_diagnostics().next().is_none());
+}
+
+#[test]
 fn selected_member_assignment_reports_ts2322() {
     let fixture = Fixture::new(
         concat!(
