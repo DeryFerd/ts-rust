@@ -50,6 +50,7 @@ use ts_goport::execute::tsc::{
     create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
     new_os_system,
 };
+use ts_goport::frontend::vfs::raw_file_bytes;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -384,7 +385,9 @@ fn new_write_file(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            std::fs::write(target, text).map_err(|e| e.to_string())
+            // Go writes the string bytes unchanged, so write each invalid
+            // source byte sentinel as its raw byte.
+            std::fs::write(target, raw_file_bytes(text)).map_err(|e| e.to_string())
         },
     )
 }

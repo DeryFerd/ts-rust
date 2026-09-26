@@ -230,7 +230,10 @@ impl OsFs {
             .open(path)
             .map_err(|err| FsError::path("open", path, err))?;
 
-        file.write_all(content.as_bytes())
+        // PORT: Go writes the string bytes unchanged. `raw_file_bytes` gives
+        // those bytes: it writes each invalid source byte sentinel (see
+        // `decode_bytes`) as its raw byte.
+        file.write_all(&raw_file_bytes(content))
             .map_err(|err| FsError::path("write", path, err))?;
 
         Ok(())

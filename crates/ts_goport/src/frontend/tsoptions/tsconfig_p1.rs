@@ -597,7 +597,10 @@ pub fn validate_json_option_value(
             }
         }
         ExtraValidation::LOCALE => {
-            // PORT: Go `locale.Parse` is not ported.
+            // PORT: Go `locale.Parse` is not ported. It is
+            // `golang.org/x/text/language.Parse`, and whether a tag is valid
+            // depends on its generated BCP 47 registry tables (see
+            // `ParsedCommandLine::locale`).
             let _ = (
                 as_string(&val),
                 diag::Locale_must_be_an_IETF_BCP_47_language_tag_Examples_Colon_0_1,

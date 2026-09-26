@@ -500,10 +500,9 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:335 setEmitDiagnostics
-    // PORT: Go `core.Map` keeps a nil entry for a file whose cached list is
-    // empty (it marshals as `null`); the port never stores an empty list
-    // (Go stores only non-empty emit diagnostics too), so it drops `None`.
+    // Go: incremental/snapshottobuildinfo.go:339 setEmitDiagnostics
+    // PORT: Go `core.Map` keeps a nil entry for a file whose cached lists are
+    // both empty. It marshals as `null` (`BuildInfoDiagnosticsOfFilePtr`).
     fn set_emit_diagnostics(&mut self) {
         let snapshot = self.snapshot;
         let mut files: Vec<Path> = snapshot.emit_diagnostics_per_file.keys().cloned().collect();
@@ -511,10 +510,9 @@ impl ToBuildInfo<'_> {
         let mut entries = Vec::with_capacity(files.len());
         for file_path in &files {
             let value = &snapshot.emit_diagnostics_per_file[file_path];
-            match self.to_build_info_diagnostics_of_file(file_path, value) {
-                Some(entry) => entries.push(entry),
-                None => unported!("setEmitDiagnostics: nil BuildInfoDiagnosticsOfFile entry"),
-            }
+            entries.push(BuildInfoDiagnosticsOfFilePtr(
+                self.to_build_info_diagnostics_of_file(file_path, value),
+            ));
         }
         self.build_info.emit_diagnostics_per_file = non_empty(entries);
     }

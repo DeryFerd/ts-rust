@@ -363,19 +363,39 @@ impl Checker {
     // isExpandableType reports whether t has a named representation that could be inlined
     // as its structural form during hover expansion. Filters out lib types.
     // When isAlias is true, checks whether t's alias symbol is from user code (not lib).
-    // PORT: both Go branches first call a lib check that is not ported. The
-    // rest of Go (enum-like, reference, class/interface and anonymous
-    // class/enum/module/function/method checks) is ported when those land.
     pub fn is_expandable_type(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
-        _t: TypeId,
+        t: TypeId,
         is_alias: bool,
     ) -> bool {
         if is_alias {
-            unported!("IsLibSymbolForHoverVerbosity")
+            return !self.is_lib_symbol_for_hover_verbosity(self.ty(t).alias.symbol());
         }
-        unported!("IsLibTypeForHoverVerbosity")
+        if self.is_lib_type_for_hover_verbosity(t) {
+            return false;
+        }
+        let ty = self.ty(t);
+        let object_flags = ty.object_flags;
+        if ty.flags.intersects(TypeFlags::ENUM_LIKE)
+            || object_flags.intersects(ObjectFlags::REFERENCE)
+            || object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE)
+        {
+            return true;
+        }
+        if object_flags.intersects(ObjectFlags::ANONYMOUS)
+            && ty.symbol.is_some()
+            && self.sym(ty.symbol).flags.intersects(
+                SymbolFlags::CLASS
+                    | SymbolFlags::ENUM
+                    | SymbolFlags::VALUE_MODULE
+                    | SymbolFlags::FUNCTION
+                    | SymbolFlags::METHOD,
+            )
+        {
+            return true;
+        }
+        false
     }
 
     // Go: checker/nodebuilderimpl.go:191 isTypeOnStack

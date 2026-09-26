@@ -22,6 +22,7 @@ use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ts_goport::baseline::type_symbol::{TestFile, generate_baseline, new_type_writer_walker};
+use ts_goport::frontend::vfs::raw_file_bytes;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -245,7 +246,13 @@ fn run(project: &str, out_dir: &str) -> i32 {
                 &unit.header,
                 is_symbol,
             );
-            std::fs::write(format!("{out_dir}/{}{ext}", unit.name), text).expect("write baseline");
+            // Go writes the baseline string bytes unchanged, so write each
+            // invalid source byte sentinel as its raw byte.
+            std::fs::write(
+                format!("{out_dir}/{}{ext}", unit.name),
+                raw_file_bytes(&text),
+            )
+            .expect("write baseline");
         }
     }
 

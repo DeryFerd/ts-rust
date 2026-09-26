@@ -81,8 +81,9 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // but augmented for a few select characters (e.g. lineSeparator, paragraphSeparator, nextLine)
 // Note that this doesn't actually wrap the input in double quotes.
 // PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch runs only
-// for U+FFFE, the port form of Go's `\xFE` prefix byte. Lone surrogates use
-// the escape unit from `encode_js_string_rune` (see
+// for the port forms of Go invalid bytes: U+FFFE for Go's `\xFE` prefix byte,
+// and the invalid source byte sentinels (see `vfs::decode_bytes`). Lone
+// surrogates use the escape unit from `encode_js_string_rune` (see
 // `scanner_util::LONE_SURROGATE_MARKER`), which `decode_js_string_rune` maps
 // back to the surrogate, so they print as `\uD800` like Go. `ch` is the
 // `char` form of `code`. For a surrogate it is U+FFFD, which matches no `ch`
@@ -103,8 +104,13 @@ fn escape_string_worker(
         // `\xFE`, which decodes as `utf8.RuneError` with size 1. This port
         // stores it as U+FFFE (INTERNAL_SYMBOL_NAME_PREFIX_CHAR), so print it
         // as that invalid byte: U+FFFD, always escaped. A real U+FFFE in source
-        // text also prints this way (Go prints it as itself).
-        let invalid_byte = code == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR as u32;
+        // text also prints this way (Go prints it as itself). An invalid
+        // source byte is also a Go invalid byte. The port stores it as a
+        // 3-byte sentinel char (see `vfs::decode_bytes`), so print it the
+        // same way. Source text that the printer copies without this worker
+        // keeps the sentinel, and the file write writes the raw byte, as Go.
+        let invalid_byte = code == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR as u32
+            || char::from_u32(code).is_some_and(crate::frontend::vfs::is_invalid_byte_sentinel);
         if invalid_byte {
             code = char::REPLACEMENT_CHARACTER as u32;
         }

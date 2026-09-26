@@ -789,6 +789,13 @@ pub fn json_marshal<T: MarshalerTo + ?Sized>(
 // PORT: not ported. Only the LSP, API and build-info writers use them.
 
 // Go: json/json.go:41 MarshalIndent
+// PORT: the Rust marshalers write compact output. Go passes
+// `jsontext.WithIndentPrefix` and `jsontext.WithIndent`, which make the
+// encoder add whitespace before each token as it writes it
+// (`encoderState.WriteToken` and `WriteValue` call `MayAppendDelim` and
+// `appendWhitespace`). That whitespace depends only on the token sequence,
+// so this marshals compact output and replays its tokens through the same
+// rules (`json_append_multiline`).
 pub fn json_marshal_indent<T: MarshalerTo + ?Sized>(
     input: &T,
     prefix: &str,
@@ -798,7 +805,246 @@ pub fn json_marshal_indent<T: MarshalerTo + ?Sized>(
         // WithIndentPrefix and WithIndent imply multiline output, so skip them.
         return json_marshal(input, &[]);
     }
-    unported!("json.MarshalIndent with jsontext.WithIndentPrefix/WithIndent")
+    json_check_indent(prefix, " in indent prefix");
+    json_check_indent(indent, " in indent");
+    let compact = json_marshal(input, &[])?;
+    json_append_multiline(&compact, prefix, indent)
+}
+
+// Go: jsontext/options.go:232 WithIndent and :265 WithIndentPrefix
+// (the character checks). Go panics when the value holds anything but
+// spaces and tabs.
+// PORT: Go quotes the first bad rune with `jsonwire.QuoteRune`
+// (`strconv.QuoteRune`); Rust `{:?}` gives the same `'x'` form for
+// printable characters.
+fn json_check_indent(value: &str, what: &str) {
+    if let Some(c) = value.trim_matches([' ', '\t']).chars().next() {
+        panic!("json: invalid character {c:?}{what}");
+    }
+}
+
+/// Go `jsontext.stateEntry`, reduced to what the encoder whitespace reads:
+/// the nesting type and the number of tokens written at this level (object
+/// names and values both count).
+#[derive(Clone, Copy, Debug)]
+struct JsonMultilineEntry {
+    is_object: bool,
+    length: i64,
+}
+
+impl JsonMultilineEntry {
+    // Go: jsontext/state.go:480 needImplicitColon
+    fn need_implicit_colon(self) -> bool {
+        self.need_object_value()
+    }
+
+    // Go: jsontext/state.go:486 needObjectValue
+    fn need_object_value(self) -> bool {
+        self.is_object && self.length % 2 == 1
+    }
+
+    // Go: jsontext/state.go:493 needImplicitComma
+    fn need_implicit_comma(self, next: u8) -> bool {
+        !self.need_object_value() && self.length > 0 && next != b'}' && next != b']'
+    }
+}
+
+/// Go `jsontext.stateMachine`. `last` starts as the top-level virtual array
+/// (Go `stateMachine.reset`).
+#[derive(Debug)]
+struct JsonMultilineState {
+    stack: Vec<JsonMultilineEntry>,
+    last: JsonMultilineEntry,
+}
+
+impl JsonMultilineState {
+    // Go: jsontext/state.go:249 Depth
+    fn depth(&self) -> usize {
+        self.stack.len() + 1
+    }
+
+    // Go: jsontext/state.go:372 NeedIndent
+    /// NeedIndent reports whether indent whitespace should be injected.
+    /// A zero value means that no whitespace should be injected.
+    /// A positive value means '\n', indentPrefix, and (n-1) copies of indentBody
+    /// should be appended to the output immediately before the next token.
+    fn need_indent(&self, next: u8) -> usize {
+        let will_end = next == b'}' || next == b']';
+        if self.depth() == 1 {
+            0 // top-level values are never indented
+        } else if self.last.length == 0 && will_end {
+            0 // an empty object or array is never indented
+        } else if self.last.length == 0 || self.last.need_implicit_comma(next) {
+            self.depth()
+        } else if will_end {
+            self.depth() - 1
+        } else {
+            0
+        }
+    }
+
+    // Go: jsontext/state.go:389 MayAppendDelim
+    /// MayAppendDelim appends a colon or comma that may precede the next token.
+    fn may_append_delim(&self, b: &mut String, next: u8) {
+        if self.last.need_implicit_colon() {
+            b.push(':');
+        } else if self.last.need_implicit_comma(next) && !self.stack.is_empty() {
+            // comma not needed for top-level values
+            b.push(',');
+        }
+    }
+
+    // Go: jsontext/state.go:403 needDelim
+    /// needDelim reports whether a colon or comma token should be implicitly emitted
+    /// before the next token of the specified kind.
+    /// A zero value means no delimiter should be emitted.
+    fn need_delim(&self, next: u8) -> u8 {
+        if self.last.need_implicit_colon() {
+            b':'
+        } else if self.last.need_implicit_comma(next) && !self.stack.is_empty() {
+            // comma not needed for top-level values
+            b','
+        } else {
+            0
+        }
+    }
+
+    // Go: jsontext/state.go:270 appendLiteral, :284 appendString and :296
+    // appendNumber
+    fn increment(&mut self) {
+        self.last.length += 1;
+    }
+
+    // Go: jsontext/state.go:302 pushObject and :337 pushArray
+    fn push(&mut self, is_object: bool) {
+        self.last.length += 1;
+        self.stack.push(self.last);
+        self.last = JsonMultilineEntry {
+            is_object,
+            length: 0,
+        };
+    }
+
+    // Go: jsontext/state.go:320 popObject and :355 popArray
+    fn pop(&mut self) -> Result<(), JsonError> {
+        self.last = self
+            .stack
+            .pop()
+            .ok_or_else(|| JsonError::new("mismatching structural token"))?;
+        Ok(())
+    }
+}
+
+// Go: jsontext/encode.go:634 appendWhitespace
+/// appendWhitespace appends whitespace that immediately precedes the next token.
+// PORT: the flags are the ones `jsonopts.Struct.InitializeMultiline` sets for
+// `WithIndentPrefix`/`WithIndent`: `SpaceAfterColon` on, `SpaceAfterComma`
+// off, `Multiline` on.
+fn json_append_whitespace(
+    m: &JsonMultilineState,
+    b: &mut String,
+    next: u8,
+    prefix: &str,
+    indent: &str,
+) {
+    if m.need_delim(next) == b':' {
+        // SpaceAfterColon
+        b.push(' ');
+    } else {
+        // SpaceAfterComma is off; Multiline is on.
+        json_append_indent(b, m.need_indent(next), prefix, indent);
+    }
+}
+
+// Go: jsontext/encode.go:652 AppendIndent
+/// AppendIndent appends the appropriate number of indentation characters
+/// for the current nested level, n.
+fn json_append_indent(b: &mut String, mut n: usize, prefix: &str, indent: &str) {
+    if n == 0 {
+        return;
+    }
+    b.push('\n');
+    b.push_str(prefix);
+    while n > 1 {
+        b.push_str(indent);
+        n -= 1;
+    }
+}
+
+// PORT: the multiline encoder pass. It reads each token of the compact
+// output, drops the compact `:` and `,` (and any whitespace, like Go
+// `reformatValue`), and writes the token the way Go `WriteToken` does:
+// `MayAppendDelim`, then `appendWhitespace`, then the token bytes, then the
+// state machine update. Top-level output has no trailing newline, as in Go
+// `json.Marshal`.
+fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<String, JsonError> {
+    let src = compact.as_bytes();
+    let mut b = String::with_capacity(compact.len() * 2);
+    let mut m = JsonMultilineState {
+        stack: Vec::new(),
+        last: JsonMultilineEntry {
+            is_object: false,
+            length: 0,
+        },
+    };
+    let mut i = 0;
+    while i < src.len() {
+        let c = src[i];
+        if c == b',' || c == b':' || is_ws(c) {
+            i += 1;
+            continue;
+        }
+        let k = normalize_kind(c);
+        m.may_append_delim(&mut b, k);
+        json_append_whitespace(&m, &mut b, k, prefix, indent);
+        let start = i;
+        match k {
+            b'"' => {
+                i += 1;
+                while i < src.len() && src[i] != b'"' {
+                    if src[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= src.len() {
+                    return Err(JsonError::new("unexpected EOF within string"));
+                }
+                i += 1;
+                m.increment();
+            }
+            b'0' => {
+                while i < src.len()
+                    && matches!(src[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                m.increment();
+            }
+            b'n' | b't' | b'f' => {
+                while i < src.len() && src[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                m.increment();
+            }
+            b'{' | b'[' => {
+                i += 1;
+                m.push(k == b'{');
+            }
+            b'}' | b']' => {
+                i += 1;
+                m.pop()?;
+            }
+            _ => {
+                return Err(JsonError::new(format!(
+                    "invalid character {:?} at start of value",
+                    char::from(c)
+                )));
+            }
+        }
+        b.push_str(&compact[start..i]);
+    }
+    Ok(b)
 }
 
 // Go: json/json.go:49 MarshalIndentWrite
@@ -846,7 +1092,7 @@ pub fn json_allow_duplicate_names(allow: bool) -> JsonOption {
 // Go: json/json.go:73 Deterministic
 // Go: json/json.go:77 WithIndent
 // PORT: not ported. Map output order is only needed by build-info and
-// baseline writers, and indentation is not ported (see MarshalIndent).
+// baseline writers. Indentation is available through `json_marshal_indent`.
 
 // Go: json/json.go:81 NewDecoder
 // PORT: Go reads from an `io.Reader`; the Rust decoder reads a complete
@@ -861,3 +1107,24 @@ pub fn json_new_decoder(r: &[u8]) -> JsonDecoder<'_> {
 // (BeginObject, EndObject, Null, BeginArray, EndArray).
 // PORT: `JsonToken` variants and `JsonToken::kind` stand in for the token
 // values. `Value` is `&[u8]`, `Kind` is `u8`, `Decoder` is `JsonDecoder`.
+
+#[cfg(test)]
+mod marshal_indent_tests {
+    use super::*;
+
+    // Expected values come from Go JSON v2 `json.Marshal` with
+    // `jsontext.WithIndentPrefix` and `jsontext.WithIndent`.
+    #[test]
+    fn multiline_output_matches_go() {
+        assert_eq!(
+            json_append_multiline(r#"["x",true,[],{},["a",["b"]]]"#, "", "  ").unwrap(),
+            "[\n  \"x\",\n  true,\n  [],\n  {},\n  [\n    \"a\",\n    [\n      \"b\"\n    ]\n  ]\n]"
+        );
+        assert_eq!(
+            json_append_multiline(r#"{"a":["x","y:{"],"b":[],"c":[[true],[]]}"#, " ", "\t")
+                .unwrap(),
+            "{\n \t\"a\": [\n \t\t\"x\",\n \t\t\"y:{\"\n \t],\n \t\"b\": [],\n \t\"c\": [\n \t\t[\n \t\t\ttrue\n \t\t],\n \t\t[]\n \t]\n }"
+        );
+        assert_eq!(json_marshal_indent("s", "", "  ").unwrap(), "\"s\"");
+    }
+}

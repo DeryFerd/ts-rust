@@ -1109,6 +1109,19 @@ pub fn string_to_token(s: &str) -> SyntaxKind {
     text_to_keyword(s)
 }
 
+// Go: scanner/scanner.go:2288 GetViableKeywordSuggestions
+// PORT: Go ranges over the `textToKeyword` map, so its order is random. Here
+// the order is the keyword table order.
+pub fn get_viable_keyword_suggestions() -> Vec<String> {
+    let mut result = Vec::with_capacity(TEXT_TO_KEYWORD.len());
+    for &(text, _) in TEXT_TO_KEYWORD {
+        if text.len() > 2 {
+            result.push(text.to_string());
+        }
+    }
+    result
+}
+
 const MAX_ASCII_CHARACTER: u8 = 127;
 
 // Go: scanner/scanner.go:2298 couldStartTrivia
@@ -1623,23 +1636,34 @@ impl RsScanner {
             .unwrap_or_default();
         self.token_flags = go_token_flags(token.flags);
         let checkpoint = inner.mark();
-        let diagnostics: Vec<(u32, i32, i32)> = inner
-            .diagnostics()
-            .iter()
-            .map(|d| {
-                let code = d
-                    .code
-                    .unwrap_or_else(|| unported!("scanner diagnostic without a code"));
-                let start = d.range.start.get() as i32;
-                (code, start, d.range.end.get() as i32 - start)
-            })
-            .collect();
+        // Go: scanner/scanner.go:425 errorAt calls onError only when it is set.
+        // PORT: Go passes the `*diagnostics.Message` itself. ts_scanner gives
+        // the catalog code instead. Every ts_scanner diagnostic has one:
+        // `Scanner::error` maps each message it reports to its code and
+        // `Scanner::error_with_code` takes the code, and both look the code
+        // up in the catalog when they report it. So both lookups here hold.
+        let diagnostics: Vec<(&'static ts_diagnostics::Message, i32, i32)> =
+            if self.on_error.is_some() {
+                inner
+                    .diagnostics()
+                    .iter()
+                    .map(|d| {
+                        let code = d
+                            .code
+                            .expect("ts_scanner reports every diagnostic with a code");
+                        let message = ts_diagnostics::message_by_code(code)
+                            .expect("ts_scanner diagnostic codes are in the catalog");
+                        let start = d.range.start.get() as i32;
+                        (message, start, d.range.end.get() as i32 - start)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         drop(inner);
         self.checkpoint = Some(checkpoint);
         if let Some(on_error) = self.on_error.as_mut() {
-            for (code, start, length) in diagnostics {
-                let message = ts_diagnostics::message_by_code(code)
-                    .unwrap_or_else(|| unported!("scanner diagnostic code not in the catalog"));
+            for (message, start, length) in diagnostics {
                 on_error(message, start, length);
             }
         }

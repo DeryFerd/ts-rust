@@ -10,7 +10,8 @@
 //!   slice as `[]` and omits only a nil slice.
 //! - Go `[]*T` elements that are JSON `null` become nil pointers in Go. The
 //!   Rust elements are values, so a `null` element is an unmarshal error
-//!   (the reader then returns no buildinfo). Go never writes such elements.
+//!   (the reader then returns no buildinfo). Go writes such an element only
+//!   in `emitDiagnosticsPerFile` (`BuildInfoDiagnosticsOfFilePtr`).
 //! - Go `int` is `i32` (PORTING.md). Integers are read like the v2 int
 //!   arshaler: digits only, no fraction or exponent.
 
@@ -308,8 +309,15 @@ fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), JsonErr
         }
         CompilerOptionsValue::Number(f) => marshal_float(enc, *f)?,
         CompilerOptionsValue::String(s) => s.marshal_json_to(enc)?,
+        // Go v2 struct arshaler: `diagnostics.Message` has only unexported
+        // fields and no `json` tags, so marshaling it fails with
+        // `errNoExportedFields` (go-json-experiment fields.go:77).
+        // PORT: v2 also names the JSON pointer and picks "cannot" or
+        // "unable to" at random; this text has neither (see json.rs).
         CompilerOptionsValue::Message(_) => {
-            unported!("json.Marshal of *diagnostics.Message in buildinfo options")
+            return Err(json_error(
+                "json: cannot marshal from Go diagnostics.Message: Go struct has no exported fields",
+            ));
         }
         // Go: core/tristate.go:55 MarshalJSON
         CompilerOptionsValue::Tristate(t) => {
@@ -946,6 +954,49 @@ impl UnmarshalerFrom for BuildInfoDiagnosticsOfFile {
     }
 }
 
+/// Go `*BuildInfoDiagnosticsOfFile`, an element of
+/// `BuildInfo.EmitDiagnosticsPerFile`. `None` is Go nil.
+// PORT: `setEmitDiagnostics` keeps each `toBuildInfoDiagnosticsOfFile`
+// result, and that is nil for a file whose cached lists are both empty. Go
+// marshals the nil element as `null`. Field reads go through `Deref`, which
+// panics on nil like a Go nil pointer dereference.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildInfoDiagnosticsOfFilePtr(pub Option<BuildInfoDiagnosticsOfFile>);
+
+impl std::ops::Deref for BuildInfoDiagnosticsOfFilePtr {
+    type Target = BuildInfoDiagnosticsOfFile;
+
+    fn deref(&self) -> &BuildInfoDiagnosticsOfFile {
+        self.0
+            .as_ref()
+            .expect("invalid memory address or nil pointer dereference")
+    }
+}
+
+impl MarshalerTo for BuildInfoDiagnosticsOfFilePtr {
+    // Go v2 pointer marshaler: nil is `null`, else the pointee's `MarshalJSON`.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        match &self.0 {
+            Some(diagnostics) => diagnostics.marshal_json_to(enc),
+            None => {
+                enc.push_str("null");
+                Ok(())
+            }
+        }
+    }
+}
+
+impl UnmarshalerFrom for BuildInfoDiagnosticsOfFilePtr {
+    // PORT: `unmarshal_elem` rejects a `null` element before this runs (see
+    // the module doc), so the result is never nil.
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let mut diagnostics = BuildInfoDiagnosticsOfFile::default();
+        diagnostics.unmarshal_json_from(dec)?;
+        self.0 = Some(diagnostics);
+        Ok(())
+    }
+}
+
 // Go: incremental/buildInfo.go:233 UnmarshalJSON (body)
 fn build_info_diagnostics_of_file_from_bytes(
     data: &[u8],
@@ -1327,7 +1378,7 @@ pub struct BuildInfo {
     pub options: Option<IndexMap<String, CompilerOptionsValue>>,
     pub referenced_map: Option<Vec<BuildInfoReferenceMapEntry>>,
     pub semantic_diagnostics_per_file: Option<Vec<BuildInfoSemanticDiagnostic>>,
-    pub emit_diagnostics_per_file: Option<Vec<BuildInfoDiagnosticsOfFile>>,
+    pub emit_diagnostics_per_file: Option<Vec<BuildInfoDiagnosticsOfFilePtr>>,
     pub change_file_set: Option<Vec<BuildInfoFileId>>,
     pub affected_files_pending_emit: Option<Vec<BuildInfoFilePendingEmit>>,
     pub latest_changed_dts_file: String, // Because this is only output file in the program, we dont need fileId to deduplicate name

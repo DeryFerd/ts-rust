@@ -42,6 +42,9 @@ pub(crate) const RUNE_SELF: i32 = 0x80;
 /// Go `utf8.DecodeRuneInString(text[pos:])`. Returns `(RuneError, 0)` at the
 /// end and `(RuneError, 1)` for an invalid sequence (for example `pos` inside
 /// a multi-byte character).
+// PORT: an invalid source byte is a 3-byte sentinel char in the text (see
+// `vfs::decode_bytes`). It decodes as `(RuneError, 3)`, not Go's
+// `(RuneError, 1)`: its width in the text is 3.
 pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if pos >= bytes.len() {
@@ -67,12 +70,15 @@ pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
         .ok()
         .and_then(|s| s.chars().next())
     {
+        Some(ch) if is_invalid_byte_sentinel(ch) => (RUNE_ERROR, width as i32),
         Some(ch) => (ch as i32, width as i32),
         None => (RUNE_ERROR, 1),
     }
 }
 
 /// Go `utf8.DecodeLastRuneInString(text[:end])`.
+// PORT: an invalid source byte sentinel decodes as `(RuneError, 3)`, as in
+// `utf8_decode_rune_in_string`.
 pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if end == 0 {
@@ -120,6 +126,7 @@ fn decode_rune_in_bytes(bytes: &[u8]) -> (i32, i32) {
         .ok()
         .and_then(|s| s.chars().next())
     {
+        Some(ch) if is_invalid_byte_sentinel(ch) => (RUNE_ERROR, width as i32),
         Some(ch) => (ch as i32, width as i32),
         None => (RUNE_ERROR, 1),
     }
