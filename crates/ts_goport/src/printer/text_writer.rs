@@ -266,3 +266,17 @@ pub fn new_text_writer(new_line: &str, indent_size: i32) -> TextWriter {
     w.clear();
     w
 }
+
+// PORT: not a Go function. Go code in package printer writes the struct
+// literal `textWriter{newLine: newLine, indentSize: indentSize}` (for example
+// `NewChangeTrackerWriter`). The fields are private to this file, so this
+// builds that literal. Unlike `new_text_writer`, it keeps an indent size of 0
+// and does not call `clear`.
+#[must_use]
+pub(crate) fn new_text_writer_literal(new_line: &str, indent_size: i32) -> TextWriter {
+    TextWriter {
+        new_line: new_line.to_string(),
+        indent_size,
+        ..TextWriter::default()
+    }
+}

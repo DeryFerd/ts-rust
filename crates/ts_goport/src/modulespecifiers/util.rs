@@ -2,6 +2,10 @@
 
 use crate::prelude::*;
 
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+
+use crate::gostd::regexp;
+
 use super::deps;
 use super::specifiers::{get_all_module_paths, get_info, try_get_module_name_as_node_module};
 use super::tspath;
@@ -39,18 +43,109 @@ pub fn path_is_bare_specifier(path: &str) -> bool {
     !tspath::path_is_absolute(path) && !tspath::path_is_relative(path)
 }
 
+// Go: modulespecifiers/util.go:19 regexPatternCacheKey
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RegexPatternCacheKey {
+    pattern: String,
+    case_insensitive: bool,
+}
+
+// Go: modulespecifiers/util.go:24 regexPatternCache
+// PORT: Go guards the map with a sync.RWMutex. Checker threads can reach
+// this code (the declaration emitter), so the port keeps the lock. A panic
+// under the lock (an unported regexp feature) must not block later calls,
+// so a poisoned lock is used as is.
+static REGEX_PATTERN_CACHE: LazyLock<
+    RwLock<FxHashMap<RegexPatternCacheKey, Option<Arc<regexp::Regexp>>>>,
+> = LazyLock::new(Default::default);
+
 // Go: modulespecifiers/util.go:46 IsExcludedByRegex
 pub fn is_excluded_by_regex(module_specifier: &str, excludes: &[String]) -> bool {
-    if excludes.is_empty() {
-        return false;
+    for pattern in excludes {
+        let Some(re) = string_to_regex(pattern) else {
+            continue;
+        };
+        if re.match_string(module_specifier) {
+            return true;
+        }
     }
-    // PORT: Go compiles each pattern with `stringToRegex` (a Go `regexp`
-    // (RE2) pattern, with an optional /.../i form) and tests
-    // `module_specifier`. This crate has no regex engine, and Go `regexp`
-    // plus `regexp/syntax` is about 6,600 lines. Only language-service
-    // preferences set excludes; the declaration emitter always passes none.
-    let _ = module_specifier;
-    unported!("stringToRegex")
+    false
+}
+
+// Go: modulespecifiers/util.go:59 stringToRegex
+fn string_to_regex(pattern: &str) -> Option<Arc<regexp::Regexp>> {
+    let mut pattern = pattern;
+    let mut case_insensitive = false;
+
+    let pb = pattern.as_bytes();
+    if pb.len() > 2 && pb[0] == b'/' {
+        // PORT: Go's strings.LastIndex returns -1 when there is no match;
+        // pattern[0] is '/', so there is always one.
+        let last_slash = pattern.rfind('/').unwrap_or(0);
+        if last_slash > 0 {
+            let mut has_unescaped_middle_slash = false;
+            for i in 1..last_slash {
+                if pb[i] == b'/' && (i == 0 || pb[i - 1] != b'\\') {
+                    has_unescaped_middle_slash = true;
+                    break;
+                }
+            }
+
+            if !has_unescaped_middle_slash {
+                let flags = &pattern[last_slash + 1..];
+                pattern = &pattern[1..last_slash];
+
+                for flag in flags.chars() {
+                    if flag == 'i' {
+                        case_insensitive = true;
+                    }
+                }
+            }
+        }
+    }
+    let key = RegexPatternCacheKey {
+        pattern: pattern.to_string(),
+        case_insensitive,
+    };
+
+    {
+        let cache = REGEX_PATTERN_CACHE
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(re) = cache.get(&key) {
+            return re.clone();
+        }
+    }
+
+    let mut cache = REGEX_PATTERN_CACHE
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(re) = cache.get(&key) {
+        return re.clone();
+    }
+
+    if cache.len() > 1000 {
+        cache.clear();
+    }
+
+    let compile_pattern = if case_insensitive {
+        format!("(?i:{pattern})")
+    } else {
+        pattern.to_string()
+    };
+
+    match regexp::compile_exported(&compile_pattern) {
+        Err(_) => {
+            cache.insert(key, None);
+            None
+        }
+        Ok(compiled) => {
+            let compiled = Arc::new(compiled);
+            cache.insert(key, Some(compiled.clone()));
+            Some(compiled)
+        }
+    }
 }
 
 // Go: modulespecifiers/util.go:130 ensurePathIsNonModuleName

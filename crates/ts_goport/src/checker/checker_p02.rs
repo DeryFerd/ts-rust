@@ -665,7 +665,7 @@ impl Checker {
     // Go: checker/checker.go:1464 createNameResolver
     // PORT: Go binds checker methods as closures. Here each callback takes the
     // checker as its first argument (see `nameresolver.rs`). Go
-    // `c.compilerOptions` is `program.Options()`, which is `prog().options`.
+    // `c.compilerOptions` is `program.Options()`, which is `self.compiler_options`.
     pub fn create_name_resolver(&self) -> NameResolver {
         let get_symbol_of_declaration: NameResolverGetSymbolOfDeclarationFn =
             Rc::new(|c: &mut Checker, node: Node| -> SymbolId {
@@ -679,9 +679,11 @@ impl Checker {
              -> Diagnostic { c.error(location, message, args) },
         );
         let lookup: NameResolverLookupFn = Rc::new(
-            |c: &mut Checker, symbols: SymbolTable, name: &str, meaning: SymbolFlags| -> SymbolId {
-                c.get_symbol(symbols, name, meaning)
-            },
+            |c: &mut Checker,
+             symbols: SymbolTable,
+             key: TableKey<'_>,
+             meaning: SymbolFlags|
+             -> SymbolId { c.get_symbol_key(symbols, key, meaning) },
         );
         let symbol_referenced: NameResolverSymbolReferencedFn =
             Rc::new(|c: &mut Checker, symbol: SymbolId, meaning: SymbolFlags| {
@@ -739,7 +741,7 @@ impl Checker {
             },
         );
         NameResolver {
-            compiler_options: &prog().options,
+            compiler_options: self.compiler_options,
             get_symbol_of_declaration: Some(get_symbol_of_declaration),
             error: Some(error),
             globals: self.globals,
@@ -769,8 +771,12 @@ impl Checker {
              -> Diagnostic { c.error(location, message, args) },
         );
         let lookup: NameResolverLookupFn = Rc::new(
-            |c: &mut Checker, symbols: SymbolTable, name: &str, meaning: SymbolFlags| -> SymbolId {
-                c.get_suggestion_for_symbol_name_lookup(symbols, name, meaning)
+            |c: &mut Checker,
+             symbols: SymbolTable,
+             key: TableKey<'_>,
+             meaning: SymbolFlags|
+             -> SymbolId {
+                c.get_suggestion_for_symbol_name_lookup(symbols, key, meaning)
             },
         );
         let symbol_referenced: NameResolverSymbolReferencedFn =
@@ -786,7 +792,7 @@ impl Checker {
                 c.get_requires_scope_change_cache(node)
             });
         NameResolver {
-            compiler_options: &prog().options,
+            compiler_options: self.compiler_options,
             get_symbol_of_declaration: Some(get_symbol_of_declaration),
             error: Some(error),
             globals: self.globals,
@@ -828,7 +834,7 @@ impl Checker {
         property_with_invalid_initializer: Node,
         result: SymbolId,
     ) -> bool {
-        if !prog().options.get_emit_standard_class_fields() {
+        if !self.compiler_options.get_emit_standard_class_fields() {
             if error_location.is_some()
                 && result.is_nil()
                 && self.check_and_report_error_for_missing_prefix(error_location, name)
@@ -1342,13 +1348,15 @@ impl Checker {
     }
 
     // Go: checker/checker.go:1759 getSuggestionForSymbolNameLookup
+    // PORT: the name is a `TableKey` because this is a `NameResolver` lookup
+    // callback (see `NameResolverLookupFn`).
     pub fn get_suggestion_for_symbol_name_lookup(
         &mut self,
         symbols: SymbolTable,
-        name: &str,
+        name: TableKey<'_>,
         meaning: SymbolFlags,
     ) -> SymbolId {
-        let symbol = self.get_symbol(symbols, name, meaning);
+        let symbol = self.get_symbol_key(symbols, name, meaning);
         if symbol.is_some() {
             return symbol;
         }
@@ -1358,7 +1366,7 @@ impl Checker {
             let extras = self.get_primitive_type_alias_suggestions(symbols);
             candidates.extend(extras);
         }
-        self.get_spelling_suggestion_for_name(name, &candidates, meaning)
+        self.get_spelling_suggestion_for_name(name.text(), &candidates, meaning)
     }
 
     // Go: checker/checker.go:1784 getSpellingSuggestionForName
@@ -1480,7 +1488,7 @@ impl Checker {
                 })
             {
                 self.error_or_suggestion(
-                    prog().options.allow_umd_global_access != Tristate::True,
+                    self.compiler_options.allow_umd_global_access != Tristate::True,
                     error_location,
                     diag::X_0_refers_to_a_UMD_global_but_the_current_file_is_a_module_Consider_adding_an_import_instead,
                     args![name],
@@ -1559,7 +1567,7 @@ impl Checker {
         }
         // Look at 'compilerOptions.isolatedModules' and not 'getIsolatedModules(...)' (which considers 'verbatimModuleSyntax')
         // here because 'verbatimModuleSyntax' will already have an error for importing a type without 'import type'.
-        if prog().options.isolated_modules == Tristate::True
+        if self.compiler_options.isolated_modules == Tristate::True
             && result.is_some()
             && is_in_external_module
             && (meaning & SymbolFlags::VALUE) == SymbolFlags::VALUE
@@ -1654,7 +1662,7 @@ impl Checker {
                 ));
             } else {
                 debug_assert!(result_flags.intersects(SymbolFlags::CONST_ENUM));
-                if prog().options.get_isolated_modules() {
+                if self.compiler_options.get_isolated_modules() {
                     diagnostic = Some(new_diagnostic_for_node(
                         error_location,
                         diag::Enum_0_used_before_its_declaration,

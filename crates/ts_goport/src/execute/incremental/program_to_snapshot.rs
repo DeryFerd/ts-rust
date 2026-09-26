@@ -109,13 +109,29 @@ impl ToProgramSnapshot<'_> {
             });
 
         let files = source_files();
+        // PORT: perf. Go runs this loop in a WorkGroup. The checker part of
+        // `getReferencedFiles` runs on the file's checker thread, so the jobs
+        // of every file are sent first and run in parallel; the loop takes
+        // each result in file order. Each checker still gets its files in
+        // the same order. Binding comes first, as in the first iteration of
+        // the loop (`file_affects_global_scope`).
+        bind_all();
+        let mut reference_jobs: std::collections::VecDeque<_> = files
+            .iter()
+            .map(|&file| start_referenced_files_job(file))
+            .collect();
         for file in files {
             let file_path = Path(source_file_info(file).path.clone());
             let version = self.snapshot.compute_hash(source_file_text(file));
             let implied_node_format = get_source_file_meta_data(&file_path).implied_node_format;
             let affects_global_scope = file_affects_global_scope(file);
             let mut signature = String::new();
-            let new_references = get_referenced_files(file);
+            let new_references = finish_referenced_files(
+                file,
+                reference_jobs
+                    .pop_front()
+                    .expect("one referenced files job per file"),
+            );
             if let Some(new_references) = &new_references {
                 self.snapshot
                     .referenced_map
@@ -365,44 +381,53 @@ fn add_referenced_file_from_file_name(
 // of each part. They are added to the set in Go order.
 #[must_use]
 pub fn get_referenced_files(file: Node) -> Option<IndexSet<Path>> {
-    let mut referenced_files: IndexSet<Path> = IndexSet::default();
+    finish_referenced_files(file, start_referenced_files_job(file))
+}
 
+/// The paths that the checker part of `get_referenced_files` finds: imports,
+/// module augmentations and ambient modules.
+pub type ReferencedFilesJob = CheckerJob<(Vec<Path>, Vec<Path>, Vec<Path>)>;
+
+/// Sends the checker part of `get_referenced_files` for `file` to its checker
+/// thread without waiting (see `compute_program_file_changes`).
+pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
     // We need to use a set here since the code can contain the same import twice,
     // but that will only be one dependency.
     // To avoid invernal conversion, the key of the referencedFiles map must be of type Path
     let imports = source_file_info(file).imports.clone();
     let module_augmentations = source_file_info(file).module_augmentations.clone();
-    let (import_paths, augmentation_paths, ambient_paths) =
-        get_type_checker_for_file_exclusive(file, move |checker| {
-            let mut import_paths = Vec::new();
-            for import_name in imports {
-                add_referenced_files_from_import_literal(
-                    file,
-                    &mut import_paths,
-                    checker,
-                    import_name,
-                );
+    send_type_checker_job_for_file(file, move |checker| {
+        let mut import_paths = Vec::new();
+        for import_name in imports {
+            add_referenced_files_from_import_literal(file, &mut import_paths, checker, import_name);
+        }
+        let mut augmentation_paths = Vec::new();
+        // Add module augmentation as references
+        for module_name in module_augmentations {
+            if !is_string_literal(module_name) {
+                continue;
             }
-            let mut augmentation_paths = Vec::new();
-            // Add module augmentation as references
-            for module_name in module_augmentations {
-                if !is_string_literal(module_name) {
-                    continue;
-                }
-                add_referenced_files_from_import_literal(
-                    file,
-                    &mut augmentation_paths,
-                    checker,
-                    module_name,
-                );
-            }
-            let mut ambient_paths = Vec::new();
-            // From ambient modules
-            for ambient_module in checker.get_ambient_modules() {
-                add_referenced_files_from_symbol(checker, file, &mut ambient_paths, ambient_module);
-            }
-            (import_paths, augmentation_paths, ambient_paths)
-        });
+            add_referenced_files_from_import_literal(
+                file,
+                &mut augmentation_paths,
+                checker,
+                module_name,
+            );
+        }
+        let mut ambient_paths = Vec::new();
+        // From ambient modules
+        for ambient_module in checker.get_ambient_modules() {
+            add_referenced_files_from_symbol(checker, file, &mut ambient_paths, ambient_module);
+        }
+        (import_paths, augmentation_paths, ambient_paths)
+    })
+}
+
+/// The rest of `get_referenced_files`, with the result of its checker job.
+#[must_use]
+pub fn finish_referenced_files(file: Node, job: ReferencedFilesJob) -> Option<IndexSet<Path>> {
+    let mut referenced_files: IndexSet<Path> = IndexSet::default();
+    let (import_paths, augmentation_paths, ambient_paths) = job.wait();
     referenced_files.extend(import_paths);
 
     let source_file_directory = get_directory_path(source_file_file_name(file));

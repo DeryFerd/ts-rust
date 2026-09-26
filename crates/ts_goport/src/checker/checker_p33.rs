@@ -245,13 +245,14 @@ impl Checker {
             }
             return Vec::new();
         }
-        let args = node.arguments().to_vec();
-        let spread_index = self.get_spread_argument_index(&args);
-        if spread_index >= 0 {
+        // PERF: read the arguments in place (`NodeSlice` is program data) and
+        // copy them only into the result. This is `get_spread_argument_index`
+        // on the slice.
+        let args = node.arguments();
+        if let Some(spread_index) = args.iter().position(is_spread_argument) {
             // Create synthetic arguments from spreads of tuple types.
-            let mut effective_args: Vec<Node> = args[..spread_index as usize].to_vec();
-            for i in spread_index as usize..args.len() {
-                let arg = args[i];
+            let mut effective_args: Vec<Node> = args.iter().take(spread_index).collect();
+            for arg in args.iter().skip(spread_index) {
                 let mut spread_type = TypeId::NIL;
                 // We can call checkExpressionCached because spread expressions never have a contextual type.
                 if is_spread_element(arg) {
@@ -286,7 +287,7 @@ impl Checker {
             }
             return effective_args;
         }
-        args
+        args.to_vec()
     }
 
     // Go: checker/checker.go:29860 getSpreadArgumentIndex

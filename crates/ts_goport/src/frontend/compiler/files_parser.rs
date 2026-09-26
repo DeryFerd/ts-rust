@@ -431,7 +431,13 @@ impl FilesParser {
             let existing_task = data.borrow().tasks.get(&name).cloned();
             if let Some(existing_task) = existing_task {
                 // Go: tasks[i].loadedTask = existingTask (tasks[i] is task)
-                task.borrow_mut().loaded_task = Some(existing_task);
+                // PORT: a restart of started subtasks (see below) queues the
+                // same task again, so `existing_task` can be `task`. Go then
+                // sets `task.loadedTask = task`, which `collectFiles` resolves
+                // to the same task. Skip it here so no `Rc` cycle forms.
+                if !Rc::ptr_eq(&existing_task, &task) {
+                    task.borrow_mut().loaded_task = Some(existing_task);
+                }
             } else {
                 let mut d = data.borrow_mut();
                 d.tasks.insert(name, task.clone());
@@ -454,9 +460,11 @@ impl FilesParser {
         } else {
             depth
         };
+        let mut relower = false;
         {
             let mut d = data.borrow_mut();
             if current_depth < d.lowest_depth {
+                relower = d.lowest_depth != i32::MAX;
                 // If we're seeing this task at a lower depth than before,
                 // reprocess its subtasks to ensure they are loaded.
                 d.lowest_depth = current_depth;
@@ -487,6 +495,24 @@ impl FilesParser {
                 let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
                 self.start(loader, &sub_tasks, lowest_depth);
+            } else if relower
+                && !self.single_threaded
+                && task_by_file_name.borrow().started_sub_tasks
+            {
+                // PORT: parallel tsgo runs each queued task in its own
+                // goroutine, so the shallowest path to a file usually arrives
+                // first and its subtasks start at that depth. This queue pops
+                // LIFO (Go singleThreadedWorkGroup order) and can reach a file
+                // first through a deeper path. Go then lowers `lowestDepth`
+                // but does not restart subtasks that already started, so the
+                // children keep a depth > 0 (node_modules files: no TS6059, no
+                // emit). Start them again at the new depth to give the result
+                // of parallel tsgo. This is also the Strada rule. Tested in
+                // pinned Go: all project configs match parallel tsgo.
+                // `--singleThreaded` keeps the exact Go order.
+                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
+                let lowest_depth = data.borrow().lowest_depth;
+                self.start(loader, &sub_tasks, lowest_depth);
             }
         }
     }
@@ -513,10 +539,7 @@ impl FilesParser {
                 None
             };
 
-        let mut include_processor = IncludeProcessor {
-            file_include_reasons: FxHashMap::default(),
-            ..Default::default()
-        };
+        let mut include_processor = IncludeProcessor::default();
         let mut output_file_to_project_reference_source: Option<FxHashMap<Path, String>> =
             if !loader.opts.can_use_project_reference_source() {
                 Some(FxHashMap::default())
@@ -633,6 +656,7 @@ impl FilesParser {
                             if checked_name != normalized_file_path {
                                 self.duplicate_source_files.push(DuplicateSourceFile {
                                     parse_options: file.parse_options().clone(),
+                                    text: file.text,
                                     script_kind: file.script_kind,
                                 });
                             }
@@ -720,6 +744,7 @@ impl FilesParser {
                                     // the host, so snapshot disposal must release that extra owner.
                                     self.duplicate_source_files.push(DuplicateSourceFile {
                                         parse_options: file.parse_options().clone(),
+                                        text: file.text,
                                         script_kind: file.script_kind,
                                     });
                                 }
@@ -908,18 +933,21 @@ impl FilesParser {
             duplicate_source_files,
             files_by_path,
             project_reference_file_mapper: Some(loader.project_reference_file_mapper.clone()),
-            resolved_modules,
-            type_resolutions_in_file,
-            source_file_meta_datas,
-            jsx_runtime_import_specifiers,
-            import_helpers_import_specifiers,
-            source_files_found_searching_node_modules,
-            lib_files: lib_files_map,
+            resolved_modules: Rc::new(resolved_modules),
+            type_resolutions_in_file: Rc::new(type_resolutions_in_file),
+            source_file_meta_datas: Rc::new(source_file_meta_datas),
+            jsx_runtime_import_specifiers: jsx_runtime_import_specifiers.map(Rc::new),
+            import_helpers_import_specifiers: import_helpers_import_specifiers.map(Rc::new),
+            source_files_found_searching_node_modules: Rc::new(
+                source_files_found_searching_node_modules,
+            ),
+            lib_files: Rc::new(lib_files_map),
             missing_files,
             include_processor,
-            output_file_to_project_reference_source,
-            redirect_targets_map,
-            redirect_files_by_path,
+            output_file_to_project_reference_source: output_file_to_project_reference_source
+                .map(Rc::new),
+            redirect_targets_map: redirect_targets_map.map(Rc::new),
+            redirect_files_by_path: redirect_files_by_path.map(Rc::new),
         }
     }
 
@@ -940,12 +968,13 @@ impl FilesParser {
             let Some(reason) = reason else {
                 return;
             };
-            if let Some(existing) = include_processor.file_include_reasons.get_mut(&t.path) {
+            // The map is not shared yet while the files are collected, so
+            // `make_mut` copies nothing.
+            let reasons = Rc::make_mut(&mut include_processor.file_include_reasons);
+            if let Some(existing) = reasons.get_mut(&t.path) {
                 existing.push(reason);
             } else {
-                include_processor
-                    .file_include_reasons
-                    .insert(t.path.clone(), vec![reason]);
+                reasons.insert(t.path.clone(), vec![reason]);
             }
         }
     }

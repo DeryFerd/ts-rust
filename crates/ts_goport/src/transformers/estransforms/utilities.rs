@@ -412,10 +412,12 @@ impl SuperAccessState {
     ///
     /// Create a variable declaration with a getter/setter (if binding) definition for each name:
     ///
-    ///     const _super = Object.create(null, {
-    ///         x: { get: () => super.x },                           // read-only
-    ///         x: { get: () => super.x, set: (v) => super.x = v }, // read-write
-    ///     });
+    /// ```text
+    /// const _super = Object.create(null, {
+    ///     x: { get: () => super.x },                           // read-only
+    ///     x: { get: () => super.x, set: (v) => super.x = v }, // read-write
+    /// });
+    /// ```
     pub(crate) fn create_super_access_variable_statement(&self) -> Node {
         let f = self.factory();
         let mut accessors: Vec<Node> = Vec::new();

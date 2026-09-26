@@ -216,10 +216,11 @@ pub fn synthetic_ast_node(n: Node) -> &'static ts_ast::Node {
 
 /// The ts_ast node of any node, parsed or synthetic. Go dereferences the
 /// pointer, so nil panics. `node.rs` reads node data through this (`raw`).
-// After freeze almost every read is a frozen store node, so only that path
-// is inlined into callers. The synthetic file index is never a frozen store
-// id, so checking the frozen table first gives the same result as the old
-// order (synthetic, store, legacy) that `ast_node_of_slow` keeps.
+// In a one-program process almost every read after the publish is a tier 0
+// store node, so only that path is inlined into callers. The synthetic file
+// index is never a tier 0 store id, so checking the tier 0 table first gives
+// the same result as the old order (synthetic, store, legacy) that
+// `ast_node_of_slow` keeps.
 #[inline]
 #[must_use]
 pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
@@ -230,8 +231,9 @@ pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
     }
 }
 
-/// `ast_node_of` for a node that is not a frozen store node: a synthetic
-/// node, a store node before freeze (built or detached) or a legacy node.
+/// `ast_node_of` for a node that is not a tier 0 store node: a synthetic
+/// node, a tier 1 or unpublished (built or detached) store node or a legacy
+/// node.
 #[cold]
 #[inline(never)]
 fn ast_node_of_slow(n: Node) -> &'static ts_ast::Node {
@@ -241,7 +243,7 @@ fn ast_node_of_slow(n: Node) -> &'static ts_ast::Node {
     if let Some(node) = try_store_ast_node(n) {
         return node;
     }
-    prog().files[n.file_index()]
+    crate::ast::go_file(n.file_index())
         .legacy_source()
         .parse
         .arena

@@ -980,41 +980,6 @@ impl Checker {
                     && has_static_modifier(s.value_declaration)
                     && is_class_like(s.value_declaration.parent())))
     }
-
-    // Go: checker/services.go:1113 IsLibSymbolForHoverVerbosity
-    // IsLibSymbolForHoverVerbosity returns true if a symbol is declared in a lib file.
-    // PORT: the Go function lives in services.go. It is here because the hover
-    // node builder is its only caller in this crate.
-    pub fn is_lib_symbol_for_hover_verbosity(&self, symbol: SymbolId) -> bool {
-        if symbol.is_nil() {
-            return false;
-        }
-        for &decl in &self.sym(symbol).declarations {
-            let sf = get_source_file_of_node(decl);
-            // PORT: Go `c.program.IsSourceFileDefaultLibrary(sf.Path())` is the
-            // Program method ported as a free function (see relater_p1.rs).
-            if sf.is_some() && is_source_file_default_library(&source_file_info(sf).path) {
-                return true;
-            }
-        }
-        false
-    }
-
-    // Go: checker/services.go:1127 IsLibTypeForHoverVerbosity
-    // IsLibTypeForHoverVerbosity returns true if a type is declared in a lib file.
-    // Don't expand types like Array or Promise, instead treating them as opaque.
-    pub fn is_lib_type_for_hover_verbosity(&self, t: TypeId) -> bool {
-        let ty = self.ty(t);
-        let symbol = if ty.object_flags.intersects(ObjectFlags::REFERENCE) {
-            self.ty(ty.target()).symbol
-        } else {
-            ty.symbol
-        };
-        if self.is_lib_symbol_for_hover_verbosity(symbol) {
-            return true;
-        }
-        self.is_tuple_type(t)
-    }
 }
 
 // Go: checker/nodebuilder_hover.go:215 typeElementsToClassElements

@@ -435,8 +435,31 @@ impl DeclarationTransformer {
         // `VisitNode` calls the callback, then only lifts a SyntaxList result.
         // Both callbacks return a SourceFile for a SourceFile, so the callbacks
         // are called directly.
-        self.visit_cjs_export_assignments(node); // collect nested module.exports= assignments
-        self.visit_nested_expression(node); // collect expando members (requires any export assignment be located in advance)
+        //
+        // PERF: the two walks act only on CommonJS exports, which need a
+        // `common_js_module_indicator`, and on expando assignments that the
+        // binder gave an `ASSIGNMENT` symbol (`transform_expando_assignment`
+        // returns early for any other node). Elsewhere they only walk: an
+        // unchanged tree makes no node, and each diagnostic context is
+        // restored. So a parsed file with neither skips them. A factory
+        // SourceFile always walks.
+        let (cjs_walk, expando_walk) = if is_synthetic_node(node) {
+            (true, true)
+        } else {
+            let cjs = source_file_info(node).common_js_module_indicator.is_some();
+            let expando = node
+                .go_file()
+                .file_bind
+                .get()
+                .is_none_or(|bind| bind.has_expando_assignments);
+            (cjs, cjs || expando)
+        };
+        if cjs_walk {
+            self.visit_cjs_export_assignments(node); // collect nested module.exports= assignments
+        }
+        if expando_walk {
+            self.visit_nested_expression(node); // collect expando members (requires any export assignment be located in advance)
+        }
         let source_statements = node.statement_list();
         let statements = self.with_visitor(|v| v.visit_nodes(source_statements));
         let mut combined_statements =

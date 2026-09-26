@@ -151,7 +151,8 @@ and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 
 Go reads the AST without a context. So do we: `crate::core::prog()` returns
-the installed `&'static GoProgram`. `Node` methods reach the AST through it.
+the current `&'static GoProgram` of the thread (see Threads). `Node`
+methods reach the AST through it.
 - `node.Kind` -> `n.kind() -> SyntaxKind`; `node.Flags` -> `n.flags() -> NodeFlags`
   (Go flags: parser flags plus binder-added flags); `node.Parent` ->
   `n.parent() -> Node`; `node.Pos()`/`End()`/`Loc` -> `n.pos() -> i32`,
@@ -198,9 +199,23 @@ the installed `&'static GoProgram`. `Node` methods reach the AST through it.
 
 ## Program (owned by program.rs)
 
-`core::GoProgram` and `core::GoFile` are fixed. `program.rs` defines
-`SourceFileInfo`, `load`, `bind_all`, the Go `Program` methods as free
-functions with Go snake names (`get_resolved_module(file, name, mode)` ->
+`core::GoProgram` and `core::GoFile` are fixed. **Pending Theo's approval
+(A1, multi-program plan):** this model replaces one program per process.
+The batch that adds it is not accepted until Theo approves.
+
+- `GoProgram` is one program version (Go makes a new `Program` for each
+  edit). It has an `id` (`core::next_program_id`), the file ids in Go order
+  (`source_file_order`), options, binder symbols and its program state. It
+  has no file list.
+- `GoFile` is one file version. The file registry (`ast/store.rs`) owns it
+  from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
+  versions share the file versions they have in common, as Go shares
+  unchanged `SourceFile` objects.
+- `program::release_program` frees the checker pool and the frontend of a
+  version. The program shell and the file versions stay leaked for now.
+
+`program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
+`Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
 `*module.ResolvedModule` port as `Option<ResolvedModule>` struct with Go
 fields, `get_source_file_for_resolved_module(name) -> Node`, ...), the
 checker pool, and diagnostic sorting. `options.rs` defines Go-shaped
@@ -232,19 +247,38 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
 
 ## Threads
 
-- `prog()` and the program state are process-wide and read only after
-  load, so they hold only thread-safe data (`Arc`, `OnceLock`, `Mutex`).
-- Files bind in parallel, each into its own arena, and join the program
-  arena in file order (`program::bind_all`). The ids equal a serial bind.
-- Each checker is made on its own worker thread and stays there (Go
-  `checkerPool`: 4 checkers, file `i` goes to checker `i % 4`). The loading
-  thread sends jobs and merges the results in file order.
+- `prog()` is the current program of the thread. A one-program process
+  calls `core::set_prog` once, and every thread with no current program
+  reads that program. `WorkerSeed` sets it on checker and bind threads. A
+  multi-program process (watch, language server, tests) registers each
+  version with `core::register_program_version` and makes one current for
+  a scope with `core::enter_program`. There, `prog()` panics on a thread
+  with no current program.
+- Programs and the program state are read only after load, so they hold
+  only thread-safe data (`Arc`, `OnceLock`, `Mutex`).
+- Files bind in parallel, each into its own arena, and join the binder
+  lineage in file order (`program::bind_all`). The ids equal a serial bind.
+  A file version binds once (Go `BindOnce`): a later program version binds
+  only its new file versions and adds them to the same lineage.
+- Each program has its own checker pool. Each checker is made on its own
+  worker thread and stays there (Go `checkerPool`: 4 checkers, file `i`
+  goes to checker `i % 4`). The loading thread sends jobs and merges the
+  results in file order. `program::release_program` joins the workers of
+  the pool; the released program must not be current on the calling thread.
 - Thread-local state (synthetic nodes, node and symbol ids, lazy JSDoc,
   caches) is per thread. A worker starts from a copy of the loading
   thread's state (`WorkerSeed`), so each checker's results depend only on
   its own files, not on thread timing.
+- One thread can hold checkers of several programs (the language server's
+  dispatch thread). Make a checker's program current while the checker runs
+  (`core::enter_program`): the `program.rs` functions that checker code
+  calls read `prog()`. The ids of the symbols that a checker adds are kept
+  per checker arena (`SymbolArena::for_checker`, `ast::get_symbol_id`), and
+  the module specifier caches per program (`modulespecifiers/host.rs`), so
+  checkers of different programs do not share them.
 - The Go frontend program is not thread-safe. Only the loading thread reads
-  it; checker code reads the copies in `program::go_frontend::GoSharedState`.
+  it (one frontend per program version); checker code reads the copies in
+  `program::go_frontend::GoSharedState`.
 - Emit (`emitter/`, `transformers/`, `printer/`, `bin/goport_emit.rs`)
   runs each file on its checker's thread with no checker borrowed
   (`program::run_on_checker_threads_for_files`); the emit resolver borrows
@@ -292,3 +326,295 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   `jemalloc`). Lints are relaxed crate-wide; still write clean Rust.
 - Keep a `// Go: file.go:LINE funcName` comment above each ported function.
 - Use `#[allow]` sparingly; do not add crate attributes.
+
+## Language service
+
+These rules add to the rules above for the language-service port: Go
+`internal/{ls,lsp,project,format,astnav,api,fswatch,jsonrpc}`,
+`cmd/tsgo`, and the small parts of other packages they need. The wave plan
+is `target/continuation-r97-goport/ls-port/plan.md` in the main checkout.
+Where this section and a rule above differ, this section wins for these
+files.
+
+The shared-shape sections of the area maps in the same directory are also
+binding, except where this section says otherwise: `map-lsproto.md` section
+3, `map-ls-completions.md` section 2, `map-ls-navigation.md` section 2,
+`map-ls-edits.md` section 3, `map-project.md` section 4 and the U1 contract
+in `map-watch-api.md`.
+
+### Ownership
+
+- A unit owns the files the plan lists for it. Some units own several new
+  files. A few also own one existing file for one wave. Write nothing else.
+- Root (the integrator) owns `lib.rs`, every `mod.rs`, the `mod` lines of
+  the module-root file `program.rs`, `Cargo.toml` and `Cargo.lock`. Root
+  also writes each package `prelude` (inside that package `mod.rs`).
+- Nobody edits `src/prelude.rs` or `src/frontend/prelude.rs` for this
+  port. Language-service packages are never glob-exported into them.
+- Do not run cargo.
+- The rule "skip language-service-only exported APIs" above no longer
+  applies. `checker/exports.go` and `checker/services.go` are ported now.
+
+### Modules, files and imports
+
+- A Go package becomes the Rust module at the same path:
+  `internal/ls/lsutil` -> `crate::ls::lsutil`, `internal/lsp/lsproto` ->
+  `crate::lsp::lsproto`, `internal/project/dirty` ->
+  `crate::project::dirty`, `cmd/tsgo` -> `crate::cmd::tsgo`.
+- A Go file becomes one Rust file with the Go base name in snake case
+  (`importTracker.go` -> `import_tracker.rs`, `box.go` -> `box_.rs`). A Go
+  file split by line ranges uses `_p1`, `_p2`, ... in Go order.
+- Small parts of other Go packages go in the files the plan names:
+  `src/frontend/core_*.rs` (Go `internal/core`),
+  `src/frontend/stringutil_ls.rs`, `src/frontend/scanner/scanner_ls.rs`,
+  `src/ast/source_file_ls.rs`, `src/program/ls_program.rs`.
+- Every file of a language-service package starts with exactly one glob
+  import, its own package prelude, by absolute path. Examples:
+  `use crate::ls::prelude::*;`, `use crate::ls::lsutil::prelude::*;`,
+  `use crate::lsp::lsproto::prelude::*;` (also in generated files),
+  `use crate::project::dirty::prelude::*;`. Add no other glob. Import
+  anything else by explicit path.
+- A package prelude re-exports the crate prelude (not in `lsproto`, see
+  below), every item of the package's own files, the packages that the Go
+  package imports as module names, and `Context`, `GoError`, `LspAny`.
+  When two globs export the same name, root adds an explicit pick in the
+  prelude. The package's own item wins, as in Go.
+- Module names in the preludes: `lsproto`, `jsonrpc`, `lsutil`, `lsconv`,
+  `change`, `autoimport`, `astnav`, `format`, `ls`, `project`, `dirty`,
+  `logging`, `background`, `ata`, `fswatch`, `lspwatcher`, `api`, `lsp`,
+  `gostd`, `locale`, `compiler` (`frontend::compiler`), `tsoptions`,
+  `tspath`, `vfs`, `module`, `packagejson`, `modulespecifiers`,
+  `sourcemap`, `json_ext`, `scanner_ls`, `ls_program`
+  (`program::ls_program`).
+- Call another Go package through its name, as Go does:
+  `lsproto::Hover`, `lsutil::UserPreferences`,
+  `astnav::get_token_at_position(file, pos)`,
+  `format::format_document(ctx, file)`. Always write
+  `lsutil::UserPreferences` in full; `modulespecifiers` has its own
+  `UserPreferences`.
+- A new file in an existing module keeps that module's header:
+  `use crate::prelude::*;` (checker, printer, ast, sourcemap,
+  modulespecifiers), `use crate::frontend::prelude::*;` (frontend), or
+  `use super::*;` (children of `program`).
+- `lsproto` files do not see the crate prelude. It exports `Diagnostic`,
+  `FormattingOptions` and `Message`, and lsproto defines the same names.
+  The lsproto prelude holds the JSON items, `json_ext`, `IndexMap`, `Cow`,
+  `gostd`, `tspath` and `unported`. Inside lsproto, write
+  `crate::jsonrpc::X` in full (lsproto has its own `jsonrpc` module).
+- A Go package-private name that another Go file of the same package uses
+  is `pub` in Rust. Never rename a Go name to avoid a clash; the prelude
+  picks.
+
+### Threads
+
+One thread runs all language-service state: the LSP dispatch thread. It
+loads programs and owns the session, projects, file systems
+(`Rc<dyn Fs>`), programs, checkers and language services. It runs every
+request. These types use `Rc` and `RefCell` and are not `Send`. Other
+threads (stdin reader, stdout writer, progress reporter, parent watchdog,
+fswatch backends and debouncers, timer wake-ups) touch only `Send` data.
+Factory nodes and cached tokens are thread-local, which is correct
+because every request runs on the dispatch thread.
+
+### Go runtime (`crate::gostd`)
+
+| Go | Rust |
+|---|---|
+| `ctx context.Context` param | `ctx: &Context` (`gostd::context::Context`, `Clone + Send + Sync`) |
+| `context.Background`, `WithCancel`, `WithCancelCause`, `WithTimeout`, `WithDeadline`, `WithValue`, `AfterFunc`, `Cause` | `gostd::context::{background, with_cancel, with_cancel_cause, with_timeout, with_deadline, with_value, after_func, cause}` |
+| `ctx.Err()`, `ctx.Done()` | `ctx.err() -> Option<GoError>`, `ctx.done() -> Option<Done>` (`None` is Go's nil channel) |
+| context key and value | `pub static KEY: ContextKey<T> = ContextKey::new("goName");`, `with_value(&ctx, &KEY, v)`, `ctx.value(&KEY) -> Option<Arc<T>>` (`T: Send + Sync + 'static`) |
+| `error` | `GoError` (`gostd::errors`, `Clone + Send + Sync`) |
+| `(T, error)` / `error` result | `Result<T, GoError>` / `Result<(), GoError>`; an `error` param or field that can be nil is `Option<GoError>` |
+| package var `errors.New("x")` | `pub static ERR_X: LazyLock<GoError> = LazyLock::new(\|\| errors::new("x"));` |
+| `fmt.Errorf("..%w..", a, b)` | `errors::errorf(text, vec![a, b])`, text built with `format!` |
+| typed error value (`lsproto.ErrorCode`, a struct) | `errors::from_value(v)` |
+| `errors.Is`, `errors.As` / `AsType[T]`, `errors.Join` | `errors::is(&err, &target)`, `errors::as_type::<T>(&err)`, `errors::join(errs)` |
+| `io.EOF`, `context.Canceled`, `context.DeadlineExceeded` | `errors::EOF`, `context::CANCELED`, `context::DEADLINE_EXCEEDED` |
+| `err.Error()` | `err.error()` |
+| `go f()` that touches dispatch-thread state | `gostd::local::go(Box::new(f))`: FIFO on the dispatch thread, run by `local::run_pending()` |
+| `go f()` over `Send` data only | `std::thread::spawn` |
+| `sync.WaitGroup`, `wg.Go`, `core.WorkGroup`, `errgroup` over dispatch-thread state | serial, in Go start order, like Go's single-threaded `WorkGroup`; keep the `ctx.err()` checks |
+| `errgroup.WithContext` over `Send` loops | `gostd::errgroup` (real threads) |
+| `chan T` with capacity n / unbuffered | `std::sync::mpsc::sync_channel(n)` / `sync_channel(0)`; `select` with `default` is `try_send` / `try_recv`; `select` on `ctx.Done()` is a `recv_timeout` loop that checks `ctx.err()` (PORT note) |
+| `sync.Mutex`, `RWMutex`, `atomic.*` on dispatch-thread data | a plain field, `Cell` or `RefCell` (drop the lock) |
+| the same on cross-thread data | `std::sync::{Mutex, RwLock, atomic}` |
+| `sync.Once`, `OnceValue`, `OnceFunc` | `OnceCell`, `OnceLock`, `LazyLock`, or a `Cell<bool>` guard |
+| `time.AfterFunc(d, f)` that touches dispatch-thread state | `gostd::local::after_func(d, Box::new(f)) -> LocalTimer` (`stop() -> bool`, `reset(d)`); `f` runs on the dispatch thread |
+| `time.Timer`, `Ticker`, `AfterFunc` over `Send` data | `gostd::timer::{Timer, Ticker, after_func}` |
+| `time.Now`, `time.Since`, `time.Duration` | `std::time::{Instant, SystemTime, Duration}` |
+| `defer f()` | a guard, or an explicit call on every return path |
+| `recover()` | `std::panic::catch_unwind(AssertUnwindSafe(..))`; `unported!` panics are recovered like Go panics |
+| `panic(x)` | `panic!` with the Go text |
+| `slices.SortFunc`, `sort.Slice` (not stable) | `gostd::slices::sort_func(&mut v, cmp)`, `gostd::slices::sort_slice(&mut v, less)` (Go pdqsort: equal elements end where Go puts them) |
+| `slices.SortStableFunc`, `sort.SliceStable` | `v.sort_by(..)` (all stable sorts agree) |
+| `slices.BinarySearchFunc` | `gostd::slices::binary_search_func(&v, target, cmp) -> (usize, bool)` |
+| `strconv.Quote`, `%q` | `gostd::strconv::quote(s)` |
+| `net/url` (`Parse`, `PathEscape`, `QueryEscape`, `PathUnescape`) | `gostd::url::{parse, path_escape, query_escape, path_unescape}` |
+| `%v`, `%+v`, `%T` in log text | `format!("{:?}", x)` with a PORT note (log text is not compared) |
+| Go map iteration that reaches output | `IndexMap` in insertion order and `// PORT: Go map order is random`; the oracle compares that output without order |
+| `collections.OrderedMap` | `IndexMap` (`Delete` is `shift_remove`) |
+| `collections.SyncMap`, `SyncSet`, `Set`, `MultiMap` | `RefCell<FxHashMap>`, `FxHashSet`, `IndexMap<K, Vec<V>>` |
+| `core.IfElse(c, a, b)` | `if c { a } else { b }`; evaluate both first only if an argument has a side effect (Go evaluates both) |
+| `core.Filter`, `Map`, `Find`, `Some`, `Every`, `FlatMap`, `FirstOrNil`, ... | iterator code with the same order and the same nil-versus-empty result |
+| `diagnostics.X.Localize(loc, args...)`, `locale.FromContext(ctx)` | `diagnostics_loc::message_localize(diag::X, &loc, &args![..])`, `locale::from_context(ctx)`; `Locale` is the Go `language.Tag` |
+| `stringutil.Compare*`, `EquateStringCaseInsensitive`, `TruncateByRunes` | `crate::frontend::stringutil_ls` |
+| `stringutil.IsLineBreak`, `IsWhiteSpace*`, `StripQuotes` | the existing `scanner_util` names |
+| Go `string` indexes and positions | byte offsets (`as_bytes()`); decode runes with the `pub(crate)` `utf8_decode_rune_in_string` / `utf8_decode_last_rune_in_string` in `frontend/scanner/scanner_p1.rs`; never slice a `&str` inside a character |
+
+Dispatch loop contract (lsp server and session): the server calls
+`gostd::local::set_waker(f)` once. A due `LocalTimer` calls the waker from
+its timer thread. The dispatch loop calls `local::run_pending()` after
+each message and after each wake-up. Go `WaitForBackgroundTasks` runs
+`local::run_pending()` until the queue is empty.
+
+### Programs and checkers
+
+- Go `*compiler.Program` in ls, project and api code is
+  `&'static compiler::NewProgram` (leaked for the process like
+  `GoProgram`; `Copy`; pointer equality is `std::ptr::eq`; a map key is
+  `p as *const _ as usize`).
+- Go `compiler.NewProgram(opts)` is `ls_program::new_program(opts,
+  create_checker_pool)`; `p.UpdateProgram(..)` is
+  `ls_program::update_program(p, ..)`. Go `ProgramOptions.CreateCheckerPool`
+  is the extra `create_checker_pool` argument (PORT).
+- Every program made by `ls_program::new_program` or
+  `ls_program::update_program` is a program version of the process
+  (`program::new_program_version`), as Go makes a new `Program` for each
+  snapshot change. Versions share the file versions they have in common.
+  The checkers of every version are made on the dispatch thread.
+- Current program: checker code reads `prog()`. `ls_program::enter(p)`
+  makes `p` current while its `ProgramGuard` lives; the last guard that is
+  still alive wins, so guards can drop in any order. A language service
+  holds a guard for its program, the `get_type_checker*` functions return
+  a `Release` that holds one, and the `ls_program` diagnostics functions
+  enter `p`. A caller that uses several language services in turn calls
+  `ls.enter_program()` for each. A checker from a pool of its own gets its
+  guard with `ProgramGuard::with_release`.
+- Release: `ls_program::release_program(p)` is Go's program drop (the
+  snapshot `programCounter.Deref`). It frees the checker pools of `p` and
+  its program version now, or when the last guard of `p` drops. The
+  `NewProgram`, the `GoProgram` shell and the file versions stay leaked
+  (multi-program M2, M3).
+- Go `*ast.SourceFile` is `Node` (the file root). An `Rc<ParsedSourceFile>`
+  from a `NewProgram` method becomes `file.root`.
+- Go `p.X(..)` on a program: call `NewProgram::x` when it exists; else
+  `ls_program::x(p, ..)` when the plan lists it (checker and diagnostics
+  methods); else the `program::x` free function (it reads the current
+  program); else `unported!("Program.X")`.
+- `c, done := p.GetTypeCheckerForFile(ctx, file); defer done()` becomes
+  `let (checker, done) = ls_program::get_type_checker_for_file(p, ctx, file);`
+  and `let c = &mut *checker.borrow_mut();`. Keep `done` (a `Release`
+  guard) alive to the end of the scope; it releases once, on drop or on
+  `done.call()`. Helper functions take `c: &mut Checker`, never the `Rc`.
+  Never borrow the checker twice.
+- Go `compiler.CheckerPool` is the trait `ls_program::CheckerPool`
+  (`get_checker(&self, ctx: &Context, file: Node) -> (Rc<RefCell<Checker>>, Release)`,
+  `file` may be `Node::NIL`). The project pool implements it. Go
+  `checker.NewChecker(program)` is `ls_program::new_checker(program)`.
+- Checker API names: `checker-api-tools/names_exports_services.tsv`
+  (the new `checker/exports.rs` and `checker/services.rs`) and
+  `checker-api-tools/ported_ls_names.tsv` (existing ports), both next to
+  the maps. When Go calls an exported wrapper whose unexported twin also
+  exists, the Rust name ends in `_exported`. Never call the twin in its
+  place.
+- Node builder `idToSymbol`: Go shares one map between the builder and its
+  caller. Build with `new_node_builder_ex(c, ec, Some(FxHashMap::default()))`
+  and read the filled map back from `nb.impl_.borrow().id_to_symbol`. For
+  a printer, move the map into `Printer.id_to_symbol`. Add a PORT note.
+- A file that the language server parses outside a program load (the
+  parse cache, `getOrParseSourceFile` in sourcedefinition.go) is recorded
+  with `program::note_parsed_source_file`, so the next publish gives it
+  its parser fields. To read it before a program includes it, publish it
+  with `program::publish_parsed_files` and bind it with
+  `program::bind_file_outside_program` (Go `BindSourceFile`).
+- The autoimport `aliasResolver` (a checker over node_modules files that no
+  program holds) is not ported: a checker reads its program state from a
+  program version, which only a `NewProgram` makes. It calls
+  `unported!("NewChecker (aliasResolver)")`.
+
+### Scanning
+
+- ls, astnav and format code scan with the literal Go scanner
+  `frontend::scanner::Scanner`, not `RsScanner`.
+- Go `scanner.GetScannerForSourceFile(f, pos)` is
+  `scanner_ls::get_scanner_for_source_file(f, pos)` and
+  `scanner.GetECMAPositionOfLineAndByteOffset` is
+  `scanner_ls::get_ecma_position_of_line_and_byte_offset`. Other Go
+  `scanner.X` free functions (`SkipTrivia`, `GetTokenPosOfNode`,
+  `TokenToString`, ...) are the existing `scanner_util` names.
+
+### Protocol types (`lsproto`)
+
+- `src/lsp/lsproto/lsp_generated/*.rs` is generated by
+  `src/lsp/lsproto/_generate/generate.mts` (a port of Go's generator) from
+  the pinned `metaModel.json`. Never edit the output by hand. Change the
+  generator, then run `node --experimental-strip-types generate.mts`.
+- Names and shapes follow `map-lsproto.md` section 3. Short form: type
+  names keep the Go spelling (`HoverParams`, `URI`, `DocumentUri`); fields
+  are snake case (`text_document`, `type_`); `*T` is `Option<T>`
+  (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
+  `[]T` and `[]*T` are `Vec<T>`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
+  `LspAny`; a string enum is `pub struct MarkupKind(pub Cow<'static, str>)`
+  with consts such as `MarkupKind::PLAIN_TEXT`; an int enum is
+  `pub struct CompletionItemKind(pub i32)` with consts; method consts are
+  `Method::TEXT_DOCUMENT_HOVER`; `TextDocumentHoverInfo` is
+  `TEXT_DOCUMENT_HOVER_INFO: RequestInfo<HoverParams, TextDocumentHoverResponse>`;
+  a union is a struct of `Option` fields (all `None` is null); a literal is
+  a unit struct; `*Response` aliases are `pub type`; `(v *X) resolve()` is
+  `X::resolve(v: Option<&X>)`.
+- Go `any` in `RequestMessage.Params` and `ResponseMessage.Result` is
+  `Box<dyn AnyValue>`. Read it with `downcast_ref::<HoverParams>()`.
+- Client capabilities in a context:
+  `lsproto::with_client_capabilities(&ctx, caps) -> Context` and
+  `lsproto::get_client_capabilities(&ctx) -> Arc<ResolvedClientCapabilities>`.
+- `lsproto::ErrorCode` is also a `GoError` value
+  (`errors::from_value(code)`), so `errors::as_type::<lsproto::ErrorCode>`
+  finds it in a wrap chain.
+
+### JSON
+
+- All JSON uses `frontend/json.rs` (`MarshalerTo`, `UnmarshalerFrom`,
+  `JsonDecoder`) and `frontend/json_ext.rs` (the Go JSON v2 default
+  arshalers for integers, floats, `Option`, `Box`, `Vec`, `[u32; 2]`,
+  `IndexMap`, `LspAny`, `JsonValue`, one-line field helpers, and
+  `marshal_indent`). No serde.
+- A hand-written Go struct with `json:"..."` tags (Go marshals it by
+  reflection) gets a hand-written `MarshalerTo` and `UnmarshalerFrom` with
+  the v2 default rules: fields in declaration order; `omitzero` skips the
+  zero value; `omitempty` skips `null`, `""`, `[]` and `{}`; a non-omit
+  `None` writes `null`; a non-omit nil slice or map writes `[]` or `{}`;
+  input names match exactly and unknown names are skipped; `null` input
+  sets the zero value.
+- Go `json.Value` is `JsonValue(Vec<u8>)`. Go `map[string]any` is
+  `IndexMap<String, LspAny>`.
+- A `float64` field writes the ES6 number text (as v2). An integer field
+  rejects `1.0` and `1e2` (as v2).
+- `null`, `[]` and a missing key are different values. Maps write keys in
+  insertion order. Go writes random order unless it sets
+  `json.Deterministic(true)`; then sort the keys as Go does.
+
+### `goport --lsp`
+
+- `bin/goport.rs` sends `--lsp` and `--api` to `cmd::tsgo::run_main` before
+  anything is written to stdout.
+- A request that reaches `unported!` gets a `-32603` error response through
+  the server's `recover`. At exit, goport returns the Go status (0 or 1)
+  unless unported code ran; then it prints the unported report on stderr
+  and exits 70 (`EXIT_UNPORTED`).
+
+### Not ported (plan level)
+
+- The autoimport `aliasResolver` checker (see "Programs and checkers").
+- fanotify (D-W1): `src/fswatch/unix.rs` keeps Go names. The inotify,
+  pipe, poll, read, write, close, open, getdents and lstat calls go through
+  the safe API of `rustix` (already a dependency) or `std`, so `tsc --watch`
+  and `-b --watch` watch files with the inotify backend. rustix has no
+  `fanotify_init`, `fanotify_mark`, `name_to_handle_at` or usable `statfs`,
+  so those bodies call `unported!("unix.Name")` and fanotify is never
+  available (Go's result when `fanotify_init` fails). No `libc`, no
+  `unsafe`.
+- SIGINT/SIGTERM handling (a `--watch` or `--lsp` process that gets SIGTERM
+  dies with the signal; Go exits 0), pprof, Go runtime metrics and
+  `runtime.GC`, Unicode collation (`collate.New`), and the kqueue, FSEvents
+  and Windows watchers.

@@ -7,6 +7,7 @@ pub mod text_writer;
 pub mod types;
 // PORT: `factory` is not glob-exported. Its `NodeFactory` (Go
 // `printer.NodeFactory`) would clash with `ast::NodeFactory` in the prelude.
+pub mod change_tracker_writer;
 pub mod factory;
 pub mod helpers;
 pub mod printer_p1;
@@ -16,6 +17,7 @@ pub mod printer_p4;
 pub mod printer_p5;
 pub mod utilities;
 
+pub use change_tracker_writer::*;
 pub use emit_context::*;
 pub use helpers::*;
 pub use name_generator::*;

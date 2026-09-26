@@ -3,6 +3,7 @@
 //! names, return types of signatures and bodies, and promise/generator types.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 use ts_diagnostics::Message;
 
 // PORT: Go `core.AppendIfUnique` for type slices.
@@ -88,8 +89,10 @@ impl Checker {
             let args = {
                 let type_arguments = self.type_arguments_of(t);
                 (type_parameter_count == type_arguments.len()).then(|| {
-                    // One allocation with room for the this-argument.
-                    let mut args = Vec::with_capacity(type_arguments.len() + 1);
+                    // PERF: room for the this-argument, and no heap
+                    // allocation for up to 8 arguments.
+                    let mut args: SmallVec<[TypeId; 8]> =
+                        SmallVec::with_capacity(type_arguments.len() + 1);
                     args.extend_from_slice(&type_arguments);
                     args
                 })
@@ -128,13 +131,16 @@ impl Checker {
         base_symbols: &[SymbolId],
     ) -> SymbolTable {
         let mut symbols = symbols;
+        // PERF: room for every base property up front, so the loop does not
+        // grow the table or rebuild its index. Entry order does not change.
+        self.symbols.reserve(symbols, base_symbols.len());
         for &base in base_symbols {
             if !self.is_static_private_identifier_property(base) {
                 let base_name = self.sym(base).name.clone();
                 // PORT: one table lookup for the Go read and write. A nil
                 // table has no entry, so Go always writes; make it first.
                 if symbols.is_nil() {
-                    symbols = self.symbols.new_table();
+                    symbols = self.symbols.new_table_with_capacity(base_symbols.len());
                 }
                 self.symbols
                     .set_if_absent_or(symbols, &base_name, base, |s| {

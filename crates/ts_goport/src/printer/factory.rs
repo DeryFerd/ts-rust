@@ -14,12 +14,14 @@ use std::rc::Weak;
 // Go: printer/factory.go:13 NodeFactory
 /// Go `printer.NodeFactory`. It derefs to `ast::NodeFactory`, as Go embeds it.
 // PORT: Go `EmitContext.Factory` points back to this factory, and this factory
-// points to its `EmitContext`. The contract keeps `Rc<EmitContext>` here, so
-// that pair is an `Rc` cycle. Synthetic nodes are leaked too, so this matches
-// the crate's memory model.
+// points to its `EmitContext`. The factory keeps a `Weak`, so the pair is no
+// `Rc` cycle and a context is freed with its last `Rc` (each declaration
+// diagnostic and emit makes one, so a cycle leaked one per file and program
+// version). Only `new_emit_context` makes a factory, and the context owns it,
+// so the context is alive while its factory is used.
 pub struct NodeFactory {
     pub ast: crate::ast::NodeFactory,
-    pub emit_context: Rc<EmitContext>,
+    context: Weak<EmitContext>,
 }
 
 impl std::ops::Deref for NodeFactory {
@@ -59,8 +61,16 @@ impl NodeFactory {
                     }
                 })),
             }),
-            emit_context: Rc::clone(context),
+            context: Rc::downgrade(context),
         }
+    }
+
+    /// Go `f.emitContext`.
+    #[must_use]
+    pub fn emit_context(&self) -> Rc<EmitContext> {
+        self.context
+            .upgrade()
+            .expect("a printer factory outlived its EmitContext")
     }
 
     // Go: ast/ast.go:97 AsNodeFactory (promoted from the embedded ast.NodeFactory)
@@ -89,7 +99,7 @@ impl NodeFactory {
                 text = format!(
                     "(generated@{})",
                     get_node_id(
-                        self.emit_context
+                        self.emit_context()
                             .get_node_for_generated_name_worker(node, id)
                     )
                 );
@@ -111,7 +121,7 @@ impl NodeFactory {
             node,
         };
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context
+        self.emit_context()
             .auto_generate
             .borrow_mut()
             .insert(name, auto_generate);
@@ -213,7 +223,7 @@ impl NodeFactory {
                 text = format!(
                     "(generated@{})",
                     get_node_id(
-                        self.emit_context
+                        self.emit_context()
                             .get_node_for_generated_name_worker(node, id)
                     )
                 );
@@ -237,7 +247,7 @@ impl NodeFactory {
             node,
         };
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context
+        self.emit_context()
             .auto_generate
             .borrow_mut()
             .insert(name, auto_generate);
@@ -304,7 +314,7 @@ impl NodeFactory {
         }
         let node = self.new_string_literal(text, TokenFlags::NONE);
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context
+        self.emit_context()
             .text_source
             .borrow_mut()
             .insert(node, text_source_node);
@@ -628,8 +638,8 @@ impl NodeFactory {
     fn is_ignorable_paren(&self, node: Node) -> bool {
         is_parenthesized_expression(node)
             && node_is_synthesized(node)
-            && range_is_synthesized(self.emit_context.source_map_range(node))
-            && range_is_synthesized(self.emit_context.comment_range(node)) // &&
+            && range_is_synthesized(self.emit_context().source_map_range(node))
+            && range_is_synthesized(self.emit_context().comment_range(node)) // &&
         // len(emitContext.SyntheticLeadingComments(node)) == 0 &&
         // len(emitContext.SyntheticTrailingComments(node)) == 0
     }
@@ -736,7 +746,7 @@ impl NodeFactory {
         for (i, &statement) in source.iter().enumerate() {
             if is_prologue_directive(statement)
                 || !self
-                    .emit_context
+                    .emit_context()
                     .emit_flags(statement)
                     .intersects(EmitFlags::CUSTOM_PROLOGUE)
             {
@@ -791,7 +801,7 @@ impl NodeFactory {
             if !opts.allow_source_maps {
                 emit_flags |= EmitFlags::NO_SOURCE_MAP;
             }
-            self.emit_context.add_emit_flags(name, emit_flags);
+            self.emit_context().add_emit_flags(name, emit_flags);
             return name;
         }
 
@@ -854,7 +864,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:561 GetNamespaceMemberName
     pub fn get_namespace_member_name(&self, ns: Node, mut name: Node, opts: NameOptions) -> Node {
-        if !self.emit_context.has_auto_generate_info(name) {
+        if !self.emit_context().has_auto_generate_info(name) {
             name = self.as_node_factory().clone_node(name);
         }
         let qualified_name = self.new_property_access_expression(
@@ -863,14 +873,14 @@ impl NodeFactory {
             name,
             NodeFlags::NONE,
         );
-        self.emit_context
+        self.emit_context()
             .assign_comment_and_source_map_ranges(qualified_name, name);
         if !opts.allow_comments {
-            self.emit_context
+            self.emit_context()
                 .add_emit_flags(qualified_name, EmitFlags::NO_COMMENTS);
         }
         if !opts.allow_source_maps {
-            self.emit_context
+            self.emit_context()
                 .add_emit_flags(qualified_name, EmitFlags::NO_SOURCE_MAP);
         }
         qualified_name
@@ -917,7 +927,7 @@ impl NodeFactory {
     /// Allocates a new Identifier representing a reference to a helper function.
     pub fn new_unscoped_helper_name(&self, name: &str) -> Node {
         let node = self.new_identifier(name);
-        self.emit_context
+        self.emit_context()
             .set_emit_flags(node, EmitFlags::HELPER_NAME);
         node
     }
@@ -932,7 +942,7 @@ impl NodeFactory {
         member_name: Node,
         descriptor: Node,
     ) -> Node {
-        self.emit_context.request_emit_helper(&DECORATE_HELPER);
+        self.emit_context().request_emit_helper(&DECORATE_HELPER);
 
         let mut arguments_array: Vec<Node> = Vec::new();
         arguments_array.push(
@@ -957,7 +967,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:623 NewMetadataHelper
     pub fn new_metadata_helper(&self, metadata_key: &str, metadata_value: Node) -> Node {
-        self.emit_context.request_emit_helper(&METADATA_HELPER);
+        self.emit_context().request_emit_helper(&METADATA_HELPER);
 
         self.new_call_expression(
             self.new_unscoped_helper_name("__metadata"),
@@ -978,7 +988,7 @@ impl NodeFactory {
         parameter_offset: i32,
         location: TextRange,
     ) -> Node {
-        self.emit_context.request_emit_helper(&PARAM_HELPER);
+        self.emit_context().request_emit_helper(&PARAM_HELPER);
         let helper = self.new_call_expression(
             self.new_unscoped_helper_name("__param"),
             Node::NIL,     /*questionDotToken*/
@@ -1002,7 +1012,7 @@ impl NodeFactory {
         value: Node,
         async_: bool,
     ) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&ADD_DISPOSABLE_RESOURCE_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__addDisposableResource"),
@@ -1023,7 +1033,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:664 NewDisposeResourcesHelper
     pub fn new_dispose_resources_helper(&self, env_binding: Node) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&DISPOSE_RESOURCES_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__disposeResources"),
@@ -1058,7 +1068,7 @@ impl NodeFactory {
         kind: PrivateIdentifierKind,
         fn_: Node,
     ) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&CLASS_PRIVATE_FIELD_GET_HELPER);
         let args: Vec<Node> = if fn_.is_nil() {
             vec![
@@ -1092,7 +1102,7 @@ impl NodeFactory {
         kind: PrivateIdentifierKind,
         fn_: Node,
     ) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&CLASS_PRIVATE_FIELD_SET_HELPER);
         let args: Vec<Node> = if fn_.is_nil() {
             vec![
@@ -1121,7 +1131,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:720 NewClassPrivateFieldInHelper
     pub fn new_class_private_field_in_helper(&self, state: Node, receiver: Node) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&CLASS_PRIVATE_FIELD_IN_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__classPrivateFieldIn"),
@@ -1283,7 +1293,7 @@ impl NodeFactory {
         computed_temp_variables: Option<&[Node]>,
         location: TextRange,
     ) -> Node {
-        self.emit_context.request_emit_helper(&REST_HELPER);
+        self.emit_context().request_emit_helper(&REST_HELPER);
         let mut property_names: Vec<Node> = Vec::new();
         let mut computed_temp_variable_offset = 0usize;
         for (i, &element) in elements.iter().enumerate() {
@@ -1336,7 +1346,7 @@ impl NodeFactory {
     // Go: printer/factory.go:871 NewAwaitHelper
     /// Allocates a new Call expression to the `__await` helper.
     pub fn new_await_helper(&self, expression: Node) -> Node {
-        self.emit_context.request_emit_helper(&AWAIT_HELPER);
+        self.emit_context().request_emit_helper(&AWAIT_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__await"),
             Node::NIL,     /*questionDotToken*/
@@ -1349,12 +1359,12 @@ impl NodeFactory {
     // Go: printer/factory.go:883 NewAsyncGeneratorHelper
     /// Allocates a new Call expression to the `__asyncGenerator` helper.
     pub fn new_async_generator_helper(&self, generator_func: Node, has_lexical_this: bool) -> Node {
-        self.emit_context.request_emit_helper(&AWAIT_HELPER);
-        self.emit_context
+        self.emit_context().request_emit_helper(&AWAIT_HELPER);
+        self.emit_context()
             .request_emit_helper(&ASYNC_GENERATOR_HELPER);
 
         // Mark this node as originally an async function body
-        self.emit_context.add_emit_flags(
+        self.emit_context().add_emit_flags(
             generator_func,
             EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE,
         );
@@ -1377,8 +1387,8 @@ impl NodeFactory {
     // Go: printer/factory.go:914 NewAsyncDelegatorHelper
     /// Allocates a new Call expression to the `__asyncDelegator` helper.
     pub fn new_async_delegator_helper(&self, expression: Node) -> Node {
-        self.emit_context.request_emit_helper(&AWAIT_HELPER);
-        self.emit_context
+        self.emit_context().request_emit_helper(&AWAIT_HELPER);
+        self.emit_context()
             .request_emit_helper(&ASYNC_DELEGATOR_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__asyncDelegator"),
@@ -1392,7 +1402,8 @@ impl NodeFactory {
     // Go: printer/factory.go:927 NewAsyncValuesHelper
     /// Allocates a new Call expression to the `__asyncValues` helper.
     pub fn new_async_values_helper(&self, expression: Node) -> Node {
-        self.emit_context.request_emit_helper(&ASYNC_VALUES_HELPER);
+        self.emit_context()
+            .request_emit_helper(&ASYNC_VALUES_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__asyncValues"),
             Node::NIL,     /*questionDotToken*/
@@ -1413,7 +1424,7 @@ impl NodeFactory {
         parameters: NodeList,
         body: Node,
     ) -> Node {
-        self.emit_context.request_emit_helper(&AWAITER_HELPER);
+        self.emit_context().request_emit_helper(&AWAITER_HELPER);
 
         let params = if parameters.is_nil() {
             self.new_node_list(&[])
@@ -1433,7 +1444,7 @@ impl NodeFactory {
         );
 
         // Mark this node as originally an async function body
-        self.emit_context.add_emit_flags(
+        self.emit_context().add_emit_flags(
             generator_func,
             EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE,
         );
@@ -1795,7 +1806,7 @@ impl NodeFactory {
         initializers: Node,
         extra_initializers: Node,
     ) -> Node {
-        self.emit_context.request_emit_helper(&ES_DECORATE_HELPER);
+        self.emit_context().request_emit_helper(&ES_DECORATE_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__esDecorate"),
             Node::NIL,     /*questionDotToken*/
@@ -1819,7 +1830,7 @@ impl NodeFactory {
         initializers: Node,
         value: Node,
     ) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&RUN_INITIALIZERS_HELPER);
         let arguments: Vec<Node> = if value.is_some() {
             vec![this_arg, initializers, value]
@@ -1839,7 +1850,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1198 NewTemplateObjectHelper
     pub fn new_template_object_helper(&self, cooked_array: Node, raw_array: Node) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&MAKE_TEMPLATE_OBJECT_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__makeTemplateObject"),
@@ -1852,7 +1863,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1209 NewPropKeyHelper
     pub fn new_prop_key_helper(&self, expr: Node) -> Node {
-        self.emit_context.request_emit_helper(&PROP_KEY_HELPER);
+        self.emit_context().request_emit_helper(&PROP_KEY_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__propKey"),
             Node::NIL,     /*questionDotToken*/
@@ -1864,7 +1875,7 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1220 NewSetFunctionNameHelper
     pub fn new_set_function_name_helper(&self, fn_: Node, name: Node, prefix: &str) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&SET_FUNCTION_NAME_HELPER);
         let arguments: Vec<Node> = if !prefix.is_empty() {
             vec![fn_, name, self.new_string_literal(prefix, TokenFlags::NONE)]
@@ -1885,7 +1896,7 @@ impl NodeFactory {
     // Go: printer/factory.go:1240 NewImportDefaultHelper
     /// Allocates a new Call expression to the `__importDefault` helper.
     pub fn new_import_default_helper(&self, expression: Node) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&IMPORT_DEFAULT_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__importDefault"),
@@ -1899,7 +1910,7 @@ impl NodeFactory {
     // Go: printer/factory.go:1252 NewImportStarHelper
     /// Allocates a new Call expression to the `__importStar` helper.
     pub fn new_import_star_helper(&self, expression: Node) -> Node {
-        self.emit_context.request_emit_helper(&IMPORT_STAR_HELPER);
+        self.emit_context().request_emit_helper(&IMPORT_STAR_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__importStar"),
             Node::NIL,     /*questionDotToken*/
@@ -1916,7 +1927,7 @@ impl NodeFactory {
         module_expression: Node,
         exports_expression: Node,
     ) -> Node {
-        self.emit_context.request_emit_helper(&EXPORT_STAR_HELPER);
+        self.emit_context().request_emit_helper(&EXPORT_STAR_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__exportStar"),
             Node::NIL,     /*questionDotToken*/
@@ -1965,7 +1976,7 @@ impl NodeFactory {
         first_argument: Node,
         preserve_jsx: bool,
     ) -> Node {
-        self.emit_context
+        self.emit_context()
             .request_emit_helper(&REWRITE_RELATIVE_IMPORT_EXTENSIONS_HELPER);
         let arguments: Vec<Node> = if preserve_jsx {
             vec![first_argument, self.new_token(SyntaxKind::TrueKeyword)]

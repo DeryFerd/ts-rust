@@ -1,9 +1,9 @@
 //! Go: execute/build/orchestrator.go, and `tscBuildCompilation` of
 //! execute/tsc.go:90 (the `tsc -b` entry).
 //!
-//! PORT: watch mode is out of scope (plan D3). `Watch`, `updateWatch`,
-//! `resetCaches`, `checkTasksForEventChanges`, `computeDesiredWatches` and
-//! `DoCycle` are not ported; `Start` calls `unported!` when `--watch` is set.
+//! The watch part (`Watch`, `updateWatch`, `resetCaches`,
+//! `checkTasksForEventChanges`, `computeDesiredWatches`, `DoCycle`) is in
+//! orchestrator_watch.rs.
 //!
 //! PORT: concurrency. Go runs `buildOrCleanProject` for the tasks in
 //! `order` on up to `numRoutines` goroutines; each goroutine takes the next
@@ -34,13 +34,17 @@ use crate::execute::build::worker::{
 };
 use crate::execute::incremental::build_info::BuildInfo;
 use crate::execute::incremental::incremental::new_build_info_reader;
-use crate::execute::tsc::compile::{CommandLineResult, ExitStatus, System, Writer, write_str};
+use crate::execute::tsc::compile::{
+    CommandLineResult, ExitStatus, System, Watcher, Writer, write_str,
+};
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_builder_status_reporter,
     create_diagnostic_reporter, create_report_error_summary, create_watch_status_reporter,
 };
 use crate::execute::tsc::statistics::Statistics;
+use crate::execute::watchmanager::{WatchManager, new_watch_manager};
 use crate::frontend::prelude::*;
+use crate::gostd::Context;
 use std::sync::mpsc;
 use std::time::SystemTime;
 
@@ -115,20 +119,25 @@ impl OrchestratorResult {
 }
 
 // Go: build/orchestrator.go:61 Orchestrator
-// PORT: `wm` (watch manager) is dropped (see top). Go `*SyncMap` of tasks
-// is a plain map; tasks are `Rc<RefCell<BuildTask>>`.
+// PORT: Go `*SyncMap` of tasks is a plain map; tasks are
+// `Rc<RefCell<BuildTask>>`. Go `wm *watchmanager.WatchManager` is
+// `Rc<RefCell<WatchManager>>`, so the watch loop can run while `DoCycle`
+// borrows the orchestrator (see orchestrator_watch.rs).
 pub struct Orchestrator {
-    opts: Options,
-    compare_paths_options: ComparePathsOptions,
-    host: Rc<BuildHost>,
+    pub(crate) opts: Options,
+    pub(crate) compare_paths_options: ComparePathsOptions,
+    pub(crate) host: Rc<BuildHost>,
 
     // order generation result
     tasks: FxHashMap<Path, Rc<RefCell<BuildTask>>>,
-    order: Vec<String>,
+    pub(crate) order: Vec<String>,
     errors: Vec<Diagnostic>,
 
     error_summary_reporter: Option<DiagnosticsReporter>,
-    watch_status_reporter: Option<DiagnosticReporter>,
+    pub(crate) watch_status_reporter: Option<DiagnosticReporter>,
+
+    // fswatch event-based watching
+    pub(crate) wm: Rc<RefCell<WatchManager>>,
 }
 
 impl Orchestrator {
@@ -326,17 +335,31 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:227 (*Orchestrator).Start
-    pub fn start(&mut self) -> CommandLineResult {
+    // Go: build/orchestrator.go:226 (*Orchestrator).Start
+    // PORT: Go returns the orchestrator itself as `result.Watcher`, so this
+    // takes the boxed orchestrator. `Watch` blocks in the watch loop until
+    // `ctx` ends (orchestrator_watch.rs).
+    pub fn start(mut self: Box<Self>, ctx: &Context) -> CommandLineResult {
         if self.opts.command.compiler_options.watch.is_true() {
-            unported!("Orchestrator.Watch");
+            (self
+                .watch_status_reporter
+                .as_ref()
+                .expect("watch status reporter"))(&new_compiler_diagnostic(
+                diag::Starting_compilation_in_watch_mode,
+                args![],
+            ));
         }
         self.generate_graph(None);
-        self.build_or_clean()
+        let mut result = self.build_or_clean();
+        if self.opts.command.compiler_options.watch.is_true() {
+            self.watch(ctx);
+            result.watcher = Some(self as Box<dyn Watcher>);
+        }
+        result
     }
 
     // Go: build/orchestrator.go:517 (*Orchestrator).buildOrClean
-    fn build_or_clean(&mut self) -> CommandLineResult {
+    pub(crate) fn build_or_clean(&mut self) -> CommandLineResult {
         if !self.opts.command.build_options.clean.is_true()
             && self.opts.command.build_options.verbose.is_true()
         {
@@ -368,7 +391,7 @@ impl Orchestrator {
     }
 
     // Go: build/orchestrator.go:540 (*Orchestrator).numRoutines part of rangeTask
-    fn num_routines(&self) -> i32 {
+    pub(crate) fn num_routines(&self) -> i32 {
         let mut num_routines = 4;
         if self.opts.command.compiler_options.single_threaded.is_true() {
             num_routines = 1;
@@ -635,6 +658,12 @@ impl BuildTaskOrchestrator for Orchestrator {
 
 // Go: build/orchestrator.go:603 NewOrchestrator
 pub fn new_orchestrator(opts: Options) -> Orchestrator {
+    // PORT: Go passes the method value `opts.Sys.FS().DirectoryExists`.
+    let fs = opts.sys.fs();
+    let wm = new_watch_manager(
+        opts.sys.writer(),
+        Box::new(move |path: &str| fs.directory_exists(path)),
+    );
     let compare_paths_options = compare_paths_options_of_sys(&*opts.sys);
     let host = Rc::new(BuildHost::new(
         opts.sys.clone(),
@@ -650,6 +679,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         errors: Vec::new(),
         error_summary_reporter: None,
         watch_status_reporter: None,
+        wm: Rc::new(RefCell::new(wm)),
     };
     if orchestrator.opts.command.compiler_options.watch.is_true() {
         orchestrator.watch_status_reporter = Some(create_watch_status_reporter(
@@ -657,6 +687,11 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
             &orchestrator.opts.command.locale(),
             orchestrator.opts.command.compiler_options.clone(),
         ));
+        // Go: if t, ok := opts.Testing.(CommandLineTestingWithWatchBackend); ok { wm.SetBackend(t.WatchBackend()) }
+        // PORT: the test backend comes from `watcher::set_test_watch_backend`.
+        if let Some(backend) = crate::execute::watcher::test_watch_backend() {
+            orchestrator.wm.borrow_mut().set_backend(backend);
+        }
     } else {
         orchestrator.error_summary_reporter = Some(create_report_error_summary(
             &*orchestrator.opts.sys,

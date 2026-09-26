@@ -7,6 +7,8 @@ pub mod unicode_properties;
 // so this copy is not glob-exported.
 pub mod comment_ranges;
 pub mod utilities;
+// Language-service scanner helpers. Not glob-exported.
+pub mod scanner_ls;
 pub use comment_ranges::*;
 pub use regexp::*;
 pub use scanner_p1::*;

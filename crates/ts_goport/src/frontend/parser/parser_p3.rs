@@ -11,6 +11,7 @@
 //! because `self.factory` cannot stay borrowed while a child parse runs.
 
 use crate::frontend::prelude::*;
+use smallvec::SmallVec;
 
 // PORT: Go reads `p.diagnostics` directly. The parser and the scanner share
 // the diagnostics through `Rc<RefCell<ParseDiagnostics>>` (contract 4.5).
@@ -1516,7 +1517,9 @@ impl Parser {
         // It is illegal to have both leadingDecorators and trailingDecorators, but we will report that as a grammar check in the checker.
         // parse leading decorators
         let pos = self.node_pos();
-        let mut list: Vec<Node> = Vec::with_capacity(16);
+        // PERF: `new_modifier_list` copies the nodes out, so the scratch list
+        // stays on the stack.
+        let mut list: SmallVec<[Node; 16]> = SmallVec::new();
         loop {
             if allow_decorators && self.token == SyntaxKind::AtToken && !has_trailing_modifier {
                 let decorator = self.parse_decorator();

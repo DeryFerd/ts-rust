@@ -53,7 +53,8 @@ pub struct Binder {
     pub in_assignment_pattern: bool,
     pub seen_parse_error: bool,
     pub symbol_count: i32,
-    pub classifiable_names: FxHashSet<Name>,
+    // PORT: Go `classifiableNames` is not kept. Go stores it on the file and
+    // nothing reads it.
     pub not_const_enum_only_modules: FxHashSet<SymbolId>,
     /// Go `symbolArena`. The program-wide symbol arena, moved in while binding.
     pub symbols: SymbolArena,
@@ -134,7 +135,11 @@ impl FlowNode {
 // binding ends. The binder output is stored in the file's `GoFile`
 // `OnceCell`s (Go `file.BindOnce`). A file that is already bound is skipped.
 pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
-    if prog().files[file.file_index()].file_bind.get().is_some() {
+    if crate::ast::go_file(file.file_index())
+        .file_bind
+        .get()
+        .is_some()
+    {
         return;
     }
     let mark = symbols.mark();
@@ -214,7 +219,7 @@ pub struct BoundFile {
 /// moves the symbols into the program arena (`BoundFile::remap`).
 pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> BoundFile {
     let file_index = file.file_index();
-    let go_file = &prog().files[file_index];
+    let go_file = crate::ast::go_file(file_index);
     let node_count = go_file.parser_flags.len();
     let mut b = Binder {
         file,
@@ -228,7 +233,6 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     b.bind(file);
     b.bind_deferred_expando_assignments();
     b.file_bind.symbol_count = b.symbol_count;
-    b.file_bind.classifiable_names = std::mem::take(&mut b.classifiable_names);
     b.file_bind.common_js_module_indicator = b.common_js_module_indicator;
     *symbols = std::mem::take(&mut b.symbols);
     let Binder {
@@ -249,7 +253,7 @@ impl BoundFile {
     /// Stores the output in the file's `GoFile` `OnceLock`s (Go
     /// `file.BindOnce`).
     pub fn install(self) {
-        let go_file = &prog().files[self.file.file_index()];
+        let go_file = crate::ast::go_file(self.file.file_index());
         assert!(
             go_file.node_bind.set(self.node_bind).is_ok(),
             "file already bound"
@@ -344,9 +348,39 @@ impl Binder {
         if locals.is_some() {
             return locals;
         }
-        let locals = self.symbols.new_table();
+        let locals = self
+            .symbols
+            .new_table_with_capacity(locals_size_hint(container));
         self.node_data_mut(container).locals = locals;
         locals
+    }
+
+    /// Go `ast.GetMembers(symbol)` where `symbol` is the symbol of
+    /// `container`. A new table is sized for the members of `container`.
+    pub fn get_container_members(&mut self, container: Node, symbol: SymbolId) -> SymbolTable {
+        let members = self.symbols.sym(symbol).members;
+        if members.is_some() {
+            return members;
+        }
+        let members = self
+            .symbols
+            .new_table_with_capacity(members_size_hint(container));
+        self.symbols.sym_mut(symbol).members = members;
+        members
+    }
+
+    /// Go `ast.GetExports(symbol)` where `symbol` is the symbol of
+    /// `container`. A new table is sized for the exports of `container`.
+    pub fn get_container_exports(&mut self, container: Node, symbol: SymbolId) -> SymbolTable {
+        let exports = self.symbols.sym(symbol).exports;
+        if exports.is_some() {
+            return exports;
+        }
+        let exports = self
+            .symbols
+            .new_table_with_capacity(exports_size_hint(container));
+        self.symbols.sym_mut(symbol).exports = exports;
+        exports
     }
 
     /// Go `ast.GetSymbolTable(&b.file.GlobalExports)`.
@@ -498,13 +532,16 @@ impl Binder {
             // Otherwise, we'll be merging into a compatible existing symbol (for example when
             // you have multiple 'vars' with the same name in the same container).  In this case
             // just add this node into the declarations list of the symbol.
-            symbol = self.symbols.get_name(symbol_table, &name);
-            if includes.intersects(SymbolFlags::CLASSIFIABLE) {
-                self.classifiable_names.insert(name.clone());
-            }
+            //
+            // PORT: Go also adds a classifiable name to `classifiableNames`,
+            // which nothing reads (see `Binder`).
+            // PERF: one table lookup finds the symbol and the slot to store
+            // a new one; `new_symbol` does not change tables.
+            let (found, slot) = self.symbols.get_slot(symbol_table, &name);
+            symbol = found;
             if symbol.is_nil() {
                 symbol = self.new_symbol(SymbolFlags::NONE, name.clone());
-                self.symbols.set(symbol_table, name.clone(), symbol);
+                self.symbols.set_slot(slot, symbol);
                 if is_replaceable_by_method {
                     self.sym_mut(symbol).flags |= SymbolFlags::REPLACEABLE_BY_METHOD;
                 }
@@ -781,7 +818,7 @@ impl Binder {
                 || (node.kind() == SyntaxKind::ImportEqualsDeclaration && has_export_modifier)
             {
                 let container_symbol = self.node_symbol(container);
-                let exports = get_exports(&mut self.symbols, container_symbol);
+                let exports = self.get_container_exports(container, container_symbol);
                 return self.declare_symbol(
                     exports,
                     container_symbol,
@@ -825,7 +862,7 @@ impl Binder {
                     && self.get_declaration_name(node) == INTERNAL_SYMBOL_NAME_MISSING)
             {
                 let container_symbol = self.node_symbol(container);
-                let exports = get_exports(&mut self.symbols, container_symbol);
+                let exports = self.get_container_exports(container, container_symbol);
                 return self.declare_symbol(
                     exports,
                     container_symbol,
@@ -849,7 +886,7 @@ impl Binder {
                 symbol_excludes,
             );
             let container_symbol = self.node_symbol(container);
-            let exports = get_exports(&mut self.symbols, container_symbol);
+            let exports = self.get_container_exports(container, container_symbol);
             let export_symbol = self.declare_symbol(
                 exports,
                 container_symbol,
@@ -889,7 +926,7 @@ impl Binder {
                 symbol_excludes,
             );
         }
-        let members = get_members(&mut self.symbols, container_symbol);
+        let members = self.get_container_members(self.container, container_symbol);
         self.declare_symbol(
             members,
             container_symbol,
@@ -938,7 +975,7 @@ impl Binder {
             }
             SyntaxKind::EnumDeclaration => {
                 let container_symbol = self.node_symbol(self.container);
-                let exports = get_exports(&mut self.symbols, container_symbol);
+                let exports = self.get_container_exports(self.container, container_symbol);
                 return self.declare_symbol(
                     exports,
                     container_symbol,
@@ -952,7 +989,7 @@ impl Binder {
             | SyntaxKind::InterfaceDeclaration
             | SyntaxKind::JsxAttributes => {
                 let container_symbol = self.node_symbol(self.container);
-                let members = get_members(&mut self.symbols, container_symbol);
+                let members = self.get_container_members(self.container, container_symbol);
                 return self.declare_symbol(
                     members,
                     container_symbol,
@@ -1700,7 +1737,7 @@ impl Binder {
             self.bind_anonymous_declaration(node, SymbolFlags::EXPORT_STAR, &name);
         } else if export_clause.is_nil() {
             // All export * declarations are collected in an __export symbol
-            let exports = get_exports(&mut self.symbols, container_symbol);
+            let exports = self.get_container_exports(self.container, container_symbol);
             self.declare_symbol(
                 exports,
                 container_symbol,
@@ -1709,7 +1746,7 @@ impl Binder {
                 SymbolFlags::NONE,
             );
         } else if is_namespace_export(export_clause) {
-            let exports = get_exports(&mut self.symbols, container_symbol);
+            let exports = self.get_container_exports(self.container, container_symbol);
             self.declare_symbol(
                 exports,
                 container_symbol,
@@ -1736,7 +1773,7 @@ impl Binder {
             } else {
                 SymbolFlags::PROPERTY
             };
-            let exports = get_exports(&mut self.symbols, container_symbol);
+            let exports = self.get_container_exports(container, container_symbol);
             let symbol =
                 self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::ALL);
             if node.is_export_equals() {
@@ -1796,6 +1833,54 @@ impl Binder {
         statements
             .iter()
             .any(|&s| is_export_declaration(s) || is_export_assignment(s))
+    }
+}
+
+// PERF: size hints for a new members, exports or locals table of a
+// container, from its member or statement count, so that filling the table
+// does not grow it or rebuild its index. A hint only sizes the table: entry
+// order does not change. 0 gives an unsized table.
+
+/// About the number of members of `container`.
+fn members_size_hint(container: Node) -> usize {
+    match container.kind() {
+        SyntaxKind::ClassDeclaration
+        | SyntaxKind::ClassExpression
+        | SyntaxKind::InterfaceDeclaration
+        | SyntaxKind::TypeLiteral => container.members().len(),
+        SyntaxKind::ObjectLiteralExpression | SyntaxKind::JsxAttributes => {
+            container.properties().len()
+        }
+        _ => 0,
+    }
+}
+
+/// About the number of exports of `container`.
+fn exports_size_hint(container: Node) -> usize {
+    match container.kind() {
+        SyntaxKind::EnumDeclaration => container.members().len(),
+        _ => statement_count_hint(container),
+    }
+}
+
+/// About the number of locals of `container`.
+fn locals_size_hint(container: Node) -> usize {
+    statement_count_hint(container)
+}
+
+/// The statement count of a source file or of a namespace body, else 0.
+fn statement_count_hint(container: Node) -> usize {
+    match container.kind() {
+        SyntaxKind::SourceFile => container.statements().len(),
+        SyntaxKind::ModuleDeclaration => {
+            let body = container.body();
+            if body.is_some() && body.kind() == SyntaxKind::ModuleBlock {
+                body.statements().len()
+            } else {
+                0
+            }
+        }
+        _ => 0,
     }
 }
 

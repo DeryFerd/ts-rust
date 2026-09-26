@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 // PORT: Go `*InferenceState` is pooled on the checker
 // (`Checker::freeinference_state: Option<Rc<RefCell<InferenceState>>>`), so every
@@ -200,7 +201,9 @@ impl Checker {
             };
             // First, infer between identically matching source and target constituents and remove the
             // matching types.
-            let target_distributed = self.ty(target).distributed();
+            // PORT: perf. `target` is a union here, so Go `Distributed()`
+            // is its type list. The shared list copies no elements.
+            let target_distributed = self.ty(target).types_list();
             let (temp_sources, temp_targets) = self.infer_from_matching_types(
                 n,
                 source_types,
@@ -631,15 +634,22 @@ impl Checker {
             s: source,
             t: target,
         };
-        let status = n
-            .borrow()
-            .visited
-            .as_ref()
-            .and_then(|v| v.get(&key).copied());
-        if let Some(status) = status {
-            let mut s = n.borrow_mut();
-            s.inference_priority = std::cmp::min(s.inference_priority, status);
-            return;
+        // PORT: perf. One `entry` probe does the Go lookup and the first
+        // `CIRCULARITY` insert. The map is made first; a lookup on Go's nil
+        // map misses, and the miss path makes the map anyway, so the map
+        // contents are the same.
+        {
+            let mut guard = n.borrow_mut();
+            let s = &mut *guard;
+            match s.visited.get_or_insert_with(FxHashMap::default).entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    s.inference_priority = std::cmp::min(s.inference_priority, *e.get());
+                    return;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(InferencePriority::CIRCULARITY);
+                }
+            }
         }
         let save_inference_priority;
         let save_expanding_flags;
@@ -650,9 +660,6 @@ impl Checker {
         let target_id = self.stack_recursion_id(target);
         {
             let mut s = n.borrow_mut();
-            s.visited
-                .get_or_insert_with(FxHashMap::default)
-                .insert(key, InferencePriority::CIRCULARITY);
             save_inference_priority = s.inference_priority;
             s.inference_priority = InferencePriority::MAX_VALUE;
             // We stop inferring and report a circularity if we encounter duplicate recursion identities on both
@@ -665,17 +672,30 @@ impl Checker {
         }
         // PORT: the stacks are read through a shared borrow of `n`, instead
         // of cloned. Nothing reached from isDeeplyNestedType can use `n`; if
-        // that changes, the borrow check panics.
+        // that changes, the borrow check panics. The probe is the entry just
+        // pushed, so its stored id is passed as the probe identity.
         let source_nested = {
             let s = n.borrow();
-            self.is_deeply_nested_type_with_ids(source, &s.source_stack, &s.source_ids, 2)
+            self.is_deeply_nested_type_with_ids(
+                source,
+                source_id,
+                &s.source_stack,
+                &s.source_ids,
+                2,
+            )
         };
         if source_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
         }
         let target_nested = {
             let s = n.borrow();
-            self.is_deeply_nested_type_with_ids(target, &s.target_stack, &s.target_ids, 2)
+            self.is_deeply_nested_type_with_ids(
+                target,
+                target_id,
+                &s.target_stack,
+                &s.target_ids,
+                2,
+            )
         };
         if target_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
@@ -694,9 +714,16 @@ impl Checker {
             s.source_ids.pop();
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
-            s.visited
-                .get_or_insert_with(FxHashMap::default)
-                .insert(key, inference_priority);
+            // PORT: perf. The key was inserted above and nothing removes it
+            // while `n` is in use, so this overwrites it in place. The insert
+            // is the Go map write, kept in case that changes.
+            if let Some(p) = s.visited.as_mut().and_then(|v| v.get_mut(&key)) {
+                *p = inference_priority;
+            } else {
+                s.visited
+                    .get_or_insert_with(FxHashMap::default)
+                    .insert(key, inference_priority);
+            }
             s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
         }
     }
@@ -708,9 +735,11 @@ impl Checker {
         sources: &[TypeId],
         targets: &[TypeId],
         matches: &mut dyn FnMut(&mut Checker, TypeId, TypeId) -> bool,
-    ) -> (Vec<TypeId>, Vec<TypeId>) {
-        let mut matched_sources: Vec<TypeId> = Vec::new();
-        let mut matched_targets: Vec<TypeId> = Vec::new();
+    ) -> (SmallVec<[TypeId; 8]>, SmallVec<[TypeId; 8]>) {
+        // PORT: perf. The matched and returned lists are short temporaries,
+        // so they live on the stack up to 8 entries.
+        let mut matched_sources: SmallVec<[TypeId; 8]> = SmallVec::new();
+        let mut matched_targets: SmallVec<[TypeId; 8]> = SmallVec::new();
         for &t in targets {
             for &s in sources {
                 if matches(self, s, t) {
@@ -725,9 +754,9 @@ impl Checker {
             }
         }
         // Copies the list once, without the matched types.
-        let unmatched = |list: &[TypeId], matched: &[TypeId]| -> Vec<TypeId> {
+        let unmatched = |list: &[TypeId], matched: &[TypeId]| -> SmallVec<[TypeId; 8]> {
             if matched.is_empty() {
-                return list.to_vec();
+                return SmallVec::from_slice(list);
             }
             list.iter()
                 .copied()
@@ -1436,8 +1465,10 @@ impl Checker {
     ) {
         let properties = self.get_properties_of_object_type(target);
         for target_prop in properties {
+            // PORT: perf. The lookup takes the `Name`, so the member table
+            // compares ids instead of hashing and comparing text.
             let name = self.sym(target_prop).name.clone();
-            let source_prop = self.get_property_of_type(source, &name);
+            let source_prop = self.get_property_of_type_name(source, &name);
             if source_prop.is_some()
                 && !self
                     .sym(source_prop)

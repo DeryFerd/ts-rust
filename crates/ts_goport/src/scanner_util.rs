@@ -366,9 +366,26 @@ fn go_string_marker_at(bytes: &[u8], i: usize) -> bool {
 
 /// The byte offset of the first `GO_STRING_MARKER` at or after `from`. The
 /// marker starts with a lead byte, so a match starts a char.
+///
+/// PERF: `memmem::find` builds a searcher on each call, which cost about 15%
+/// of Hono's check time (template literal texts are short and many). The
+/// lead byte 0xEF is rare in source text, so a check for it (core's inlined
+/// `contains`), then `memchr` for it and a compare of the other two bytes,
+/// is cheaper.
 #[inline]
 fn find_go_string_marker(bytes: &[u8], from: usize) -> Option<usize> {
-    memchr::memmem::find(&bytes[from..], GO_STRING_MARKER_BYTES).map(|i| from + i)
+    if !bytes[from..].contains(&GO_STRING_MARKER_BYTES[0]) {
+        return None;
+    }
+    let mut i = from;
+    while let Some(j) = memchr::memchr(GO_STRING_MARKER_BYTES[0], &bytes[i..]) {
+        let at = i + j;
+        if go_string_marker_at(bytes, at) {
+            return Some(at);
+        }
+        i = at + 1;
+    }
+    None
 }
 
 /// Reports whether `text` holds `GO_STRING_MARKER`, which means that its
@@ -827,9 +844,40 @@ pub fn decode_go_js_string_rune(s: &str) -> (u32, usize, usize) {
 // can be a prefix of another unit's bytes, so then the Go bytes of the rest
 // of both strings are compared.
 pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
+    /// Length of the common byte prefix. It compares 8 bytes at a time: in
+    /// a little-endian load, the lowest set bit of the XOR is in the first
+    /// different byte.
+    fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+        let mut p = 0;
+        for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+            let diff = u64::from_le_bytes(x.try_into().unwrap())
+                ^ u64::from_le_bytes(y.try_into().unwrap());
+            if diff != 0 {
+                return p + (diff.trailing_zeros() / 8) as usize;
+            }
+            p += 8;
+        }
+        p + a[p..]
+            .iter()
+            .zip(&b[p..])
+            .take_while(|(x, y)| x == y)
+            .count()
+    }
     // Equal bytes are equal characters, so skip the common byte prefix and
     // step back to the start of the first different character.
-    let mut p = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let mut p = common_prefix_len(a.as_bytes(), b.as_bytes());
+    // PERF: an ASCII byte is always a whole unit whose Go byte is itself.
+    // When the prefix is empty or ends with an ASCII byte, `p` starts a unit
+    // in both strings. When the next byte of each string is ASCII or absent,
+    // those units are single bytes (or the end), so byte order is the Go
+    // order. This holds for any encoding in which non-ASCII units have Go
+    // bytes >= 0x80, and skips the unit decoding below.
+    if p == 0 || a.as_bytes()[p - 1].is_ascii() {
+        let (x, y) = (a.as_bytes().get(p), b.as_bytes().get(p));
+        if x.is_none_or(u8::is_ascii) && y.is_none_or(u8::is_ascii) {
+            return x.cmp(&y);
+        }
+    }
     while !a.is_char_boundary(p) {
         p -= 1;
     }
@@ -960,8 +1008,14 @@ pub(crate) fn js_string_to_token_value(value: &ts_core::JsString) -> String {
 // returned unchanged.
 // PORT: the sentinel check looks for GO_STRING_MARKER.
 pub fn combine_surrogate_pairs(s: &str) -> String {
+    combine_surrogate_pairs_cow(s).into_owned()
+}
+
+/// `combine_surrogate_pairs` that borrows `s` when it is unchanged, so only
+/// a string with a sentinel is copied.
+pub fn combine_surrogate_pairs_cow(s: &str) -> Cow<'_, str> {
     if !contains_go_string_marker(s) {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
     let mut b = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -980,7 +1034,7 @@ pub fn combine_surrogate_pairs(s: &str) -> String {
         b.push_str(&s[i..i + size]);
         i += size;
     }
-    b
+    Cow::Owned(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,13 +1620,10 @@ static TEXT_TO_PUNCTUATION: &[(&str, SyntaxKind)] = &[
 
 /// Go `textToKeyword[text]`: returns `SyntaxKind::Unknown` (Go zero value)
 /// on a miss.
+// PERF: the ported scanner's copy is a match on the same table, which does
+// not hash the text.
 fn text_to_keyword(text: &str) -> SyntaxKind {
-    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> =
-        std::sync::OnceLock::new();
-    MAP.get_or_init(|| TEXT_TO_KEYWORD.iter().copied().collect())
-        .get(text)
-        .copied()
-        .unwrap_or(SyntaxKind::Unknown)
+    crate::frontend::scanner::scanner_p1::text_to_keyword(text)
 }
 
 // Go: scanner/scanner.go:2227 GetIdentifierToken

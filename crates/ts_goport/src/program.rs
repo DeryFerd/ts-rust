@@ -11,16 +11,22 @@
 //! Use: `let program = load(config_path); bind_all();` then the diagnostics
 //! functions below. `load` installs the program for the process; the
 //! loading thread also keeps the frontend program and the checker pool.
+//!
+//! A multi-program process (watch, language server, tests) loads program
+//! versions with `try_load_version` and `update_program_version`, reads one
+//! inside `core::enter_program`, and frees its checker pool with
+//! `release_program`. The loading thread keeps the frontend program and the
+//! checker pool of each version, by program id.
 
 use crate::execute::tsc::compile::CompileTimes;
 use crate::prelude::*;
-use std::cell::OnceCell;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use ts_path::CaseSensitivity;
 use ts_vfs::FileSystem;
 
 mod go_frontend;
+pub mod ls_program;
 mod verify_options;
 
 // ---------------------------------------------------------------------------
@@ -151,6 +157,9 @@ pub struct SourceOutputAndProjectReference {
 /// installed. The fields that walk the tree (external module indicator,
 /// imports, ...) are in `LateSourceFileInfo`, reached through `Deref`, and
 /// are set by `install`.
+// PORT: the program sets Go `SourceFile.Metadata` and the default library
+// flag, and program versions that share a file version can differ in them,
+// so they are in `ProgramState::file_meta`.
 pub struct SourceFileInfo {
     pub file_name: String,
     pub path: String,
@@ -168,8 +177,6 @@ pub struct SourceFileInfo {
     pub jsdoc_diagnostics: Vec<Diagnostic>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
-    pub is_default_library: bool,
-    pub meta_data: SourceFileMetaData,
     /// Trivia runs of the text. They map the Rust token-start ranges to Go
     /// full-start ranges (see `ast::go_view`).
     pub trivia: crate::ast::go_view::TriviaRuns,
@@ -220,7 +227,7 @@ impl Deref for LateSourceFileInfo {
         if let Some(info) = self.post_bind.get() {
             return info;
         }
-        let file = &prog().files[self.file_index];
+        let file = crate::ast::go_file(self.file_index);
         let Some(file_bind) = file.file_bind.get() else {
             return &NOT_BOUND;
         };
@@ -232,9 +239,69 @@ impl Deref for LateSourceFileInfo {
 
 /// Go `checkerPool` (compiler pool). Checkers are created on first use.
 /// Each checker lives on its own worker thread; the pool holds the job
-/// queue of each worker. Only the loading thread has a pool.
+/// queue of each worker. Only the loading thread has pools, one for each
+/// program version (`POOLS`).
 struct CheckerPool {
     workers: Vec<std::sync::mpsc::Sender<Job>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl CheckerPool {
+    /// Stops the workers: each drops its checker, then it closes their job
+    /// queues and waits for each thread to end, so the checkers are freed on
+    /// return.
+    fn shut_down(self) {
+        // A pool that only ends with the process forgets its checkers (see
+        // `create_checkers`); a released program frees them here.
+        for worker in &self.workers {
+            let _ = worker.send(Box::new(|| {
+                drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                record_worker_arena_use();
+            }));
+        }
+        drop(self.workers);
+        for thread in self.threads {
+            // A job panic stays in its job result, so a worker ends normally.
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The AST arena bytes that each checker worker of the last released pool
+/// used, by worker index (see `worker_arena_start`).
+static WORKER_ARENA_USE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Records the AST arena use of this checker worker. A released pool runs it
+/// on each worker after it drops the checker.
+fn record_worker_arena_use() {
+    let Some(index) = worker_index() else {
+        return;
+    };
+    let used = crate::ast::store::ast_arena_used();
+    let mut uses = WORKER_ARENA_USE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if uses.len() <= index {
+        uses.resize(index + 1, 0);
+    }
+    uses[index] = used;
+}
+
+/// The first AST arena chunk of checker worker `index`: what worker `index`
+/// of the last released pool used, plus a sixteenth, in whole pages. None
+/// (the 1 MiB default) before any pool is released, so a one-program
+/// process keeps the default. A released pool leaks its worker arenas (the
+/// nodes are `&'static`), so a 1 MiB chunk would leak about 1 MiB for each
+/// worker and program version while a Query core worker uses 25 to 80 KB.
+/// A worker checks the same files in each version, so its use changes
+/// little; when it needs more, the arena adds a chunk twice as large.
+fn worker_arena_start(index: usize) -> Option<usize> {
+    const PAGE: usize = 4096;
+    let uses = WORKER_ARENA_USE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let used = *uses.get(index)?;
+    Some((used + used / 16).div_ceil(PAGE) * PAGE)
 }
 
 /// Work for one checker worker. It runs on the worker thread, where
@@ -256,12 +323,16 @@ struct ExternalLocation {
     character: i32,
 }
 
-/// Program-level state that `GoProgram` does not hold.
-struct ProgramState {
+/// Program-level state that `GoProgram` does not hold. One per program
+/// version, in `GoProgram::state`; read it with `state()`.
+pub(crate) struct ProgramState {
     cwd: String,
     case_sensitivity: CaseSensitivity,
     fs: ts_vfs::OsFileSystem,
     file_by_path: FxHashMap<String, usize>,
+    /// The Go `SourceFile` fields that the program sets, by file id, for
+    /// each program file.
+    file_meta: FxHashMap<usize, FileProgramMeta>,
     config_diagnostics: Vec<Diagnostic>,
     program_diagnostics: Vec<Diagnostic>,
     external_locations: Vec<ExternalLocation>,
@@ -275,36 +346,191 @@ struct ProgramState {
     declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
     /// The thread-safe copy of the Go frontend data that the checker reads
     /// (`GOPORT_FRONTEND=go`). None on the legacy path. The frontend program
-    /// itself is in `GO_FRONTEND`, on the loading thread only.
+    /// itself is in `FRONTENDS`, on the loading thread only.
     go: Option<go_frontend::GoSharedState>,
+    /// True for the program of an autoimport alias resolver
+    /// (`new_alias_resolver_program`). Its resolver is in `ALIAS_RESOLVERS`.
+    alias_resolver: bool,
 }
 
-/// The program state of the process. Every thread reads it.
-static STATE: OnceLock<&'static ProgramState> = OnceLock::new();
+/// Go `SourceFile.IsDefaultLibrary` (read through the program) and
+/// `SourceFile.Metadata` of one program file.
+struct FileProgramMeta {
+    meta_data: SourceFileMetaData,
+    is_default_library: bool,
+}
 
 thread_local! {
-    /// The Go frontend program. Only the thread that loaded the program has
-    /// it: the frontend data is not thread-safe.
-    static GO_FRONTEND: OnceCell<&'static go_frontend::GoFrontendState> = const { OnceCell::new() };
+    /// The Go frontend program of each program version, by `GoProgram::id`.
+    /// Only the thread that loaded a program has it: the frontend data is
+    /// not thread-safe.
+    static FRONTENDS: RefCell<FxHashMap<u32, &'static go_frontend::GoFrontendState>> =
+        RefCell::new(FxHashMap::default());
 }
 
+/// The state of the current program (`prog()`).
 fn state() -> &'static ProgramState {
-    STATE.get().copied().expect("program not loaded")
-}
-
-fn set_state(program_state: &'static ProgramState) {
-    assert!(STATE.set(program_state).is_ok(), "program already loaded");
+    prog().state.get().copied().expect("program not loaded")
 }
 
 /// The Go frontend program, or None on the legacy path. Panics on a checker
 /// worker thread, which must use the copies in `ProgramState::go`.
 fn go_frontend() -> Option<&'static go_frontend::GoFrontendState> {
     state().go.as_ref()?;
-    Some(GO_FRONTEND.with(|cell| {
-        *cell
-            .get()
+    let id = prog().id;
+    Some(FRONTENDS.with(|frontends| {
+        *frontends
+            .borrow()
+            .get(&id)
             .expect("the Go frontend program is read on the loading thread only")
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Alias resolver programs (Go ls/autoimport/aliasresolver.go)
+// ---------------------------------------------------------------------------
+
+/// The Go `checker.Program` methods of the autoimport alias resolver
+/// (`ls/autoimport/aliasresolver.go`) that read the files and module
+/// resolutions it adds while its checker runs. Go gives the other methods a
+/// constant or panics, and the `program.rs` functions do the same for an
+/// alias resolver program.
+pub trait AliasResolverProgram {
+    /// Go `GetSourceFile`.
+    fn source_file(&self, file_name: &str) -> Node;
+    /// Go `GetSourceFileForResolvedModule`.
+    fn source_file_for_resolved_module(&self, file_name: &str) -> Node;
+    /// Go `GetResolvedModule`.
+    fn resolved_module(
+        &self,
+        file: Node,
+        module_reference: &str,
+        mode: ResolutionMode,
+    ) -> ResolvedModule;
+}
+
+thread_local! {
+    /// The resolver of each alias resolver program of this thread, by
+    /// `GoProgram::id`, while its `AliasResolverProgramScope` lives.
+    static ALIAS_RESOLVERS: RefCell<FxHashMap<u32, Rc<dyn AliasResolverProgram>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// The resolver of the current program when it is an alias resolver program.
+fn alias_resolver() -> Option<Rc<dyn AliasResolverProgram>> {
+    if !state().alias_resolver {
+        return None;
+    }
+    let id = prog().id;
+    let resolver = ALIAS_RESOLVERS.with(|resolvers| resolvers.borrow().get(&id).cloned());
+    Some(resolver.expect("an alias resolver program is read on its thread while its scope lives"))
+}
+
+/// Go `panic("unimplemented")`: the alias resolver's `checker.Program`
+/// methods that Go does not implement (aliasresolver.go:141-230).
+#[track_caller]
+fn alias_resolver_unimplemented() {
+    if state().alias_resolver {
+        go_panic("unimplemented".to_string());
+    }
+}
+
+/// From `new_alias_resolver_program`. The program is current on this thread
+/// while the scope lives (an `ls_program::ProgramGuard`). On drop the
+/// program forgets its resolver; do not use its checker after that.
+pub struct AliasResolverProgramScope {
+    program: &'static GoProgram,
+    _guard: ls_program::ProgramGuard,
+}
+
+impl AliasResolverProgramScope {
+    /// The alias resolver program.
+    #[must_use]
+    pub fn program(&self) -> &'static GoProgram {
+        self.program
+    }
+}
+
+impl Drop for AliasResolverProgramScope {
+    fn drop(&mut self) {
+        let id = self.program.id;
+        let resolver = ALIAS_RESOLVERS.with(|resolvers| resolvers.borrow_mut().remove(&id));
+        drop(resolver);
+    }
+}
+
+/// Go `checker.NewChecker(aliasResolver, nil)` (ls/autoimport): makes the
+/// program that the checker reads and makes it current until the scope
+/// drops. `root_files` are Go `aliasResolver.SourceFiles()`. `files` are
+/// every file that the checker can read (the root files too); they must be
+/// published, and they are bound here if they are not yet. `options` are Go
+/// `aliasResolver.Options()`, `current_directory` and
+/// `use_case_sensitive_file_names` come from the resolver's host, and
+/// `resolver` answers the lazy methods (`AliasResolverProgram`).
+// PORT: Go needs no program: the resolver is the `checker.Program`. A
+// checker here reads its program version (`prog()`), and it copies the
+// binder lineage when it is made (`SymbolArena::for_checker`). So the
+// program copies the lineage after `files` are bound, and a file bound
+// later is not in its checkers' arenas. Go `GetResolvedModules` is nil, so
+// the program has no resolved modules. The program shell stays leaked like
+// other program versions (multi-program M2, M3).
+pub fn new_alias_resolver_program(
+    options: CompilerOptions,
+    root_files: &[Node],
+    files: &[Node],
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+    resolver: Rc<dyn AliasResolverProgram>,
+) -> AliasResolverProgramScope {
+    let case_sensitivity = if use_case_sensitive_file_names {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    };
+    let file_by_path = files
+        .iter()
+        .map(|&file| (source_file_info(file).path.clone(), file.file_index()))
+        .collect();
+    let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+        id: next_program_id(),
+        program: None,
+        source_file_order: root_files.iter().map(|file| file.file_index()).collect(),
+        options,
+        bound_symbols: OnceLock::new(),
+        state: OnceLock::new(),
+    }));
+    let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
+        cwd: current_directory.to_string(),
+        case_sensitivity,
+        fs: ts_vfs::OsFileSystem::default(),
+        file_by_path,
+        file_meta: FxHashMap::default(),
+        config_diagnostics: Vec::new(),
+        program_diagnostics: Vec::new(),
+        external_locations: Vec::new(),
+        resolved_modules: OnceLock::from(IndexMap::new()),
+        common_source_directory: OnceLock::new(),
+        file_associations: OnceLock::new(),
+        declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
+        go: None,
+        alias_resolver: true,
+    }));
+    assert!(program.state.set(program_state).is_ok());
+    register_program_version(program);
+    let bound_symbols = {
+        let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+        let symbols = lineage.get_or_insert_with(SymbolArena::new);
+        for &file in files {
+            bind_source_file(file, symbols);
+        }
+        symbols.clone()
+    };
+    assert!(program.bound_symbols.set(bound_symbols).is_ok());
+    ALIAS_RESOLVERS.with(|resolvers| resolvers.borrow_mut().insert(program.id, resolver));
+    AliasResolverProgramScope {
+        program,
+        _guard: ls_program::enter_version(program),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +609,7 @@ fn try_load_legacy(
 
     let mut files = Vec::new();
     let mut file_by_path = FxHashMap::default();
+    let mut file_meta = FxHashMap::default();
     for (index, id) in compiler_program
         .semantic_source_order()
         .into_iter()
@@ -393,7 +620,7 @@ fn try_load_legacy(
             .ok_or_else(|| format!("missing source file for {id:?}"))?;
         let parser_flags = compute_parser_flags(index, source);
         let root = Node::new(index, source.parse.source_file);
-        let info = build_early_info(
+        let (info, meta) = build_early_info(
             index,
             source,
             &parser_flags,
@@ -403,6 +630,7 @@ fn try_load_legacy(
             &fs,
         );
         file_by_path.insert(info.path.clone(), index);
+        file_meta.insert(index, meta);
         files.push(GoFile {
             source: Some(source),
             root,
@@ -429,19 +657,24 @@ fn try_load_legacy(
         &mut external_locations,
     );
 
-    let source_file_order = (0..files.len()).collect();
+    // The legacy files have no node stores; they become the first publish.
+    let file_count = files.len();
+    crate::ast::publish_file_stores(files);
+    let source_file_order = (0..file_count).collect();
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+        id: next_program_id(),
         program: Some(compiler_program),
-        files,
         source_file_order,
         options,
         bound_symbols: OnceLock::new(),
+        state: OnceLock::new(),
     }));
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
         case_sensitivity,
         fs,
         file_by_path,
+        file_meta,
         config_diagnostics,
         program_diagnostics,
         external_locations,
@@ -450,8 +683,9 @@ fn try_load_legacy(
         file_associations: OnceLock::new(),
         declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
         go: None,
+        alias_resolver: false,
     }));
-    set_state(program_state);
+    assert!(program.state.set(program_state).is_ok());
     install(program);
     record_legacy_import_helpers_import_specifiers();
     Ok(program)
@@ -460,10 +694,12 @@ fn try_load_legacy(
 /// Installs `program` for the process (`core::set_prog`) and computes the
 /// Go SourceFile fields that need the tree: Go `finishSourceFile`
 /// (reparsed clones, external module indicator) and
-/// `collectExternalModuleReferences`.
+/// `collectExternalModuleReferences`. The files of `program` must be
+/// published (`crate::ast::publish_file_stores`) and its state set first.
 pub fn install(program: &'static GoProgram) {
     set_prog(program);
-    for (index, file) in program.files.iter().enumerate() {
+    for &index in &program.source_file_order {
+        let file = crate::ast::go_file(index);
         let late = build_late_info(index, file);
         assert!(
             file.info.late.set(late).is_ok(),
@@ -472,17 +708,26 @@ pub fn install(program: &'static GoProgram) {
     }
 }
 
+/// The symbol arena of every file version bound so far, in any program
+/// version. It only grows, so the symbol ids of a file version stay valid
+/// in every program that shares the file (Go `SourceFile.BindOnce`).
+static LINEAGE: Mutex<Option<SymbolArena>> = Mutex::new(None);
+
 // Go: compiler/program.go:445 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
-// file binds into the shared `prog().bound_symbols` arena, with the same
-// initializer that `Checker::new` uses, so the first of the two to run binds.
-// Files bind in parallel, each into its own arena (`bind_files_parallel`),
-// and join the program arena in file order with the ids a serial bind gives.
+// file binds into the shared `LINEAGE` arena, and `prog().bound_symbols` is
+// a copy of it after the program files are bound. `Checker::new` uses the
+// same initializer, so the first of the two to run binds. Files bind in
+// parallel, each into its own arena (`bind_files_parallel`), and join the
+// lineage in file order with the ids a serial bind gives. A file that an
+// earlier program version bound is not bound again.
 pub fn bind_all() {
     let program = prog();
     program.bound_symbols.get_or_init(|| {
-        let mut symbols = SymbolArena::new();
-        bind_files_parallel(&mut symbols);
+        let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+        let symbols = lineage.get_or_insert_with(SymbolArena::new);
+        let mark = symbols.mark();
+        bind_files_parallel(symbols);
         for file in program.source_files() {
             // Go: program.go:450 traces the files that are not bound yet.
             let _trace = if file.file_bind.get().is_none() {
@@ -490,9 +735,11 @@ pub fn bind_all() {
             } else {
                 None
             };
-            bind_source_file(file.root, &mut symbols);
+            bind_source_file(file.root, symbols);
         }
-        symbols
+        // Checkers clone the copy; share what this program added.
+        symbols.share_since(mark);
+        symbols.clone()
     });
 }
 
@@ -542,55 +789,176 @@ fn bind_thread_count() -> usize {
 /// than 5 ms and cost more RSS.
 const BIND_THREAD_CAP: usize = 8;
 
-/// One file bound on a bind thread, or None when binding it made
-/// thread-local state or panicked.
-type ParallelBind = (usize, Option<(BoundFile, SymbolArena)>);
+/// One file bound on a bind thread, with its ids already moved to program
+/// ids, or None when binding it made thread-local state or panicked.
+type ParallelBind = (usize, Option<(BoundFile, PreparedFileArena)>);
 
-/// Binds the program files on several threads, each file into its own
-/// arena, and joins the arenas into `symbols` in file order. It stops at the
-/// first file that made thread-local state while binding (for example a
-/// lazy JSDoc parse) or panicked; `bind_all` binds that file and the rest
-/// serially, which gives the same result as a serial bind of every file.
+/// The work queue of the bind threads (`bind_files_parallel`).
+struct BindQueue {
+    state: Mutex<BindQueueState>,
+    /// Signals new known offsets, a finished bind and `stop`.
+    changed: std::sync::Condvar,
+}
+
+struct BindQueueState {
+    /// The next file to bind, as an index into the bind order.
+    next: usize,
+    /// The number of files being bound.
+    binding: usize,
+    /// Set by the loading thread when it stops at a failed file.
+    stop: bool,
+    /// The arena counts of each bound file, by file index.
+    counts: Vec<Option<ArenaMark>>,
+    /// The id offsets of file `i` at index `i`. They are known when every
+    /// earlier file is bound: each file adds its counts to the offsets of the
+    /// file before it.
+    offsets: Vec<ArenaOffsets>,
+    /// Bound files that wait for their offsets, by file index.
+    waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)>,
+}
+
+impl BindQueue {
+    fn new(file_count: usize, first: ArenaOffsets) -> Self {
+        BindQueue {
+            state: Mutex::new(BindQueueState {
+                next: 0,
+                binding: 0,
+                stop: false,
+                counts: vec![None; file_count],
+                offsets: vec![first],
+                waiting: std::collections::BTreeMap::new(),
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BindQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Stops the bind threads.
+    fn stop(&self) {
+        self.lock().stop = true;
+        self.changed.notify_all();
+    }
+}
+
+impl BindQueueState {
+    /// Records the arena counts of bound file `i`. Returns true when that
+    /// made the offsets of more files known.
+    fn record(&mut self, i: usize, counts: ArenaMark) -> bool {
+        self.counts[i] = Some(counts);
+        let known = self.offsets.len();
+        while let Some(&Some(file_counts)) = self.counts.get(self.offsets.len() - 1) {
+            let last = *self.offsets.last().expect("first offsets");
+            self.offsets.push(last.after(file_counts));
+        }
+        self.offsets.len() > known
+    }
+
+    /// The waiting file with the lowest index, when its offsets are known.
+    fn take_ready(&mut self) -> Option<(usize, BoundFile, SymbolArena, ArenaOffsets)> {
+        let (&i, _) = self.waiting.first_key_value()?;
+        let offsets = *self.offsets.get(i)?;
+        let (_, (bound, file_symbols)) = self.waiting.pop_first()?;
+        Some((i, bound, file_symbols, offsets))
+    }
+}
+
+/// Binds the program files that are not bound yet on several threads, each
+/// file into its own arena, and joins the arenas into `symbols` in file
+/// order. It stops at the first file that made thread-local state while
+/// binding (for example a lazy JSDoc parse) or panicked; `bind_all` binds
+/// that file and the rest serially, which gives the same result as a serial
+/// bind of every file.
+// PERF: a file's ids move to their program values on a bind thread, as soon
+// as every earlier file is bound, because its offsets are the sums of the
+// earlier file counts. The threads stay while files wait for offsets, so
+// when the last large file (lib.dom) is bound they move the waiting files in
+// parallel. The loading thread only appends chunks, in file order. The ids
+// are the ones that a join on the loading thread gives.
 fn bind_files_parallel(symbols: &mut SymbolArena) {
-    let files: Vec<Node> = prog().source_files().map(|file| file.root).collect();
+    let files: Vec<Node> = prog()
+        .source_files()
+        .filter(|file| file.file_bind.get().is_none())
+        .map(|file| file.root)
+        .collect();
     let threads = bind_thread_count().min(files.len());
-    if single_threaded()
-        || threads < 2
-        || prog()
-            .source_files()
-            .any(|file| file.file_bind.get().is_some())
-    {
+    if single_threaded() || threads < 2 {
         return;
     }
     let unported = unported_report();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    // PERF: the threads take the largest files first (by node count), so the
+    // largest file (lib.dom) starts at once and the small files fill the other
+    // threads while it binds. The join order stays the file order.
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(files[i].go_file().parser_flags.len()));
+    let queue = BindQueue::new(files.len(), symbols.next_file_offsets());
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
         for _ in 0..threads {
             let seed = WorkerSeed::take();
-            let (files, next, stop, sender) = (&files, &next, &stop, sender.clone());
+            let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
             std::thread::Builder::new()
                 .stack_size(CHECKER_STACK_SIZE)
                 .spawn_scoped(scope, move || {
                     seed.install();
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&file) = files.get(i) else { break };
-                        let before = bind_thread_fingerprint();
-                        let result = std::panic::catch_unwind(|| {
-                            let _trace = trace_bind_source_file(file);
-                            let mut file_symbols = SymbolArena::new();
-                            let bound = bind_source_file_detached(file, &mut file_symbols);
-                            (bound, file_symbols)
-                        })
-                        .ok()
-                        .filter(|_| bind_thread_fingerprint() == before);
-                        let failed = result.is_none();
-                        let _ = sender.send((i, result));
-                        if failed {
+                    let mut state = queue.lock();
+                    loop {
+                        if state.stop {
                             break;
                         }
+                        // Moving ids first: the loading thread waits for it.
+                        if let Some((i, mut bound, file_symbols, offsets)) = state.take_ready() {
+                            drop(state);
+                            bound.remap(offsets);
+                            let prepared = file_symbols.prepare_file_arena(offsets);
+                            let _ = sender.send((i, Some((bound, prepared))));
+                            state = queue.lock();
+                            continue;
+                        }
+                        if let Some(&i) = order.get(state.next) {
+                            let file = files[i];
+                            state.next += 1;
+                            state.binding += 1;
+                            drop(state);
+                            let before = bind_thread_fingerprint();
+                            let result = std::panic::catch_unwind(|| {
+                                let _trace = trace_bind_source_file(file);
+                                let mut file_symbols = SymbolArena::new();
+                                let bound = bind_source_file_detached(file, &mut file_symbols);
+                                (bound, file_symbols)
+                            })
+                            .ok()
+                            .filter(|_| bind_thread_fingerprint() == before);
+                            state = queue.lock();
+                            state.binding -= 1;
+                            let Some((bound, file_symbols)) = result else {
+                                drop(state);
+                                // Later files never get offsets now; waiting
+                                // threads check whether to stay.
+                                queue.changed.notify_all();
+                                let _ = sender.send((i, None));
+                                break;
+                            };
+                            let more = state.record(i, file_symbols.mark());
+                            state.waiting.insert(i, (bound, file_symbols));
+                            if more || state.binding == 0 {
+                                queue.changed.notify_all();
+                            }
+                            continue;
+                        }
+                        // Nothing to bind. Stay while a waiting file can
+                        // still get its offsets from a bind in progress.
+                        if state.waiting.is_empty() || state.binding == 0 {
+                            break;
+                        }
+                        state = queue
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                 })
                 .expect("cannot start a bind thread");
@@ -602,11 +970,11 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
         for (i, result) in &receiver {
             pending.insert(i, result);
             while let Some(result) = pending.remove(&joined) {
-                let Some((mut bound, file_symbols)) = result else {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let Some((bound, prepared)) = result else {
+                    queue.stop();
                     return false;
                 };
-                bound.remap(symbols.append_file_arena(file_symbols));
+                symbols.append_prepared_file_arena(prepared);
                 bound.install();
                 joined += 1;
             }
@@ -621,6 +989,7 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
 
 // Go: parser/parser.go finishSourceFile (text part) and
 // compiler/fileloader.go parseSourceFile / loadSourceFileMetaData.
+// The metadata and the default library flag come back beside the info.
 fn build_early_info(
     index: usize,
     source: &'static ts_compiler::SourceFile,
@@ -629,7 +998,7 @@ fn build_early_info(
     cwd: &str,
     case_sensitivity: CaseSensitivity,
     fs: &ts_vfs::OsFileSystem,
-) -> SourceFileInfo {
+) -> (SourceFileInfo, FileProgramMeta) {
     let file_name = source.file_name.clone();
     let path = ts_path::canonicalize(&file_name, cwd, case_sensitivity);
     let text = source.source_text.as_str();
@@ -694,10 +1063,13 @@ fn build_early_info(
         }
     }
 
-    let meta_data = load_source_file_meta_data(&file_name, options, fs);
+    let meta = FileProgramMeta {
+        meta_data: load_source_file_meta_data(&file_name, options, fs),
+        is_default_library: source.is_default_library,
+    };
     let _ = parser_flags;
 
-    SourceFileInfo {
+    let info = SourceFileInfo {
         file_name,
         path,
         is_declaration_file,
@@ -715,11 +1087,10 @@ fn build_early_info(
         js_diagnostics: Vec::new(),
         jsdoc_diagnostics: Vec::new(),
         has_lazy_js_doc: script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX,
-        is_default_library: source.is_default_library,
-        meta_data,
         trivia: crate::ast::go_view::TriviaRuns::compute(&source.parse.arena, text),
         late: OnceLock::new(),
-    }
+    };
+    (info, meta)
 }
 
 // Go: parser/parser.go finishSourceFile (tree part) and
@@ -740,7 +1111,13 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
         .collect();
     reparsed_clones.sort_by(|a, b| compare_node_positions(*a, *b).cmp(&0));
 
-    let external_module_indicator = get_external_module_indicator(root, info, &prog().options);
+    let missing = SourceFileMetaData::default();
+    let meta_data = state()
+        .file_meta
+        .get(&index)
+        .map_or(&missing, |meta| &meta.meta_data);
+    let external_module_indicator =
+        get_external_module_indicator(root, info, meta_data, &prog().options);
 
     let mut refs = ModuleReferences {
         imports: Vec::new(),
@@ -1333,9 +1710,11 @@ fn parse_resolution_mode(
 // Go: ast/parseoptions.go:60 getExternalModuleIndicator
 // PORT: Go computes `ExternalModuleIndicatorOptions` first
 // (GetExternalModuleIndicatorOptions); it is inlined here as `jsx`/`force`.
+// `meta_data` is the file metadata from `ProgramState::file_meta`.
 fn get_external_module_indicator(
     file: Node,
     info: &SourceFileInfo,
+    meta_data: &SourceFileMetaData,
     options: &CompilerOptions,
 ) -> Node {
     if info.script_kind == ScriptKind::JSON {
@@ -1348,8 +1727,7 @@ fn get_external_module_indicator(
     if info.is_declaration_file {
         return Node::NIL;
     }
-    let (jsx, force) =
-        get_external_module_indicator_options(&info.file_name, options, &info.meta_data);
+    let (jsx, force) = get_external_module_indicator_options(&info.file_name, options, meta_data);
     if jsx {
         let node = walk_tree_for_jsx_tags(file);
         if node.is_some() {
@@ -1803,7 +2181,7 @@ fn get_emit_syntax_for_usage_location_worker(
 }
 
 // ---------------------------------------------------------------------------
-// Program methods (Go compiler/program.go). The program is the installed
+// Program methods (Go compiler/program.go). The program is the current
 // `prog()`; these are free functions.
 // PORT: Go `projectReferenceFileMapper.getCompilerOptionsForFile` returns the
 // program options when there are no project references, which is always the
@@ -1814,18 +2192,36 @@ fn file_info_by_path(path: &str) -> Option<&'static SourceFileInfo> {
     state()
         .file_by_path
         .get(path)
-        .map(|&index| &prog().files[index].info)
+        .map(|&index| &crate::ast::go_file(index).info)
+}
+
+/// The program-set fields of the file at `path`, or None when `path` is not
+/// a program file.
+fn file_meta_by_path(path: &str) -> Option<&'static FileProgramMeta> {
+    let state = state();
+    state
+        .file_by_path
+        .get(path)
+        .and_then(|index| state.file_meta.get(index))
 }
 
 /// Lazy JSDoc of `node` in `file` on the Go frontend path (Go
 /// `SourceFile.resolveJSDoc`). None on the legacy path, where lazy JSDoc
 /// parsing is not ported.
+// PORT: the files of an alias resolver program are in no program, or in
+// another program version; `go_frontend` keeps their parser inputs.
 pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
-    state().go.as_ref().map(|go| go.resolve_js_doc(file, node))
+    let state = state();
+    if state.alias_resolver {
+        return go_frontend::resolve_js_doc_outside_program(file, node);
+    }
+    state.go.as_ref().map(|go| go.resolve_js_doc(file, node))
 }
 
 // Go: compiler/program.go:122 FileExists
+// Go: ls/autoimport/aliasresolver.go:158 FileExists (unimplemented)
 pub fn file_exists(path: &str) -> bool {
+    alias_resolver_unimplemented();
     if let Some(go) = &state().go {
         return go.file_exists(path);
     }
@@ -1855,11 +2251,15 @@ pub fn uses_uri_style_node_core_modules() -> Tristate {
 pub fn get_project_reference_from_source(
     path: &str,
 ) -> Option<&'static SourceOutputAndProjectReference> {
+    // Go: ls/autoimport/aliasresolver.go:193 (unimplemented)
+    alias_resolver_unimplemented();
     state().go.as_ref()?.get_project_reference_from_source(path)
 }
 
 // Go: compiler/program.go:178 IsSourceFromProjectReference
 pub fn is_source_from_project_reference(path: &str) -> bool {
+    // Go: ls/autoimport/aliasresolver.go:223 (unimplemented)
+    alias_resolver_unimplemented();
     state()
         .go
         .as_ref()
@@ -1871,6 +2271,8 @@ pub fn is_source_from_project_reference(path: &str) -> bool {
 pub fn get_project_reference_from_output_dts(
     path: &str,
 ) -> Option<&'static SourceOutputAndProjectReference> {
+    // Go: ls/autoimport/aliasresolver.go:188 (unimplemented)
+    alias_resolver_unimplemented();
     state()
         .go
         .as_ref()?
@@ -1880,6 +2282,8 @@ pub fn get_project_reference_from_output_dts(
 // Go: compiler/program.go:190 GetRedirectForResolution
 // PORT: see `get_project_reference_from_source`.
 pub fn get_redirect_for_resolution(file: Node) -> Option<&'static ResolvedProjectReference> {
+    // Go: ls/autoimport/aliasresolver.go:198 (unimplemented)
+    alias_resolver_unimplemented();
     state().go.as_ref()?.get_redirect_for_resolution(file)
 }
 
@@ -1907,6 +2311,8 @@ pub fn get_resolved_project_references() -> Vec<Option<&'static ResolvedProjectR
 // PORT: the Go frontend program has the port, and this is its value. None
 // on the legacy loader, where `modulespecifiers::host` builds its own.
 pub fn get_go_symlink_cache() -> Option<&'static crate::modulespecifiers::symlinks::KnownSymlinks> {
+    // Go: ls/autoimport/aliasresolver.go:143 (unimplemented)
+    alias_resolver_unimplemented();
     state()
         .go
         .as_ref()
@@ -1915,6 +2321,8 @@ pub fn get_go_symlink_cache() -> Option<&'static crate::modulespecifiers::symlin
 
 // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
 pub fn get_source_of_project_reference_if_output_included(file: Node) -> String {
+    // Go: ls/autoimport/aliasresolver.go:213 (unimplemented)
+    alias_resolver_unimplemented();
     let info = source_file_info(file);
     state()
         .go
@@ -1930,6 +2338,99 @@ pub fn install_new_program(
     opts: crate::frontend::compiler::ProgramOptions,
 ) -> Result<&'static GoProgram, String> {
     go_frontend::install_new_program(opts)
+}
+
+/// Go `compiler.NewProgram` for a multi-program process (watch, language
+/// server, tests), with the Go frontend. It loads a new program version and
+/// does not make it current: read it inside `core::enter_program`. Call it
+/// on the loading thread, which keeps the frontend and the checker pool of
+/// the version. `edit_options` is as in `try_load_with`. The version is
+/// leaked; `release_program` frees its checker pool.
+pub fn try_load_version(
+    config_path: &str,
+    edit_options: impl FnOnce(&mut CompilerOptions),
+) -> Result<&'static GoProgram, String> {
+    go_frontend::try_load_version(config_path, edit_options)
+}
+
+/// Go `Program.UpdateProgram`: a new version of `old` after an edit of
+/// `changed_file` (a file name, relative to the current directory or
+/// absolute). It reads `changed_file` from disk again. When the edit keeps
+/// the imports and references, the new version shares every other file
+/// version with `old` and the second value is true. Else every file is
+/// parsed again. `old` stays usable. Loading thread only.
+pub fn update_program_version(
+    old: &'static GoProgram,
+    changed_file: &str,
+) -> (&'static GoProgram, bool) {
+    go_frontend::update_program_version(old, changed_file)
+}
+
+/// Go `compiler.NewProgram` and `Program.UpdateProgram` for a
+/// multi-program process whose caller builds the frontend program `np`
+/// itself (the language server, watch mode). It builds the Go files of the
+/// stores that `np` parsed, publishes them and makes the program version of
+/// `np`. It does not make it current: read it inside `core::enter_program`.
+/// `previous` is the version that `np` was updated from, if it is still
+/// loaded; the new version shares its copies of unchanged frontend data.
+/// Call it on the loading thread, after `np` is built with no current
+/// program.
+pub fn new_program_version(
+    np: &'static crate::frontend::compiler::NewProgram,
+    previous: Option<&'static GoProgram>,
+) -> &'static GoProgram {
+    go_frontend::new_program_version(np, previous)
+}
+
+/// Records a source file that this thread parsed outside a program load
+/// (the language server parse cache). When a program version publishes
+/// the file's store but does not include the file, the store still gets
+/// the file's Go file (parser fields), so a later version can share it.
+pub fn note_parsed_source_file(file: &Rc<crate::frontend::parser::ParsedSourceFile>) {
+    go_frontend::note_parsed_source_file(file);
+}
+
+/// Publishes this thread's unpublished stores with no program: the files
+/// that `note_parsed_source_file` recorded get their Go files, and other
+/// stores (config files) the name only. Then their nodes can be bound
+/// (`bind_file_outside_program`). `cwd` is the current directory of the
+/// caller's host.
+pub fn publish_parsed_files(cwd: &str) {
+    go_frontend::publish_parsed_files(cwd);
+}
+
+/// Go `binder.BindSourceFile` for a published file that no program
+/// includes (Go `BindOnce`: a program that includes it later does not bind
+/// it again). The file joins the binder lineage of the process.
+pub fn bind_file_outside_program(file: Node) {
+    let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+    bind_source_file(file, lineage.get_or_insert_with(SymbolArena::new));
+}
+
+/// Frees what the loading thread keeps for `program`: it stops the checker
+/// pool (and waits for its workers), removes the frontend program from this
+/// thread and empties the declaration diagnostic cache. Do not use `program`
+/// after this. Its `GoProgram`, frontend program and file versions stay
+/// leaked. Panics when `program` is current on this thread.
+pub fn release_program(program: &'static GoProgram) {
+    assert!(
+        !try_prog().is_some_and(|current| std::ptr::eq(current, program)),
+        "program {} is released while it is current",
+        program.id
+    );
+    let pool = POOLS.with(|pools| pools.borrow_mut().remove(&program.id));
+    if let Some(pool) = pool {
+        pool.shut_down();
+    }
+    FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
+    if let Some(state) = program.state.get() {
+        drop(std::mem::take(
+            &mut *state
+                .declaration_diagnostic_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ));
+    }
 }
 
 /// The Go frontend program, or None on the legacy path. Loading thread only.
@@ -1982,11 +2483,15 @@ pub fn get_resolved_module(
     module_reference: &str,
     mode: ResolutionMode,
 ) -> Option<ResolvedModule> {
+    // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule (never nil)
+    if let Some(resolver) = alias_resolver() {
+        return Some(resolver.resolved_module(file, module_reference, mode));
+    }
     if let Some(go) = &state().go {
         return go.get_resolved_module(file, module_reference, mode);
     }
     let program = prog();
-    let go_file = &program.files[file.file_index()];
+    let go_file = crate::ast::go_file(file.file_index());
     let formats = [
         None,
         Some(ts_module::ModuleFormat::CommonJs),
@@ -2051,6 +2556,8 @@ pub fn get_resolved_module_from_module_specifier(
     file: Node,
     module_specifier: Node,
 ) -> Option<ResolvedModule> {
+    // Go: ls/autoimport/aliasresolver.go:208 (unimplemented)
+    alias_resolver_unimplemented();
     if !is_string_literal_like(module_specifier) {
         panic!("moduleSpecifier must be a StringLiteralLike");
     }
@@ -2109,17 +2616,23 @@ pub fn get_resolved_modules()
 
 // Go: compiler/program.go:1519 GetSourceFileMetaData
 pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
-    file_info_by_path(path)
-        .map(|info| info.meta_data.clone())
+    // Go: ls/autoimport/aliasresolver.go:148 (unimplemented)
+    alias_resolver_unimplemented();
+    file_meta_by_path(path)
+        .map(|meta| meta.meta_data.clone())
         .unwrap_or_default()
 }
 
 // Go: compiler/program.go:1523 GetEmitModuleFormatOfFile
 pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
+    // Go: ls/autoimport/aliasresolver.go:96 GetEmitModuleFormatOfFile
+    if state().alias_resolver {
+        return ModuleKind::ES_NEXT;
+    }
     let info = source_file_info(source_file);
     // Borrow the metadata instead of cloning its strings for each call.
     let missing = SourceFileMetaData::default();
-    let meta_data = file_info_by_path(&info.path).map_or(&missing, |info| &info.meta_data);
+    let meta_data = file_meta_by_path(&info.path).map_or(&missing, |meta| &meta.meta_data);
     get_emit_module_format_of_file_worker(
         &info.file_name,
         compiler_options_for_file(source_file),
@@ -2129,6 +2642,10 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
 
 // Go: compiler/program.go:1527 GetEmitSyntaxForUsageLocation
 pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> ResolutionMode {
+    // Go: ls/autoimport/aliasresolver.go:101 GetEmitSyntaxForUsageLocation
+    if state().alias_resolver {
+        return ModuleKind::ES_NEXT;
+    }
     let info = source_file_info(source_file);
     get_emit_syntax_for_usage_location_worker(
         &info.file_name,
@@ -2140,6 +2657,10 @@ pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> 
 
 // Go: compiler/program.go:1531 GetImpliedNodeFormatForEmit
 pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
+    // Go: ls/autoimport/aliasresolver.go:106 GetImpliedNodeFormatForEmit
+    if state().alias_resolver {
+        return ModuleKind::ES_NEXT;
+    }
     let info = source_file_info(source_file);
     get_implied_node_format_for_emit_worker(
         &info.file_name,
@@ -2150,6 +2671,10 @@ pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
 
 // Go: compiler/program.go:1535 GetModeForUsageLocation
 pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> ResolutionMode {
+    // Go: ls/autoimport/aliasresolver.go:111 GetModeForUsageLocation
+    if state().alias_resolver {
+        return ModuleKind::ES_NEXT;
+    }
     let info = source_file_info(source_file);
     get_mode_for_usage_location_worker(
         &info.file_name,
@@ -2161,6 +2686,10 @@ pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> Resolut
 
 // Go: compiler/program.go:1539 GetDefaultResolutionModeForFile
 pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode {
+    // Go: ls/autoimport/aliasresolver.go:91 GetDefaultResolutionModeForFile
+    if state().alias_resolver {
+        return ModuleKind::ES_NEXT;
+    }
     let info = source_file_info(source_file);
     get_default_resolution_mode_for_file_worker(
         &info.file_name,
@@ -2171,13 +2700,15 @@ pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode
 
 // Go: compiler/program.go:1543 IsSourceFileDefaultLibrary
 pub fn is_source_file_default_library(path: &str) -> bool {
-    file_info_by_path(path).is_some_and(|info| info.is_default_library)
+    file_meta_by_path(path).is_some_and(|meta| meta.is_default_library)
 }
 
 // Go: compiler/program.go:1562 CommonSourceDirectory
 // PORT: the Go frontend program computes it once (see `GoSharedState`). The
 // legacy loader computes it here.
 pub fn common_source_directory() -> &'static str {
+    // Go: ls/autoimport/aliasresolver.go:153 (unimplemented)
+    alias_resolver_unimplemented();
     if let Some(go) = &state().go {
         return go.common_source_directory();
     }
@@ -2333,6 +2864,8 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
 
 // Go: compiler/program.go:1927 SourceFileMayBeEmitted
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
+    // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
+    alias_resolver_unimplemented();
     source_file_may_be_emitted_worker(source_file, force_dts_emit)
 }
 
@@ -2412,6 +2945,10 @@ fn get_source_file_path_in_new_dir_worker(
 
 // Go: compiler/program.go:1792 GetSourceFile
 pub fn get_source_file(file_name: &str) -> Node {
+    // Go: ls/autoimport/aliasresolver.go:80 GetSourceFile
+    if let Some(resolver) = alias_resolver() {
+        return resolver.source_file(file_name);
+    }
     let path = ts_path::canonicalize(file_name, get_current_directory(), state().case_sensitivity);
     get_source_file_by_path(&path)
 }
@@ -2421,24 +2958,51 @@ pub fn get_source_file_by_path(path: &str) -> Node {
     state()
         .file_by_path
         .get(path)
-        .map_or(Node::NIL, |&index| prog().files[index].root)
+        .map_or(Node::NIL, |&index| crate::ast::go_file(index).root)
+}
+
+/// A memo of `get_source_file_for_resolved_module` by file name, for the
+/// program with id `program`.
+struct ResolvedModuleFiles {
+    program: u32,
+    files: FxHashMap<String, Node>,
 }
 
 thread_local! {
-    /// Memo of `get_source_file_for_resolved_module` by file name.
-    static RESOLVED_MODULE_FILES: RefCell<FxHashMap<String, Node>> =
-        const { RefCell::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher)) };
+    /// Memo of `get_source_file_for_resolved_module` for the current program
+    /// of this thread. Program ids start at 1, so 0 is no program.
+    static RESOLVED_MODULE_FILES: RefCell<ResolvedModuleFiles> = const {
+        RefCell::new(ResolvedModuleFiles {
+            program: 0,
+            files: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+        })
+    };
 }
 
 // Go: compiler/program.go:1797 GetSourceFileForResolvedModule
 // PORT: the legacy loader has no parse-file redirects, so only the Go
 // frontend program has the redirect fallback.
-// PORT: the answer is memoized per thread. The files, their paths and the
-// redirects do not change after load, so a name always gives the same
-// file. The checker asks again on each alias and default-import check, and
-// each lookup canonicalizes the path.
+// PORT: the answer is memoized per thread and program. The files, their
+// paths and the redirects of a program do not change after load, so a name
+// always gives the same file. The checker asks again on each alias and
+// default-import check, and each lookup canonicalizes the path. Another
+// program version can give another file (an edited file has a new id), so
+// the memo is emptied when the current program changes.
 pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
-    if let Some(file) = RESOLVED_MODULE_FILES.with_borrow(|memo| memo.get(file_name).copied()) {
+    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+    if let Some(resolver) = alias_resolver() {
+        return resolver.source_file_for_resolved_module(file_name);
+    }
+    let program = prog().id;
+    let hit = RESOLVED_MODULE_FILES.with_borrow_mut(|memo| {
+        if memo.program != program {
+            memo.program = program;
+            memo.files.clear();
+            return None;
+        }
+        memo.files.get(file_name).copied()
+    });
+    if let Some(file) = hit {
         return file;
     }
     let mut file = get_source_file(file_name);
@@ -2450,7 +3014,7 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
     {
         file = get_source_file(redirect);
     }
-    RESOLVED_MODULE_FILES.with_borrow_mut(|memo| memo.insert(file_name.to_string(), file));
+    RESOLVED_MODULE_FILES.with_borrow_mut(|memo| memo.files.insert(file_name.to_string(), file));
     file
 }
 
@@ -2458,6 +3022,8 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
 // PORT: the legacy loader does not deduplicate packages, so it has no
 // redirect targets.
 pub fn get_redirect_targets(path: &crate::frontend::tspath::Path) -> Vec<String> {
+    // Go: ls/autoimport/aliasresolver.go:203 (unimplemented)
+    alias_resolver_unimplemented();
     state()
         .go
         .as_ref()
@@ -2556,6 +3122,8 @@ pub fn get_output_paths_for_source_file(
 // import (Go `createSyntheticImport`). On the legacy path the specifier is
 // nil and callers fall back to their own location node.
 pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
+    // Go: ls/autoimport/aliasresolver.go:173 (unimplemented)
+    alias_resolver_unimplemented();
     if let Some(go) = &state().go {
         return go.get_jsx_runtime_import_specifier(path);
     }
@@ -2566,7 +3134,7 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
         return (String::new(), Node::NIL);
     }
     let options = &prog().options;
-    let file = prog().files[info.file_index].root;
+    let file = crate::ast::go_file(info.file_index).root;
     let jsx_import = get_jsx_runtime_import(&get_jsx_implicit_import_base(options, file), options);
     if jsx_import.is_empty() {
         return (String::new(), Node::NIL);
@@ -2578,6 +3146,8 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
 // PORT: the Go frontend loader records the synthetic imports. On the legacy
 // path `record_legacy_import_helpers_import_specifiers` records them.
 pub fn get_import_helpers_import_specifier(path: &str) -> Node {
+    // Go: ls/autoimport/aliasresolver.go:168 (unimplemented)
+    alias_resolver_unimplemented();
     if let Some(go) = &state().go {
         return go.get_import_helpers_import_specifier(path);
     }
@@ -2684,17 +3254,19 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
 const CHECKER_STACK_SIZE: usize = 1 << 30;
 
 thread_local! {
-    /// The checker pool of the loading thread.
-    static POOL: RefCell<Option<CheckerPool>> = const { RefCell::new(None) };
+    /// The checker pools of the loading thread, by `GoProgram::id`.
+    static POOLS: RefCell<FxHashMap<u32, CheckerPool>> = RefCell::new(FxHashMap::default());
     /// The checker of a worker thread.
     static WORKER_CHECKER: RefCell<Option<Checker>> = const { RefCell::new(None) };
     /// The pool index of the checker of a worker thread.
     static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// The thread-local state that a checker worker starts from: the synthetic
-/// nodes, ids and lazy JSDoc of the loading thread when the pool is made.
+/// The thread-local state that a checker worker starts from: the current
+/// program, and the synthetic nodes, ids and lazy JSDoc of the loading
+/// thread when the pool is made.
 struct WorkerSeed {
+    program: &'static GoProgram,
     synthetic: SyntheticSeed,
     ids: IdSeed,
     lazy_jsdoc: FxHashMap<Node, &'static [Node]>,
@@ -2703,6 +3275,7 @@ struct WorkerSeed {
 impl WorkerSeed {
     fn take() -> Self {
         Self {
+            program: prog(),
             synthetic: synthetic_seed(),
             ids: id_seed(),
             lazy_jsdoc: go_frontend::lazy_jsdoc_seed(),
@@ -2710,6 +3283,7 @@ impl WorkerSeed {
     }
 
     fn install(self) {
+        crate::core::set_thread_program(Some(self.program));
         install_synthetic_seed(self.synthetic);
         install_id_seed(self.ids);
         go_frontend::install_lazy_jsdoc_seed(self.lazy_jsdoc);
@@ -2738,7 +3312,13 @@ fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
     let program = prog();
-    let mut file_associations = vec![0; program.files.len()];
+    // One entry per file id up to the last program file.
+    let len = program
+        .source_file_order
+        .iter()
+        .max()
+        .map_or(0, |&last| last + 1);
+    let mut file_associations = vec![0; len];
     for (i, &file_index) in program.source_file_order.iter().enumerate() {
         file_associations[file_index] = i % count;
     }
@@ -2746,14 +3326,18 @@ fn create_checkers() -> CheckerPool {
         state().file_associations.set(file_associations).is_ok(),
         "checker pool made twice"
     );
-    let workers = (0..count)
+    let (workers, threads): (Vec<_>, Vec<_>) = (0..count)
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
             let seed = WorkerSeed::take();
-            std::thread::Builder::new()
+            let arena_start = worker_arena_start(index);
+            let thread = std::thread::Builder::new()
                 .name(format!("checker-{index}"))
                 .stack_size(CHECKER_STACK_SIZE)
                 .spawn(move || {
+                    if let Some(bytes) = arena_start {
+                        crate::ast::store::set_ast_arena_start(bytes);
+                    }
                     seed.install();
                     let checker = Checker::new(index);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -2761,20 +3345,21 @@ fn create_checkers() -> CheckerPool {
                     for job in receiver {
                         job();
                     }
-                    // The queue closes only when the loading thread ends,
-                    // after every job sent its result. A process makes one
-                    // program and one pool (`set_state`, `file_associations`),
-                    // so this runs once per checker, at the end of the
-                    // process. Like Go, which never frees a checker, the
+                    // In a one-program process the queue closes only when
+                    // the loading thread ends, after every job sent its
+                    // result, so this runs once per checker, at the end of
+                    // the process. Like Go, which never frees a checker, the
                     // checker is not dropped: freeing its arenas at thread
-                    // exit cost 0.83% of query CPU.
+                    // exit cost 0.83% of query CPU. `release_program` drops
+                    // the checker first (`CheckerPool::shut_down`), so a
+                    // released program does not leak it.
                     std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                 })
                 .expect("cannot start a checker thread");
-            sender
+            (sender, thread)
         })
-        .collect();
-    CheckerPool { workers }
+        .unzip();
+    CheckerPool { workers, threads }
 }
 
 /// Starts `f` with checker `index` on its thread and returns where the
@@ -2797,9 +3382,10 @@ fn send_thread_job<R: Send + 'static>(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let _ = sender.send(result);
     });
-    POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        let pool = pool.get_or_insert_with(create_checkers);
+    let id = prog().id;
+    POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        let pool = pools.entry(id).or_insert_with(create_checkers);
         pool.workers[index]
             .send(job)
             .expect("checker thread stopped");
@@ -2828,11 +3414,12 @@ fn wait_jobs<R>(receivers: Vec<std::sync::mpsc::Receiver<JobResult<R>>>) -> Vec<
         .collect()
 }
 
-/// True once the checker pool exists. `crate::tracing` dumps the checkers'
-/// types only then, so that stopping a trace does not make the pool.
+/// True once the checker pool of the current program exists.
+/// `crate::tracing` dumps the checkers' types only then, so that stopping a
+/// trace does not make the pool.
 pub fn checker_pool_created() -> bool {
-    STATE
-        .get()
+    crate::core::try_prog()
+        .and_then(|program| program.state.get())
         .is_some_and(|program_state| program_state.file_associations.get().is_some())
 }
 
@@ -2844,8 +3431,9 @@ fn worker_index() -> Option<usize> {
 /// The checker index of `file` (Go `fileAssociations[file]`).
 fn checker_index_for_file(file: Node) -> usize {
     if state().file_associations.get().is_none() {
-        POOL.with(|pool| {
-            pool.borrow_mut().get_or_insert_with(create_checkers);
+        let id = prog().id;
+        POOLS.with(|pools| {
+            pools.borrow_mut().entry(id).or_insert_with(create_checkers);
         });
     }
     state()
@@ -2866,6 +3454,38 @@ pub fn with_type_checker_for_file<R: Send + 'static>(
         return with_checker_at(index, f);
     }
     wait_job(&send_job(index, f))
+}
+
+/// A job sent to the checker thread of a file by `send_type_checker_job_for_file`.
+/// `CheckerJob::Inline` holds the result when the caller is itself a checker
+/// thread, where the job ran at once.
+pub enum CheckerJob<R> {
+    Sent(std::sync::mpsc::Receiver<JobResult<R>>),
+    Inline(R),
+}
+
+impl<R> CheckerJob<R> {
+    /// Waits for the result. A panic in the job continues on this thread.
+    pub fn wait(self) -> R {
+        match self {
+            CheckerJob::Sent(receiver) => wait_job(&receiver),
+            CheckerJob::Inline(value) => value,
+        }
+    }
+}
+
+/// `with_type_checker_for_file` without the wait: jobs for several files can
+/// run on their checker threads at the same time (Go runs such loops in a
+/// `WorkGroup`). Jobs for one checker still run in the order they are sent.
+pub fn send_type_checker_job_for_file<R: Send + 'static>(
+    file: Node,
+    f: impl FnOnce(&mut Checker) -> R + Send + 'static,
+) -> CheckerJob<R> {
+    let index = checker_index_for_file(file);
+    if worker_index().is_some() {
+        return CheckerJob::Inline(with_checker_at(index, f));
+    }
+    CheckerJob::Sent(send_job(index, f))
 }
 
 // PORT: replaces EmitResolver.checkerMu. Lends checker `index` to `f`. Only
@@ -3175,6 +3795,20 @@ pub fn get_declaration_diagnostics(source_file: Node) -> Vec<Diagnostic> {
         })
         .collect();
     sort_and_deduplicate_diagnostics(wait_jobs(receivers).into_iter().flatten().collect())
+}
+
+/// `get_declaration_diagnostics` for one file without the wait: the job runs
+/// on the file's checker thread while the caller sends more (see
+/// `CheckerJob`). `CheckerJob::wait` gives the diagnostics before
+/// `sort_and_deduplicate_diagnostics`.
+pub fn send_declaration_diagnostics_job(source_file: Node) -> CheckerJob<Vec<Diagnostic>> {
+    if worker_index().is_some() {
+        return CheckerJob::Inline(get_declaration_diagnostics_for_file(source_file));
+    }
+    CheckerJob::Sent(send_thread_job(
+        checker_index_for_file(source_file),
+        move || get_declaration_diagnostics_for_file(source_file),
+    ))
 }
 
 // Go: compiler/program.go:1394 getDeclarationDiagnosticsForFile

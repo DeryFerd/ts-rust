@@ -11,7 +11,8 @@ use std::cell::OnceCell;
 // Go pointer keys. Go `sync.Once` values are `OnceCell`.
 #[derive(Default)]
 pub struct IncludeProcessor {
-    pub file_include_reasons: FxHashMap<Path, Vec<Rc<FileIncludeReason>>>,
+    /// Shared by the program versions that `UpdateProgram` makes, as in Go.
+    pub file_include_reasons: Rc<FxHashMap<Path, Vec<Rc<FileIncludeReason>>>>,
     pub processing_diagnostics: Vec<Rc<ProcessingDiagnostic>>,
     // PORT: Go `checkSourceFilesBelongToPath` appends processing diagnostics
     // from `CommonSourceDirectory`, which takes `&self` here. They are kept
@@ -47,7 +48,8 @@ impl Clone for IncludeProcessor {
 
 // Go: includeprocessor.go:28 updateFileIncludeProcessor
 // PORT: Go replaces the processor of `p` in place and shares the reason map
-// and the diagnostics slice. Rust clones them (the old program keeps its own).
+// and the diagnostics slice. Rust shares the reason map and clones the
+// diagnostics (the old program keeps its own).
 pub fn update_file_include_processor(p: &mut NewProgram) {
     p.include_processor = IncludeProcessor {
         file_include_reasons: p.include_processor.file_include_reasons.clone(),

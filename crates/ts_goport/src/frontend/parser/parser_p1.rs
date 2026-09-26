@@ -13,6 +13,7 @@ use crate::frontend::prelude::*;
 use crate::frontend::scanner::scanner_p1::{
     ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD, new_scanner,
 };
+use smallvec::SmallVec;
 use std::sync::LazyLock;
 
 // Go: parser.go:19 ParsingContext
@@ -778,6 +779,7 @@ impl Parser {
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
         set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
+        set_file_store_parse_fields(result.store, result.language_variant, &result.diagnostics);
         // For non-JS files, enable lazy JSDoc parsing on demand
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;
@@ -994,7 +996,9 @@ impl Parser {
         let pos = self.node_pos();
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
-        let mut list: Vec<Node> = Vec::with_capacity(16);
+        // PERF: `new_node_list` copies the nodes out, so the scratch list
+        // stays on the stack. Most lists hold 16 nodes or fewer.
+        let mut list: SmallVec<[Node; 16]> = SmallVec::new();
         loop {
             if self.is_list_element(kind, false /*inErrorRecovery*/) {
                 let start_pos = self.node_pos();

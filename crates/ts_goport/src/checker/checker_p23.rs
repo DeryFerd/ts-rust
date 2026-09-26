@@ -813,12 +813,28 @@ impl Checker {
 
     /// `get_property_name_from_type` as an interned `Name`. String literal
     /// and unique symbol names are interned from the type with no `String`.
+    ///
+    /// PORT: a string or number literal type keeps its name after the first
+    /// call, so each mapped member does not intern the text again or format
+    /// the number again. The literal value never changes.
     pub fn get_property_name_from_type_as_name(&self, t: TypeId) -> Name {
         let ty = self.ty(t);
-        if ty.flags.intersects(TypeFlags::STRING_LITERAL)
-            && let Some(LiteralValue::String(s)) = ty.as_literal_type().value.as_ref()
+        if ty
+            .flags
+            .intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
         {
-            return Name::from(s.as_str());
+            let literal = ty.as_literal_type();
+            return literal
+                .property_name
+                .get_or_init(|| match literal.value.as_ref() {
+                    Some(LiteralValue::String(s))
+                        if ty.flags.intersects(TypeFlags::STRING_LITERAL) =>
+                    {
+                        Name::from(s.as_str())
+                    }
+                    _ => Name::from(self.get_property_name_from_type(t)),
+                })
+                .clone();
         }
         if ty.flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
             return Name::from(ty.as_unique_es_symbol_type().name.as_str());

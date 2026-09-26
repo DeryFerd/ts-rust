@@ -1,9 +1,10 @@
-//! Go `internal/execute/build` (`tsc --build`), without watch mode.
+//! Go `internal/execute/build` (`tsc --build`), with watch mode in orchestrator_watch.rs.
 
 pub mod build_task;
 pub mod command_line;
 pub mod host;
 pub mod orchestrator;
+pub mod orchestrator_watch;
 pub mod parse_cache;
 pub mod shared_fs;
 pub mod up_to_date_status;

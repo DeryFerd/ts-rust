@@ -9,7 +9,9 @@
 //! `EmitContext.NewNodeVisitor` (bindingNameVisitor, expressionVisitor,
 //! cjsExportAssignmentVisitor). Each use here builds one on demand with
 //! `EmitContext::new_node_visitor` and the same callback (`with_tx_visitor`),
-//! so the emit context hooks are attached as in Go. Go
+//! so the emit context hooks are attached as in Go. The two whole-tree walks
+//! (`visit_cjs_export_assignments`, `visit_nested_expression`) build one
+//! visitor per walk and recurse through it. Go
 //! `tx.Visitor().Visit(n)` calls the callback directly, so it is `self.visit(n)`.
 //!
 //! PORT: Go `setupDiagnosticContext` returns a cleanup closure. Here it
@@ -56,6 +58,92 @@ fn with_tx_visitor<R>(
 fn emit_tracker(tx: &DeclarationTransformer) -> EmitSymbolTracker {
     let tracker: Rc<dyn SymbolTracker> = tx.tracker.clone();
     Some(tracker)
+}
+
+// Go: transformers/declarations/transform.go:2639 DeclarationTransformer.visitCJSExportAssignments
+/// The body of `visit_cjs_export_assignments` and the callback of its walk
+/// visitor `v` (Go `tx.cjsExportAssignmentVisitor`). `v.ctx` is `tx`.
+fn visit_cjs_export_assignments_in(
+    expression: Node,
+    v: &mut NodeVisitor<'_, &mut DeclarationTransformer>,
+) -> Node {
+    if expression.is_some() {
+        let tx = &mut *v.ctx;
+        let (_, cleanup) = tx.setup_diagnostic_context(expression);
+        if get_assignment_declaration_kind(expression) == JSDeclarationKind::MODULE_EXPORTS {
+            let current_source_file = tx.state.borrow().current_source_file;
+            if source_file_info(current_source_file)
+                .common_js_module_indicator
+                .is_some()
+            {
+                let result = tx.transform_export_assignment(
+                    expression.parent(),
+                    expression,
+                    expression.right(),
+                    true, /*isExportEquals*/
+                );
+                if result.is_some() {
+                    tx.cjs_export_assignment = result;
+                    tx.result_has_scope_marker = true;
+                    tx.result_has_external_module_indicator = true;
+                }
+            }
+        }
+        // recur through the whole tree, looking for module.exports=
+        let result = v.visit_each_child(expression);
+        cleanup.run(&mut *v.ctx);
+        return result;
+    }
+    Node::NIL
+}
+
+// Go: transformers/declarations/transform.go:2659 DeclarationTransformer.visitNestedExpression
+/// The body of `visit_nested_expression` and the callback of its walk
+/// visitor `v` (Go `tx.expressionVisitor`). `v.ctx` is `tx`.
+fn visit_nested_expression_in(
+    expression: Node,
+    v: &mut NodeVisitor<'_, &mut DeclarationTransformer>,
+) -> Node {
+    if expression.is_some() {
+        let tx = &mut *v.ctx;
+        let (_, cleanup) = tx.setup_diagnostic_context(expression);
+        let kind = get_assignment_declaration_kind(expression);
+        if kind == JSDeclarationKind::PROPERTY {
+            tx.transform_expando_assignment(expression);
+        } else if kind == JSDeclarationKind::EXPORTS_PROPERTY {
+            let current_source_file = tx.state.borrow().current_source_file;
+            if source_file_info(current_source_file)
+                .common_js_module_indicator
+                .is_some()
+            {
+                let name = tx.get_name_expression_preferring_identifier(
+                    get_element_or_property_access_name(expression.left()),
+                );
+                let result = tx.transform_common_js_export(expression, name);
+                if result.is_some() {
+                    tx.cjs_export_members.push(result);
+                }
+            }
+        } else if kind == JSDeclarationKind::OBJECT_DEFINE_PROPERTY_EXPORTS {
+            let current_source_file = tx.state.borrow().current_source_file;
+            if source_file_info(current_source_file)
+                .common_js_module_indicator
+                .is_some()
+            {
+                let name =
+                    tx.get_name_expression_preferring_identifier(expression.arguments().get(1));
+                let result = tx.transform_common_js_export(expression, name);
+                if result.is_some() {
+                    tx.cjs_export_members.push(result);
+                }
+            }
+        }
+        // recur through the whole tree, looking for special assignments
+        let result = v.visit_each_child(expression);
+        cleanup.run(&mut *v.ctx);
+        return result;
+    }
+    Node::NIL
 }
 
 /// Go `node.FunctionLikeData() != nil && node.FunctionLikeData().FullSignature != nil`.
@@ -139,15 +227,15 @@ impl DeclarationTransformer {
             }
             input_nodes = normal_declarations;
             extra_imports = with_tx_visitor(self, DeclarationTransformer::visit, |v| {
-                v.visit_slice(&imports)
+                v.visit_slice_changed(imports.iter().copied())
             })
-            .0;
+            .unwrap_or(imports);
         }
 
         let nodes = with_tx_visitor(self, DeclarationTransformer::visit, |v| {
-            v.visit_slice(&input_nodes)
+            v.visit_slice_changed(input_nodes.iter().copied())
         })
-        .0;
+        .unwrap_or(input_nodes);
         if nodes.is_empty() {
             if !extra_imports.is_empty() {
                 return self.emit_context.factory().new_syntax_list(&extra_imports);
@@ -632,9 +720,9 @@ impl DeclarationTransformer {
     pub(crate) fn transform_js_doc_type_literal(&mut self, input: Node) -> Node {
         let tags = input.js_doc_property_tags();
         let members = with_tx_visitor(self, DeclarationTransformer::visit, |v| {
-            v.visit_slice(&tags)
+            v.visit_slice_changed(tags.iter().copied())
         })
-        .0;
+        .unwrap_or(tags);
         let ec = self.emit_context.clone();
         let f = ec.factory();
         let replacement = f.new_type_literal_node(f.new_node_list(&members));
@@ -758,84 +846,23 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:2639 DeclarationTransformer.visitCJSExportAssignments
+    // PERF: Go recurses through the one `tx.cjsExportAssignmentVisitor`. This
+    // entry makes one visitor for the whole walk; its callback
+    // `visit_cjs_export_assignments_in` recurses through the visitor it gets,
+    // so no visitor (an `Rc` closure) is made per node.
     pub(crate) fn visit_cjs_export_assignments(&mut self, expression: Node) -> Node {
-        if expression.is_some() {
-            let (_, cleanup) = self.setup_diagnostic_context(expression);
-            if get_assignment_declaration_kind(expression) == JSDeclarationKind::MODULE_EXPORTS {
-                let current_source_file = self.state.borrow().current_source_file;
-                if source_file_info(current_source_file)
-                    .common_js_module_indicator
-                    .is_some()
-                {
-                    let result = self.transform_export_assignment(
-                        expression.parent(),
-                        expression,
-                        expression.right(),
-                        true, /*isExportEquals*/
-                    );
-                    if result.is_some() {
-                        self.cjs_export_assignment = result;
-                        self.result_has_scope_marker = true;
-                        self.result_has_external_module_indicator = true;
-                    }
-                }
-            }
-            // recur through the whole tree, looking for module.exports=
-            let result = with_tx_visitor(
-                self,
-                DeclarationTransformer::visit_cjs_export_assignments,
-                |v| v.visit_each_child(expression),
-            );
-            cleanup.run(self);
-            return result;
-        }
-        Node::NIL
+        let ec = self.emit_context.clone();
+        let mut v = ec.new_node_visitor(visit_cjs_export_assignments_in, self);
+        visit_cjs_export_assignments_in(expression, &mut v)
     }
 
     // Go: transformers/declarations/transform.go:2659 DeclarationTransformer.visitNestedExpression
+    // PERF: one visitor per walk, like `visit_cjs_export_assignments`. Go
+    // keeps it in `tx.expressionVisitor`.
     pub(crate) fn visit_nested_expression(&mut self, expression: Node) -> Node {
-        if expression.is_some() {
-            let (_, cleanup) = self.setup_diagnostic_context(expression);
-            let kind = get_assignment_declaration_kind(expression);
-            if kind == JSDeclarationKind::PROPERTY {
-                self.transform_expando_assignment(expression);
-            } else if kind == JSDeclarationKind::EXPORTS_PROPERTY {
-                let current_source_file = self.state.borrow().current_source_file;
-                if source_file_info(current_source_file)
-                    .common_js_module_indicator
-                    .is_some()
-                {
-                    let name = self.get_name_expression_preferring_identifier(
-                        get_element_or_property_access_name(expression.left()),
-                    );
-                    let result = self.transform_common_js_export(expression, name);
-                    if result.is_some() {
-                        self.cjs_export_members.push(result);
-                    }
-                }
-            } else if kind == JSDeclarationKind::OBJECT_DEFINE_PROPERTY_EXPORTS {
-                let current_source_file = self.state.borrow().current_source_file;
-                if source_file_info(current_source_file)
-                    .common_js_module_indicator
-                    .is_some()
-                {
-                    let name = self
-                        .get_name_expression_preferring_identifier(expression.arguments().get(1));
-                    let result = self.transform_common_js_export(expression, name);
-                    if result.is_some() {
-                        self.cjs_export_members.push(result);
-                    }
-                }
-            }
-            // recur through the whole tree, looking for special assignments
-            let result =
-                with_tx_visitor(self, DeclarationTransformer::visit_nested_expression, |v| {
-                    v.visit_each_child(expression)
-                });
-            cleanup.run(self);
-            return result;
-        }
-        Node::NIL
+        let ec = self.emit_context.clone();
+        let mut v = ec.new_node_visitor(visit_nested_expression_in, self);
+        visit_nested_expression_in(expression, &mut v)
     }
 
     // Go: transformers/declarations/transform.go:2686 DeclarationTransformer.transformExpandoAssignment

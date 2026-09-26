@@ -13,8 +13,64 @@ thread_local! {
     static NEXT_NODE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NEXT_SYMBOL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NODE_IDS: RefCell<FxHashMap<Node, u64>> = RefCell::new(FxHashMap::default());
-    // Dense: indexed by `SymbolId::index()`; 0 means no id yet (Go ids start at 1).
+    // Dense: indexed by `SymbolId::index()`; 0 means no id yet (Go ids start
+    // at 1). Binder symbols only: every arena gives an index the same binder
+    // symbol (`SymbolArena::own_symbol_id_slot`).
     static SYMBOL_IDS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    // The ids of the symbols that checker arenas add, by arena.
+    static OWN_SYMBOL_IDS: RefCell<OwnSymbolIds> = const { RefCell::new(OwnSymbolIds::new()) };
+}
+
+/// The ids of the symbols that checker arenas add on one thread, by arena
+/// key. Such a symbol has an index that other checkers and later binds use
+/// for other symbols, so its id cannot live in `SYMBOL_IDS`. A checker
+/// worker has one arena; a thread that runs checkers of several programs
+/// (the language server's) switches between them.
+struct OwnSymbolIds {
+    /// The arena whose ids are in `ids`, or 0.
+    key: u32,
+    /// Dense, by place among the arena's own symbols; 0 means no id yet.
+    ids: Vec<u64>,
+    /// The ids of the other arenas.
+    others: FxHashMap<u32, Vec<u64>>,
+}
+
+impl OwnSymbolIds {
+    const fn new() -> Self {
+        Self {
+            key: 0,
+            ids: Vec::new(),
+            others: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+        }
+    }
+
+    /// The ids of arena `key`.
+    fn ids_of(&mut self, key: u32) -> &mut Vec<u64> {
+        if self.key != key {
+            let ids = self.others.remove(&key).unwrap_or_default();
+            let previous = std::mem::replace(&mut self.ids, ids);
+            if self.key != 0 {
+                self.others.insert(self.key, previous);
+            }
+            self.key = key;
+        }
+        &mut self.ids
+    }
+}
+
+/// Frees this thread's ids of the own symbols of arena `key`. A checker
+/// arena calls it when it drops.
+pub(crate) fn forget_own_symbol_ids(key: u32) {
+    // The thread may be ending, after its thread-locals.
+    let _ = OWN_SYMBOL_IDS.try_with(|own| {
+        let mut own = own.borrow_mut();
+        if own.key == key {
+            own.key = 0;
+            own.ids = Vec::new();
+        } else {
+            own.others.remove(&key);
+        }
+    });
 }
 
 /// The node and symbol ids of one thread (see `id_seed`).
@@ -29,6 +85,7 @@ pub struct IdSeed {
 /// The ids assigned on this thread so far. A checker worker starts from
 /// the ids of the loading thread (`install_id_seed`), so a node or symbol
 /// that got an id before the checkers started keeps it on every thread.
+/// The ids of checker symbols stay: a new thread has none of those checkers.
 // PORT: Go shares one atomic counter between checker goroutines, so ids
 // that checkers assign race. Here each checker thread counts on its own
 // from the same start, which keeps its ids deterministic.
@@ -57,6 +114,27 @@ pub fn install_id_seed(seed: IdSeed) {
     NEXT_SYMBOL_ID.with(|next| next.set(seed.next_symbol_id));
     NODE_IDS.with(|ids| *ids.borrow_mut() = seed.node_ids);
     SYMBOL_IDS.with(|ids| *ids.borrow_mut() = seed.symbol_ids);
+    OWN_SYMBOL_IDS.with(|own| *own.borrow_mut() = OwnSymbolIds::new());
+}
+
+/// The next symbol id of this thread (Go `nextSymbolId.Add(1)`).
+fn next_symbol_id() -> u64 {
+    NEXT_SYMBOL_ID.with(|next| {
+        let id = next.get() + 1;
+        next.set(id);
+        id
+    })
+}
+
+/// The id in `ids[index]`, assigned now when it has none.
+fn symbol_id_at(ids: &mut Vec<u64>, index: usize) -> u64 {
+    if index >= ids.len() {
+        ids.resize(index + 1, 0);
+    }
+    if ids[index] == 0 {
+        ids[index] = next_symbol_id();
+    }
+    ids[index]
 }
 
 // Go: ast/utilities.go:22 GetNodeId
@@ -78,27 +156,16 @@ pub fn get_node_id(node: Node) -> u64 {
 }
 
 // Go: ast/utilities.go:34 GetSymbolId
-// PORT: Go `ast.SymbolId` is a `uint64`; returned here as `u64`. The arena
-// parameter follows the contract rule for `ast` functions that take a symbol.
+// PORT: Go `ast.SymbolId` is a `uint64`; returned here as `u64`. A symbol
+// handle is an index into `symbols`, which keys where the id is kept (see
+// `SymbolArena::own_symbol_id_slot`).
 pub fn get_symbol_id(symbols: &SymbolArena, symbol: SymbolId) -> u64 {
-    let _ = symbols;
-    SYMBOL_IDS.with(|ids| {
-        let mut ids = ids.borrow_mut();
-        let index = symbol.index();
-        if index >= ids.len() {
-            ids.resize(index + 1, 0);
+    match symbols.own_symbol_id_slot(symbol) {
+        None => SYMBOL_IDS.with(|ids| symbol_id_at(&mut ids.borrow_mut(), symbol.index())),
+        Some((key, place)) => {
+            OWN_SYMBOL_IDS.with(|own| symbol_id_at(own.borrow_mut().ids_of(key), place))
         }
-        if ids[index] != 0 {
-            return ids[index];
-        }
-        let id = NEXT_SYMBOL_ID.with(|next| {
-            let id = next.get() + 1;
-            next.set(id);
-            id
-        });
-        ids[index] = id;
-        id
-    })
+    }
 }
 
 // Go: ast/utilities.go:46 GetSymbolTable
@@ -676,18 +743,73 @@ pub fn is_access_expression(node: Node) -> bool {
         || node.kind() == SyntaxKind::ElementAccessExpression
 }
 
+/// A fixed set of `SyntaxKind`s, one bit per kind, built at compile time.
+// PERF: the hot kind tests below (`is_statement`, `is_function_like`,
+// `is_private_identifier_class_element_declaration`) are one table load and
+// one bit test, not a chain of compares. The answers are the same as the Go
+// `switch` statements, whose kind lists are kept here in Go order.
+#[derive(Clone, Copy)]
+struct KindSet([u64; 8]);
+
+// `KindSet::contains` masks the word index with `& 7`, so 8 words (512 bits)
+// must cover every kind. The mask removes the bounds check.
+const _: () = assert!(SyntaxKind::COUNT <= 512);
+
+impl KindSet {
+    const fn of(kinds: &[SyntaxKind]) -> Self {
+        Self::EMPTY.with(kinds)
+    }
+
+    const EMPTY: Self = Self([0; 8]);
+
+    /// This set plus `kinds`.
+    const fn with(mut self, kinds: &[SyntaxKind]) -> Self {
+        let mut i = 0;
+        while i < kinds.len() {
+            let k = kinds[i] as usize;
+            self.0[k >> 6] |= 1 << (k & 63);
+            i += 1;
+        }
+        self
+    }
+
+    #[inline]
+    const fn contains(&self, kind: SyntaxKind) -> bool {
+        let k = kind as usize;
+        self.0[(k >> 6) & 7] & (1 << (k & 63)) != 0
+    }
+}
+
+// The kinds of Go `isFunctionLikeDeclarationKind` (ast/utilities.go:483).
+const FUNCTION_LIKE_DECLARATION_KIND_LIST: &[SyntaxKind] = &[
+    SyntaxKind::FunctionDeclaration,
+    SyntaxKind::MethodDeclaration,
+    SyntaxKind::Constructor,
+    SyntaxKind::GetAccessor,
+    SyntaxKind::SetAccessor,
+    SyntaxKind::FunctionExpression,
+    SyntaxKind::ArrowFunction,
+];
+
+static FUNCTION_LIKE_DECLARATION_KINDS: KindSet = KindSet::of(FUNCTION_LIKE_DECLARATION_KIND_LIST);
+
+// The kinds of Go `IsFunctionLikeKind` (ast/utilities.go:503): these kinds,
+// then the function-like declaration kinds.
+static FUNCTION_LIKE_KINDS: KindSet = KindSet::of(&[
+    SyntaxKind::MethodSignature,
+    SyntaxKind::CallSignature,
+    SyntaxKind::JsDocSignature,
+    SyntaxKind::ConstructSignature,
+    SyntaxKind::IndexSignature,
+    SyntaxKind::FunctionType,
+    SyntaxKind::ConstructorType,
+])
+.with(FUNCTION_LIKE_DECLARATION_KIND_LIST);
+
 // Go: ast/utilities.go:483 isFunctionLikeDeclarationKind
+#[inline]
 fn is_function_like_declaration_kind(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::FunctionDeclaration
-            | SyntaxKind::MethodDeclaration
-            | SyntaxKind::Constructor
-            | SyntaxKind::GetAccessor
-            | SyntaxKind::SetAccessor
-            | SyntaxKind::FunctionExpression
-            | SyntaxKind::ArrowFunction
-    )
+    FUNCTION_LIKE_DECLARATION_KINDS.contains(kind)
 }
 
 // Determines if a node is function-like (but is not a signature declaration)
@@ -698,21 +820,14 @@ pub fn is_function_like_declaration(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:503 IsFunctionLikeKind
+#[inline]
 pub fn is_function_like_kind(kind: SyntaxKind) -> bool {
-    match kind {
-        SyntaxKind::MethodSignature
-        | SyntaxKind::CallSignature
-        | SyntaxKind::JsDocSignature
-        | SyntaxKind::ConstructSignature
-        | SyntaxKind::IndexSignature
-        | SyntaxKind::FunctionType
-        | SyntaxKind::ConstructorType => true,
-        _ => is_function_like_declaration_kind(kind),
-    }
+    FUNCTION_LIKE_KINDS.contains(kind)
 }
 
 // Determines if a node is function- or signature-like.
 // Go: ast/utilities.go:518 IsFunctionLike
+#[inline]
 pub fn is_function_like(node: Node) -> bool {
     // TODO(rbuckton): Move `node != nil` test to call sites
     node.is_some() && is_function_like_kind(node.kind())
@@ -763,9 +878,20 @@ pub fn is_method_or_accessor(node: Node) -> bool {
     )
 }
 
+// The kinds of `IsPropertyDeclaration || IsMethodOrAccessor` in Go
+// `IsPrivateIdentifierClassElementDeclaration` (ast/utilities.go:562).
+static PRIVATE_IDENTIFIER_CLASS_ELEMENT_KINDS: KindSet = KindSet::of(&[
+    SyntaxKind::PropertyDeclaration,
+    SyntaxKind::MethodDeclaration,
+    SyntaxKind::GetAccessor,
+    SyntaxKind::SetAccessor,
+]);
+
 // Go: ast/utilities.go:562 IsPrivateIdentifierClassElementDeclaration
+#[inline]
 pub fn is_private_identifier_class_element_declaration(node: Node) -> bool {
-    (is_property_declaration(node) || is_method_or_accessor(node))
+    // PERF: one kind lookup for `IsPropertyDeclaration || IsMethodOrAccessor`.
+    PRIVATE_IDENTIFIER_CLASS_ELEMENT_KINDS.contains(node.kind())
         && is_private_identifier(node.name())
 }
 
@@ -843,25 +969,30 @@ pub fn is_jsx_attribute_like(node: Node) -> bool {
     is_jsx_attribute(node) || is_jsx_spread_attribute(node)
 }
 
+// The kinds of Go `isDeclarationStatementKind` (ast/utilities.go:628).
+const DECLARATION_STATEMENT_KIND_LIST: &[SyntaxKind] = &[
+    SyntaxKind::FunctionDeclaration,
+    SyntaxKind::MissingDeclaration,
+    SyntaxKind::ClassDeclaration,
+    SyntaxKind::InterfaceDeclaration,
+    SyntaxKind::TypeAliasDeclaration,
+    SyntaxKind::JsTypeAliasDeclaration,
+    SyntaxKind::EnumDeclaration,
+    SyntaxKind::ModuleDeclaration,
+    SyntaxKind::ImportDeclaration,
+    SyntaxKind::JsImportDeclaration,
+    SyntaxKind::ImportEqualsDeclaration,
+    SyntaxKind::ExportDeclaration,
+    SyntaxKind::ExportAssignment,
+    SyntaxKind::NamespaceExportDeclaration,
+];
+
+static DECLARATION_STATEMENT_KINDS: KindSet = KindSet::of(DECLARATION_STATEMENT_KIND_LIST);
+
 // Go: ast/utilities.go:628 isDeclarationStatementKind
+#[inline]
 fn is_declaration_statement_kind(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::FunctionDeclaration
-            | SyntaxKind::MissingDeclaration
-            | SyntaxKind::ClassDeclaration
-            | SyntaxKind::InterfaceDeclaration
-            | SyntaxKind::TypeAliasDeclaration
-            | SyntaxKind::JsTypeAliasDeclaration
-            | SyntaxKind::EnumDeclaration
-            | SyntaxKind::ModuleDeclaration
-            | SyntaxKind::ImportDeclaration
-            | SyntaxKind::JsImportDeclaration
-            | SyntaxKind::ImportEqualsDeclaration
-            | SyntaxKind::ExportDeclaration
-            | SyntaxKind::ExportAssignment
-            | SyntaxKind::NamespaceExportDeclaration
-    )
+    DECLARATION_STATEMENT_KINDS.contains(kind)
 }
 
 // Determines whether a node is a DeclarationStatement. Ideally this does not use Parent pointers, but it may use them
@@ -873,30 +1004,40 @@ pub fn is_declaration_statement(node: Node) -> bool {
     is_declaration_statement_kind(node.kind())
 }
 
+// The kinds of Go `isStatementKindButNotDeclarationKind` (ast/utilities.go:657).
+const STATEMENT_BUT_NOT_DECLARATION_KIND_LIST: &[SyntaxKind] = &[
+    SyntaxKind::BreakStatement,
+    SyntaxKind::ContinueStatement,
+    SyntaxKind::DebuggerStatement,
+    SyntaxKind::DoStatement,
+    SyntaxKind::ExpressionStatement,
+    SyntaxKind::EmptyStatement,
+    SyntaxKind::ForInStatement,
+    SyntaxKind::ForOfStatement,
+    SyntaxKind::ForStatement,
+    SyntaxKind::IfStatement,
+    SyntaxKind::LabeledStatement,
+    SyntaxKind::ReturnStatement,
+    SyntaxKind::SwitchStatement,
+    SyntaxKind::ThrowStatement,
+    SyntaxKind::TryStatement,
+    SyntaxKind::VariableStatement,
+    SyntaxKind::WhileStatement,
+    SyntaxKind::WithStatement,
+    SyntaxKind::NotEmittedStatement,
+];
+
+static STATEMENT_BUT_NOT_DECLARATION_KINDS: KindSet =
+    KindSet::of(STATEMENT_BUT_NOT_DECLARATION_KIND_LIST);
+
+// The two statement kind lists together, for `is_statement`.
+static STATEMENT_KINDS: KindSet =
+    KindSet::of(STATEMENT_BUT_NOT_DECLARATION_KIND_LIST).with(DECLARATION_STATEMENT_KIND_LIST);
+
 // Go: ast/utilities.go:657 isStatementKindButNotDeclarationKind
+#[inline]
 fn is_statement_kind_but_not_declaration_kind(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::BreakStatement
-            | SyntaxKind::ContinueStatement
-            | SyntaxKind::DebuggerStatement
-            | SyntaxKind::DoStatement
-            | SyntaxKind::ExpressionStatement
-            | SyntaxKind::EmptyStatement
-            | SyntaxKind::ForInStatement
-            | SyntaxKind::ForOfStatement
-            | SyntaxKind::ForStatement
-            | SyntaxKind::IfStatement
-            | SyntaxKind::LabeledStatement
-            | SyntaxKind::ReturnStatement
-            | SyntaxKind::SwitchStatement
-            | SyntaxKind::ThrowStatement
-            | SyntaxKind::TryStatement
-            | SyntaxKind::VariableStatement
-            | SyntaxKind::WhileStatement
-            | SyntaxKind::WithStatement
-            | SyntaxKind::NotEmittedStatement
-    )
+    STATEMENT_BUT_NOT_DECLARATION_KINDS.contains(kind)
 }
 
 // Determines whether a node is a Statement that is not also a Declaration. Ideally this does not use Parent pointers,
@@ -913,11 +1054,11 @@ pub fn is_statement_but_not_declaration(node: Node) -> bool {
 //
 // NOTE: ECMA262 would call this either a StatementListItem or ModuleListItem
 // Go: ast/utilities.go:695 IsStatement
+#[inline]
 pub fn is_statement(node: Node) -> bool {
-    let kind = node.kind();
-    is_statement_kind_but_not_declaration_kind(kind)
-        || is_declaration_statement_kind(kind)
-        || is_block_statement(node)
+    // PERF: one lookup for `isStatementKindButNotDeclarationKind(kind) ||
+    // isDeclarationStatementKind(kind)`. Neither list holds `Block`.
+    STATEMENT_KINDS.contains(node.kind()) || is_block_statement(node)
 }
 
 // Determines whether a node is a BlockStatement. If parents are available, this ensures the Block is
@@ -1184,4 +1325,50 @@ fn new_parent_in_children_setter() -> ParentInChildrenSetter {
 pub fn set_parent_in_children(node: Node) {
     let mut f = new_parent_in_children_setter();
     f.visit(node);
+}
+
+#[cfg(test)]
+mod symbol_id_tests {
+    use super::*;
+
+    /// Two checker arenas made from one binder arena share the ids of the
+    /// binder symbols. Their own symbols get ids of their own, also at an
+    /// index where a later bind put another symbol.
+    #[test]
+    fn checker_symbols_have_ids_of_their_own() {
+        let mut binder = SymbolArena::new();
+        let shared = binder.new_symbol(SymbolFlags::NONE, "shared");
+        let mut first = binder.for_checker();
+        // A later program binds more files into the same binder arena.
+        let later = binder.new_symbol(SymbolFlags::NONE, "later");
+        let mut second = binder.for_checker();
+        let own_first = first.new_symbol(SymbolFlags::NONE, "own");
+        let own_second = second.new_symbol(SymbolFlags::NONE, "own");
+        assert_eq!(own_first, later, "the test needs one index for two symbols");
+
+        let id_later = get_symbol_id(&second, later);
+        let id_own_first = get_symbol_id(&first, own_first);
+        let id_own_second = get_symbol_id(&second, own_second);
+        assert_ne!(id_own_first, id_later);
+        assert_ne!(id_own_first, id_own_second);
+        assert_ne!(id_own_second, id_later);
+        assert_eq!(get_symbol_id(&binder, later), id_later);
+        assert_eq!(
+            get_symbol_id(&first, shared),
+            get_symbol_id(&second, shared)
+        );
+        // An id stays when the thread switches between arenas.
+        assert_eq!(get_symbol_id(&first, own_first), id_own_first);
+        assert_eq!(get_symbol_id(&second, own_second), id_own_second);
+
+        // A dropped checker arena frees its ids on this thread.
+        let (key, _) = first
+            .own_symbol_id_slot(own_first)
+            .expect("a checker symbol has an id of its own");
+        drop(first);
+        OWN_SYMBOL_IDS.with(|own| {
+            let own = own.borrow();
+            assert!(own.key != key && !own.others.contains_key(&key));
+        });
+    }
 }

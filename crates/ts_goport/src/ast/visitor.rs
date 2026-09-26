@@ -225,8 +225,9 @@ impl<'a, C> NodeVisitor<'a, C> {
             return nodes;
         }
 
-        let (result, changed) = self.visit_slice(&nodes.nodes().to_vec());
-        if changed {
+        // PERF: read the list in place. A new Vec is made only when a node
+        // changes (Go `VisitSlice` returns the input slice otherwise).
+        if let Some(result) = self.visit_slice_changed(nodes.nodes().iter()) {
             // PORT: Go `list := v.Factory.NewNodeList(result); list.Loc = nodes.Loc`.
             // A synthetic list fixes its `Loc` at creation (see synthetic.rs).
             return new_synthetic_node_list(&result, nodes.loc());
@@ -249,8 +250,8 @@ impl<'a, C> NodeVisitor<'a, C> {
             return nodes;
         }
 
-        let (result, changed) = self.visit_slice(&nodes.nodes().to_vec());
-        if changed {
+        // PERF: read the list in place, as in `visit_nodes`.
+        if let Some(result) = self.visit_slice_changed(nodes.nodes().iter()) {
             // PORT: Go `list := v.Factory.NewModifierList(result); list.Loc = nodes.Loc`.
             // A synthetic list fixes its `Loc` at creation (see synthetic.rs).
             return new_synthetic_modifier_list(&result, nodes.node_list().loc());
@@ -268,21 +269,40 @@ impl<'a, C> NodeVisitor<'a, C> {
     ///   - If v.Visit returns a different Node than the input, a new slice will be generated and returned.
     ///   - If v.Visit returns a SyntaxList Node, then the children of that node will be merged into the output and a new slice will be returned.
     // PORT: an unchanged result is a copy of the input, not the same slice.
+    // `visit_slice_changed` gives `None` instead of that copy.
     pub fn visit_slice(&mut self, nodes: &[Node]) -> (Vec<Node>, bool) {
+        match self.visit_slice_changed(nodes.iter().copied()) {
+            Some(updated) => (updated, true),
+            None => (nodes.to_vec(), false),
+        }
+    }
+
+    /// Go `VisitSlice` over any node sequence (a `&[Node]` or a
+    /// `NodeSlice`). `None` means "not changed": Go returns the input slice,
+    /// so the caller keeps its own input and nothing is copied.
+    // PORT: the body of Go `VisitSlice` (ast/visitor.go:138).
+    // PERF: `nodes` is read in place. The clone of the iterator rereads the
+    // unchanged prefix only when a node changes (Go `slices.Clone(nodes[:i])`).
+    pub fn visit_slice_changed<I>(&mut self, nodes: I) -> Option<Vec<Node>>
+    where
+        I: Iterator<Item = Node> + Clone,
+    {
         if self.visit.is_none() {
-            return (nodes.to_vec(), false);
+            return None;
         }
 
+        let prefix = nodes.clone();
+        let mut rest = nodes;
         let mut i = 0;
-        while i < nodes.len() {
-            let node = nodes[i];
+        while let Some(node) = rest.next() {
             if self.visit.is_none() {
                 break;
             }
 
             let mut visited = self.call_visit(node);
             if visited.is_nil() || visited != node {
-                let mut updated: Vec<Node> = nodes[..i].to_vec();
+                let mut updated: Vec<Node> = Vec::with_capacity(prefix.size_hint().0);
+                updated.extend(prefix.take(i));
 
                 loop {
                     // finish prior loop
@@ -294,27 +314,26 @@ impl<'a, C> NodeVisitor<'a, C> {
                         updated.push(visited);
                     }
 
-                    i += 1;
-
                     // loop over remaining elements
-                    if i >= nodes.len() {
+                    let Some(next) = rest.next() else {
                         break;
-                    }
+                    };
 
                     if self.visit.is_some() {
-                        visited = self.call_visit(nodes[i]);
+                        visited = self.call_visit(next);
                     } else {
-                        updated.extend_from_slice(&nodes[i..]);
+                        updated.push(next);
+                        updated.extend(rest);
                         break;
                     }
                 }
 
-                return (updated, true);
+                return Some(updated);
             }
             i += 1;
         }
 
-        (nodes.to_vec(), false)
+        None
     }
 
     // Go: ast/visitor.go:188 VisitEachChild

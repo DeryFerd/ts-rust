@@ -85,12 +85,12 @@ impl NewProgram {
         ) && equal_maps(
             self.processed_files
                 .redirect_files_by_path
-                .as_ref()
+                .as_deref()
                 .unwrap_or(&empty),
             other
                 .processed_files
                 .redirect_files_by_path
-                .as_ref()
+                .as_deref()
                 .unwrap_or(&empty),
             |a, b| a.file_name() == b.file_name(),
         )
@@ -442,7 +442,7 @@ impl NewProgram {
                     .as_ref()
                     .expect("program has a resolver");
                 let mut seen_package_jsons: FxHashSet<Path> = FxHashSet::default();
-                for (file_path, meta) in &self.processed_files.source_file_meta_datas {
+                for (file_path, meta) in self.processed_files.source_file_meta_datas.iter() {
                     if meta.package_json_directory.is_empty() {
                         continue;
                     }

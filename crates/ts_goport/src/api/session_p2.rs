@@ -1,0 +1,1682 @@
+use crate::api::prelude::*;
+
+// Port of Go `internal/api/session.go`, lines 1272-2484: the
+// `resolve*PropertyOf*` helpers, the checker query handlers, node building
+// and printing, intrinsic types, diagnostics, `resolveNodeHandle`,
+// `computeSnapshotChanges`, `Close`, and the references, signature usage and
+// completion handlers. The file header of `session_p1.rs` holds the PORT
+// notes for both files (registry entries keep the owning checker; handles
+// cross to the setup checker only through `checker_symbol`, `checker_type`
+// and `checker_signature`).
+
+use crate::api::encoder;
+use crate::frontend::compiler;
+use crate::frontend::core_context::{self, CheckerLifetime};
+use crate::frontend::core_ls_ext::{diff_maps, diff_ordered_maps};
+use crate::frontend::json_ext::AnyValue;
+use crate::frontend::parser::ParsedSourceFile;
+use crate::frontend::tspath;
+use crate::frontend::vfs::Fs as _;
+use crate::gostd::{self, Context, GoError, errors};
+use crate::program::ls_program;
+use crate::project;
+
+impl Session {
+    // Go: api/session.go:1273 resolveTypePropertyOfType
+    // resolveTypePropertyOfType resolves a type property of type `Type` and returns a type response.
+    // PORT: the getter reads the type in the arena of its checker.
+    pub fn resolve_type_property_of_type(
+        &self,
+        params: &GetTypePropertyParams,
+        getter: &dyn Fn(&Checker, TypeId) -> TypeId,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+
+        let result = getter(&checker.borrow(), t);
+        if result.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(sd.new_type_response(&checker, result))
+    }
+
+    // Go: api/session.go:1293 resolveTypeArrayPropertyOfType
+    // resolveTypeArrayPropertyOfType resolves a type property of an array of types and returns an array of type responses.
+    pub fn resolve_type_array_property_of_type(
+        &self,
+        params: &GetTypePropertyParams,
+        getter: &dyn Fn(&Checker, TypeId) -> Vec<TypeId>,
+    ) -> Result<Vec<Option<TypeResponse>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+
+        let types = getter(&checker.borrow(), t);
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(types.len());
+        for sub in types {
+            results.push(sd.new_type_response(&checker, sub));
+        }
+        Ok(results)
+    }
+
+    // Go: api/session.go:1317 resolveSymbolPropertyOfType
+    // resolveSymbolPropertyOfType resolves a type property of type `Symbol` and returns a symbol response.
+    pub fn resolve_symbol_property_of_type(
+        &self,
+        params: &GetTypePropertyParams,
+        getter: &dyn Fn(&Checker, TypeId) -> SymbolId,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+
+        let result = getter(&checker.borrow(), t);
+        if result.is_nil() {
+            return Ok(None);
+        }
+        Ok(sd.new_symbol_response(&checker, result))
+    }
+
+    // Go: api/session.go:1336 resolveSymbolPropertyOfSymbol
+    // resolveSymbolTablePropertyOfSymbol resolves a symbol property of type `Symbol` and returns a symbol response.
+    pub fn resolve_symbol_property_of_symbol(
+        &self,
+        params: &GetSymbolPropertyParams,
+        getter: &dyn Fn(&Checker, SymbolId) -> SymbolId,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, symbol) = sd.resolve_symbol_handle(params.symbol)?;
+
+        let result = getter(&checker.borrow(), symbol);
+        if result.is_nil() {
+            return Ok(None);
+        }
+        Ok(sd.new_symbol_response(&checker, result))
+    }
+
+    // Go: api/session.go:1355 resolveSymbolTablePropertyOfSymbol
+    // resolveSymbolTablePropertyOfSymbol resolves a symbol property of type `SymbolTable` and returns an array of symbol responses.
+    pub fn resolve_symbol_table_property_of_symbol(
+        &self,
+        params: &GetSymbolPropertyParams,
+        getter: &dyn Fn(&Checker, SymbolId) -> SymbolTable,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, symbol) = sd.resolve_symbol_handle(params.symbol)?;
+
+        let symbol_table = getter(&checker.borrow(), symbol);
+        let table_len = checker.borrow().symbols.len(symbol_table);
+        if symbol_table.is_nil() || table_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // PORT: Go map order is random; the port uses table insertion order.
+        let subs = checker.borrow().symbols.values(symbol_table);
+        let mut results = Vec::with_capacity(table_len);
+        for sub in subs {
+            results.push(sd.new_symbol_response(&checker, sub));
+        }
+        Ok(results)
+    }
+
+    // Go: api/session.go:1379 resolveSymbolArrayPropertyOfSignature
+    // resolveSymbolArrayPropertyOfSignature resolves a signature property of an array of symbols and returns an array of symbol responses.
+    pub fn resolve_symbol_array_property_of_signature(
+        &self,
+        params: &GetSignaturePropertyParams,
+        getter: &dyn Fn(&Checker, SignatureId) -> Vec<SymbolId>,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+
+        let symbols = getter(&checker.borrow(), sig);
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(symbols.len());
+        for sym in symbols {
+            results.push(sd.new_symbol_response(&checker, sym));
+        }
+        Ok(results)
+    }
+
+    // Go: api/session.go:1403 resolveSymbolPropertyOfSignature
+    // resolveSymbolPropertyOfSignature resolves a signature property of type `Symbol` and returns a symbol response.
+    pub fn resolve_symbol_property_of_signature(
+        &self,
+        params: &GetSignaturePropertyParams,
+        getter: &dyn Fn(&Checker, SignatureId) -> SymbolId,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+
+        let result = getter(&checker.borrow(), sig);
+        if result.is_nil() {
+            return Ok(None);
+        }
+        Ok(sd.new_symbol_response(&checker, result))
+    }
+
+    // Go: api/session.go:1421 resolveTypeArrayPropertyOfSignature
+    pub fn resolve_type_array_property_of_signature(
+        &self,
+        params: &GetSignaturePropertyParams,
+        getter: &dyn Fn(&Checker, SignatureId) -> Vec<TypeId>,
+    ) -> Result<Vec<Option<TypeResponse>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+
+        let types = getter(&checker.borrow(), sig);
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(types.len());
+        for sub in types {
+            results.push(sd.new_type_response(&checker, sub));
+        }
+        Ok(results)
+    }
+
+    // Go: api/session.go:1444 resolveSignaturePropertyOfSignature
+    pub fn resolve_signature_property_of_signature(
+        &self,
+        params: &GetSignaturePropertyParams,
+        getter: &dyn Fn(&Checker, SignatureId) -> SignatureId,
+    ) -> Result<Option<SignatureResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+
+        let result = getter(&checker.borrow(), sig);
+        if result.is_nil() {
+            return Ok(None);
+        }
+        Ok(sd.new_signature_response(&checker, result))
+    }
+
+    // Go: api/session.go:1463 handleGetContextualType
+    // handleGetContextualType returns the contextual type for a node.
+    pub fn handle_get_contextual_type(
+        &self,
+        ctx: &Context,
+        params: &GetContextualTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_contextual_type_exported(node, ContextFlags::NONE);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1487 handleGetBaseTypeOfLiteralType
+    // handleGetBaseTypeOfLiteralType returns the base type of a literal type (e.g. number for 42).
+    pub fn handle_get_base_type_of_literal_type(
+        &self,
+        ctx: &Context,
+        params: &GetBaseTypeOfLiteralTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .get_base_type_of_literal_type_exported(t);
+        if result.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, result))
+    }
+
+    // Go: api/session.go:1508 handleGetNonNullableType
+    // handleGetNonNullableType returns the type with null and undefined removed.
+    pub fn handle_get_non_nullable_type(
+        &self,
+        ctx: &Context,
+        params: &GetNonNullableTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup.checker.borrow_mut().get_non_nullable_type(t);
+        if result.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, result))
+    }
+
+    // Go: api/session.go:1529 handleGetTypeFromTypeNode
+    // handleGetTypeFromTypeNode returns the type for a type node.
+    pub fn handle_get_type_from_type_node(
+        &self,
+        ctx: &Context,
+        params: &GetTypeFromTypeNodeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_type_from_type_node_exported(node);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1553 handleGetWidenedType
+    // handleGetWidenedType returns the widened type.
+    pub fn handle_get_widened_type(
+        &self,
+        ctx: &Context,
+        params: &GetWidenedTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup.checker.borrow_mut().get_widened_type_exported(t);
+        if result.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, result))
+    }
+
+    // Go: api/session.go:1574 handleGetParameterType
+    // handleGetParameterType returns the type of a parameter at a given index in a signature.
+    pub fn handle_get_parameter_type(
+        &self,
+        ctx: &Context,
+        params: &GetParameterTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
+
+        if params.index < 0 {
+            return Err(errors::errorf(
+                format!("{}: invalid parameter index", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_type_at_position_exported(sig, params.index);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1599 handleIsArrayLikeType
+    // handleIsArrayLikeType returns whether a type is array-like.
+    pub fn handle_is_array_like_type(
+        &self,
+        ctx: &Context,
+        params: &IsArrayLikeTypeParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup.checker.borrow_mut().is_array_like_type_exported(t);
+        Ok(result)
+    }
+
+    // Go: api/session.go:1615 handleIsTypeAssignableTo
+    // handleIsTypeAssignableTo returns whether source is assignable to target.
+    pub fn handle_is_type_assignable_to(
+        &self,
+        ctx: &Context,
+        params: &IsTypeAssignableToParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (source_owner, source) = setup.sd.resolve_type_handle(params.source)?;
+        let (target_owner, target) = setup.sd.resolve_type_handle(params.target)?;
+        let source = checker_type(&setup.checker, &source_owner, source);
+        let target = checker_type(&setup.checker, &target_owner, target);
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .is_type_assignable_to_exported(source, target);
+        Ok(result)
+    }
+
+    // Go: api/session.go:1635 handleGetShorthandAssignmentValueSymbol
+    // handleGetShorthandAssignmentValueSymbol returns the value symbol of a shorthand property assignment.
+    pub fn handle_get_shorthand_assignment_value_symbol(
+        &self,
+        ctx: &Context,
+        params: &GetTypeAtLocationParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let symbol = setup
+            .checker
+            .borrow_mut()
+            .get_shorthand_assignment_value_symbol(node);
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_symbol_response(&setup.checker, symbol))
+    }
+
+    // Go: api/session.go:1659 handleGetTypeOfSymbolAtLocation
+    // handleGetTypeOfSymbolAtLocation returns the narrowed type of a symbol at a specific location.
+    pub fn handle_get_type_of_symbol_at_location(
+        &self,
+        ctx: &Context,
+        params: &GetTypeOfSymbolAtLocationParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_type_of_symbol_at_location(symbol, node);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1691 handleTypeToTypeNode
+    // handleTypeToTypeNode converts a Type to a TypeNode AST and returns it as binary-encoded data.
+    pub fn handle_type_to_type_node(
+        &self,
+        ctx: &Context,
+        params: &TypeToTypeNodeParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let mut enclosing_declaration = Node::NIL;
+        if !params.location.0.is_empty() {
+            enclosing_declaration = setup
+                .sd
+                .resolve_node_handle(setup.program, &params.location)?;
+        }
+
+        let type_node = setup.checker.borrow_mut().type_to_type_node_exported(
+            t,
+            enclosing_declaration,
+            NodeBuilderFlags(params.flags as u32),
+            None,
+        );
+        if type_node.is_nil() {
+            return Ok(None);
+        }
+
+        let data = match encoder::encode_node(type_node, Node::NIL) {
+            Ok((data, _)) => data,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("failed to encode type node: {err}"),
+                    vec![err],
+                ));
+            }
+        };
+
+        if self.use_binary_responses {
+            return Ok(to_any(RawBinary(data)));
+        }
+        Ok(to_any(SourceFileResponse {
+            data: base64_std_encoding_encode_to_string(&data),
+        }))
+    }
+
+    // Go: api/session.go:1729 handleSignatureToSignatureDeclaration
+    pub fn handle_signature_to_signature_declaration(
+        &self,
+        ctx: &Context,
+        params: &SignatureToSignatureDeclarationParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
+
+        let mut enclosing_declaration = Node::NIL;
+        if !params.location.0.is_empty() {
+            enclosing_declaration = setup
+                .sd
+                .resolve_node_handle(setup.program, &params.location)?;
+        }
+
+        // PORT: Go converts any int32 to `ast.Kind` (int16). A value that is
+        // no SyntaxKind has no Rust value; it panics here (Go's node builder
+        // has no case for it either).
+        let kind = SyntaxKind::try_from(params.kind as u16)
+            .unwrap_or_else(|_| panic!("ast.Kind({}) is not a syntax kind", params.kind));
+        let node = setup
+            .checker
+            .borrow_mut()
+            .signature_to_signature_declaration_exported(
+                sig,
+                kind,
+                enclosing_declaration,
+                NodeBuilderFlags(params.flags as u32),
+            );
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let data = match encoder::encode_node(node, Node::NIL) {
+            Ok((data, _)) => data,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("failed to encode signature declaration: {err}"),
+                    vec![err],
+                ));
+            }
+        };
+
+        if self.use_binary_responses {
+            return Ok(to_any(RawBinary(data)));
+        }
+        Ok(to_any(SourceFileResponse {
+            data: base64_std_encoding_encode_to_string(&data),
+        }))
+    }
+
+    // Go: api/session.go:1768 handleTypeToString
+    // handleTypeToString converts a Type to its string representation.
+    pub fn handle_type_to_string(
+        &self,
+        ctx: &Context,
+        params: &TypeToTypeNodeParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let mut enclosing_declaration = Node::NIL;
+        if !params.location.0.is_empty() {
+            enclosing_declaration = setup
+                .sd
+                .resolve_node_handle(setup.program, &params.location)?;
+        }
+
+        if params.flags != 0 {
+            let text = setup.checker.borrow_mut().type_to_string_ex(
+                t,
+                enclosing_declaration,
+                TypeFormatFlags(params.flags as u32),
+                None,
+            );
+            return Ok(to_any(text));
+        }
+        let text = setup.checker.borrow_mut().type_to_string_ex(
+            t,
+            enclosing_declaration,
+            TypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE
+                | TypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE,
+            None,
+        );
+        Ok(to_any(text))
+    }
+
+    // Go: api/session.go:1795 handlePrintNode
+    // handlePrintNode decodes a binary-encoded AST node and prints it to text.
+    pub fn handle_print_node(
+        &self,
+        _ctx: &Context,
+        params: &PrintNodeParams,
+    ) -> Result<String, GoError> {
+        let data = match base64_std_encoding_decode_string(&params.data) {
+            Ok(data) => data,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("{}: invalid base64 data: {}", *ERR_CLIENT_ERROR, err),
+                    vec![ERR_CLIENT_ERROR.clone(), err],
+                ));
+            }
+        };
+
+        let node = match encoder::decode_nodes(&data) {
+            Ok(node) => node,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("{}: failed to decode AST: {}", *ERR_CLIENT_ERROR, err),
+                    vec![ERR_CLIENT_ERROR.clone(), err],
+                ));
+            }
+        };
+
+        let mut p = new_printer(
+            PrinterOptions {
+                preserve_source_newlines: params.preserve_source_newlines,
+                never_ascii_escape: params.never_ascii_escape,
+                terminate_unterminated_literals: params.terminate_unterminated_literals,
+                ..Default::default()
+            },
+            PrintHandlers::default(),
+            None,
+        );
+        Ok(p.emit(node, Node::NIL))
+    }
+
+    // Go: api/session.go:1815 handleGetIntrinsicType
+    // handleGetIntrinsicType returns an intrinsic type (any, string, number, etc.).
+    pub fn handle_get_intrinsic_type(
+        &self,
+        ctx: &Context,
+        params: &GetIntrinsicTypeParams,
+        getter: fn(&Checker) -> TypeId,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let t = getter(&setup.checker.borrow());
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1831 handleIsContextSensitive
+    // handleIsContextSensitive returns whether a node is context-sensitive.
+    pub fn handle_is_context_sensitive(
+        &self,
+        ctx: &Context,
+        params: &GetContextualTypeParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(false);
+        }
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .is_context_sensitive_exported(node);
+        Ok(result)
+    }
+
+    // Go: api/session.go:1850 handleGetReturnTypeOfSignature
+    // handleGetReturnTypeOfSignature returns the return type of a signature.
+    pub fn handle_get_return_type_of_signature(
+        &self,
+        ctx: &Context,
+        params: &CheckerSignatureParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_return_type_of_signature_exported(sig);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1871 handleGetRestTypeOfSignature
+    // handleGetRestTypeOfSignature returns the rest type of a signature.
+    pub fn handle_get_rest_type_of_signature(
+        &self,
+        ctx: &Context,
+        params: &CheckerSignatureParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_rest_type_of_signature_exported(sig);
+        if t.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, t))
+    }
+
+    // Go: api/session.go:1892 handleGetTypePredicateOfSignature
+    // handleGetTypePredicateOfSignature returns the type predicate of a signature.
+    pub fn handle_get_type_predicate_of_signature(
+        &self,
+        ctx: &Context,
+        params: &CheckerSignatureParams,
+    ) -> Result<Option<TypePredicateResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
+
+        let pred = setup
+            .checker
+            .borrow_mut()
+            .get_type_predicate_of_signature_exported(sig);
+        if pred.is_nil() {
+            return Ok(None);
+        }
+
+        let (kind, parameter_index, parameter_name, pred_type) = {
+            let c = setup.checker.borrow();
+            let p = c.pred(pred);
+            (
+                p.kind().0,
+                p.parameter_index(),
+                p.parameter_name().to_string(),
+                p.type_(),
+            )
+        };
+        let mut resp = TypePredicateResponse {
+            kind,
+            parameter_index,
+            parameter_name,
+            ..Default::default()
+        };
+        if pred_type.is_some() {
+            resp.type_ = setup.sd.new_type_response(&setup.checker, pred_type);
+        }
+
+        Ok(Some(resp))
+    }
+
+    // Go: api/session.go:1922 handleGetBaseTypes
+    // handleGetBaseTypes returns the base types of an interface/class type.
+    pub fn handle_get_base_types(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Vec<Option<TypeResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let base_types = setup.checker.borrow_mut().get_base_types_exported(t);
+        if base_types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(base_types.len());
+        for bt in base_types {
+            results.push(setup.sd.new_type_response(&setup.checker, bt));
+        }
+
+        Ok(results)
+    }
+
+    // Go: api/session.go:1948 handleGetPropertiesOfType
+    // handleGetPropertiesOfType returns the properties of a type.
+    pub fn handle_get_properties_of_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let props = setup
+            .checker
+            .borrow_mut()
+            .get_properties_of_type_exported(t);
+        if props.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(props.len());
+        for prop in props {
+            results.push(setup.sd.new_symbol_response(&setup.checker, prop));
+        }
+
+        Ok(results)
+    }
+
+    // Go: api/session.go:1974 handleGetIndexInfosOfType
+    // handleGetIndexInfosOfType returns the index infos of a type.
+    pub fn handle_get_index_infos_of_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Vec<IndexInfoResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let infos = setup
+            .checker
+            .borrow_mut()
+            .get_index_infos_of_type_exported(t);
+        if infos.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(infos.len());
+        for info in infos {
+            let (key_type, value_type, is_readonly, declaration) = {
+                let c = setup.checker.borrow();
+                let info = c.index_info(info);
+                (
+                    info.key_type(),
+                    info.value_type(),
+                    info.is_readonly(),
+                    info.declaration(),
+                )
+            };
+            // PORT: Go dereferences the `*TypeResponse` (`*sd.newTypeResponse(..)`),
+            // which panics on nil.
+            let mut result = IndexInfoResponse {
+                key_type: setup
+                    .sd
+                    .new_type_response(&setup.checker, key_type)
+                    .expect("invalid memory address or nil pointer dereference"),
+                value_type: setup
+                    .sd
+                    .new_type_response(&setup.checker, value_type)
+                    .expect("invalid memory address or nil pointer dereference"),
+                is_readonly,
+                ..Default::default()
+            };
+            if declaration.is_some() {
+                result.declaration = setup.sd.node_handle_from(declaration);
+            }
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
+    // Go: api/session.go:2007 handleGetConstraintOfTypeParameter
+    // handleGetConstraintOfTypeParameter returns the constraint of a type parameter.
+    pub fn handle_get_constraint_of_type_parameter(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let constraint = setup
+            .checker
+            .borrow_mut()
+            .get_constraint_of_type_parameter_exported(t);
+        if constraint.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.sd.new_type_response(&setup.checker, constraint))
+    }
+
+    // Go: api/session.go:2028 handleGetTypeArguments
+    // handleGetTypeArguments returns the type arguments of a type reference.
+    pub fn handle_get_type_arguments(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Vec<Option<TypeResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let type_args = setup.checker.borrow_mut().get_type_arguments_exported(t);
+        if type_args.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(type_args.len());
+        for ta in type_args {
+            results.push(setup.sd.new_type_response(&setup.checker, ta));
+        }
+
+        Ok(results)
+    }
+}
+
+impl SnapshotData {
+    // Go: api/session.go:2053 resolveNodeHandle
+    pub fn resolve_node_handle(
+        &self,
+        program: &'static compiler::NewProgram,
+        handle: &NodeHandle,
+    ) -> Result<Node, GoError> {
+        let s = handle.0.as_str();
+        // Format: "index.kind.path" — we need index and path, kind is informational only.
+        let Some(first_dot) = s.bytes().position(|b| b == b'.') else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: invalid node handle {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(s)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let Some(second_dot) = s[first_dot + 1..].bytes().position(|b| b == b'.') else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: invalid node handle {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(s)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let second_dot = second_dot + first_dot + 1; // adjust to absolute index
+
+        let idx = match strconv_parse_uint(&s[..first_dot], 10, 32) {
+            Ok(idx) => idx,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: invalid node handle {}: {}",
+                        *ERR_CLIENT_ERROR,
+                        gostd::strconv::quote(s),
+                        err
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone(), err],
+                ));
+            }
+        };
+        let path = tspath::Path(s[second_dot + 1..].to_string());
+
+        let source_file = program
+            .get_source_file_by_path(&path)
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: node handle {} could not be resolved (file may not be loaded or handle may be stale)",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(s)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let table = encoder::get_node_index_table(source_file);
+
+        // PORT: Go also checks `table != nil`; the Rust table is never nil.
+        if idx < table.nodes.len() as u64 {
+            let node = table.nodes[idx as usize];
+            if node.is_some() {
+                return Ok(node);
+            }
+        }
+        Err(errors::errorf(
+            format!(
+                "{}: node handle {} could not be resolved (file may not be loaded or handle may be stale)",
+                *ERR_CLIENT_ERROR,
+                gostd::strconv::quote(s)
+            ),
+            vec![ERR_CLIENT_ERROR.clone()],
+        ))
+    }
+}
+
+// Go: api/session.go:2090 computeSnapshotChanges
+// computeSnapshotChanges computes the per-project source file differences between
+// two snapshots. It uses DiffOrderedMaps on projects to find changed/removed projects,
+// then DiffMaps on FilesByPath for each changed project to collect file-level changes.
+pub fn compute_snapshot_changes(
+    prev: &project::Snapshot,
+    next: &project::Snapshot,
+) -> SnapshotChanges {
+    let prev_projects = prev.project_collection.projects_by_path();
+    let next_projects = next.project_collection.projects_by_path();
+
+    let mut changes = SnapshotChanges::default();
+
+    diff_ordered_maps(
+        &prev_projects,
+        &next_projects,
+        // onAdded: new project — nothing to retain from previous snapshot.
+        |_, _| {},
+        // onRemoved: project removed entirely.
+        |_, old_proj| {
+            changes
+                .removed_projects
+                .push(project_handle(&old_proj.borrow()));
+        },
+        // onModified: project changed, diff its files.
+        |_, old_proj, new_proj| {
+            let old_program = old_proj.borrow().get_program();
+            let new_program = new_proj.borrow().get_program();
+            let same_program = match (old_program, new_program) {
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if same_program {
+                return;
+            }
+            // PORT: a nil Go map is an empty map here.
+            let empty: FxHashMap<tspath::Path, Rc<ParsedSourceFile>> = FxHashMap::default();
+            let old_files = match old_program {
+                Some(p) => p.files_by_path(),
+                None => &empty,
+            };
+            let new_files = match new_program {
+                Some(p) => p.files_by_path(),
+                None => &empty,
+            };
+            let mut project_changes = ProjectFileChanges::default();
+            {
+                // PORT: Go map order is random; the port uses FxHashMap order.
+                let mut on_removed = |path: &tspath::Path, _: &Rc<ParsedSourceFile>| {
+                    project_changes.deleted_files.push(path.clone());
+                };
+                let mut on_changed =
+                    |path: &tspath::Path, _: &Rc<ParsedSourceFile>, _: &Rc<ParsedSourceFile>| {
+                        project_changes.changed_files.push(path.clone());
+                    };
+                diff_maps::<tspath::Path, Rc<ParsedSourceFile>>(
+                    old_files,
+                    new_files,
+                    None, // onAdded: new file in project, not a change.
+                    Some(&mut on_removed),
+                    Some(&mut on_changed),
+                );
+            }
+            if !project_changes.changed_files.is_empty()
+                || !project_changes.deleted_files.is_empty()
+            {
+                // PORT: Go makes the nil map here; an empty map is the same
+                // value to the `omitempty` field.
+                changes
+                    .changed_projects
+                    .insert(project_handle(&new_proj.borrow()), project_changes);
+            }
+        },
+    );
+
+    changes
+}
+
+impl Session {
+    // Go: api/session.go:2141 Close
+    // Close closes the session and releases all active snapshots,
+    // regardless of their ref counts.
+    pub fn close(&self) {
+        let mut snapshots = self.snapshots.borrow_mut();
+        let handles: Vec<SnapshotID> = snapshots.keys().copied().collect();
+        for handle in handles {
+            snapshots.remove(&handle);
+        }
+    }
+}
+
+// Go: api/session.go:2149 formatSessionID
+pub fn format_session_id(id: u64) -> String {
+    format!("api-session-{id}")
+}
+
+impl Session {
+    // Go: api/session.go:2154 toAbsoluteFileName
+    // toAbsoluteFileName converts a file name to an absolute path.
+    pub fn to_absolute_file_name(&self, file_name: &str) -> String {
+        tspath::get_normalized_absolute_path(
+            file_name,
+            &self.project_session.get_current_directory(),
+        )
+    }
+
+    // Go: api/session.go:2159 toPath
+    // toPath converts a file name to a normalized path.
+    pub fn to_path(&self, file_name: &str) -> tspath::Path {
+        tspath::to_path(
+            file_name,
+            &self.project_session.get_current_directory(),
+            self.project_session.fs().use_case_sensitive_file_names(),
+        )
+    }
+
+    // Go: api/session.go:2164 toFileChangeSummary
+    // toFileChangeSummary converts API file changes to a project.FileChangeSummary.
+    pub fn to_file_change_summary(
+        &self,
+        changes: Option<&APIFileChanges>,
+    ) -> project::FileChangeSummary {
+        let Some(changes) = changes else {
+            return project::FileChangeSummary::default();
+        };
+        let mut summary = project::FileChangeSummary::default();
+        if changes.invalidate_all {
+            summary.invalidate_all = true;
+            summary.includes_watch_change_outside_node_modules = true;
+            return summary;
+        }
+        for doc in &changes.changed {
+            let uri = doc.to_uri();
+            summary.changed.insert(uri);
+        }
+        for doc in &changes.created {
+            let uri = doc.to_uri();
+            summary.created.insert(uri);
+        }
+        for doc in &changes.deleted {
+            let uri = doc.to_uri();
+            summary.deleted.insert(uri);
+        }
+        if summary.changed.len() + summary.created.len() + summary.deleted.len() > 0 {
+            summary.includes_watch_change_outside_node_modules = true;
+        }
+        summary
+    }
+
+    // Go: api/session.go:2193 handleGetSyntacticDiagnostics
+    // handleGetSyntacticDiagnostics returns syntactic diagnostics for a file or all files.
+    pub fn handle_get_syntactic_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
+
+        let diags = ls_program::get_syntactic_diagnostics(program, ctx, source_file);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:2215 handleGetSemanticDiagnostics
+    // handleGetSemanticDiagnostics returns semantic diagnostics for a file or all files.
+    pub fn handle_get_semantic_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
+
+        let diags = ls_program::get_semantic_diagnostics(program, ctx, source_file);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:2237 handleGetSuggestionDiagnostics
+    // handleGetSuggestionDiagnostics returns suggestion diagnostics for a file or all files.
+    pub fn handle_get_suggestion_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
+
+        let diags = ls_program::get_suggestion_diagnostics(program, ctx, source_file);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:2259 handleGetDeclarationDiagnostics
+    // handleGetDeclarationDiagnostics returns declaration diagnostics for a file or all files.
+    pub fn handle_get_declaration_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
+
+        let diags = ls_program::get_declaration_diagnostics(program, ctx, source_file);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:2281 handleGetConfigFileParsingDiagnostics
+    // handleGetConfigFileParsingDiagnostics returns config file parsing diagnostics.
+    pub fn handle_get_config_file_parsing_diagnostics(
+        &self,
+        _ctx: &Context,
+        params: &GetProjectDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let diags = program.get_config_file_parsing_diagnostics();
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:2298 resolveOptionalSourceFile
+    // resolveOptionalSourceFile resolves an optional DocumentIdentifier to a source file.
+    // Returns nil if the identifier is nil (meaning all files).
+    pub fn resolve_optional_source_file(
+        &self,
+        program: &'static compiler::NewProgram,
+        file: Option<&DocumentIdentifier>,
+    ) -> Result<Node, GoError> {
+        let Some(file) = file else {
+            return Ok(Node::NIL);
+        };
+        let source_file = program
+            .get_source_file(&file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        Ok(source_file)
+    }
+
+    // Go: api/session.go:2310 handleGetReferencesToSymbolInFile
+    // handleGetReferencesToSymbolInFile returns node handles for all identifiers in a file that reference the given symbol.
+    pub fn handle_get_references_to_symbol_in_file(
+        &self,
+        ctx: &Context,
+        params: &GetReferencesToSymbolInFileParams,
+    ) -> Result<Vec<NodeHandle>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(Vec::new());
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let source_file = setup
+            .program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    params.file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let nodes = setup
+            .checker
+            .borrow_mut()
+            .get_references_to_symbol_in_file(source_file, symbol);
+        let mut result = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            result.push(setup.sd.node_handle_from(node));
+        }
+        Ok(result)
+    }
+
+    // Go: api/session.go:2338 handleGetSignatureUsages
+    pub fn handle_get_signature_usages(
+        &self,
+        ctx: &Context,
+        params: &GetSignatureUsagesParams,
+    ) -> Result<Vec<SignatureUsageResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = sd.get_program(&params.project)?;
+
+        let signature_decl = sd.resolve_node_handle(program, &params.signature_decl)?;
+        if signature_decl.is_nil() {
+            return Ok(Vec::new());
+        }
+
+        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+
+        let usages = lang_svc.get_signature_usages(ctx, signature_decl);
+        // PORT: Go `usages == nil`. Go returns a nil slice exactly when there
+        // is no usage; both results marshal as `[]`.
+        if usages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::with_capacity(usages.len());
+        for u in &usages {
+            let mut entry = SignatureUsageResponse {
+                name: sd.node_handle_from(u.name),
+                ..Default::default()
+            };
+            if u.call.is_some() {
+                entry.call = sd.node_handle_from(u.call);
+            }
+            result.push(entry);
+        }
+        Ok(result)
+    }
+
+    // Go: api/session.go:2380 handleGetCompletionsAtPosition
+    // handleGetCompletionsAtPosition returns completions at a position in a document.
+    pub fn handle_get_completions_at_position(
+        &self,
+        ctx: &Context,
+        params: &GetCompletionsAtPositionParams,
+    ) -> Result<Option<CompletionInfoResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = sd.get_program(&params.project)?;
+        let source_file = program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Ok(None);
+        }
+        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+        let position_map = source_file_get_position_map(source_file);
+        let internal_pos = position_map.utf16_to_utf8(params.position as i32);
+        let result = lang_svc.get_completions_at_position_exported(
+            ctx,
+            source_file,
+            internal_pos,
+            params.trigger_character.clone(),
+            params.include_symbol,
+        );
+        let result = match result {
+            Err(err) => return Err(err),
+            Ok(None) => return Ok(None),
+            Ok(Some(result)) => result,
+        };
+        // PORT: Go reads `item.Symbol` without a checker. The symbols live in
+        // the arena of the checker the completion request used, so the port
+        // takes that checker again (same request context and file; the pool
+        // returns the same checker) to read them.
+        let mut symbol_checker: Option<(Rc<RefCell<Checker>>, ls_program::Release)> = None;
+        let mut entries = Vec::with_capacity(result.items.len());
+        for item in &result.items {
+            let mut entry = CompletionEntryResponse {
+                name: item.label.clone(),
+                sort_text: item.sort_text.clone(),
+                insert_text: item.insert_text.clone(),
+                filter_text: item.filter_text.clone(),
+                detail: item.detail.clone(),
+                ..Default::default()
+            };
+            if let Some(kind) = item.kind {
+                entry.kind = kind.0;
+            }
+            if let Some(label_details) = &item.label_details {
+                entry.label_details = Some(CompletionEntryLabelDetailsResponse {
+                    detail: label_details.detail.clone(),
+                    description: label_details.description.clone(),
+                });
+            }
+            if item.symbol.is_some() {
+                let (checker, _) = symbol_checker.get_or_insert_with(|| {
+                    ls_program::get_type_checker_for_file(program, ctx, source_file)
+                });
+                entry.symbol = sd.new_symbol_response(checker, item.symbol);
+            }
+            entries.push(entry);
+        }
+        Ok(Some(CompletionInfoResponse {
+            is_incomplete: result.is_incomplete,
+            entries,
+        }))
+    }
+
+    // Go: api/session.go:2433 handleGetReferencedSymbolsForNode
+    // handleGetReferencedSymbolsForNode returns node handles for all references found at a node.
+    pub fn handle_get_referenced_symbols_for_node(
+        &self,
+        ctx: &Context,
+        params: &GetReferencedSymbolsForNodeParams,
+    ) -> Result<Vec<ReferencedSymbolEntry>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = sd.get_program(&params.project)?;
+
+        let node = sd.resolve_node_handle(program, &params.node)?;
+        if node.is_nil() {
+            return Ok(Vec::new());
+        }
+
+        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+
+        let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();
+        let entries = lang_svc.get_referenced_symbols_for_node_exported(
+            ctx,
+            params.position,
+            node,
+            &source_files,
+        );
+        // PORT: Go `entries == nil`; an empty result marshals as `[]` either way.
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // PORT: Go reads `symbol.Declarations` (DefinitionNode) and the
+        // definition symbols without a checker. They live in the arena of the
+        // request checker, which the language service took with
+        // `GetTypeChecker(ctx)`; the port takes it again to read them
+        // (ls/findallreferences_p1.rs header).
+        let (checker, _done) = ls_program::get_type_checker(program, ctx);
+
+        let mut result: Vec<ReferencedSymbolEntry> = Vec::new();
+        for entry in &entries {
+            let entry = entry.borrow();
+            let def_node = entry.definition_node(&checker.borrow().symbols);
+            if def_node.is_nil() {
+                continue;
+            }
+            let mut refs: Vec<NodeHandle> = Vec::new();
+            for ref_ in entry.references() {
+                let ref_ = ref_.borrow();
+                if ref_.is_node_entry() {
+                    refs.push(sd.node_handle_from(ref_.node()));
+                }
+            }
+            let mut re = ReferencedSymbolEntry {
+                definition: sd.node_handle_from(def_node),
+                references: refs,
+                ..Default::default()
+            };
+            let sym = entry.definition_symbol();
+            if sym.is_some() {
+                re.symbol = sd.new_symbol_response(&checker, sym);
+            }
+            result.push(re);
+        }
+        Ok(result)
+    }
+}
+
+// Go: encoding/base64/base64.go:139 (*Encoding).EncodeToString (StdEncoding)
+// PORT: the crate has no base64 dependency. Go `base64.StdEncoding`: the
+// standard alphabet with `=` padding.
+pub fn base64_std_encoding_encode_to_string(src: &[u8]) -> String {
+    const ENCODE_STD: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut dst = String::with_capacity(src.len().div_ceil(3) * 4);
+    for chunk in src.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).map_or(0, |&b| u32::from(b));
+        let b2 = chunk.get(2).map_or(0, |&b| u32::from(b));
+        let val = (b0 << 16) | (b1 << 8) | b2;
+        dst.push(ENCODE_STD[((val >> 18) & 0x3F) as usize] as char);
+        dst.push(ENCODE_STD[((val >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            dst.push(ENCODE_STD[((val >> 6) & 0x3F) as usize] as char);
+        } else {
+            dst.push('=');
+        }
+        if chunk.len() > 2 {
+            dst.push(ENCODE_STD[(val & 0x3F) as usize] as char);
+        } else {
+            dst.push('=');
+        }
+    }
+    dst
+}
+
+// Go: encoding/base64/base64.go:429 (*Encoding).DecodeString (StdEncoding)
+// PORT: the crate has no base64 dependency. This is Go `Decode` as a loop of
+// `decodeQuantum` (base64.go:312): the standard alphabet, `=` padding
+// required, not strict, `\r` and `\n` skipped. Go's 8- and 4-byte fast paths
+// decode valid input the same way and fall back to `decodeQuantum` at the
+// same offset, so results and error offsets are equal. Go returns the
+// partial data with the error; the only caller uses the error alone. Go
+// `CorruptInputError` is a `GoError` with the same text.
+pub fn base64_std_encoding_decode_string(s: &str) -> Result<Vec<u8>, GoError> {
+    fn decode_map(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0xFF,
+        }
+    }
+    // Go: base64.go:303 CorruptInputError.Error
+    fn corrupt_input_error(offset: usize) -> GoError {
+        errors::new(format!("illegal base64 data at input byte {offset}"))
+    }
+
+    let src = s.as_bytes();
+    let mut dst: Vec<u8> = Vec::with_capacity(src.len() / 4 * 3);
+    if src.is_empty() {
+        return Ok(dst);
+    }
+    let mut si = 0usize;
+    while si < src.len() {
+        // Go: base64.go:312 decodeQuantum
+        let mut dbuf = [0u8; 4];
+        let mut dlen = 4usize;
+        let mut err: Option<GoError> = None;
+
+        let mut j = 0usize;
+        while j < dbuf.len() {
+            if src.len() == si {
+                if j == 0 {
+                    return Ok(dst);
+                }
+                // j == 1, or padding is required (StdEncoding)
+                return Err(corrupt_input_error(si - j));
+            }
+            let input = src[si];
+            si += 1;
+
+            let out = decode_map(input);
+            if out != 0xFF {
+                dbuf[j] = out;
+                j += 1;
+                continue;
+            }
+
+            if input == b'\n' || input == b'\r' {
+                continue;
+            }
+
+            if input != b'=' {
+                return Err(corrupt_input_error(si - 1));
+            }
+
+            // We've reached the end and there's padding
+            match j {
+                0 | 1 => {
+                    // incorrect padding
+                    return Err(corrupt_input_error(si - 1));
+                }
+                2 => {
+                    // "==" is expected, the first "=" is already consumed.
+                    // skip over newlines
+                    while si < src.len() && (src[si] == b'\n' || src[si] == b'\r') {
+                        si += 1;
+                    }
+                    if si == src.len() {
+                        // not enough padding
+                        return Err(corrupt_input_error(src.len()));
+                    }
+                    if src[si] != b'=' {
+                        // incorrect padding
+                        return Err(corrupt_input_error(si - 1));
+                    }
+
+                    si += 1;
+                }
+                _ => {}
+            }
+
+            // skip over newlines
+            while si < src.len() && (src[si] == b'\n' || src[si] == b'\r') {
+                si += 1;
+            }
+            if si < src.len() {
+                // trailing garbage
+                err = Some(corrupt_input_error(si));
+            }
+            dlen = j;
+            break;
+        }
+
+        // Convert 4x 6bit source bytes into 3 bytes
+        let val = u32::from(dbuf[0]) << 18
+            | u32::from(dbuf[1]) << 12
+            | u32::from(dbuf[2]) << 6
+            | u32::from(dbuf[3]);
+        let bytes = [(val >> 16) as u8, (val >> 8) as u8, val as u8];
+        match dlen {
+            4 => dst.extend_from_slice(&bytes[..3]),
+            3 => dst.extend_from_slice(&bytes[..2]),
+            2 => dst.extend_from_slice(&bytes[..1]),
+            _ => {}
+        }
+
+        if let Some(err) = err {
+            return Err(err);
+        }
+    }
+    Ok(dst)
+}
+
+// Go: strconv/number.go:104 ParseUint and internal/strconv/atoi.go:47 ParseUint
+// PORT: Go stdlib. Only `2 <= base <= 36` is ported (the caller passes 10);
+// Go `*strconv.NumError` is a `GoError` with the same text.
+fn strconv_parse_uint(s: &str, base: u32, bit_size: u32) -> Result<u64, GoError> {
+    // Go: strconv/number.go:258 (*NumError).Error
+    let num_error = |reason: &str| {
+        errors::new(format!(
+            "strconv.ParseUint: parsing {}: {}",
+            gostd::strconv::quote(s),
+            reason
+        ))
+    };
+
+    if s.is_empty() {
+        return Err(num_error("invalid syntax"));
+    }
+
+    debug_assert!((2..=36).contains(&base) && (1..=64).contains(&bit_size));
+
+    // Cutoff is the smallest number such that cutoff*base > maxUint64.
+    let cutoff = u64::MAX / u64::from(base) + 1;
+
+    let max_val: u64 = if bit_size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_size) - 1
+    };
+
+    let mut n: u64 = 0;
+    for &c in s.as_bytes() {
+        let lower = c | (b'x' - b'X');
+        let d: u8 = if c.is_ascii_digit() {
+            c - b'0'
+        } else if lower.is_ascii_lowercase() {
+            lower - b'a' + 10
+        } else {
+            return Err(num_error("invalid syntax"));
+        };
+
+        if u32::from(d) >= base {
+            return Err(num_error("invalid syntax"));
+        }
+
+        if n >= cutoff {
+            // n*base overflows
+            return Err(num_error("value out of range"));
+        }
+        n *= u64::from(base);
+
+        let n1 = n.wrapping_add(u64::from(d));
+        if n1 < n || n1 > max_val {
+            // n+d overflows
+            return Err(num_error("value out of range"));
+        }
+        n = n1;
+    }
+
+    Ok(n)
+}

@@ -4,7 +4,8 @@
 //! `TextRange`).
 //!
 //! Go reads the AST without a context. So do we: every method reaches the
-//! parsed ts_ast arena through `prog()`. Nodes of a ported-parser file are
+//! parsed ts_ast arena through the file registry (`ast/store.rs`
+//! `go_file`). Nodes of a ported-parser file are
 //! read from its node store (`ast/store.rs`), and factory nodes from the
 //! synthetic arena (`ast/synthetic.rs`).
 //!
@@ -227,7 +228,7 @@ macro_rules! variant_has_kind {
     };
 }
 
-/// True when `n` is a frozen store node whose kind fits none of the listed
+/// True when `n` is a tier 0 store node whose kind fits none of the listed
 /// data variants. Such a node cannot hold the field, so the accessor gives
 /// its default without loading the node data.
 // Store data always fits the header kind (`alloc_store_node`). `Unknown` is
@@ -246,7 +247,7 @@ macro_rules! kind_lacks_data {
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
 ///
-/// PERF: a frozen store node whose kind fits no listed variant gives `$def`
+/// PERF: a tier 0 store node whose kind fits no listed variant gives `$def`
 /// from the packed kind table (`kind_lacks_data!`), without the pointer
 /// chase to its ts_ast node and data.
 macro_rules! by_data {
@@ -408,7 +409,7 @@ fn mapped_type_members(n: Node) -> NodeList {
     };
     let f = n.file_index();
     // A ported-parser file keeps the Go list as parsed.
-    if d.members.is_some() || has_file_store(f) || prog().files.get(f).is_none() {
+    if d.members.is_some() || has_file_store(f) || try_go_file(f).is_none() {
         return opt_list(f, &d.members);
     }
     let l = MAPPED_TYPE_MEMBERS.with(|cache| {
@@ -437,7 +438,7 @@ fn mapped_type_members(n: Node) -> NodeList {
 // The data stays the same. The accessors in this file and fields.rs read the
 // Go fields from it.
 fn go_kind(file: usize, id: ts_ast::NodeId, n: &ts_ast::Node) -> SyntaxKind {
-    let Some(f) = prog().files.get(file) else {
+    let Some(f) = try_go_file(file) else {
         return n.kind;
     };
     let arena = &f.legacy_source().parse.arena;
@@ -588,7 +589,7 @@ pub struct NodeSliceIter {
 }
 
 impl NodeSliceIter {
-    /// `self.slice.get(i)`, without the per-node store lookup after freeze.
+    /// `self.slice.get(i)`, without the per-node store lookup in tier 0.
     #[inline]
     fn at(&self, i: usize) -> Node {
         match self.resolved {
@@ -713,7 +714,7 @@ impl NodeList {
         if self.file as usize == SYNTHETIC_NODE_FILE || has_file_store(self.file as usize) {
             return text_range_of(&l.range);
         }
-        let Some(file) = prog().files.get(self.file as usize) else {
+        let Some(file) = try_go_file(self.file as usize) else {
             return text_range_of(&l.range);
         };
         let arena = &file.legacy_source().parse.arena;
@@ -919,7 +920,7 @@ thread_local! {
 }
 
 impl Node {
-    /// Go `node.Kind`. Frozen store nodes read a packed kind table inline;
+    /// Go `node.Kind`. Tier 0 store nodes read a packed kind table inline;
     /// other nodes take `kind_slow`.
     #[inline]
     #[must_use]
@@ -949,7 +950,7 @@ impl Node {
     #[inline]
     #[must_use]
     pub fn flags(self) -> NodeFlags {
-        // After the freeze every store file is a program file.
+        // Every tier 0 store file is published.
         match frozen_store_flags(self) {
             Some(flags) => flags | self.bind().added_flags,
             None => self.flags_slow(),
@@ -958,20 +959,22 @@ impl Node {
 
     #[inline(never)]
     fn flags_slow(self) -> NodeFlags {
+        // PERF: a node of the file this thread parses (query Q8). No
+        // program holds that file yet, so there are no binder flags and no
+        // `FROZEN` or program check is needed.
+        if let Some(h) = active_store_header(self) {
+            return h.flags;
+        }
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
         if let Some(h) = try_store_header(self) {
-            // The parser reads flags before the program exists.
-            // After the freeze every store file is a program file.
-            let flags = h.flags;
-            if file_stores_frozen() {
-                return flags | self.bind().added_flags;
+            // The parser reads flags before the file is published. A
+            // published file has a GoFile and binder data.
+            if is_published(self.file_index()) {
+                return h.flags | self.bind().added_flags;
             }
-            return match crate::core::try_prog() {
-                Some(p) if self.file_index() < p.files.len() => flags | self.bind().added_flags,
-                _ => flags,
-            };
+            return h.flags;
         }
         self.go_file().parser_flags[nid(self).index()] | self.bind().added_flags
     }
@@ -1018,7 +1021,7 @@ impl Node {
             return h.loc;
         }
         let r = raw(self);
-        let Some(file) = prog().files.get(self.file_index()) else {
+        let Some(file) = try_go_file(self.file_index()) else {
             return text_range_of(&r.range);
         };
         let (pos, end) = crate::ast::go_view::go_node_range(
@@ -1042,10 +1045,10 @@ impl Node {
         self.loc().end()
     }
 
-    /// The program file that holds this node.
+    /// The published file that holds this node.
     #[must_use]
     pub fn go_file(self) -> &'static GoFile {
-        &prog().files[self.file_index()]
+        crate::ast::go_file(self.file_index())
     }
 
     /// Binder data for this node. Nil values before the file is bound.
@@ -1292,7 +1295,7 @@ impl FlowNodeId {
         if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
             return crate::checker::synthetic_flow(self);
         }
-        &prog().files[self.file_index()]
+        &crate::ast::go_file(self.file_index())
             .flow_nodes
             .get()
             .expect("flow nodes are not built for this file")[self.local_index()]
@@ -1311,6 +1314,17 @@ pub fn source_file_info(file: Node) -> &'static crate::program::SourceFileInfo {
             .info;
     }
     &file.go_file().info
+}
+
+/// Go `file.LanguageVariant`.
+// PORT: a file that is not published yet (a parse outside a program, as the
+// format tests make) has no `GoFile`; its store keeps the parser value.
+#[must_use]
+pub fn source_file_language_variant(file: Node) -> LanguageVariant {
+    if !is_synthetic_node(file) && is_file_store_before_program(file.file_index()) {
+        return file_store_language_variant(file.file_index());
+    }
+    source_file_info(file).language_variant
 }
 
 /// Go `file.AsSourceFile()` fields that the binder sets.
@@ -3676,6 +3690,13 @@ impl Node {
         if file.is_nil() {
             return NodeSlice::NIL;
         }
+        // Go: a factory SourceFile (`NewSourceFile`, also after `copyFrom`)
+        // has `hasLazyJSDoc` false and a nil `jsdocCache`, so the result is
+        // nil. `source_file_info` would read the parsed file with the same
+        // path, whose cache and lazy flag Go does not copy.
+        if is_synthetic_node(file) {
+            return NodeSlice::NIL;
+        }
         // PORT: during the parse (Go `collectExternalModuleReferences`) the
         // store file is not in a program yet; its cache is in the store.
         if is_file_store_before_program(file.file_index()) {
@@ -3706,6 +3727,10 @@ impl Node {
             file
         };
         if file.is_nil() {
+            return NodeSlice::NIL;
+        }
+        // Go: a factory SourceFile has a nil `jsdocCache` (see `js_doc`).
+        if is_synthetic_node(file) {
             return NodeSlice::NIL;
         }
         if is_file_store_before_program(file.file_index()) {
@@ -3823,8 +3848,13 @@ pub fn source_file_imports(file: Node) -> NodeSlice {
 }
 
 // Go: ast.go:2582 (*SourceFile).Diagnostics
+// PORT: a file that is not published yet reads its store (see
+// `source_file_language_variant`).
 #[must_use]
 pub fn source_file_diagnostics(file: Node) -> &'static [Diagnostic] {
+    if !is_synthetic_node(file) && is_file_store_before_program(file.file_index()) {
+        return file_store_diagnostics(file.file_index());
+    }
     &source_file_info(file).diagnostics
 }
 

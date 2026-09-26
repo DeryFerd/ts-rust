@@ -1,6 +1,7 @@
 //! Port of typescript-go `internal/checker/checker.go` lines 26861-27804.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 use ts_diagnostics::Message;
 use ts_jsnum::Number;
 
@@ -19,10 +20,12 @@ impl Checker {
         if access_node.is_some() && is_element_access_expression(access_node) {
             access_expression = access_node;
         }
-        let mut prop_name = String::new();
+        // PERF: `prop_name` is an interned `Name`, so the property lookup
+        // below compares ids; messages print its text.
+        let mut prop_name = Name::default();
         let mut has_prop_name = false;
         if !(access_node.is_some() && is_private_identifier(access_node)) {
-            prop_name = self.get_property_name_from_index(index_type, access_node);
+            prop_name = self.get_property_name_from_index_as_name(index_type, access_node);
             has_prop_name = prop_name != INTERNAL_SYMBOL_NAME_MISSING;
         }
         if has_prop_name {
@@ -33,7 +36,7 @@ impl Checker {
                 }
                 return t;
             }
-            let prop = self.get_property_of_type(object_type, &prop_name);
+            let prop = self.get_property_of_type_name(object_type, &prop_name);
             if prop.is_some() {
                 if access_flags.intersects(AccessFlags::REPORT_DEPRECATED)
                     && access_node.is_some()
@@ -284,7 +287,7 @@ impl Checker {
                 let is_block_scoped_global_this_property =
                     self.ty(object_type).symbol == global_this_symbol && has_prop_name && {
                         let exports = self.sym(global_this_symbol).exports;
-                        let export = self.symbols.get(exports, &prop_name);
+                        let export = self.symbols.get_name(exports, &prop_name);
                         export.is_some()
                             && self.sym(export).flags.intersects(SymbolFlags::BLOCK_SCOPED)
                     };
@@ -730,6 +733,22 @@ impl Checker {
         INTERNAL_SYMBOL_NAME_MISSING.to_string()
     }
 
+    /// `get_property_name_from_index` as an interned `Name`. String literal
+    /// and unique symbol names are interned from the type with no `String`.
+    pub fn get_property_name_from_index_as_name(
+        &mut self,
+        index_type: TypeId,
+        access_node: Node,
+    ) -> Name {
+        if self.is_type_usable_as_property_name(index_type) {
+            return self.get_property_name_from_type_as_name(index_type);
+        }
+        if access_node.is_some() && is_property_name(access_node) {
+            return Name::from(get_property_name_for_property_name_node(access_node));
+        }
+        Name::from(INTERNAL_SYMBOL_NAME_MISSING)
+    }
+
     // Go: checker/checker.go:27225 isStringIndexSignatureOnlyTypeWorker
     pub fn is_string_index_signature_only_type_worker(&mut self, t: TypeId) -> bool {
         let flags = self.ty(t).flags;
@@ -900,7 +919,11 @@ impl Checker {
         let identity = self.get_recursion_identity(t);
         if stack.len() < 10 || stack.len() < 50 && !stack.contains(&identity) {
             let simplified = self.get_simplified_type(t, false /*writing*/);
-            let mut new_stack = stack.to_vec();
+            // PERF: the stack is at most 50 deep and usually short, so it
+            // lives inline on the call stack instead of in a new heap `Vec`.
+            let mut new_stack: SmallVec<[RecursionId; 16]> =
+                SmallVec::with_capacity(stack.len() + 1);
+            new_stack.extend_from_slice(stack);
             new_stack.push(identity);
             constraint = self.compute_base_constraint(simplified, &new_stack);
         }

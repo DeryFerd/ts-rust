@@ -178,6 +178,27 @@ impl<'a> EmitFilesHandler<'a> {
             .iter()
             .map(|(path, kind)| (path.clone(), *kind))
             .collect();
+        // PORT: perf. Go runs this loop in a WorkGroup. For declaration
+        // diagnostics (`is_for_dts_errors`) the job of every file that the
+        // loop will ask is sent to its checker thread first, and the loop
+        // takes each result in order. Each checker gets its files in the same
+        // order as before. The real emit below stays one file at a time.
+        let mut dts_jobs: std::collections::VecDeque<_> = if self.is_for_dts_errors {
+            pending
+                .iter()
+                .filter_map(|(path, emit_kind)| {
+                    let affected_file = get_source_file_by_path(path);
+                    (affected_file.is_some()
+                        && source_file_may_be_emitted(affected_file, false)
+                        && !self
+                            .get_pending_emit_kind_for_emit_options(*emit_kind, options)
+                            .is_empty())
+                    .then(|| send_declaration_diagnostics_job(affected_file))
+                })
+                .collect()
+        } else {
+            std::collections::VecDeque::new()
+        };
         for (path, emit_kind) in pending {
             let affected_file = get_source_file_by_path(&path);
             if affected_file.is_nil() || !source_file_may_be_emitted(affected_file, false) {
@@ -206,9 +227,13 @@ impl<'a> EmitFilesHandler<'a> {
                     });
                     emit(emit_options)
                 } else {
+                    // Go `GetDeclarationDiagnostics(ctx, affectedFile)`.
+                    let job = dts_jobs
+                        .pop_front()
+                        .expect("one declaration diagnostics job per emitted file");
                     EmitResult {
                         emit_skipped: true,
-                        diagnostics: get_declaration_diagnostics(affected_file),
+                        diagnostics: sort_and_deduplicate_diagnostics(job.wait()),
                         ..EmitResult::default()
                     }
                 };

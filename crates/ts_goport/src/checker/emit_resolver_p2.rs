@@ -404,7 +404,8 @@ impl EmitResolver {
                     c.get_export_symbol_of_value_symbol_if_exported(symbol)
                 }),
                 get_element_access_expression_name: Some(|c, expression| {
-                    c.try_get_element_access_expression_name(expression)
+                    let (name, ok) = c.try_get_element_access_expression_name(expression);
+                    (name.into_owned(), ok)
                 }),
             },
         )
@@ -1147,9 +1148,9 @@ fn mark_linked_references_recursively_visit(c: &mut Checker, n: Node) -> bool {
 }
 
 // PORT: Go passes `*printer.EmitContext` to `NewNodeBuilder`, which keeps it. The Rust node
-// builder keeps an `Rc<EmitContext>`; the context's factory holds that `Rc`.
+// builder keeps an `Rc<EmitContext>`; the context's factory gives it.
 fn emit_context_rc(emit_context: &EmitContext) -> Rc<EmitContext> {
-    emit_context.factory.emit_context.clone()
+    emit_context.factory.emit_context()
 }
 
 impl Checker {

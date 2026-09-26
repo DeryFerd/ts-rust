@@ -120,8 +120,8 @@ impl FlowNodeId {
 }
 
 /// Go `*ast.Node` (and every alias: `*ast.Expression`, `*ast.TypeNode`,
-/// `*ast.SourceFile`, ...). High 32 bits: file index in `GoProgram::files`.
-/// For a ported-parser file this is also its store id (`ast/store.rs`).
+/// `*ast.SourceFile`, ...). High 32 bits: file id in the file registry
+/// (`ast/store.rs`). For a ported-parser file this is also its store id.
 /// Low 32 bits: `ts_ast::NodeId::index() + 1`. Zero is nil.
 /// Node methods (kind, parent, fields, binder data) live in `crate::ast`.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
@@ -169,7 +169,7 @@ impl Node {
         Self(((file as u64) << 32) | (node.index() as u64 + 1))
     }
 
-    /// File index in `GoProgram::files`.
+    /// File id in the file registry (`crate::ast::go_file`).
     #[must_use]
     pub const fn file_index(self) -> usize {
         (self.0 >> 32) as usize
@@ -339,7 +339,8 @@ impl PartialEq<Name> for String {
 }
 
 /// The process-wide string interner behind `Name`. Text is copied once into
-/// leaked blocks and never freed. Ids are dense and start at 1; id 0 is "".
+/// leaked blocks and never freed. Ids start at 1 and are close to dense
+/// (see `next_id`); id 0 is "".
 /// `text` reads without a lock; `intern` takes one shard lock on a miss in
 /// the per-thread cache.
 mod intern {
@@ -364,7 +365,10 @@ mod intern {
     /// chunks as `TEXTS`. A table lookup by `Name` reads it instead of
     /// reading and hashing the text again.
     static HASHES: [OnceLock<Box<[AtomicU32]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
+    /// The next id block. Only `next_id` reads it.
     static NEXT: AtomicU32 = AtomicU32::new(1);
+    /// Ids that a thread takes from `NEXT` at once.
+    const ID_BLOCK: u32 = 64;
 
     /// Hasher for `u64` keys that already are a `hash_str` hash, so a
     /// lookup does not hash the text again. The halves swap because the
@@ -395,7 +399,12 @@ mod intern {
         free: &'static mut [u8],
     }
 
-    static SHARD_LOCKS: OnceLock<[Mutex<Shard>; SHARDS]> = OnceLock::new();
+    /// A shard lock on its own 128 bytes, so threads that lock neighboring
+    /// shards do not share a cache line (x86 fetches lines in pairs).
+    #[repr(align(128))]
+    struct PaddedShard(Mutex<Shard>);
+
+    static SHARD_LOCKS: OnceLock<[PaddedShard; SHARDS]> = OnceLock::new();
 
     /// One `CACHE` slot: (hash, id, text). Id 0 marks an empty slot.
     type CacheSlot = Cell<(u64, u32, &'static str)>;
@@ -406,6 +415,30 @@ mod intern {
         /// directly and needs no lazy init, borrow flag or `text` lookup.
         static CACHE: [CacheSlot; CACHE_SLOTS] =
             const { [const { Cell::new((0, 0, "")) }; CACHE_SLOTS] };
+
+        /// The ids this thread took from `NEXT` and did not use yet:
+        /// (next, end).
+        static IDS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    }
+
+    /// A new name id.
+    // PERF: a thread takes `ID_BLOCK` ids from `NEXT` at once, so threads
+    // that intern new names do not contend on one atomic, and the names of
+    // one file get close ids (their `HASHES` and `TEXTS` slots share cache
+    // lines). An id only has to be unique: ids already came in thread race
+    // order, and no output orders by id (`Name` orders by text). A thread
+    // that ends leaves its unused ids as empty slots.
+    fn next_id() -> u32 {
+        IDS.with(|ids| {
+            let (mut next, mut end) = ids.get();
+            if next == end {
+                next = NEXT.fetch_add(ID_BLOCK, Ordering::Relaxed);
+                // `end` fits, so no id is `u32::MAX`.
+                end = next.checked_add(ID_BLOCK).expect("name id overflow");
+            }
+            ids.set((next + 1, end));
+            next
+        })
     }
 
     /// Fx hash of `s`. Symbol tables use it too.
@@ -475,14 +508,15 @@ mod intern {
     fn intern_shared(s: &str, hash: u64) -> (u32, &'static str) {
         let shards = SHARD_LOCKS.get_or_init(|| {
             std::array::from_fn(|_| {
-                Mutex::new(Shard {
+                PaddedShard(Mutex::new(Shard {
                     ids: HashMap::default(),
                     collisions: FxHashMap::with_hasher(FxBuildHasher),
                     free: Default::default(),
-                })
+                }))
             })
         });
         let mut shard = shards[(hash >> 59) as usize % SHARDS]
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let hash_taken = match shard.ids.get(&hash) {
@@ -503,8 +537,7 @@ mod intern {
         shard.free = tail;
         let head: &'static [u8] = head;
         let stored = std::str::from_utf8(head).expect("interned text is UTF-8");
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert!(id != u32::MAX, "name id overflow");
+        let id = next_id();
         let (chunk, index) = slot(id);
         let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
         let hashes =
@@ -791,6 +824,93 @@ impl<T: Clone> CowChunks<T> {
             }
         }
     }
+
+    /// Moves the values from index `skip` on into chunks for `append_aligned`
+    /// at index `at` of another array, and runs `f` on each value first, in
+    /// order. The chunks end where the chunks of that array end, so the
+    /// append moves whole chunks and moves no value, except the values of a
+    /// first chunk that fills a partial last chunk there.
+    // PERF: a bind thread does the id remap (`f`) and the moves here, so
+    // the loading thread only appends chunks (`SymbolArena::append_file_arena`).
+    pub fn into_aligned(
+        self,
+        skip: usize,
+        at: usize,
+        mut f: impl FnMut(&mut T),
+    ) -> AlignedChunks<T> {
+        let len = self.len.saturating_sub(skip);
+        let mut parts: Vec<Vec<T>> = Vec::with_capacity(len.div_ceil(COW_CHUNK_LEN) + 1);
+        // The part being filled, the room left in it, and the values left.
+        let mut room = COW_CHUNK_LEN - (at & COW_CHUNK_MASK);
+        let mut left = len;
+        let mut part: Vec<T> = Vec::with_capacity(if left == 0 {
+            0
+        } else if room < COW_CHUNK_LEN {
+            // It fills the partial chunk at `at` and is emptied there.
+            room.min(left)
+        } else {
+            COW_CHUNK_LEN
+        });
+        let mut skip = skip;
+        for chunk in self.chunks {
+            let mut values = chunk.into_values();
+            if skip >= values.len() {
+                skip -= values.len();
+                continue;
+            }
+            let start = std::mem::take(&mut skip);
+            for value in &mut values[start..] {
+                f(value);
+            }
+            let mut moved = values.drain(start..);
+            while moved.len() > 0 {
+                let count = room.min(moved.len());
+                part.extend(moved.by_ref().take(count));
+                room -= count;
+                left -= count;
+                if room == 0 {
+                    let next = Vec::with_capacity(if left == 0 { 0 } else { COW_CHUNK_LEN });
+                    parts.push(std::mem::replace(&mut part, next));
+                    room = COW_CHUNK_LEN;
+                }
+            }
+        }
+        debug_assert_eq!(left, 0, "aligned chunk count");
+        if !part.is_empty() {
+            parts.push(part);
+        }
+        AlignedChunks { at, len, parts }
+    }
+
+    /// Appends the values of `aligned`, which `into_aligned` made for the
+    /// current length.
+    pub fn append_aligned(&mut self, aligned: AlignedChunks<T>) {
+        assert_eq!(
+            self.len, aligned.at,
+            "aligned chunks made for another index"
+        );
+        let mut parts = aligned.parts.into_iter();
+        if self.len & COW_CHUNK_MASK != 0 {
+            if let Some(mut first) = parts.next() {
+                self.chunks
+                    .last_mut()
+                    .expect("cow chunk")
+                    .owned()
+                    .append(&mut first);
+            }
+        }
+        self.chunks.extend(parts.map(Chunk::Owned));
+        self.len += aligned.len;
+    }
+}
+
+/// Values moved out of a `CowChunks` for `CowChunks::append_aligned` at
+/// index `at`. Each part ends at a chunk end of the target, except the last.
+#[derive(Debug)]
+pub struct AlignedChunks<T> {
+    at: usize,
+    len: usize,
+    parts: Vec<Vec<T>>,
 }
 
 impl<T: Clone> Default for CowChunks<T> {
@@ -913,7 +1033,39 @@ impl Table {
     fn with_capacity(capacity: usize) -> Self {
         Table {
             entries: Vec::with_capacity(capacity),
-            index: Box::default(),
+            // PERF: a table sized past `TABLE_LINEAR_MAX` gets its index now,
+            // so filling it never reindexes. The index is lookup only.
+            index: Self::empty_index(capacity),
+        }
+    }
+
+    /// An empty index for `len` entries, or no index when a table of that
+    /// size is searched linearly.
+    fn empty_index(len: usize) -> Box<[u16]> {
+        if len <= TABLE_LINEAR_MAX {
+            return Box::default();
+        }
+        vec![0u16; (len * 2).next_power_of_two()].into_boxed_slice()
+    }
+
+    /// True when `additional` more entries fit without growing the entries
+    /// or rebuilding the index.
+    fn has_room(&self, additional: usize) -> bool {
+        let len = self.entries.len() + additional;
+        self.entries.capacity() >= len && (len <= TABLE_LINEAR_MAX || self.index.len() >= len * 2)
+    }
+
+    /// Makes room for `additional` more entries (see `has_room`). Entry
+    /// order does not change.
+    fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+        let len = self.entries.len() + additional;
+        if len > TABLE_LINEAR_MAX && self.index.len() < len * 2 {
+            let mut index = Self::empty_index(len);
+            for (position, entry) in self.entries.iter().enumerate() {
+                Self::index_insert(&mut index, entry.hash, position);
+            }
+            self.index = index;
         }
     }
 
@@ -970,14 +1122,11 @@ impl Table {
 
     /// Rebuilds the index for the current entries.
     fn reindex(&mut self) {
-        if self.entries.len() <= TABLE_LINEAR_MAX {
-            self.index = Box::default();
-            return;
-        }
-        let size = (self.entries.len() * 2).next_power_of_two();
-        let mut index = vec![0u16; size].into_boxed_slice();
-        for (position, entry) in self.entries.iter().enumerate() {
-            Self::index_insert(&mut index, entry.hash, position);
+        let mut index = Self::empty_index(self.entries.len());
+        if !index.is_empty() {
+            for (position, entry) in self.entries.iter().enumerate() {
+                Self::index_insert(&mut index, entry.hash, position);
+            }
         }
         self.index = index;
     }
@@ -995,13 +1144,13 @@ impl Table {
     fn push(&mut self, hash: u32, name: u32, symbol: SymbolId) {
         self.entries.push(TableEntry { hash, name, symbol });
         let len = self.entries.len();
-        if len <= TABLE_LINEAR_MAX {
-            return;
-        }
-        if self.index.len() < len * 2 {
-            self.reindex();
-        } else {
+        // A table can have an index before it passes `TABLE_LINEAR_MAX`
+        // (`with_capacity`, `reserve`). Every entry of an indexed table is in
+        // the index.
+        if self.index.len() >= len * 2 {
             Self::index_insert(&mut self.index, hash, len - 1);
+        } else if len > TABLE_LINEAR_MAX {
+            self.reindex();
         }
     }
 
@@ -1015,19 +1164,74 @@ impl Table {
 }
 
 /// Owns all symbols and symbol tables. The binder fills one arena. Each
-/// checker starts from a clone, so binder ids stay valid and checker
-/// (transient) symbols stay private to that checker. The clone shares the
-/// binder's symbol and table chunks; a checker copies a chunk only when it
-/// first writes to it. The binder writes without atomic operations and then
-/// shares what it wrote (`share_since`), so the clone copies nothing.
+/// checker starts from a copy (`for_checker`), so binder ids stay valid and
+/// checker (transient) symbols stay private to that checker. The copy shares
+/// the binder's symbol and table chunks; a checker copies a chunk only when
+/// it first writes to it. The binder writes without atomic operations and
+/// then shares what it wrote (`share_since`), so the copy copies nothing.
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
     tables: CowChunks<Table>,
     /// The names that the binder gave private identifier symbols
     /// (`get_symbol_name_for_private_identifier`), as intern ids. Each holds
-    /// a symbol id, which `append_file_arena` moves.
+    /// a symbol id, which `prepare_file_arena` moves.
     private_names: Vec<u32>,
+    /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
+    ids: SymbolIds,
+}
+
+/// Where `crate::ast::get_symbol_id` keeps the ids of the symbols of one
+/// arena. Every binder arena of the process (the binder lineage in
+/// `program.rs` and its copies) gives a symbol one id, like Go, where a
+/// bound file keeps its symbols in every program. A checker arena
+/// (`SymbolArena::for_checker`) adds its own symbols after the binder
+/// symbols, at indexes where other checkers and later binds put other
+/// symbols, so those symbols have ids of their own, kept by `key`.
+#[derive(Debug)]
+struct SymbolIds {
+    /// Symbols below this index have the shared id of their index.
+    shared: u32,
+    /// Keys the ids of the other symbols. 0 when every symbol is shared.
+    key: u32,
+}
+
+impl SymbolIds {
+    /// Every symbol has the shared id of its index.
+    const SHARED: SymbolIds = SymbolIds {
+        shared: u32::MAX,
+        key: 0,
+    };
+
+    /// Symbols from index `shared` on have ids of their own.
+    fn own_from(shared: usize) -> SymbolIds {
+        static NEXT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        SymbolIds {
+            shared: u32::try_from(shared).expect("symbol overflow"),
+            key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+impl Clone for SymbolIds {
+    /// A copy of a checker arena holds copies of its own symbols, which are
+    /// other symbols, so they get new ids.
+    fn clone(&self) -> Self {
+        if self.key == 0 {
+            SymbolIds::SHARED
+        } else {
+            SymbolIds::own_from(self.shared as usize)
+        }
+    }
+}
+
+impl Drop for SymbolIds {
+    /// Frees this thread's ids of the arena's own symbols.
+    fn drop(&mut self) {
+        if self.key != 0 {
+            crate::ast::forget_own_symbol_ids(self.key);
+        }
+    }
 }
 
 impl Default for SymbolArena {
@@ -1047,7 +1251,43 @@ impl SymbolArena {
             symbols,
             tables,
             private_names: Vec::new(),
+            ids: SymbolIds::SHARED,
         }
+    }
+
+    /// A copy of this binder arena for a checker (Go `NewChecker` reads the
+    /// bound program). The symbols that the checker adds have ids of their
+    /// own (`crate::ast::get_symbol_id`), so checkers of any program can
+    /// share a thread.
+    #[must_use]
+    pub fn for_checker(&self) -> SymbolArena {
+        debug_assert!(
+            self.ids.key == 0,
+            "a checker arena is made from a binder arena"
+        );
+        SymbolArena {
+            symbols: self.symbols.clone(),
+            tables: self.tables.clone(),
+            private_names: self.private_names.clone(),
+            ids: SymbolIds::own_from(self.symbols.len()),
+        }
+    }
+
+    /// Where `crate::ast::get_symbol_id` keeps the id of `symbol`: None when
+    /// every arena shares it (a binder symbol), else the key of this arena's
+    /// own ids and the place of `symbol` among the symbols that have them.
+    #[inline]
+    #[must_use]
+    pub fn own_symbol_id_slot(&self, symbol: SymbolId) -> Option<(u32, usize)> {
+        let shared = self.ids.shared as usize;
+        let index = symbol.index();
+        (index >= shared).then(|| (self.ids.key, index - shared))
+    }
+
+    /// The number of symbols, with the nil symbol at index 0.
+    #[must_use]
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
     }
 
     /// Notes that the binder gave `name` to a private identifier symbol
@@ -1106,10 +1346,79 @@ impl SymbolArena {
         self.push_table(Table::with_capacity(capacity))
     }
 
+    /// Makes room for `additional` more entries in `table`, so the inserts
+    /// that follow do not grow it or rebuild its index. Entry order and
+    /// lookups do not change. A nil table stays nil. A table that has room
+    /// is not written, so a shared chunk is not taken back.
+    pub fn reserve(&mut self, table: SymbolTable, additional: usize) {
+        if table.is_nil() || self.tables.get(table.index()).has_room(additional) {
+            return;
+        }
+        self.tables.get_mut(table.index()).reserve(additional);
+    }
+
+    /// Go `table[name]`, plus the slot of `name` in `table`, so that
+    /// `set_slot` stores it without a second lookup. The table must not
+    /// change between the two calls. A nil table reads as empty.
+    #[must_use]
+    pub fn get_slot(&self, table: SymbolTable, name: &Name) -> (SymbolId, TableSlot) {
+        let hash = name.table_hash();
+        let mut found = (SymbolId::NIL, None);
+        if table.is_some() {
+            let current = self.tables.get(table.index());
+            if let Some(position) = current.find_id(hash, name.0) {
+                found = (current.entries[position].symbol, Some(position));
+            }
+        }
+        let slot = TableSlot {
+            table,
+            hash,
+            name: name.0,
+            position: found.1,
+        };
+        (found.0, slot)
+    }
+
+    /// Go `table[name] = symbol` for the `table` and `name` of `slot`
+    /// (`get_slot`). Panics on a nil table, like Go.
+    pub fn set_slot(&mut self, slot: TableSlot, symbol: SymbolId) {
+        assert!(slot.table.is_some(), "assignment to entry in nil map");
+        let current = self.tables.get_mut(slot.table.index());
+        match slot.position {
+            Some(position) => current.entries[position].symbol = symbol,
+            None => {
+                debug_assert!(
+                    current.find_id(slot.hash, slot.name).is_none(),
+                    "table changed after get_slot"
+                );
+                current.push(slot.hash, slot.name, symbol);
+            }
+        }
+    }
+
+    /// The id offsets that a file arena appended now gets
+    /// (`append_file_arena`): every id moves by the number of entries already
+    /// here.
+    #[must_use]
+    pub fn next_file_offsets(&self) -> ArenaOffsets {
+        ArenaOffsets {
+            symbols: u32::try_from(self.symbols.len() - 1).expect("symbol overflow"),
+            tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
+        }
+    }
+
     /// Appends the symbols and tables of `file_arena`, an arena that one
     /// file was bound into on its own, and returns how its ids moved. The
     /// ids get the values that binding the file into this arena would give:
     /// every id moves by the number of entries already here.
+    pub fn append_file_arena(&mut self, file_arena: SymbolArena) -> ArenaOffsets {
+        let offsets = self.next_file_offsets();
+        self.append_prepared_file_arena(file_arena.prepare_file_arena(offsets))
+    }
+
+    /// Moves every id in this file arena by `offsets`, in place, and puts
+    /// the entries in chunks for `append_prepared_file_arena` with the same
+    /// offsets. It can run on another thread once the offsets are known.
     // PORT: the binder writes a symbol id into the names of private
     // identifier symbols (`get_symbol_name_for_private_identifier`), so those
     // names move with the ids. Source text can spell a name of the same form
@@ -1118,17 +1427,16 @@ impl SymbolArena {
     // identifier declares moves, with its entries in the tables. Go gives
     // symbol ids in a different order, so a source name that is equal to a
     // private identifier name in Go is not always equal to it here.
-    pub fn append_file_arena(&mut self, file_arena: SymbolArena) -> ArenaOffsets {
-        let mark = self.mark();
-        let offsets = ArenaOffsets {
-            symbols: u32::try_from(self.symbols.len() - 1).expect("symbol overflow"),
-            tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
-        };
+    // PERF: the entries are changed in place and moved by chunk. Rebuilding
+    // each symbol in an iterator chain was most of the join time.
+    #[must_use]
+    pub fn prepare_file_arena(self, offsets: ArenaOffsets) -> PreparedFileArena {
         let SymbolArena {
             symbols,
             tables,
             private_names,
-        } = file_arena;
+            ids: _,
+        } = self;
         // The file symbols whose names hold a symbol id.
         let mut private_symbols = FxHashSet::default();
         if offsets.symbols != 0 && !private_names.is_empty() {
@@ -1146,45 +1454,55 @@ impl SymbolArena {
                 }
             }
         }
-        // Move the entries instead of copying them: the file arena was
-        // built on a bind thread, and its buffers stay in use here.
-        self.symbols.extend(
-            symbols
-                .into_values()
-                .enumerate()
-                .skip(1)
-                .map(|(i, symbol)| Symbol {
-                    name: if private_symbols.contains(&(i as u32)) {
-                        offsets.private_name(&symbol.name)
-                    } else {
-                        symbol.name.clone()
-                    },
-                    members: offsets.table(symbol.members),
-                    exports: offsets.table(symbol.exports),
-                    parent: offsets.symbol(symbol.parent),
-                    export_symbol: offsets.symbol(symbol.export_symbol),
-                    ..symbol
-                }),
-        );
-        self.tables
-            .extend(tables.into_values().skip(1).map(|mut table| {
-                let mut renamed = false;
-                for entry in &mut table.entries {
-                    if private_symbols.contains(&entry.symbol.0) {
-                        let name = offsets.private_name(&Name(entry.name));
-                        if name.0 != entry.name {
-                            renamed = true;
-                            entry.name = name.0;
-                            entry.hash = name.table_hash();
-                        }
+        // `into_aligned` visits the symbols in order from index 1.
+        let mut index = 0u32;
+        let symbols = symbols.into_aligned(1, offsets.symbols as usize + 1, |symbol| {
+            index += 1;
+            if private_symbols.contains(&index) {
+                symbol.name = offsets.private_name(&symbol.name);
+            }
+            symbol.members = offsets.table(symbol.members);
+            symbol.exports = offsets.table(symbol.exports);
+            symbol.parent = offsets.symbol(symbol.parent);
+            symbol.export_symbol = offsets.symbol(symbol.export_symbol);
+        });
+        let tables = tables.into_aligned(1, offsets.tables as usize + 1, |table| {
+            let mut renamed = false;
+            for entry in &mut table.entries {
+                if private_symbols.contains(&entry.symbol.0) {
+                    let name = offsets.private_name(&Name(entry.name));
+                    if name.0 != entry.name {
+                        renamed = true;
+                        entry.name = name.0;
+                        entry.hash = name.table_hash();
                     }
-                    entry.symbol = offsets.symbol(entry.symbol);
                 }
-                if renamed {
-                    table.reindex();
-                }
-                table
-            }));
+                entry.symbol = offsets.symbol(entry.symbol);
+            }
+            if renamed {
+                table.reindex();
+            }
+        });
+        PreparedFileArena {
+            symbols,
+            tables,
+            offsets,
+        }
+    }
+
+    /// Appends a file arena that `prepare_file_arena` prepared with the
+    /// offsets that `next_file_offsets` gives now, and returns them.
+    pub fn append_prepared_file_arena(&mut self, prepared: PreparedFileArena) -> ArenaOffsets {
+        let offsets = self.next_file_offsets();
+        assert_eq!(
+            offsets, prepared.offsets,
+            "file arena prepared for other offsets"
+        );
+        let mark = self.mark();
+        // The entries were moved on the bind thread; their buffers stay in
+        // use here.
+        self.symbols.append_aligned(prepared.symbols);
+        self.tables.append_aligned(prepared.tables);
         self.share_since(mark);
         offsets
     }
@@ -1348,6 +1666,15 @@ impl SymbolArena {
     }
 }
 
+/// Where a name is, or goes, in one symbol table (`SymbolArena::get_slot`).
+#[derive(Clone, Copy, Debug)]
+pub struct TableSlot {
+    table: SymbolTable,
+    hash: u32,
+    name: u32,
+    position: Option<usize>,
+}
+
 /// Symbol and table counts of a `SymbolArena` at one point
 /// (`SymbolArena::mark`).
 #[derive(Clone, Copy, Debug)]
@@ -1360,14 +1687,41 @@ pub struct ArenaMark {
 /// `ast::INTERNAL_SYMBOL_NAME_PREFIX` + "#".
 const PRIVATE_PREFIX: &str = "\u{FDD0}\u{10F7FE}#";
 
+/// A file arena with its ids moved to program ids
+/// (`SymbolArena::prepare_file_arena`).
+#[derive(Debug)]
+pub struct PreparedFileArena {
+    symbols: AlignedChunks<Symbol>,
+    tables: AlignedChunks<Table>,
+    offsets: ArenaOffsets,
+}
+
 /// How the ids of a file arena moved in `SymbolArena::append_file_arena`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaOffsets {
     symbols: u32,
     tables: u32,
 }
 
 impl ArenaOffsets {
+    /// The offsets of the file after a file with these offsets, where
+    /// `file_arena` is the `SymbolArena::mark` of that file's own arena.
+    /// Parallel binding adds the counts of the earlier files this way.
+    #[must_use]
+    pub fn after(self, file_arena: ArenaMark) -> ArenaOffsets {
+        let count = |len: usize| u32::try_from(len - 1).expect("arena overflow");
+        ArenaOffsets {
+            symbols: self
+                .symbols
+                .checked_add(count(file_arena.symbols))
+                .expect("symbol overflow"),
+            tables: self
+                .tables
+                .checked_add(count(file_arena.tables))
+                .expect("table overflow"),
+        }
+    }
+
     /// The program id of file arena symbol `symbol`.
     #[must_use]
     pub fn symbol(self, symbol: SymbolId) -> SymbolId {
@@ -1524,14 +1878,19 @@ pub struct FileBindData {
     pub bind_suggestion_diagnostics: Vec<Diagnostic>,
     pub end_flow_node: FlowNodeId,
     pub symbol_count: i32,
-    /// Go `ClassifiableNames`. Nothing reads it; interned names keep it small.
-    pub classifiable_names: rustc_hash::FxHashSet<Name>,
+    // PORT: Go also keeps `ClassifiableNames` here. Nothing reads it, so the
+    // binder does not collect it.
     pub pattern_ambient_modules: Vec<PatternAmbientModule>,
     pub global_exports: SymbolTable,
     /// Go `JSGlobalAugmentations`.
     pub js_global_augmentations: SymbolTable,
     /// Go `SourceFile.CommonJSModuleIndicator` (set by the binder).
     pub common_js_module_indicator: Node,
+    /// Rust-only: the binder gave an expando assignment (Go
+    /// `bindDeferredExpandoAssignment`) a symbol. When false, no node of the
+    /// file has an `ASSIGNMENT` symbol, so the declaration transformer skips
+    /// its expando walk (`transform_source_file`).
+    pub has_expando_assignments: bool,
 }
 
 /// Go `*ast.Diagnostic`. Positions are Go positions (UTF-8 byte offsets).
@@ -1881,8 +2240,11 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     true
 }
 
-/// One loaded source file. Parser data is ready when the program is
-/// installed. The binder fills the `OnceLock` fields once per file.
+/// One version of a loaded source file: one per file id. The file registry
+/// (`ast/store.rs`) owns it from `publish_file_stores` on; read it with
+/// `crate::ast::go_file`. Program versions that share a file version share
+/// this value. Parser data is ready when the file is published. The binder
+/// fills the `OnceLock` fields once per file version.
 pub struct GoFile {
     /// The ts_compiler source file (arena, text, file name). None for a
     /// file parsed by the Go frontend (`GOPORT_FRONTEND=go`), whose nodes
@@ -1901,20 +2263,24 @@ pub struct GoFile {
     pub flow_nodes: std::sync::OnceLock<Vec<FlowNode>>,
 }
 
-/// Go `Program` as the checker sees it. Installed once per process with
-/// `crate::program::install`, then read with `prog()`.
+/// Go `Program` as the checker sees it: one per program version (Go makes a
+/// new `Program` for each edit). Read the current one with `prog()`. Its
+/// files live in the file registry (`crate::ast::go_file`), and versions
+/// share the file versions they have in common.
 pub struct GoProgram {
+    /// Unique in the process, from `next_program_id`. It keys the checker
+    /// pool and the frontend of the program on the loading thread.
+    pub id: u32,
     /// The legacy graph. None on the Go frontend path.
     pub program: Option<&'static ts_compiler::Program>,
-    /// Files by file index. `Node::file_index` indexes it. On the Go frontend
-    /// path this holds every node store, including config files that are not
-    /// program source files.
-    pub files: Vec<GoFile>,
-    /// File indexes in Go `Program.SourceFiles()` order.
+    /// File ids in Go `Program.SourceFiles()` order.
     pub source_file_order: Vec<usize>,
     pub options: crate::options::CompilerOptions,
     /// Binder symbols. Each checker clones this.
     pub bound_symbols: std::sync::OnceLock<SymbolArena>,
+    /// Program state (`program::state()`). Set once, after the files are
+    /// published.
+    pub(crate) state: std::sync::OnceLock<&'static crate::program::ProgramState>,
 }
 
 impl GoFile {
@@ -1929,38 +2295,109 @@ impl GoFile {
 
 impl GoProgram {
     /// Go `Program.SourceFiles()`: the program files in Go order.
-    pub fn source_files(&self) -> impl Iterator<Item = &GoFile> {
+    pub fn source_files(&self) -> impl Iterator<Item = &'static GoFile> {
         self.source_file_order
             .iter()
-            .map(|&index| &self.files[index])
+            .map(|&index| crate::ast::go_file(index))
     }
 }
 
-/// The installed program, shared by every thread (the checker workers read
-/// it too). Set once.
-static PROGRAM: std::sync::OnceLock<&'static GoProgram> = std::sync::OnceLock::new();
+static NEXT_PROGRAM_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// Installs the program for the process. Call once. Freezes the node
-/// stores first (`ast::store::freeze_file_stores`): the parse is over.
-pub fn set_prog(program: &'static GoProgram) {
-    crate::ast::freeze_file_stores();
-    assert!(PROGRAM.set(program).is_ok(), "GoProgram already installed");
+/// A new `GoProgram::id`: 1 for the first program of the process, then 2, 3...
+#[must_use]
+pub fn next_program_id() -> u32 {
+    NEXT_PROGRAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The installed program, or `None` before `set_prog`. The ported parser
-/// reads nodes before the program exists.
+thread_local! {
+    /// The current program of this thread. Const init with no destructor,
+    /// so `prog()` reads it with one thread-local load.
+    static CURRENT: std::cell::Cell<Option<&'static GoProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The program of a one-program process (`set_prog`). A thread with no
+/// current program reads it. A multi-program process never sets it, so a
+/// missed `enter_program` panics and does not read the wrong program.
+static DEFAULT: std::sync::OnceLock<&'static GoProgram> = std::sync::OnceLock::new();
+
+/// Set by `register_program_version`. Then `set_prog` panics.
+static MULTI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Installs the program of a one-program process and makes it current on
+/// this thread. Call once. The caller publishes the files of the program
+/// first (`crate::ast::publish_file_stores`).
+pub fn set_prog(program: &'static GoProgram) {
+    assert!(
+        !MULTI.load(std::sync::atomic::Ordering::SeqCst),
+        "set_prog in a multi-program process"
+    );
+    assert!(DEFAULT.set(program).is_ok(), "GoProgram already installed");
+    CURRENT.set(Some(program));
+}
+
+/// Registers a program version of a multi-program process (watch, language
+/// server, tests). It does not make `program` current; use `enter_program`.
+pub fn register_program_version(program: &'static GoProgram) {
+    MULTI.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        DEFAULT.get().is_none(),
+        "program version {} registered in a one-program process",
+        program.id
+    );
+}
+
+/// Sets the current program of this thread with no restore. Only for thread
+/// setup (`program::WorkerSeed` on checker and bind threads).
+pub fn set_thread_program(program: Option<&'static GoProgram>) {
+    CURRENT.set(program);
+}
+
+/// Makes `program` current on this thread until the scope drops. `None`
+/// clears it, for example while the frontend parses a new version.
+#[must_use = "the program is current only while the scope lives"]
+pub fn enter_program(program: Option<&'static GoProgram>) -> ProgramScope {
+    ProgramScope {
+        previous: CURRENT.replace(program),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// From `enter_program`. On drop it restores the previous current program.
+/// It is `!Send`, so it drops on the thread that made it.
+pub struct ProgramScope {
+    previous: Option<&'static GoProgram>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ProgramScope {
+    fn drop(&mut self) {
+        CURRENT.set(self.previous);
+    }
+}
+
+/// The current program of this thread, or `None`. The ported parser reads
+/// nodes before the program exists.
 #[inline]
 #[must_use]
 pub fn try_prog() -> Option<&'static GoProgram> {
-    PROGRAM.get().copied()
+    CURRENT.get().or_else(default_prog)
 }
 
-/// The installed program. Go code reads nodes without a context; this is
-/// how node accessors reach the AST.
+/// `try_prog` on a thread with no current program.
+#[cold]
+#[inline(never)]
+fn default_prog() -> Option<&'static GoProgram> {
+    DEFAULT.get().copied()
+}
+
+/// The current program of this thread. Go code reads nodes without a
+/// context; this is how node accessors reach the AST.
 #[inline]
 #[must_use]
 pub fn prog() -> &'static GoProgram {
-    PROGRAM.get().copied().expect("GoProgram not installed")
+    try_prog().expect("no current program; use core::enter_program")
 }
 
 // Go: core/version.go:8 version

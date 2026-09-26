@@ -17,3 +17,13 @@ pub mod semver;
 pub mod tsoptions;
 pub mod tspath;
 pub mod vfs;
+// Language-service support files. Not glob-exported in the frontend prelude.
+pub mod core_bfs;
+pub mod core_binarysearch;
+pub mod core_context;
+pub mod core_ls_ext;
+pub mod core_nodemodules;
+pub mod core_textchange;
+pub mod core_workgroup;
+pub mod json_ext;
+pub mod stringutil_ls;

@@ -1077,13 +1077,17 @@ impl ClassFieldsTransformer {
     // Go: transformers/estransforms/classfields.go:830 classFieldsTransformer.transformAutoAccessor
     /// transformAutoAccessor transforms an auto-accessor property:
     ///
-    ///     accessor x = 1;
+    /// ```text
+    /// accessor x = 1;
+    /// ```
     ///
     /// into:
     ///
-    ///     #x = 1;
-    ///     get x() { return this.#x; }
-    ///     set x(value) { this.#x = value; }
+    /// ```text
+    /// #x = 1;
+    /// get x() { return this.#x; }
+    /// set x(value) { this.#x = value; }
+    /// ```
     pub(super) fn transform_auto_accessor(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();

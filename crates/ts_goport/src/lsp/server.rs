@@ -1,0 +1,3513 @@
+//! Go `internal/lsp/server.go`.
+//!
+//! PORT: threads (PORTING.md "Threads", map-lsp-server.md section 3). Go
+//! runs the read loop, the dispatch loop, the write loop, the async part of
+//! each handler, the progress loop and the parent watchdog on goroutines.
+//! Language-service state (`Rc`/`RefCell`) must stay on one thread, so:
+//!
+//! - The dispatch thread (the thread that calls `Server::run`, 1 GiB stack)
+//!   owns `Server`: the session, the file system, the handler table and the
+//!   API sessions. It runs the sync part of each handler and then its async
+//!   part inline (Go starts the async part on a goroutine, so Go can answer
+//!   requests out of order; the port answers them in order). After each
+//!   message and each wake-up it runs `gostd::local::run_pending()`.
+//! - The reader thread owns the `Reader`. It routes responses to
+//!   `pending_server_requests`, handles `$/cancelRequest` and the first
+//!   `initialize`, and queues all other messages (Go does the same on the
+//!   read goroutine).
+//! - The writer thread owns the `Writer` and drains the outgoing queue.
+//! - The progress thread (`progress.rs`) and the parent watchdog
+//!   (`cmd/tsgo/lsp.rs`) touch only `Send` data.
+//!
+//! So Go `*Server` is split. `ServerShared` (`Arc`, `Send + Sync`) holds
+//! the queues, the pending maps, the atomics and the state that
+//! `handleInitialize` writes once on the reader thread (`OnceLock`).
+//! `Server` (`Rc`, dispatch thread) holds the rest. Go methods that the
+//! reader thread calls (`readLoop`, `sendError`, `handleInitialize`, the
+//! send functions) are on `ServerShared`.
+
+use crate::lsp::prelude::*;
+
+use crate::frontend::compiler;
+use crate::frontend::json_ext::{self, AnyValue};
+use crate::gostd::context::{self, CancelCauseFunc, CancelFunc};
+use crate::gostd::errors;
+use crate::lsp::lsproto::{ErrorCode, HasTextDocumentPosition, HasTextDocumentURI};
+use crate::project::logging::{self, Logger as _};
+use crate::project::{Snapshot, ata};
+use std::any::Any;
+use std::cell::Cell;
+use std::io::{BufRead, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Go runtime panic text for a nil pointer dereference.
+const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
+
+// PORT: Go mutexes do not poison.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// Go: server.go:38 ServerOptions
+// PORT: Go `In`, `Out` and `Err` move to the reader, writer and logging
+// threads, so they are `Send`. `NpmInstall` and `SetParentProcessID` are
+// nil-able Go funcs (`None`). `NpmInstall` returns Go's `([]byte, error)`
+// pair, as `ata::NpmExecutor` does.
+pub struct ServerOptions {
+    pub in_: Box<dyn Reader + Send>,
+    pub out: Box<dyn Writer + Send>,
+    pub err: Box<dyn Write + Send>,
+
+    pub cwd: String,
+    pub fs: Rc<dyn vfs::Fs>,
+    pub default_library_path: String,
+    pub typings_location: String,
+    pub parse_cache: Option<Rc<project::ParseCache>>,
+    pub npm_install: Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>>,
+    pub progress_delay: Duration, // delay before showing progress UI; 0 means no delay
+    pub set_parent_process_id: Option<Box<dyn Fn(i32) + Send + Sync>>,
+}
+
+// Go: server.go:53 NewServer
+pub fn new_server(opts: ServerOptions) -> Rc<Server> {
+    if opts.cwd.is_empty() {
+        panic!("Cwd is required");
+    }
+
+    let ServerOptions {
+        in_,
+        out,
+        err,
+        cwd,
+        fs,
+        default_library_path,
+        typings_location,
+        parse_cache,
+        npm_install,
+        progress_delay,
+        set_parent_process_id,
+    } = opts;
+
+    // Go: s.logger = newLogger(s)
+    let shared = Arc::new_cyclic(|weak| ServerShared {
+        background_ctx: OnceLock::new(),
+        stderr: Mutex::new(err),
+        logger: Arc::new(new_logger(weak.clone())),
+        init_started: AtomicBool::new(false),
+        client_seq: AtomicI32::new(0),
+        request_queue: new_dynamic_queue(),
+        outgoing_queue: new_dynamic_queue(),
+        pending_client_requests: Mutex::new(FxHashMap::default()),
+        pending_server_requests: Mutex::new(FxHashMap::default()),
+        cwd,
+        initialize_params: OnceLock::new(),
+        initialization_options: OnceLock::new(),
+        client_capabilities: OnceLock::new(),
+        position_encoding: OnceLock::new(),
+        locale: OnceLock::new(),
+        last_request_time_ms: AtomicI64::new(0),
+        progress_delay,
+        project_progress: OnceLock::new(),
+        start_watchdog: set_parent_process_id,
+    });
+
+    Rc::new(Server {
+        logger: shared.logger.clone(),
+        shared,
+        r: RefCell::new(Some(in_)),
+        w: RefCell::new(Some(out)),
+        fs,
+        default_library_path,
+        typings_location,
+        watch_enabled: Cell::new(false),
+        telemetry_enabled: Cell::new(false),
+        watcher_id: Cell::new(0),
+        watchers: RefCell::new(FxHashSet::default()),
+        builtin_watcher: RefCell::new(None),
+        session: RefCell::new(None),
+        api_sessions: RefCell::new(None),
+        client: None,
+        init_complete: Cell::new(false),
+        compiler_options_for_inferred_projects: RefCell::new(None),
+        parse_cache,
+        npm_install,
+    })
+}
+
+// Go: server.go:81 fileRenameFilters
+pub static FILE_RENAME_FILTERS: LazyLock<Vec<lsproto::FileOperationFilter>> = LazyLock::new(|| {
+    vec![lsproto::FileOperationFilter {
+        scheme: Some("file".to_string()),
+        pattern: Some(lsproto::FileOperationPattern {
+            glob: "**/*.{ts,tsx,js,jsx,cts,cjs,mts,mjs,json}".to_string(),
+            ..Default::default()
+        }),
+    }]
+});
+
+// Go: server.go:90 `_ ata.NpmExecutor = (*Server)(nil)` and
+// `_ project.Client = (*Server)(nil)`: the impls below.
+
+// Go: server.go:94 pendingClientRequest
+// PORT: Go keeps the `*lsproto.RequestMessage`, which no code reads. The
+// request stays on the dispatch thread (its params are not `Sync`), so the
+// entry keeps its method.
+pub struct PendingClientRequest {
+    pub method: lsproto::Method,
+    pub cancel: CancelFunc,
+}
+
+// Go: server.go:99 Reader
+// PORT: Go `Read() (*lsproto.Message, error)` can return a message and an
+// error together (invalid params), so the result is a pair.
+pub trait Reader {
+    fn read(&mut self) -> (Option<lsproto::Message>, Option<GoError>);
+}
+
+// Go: server.go:103 Writer
+pub trait Writer {
+    fn write(&mut self, msg: &lsproto::Message) -> Result<(), GoError>;
+}
+
+// Go: server.go:107 lspReader
+pub struct LspReader {
+    pub r: lsproto::BaseReader,
+}
+
+// Go: server.go:111 lspWriter
+pub struct LspWriter {
+    pub w: lsproto::BaseWriter,
+}
+
+// Go: `fmt.Errorf("%w: %w", code, err)`.
+fn wrap_error_code(code: ErrorCode, err: GoError) -> GoError {
+    let code = errors::from_value(code);
+    errors::errorf(
+        format!("{}: {}", code.error(), err.error()),
+        vec![code, err],
+    )
+}
+
+impl Reader for LspReader {
+    // Go: server.go:115 lspReader.Read
+    fn read(&mut self) -> (Option<lsproto::Message>, Option<GoError>) {
+        let data = match self.r.read() {
+            Ok(data) => data,
+            Err(err) => return (None, Some(err)),
+        };
+
+        let mut req = lsproto::Message::default();
+        // PORT: Go `json.Unmarshal(data, req)` calls `(*Message).UnmarshalJSON`.
+        // `unmarshal_json` keeps the error chain for `errors.Is`; the JSON
+        // error texts differ from Go v2 (the codes match).
+        if let Err(err) = req.unmarshal_json(&data) {
+            if errors::is(&err, &errors::from_value(ErrorCode::INVALID_PARAMS)) {
+                return (
+                    Some(req),
+                    Some(wrap_error_code(ErrorCode::INVALID_PARAMS, err)),
+                );
+            }
+            return (None, Some(wrap_error_code(ErrorCode::INVALID_REQUEST, err)));
+        }
+
+        (Some(req), None)
+    }
+}
+
+// Go: server.go:132 ToReader
+// PORT: `lsproto.NewBaseReader` takes a `BufRead` (the caller supplies the
+// buffer that Go's bufio adds).
+pub fn to_reader(r: Box<dyn BufRead + Send>) -> Box<dyn Reader + Send> {
+    Box::new(LspReader {
+        r: lsproto::new_base_reader(r),
+    })
+}
+
+impl Writer for LspWriter {
+    // Go: server.go:136 lspWriter.Write
+    fn write(&mut self, msg: &lsproto::Message) -> Result<(), GoError> {
+        let data = match crate::frontend::json::json_marshal(msg, &[]) {
+            Ok(data) => data,
+            Err(err) => {
+                let err = errors::from_value(err);
+                return Err(errors::errorf(
+                    format!("failed to marshal message: {}", err.error()),
+                    vec![err],
+                ));
+            }
+        };
+        self.w.write(data.as_bytes())
+    }
+}
+
+// Go: server.go:144 ToWriter
+pub fn to_writer(w: Box<dyn Write + Send>) -> Box<dyn Writer + Send> {
+    Box::new(LspWriter {
+        w: lsproto::new_base_writer(w),
+    })
+}
+
+// Go: server.go:148 `_ Reader = (*lspReader)(nil)`, `_ Writer = (*lspWriter)(nil)`:
+// the impls above.
+
+/// PORT: an item of the request queue. Go queues `*lsproto.RequestMessage`.
+/// The port also queues `Wake` from `gostd::local` timers (the dispatch
+/// loop contract in PORTING.md "Go runtime").
+pub enum QueuedRequest {
+    Request(lsproto::RequestMessage),
+    Wake,
+}
+
+// Go: server.go:153 Server (the fields that other threads use)
+pub struct ServerShared {
+    pub background_ctx: OnceLock<Context>,
+
+    pub stderr: Mutex<Box<dyn Write + Send>>,
+
+    pub logger: Arc<Logger>,
+    pub init_started: AtomicBool,
+    pub client_seq: AtomicI32,
+    pub request_queue: DynamicQueue<QueuedRequest>,
+    pub outgoing_queue: DynamicQueue<lsproto::Message>,
+    // PORT: Go `pendingClientRequestsMu` and `pendingServerRequestsMu` are
+    // the mutexes. A pending server request holds the sending end of its
+    // response channel; `None` on that channel is the context wake-up of
+    // `send_client_request`.
+    pub pending_client_requests: Mutex<FxHashMap<crate::jsonrpc::ID, PendingClientRequest>>,
+    pub pending_server_requests:
+        Mutex<FxHashMap<crate::jsonrpc::ID, SyncSender<Option<lsproto::ResponseMessage>>>>,
+
+    pub cwd: String,
+
+    // PORT: written once by `handle_initialize` on the reader thread.
+    pub initialize_params: OnceLock<lsproto::InitializeParams>,
+    pub initialization_options: OnceLock<lsproto::InitializationOptions>,
+    pub client_capabilities: OnceLock<Arc<lsproto::ResolvedClientCapabilities>>,
+    pub position_encoding: OnceLock<lsproto::PositionEncodingKind>,
+    pub locale: OnceLock<locale::Locale>,
+
+    pub last_request_time_ms: AtomicI64,
+
+    pub progress_delay: Duration,
+    pub project_progress: OnceLock<Arc<ProjectLoadingProgress>>,
+
+    pub start_watchdog: Option<Box<dyn Fn(i32) + Send + Sync>>,
+}
+
+// Go: server.go:153 Server (the dispatch-thread fields)
+pub struct Server {
+    pub shared: Arc<ServerShared>,
+
+    // PORT: taken by `run` for the reader and writer threads.
+    pub r: RefCell<Option<Box<dyn Reader + Send>>>,
+    pub w: RefCell<Option<Box<dyn Writer + Send>>>,
+
+    // PORT: the same logger as `shared.logger`.
+    pub logger: Arc<Logger>,
+
+    pub fs: Rc<dyn vfs::Fs>,
+    pub default_library_path: String,
+    pub typings_location: String,
+
+    pub watch_enabled: Cell<bool>,
+    pub telemetry_enabled: Cell<bool>,
+    pub watcher_id: Cell<u32>,
+    pub watchers: RefCell<FxHashSet<project::WatcherID>>,
+    // builtinWatcher is non-nil when the server is running its own
+    // in-process file watcher instead of using LSP-based watching. It
+    // is enabled when the client lacks DynamicRegistration for
+    // workspace/didChangeWatchedFiles and the builtin watcher backend
+    // supports efficient recursive watching (Windows or FSEvents).
+    pub builtin_watcher: RefCell<Option<Rc<lspwatcher::Watcher>>>,
+
+    pub session: RefCell<Option<Rc<project::Session>>>,
+
+    // apiSessions holds active API sessions keyed by their ID
+    // PORT: `apiSessionsMu` is dropped (dispatch thread). `None` is Go's nil map.
+    pub api_sessions: RefCell<Option<FxHashMap<String, Rc<api::Session>>>>,
+
+    // Test options for initializing session
+    pub client: Option<Rc<dyn project::Client>>,
+
+    // initComplete is closed when handleInitialized completes.
+    // Used by tests to wait for full initialization.
+    // PORT: Go `chan struct{}`; `true` is closed.
+    pub init_complete: Cell<bool>,
+
+    // !!! temporary; remove when we have `handleDidChangeConfiguration`/implicit project config support
+    pub compiler_options_for_inferred_projects: RefCell<Option<Rc<CompilerOptions>>>,
+    // parseCache can be passed in so separate tests can share ASTs
+    pub parse_cache: Option<Rc<project::ParseCache>>,
+
+    pub npm_install: Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>>,
+    // PORT: Go `cpuProfiler pprof.CPUProfiler` is not ported (pprof); the
+    // profile handlers call `unported!`.
+    // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
+    // `startWatchdog` is `ServerShared::start_watchdog`.
+}
+
+impl ServerShared {
+    /// Go `s.backgroundCtx`, set by `Run`.
+    pub fn background_ctx(&self) -> Context {
+        self.background_ctx.get().cloned().expect(NIL_DEREF)
+    }
+
+    /// Go `s.initializeParams` (nil before `initialize`).
+    pub fn initialize_params(&self) -> &lsproto::InitializeParams {
+        self.initialize_params.get().expect(NIL_DEREF)
+    }
+
+    /// Go `s.initializationOptions` (nil before `initialize`).
+    pub fn initialization_options(&self) -> &lsproto::InitializationOptions {
+        self.initialization_options.get().expect(NIL_DEREF)
+    }
+
+    /// Go `&s.clientCapabilities` (the zero value before `initialize`).
+    pub fn client_capabilities(&self) -> Arc<lsproto::ResolvedClientCapabilities> {
+        match self.client_capabilities.get() {
+            Some(caps) => caps.clone(),
+            None => Arc::new(lsproto::ResolvedClientCapabilities::default()),
+        }
+    }
+
+    /// Go `s.positionEncoding` (the zero value before `initialize`).
+    pub fn position_encoding(&self) -> lsproto::PositionEncodingKind {
+        self.position_encoding.get().cloned().unwrap_or_default()
+    }
+
+    /// Go `s.locale` (the zero value until `initialize` parses one).
+    pub fn locale(&self) -> locale::Locale {
+        self.locale.get().cloned().unwrap_or_default()
+    }
+}
+
+impl Server {
+    // Go: server.go:222 Session
+    pub fn session(&self) -> Option<Rc<project::Session>> {
+        self.session.borrow().clone()
+    }
+
+    /// Go `s.session` where Go dereferences it: a nil session panics like a
+    /// Go nil pointer dereference.
+    pub fn session_ref(&self) -> Rc<project::Session> {
+        self.session.borrow().clone().expect(NIL_DEREF)
+    }
+
+    // Go: server.go:227 InitComplete
+    // InitComplete returns a channel that is closed when the server has finished
+    // processing the initialized notification, including the initial configuration
+    // exchange with the client.
+    // PORT: whether the channel is closed.
+    pub fn init_complete(&self) -> bool {
+        self.init_complete.get()
+    }
+}
+
+impl project::Client for Server {
+    // Go: server.go:230 WatchFiles
+    // WatchFiles implements project.Client.
+    fn watch_files(
+        &self,
+        ctx: &Context,
+        id: project::WatcherID,
+        watchers: &[lsproto::FileSystemWatcher],
+    ) -> Result<(), GoError> {
+        let builtin_watcher = self.builtin_watcher.borrow().clone();
+        if let Some(builtin_watcher) = builtin_watcher {
+            if let Err(err) = builtin_watcher.watch_files(&id.0, watchers) {
+                return Err(errors::errorf(
+                    format!("failed to register file watcher: {}", err.error()),
+                    vec![err],
+                ));
+            }
+            self.watchers.borrow_mut().insert(id);
+            return Ok(());
+        }
+        let result = send_client_request(
+            ctx,
+            &self.shared,
+            &lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
+            lsproto::RegistrationParams {
+                registrations: vec![lsproto::Registration {
+                    id: id.0.clone(),
+                    register_options: Some(lsproto::RegisterOptions {
+                        workspace_did_change_watched_files: Some(
+                            lsproto::DidChangeWatchedFilesRegistrationOptions {
+                                watchers: watchers.to_vec(),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                }],
+            },
+        );
+        if let Err(err) = result {
+            return Err(errors::errorf(
+                format!("failed to register file watcher: {}", err.error()),
+                vec![err],
+            ));
+        }
+
+        self.watchers.borrow_mut().insert(id);
+        Ok(())
+    }
+
+    // Go: server.go:259 UnwatchFiles
+    // UnwatchFiles implements project.Client.
+    fn unwatch_files(&self, ctx: &Context, id: project::WatcherID) -> Result<(), GoError> {
+        let builtin_watcher = self.builtin_watcher.borrow().clone();
+        if let Some(builtin_watcher) = builtin_watcher {
+            if !self.watchers.borrow().contains(&id) {
+                return Err(errors::new(format!(
+                    "no file watcher exists with ID {}",
+                    id.0
+                )));
+            }
+            if let Err(err) = builtin_watcher.unwatch_files(&id.0) {
+                return Err(errors::errorf(
+                    format!("failed to unregister file watcher: {}", err.error()),
+                    vec![err],
+                ));
+            }
+            self.watchers.borrow_mut().remove(&id);
+            return Ok(());
+        }
+        if self.watchers.borrow().contains(&id) {
+            let result = send_client_request(
+                ctx,
+                &self.shared,
+                &lsproto::CLIENT_UNREGISTER_CAPABILITY_INFO,
+                lsproto::UnregistrationParams {
+                    unregisterations: vec![lsproto::Unregistration {
+                        id: id.0.clone(),
+                        method: lsproto::Method::WORKSPACE_DID_CHANGE_WATCHED_FILES
+                            .0
+                            .to_string(),
+                    }],
+                },
+            );
+            if let Err(err) = result {
+                return Err(errors::errorf(
+                    format!("failed to unregister file watcher: {}", err.error()),
+                    vec![err],
+                ));
+            }
+
+            self.watchers.borrow_mut().remove(&id);
+            return Ok(());
+        }
+
+        Err(errors::new(format!(
+            "no file watcher exists with ID {}",
+            id.0
+        )))
+    }
+
+    // Go: server.go:291 RefreshDiagnostics
+    // RefreshDiagnostics implements project.Client.
+    fn refresh_diagnostics(&self, ctx: &Context) -> Result<(), GoError> {
+        if !self
+            .shared
+            .client_capabilities()
+            .workspace
+            .diagnostics
+            .refresh_support
+        {
+            return Ok(());
+        }
+
+        if let Some(err) = ctx.err() {
+            return Err(err);
+        }
+
+        // Fire-and-forget: the client always returns null, and waiting for the response
+        // can cause the server to hang if the client is slow or unresponsive.
+        // Any response from the client will be silently ignored by the read loop.
+        if let Err(err) = send_client_request_fire_and_forget(
+            &self.shared,
+            &lsproto::WORKSPACE_DIAGNOSTIC_REFRESH_INFO,
+            lsproto::NoParams,
+        ) {
+            return Err(errors::errorf(
+                format!("failed to refresh diagnostics: {}", err.error()),
+                vec![err],
+            ));
+        }
+
+        Ok(())
+    }
+
+    // Go: server.go:311 PublishDiagnostics
+    // PublishDiagnostics implements project.Client.
+    fn publish_diagnostics(
+        &self,
+        _ctx: &Context,
+        params: lsproto::PublishDiagnosticsParams,
+    ) -> Result<(), GoError> {
+        send_notification(
+            &self.shared,
+            &lsproto::TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS_INFO,
+            params,
+        )
+    }
+
+    // Go: server.go:316 SendTelemetry
+    // SendTelemetry implements project.Client.
+    fn send_telemetry(
+        &self,
+        _ctx: &Context,
+        telemetry: lsproto::TelemetryEvent,
+    ) -> Result<(), GoError> {
+        if !self.telemetry_enabled.get() {
+            panic!("SendTelemetry called with telemetry disabled");
+        }
+        send_notification(&self.shared, &lsproto::TELEMETRY_EVENT_INFO, telemetry)
+    }
+
+    // Go: server.go:324 IsActive
+    // IsActive implements project.Client.
+    fn is_active(&self) -> bool {
+        let last = self.shared.last_request_time_ms.load(Ordering::SeqCst);
+        last == 0 || unix_milli_now() - last <= Duration::from_secs(60).as_millis() as i64
+    }
+
+    // Go: server.go:329 RefreshInlayHints
+    fn refresh_inlay_hints(&self, _ctx: &Context) -> Result<(), GoError> {
+        if !self
+            .shared
+            .client_capabilities()
+            .workspace
+            .inlay_hint
+            .refresh_support
+        {
+            return Ok(());
+        }
+
+        if let Err(err) = send_client_request_fire_and_forget(
+            &self.shared,
+            &lsproto::WORKSPACE_INLAY_HINT_REFRESH_INFO,
+            lsproto::NoParams,
+        ) {
+            return Err(errors::errorf(
+                format!("failed to refresh inlay hints: {}", err.error()),
+                vec![err],
+            ));
+        }
+        Ok(())
+    }
+
+    // Go: server.go:340 RefreshCodeLens
+    fn refresh_code_lens(&self, _ctx: &Context) -> Result<(), GoError> {
+        if !self
+            .shared
+            .client_capabilities()
+            .workspace
+            .code_lens
+            .refresh_support
+        {
+            return Ok(());
+        }
+
+        if let Err(err) = send_client_request_fire_and_forget(
+            &self.shared,
+            &lsproto::WORKSPACE_CODE_LENS_REFRESH_INFO,
+            lsproto::NoParams,
+        ) {
+            return Err(errors::errorf(
+                format!("failed to refresh code lens: {}", err.error()),
+                vec![err],
+            ));
+        }
+        Ok(())
+    }
+
+    // Go: server.go:352 ProgressStart
+    // ProgressStart implements project.Client.
+    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+        if let Some(project_progress) = self.shared.project_progress.get() {
+            project_progress.start(message, args);
+        }
+    }
+
+    // Go: server.go:359 ProgressFinish
+    // ProgressFinish implements project.Client.
+    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+        if let Some(project_progress) = self.shared.project_progress.get() {
+            project_progress.finish(message, args);
+        }
+    }
+}
+
+/// Go `time.Now().UnixMilli()`.
+fn unix_milli_now() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(e) => -(e.duration().as_millis() as i64),
+    }
+}
+
+impl Server {
+    // Go: server.go:365 RequestConfiguration
+    pub fn request_configuration(&self, ctx: &Context) -> Result<lsutil::UserPreferences, GoError> {
+        let caps = lsproto::get_client_capabilities(ctx);
+        if !caps.workspace.configuration {
+            let opts = self.shared.initialization_options();
+            if let Some(user_prefs) = &opts.user_preferences {
+                // PORT: Go `%T` and `%+v`; log text is not compared.
+                self.logger.logf(&format!(
+                    "received formatting options from initialization: {}\n{:?}",
+                    lsp_any_type_name(user_prefs),
+                    user_prefs
+                ));
+                if let LspAny::Object(config) = user_prefs {
+                    let mut items: IndexMap<String, LspAny> = IndexMap::default();
+                    items.insert("js/ts".to_string(), LspAny::Object(config.clone()));
+                    return Ok(lsutil::parse_user_preferences(&items));
+                }
+            }
+            return Ok(lsutil::new_default_user_preferences());
+        }
+        let configs = send_client_request(
+            ctx,
+            &self.shared,
+            &lsproto::WORKSPACE_CONFIGURATION_INFO,
+            lsproto::ConfigurationParams {
+                items: vec![
+                    lsproto::ConfigurationItem {
+                        section: Some("js/ts".to_string()),
+                        ..Default::default()
+                    },
+                    lsproto::ConfigurationItem {
+                        section: Some("typescript".to_string()),
+                        ..Default::default()
+                    },
+                    lsproto::ConfigurationItem {
+                        section: Some("javascript".to_string()),
+                        ..Default::default()
+                    },
+                    lsproto::ConfigurationItem {
+                        section: Some("editor".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+        let configs = match configs {
+            Ok(configs) => configs,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("configure request failed: {}", err.error()),
+                    vec![err],
+                ));
+            }
+        };
+        // PORT: Go `map[string]any`; `ParseUserPreferences` looks keys up by name.
+        let mut config_map: IndexMap<String, LspAny> = IndexMap::default();
+        for (i, config) in configs.into_iter().enumerate() {
+            match i {
+                0 => {
+                    config_map.insert("js/ts".to_string(), config);
+                }
+                1 => {
+                    config_map.insert("typescript".to_string(), config);
+                }
+                2 => {
+                    config_map.insert("javascript".to_string(), config);
+                }
+                3 => {
+                    config_map.insert("editor".to_string(), config);
+                }
+                _ => {}
+            }
+        }
+        // PORT: Go `%+v` of each value (`<nil>` for a missing key); log
+        // text is not compared.
+        let show = |key: &str| match config_map.get(key) {
+            Some(v) => format!("{v:?}"),
+            None => "<nil>".to_string(),
+        };
+        self.logger.logf(&format!(
+            "received options from workspace/configuration request:\njs/ts: {}\n\ntypescript: {}\n\njavascript: {}\n\neditor: {}\n",
+            show("js/ts"),
+            show("typescript"),
+            show("javascript"),
+            show("editor"),
+        ));
+        Ok(lsutil::parse_user_preferences(&config_map))
+    }
+}
+
+/// Go `%T` of the dynamic value of an `any` (log text only).
+fn lsp_any_type_name(v: &LspAny) -> &'static str {
+    match v {
+        LspAny::Null => "<nil>",
+        LspAny::Bool(_) => "bool",
+        LspAny::Number(_) => "float64",
+        LspAny::String(_) => "string",
+        LspAny::Array(_) => "[]interface {}",
+        LspAny::Object(_) => "map[string]interface {}",
+    }
+}
+
+/// PORT: a panic on a Go goroutine without `recover` ends the Go process.
+/// goport ends it the way `bin/goport.rs` ends a failed run: the unported
+/// report on stderr and `EXIT_UNPORTED` (70). The panic hook already
+/// printed any other panic.
+pub fn go_crash(_payload: Box<dyn Any + Send>) -> ! {
+    let mut stderr = std::io::stderr().lock();
+    for (name, count) in crate::core::unported_report() {
+        let _ = writeln!(stderr, "unported: {name} {count}");
+    }
+    let _ = stderr.flush();
+    std::process::exit(crate::execute::tsc::EXIT_UNPORTED);
+}
+
+/// The text of a panic value (Go `%v` of the recovered value).
+pub fn panic_value_string(r: &(dyn Any + Send)) -> String {
+    if let Some(message) = r.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = r.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        String::new()
+    }
+}
+
+impl Server {
+    // Go: server.go:423 Run
+    // PORT: the dispatch loop runs on the calling thread, because it owns
+    // the `!Send` state. Its result joins the group after it returns, so
+    // the group keeps the first error in the same order as Go.
+    pub fn run(self: &Rc<Self>, ctx: &Context) -> Result<(), GoError> {
+        let (g, ctx) = gostd::errgroup::with_context(ctx);
+        let _ = self.shared.background_ctx.set(ctx.clone());
+
+        let mut w = self.w.borrow_mut().take().expect("lsp: Run called twice");
+        {
+            let shared = self.shared.clone();
+            let ctx = ctx.clone();
+            g.go(move || shared.write_loop(&ctx, &mut *w));
+        }
+
+        // Don't run readLoop in the group, as it blocks on stdin read and cannot be cancelled.
+        // PORT: `None` on the channel is the wake-up of the waiter's
+        // `ctx.Done()` case.
+        let (read_loop_err_tx, read_loop_err) = sync_channel::<Option<Result<(), GoError>>>(2);
+        {
+            let ctx = ctx.clone();
+            let wake = read_loop_err_tx.clone();
+            g.go(move || {
+                // Go:
+                //	select {
+                //	case <-ctx.Done():
+                //		return ctx.Err()
+                //	case err := <-readLoopErr:
+                //		return err
+                //	}
+                match recv_or_done(&ctx, &wake, &read_loop_err) {
+                    Ok(err) => err,
+                    Err(err) => Err(err),
+                }
+            });
+        }
+        let mut r = self.r.borrow_mut().take().expect("lsp: Run called twice");
+        {
+            let shared = self.shared.clone();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name("lsp-reader".to_string())
+                .spawn(move || {
+                    match catch_unwind(AssertUnwindSafe(|| shared.read_loop(&ctx, &mut *r))) {
+                        Ok(err) => {
+                            let _ = read_loop_err_tx.try_send(Some(err));
+                        }
+                        Err(payload) => go_crash(payload),
+                    }
+                })
+                .expect("lsp: failed to start the read goroutine");
+        }
+
+        let dispatch_result = self.dispatch_loop(&ctx);
+        g.go(move || dispatch_result);
+
+        if let Err(err) = g.wait() {
+            if !errors::is(&err, &errors::EOF) && ctx.err().is_some() {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// PORT: Go `select { case <-ctx.Done(): return ctx.Err(); case v := <-ch: }`.
+/// The channel carries `Option<T>`; a waker on `ctx.Done()` sends `None`
+/// through `wake` (a sender of the same channel). When both cases are
+/// ready Go picks one at random; the port picks the context.
+fn recv_or_done<T: Send + 'static>(
+    ctx: &Context,
+    wake: &SyncSender<Option<T>>,
+    ch: &Receiver<Option<T>>,
+) -> Result<T, GoError> {
+    let done = ctx.done();
+    let waker_id = match &done {
+        Some(done) => {
+            let wake = wake.clone();
+            done.register_waker(move || {
+                let _ = wake.try_send(None);
+            })
+        }
+        None => None,
+    };
+    let unregister = || {
+        if let (Some(done), Some(id)) = (&done, waker_id) {
+            done.unregister_waker(id);
+        }
+    };
+    loop {
+        if let Some(err) = ctx.err() {
+            unregister();
+            return Err(err);
+        }
+        match ch.recv() {
+            Ok(Some(v)) => {
+                unregister();
+                return Ok(v);
+            }
+            // The context wake-up: the next iteration returns ctx.Err().
+            Ok(None) => {}
+            // Go: a receive from a closed channel gives the zero value; no
+            // caller closes its channel before it sends.
+            Err(_) => panic!("{}", NIL_DEREF),
+        }
+    }
+}
+
+impl ServerShared {
+    // Go: server.go:447 readLoop
+    // PORT: `r` is the reader, which this thread owns.
+    pub fn read_loop(self: &Arc<Self>, ctx: &Context, r: &mut dyn Reader) -> Result<(), GoError> {
+        loop {
+            if let Some(err) = ctx.err() {
+                return Err(err);
+            }
+            let (msg, err) = r.read();
+            if let Some(err) = err {
+                if errors::is(&err, &errors::from_value(ErrorCode::INVALID_REQUEST))
+                    || errors::is(&err, &errors::from_value(ErrorCode::INVALID_PARAMS))
+                {
+                    let mut id: Option<crate::jsonrpc::ID> = None;
+                    if errors::is(&err, &errors::from_value(ErrorCode::INVALID_PARAMS)) {
+                        if let Some(msg) = &msg {
+                            if msg.kind == crate::jsonrpc::MessageKind::REQUEST {
+                                id = msg.as_request().id.clone();
+                            }
+                        }
+                    }
+                    self.send_error(id, err)?;
+                    continue;
+                }
+                return Err(err);
+            }
+            let msg = msg.expect(NIL_DEREF);
+
+            if self.initialize_params.get().is_none()
+                && msg.kind == crate::jsonrpc::MessageKind::REQUEST
+            {
+                let req = msg.as_request();
+                if req.method == lsproto::Method::INITIALIZE {
+                    // Go: req.Params.(*lsproto.InitializeParams)
+                    let params = request_params::<lsproto::InitializeParams>(req).expect(
+                        "interface conversion: interface is nil, not *lsproto.InitializeParams",
+                    );
+                    let resp = self.handle_initialize(ctx, Some(params), req)?;
+                    self.send_result(req.id.clone(), Box::new(resp))?;
+                } else {
+                    self.send_error(
+                        req.id.clone(),
+                        errors::from_value(ErrorCode::SERVER_NOT_INITIALIZED),
+                    )?;
+                }
+                continue;
+            }
+
+            if msg.kind == crate::jsonrpc::MessageKind::RESPONSE {
+                let resp = msg.into_response();
+                let mut pending_server_requests = lock(&self.pending_server_requests);
+                let id = resp.id.clone().expect(NIL_DEREF);
+                // Go: respChan <- resp; close(respChan); delete(...)
+                if let Some(resp_chan) = pending_server_requests.remove(&id) {
+                    let _ = resp_chan.try_send(Some(resp));
+                }
+            } else {
+                let req = msg.into_request();
+                if req.method == lsproto::Method::CANCEL_REQUEST {
+                    // Go: req.Params.(*lsproto.CancelParams).Id
+                    let params = request_params::<lsproto::CancelParams>(&req).expect(
+                        "interface conversion: interface is nil, not *lsproto.CancelParams",
+                    );
+                    self.cancel_request(&params.id);
+                } else {
+                    self.request_queue.put(ctx, QueuedRequest::Request(req))?;
+                }
+            }
+        }
+    }
+
+    // Go: server.go:509 cancelRequest
+    pub fn cancel_request(&self, raw_id: &lsproto::IntegerOrString) {
+        let id = lsproto::new_id(raw_id);
+        let mut pending_client_requests = lock(&self.pending_client_requests);
+        if let Some(pending_req) = pending_client_requests.get(&id) {
+            (pending_req.cancel)();
+            pending_client_requests.remove(&id);
+        }
+    }
+
+    // Go: server.go:519 read
+    // PORT: the reader is owned by the reader thread; `read_loop` calls
+    // `r.read()` directly.
+}
+
+impl Server {
+    // Go: server.go:523 dispatchLoop
+    pub fn dispatch_loop(self: &Rc<Self>, ctx: &Context) -> Result<(), GoError> {
+        let (ctx, lsp_exit) = context::with_cancel_cause(ctx);
+        // Go: defer lspExit(nil)
+        struct LspExitGuard(CancelCauseFunc);
+        impl Drop for LspExitGuard {
+            fn drop(&mut self) {
+                (self.0)(None);
+            }
+        }
+        let _lsp_exit_guard = LspExitGuard(lsp_exit.clone());
+
+        // PORT: the dispatch loop contract. A due `gostd::local` timer wakes
+        // this loop through the request queue.
+        {
+            let shared = self.shared.clone();
+            let wake_ctx = ctx.clone();
+            gostd::local::set_waker(Arc::new(move || {
+                let _ = shared.request_queue.put(&wake_ctx, QueuedRequest::Wake);
+            }));
+        }
+
+        loop {
+            let req = match self.shared.request_queue.get(&ctx)? {
+                QueuedRequest::Request(req) => Rc::new(req),
+                QueuedRequest::Wake => {
+                    gostd::local::run_pending();
+                    continue;
+                }
+            };
+
+            self.shared
+                .last_request_time_ms
+                .store(unix_milli_now(), Ordering::SeqCst);
+            let mut request_ctx = locale::with_locale(&ctx, self.shared.locale());
+            let mut cancel: Option<CancelFunc> = None;
+            if let Some(id) = &req.id {
+                let (c, f) = context::with_cancel(&crate::frontend::core_context::with_request_id(
+                    &request_ctx,
+                    &id.string(),
+                ));
+                request_ctx = c;
+                cancel = Some(f.clone());
+                lock(&self.shared.pending_client_requests).insert(
+                    id.clone(),
+                    PendingClientRequest {
+                        method: req.method.clone(),
+                        cancel: f,
+                    },
+                );
+            }
+
+            let handle_error = |err: GoError| {
+                if errors::is(&err, &context::CANCELED) {
+                    if let Err(err) = self.shared.send_error(
+                        req.id.clone(),
+                        errors::from_value(ErrorCode::REQUEST_CANCELLED),
+                    ) {
+                        lsp_exit(Some(err));
+                    }
+                } else if errors::is(&err, &errors::EOF) {
+                    lsp_exit(None);
+                } else if let Err(err) = self.shared.send_error(req.id.clone(), err) {
+                    lsp_exit(Some(err));
+                }
+            };
+
+            let remove_request = || {
+                if let Some(id) = &req.id {
+                    lock(&self.shared.pending_client_requests).remove(id);
+                    // Go: defer cancel()
+                    if let Some(cancel) = &cancel {
+                        cancel();
+                    }
+                }
+            };
+
+            match self.handle_request_or_notification(&request_ctx, &req) {
+                Err(err) => {
+                    handle_error(err);
+                    remove_request();
+                }
+                Ok(Some(do_async_work)) => {
+                    // PORT: Go runs the async work on a goroutine
+                    // (`go func() {...}()`); it runs here, on the dispatch
+                    // thread, before the next message.
+                    if let Err(ls_error) = do_async_work() {
+                        handle_error(ls_error);
+                    }
+                    remove_request();
+                }
+                Ok(None) => remove_request(),
+            }
+
+            gostd::local::run_pending();
+        }
+    }
+}
+
+impl ServerShared {
+    // Go: server.go:584 writeLoop
+    // PORT: `w` is the writer, which this thread owns.
+    pub fn write_loop(&self, ctx: &Context, w: &mut dyn Writer) -> Result<(), GoError> {
+        loop {
+            let msg = self.outgoing_queue.get(ctx)?;
+            if let Err(err) = w.write(&msg) {
+                return Err(errors::errorf(
+                    format!("failed to write message: {}", err.error()),
+                    vec![err],
+                ));
+            }
+        }
+    }
+}
+
+// Go: server.go:598 sendClientRequest
+// WARNING: this should only be called in the async portion of a request handler,
+// otherwise a deadlock can occur.
+// PORT: the reader thread delivers the response, so the dispatch thread can
+// wait here in the sync portion too (Go's handleInitialized does).
+pub fn send_client_request<Req: AnyValue, Resp: 'static>(
+    ctx: &Context,
+    s: &ServerShared,
+    info: &lsproto::RequestInfo<Req, Resp>,
+    params: Req,
+) -> Result<Resp, GoError> {
+    let id = crate::jsonrpc::new_id_string(&format!(
+        "ts{}",
+        s.client_seq.fetch_add(1, Ordering::SeqCst) + 1
+    ));
+    let req = info.new_request_message(Some(id.clone()), params);
+
+    let (response_tx, response_chan) = sync_channel::<Option<lsproto::ResponseMessage>>(2);
+    lock(&s.pending_server_requests).insert(id.clone(), response_tx.clone());
+
+    let result = (|| {
+        s.send(req.message())?;
+
+        // Go:
+        //	select {
+        //	case <-ctx.Done():
+        //		return *new(Resp), ctx.Err()
+        //	case resp := <-responseChan:
+        let resp = recv_or_done(ctx, &response_tx, &response_chan)?;
+        if resp.error.is_some() {
+            return Err(errors::new(format!(
+                "request failed: {}",
+                crate::jsonrpc::ResponseError::string(resp.error.as_ref())
+            )));
+        }
+        info.unmarshal_result(resp.result)
+    })();
+
+    // Go: defer: close(respChan); delete(s.pendingServerRequests, *id)
+    lock(&s.pending_server_requests).remove(&id);
+
+    result
+}
+
+// Go: server.go:635 sendClientRequestFireAndForget
+// sendClientRequestFireAndForget sends a request to the client without waiting for a response.
+// The response, if any, will be silently ignored by the read loop since no pending channel is registered.
+// This means any error returned by the client will not be observed. Use only for requests where the
+// response value is not needed (e.g., the client always returns null).
+pub fn send_client_request_fire_and_forget<Req: AnyValue, Resp>(
+    s: &ServerShared,
+    info: &lsproto::RequestInfo<Req, Resp>,
+    params: Req,
+) -> Result<(), GoError> {
+    let id = crate::jsonrpc::new_id_string(&format!(
+        "ts{}",
+        s.client_seq.fetch_add(1, Ordering::SeqCst) + 1
+    ));
+    let req = info.new_request_message(Some(id), params);
+    s.send(req.message())
+}
+
+impl ServerShared {
+    // Go: server.go:641 sendResult
+    pub fn send_result(
+        &self,
+        id: Option<crate::jsonrpc::ID>,
+        result: Box<dyn AnyValue>,
+    ) -> Result<(), GoError> {
+        self.send_response(lsproto::ResponseMessage {
+            id,
+            result: Some(result),
+            ..Default::default()
+        })
+    }
+}
+
+// Go: server.go:648 userFacingRequestFailedError
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserFacingRequestFailedError(pub String);
+
+impl std::fmt::Display for UserFacingRequestFailedError {
+    // Go: server.go:650 Error
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Go `userFacingRequestFailedError(msg)` as an `error`.
+/// Go: server.go:651 Unwrap returns `lsproto.ErrorCodeRequestFailed`.
+pub fn user_facing_request_failed_error(msg: String) -> GoError {
+    errors::from_value_with_unwrap(
+        UserFacingRequestFailedError(msg),
+        errors::from_value(ErrorCode::REQUEST_FAILED),
+    )
+}
+
+impl ServerShared {
+    // Go: server.go:653 sendError
+    pub fn send_error(&self, id: Option<crate::jsonrpc::ID>, err: GoError) -> Result<(), GoError> {
+        // Do not send error response for notifications,
+        // except for parse errors which may occur before determining if the message is a request or notification.
+        if id.is_none() && !errors::is(&err, &errors::from_value(ErrorCode::INVALID_REQUEST)) {
+            self.logger
+                .errorf(&format!("error handling notification: {}", err.error()));
+            return Ok(());
+        }
+        let mut code = ErrorCode::INTERNAL_ERROR;
+        if let Some(err_code) = errors::as_type::<ErrorCode>(&err) {
+            code = err_code;
+        }
+        // TODO(jakebailey): error data
+        self.send_response(lsproto::ResponseMessage {
+            id,
+            error: Some(crate::jsonrpc::ResponseError {
+                code: code.0,
+                message: err.error(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+// Go: server.go:674 sendNotification
+pub fn send_notification<Params: AnyValue>(
+    s: &ServerShared,
+    info: &lsproto::NotificationInfo<Params>,
+    params: Params,
+) -> Result<(), GoError> {
+    s.send(info.new_notification_message(params).message())
+}
+
+impl ServerShared {
+    // Go: server.go:678 sendResponse
+    pub fn send_response(&self, resp: lsproto::ResponseMessage) -> Result<(), GoError> {
+        self.send(resp.message())
+    }
+
+    // Go: server.go:683 send
+    // send writes a message to the outgoing queue, respecting context cancellation.
+    pub fn send(&self, msg: lsproto::Message) -> Result<(), GoError> {
+        self.outgoing_queue.put(&self.background_ctx(), msg)
+    }
+}
+
+/// PORT: the async part of a handler. Go `func() error`.
+pub type AsyncWork = Box<dyn FnOnce() -> Result<(), GoError>>;
+
+impl Server {
+    // Go: server.go:689 handleRequestOrNotification
+    // handleRequestOrNotification looks up the handler for the given request or notification, executes its synchronous work
+    // and returns any asynchronous work as a function to be executed by the caller.
+    pub fn handle_request_or_notification(
+        self: &Rc<Self>,
+        ctx: &Context,
+        req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<Option<AsyncWork>, GoError> {
+        let ctx = lsproto::with_client_capabilities(ctx, self.shared.client_capabilities());
+
+        if let Some(handler) = handlers().get(&req.method) {
+            let start = Instant::now();
+            let result = handler(self, &ctx, req);
+            let mut id_str = String::new();
+            if let Some(id) = &req.id {
+                id_str = format!(" ({})", id.string());
+            }
+            // PORT: Go prints `time.Duration`; log text is not compared.
+            let do_async_work = match result {
+                Err(err) => {
+                    if errors::as_type::<UserFacingRequestFailedError>(&err).is_none() {
+                        self.logger.error(&format!(
+                            "error handling method '{}'{}: {}",
+                            req.method,
+                            id_str,
+                            err.error()
+                        ));
+                    } else if !self.logger.is_tracing() {
+                        self.logger.info(&format!(
+                            "handled method '{}'{} in {:?}",
+                            req.method,
+                            id_str,
+                            start.elapsed()
+                        ));
+                    }
+                    return Err(err);
+                }
+                Ok(do_async_work) => do_async_work,
+            };
+            if let Some(do_async_work) = do_async_work {
+                let s = self.clone();
+                let req = req.clone();
+                return Ok(Some(Box::new(move || -> Result<(), GoError> {
+                    // note: ctx.Err() has to be checked in the async work to allow async handlers to cleanup resources correctly
+                    let async_work_err = do_async_work();
+                    let is_user_facing = match &async_work_err {
+                        Err(err) => errors::as_type::<UserFacingRequestFailedError>(err).is_some(),
+                        Ok(()) => false,
+                    };
+                    let is_real_error = async_work_err.is_err() && !is_user_facing;
+                    if is_real_error {
+                        s.logger.info(&format!(
+                            "error handling method '{}'{} in {:?}",
+                            req.method,
+                            id_str,
+                            start.elapsed()
+                        ));
+                    } else if !s.logger.is_tracing() {
+                        s.logger.info(&format!(
+                            "handled method '{}'{} in {:?}",
+                            req.method,
+                            id_str,
+                            start.elapsed()
+                        ));
+                    }
+                    async_work_err
+                }) as AsyncWork));
+            }
+            if !self.logger.is_tracing() {
+                self.logger.info(&format!(
+                    "handled method '{}'{} in {:?}",
+                    req.method,
+                    id_str,
+                    start.elapsed()
+                ));
+            }
+            return Ok(None);
+        }
+        self.logger
+            .warn(&format!("unknown method '{}'", req.method));
+        if req.id.is_some() {
+            self.shared.send_error(
+                req.id.clone(),
+                errors::from_value(ErrorCode::INVALID_REQUEST),
+            )?;
+            return Ok(None);
+        }
+        Ok(None)
+    }
+}
+
+// Go: server.go:736 handlerMap
+// handlerMap maps LSP method to a handler function. The handler function executes any work that must be done synchronously
+// before other requests/notifications can be processed, and returns any additional work as a function to be executed
+// asynchronously after the synchronous work is complete.
+// PORT: Go `func(*Server, context.Context, *lsproto.RequestMessage) (func() error, error)`;
+// a nil `func() error` is `None`.
+pub type Handler = Box<
+    dyn Fn(
+            &Rc<Server>,
+            &Context,
+            &Rc<lsproto::RequestMessage>,
+        ) -> Result<Option<AsyncWork>, GoError>
+        + Send
+        + Sync,
+>;
+pub type HandlerMap = FxHashMap<lsproto::Method, Handler>;
+
+/// Go `req.Params.(Req)` after the nil check of the register helpers:
+/// `None` when the request has no params.
+pub fn request_params<Req: 'static>(req: &lsproto::RequestMessage) -> Option<&Req> {
+    req.params.as_deref().map(|params| {
+        params.downcast_ref::<Req>().unwrap_or_else(|| {
+            panic!(
+                "interface conversion: interface {{}} is not {}",
+                std::any::type_name::<Req>()
+            )
+        })
+    })
+}
+
+// Go: server.go:738 handlers
+static HANDLERS: LazyLock<HandlerMap> = LazyLock::new(|| {
+    let mut handlers = HandlerMap::default();
+
+    register_request_handler(
+        &mut handlers,
+        lsproto::INITIALIZE_INFO,
+        |s: &Rc<Server>,
+         ctx: &Context,
+         params: Option<&lsproto::InitializeParams>,
+         req: &Rc<lsproto::RequestMessage>| s.shared.handle_initialize(ctx, params, req),
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::INITIALIZED_INFO,
+        Server::handle_initialized,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::SHUTDOWN_INFO,
+        Server::handle_shutdown,
+    );
+    register_notification_handler(&mut handlers, lsproto::EXIT_INFO, Server::handle_exit);
+
+    register_notification_handler(
+        &mut handlers,
+        lsproto::WORKSPACE_DID_CHANGE_CONFIGURATION_INFO,
+        Server::handle_did_change_workspace_configuration,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DID_OPEN_INFO,
+        Server::handle_did_open,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DID_CHANGE_INFO,
+        Server::handle_did_change,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DID_SAVE_INFO,
+        Server::handle_did_save,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DID_CLOSE_INFO,
+        Server::handle_did_close,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::WORKSPACE_DID_CHANGE_WATCHED_FILES_INFO,
+        Server::handle_did_change_watched_files,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::SET_TRACE_INFO,
+        Server::handle_set_trace,
+    );
+    register_notification_handler(
+        &mut handlers,
+        lsproto::CUSTOM_SET_LOG_VERBOSITY_INFO,
+        Server::handle_set_log_verbosity,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::WORKSPACE_WILL_RENAME_FILES_INFO,
+        Server::handle_will_rename_files,
+    );
+
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DIAGNOSTIC_INFO,
+        Server::handle_document_diagnostic,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_HOVER_INFO,
+        Server::handle_hover,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DEFINITION_INFO,
+        Server::handle_definition,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_TEXT_DOCUMENT_SOURCE_DEFINITION_INFO,
+        Server::handle_source_definition,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_TYPE_DEFINITION_INFO,
+        Server::handle_type_definition,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_SIGNATURE_HELP_INFO,
+        Server::handle_signature_help,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_FORMATTING_INFO,
+        Server::handle_document_format,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_RANGE_FORMATTING_INFO,
+        Server::handle_document_range_format,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_ON_TYPE_FORMATTING_INFO,
+        Server::handle_document_on_type_format,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DOCUMENT_SYMBOL_INFO,
+        Server::handle_document_symbol,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT_INFO,
+        Server::handle_document_highlight,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_TEXT_DOCUMENT_MULTI_DOCUMENT_HIGHLIGHT_INFO,
+        Server::handle_multi_document_highlight,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_SELECTION_RANGE_INFO,
+        Server::handle_selection_range,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_INLAY_HINT_INFO,
+        Server::handle_inlay_hint,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_CODE_LENS_INFO,
+        Server::handle_code_lens,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_CODE_ACTION_INFO,
+        Server::handle_code_action,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY_INFO,
+        Server::handle_prepare_call_hierarchy,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_FOLDING_RANGE_INFO,
+        Server::handle_folding_range,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_PREPARE_RENAME_INFO,
+        Server::handle_prepare_rename,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_LINKED_EDITING_RANGE_INFO,
+        Server::handle_linked_editing_range,
+    );
+
+    register_language_service_with_auto_imports_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+        Server::handle_completion,
+    );
+    // This replaces the textDocument/codeAction handler registered above
+    // (same as Go: the map keeps the last registration).
+    register_language_service_with_auto_imports_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_CODE_ACTION_INFO,
+        Server::handle_code_action,
+    );
+
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_VS_ON_AUTO_INSERT_INFO,
+        Server::handle_vs_on_auto_insert,
+    );
+
+    register_multi_project_reference_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_REFERENCES_INFO,
+        ls::LanguageService::provide_references,
+    );
+    register_multi_project_reference_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_VS_REFERENCES_INFO,
+        ls::LanguageService::provide_vs_references,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_RENAME_INFO,
+        Server::handle_rename,
+    );
+    register_multi_project_reference_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_IMPLEMENTATION_INFO,
+        ls::LanguageService::provide_implementations,
+    );
+
+    register_request_handler(
+        &mut handlers,
+        lsproto::CALL_HIERARCHY_INCOMING_CALLS_INFO,
+        Server::handle_call_hierarchy_incoming_calls,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CALL_HIERARCHY_OUTGOING_CALLS_INFO,
+        Server::handle_call_hierarchy_outgoing_calls,
+    );
+
+    register_request_handler(
+        &mut handlers,
+        lsproto::WORKSPACE_SYMBOL_INFO,
+        Server::handle_workspace_symbol,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::COMPLETION_ITEM_RESOLVE_INFO,
+        Server::handle_completion_item_resolve,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CODE_LENS_RESOLVE_INFO,
+        Server::handle_code_lens_resolve,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL_INFO,
+        Server::handle_semantic_tokens_full,
+    );
+    register_language_service_document_request_handler(
+        &mut handlers,
+        lsproto::TEXT_DOCUMENT_SEMANTIC_TOKENS_RANGE_INFO,
+        Server::handle_semantic_tokens_range,
+    );
+
+    // Developer/debugging commands
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_RUN_GC_INFO,
+        Server::handle_run_gc,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_SAVE_HEAP_PROFILE_INFO,
+        Server::handle_save_heap_profile,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_SAVE_ALLOC_PROFILE_INFO,
+        Server::handle_save_alloc_profile,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_START_CPU_PROFILE_INFO,
+        Server::handle_start_cpu_profile,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_STOP_CPU_PROFILE_INFO,
+        Server::handle_stop_cpu_profile,
+    );
+
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_INITIALIZE_API_SESSION_INFO,
+        Server::handle_initialize_api_session,
+    );
+    register_request_handler(
+        &mut handlers,
+        lsproto::CUSTOM_PROJECT_INFO_INFO,
+        Server::handle_project_info,
+    );
+    handlers
+});
+
+/// Go `handlers()`, the `sync.OnceValue` of the handler map.
+pub fn handlers() -> &'static HandlerMap {
+    &HANDLERS
+}
+
+// Go: server.go:808 registerNotificationHandler
+// PORT: Go `fn func(*Server, context.Context, Req) error`. `Req` is a
+// pointer type (or `NoParams`), so the handler gets `Option<&Req>` (`None`
+// is a nil pointer).
+pub fn register_notification_handler<Req: 'static>(
+    handlers: &mut HandlerMap,
+    info: lsproto::NotificationInfo<Req>,
+    fn_: fn(&Rc<Server>, &Context, Option<&Req>) -> Result<(), GoError>,
+) {
+    handlers.insert(
+        info.method.clone(),
+        Box::new(
+            move |s: &Rc<Server>,
+                  ctx: &Context,
+                  req: &Rc<lsproto::RequestMessage>|
+                  -> Result<Option<AsyncWork>, GoError> {
+                if s.session.borrow().is_none() && req.method != lsproto::Method::INITIALIZED {
+                    return Err(errors::from_value(ErrorCode::SERVER_NOT_INITIALIZED));
+                }
+
+                // Ignore empty params; all generated params are either pointers or any.
+                let params = request_params::<Req>(req);
+                fn_(s, ctx, params)?;
+                match ctx.err() {
+                    Some(err) => Err(err),
+                    None => Ok(None),
+                }
+            },
+        ),
+    );
+}
+
+// Go: server.go:826 registerRequestHandler
+// PORT: `params` as in `register_notification_handler`.
+pub fn register_request_handler<Req: 'static, Resp: AnyValue>(
+    handlers: &mut HandlerMap,
+    info: lsproto::RequestInfo<Req, Resp>,
+    fn_: fn(
+        &Rc<Server>,
+        &Context,
+        Option<&Req>,
+        &Rc<lsproto::RequestMessage>,
+    ) -> Result<Resp, GoError>,
+) {
+    handlers.insert(
+        info.method.clone(),
+        Box::new(
+            move |s: &Rc<Server>,
+                  ctx: &Context,
+                  req: &Rc<lsproto::RequestMessage>|
+                  -> Result<Option<AsyncWork>, GoError> {
+                if s.session.borrow().is_none() && req.method != lsproto::Method::INITIALIZE {
+                    return Err(errors::from_value(ErrorCode::SERVER_NOT_INITIALIZED));
+                }
+
+                // Ignore empty params.
+                let params = request_params::<Req>(req);
+                let resp = fn_(s, ctx, params, req)?;
+                if let Some(err) = ctx.err() {
+                    return Err(err);
+                }
+                s.shared.send_result(req.id.clone(), Box::new(resp))?;
+                Ok(None)
+            },
+        ),
+    );
+}
+
+// Go: server.go:852 registerLanguageServiceDocumentRequestHandler
+// PORT: Go calls `params.TextDocumentURI()` in the sync part, which
+// dereferences the params pointer, so `fn` gets `&Req`.
+pub fn register_language_service_document_request_handler<
+    Req: HasTextDocumentURI + 'static,
+    Resp: AnyValue,
+>(
+    handlers: &mut HandlerMap,
+    info: lsproto::RequestInfo<Req, Resp>,
+    fn_: fn(&Rc<Server>, &Context, &ls::LanguageService, &Req) -> Result<Resp, GoError>,
+) {
+    handlers.insert(
+        info.method.clone(),
+        Box::new(
+            move |s: &Rc<Server>,
+                  ctx: &Context,
+                  req: &Rc<lsproto::RequestMessage>|
+                  -> Result<Option<AsyncWork>, GoError> {
+                // Ignore empty params.
+                let params = request_params::<Req>(req);
+                let ls = s
+                    .session_ref()
+                    .get_language_service(ctx, &params.expect(NIL_DEREF).text_document_uri())?;
+                let s = s.clone();
+                let ctx = ctx.clone();
+                let req = req.clone();
+                Ok(Some(Box::new(move || {
+                    s.recover_guard(
+                        &req,
+                        || -> Result<(), GoError> { Ok(()) },
+                        || {
+                            let params = request_params::<Req>(&req).expect(NIL_DEREF);
+                            let result = fn_(&s, &ctx, &ls, params);
+                            // After any language service request, check if new global diagnostics were
+                            // discovered during checking and push updated tsconfig diagnostics if so.
+                            s.session_ref().enqueue_publish_global_diagnostics();
+                            let resp = result?;
+                            if let Some(err) = ctx.err() {
+                                return Err(err);
+                            }
+                            s.shared.send_result(req.id.clone(), Box::new(resp))
+                        },
+                    )
+                }) as AsyncWork))
+            },
+        ),
+    );
+}
+
+// Go: server.go:880 registerLanguageServiceWithAutoImportsRequestHandler
+pub fn register_language_service_with_auto_imports_request_handler<
+    Req: HasTextDocumentURI + 'static,
+    Resp: AnyValue,
+>(
+    handlers: &mut HandlerMap,
+    info: lsproto::RequestInfo<Req, Resp>,
+    fn_: fn(&Rc<Server>, &Context, &ls::LanguageService, &Req) -> Result<Resp, GoError>,
+) {
+    let method = info.method.clone();
+    handlers.insert(
+        info.method.clone(),
+        Box::new(
+            move |s: &Rc<Server>,
+                  ctx: &Context,
+                  req: &Rc<lsproto::RequestMessage>|
+                  -> Result<Option<AsyncWork>, GoError> {
+            // Ignore empty params.
+            let params = request_params::<Req>(req);
+            let uri = params.expect(NIL_DEREF).text_document_uri();
+            let s = s.clone();
+            let ctx = ctx.clone();
+            let req = req.clone();
+            let method = method.clone();
+            let session = s.session_ref();
+            session.with_language_service_and_snapshot(
+                &ctx.clone(),
+                &uri.clone(),
+                move |language_service, snapshot| {
+                    Ok(Some(Box::new(move || {
+                        s.recover_guard(
+                            &req,
+                            || -> Result<(), GoError> { Ok(()) },
+                            || {
+                                let params = request_params::<Req>(&req).expect(NIL_DEREF);
+                                let mut language_service = language_service;
+                                let mut result = fn_(&s, &ctx, &language_service, params);
+                                if let Err(ls_err) = &result {
+                                    if errors::is(ls_err, &ls::ERR_NEEDS_AUTO_IMPORTS) {
+                                        language_service = s
+                                            .session_ref()
+                                            .get_language_service_with_auto_imports(
+                                                &ctx, &snapshot, &uri,
+                                            )?;
+                                        if let Some(err) = ctx.err() {
+                                            return Err(err);
+                                        }
+                                        result = fn_(&s, &ctx, &language_service, params);
+                                        if let Err(ls_err) = &result {
+                                            if errors::is(ls_err, &ls::ERR_NEEDS_AUTO_IMPORTS) {
+                                                panic!(
+                                                    "{} returned ErrNeedsAutoImports even after enabling auto imports",
+                                                    method
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                let resp = result?;
+                                if let Some(err) = ctx.err() {
+                                    return Err(err);
+                                }
+                                s.shared.send_result(req.id.clone(), Box::new(resp))
+                            },
+                        )
+                    }) as Box<dyn FnOnce() -> Result<(), GoError>>))
+                },
+            )
+        }),
+    );
+}
+
+// Go: server.go:916 registerMultiProjectReferenceRequestHandler
+pub fn register_multi_project_reference_request_handler<
+    Req: HasTextDocumentPosition + 'static,
+    Resp: AnyValue,
+>(
+    handlers: &mut HandlerMap,
+    info: lsproto::RequestInfo<Req, Resp>,
+    fn_: fn(
+        &ls::LanguageService,
+        &Context,
+        &Req,
+        Option<&dyn ls::CrossProjectOrchestrator>,
+    ) -> Result<Resp, GoError>,
+) {
+    handlers.insert(
+        info.method.clone(),
+        Box::new(
+            move |s: &Rc<Server>,
+                  ctx: &Context,
+                  req: &Rc<lsproto::RequestMessage>|
+                  -> Result<Option<AsyncWork>, GoError> {
+                // Ignore empty params.
+                let params = request_params::<Req>(req);
+                // !!! sheetal: multiple projects that contain the file through symlinks
+                let (default_ls, orchestrator) = s
+                    .get_language_service_and_cross_project_orchestrator(
+                        ctx,
+                        &params.expect(NIL_DEREF).text_document_uri(),
+                        req,
+                    )?;
+                let s = s.clone();
+                let ctx = ctx.clone();
+                let req = req.clone();
+                Ok(Some(Box::new(move || {
+                    s.recover_guard(
+                        &req,
+                        || -> Result<(), GoError> { Ok(()) },
+                        || {
+                            let params = request_params::<Req>(&req).expect(NIL_DEREF);
+                            let resp = fn_(&default_ls, &ctx, params, Some(&orchestrator))?;
+                            if let Some(err) = ctx.err() {
+                                return Err(err);
+                            }
+                            s.shared.send_result(req.id.clone(), Box::new(resp))
+                        },
+                    )
+                }) as AsyncWork))
+            },
+        ),
+    );
+}
+
+// Go: server.go:946 crossProjectOrchestrator
+// PORT: Go `defaultProject *project.Project` is the session's
+// `Rc<RefCell<Project>>`. Go stores `req`, which no code reads.
+pub struct CrossProjectOrchestrator {
+    pub server: Rc<Server>,
+    pub req: Rc<lsproto::RequestMessage>,
+    pub default_project: Rc<RefCell<project::Project>>,
+    pub all_projects: Vec<Rc<dyn ls::Project>>,
+}
+
+// Go: server.go:953 `var _ ls.CrossProjectOrchestrator = (*crossProjectOrchestrator)(nil)`: the impl below.
+
+impl ls::CrossProjectOrchestrator for CrossProjectOrchestrator {
+    // Go: server.go:955 GetDefaultProject
+    fn get_default_project(&self) -> Rc<dyn ls::Project> {
+        self.default_project.clone()
+    }
+
+    // Go: server.go:959 GetAllProjectsForInitialRequest
+    fn get_all_projects_for_initial_request(&self) -> Vec<Rc<dyn ls::Project>> {
+        self.all_projects.clone()
+    }
+
+    // Go: server.go:963 GetLanguageServiceForProjectWithFile
+    // PORT: Go asserts `p.(*project.Project)`; the session method takes the
+    // `ls.Project` itself (see project/session.rs).
+    fn get_language_service_for_project_with_file(
+        &self,
+        ctx: &Context,
+        p: &Rc<dyn ls::Project>,
+        uri: &lsproto::DocumentUri,
+    ) -> Option<ls::LanguageService> {
+        self.server
+            .session_ref()
+            .get_language_service_for_project_with_file(ctx, &**p, uri)
+    }
+
+    // Go: server.go:967 GetProjectsForFile
+    fn get_projects_for_file(
+        &self,
+        ctx: &Context,
+        uri: &lsproto::DocumentUri,
+    ) -> Result<Vec<Rc<dyn ls::Project>>, GoError> {
+        self.server.session_ref().get_projects_for_file(ctx, uri)
+    }
+
+    // Go: server.go:971 GetProjectsLoadingProjectTree
+    fn get_projects_loading_project_tree(
+        &self,
+        ctx: &Context,
+        requested_project_trees: &FxHashSet<tspath::Path>,
+        yield_: &mut dyn FnMut(Rc<dyn ls::Project>) -> bool,
+    ) {
+        self.server
+            .session_ref()
+            .with_snapshot_loading_project_tree(
+                ctx,
+                Some(requested_project_trees),
+                &mut |snapshot: &Rc<Snapshot>| {
+                    for p in snapshot.project_collection.projects() {
+                        if !yield_(p) {
+                            return;
+                        }
+                    }
+                },
+            );
+    }
+}
+
+impl Server {
+    // Go: server.go:983 getLanguageServiceAndCrossProjectOrchestrator
+    // PORT: Go returns the orchestrator only when err is nil.
+    pub fn get_language_service_and_cross_project_orchestrator(
+        self: &Rc<Self>,
+        ctx: &Context,
+        uri: &lsproto::DocumentUri,
+        req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<(ls::LanguageService, CrossProjectOrchestrator), GoError> {
+        let (default_project, default_ls, all_projects) = self
+            .session_ref()
+            .get_language_service_and_projects_for_file(ctx, uri)?;
+        let orchestrator = CrossProjectOrchestrator {
+            server: self.clone(),
+            req: req.clone(),
+            default_project,
+            all_projects,
+        };
+        Ok((default_ls, orchestrator))
+    }
+
+    // Go: server.go:992 recover
+    // PORT: Go `defer s.recover(req)`; `recover_guard` runs the guarded code
+    // in `catch_unwind` and calls this with the panic value.
+    // PORT: Go `debug.Stack()` is the stack of the panicking goroutine.
+    // Rust unwinding has left that stack here, so this is the current
+    // backtrace (empty unless RUST_BACKTRACE is set); `sanitize_stack_trace`
+    // finds no Go frames in it and gives "" (log and telemetry text only).
+    pub fn recover(&self, req: &lsproto::RequestMessage, r: Box<dyn Any + Send>) {
+        let r = panic_value_string(r.as_ref());
+        let stack = std::backtrace::Backtrace::capture().to_string();
+        self.logger.errorf(&format!(
+            "panic handling request {}: {}\n{}",
+            req.method, r, stack
+        ));
+        if req.id.is_some() {
+            let code = errors::from_value(ErrorCode::INTERNAL_ERROR);
+            let _ = self.shared.send_error(
+                req.id.clone(),
+                errors::errorf(
+                    format!(
+                        "{}: panic handling request {}: {}",
+                        code.error(),
+                        req.method,
+                        r
+                    ),
+                    vec![code],
+                ),
+            );
+        } else {
+            // Go: fmt.Sprint adds no spaces next to string operands.
+            self.logger.error(&format!(
+                "unhandled panic in notification{}{}",
+                req.method, r
+            ));
+        }
+
+        if self.telemetry_enabled.get() {
+            let _ = send_notification(
+                &self.shared,
+                &lsproto::TELEMETRY_EVENT_INFO,
+                lsproto::TelemetryEvent {
+                    request_failure_telemetry_event: Some(lsproto::RequestFailureTelemetryEvent {
+                        properties: Some(lsproto::RequestFailureTelemetryProperties {
+                            error_code: ErrorCode::INTERNAL_ERROR.string(),
+                            request_method: req.method.0.replace('/', "."),
+                            stack: sanitize_stack_trace(&stack),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Go `defer s.recover(req)` at the top of a function: runs `f`; when
+    /// it panics, recovers the panic with `recover` and returns `zero()`
+    /// (Go returns the zero values of the unnamed results).
+    pub fn recover_guard<T>(
+        &self,
+        req: &lsproto::RequestMessage,
+        zero: impl FnOnce() -> T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => v,
+            Err(r) => {
+                self.recover(req, r);
+                zero()
+            }
+        }
+    }
+}
+
+impl ServerShared {
+    // Go: server.go:1016 handleInitialize
+    pub fn handle_initialize(
+        self: &Arc<Self>,
+        _ctx: &Context,
+        params: Option<&lsproto::InitializeParams>,
+        _req: &lsproto::RequestMessage,
+    ) -> Result<lsproto::InitializeResponse, GoError> {
+        if self.initialize_params.get().is_some() {
+            return Err(errors::from_value(ErrorCode::INVALID_REQUEST));
+        }
+
+        self.init_started.store(true, Ordering::SeqCst);
+
+        let params = params.expect(NIL_DEREF);
+        let _ = self.initialize_params.set(params.clone());
+        // The spec types initializationOptions as nullable; treat both null and an
+        // absent value as empty options so the rest of the server can read fields
+        // off s.initializationOptions without nil-checking the container.
+        let initialization_options = match &params.initialization_options {
+            Some(options) if options.initialization_options.is_some() => options
+                .initialization_options
+                .clone()
+                .expect("checked above"),
+            _ => lsproto::InitializationOptions::default(),
+        };
+        let _ = self.initialization_options.set(initialization_options);
+        if let Some(v) = self.initialization_options().log_verbosity {
+            if is_valid_log_verbosity(v) {
+                self.logger.set_verbosity(v);
+            }
+        }
+        let _ = self
+            .client_capabilities
+            .set(Arc::new(lsproto::ClientCapabilities::resolve(
+                params.capabilities.as_ref(),
+            )));
+        let client_capabilities = self.client_capabilities();
+        if client_capabilities.window.work_done_progress {
+            let _ = self.project_progress.set(new_project_loading_progress(
+                self.clone(),
+                self.progress_delay,
+            ));
+        }
+
+        let capabilities_json = match json_ext::marshal_indent(&*client_capabilities, "", "\t") {
+            Ok(json) => json,
+            Err(err) => return Err(errors::from_value(err)),
+        };
+        self.logger.info(&format!(
+            "Resolved client capabilities: {capabilities_json}"
+        ));
+
+        let mut position_encoding = lsproto::PositionEncodingKind::UTF16;
+        if client_capabilities
+            .general
+            .position_encodings
+            .contains(&lsproto::PositionEncodingKind::UTF8)
+        {
+            position_encoding = lsproto::PositionEncodingKind::UTF8;
+        }
+        let _ = self.position_encoding.set(position_encoding.clone());
+
+        if let Some(l) = &params.locale {
+            let (parsed, _) = locale::parse(l);
+            let _ = self.locale.set(parsed);
+        }
+
+        if let Some(start_watchdog) = &self.start_watchdog {
+            if let Some(process_id) = params.process_id.integer {
+                start_watchdog(process_id);
+            }
+        }
+
+        let response = lsproto::InitializeResult {
+            server_info: Some(lsproto::ServerInfo {
+                name: "typescript-go".to_string(),
+                version: Some(crate::core::version().to_string()),
+            }),
+            capabilities: Some(lsproto::ServerCapabilities {
+                position_encoding: Some(position_encoding),
+                text_document_sync: Some(lsproto::TextDocumentSyncOptionsOrKind {
+                    options: Some(lsproto::TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(lsproto::TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(lsproto::BooleanOrSaveOptions {
+                            boolean: Some(true),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                hover_provider: Some(lsproto::BooleanOrHoverOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                definition_provider: Some(lsproto::BooleanOrDefinitionOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                type_definition_provider: Some(
+                    lsproto::BooleanOrTypeDefinitionOptionsOrTypeDefinitionRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                references_provider: Some(lsproto::BooleanOrReferenceOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                implementation_provider: Some(
+                    lsproto::BooleanOrImplementationOptionsOrImplementationRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                diagnostic_provider: Some(lsproto::DiagnosticOptionsOrRegistrationOptions {
+                    options: Some(lsproto::DiagnosticOptions {
+                        inter_file_dependencies: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                completion_provider: Some(lsproto::CompletionOptions {
+                    trigger_characters: Some(
+                        ls::TRIGGER_CHARACTERS.iter().map(|c| c.to_string()).collect(),
+                    ),
+                    resolve_provider: Some(true),
+                    // !!! other options
+                    ..Default::default()
+                }),
+                signature_help_provider: Some(lsproto::SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string(), "<".to_string()]),
+                    retrigger_characters: Some(vec![")".to_string()]),
+                    ..Default::default()
+                }),
+                document_formatting_provider: Some(lsproto::BooleanOrDocumentFormattingOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                document_range_formatting_provider: Some(
+                    lsproto::BooleanOrDocumentRangeFormattingOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                document_on_type_formatting_provider: Some(lsproto::DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "{".to_string(),
+                    more_trigger_character: Some(vec![
+                        "}".to_string(),
+                        ";".to_string(),
+                        "\n".to_string(),
+                    ]),
+                }),
+                workspace_symbol_provider: Some(lsproto::BooleanOrWorkspaceSymbolOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                document_symbol_provider: Some(lsproto::BooleanOrDocumentSymbolOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                folding_range_provider: Some(
+                    lsproto::BooleanOrFoldingRangeOptionsOrFoldingRangeRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                rename_provider: Some(lsproto::BooleanOrRenameOptions {
+                    rename_options: Some(lsproto::RenameOptions {
+                        prepare_provider: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                document_highlight_provider: Some(lsproto::BooleanOrDocumentHighlightOptions {
+                    boolean: Some(true),
+                    ..Default::default()
+                }),
+                selection_range_provider: Some(
+                    lsproto::BooleanOrSelectionRangeOptionsOrSelectionRangeRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                linked_editing_range_provider: Some(
+                    lsproto::BooleanOrLinkedEditingRangeOptionsOrLinkedEditingRangeRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                inlay_hint_provider: Some(
+                    lsproto::BooleanOrInlayHintOptionsOrInlayHintRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                code_lens_provider: Some(lsproto::CodeLensOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                code_action_provider: Some(lsproto::BooleanOrCodeActionOptions {
+                    code_action_options: Some(lsproto::CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            lsproto::CodeActionKind::QUICK_FIX,
+                            lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                            lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
+                            lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
+                            lsproto::CodeActionKind::SOURCE_FIX_ALL,
+                        ]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                call_hierarchy_provider: Some(
+                    lsproto::BooleanOrCallHierarchyOptionsOrCallHierarchyRegistrationOptions {
+                        boolean: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                experimental: Some(lsproto::ExperimentalServerCapabilities {
+                    custom_source_definition_provider: Some(true),
+                    custom_multi_document_highlight_provider: Some(true),
+                }),
+                vs_references_provider: Some(true),
+                vs_on_auto_insert_provider: Some(lsproto::VSOnAutoInsertOptions {
+                    vs_trigger_characters: vec![">".to_string()],
+                }),
+                workspace: Some(lsproto::WorkspaceOptions {
+                    file_operations: Some(lsproto::FileOperationOptions {
+                        will_rename: Some(lsproto::FileOperationRegistrationOptions {
+                            filters: FILE_RENAME_FILTERS.clone(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                semantic_tokens_provider: Some(lsproto::SemanticTokensOptionsOrRegistrationOptions {
+                    options: Some(lsproto::SemanticTokensOptions {
+                        legend: ls::semantic_tokens_legend(
+                            &client_capabilities.text_document.semantic_tokens,
+                        ),
+                        full: Some(lsproto::BooleanOrSemanticTokensFullDelta {
+                            boolean: Some(true),
+                            ..Default::default()
+                        }),
+                        range: Some(lsproto::BooleanOrEmptyObject {
+                            boolean: Some(true),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        Ok(Some(response))
+    }
+}
+
+impl Server {
+    // Go: server.go:1191 handleInitialized
+    pub fn handle_initialized(
+        self: &Rc<Self>,
+        ctx: &Context,
+        _params: Option<&lsproto::InitializedParams>,
+    ) -> Result<(), GoError> {
+        let mut disable_push_diagnostics = false;
+        let mut enable_telemetry = false;
+        let initialization_options = self.shared.initialization_options();
+        if let Some(v) = initialization_options.disable_push_diagnostics {
+            disable_push_diagnostics = v;
+        }
+        if let Some(v) = initialization_options.enable_telemetry {
+            enable_telemetry = v;
+        }
+        let client_capabilities = self.shared.client_capabilities();
+        let has_dynamic_watch_registration = client_capabilities
+            .workspace
+            .did_change_watched_files
+            .dynamic_registration;
+        if has_dynamic_watch_registration {
+            self.logger.logf(
+                "file watching: using LSP client-side watching (client supports dynamic registration)",
+            );
+            self.watch_enabled.set(true);
+        } else if fswatch::default().has_fast_recursive_backend() {
+            // The client cannot watch files itself, but the builtin watcher has a
+            // backend with efficient recursive watching (Windows or FSEvents), so
+            // fall back to watching files in-process.
+            self.logger.logf(
+                "file watching: using builtin in-process watcher (client lacks dynamic watch registration)",
+            );
+            self.watch_enabled.set(true);
+            let s = self.clone();
+            *self.builtin_watcher.borrow_mut() = Some(lspwatcher::new(
+                self.fs.clone(),
+                Box::new(move |changes: Vec<lsproto::FileEvent>| {
+                    let session = s.session.borrow().clone();
+                    if let Some(session) = session {
+                        session.did_change_watched_files(&s.shared.background_ctx(), &changes);
+                    }
+                }),
+                Some(Rc::new(self.logger.clone()) as Rc<dyn logging::Logger>),
+            ));
+        } else {
+            // The client cannot watch files and the builtin watcher backend lacks
+            // efficient recursive watching, so file watching is disabled.
+            self.logger.logf(
+                "file watching: disabled (client lacks dynamic watch registration and builtin watcher backend is not fast-recursive)",
+            );
+        }
+
+        let mut cwd = self.shared.cwd.clone();
+        let initialize_params = self.shared.initialize_params();
+        let single_workspace_folder = match &initialize_params.workspace_folders {
+            Some(folders) => match &folders.workspace_folders {
+                Some(folders) if folders.len() == 1 => Some(&folders[0]),
+                _ => None,
+            },
+            None => None,
+        };
+        if client_capabilities.workspace.workspace_folders && single_workspace_folder.is_some() {
+            let folder = single_workspace_folder.expect("checked above");
+            cwd = lsproto::DocumentUri(folder.uri.0.clone()).file_name();
+        } else if let Some(root_uri) = &initialize_params.root_uri.document_uri {
+            cwd = root_uri.file_name();
+        } else if let Some(root_path) = initialize_params
+            .root_path
+            .as_ref()
+            .and_then(|root_path| root_path.string.as_ref())
+        {
+            cwd = root_path.clone();
+        }
+        if !tspath::path_is_absolute(&cwd) {
+            cwd = self.shared.cwd.clone();
+        }
+
+        self.telemetry_enabled.set(enable_telemetry);
+
+        let session = project::new_session(&project::SessionInit {
+            background_ctx: lsproto::with_client_capabilities(
+                &self.shared.background_ctx(),
+                self.shared.client_capabilities(),
+            ),
+            options: Rc::new(project::SessionOptions {
+                current_directory: cwd,
+                default_library_path: self.default_library_path.clone(),
+                typings_location: self.typings_location.clone(),
+                position_encoding: self.shared.position_encoding(),
+                watch_enabled: self.watch_enabled.get(),
+                logging_enabled: true,
+                telemetry_enabled: enable_telemetry,
+                debounce_delay: Duration::from_millis(500),
+                push_diagnostics_enabled: !disable_push_diagnostics,
+                locale: self.shared.locale(),
+                checker_pool_options: project::CheckerPoolOptions::default(),
+            }),
+            fs: self.fs.clone(),
+            logger: Some(Rc::new(self.logger.clone())),
+            client: Some(self.clone()),
+            npm_executor: Some(self.clone()),
+            parse_cache: self.parse_cache.clone(),
+        });
+        *self.session.borrow_mut() = Some(session.clone());
+
+        let user_preferences = self.request_configuration(ctx)?;
+        session.initialize_with_user_config(user_preferences);
+
+        let result = send_client_request(
+            ctx,
+            &self.shared,
+            &lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
+            lsproto::RegistrationParams {
+                registrations: vec![lsproto::Registration {
+                    id: "typescript-config-watch-id".to_string(),
+                    register_options: Some(lsproto::RegisterOptions {
+                        workspace_did_change_configuration: Some(
+                            lsproto::DidChangeConfigurationRegistrationOptions {
+                                section: Some(lsproto::StringOrStrings {
+                                    strings: Some(vec![
+                                        "js/ts".to_string(),
+                                        "typescript".to_string(),
+                                        "javascript".to_string(),
+                                        "editor".to_string(),
+                                    ]),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                }],
+            },
+        );
+        if let Err(err) = result {
+            return Err(errors::errorf(
+                format!(
+                    "failed to register configuration change watcher: {}",
+                    err.error()
+                ),
+                vec![err],
+            ));
+        }
+
+        // !!! temporary.
+        // Remove when we have `handleDidChangeConfiguration`/implicit project config support
+        // derived from 'js/ts.implicitProjectConfig.*'.
+        let compiler_options_for_inferred_projects =
+            self.compiler_options_for_inferred_projects.borrow().clone();
+        if compiler_options_for_inferred_projects.is_some() {
+            session.did_change_compiler_options_for_inferred_projects(
+                ctx,
+                compiler_options_for_inferred_projects,
+            );
+        }
+
+        session.start_performance_telemetry();
+
+        // Go: close(s.initComplete)
+        self.init_complete.set(true);
+        Ok(())
+    }
+
+    // Go: server.go:1296 handleShutdown
+    pub fn handle_shutdown(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::NoParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::ShutdownResponse, GoError> {
+        let builtin_watcher = self.builtin_watcher.borrow().clone();
+        if let Some(builtin_watcher) = builtin_watcher {
+            builtin_watcher.close();
+        }
+        self.session_ref().close();
+        Ok(lsproto::ShutdownResponse::default())
+    }
+
+    // Go: server.go:1304 handleExit
+    pub fn handle_exit(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::NoParams>,
+    ) -> Result<(), GoError> {
+        Err(errors::EOF.clone())
+    }
+
+    // Go: server.go:1308 handleDidChangeWorkspaceConfiguration
+    pub fn handle_did_change_workspace_configuration(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        params: Option<&lsproto::DidChangeConfigurationParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        if params.settings == LspAny::Null {
+            return Ok(());
+        } else if let LspAny::Object(settings) = &params.settings {
+            self.session_ref()
+                .configure(lsutil::parse_user_preferences(settings));
+        }
+        Ok(())
+    }
+
+    // Go: server.go:1317 handleDidOpen
+    pub fn handle_did_open(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::DidOpenTextDocumentParams>,
+    ) -> Result<(), GoError> {
+        let text_document = params
+            .expect(NIL_DEREF)
+            .text_document
+            .as_ref()
+            .expect(NIL_DEREF);
+        self.session_ref().did_open_file(
+            ctx,
+            &text_document.uri,
+            text_document.version,
+            &text_document.text,
+            &text_document.language_id,
+        );
+        Ok(())
+    }
+
+    // Go: server.go:1322 handleDidChange
+    pub fn handle_did_change(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::DidChangeTextDocumentParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        self.session_ref().did_change_file(
+            ctx,
+            &params.text_document.uri,
+            params.text_document.version,
+            &params.content_changes,
+        );
+        Ok(())
+    }
+
+    // Go: server.go:1327 handleDidSave
+    pub fn handle_did_save(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::DidSaveTextDocumentParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        self.session_ref()
+            .did_save_file(ctx, &params.text_document.uri);
+        Ok(())
+    }
+
+    // Go: server.go:1332 handleDidClose
+    pub fn handle_did_close(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::DidCloseTextDocumentParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        self.session_ref()
+            .did_close_file(ctx, &params.text_document.uri);
+        Ok(())
+    }
+
+    // Go: server.go:1337 handleDidChangeWatchedFiles
+    pub fn handle_did_change_watched_files(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::DidChangeWatchedFilesParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        self.session_ref()
+            .did_change_watched_files(ctx, &params.changes);
+        Ok(())
+    }
+
+    // Go: server.go:1342 handleSetTrace
+    pub fn handle_set_trace(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::SetTraceParams>,
+    ) -> Result<(), GoError> {
+        // $/setTrace is sent by vscode-languageclient when trace settings change.
+        // Server log verbosity is controlled separately by custom/setLogVerbosity,
+        // so this handler is intentionally a no-op.
+        Ok(())
+    }
+
+    // Go: server.go:1349 handleSetLogVerbosity
+    pub fn handle_set_log_verbosity(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        params: Option<&lsproto::SetLogVerbosityParams>,
+    ) -> Result<(), GoError> {
+        let params = params.expect(NIL_DEREF);
+        if !is_valid_log_verbosity(params.verbosity) {
+            let code = errors::from_value(ErrorCode::INVALID_PARAMS);
+            return Err(errors::errorf(
+                format!(
+                    "{}: invalid log verbosity {}",
+                    code.error(),
+                    params.verbosity.0
+                ),
+                vec![code],
+            ));
+        }
+        self.logger.set_verbosity(params.verbosity);
+        Ok(())
+    }
+
+    // Go: server.go:1357 handleDocumentDiagnostic
+    pub fn handle_document_diagnostic(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentDiagnosticParams,
+    ) -> Result<lsproto::DocumentDiagnosticResponse, GoError> {
+        let ctx = crate::frontend::core_context::with_checker_lifetime(
+            ctx,
+            crate::frontend::core_context::CheckerLifetime::DIAGNOSTICS,
+        );
+        ls.provide_diagnostics(&ctx, &params.text_document.uri)
+    }
+
+    // Go: server.go:1362 handleHover
+    pub fn handle_hover(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::HoverParams,
+    ) -> Result<lsproto::HoverResponse, GoError> {
+        ls.provide_hover(ctx, params)
+    }
+
+    // Go: server.go:1366 handlePrepareRename
+    pub fn handle_prepare_rename(
+        self: &Rc<Self>,
+        ctx: &Context,
+        language_service: &ls::LanguageService,
+        params: &lsproto::PrepareRenameParams,
+    ) -> Result<lsproto::PrepareRenameResponse, GoError> {
+        let info = language_service.get_rename_info(
+            ctx,
+            "", /*newName*/
+            &params.text_document.uri,
+            params.position,
+        );
+        if !info.can_rename {
+            return Err(user_facing_request_failed_error(
+                info.localized_error_message,
+            ));
+        }
+        Ok(lsproto::PrepareRenameResponse {
+            prepare_rename_placeholder: Some(lsproto::PrepareRenamePlaceholder {
+                range: info.trigger_span,
+                placeholder: info.display_name,
+            }),
+            ..Default::default()
+        })
+    }
+
+    // Go: server.go:1379 handleRename
+    pub fn handle_rename(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::RenameParams>,
+        req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::RenameResponse, GoError> {
+        let params = params.expect(NIL_DEREF);
+        let (default_ls, orchestrator) = self.get_language_service_and_cross_project_orchestrator(
+            ctx,
+            &params.text_document.uri,
+            req,
+        )?;
+        let info = default_ls.get_rename_info(
+            ctx,
+            &params.new_name,
+            &params.text_document.uri,
+            params.position,
+        );
+        if info.can_rename && !info.file_to_rename.is_empty() {
+            // We send a `willRenameFiles` request if the client allows;
+            // otherwise we directly compute the edits for renaming the file.
+            if ls::client_supports_will_rename_files(ctx) {
+                let document_changes = vec![
+                    lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
+                        rename_file: Some(lsproto::RenameFile {
+                            kind: lsproto::StringLiteralRename,
+                            old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename),
+                            new_uri: lsconv::file_name_to_document_uri(&info.new_file_name),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ];
+                return Ok(lsproto::WorkspaceEditOrNull {
+                    workspace_edit: Some(lsproto::WorkspaceEdit {
+                        document_changes: Some(document_changes),
+                        ..Default::default()
+                    }),
+                });
+            }
+            let rename_files_params = lsproto::RenameFilesParams {
+                files: vec![lsproto::FileRename {
+                    old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename).0,
+                    new_uri: lsconv::file_name_to_document_uri(&info.new_file_name).0,
+                }],
+            };
+            return self.handle_will_rename_files_worker(
+                ctx,
+                &rename_files_params,
+                req,
+                true, /*sendRenameFile*/
+            );
+        }
+
+        default_ls.provide_rename(ctx, params, Some(&orchestrator))
+    }
+
+    // Go: server.go:1416 handleWillRenameFiles
+    pub fn handle_will_rename_files(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::RenameFilesParams>,
+        msg: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::WillRenameFilesResponse, GoError> {
+        self.handle_will_rename_files_worker(
+            ctx,
+            params.expect(NIL_DEREF),
+            msg,
+            false, /*sendRenameFile*/
+        )
+    }
+
+    // Go: server.go:1423 handleWillRenameFilesWorker
+    // If `sendRenameFile` is true, the original `willRenameFiles` request is being handled as part of a rename operation
+    // where the client doesn't support `willRenameFiles`,
+    // so we should include the file rename in the edits we return
+    pub fn handle_will_rename_files_worker(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: &lsproto::RenameFilesParams,
+        _req: &Rc<lsproto::RequestMessage>,
+        send_rename_file: bool,
+    ) -> Result<lsproto::WillRenameFilesResponse, GoError> {
+        if params.files.is_empty() {
+            return Ok(lsproto::WillRenameFilesResponse::default());
+        }
+
+        let mut uris: Vec<lsproto::DocumentUri> = Vec::with_capacity(params.files.len());
+        for file in &params.files {
+            uris.push(lsproto::DocumentUri(file.old_uri.clone()));
+        }
+
+        if uris.is_empty() {
+            return Ok(lsproto::WillRenameFilesResponse::default());
+        }
+
+        let services = self
+            .session_ref()
+            .get_language_services_for_documents(ctx, &uris);
+
+        // Go: type editKey struct { uri lsproto.DocumentUri; range_ lsproto.Range }
+        let mut seen_edits: FxHashMap<(lsproto::DocumentUri, lsproto::Range), String> =
+            FxHashMap::default();
+        let mut seen_renames: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
+        let mut document_changes: Vec<
+            lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile,
+        > = Vec::new();
+
+        for language_service in &services {
+            // PORT: every service is alive here; make this one's program
+            // current while it runs (ls::LanguageService::enter_program).
+            let _program = language_service.enter_program();
+            for file in &params.files {
+                let changes = language_service.get_edits_for_file_rename(
+                    ctx,
+                    &lsproto::DocumentUri(file.old_uri.clone()),
+                    &lsproto::DocumentUri(file.new_uri.clone()),
+                );
+                for change in changes {
+                    if let Some(rename_file) = &change.rename_file {
+                        if !seen_renames.contains(&rename_file.old_uri) {
+                            seen_renames.insert(rename_file.old_uri.clone());
+                            document_changes.push(change);
+                        }
+                    } else if let Some(text_document_edit) = &change.text_document_edit {
+                        let uri = text_document_edit.text_document.uri.clone();
+                        let mut deduped: Vec<
+                            lsproto::TextEditOrAnnotatedTextEditOrSnippetTextEdit,
+                        > = Vec::new();
+                        for edit in &text_document_edit.edits {
+                            if let Some(text_edit) = &edit.text_edit {
+                                let key = (uri.clone(), text_edit.range);
+                                if seen_edits
+                                    .get(&key)
+                                    .is_some_and(|prev| *prev == text_edit.new_text)
+                                {
+                                    continue;
+                                }
+                                seen_edits.insert(key, text_edit.new_text.clone());
+                            }
+                            deduped.push(edit.clone());
+                        }
+                        if !deduped.is_empty() {
+                            document_changes.push(
+                                lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
+                                    text_document_edit: Some(lsproto::TextDocumentEdit {
+                                        text_document: text_document_edit.text_document.clone(),
+                                        edits: deduped,
+                                    }),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if send_rename_file {
+            for file in &params.files {
+                document_changes.push(
+                    lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
+                        rename_file: Some(lsproto::RenameFile {
+                            kind: lsproto::StringLiteralRename,
+                            old_uri: lsproto::DocumentUri(file.old_uri.clone()),
+                            new_uri: lsproto::DocumentUri(file.new_uri.clone()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        if document_changes.is_empty() {
+            return Ok(lsproto::WillRenameFilesResponse::default());
+        }
+
+        if ls::client_supports_document_changes(ctx) {
+            return Ok(lsproto::WillRenameFilesResponse {
+                workspace_edit: Some(lsproto::WorkspaceEdit {
+                    document_changes: Some(document_changes),
+                    ..Default::default()
+                }),
+            });
+        }
+
+        // PORT: Go map order is random; the oracle compares this map
+        // without order. Insertion order here.
+        let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
+            IndexMap::default();
+        for change in &document_changes {
+            if let Some(text_document_edit) = &change.text_document_edit {
+                let uri = text_document_edit.text_document.uri.clone();
+                for edit in &text_document_edit.edits {
+                    if let Some(text_edit) = &edit.text_edit {
+                        changes
+                            .entry(uri.clone())
+                            .or_default()
+                            .push(text_edit.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(lsproto::WillRenameFilesResponse {
+            workspace_edit: Some(lsproto::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+        })
+    }
+
+    // Go: server.go:1525 handleSignatureHelp
+    pub fn handle_signature_help(
+        self: &Rc<Self>,
+        ctx: &Context,
+        language_service: &ls::LanguageService,
+        params: &lsproto::SignatureHelpParams,
+    ) -> Result<lsproto::SignatureHelpResponse, GoError> {
+        language_service.provide_signature_help(
+            ctx,
+            &params.text_document.uri,
+            params.position,
+            params.context.as_ref(),
+        )
+    }
+
+    // Go: server.go:1534 handleFoldingRange
+    pub fn handle_folding_range(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::FoldingRangeParams,
+    ) -> Result<lsproto::FoldingRangeResponse, GoError> {
+        ls.provide_folding_range(ctx, &params.text_document.uri)
+    }
+
+    // Go: server.go:1538 handleVSOnAutoInsert
+    pub fn handle_vs_on_auto_insert(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::VSOnAutoInsertParams,
+    ) -> Result<lsproto::VSOnAutoInsertResponse, GoError> {
+        ls.provide_on_auto_insert(ctx, params)
+    }
+
+    // Go: server.go:1542 handleLinkedEditingRange
+    pub fn handle_linked_editing_range(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::LinkedEditingRangeParams,
+    ) -> Result<lsproto::LinkedEditingRangeResponse, GoError> {
+        ls.provide_linked_editing_range(ctx, params)
+    }
+
+    // Go: server.go:1546 handleDefinition
+    pub fn handle_definition(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DefinitionParams,
+    ) -> Result<lsproto::DefinitionResponse, GoError> {
+        ls.provide_definition(ctx, &params.text_document.uri, params.position)
+    }
+
+    // Go: server.go:1550 handleSourceDefinition
+    pub fn handle_source_definition(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::TextDocumentPositionParams,
+    ) -> Result<lsproto::CustomTextDocumentSourceDefinitionResponse, GoError> {
+        let resp = ls.provide_source_definition(ctx, &params.text_document.uri, params.position)?;
+        Ok(Some(resp))
+    }
+
+    // Go: server.go:1558 handleTypeDefinition
+    pub fn handle_type_definition(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::TypeDefinitionParams,
+    ) -> Result<lsproto::TypeDefinitionResponse, GoError> {
+        ls.provide_type_definition(ctx, &params.text_document.uri, params.position)
+    }
+
+    // Go: server.go:1562 handleCompletion
+    pub fn handle_completion(
+        self: &Rc<Self>,
+        ctx: &Context,
+        language_service: &ls::LanguageService,
+        params: &lsproto::CompletionParams,
+    ) -> Result<lsproto::CompletionResponse, GoError> {
+        language_service.provide_completion(
+            ctx,
+            &params.text_document.uri,
+            params.position,
+            params.context.as_ref(),
+        )
+    }
+
+    // Go: server.go:1571 handleCompletionItemResolve
+    pub fn handle_completion_item_resolve(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::CompletionItem>,
+        req_msg: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CompletionResolveResponse, GoError> {
+        let params = params.expect(NIL_DEREF);
+        let data = params.data.clone();
+        let language_service = self.session_ref().get_language_service(
+            ctx,
+            &lsconv::file_name_to_document_uri(&data.as_ref().expect(NIL_DEREF).file_name),
+        )?;
+        self.recover_guard(
+            req_msg,
+            || Ok(None),
+            || {
+                language_service
+                    .resolve_completion_item(ctx, params.clone(), data)
+                    .map(Some)
+            },
+        )
+    }
+
+    // Go: server.go:1585 handleDocumentFormat
+    pub fn handle_document_format(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentFormattingParams,
+    ) -> Result<lsproto::DocumentFormattingResponse, GoError> {
+        ls.provide_format_document(
+            ctx,
+            &params.text_document.uri,
+            params.options.as_ref().expect(NIL_DEREF),
+        )
+    }
+
+    // Go: server.go:1593 handleDocumentRangeFormat
+    pub fn handle_document_range_format(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentRangeFormattingParams,
+    ) -> Result<lsproto::DocumentRangeFormattingResponse, GoError> {
+        ls.provide_format_document_range(
+            ctx,
+            &params.text_document.uri,
+            params.options.as_ref().expect(NIL_DEREF),
+            params.range,
+        )
+    }
+
+    // Go: server.go:1602 handleDocumentOnTypeFormat
+    pub fn handle_document_on_type_format(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentOnTypeFormattingParams,
+    ) -> Result<lsproto::DocumentOnTypeFormattingResponse, GoError> {
+        ls.provide_format_document_on_type(
+            ctx,
+            &params.text_document.uri,
+            params.options.as_ref().expect(NIL_DEREF),
+            params.position,
+            &params.ch,
+        )
+    }
+
+    // Go: server.go:1612 handleWorkspaceSymbol
+    pub fn handle_workspace_symbol(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::WorkspaceSymbolParams>,
+        req_msg: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::WorkspaceSymbolResponse, GoError> {
+        let params = params.expect(NIL_DEREF);
+        let mut resp = lsproto::WorkspaceSymbolResponse::default();
+        let mut ls_err: Option<GoError> = None;
+        self.session_ref()
+            .with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<Snapshot>| {
+                self.recover_guard(
+                    req_msg,
+                    || (),
+                    || {
+                        // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
+                        let programs: Vec<&'static compiler::NewProgram> = snapshot
+                            .project_collection
+                            .projects()
+                            .iter()
+                            .map(|p| p.borrow().get_program().expect(NIL_DEREF))
+                            .collect();
+                        match ls::provide_workspace_symbols(
+                            ctx,
+                            &programs,
+                            &snapshot.converters(),
+                            &snapshot.user_preferences(),
+                            &params.query,
+                        ) {
+                            Ok(r) => {
+                                resp = r;
+                                ls_err = None;
+                            }
+                            Err(err) => {
+                                resp = lsproto::WorkspaceSymbolResponse::default();
+                                ls_err = Some(err);
+                            }
+                        }
+                    },
+                );
+            });
+        match ls_err {
+            Some(err) => Err(err),
+            None => Ok(resp),
+        }
+    }
+
+    // Go: server.go:1629 handleDocumentSymbol
+    pub fn handle_document_symbol(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentSymbolParams,
+    ) -> Result<lsproto::DocumentSymbolResponse, GoError> {
+        ls.provide_document_symbols(ctx, &params.text_document.uri)
+    }
+
+    // Go: server.go:1633 handleDocumentHighlight
+    pub fn handle_document_highlight(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::DocumentHighlightParams,
+    ) -> Result<lsproto::DocumentHighlightResponse, GoError> {
+        ls.provide_document_highlights(ctx, &params.text_document.uri, params.position)
+    }
+
+    // Go: server.go:1637 handleMultiDocumentHighlight
+    pub fn handle_multi_document_highlight(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::MultiDocumentHighlightParams,
+    ) -> Result<lsproto::CustomMultiDocumentHighlightResponse, GoError> {
+        ls.provide_multi_document_highlights(
+            ctx,
+            &params.text_document.uri,
+            params.position,
+            &params.files_to_search,
+        )
+    }
+
+    // Go: server.go:1641 handleSelectionRange
+    pub fn handle_selection_range(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::SelectionRangeParams,
+    ) -> Result<lsproto::SelectionRangeResponse, GoError> {
+        ls.provide_selection_ranges(ctx, params)
+    }
+
+    // Go: server.go:1645 handleCodeAction
+    pub fn handle_code_action(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::CodeActionParams,
+    ) -> Result<lsproto::CodeActionResponse, GoError> {
+        ls.provide_code_actions(ctx, params)
+    }
+
+    // Go: server.go:1649 handleInlayHint
+    pub fn handle_inlay_hint(
+        self: &Rc<Self>,
+        ctx: &Context,
+        language_service: &ls::LanguageService,
+        params: &lsproto::InlayHintParams,
+    ) -> Result<lsproto::InlayHintResponse, GoError> {
+        language_service.provide_inlay_hint(ctx, params)
+    }
+
+    // Go: server.go:1657 handleCodeLens
+    pub fn handle_code_lens(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::CodeLensParams,
+    ) -> Result<lsproto::CodeLensResponse, GoError> {
+        ls.provide_code_lenses(ctx, &params.text_document.uri)
+    }
+
+    // Go: server.go:1661 handleCodeLensResolve
+    pub fn handle_code_lens_resolve(
+        self: &Rc<Self>,
+        ctx: &Context,
+        code_lens: Option<&lsproto::CodeLens>,
+        req_msg: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CodeLensResolveResponse, GoError> {
+        let code_lens = code_lens.expect(NIL_DEREF);
+        let result = self.get_language_service_and_cross_project_orchestrator(
+            ctx,
+            &code_lens.data.as_ref().expect(NIL_DEREF).uri,
+            req_msg,
+        );
+        if let Some(err) = ctx.err() {
+            return Err(err);
+        }
+        let (default_ls, orchestrator) = match result {
+            Ok(v) => v,
+            Err(_) => {
+                // This can happen if a codeLens/resolve request comes in after a program change.
+                // While it's true that handlers should latch onto a specific snapshot
+                // while processing requests, we just set `Data.Uri` based on
+                // some older snapshot's contents. The content could have been modified,
+                // or the file itself could have been removed from the session entirely.
+                // Note this won't bail out on every change, but will prevent crashing
+                // based on non-existent files and line maps from shortened files.
+                // PORT: Go also returns `codeLens`; the error wins.
+                return Err(errors::from_value(ErrorCode::CONTENT_MODIFIED));
+            }
+        };
+        self.recover_guard(
+            req_msg,
+            || Ok(None),
+            || {
+                default_ls
+                    .resolve_code_lens(
+                        ctx,
+                        code_lens.clone(),
+                        self.shared
+                            .initialization_options()
+                            .code_lens_show_locations_command_name
+                            .clone(),
+                        Some(&orchestrator),
+                    )
+                    .map(Some)
+            },
+        )
+    }
+
+    // Go: server.go:1685 handlePrepareCallHierarchy
+    pub fn handle_prepare_call_hierarchy(
+        self: &Rc<Self>,
+        ctx: &Context,
+        language_service: &ls::LanguageService,
+        params: &lsproto::CallHierarchyPrepareParams,
+    ) -> Result<lsproto::CallHierarchyPrepareResponse, GoError> {
+        language_service.provide_prepare_call_hierarchy(
+            ctx,
+            &params.text_document.uri,
+            params.position,
+        )
+    }
+
+    // Go: server.go:1693 handleCallHierarchyIncomingCalls
+    pub fn handle_call_hierarchy_incoming_calls(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::CallHierarchyIncomingCallsParams>,
+        req_msg: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CallHierarchyIncomingCallsResponse, GoError> {
+        let item = params.expect(NIL_DEREF).item.as_ref().expect(NIL_DEREF);
+        let (default_ls, orchestrator) =
+            self.get_language_service_and_cross_project_orchestrator(ctx, &item.uri, req_msg)?;
+        default_ls.provide_call_hierarchy_incoming_calls(ctx, item, Some(&orchestrator))
+    }
+
+    // Go: server.go:1705 handleCallHierarchyOutgoingCalls
+    pub fn handle_call_hierarchy_outgoing_calls(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::CallHierarchyOutgoingCallsParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CallHierarchyOutgoingCallsResponse, GoError> {
+        let item = params.expect(NIL_DEREF).item.as_ref().expect(NIL_DEREF);
+        let language_service = self.session_ref().get_language_service(ctx, &item.uri)?;
+        language_service.provide_call_hierarchy_outgoing_calls(ctx, item)
+    }
+
+    // Go: server.go:1717 handleSemanticTokensFull
+    pub fn handle_semantic_tokens_full(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::SemanticTokensParams,
+    ) -> Result<lsproto::SemanticTokensResponse, GoError> {
+        ls.provide_semantic_tokens(ctx, &params.text_document.uri)
+    }
+
+    // Go: server.go:1721 handleSemanticTokensRange
+    pub fn handle_semantic_tokens_range(
+        self: &Rc<Self>,
+        ctx: &Context,
+        ls: &ls::LanguageService,
+        params: &lsproto::SemanticTokensRangeParams,
+    ) -> Result<lsproto::SemanticTokensRangeResponse, GoError> {
+        ls.provide_semantic_tokens_range(ctx, &params.text_document.uri, params.range)
+    }
+
+    // Go: server.go:1725 handleInitializeAPISession
+    // PORT: `apiSessionsMu` is dropped (dispatch thread).
+    pub fn handle_initialize_api_session(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        params: Option<&lsproto::InitializeAPISessionParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CustomInitializeAPISessionResponse, GoError> {
+        if self.api_sessions.borrow().is_none() {
+            *self.api_sessions.borrow_mut() = Some(FxHashMap::default());
+        }
+
+        let api_session = api::new_session(self.session_ref(), None);
+
+        // Use provided pipe path or generate a unique one
+        let params = params.expect(NIL_DEREF);
+        let pipe_path = match &params.pipe {
+            Some(pipe) if !pipe.is_empty() => pipe.clone(),
+            _ => self.generate_api_pipe_path(),
+        };
+
+        let transport = match api::new_pipe_transport(&pipe_path) {
+            Ok(transport) => transport,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("failed to create API transport: {}", err.error()),
+                    vec![err],
+                ));
+            }
+        };
+
+        // Start accepting connections in the background
+        // PORT: the API connection reads the project session, which lives on
+        // the dispatch thread, so the Go goroutine is a `gostd::local::go`
+        // job. It runs after this request; while it waits in `Accept` and
+        // while the connection runs, the dispatch thread serves only the
+        // API connection.
+        {
+            let s = self.clone();
+            let api_session = api_session.clone();
+            gostd::local::go(Box::new(move || {
+                let accept_result = transport.accept();
+                let _ = transport.close();
+                match accept_result {
+                    Err(accept_err) => {
+                        s.logger.errorf(&format!(
+                            "API session {}: failed to accept connection: {}",
+                            api_session.id(),
+                            accept_err.error()
+                        ));
+                    }
+                    Ok(rwc) => {
+                        // Create a cancellable context for the API connection
+                        let (api_ctx, api_cancel) =
+                            context::with_cancel(&s.shared.background_ctx());
+
+                        // Run the connection with panic recovery
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            let conn = api::new_async_conn(rwc.clone(), api_session.clone());
+                            if let Err(api_err) = conn.run(&api_ctx) {
+                                s.logger.errorf(&format!(
+                                    "API session {}: {}",
+                                    api_session.id(),
+                                    api_err.error()
+                                ));
+                            }
+                        }));
+                        if let Err(r) = result {
+                            let stack = std::backtrace::Backtrace::capture().to_string();
+                            s.logger.errorf(&format!(
+                                "API session {}: panic: {}\n{}",
+                                api_session.id(),
+                                panic_value_string(r.as_ref()),
+                                stack
+                            ));
+                            // Cancel the context to shut down the connection
+                            api_cancel();
+                            // Close the underlying connection
+                            let _ = rwc.close();
+                        }
+                        // Go: defer apiCancel()
+                        api_cancel();
+                    }
+                }
+                // Go: defer { apiSession.Close(); s.removeAPISession(apiSession.ID()) }
+                api_session.close();
+                s.remove_api_session(&api_session.id());
+            }));
+        }
+
+        self.api_sessions
+            .borrow_mut()
+            .as_mut()
+            .expect("created above")
+            .insert(api_session.id(), api_session.clone());
+
+        Ok(Some(lsproto::InitializeAPISessionResult {
+            session_id: api_session.id(),
+            pipe: pipe_path,
+        }))
+    }
+
+    // Go: server.go:1793 generateAPIPipePath
+    // PORT: Go `rand.Uint64()`; the port has no rand crate and takes 64
+    // random bits from std's randomly keyed hasher.
+    pub fn generate_api_pipe_path(&self) -> String {
+        use std::hash::{BuildHasher, Hasher};
+        // Generate a high-entropy path using time and random source
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i64,
+            Err(e) => -(e.duration().as_nanos() as i64),
+        };
+        let rnd = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        api::generate_pipe_path(&format!("tsgo-api-{now:x}-{rnd:x}"))
+    }
+
+    // Go: server.go:1800 removeAPISession
+    pub fn remove_api_session(&self, id: &str) {
+        if let Some(api_sessions) = self.api_sessions.borrow_mut().as_mut() {
+            api_sessions.remove(id);
+        }
+    }
+
+    // Go: server.go:1807 SetCompilerOptionsForInferredProjects
+    // !!! temporary; remove when we have `handleDidChangeConfiguration`/implicit project config support
+    pub fn set_compiler_options_for_inferred_projects(
+        &self,
+        ctx: &Context,
+        options: Option<Rc<CompilerOptions>>,
+    ) {
+        *self.compiler_options_for_inferred_projects.borrow_mut() = options.clone();
+        if let Some(session) = self.session() {
+            session.did_change_compiler_options_for_inferred_projects(ctx, options);
+        }
+    }
+}
+
+impl ata::NpmExecutor for Server {
+    // Go: server.go:1815 NpmInstall
+    // NpmInstall implements ata.NpmExecutor
+    fn npm_install(&self, cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>) {
+        (self.npm_install.as_ref().expect(NIL_DEREF))(cwd, args)
+    }
+}
+
+// Developer/debugging command handlers
+
+impl Server {
+    // Go: server.go:1821 handleRunGC
+    // PORT: pprof is not ported.
+    pub fn handle_run_gc(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::NoParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::RunGCResponse, GoError> {
+        unported!("pprof.RunGC")
+    }
+
+    // Go: server.go:1827 handleSaveHeapProfile
+    // PORT: pprof is not ported.
+    pub fn handle_save_heap_profile(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::ProfileParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::SaveHeapProfileResponse, GoError> {
+        unported!("pprof.SaveHeapProfile")
+    }
+
+    // Go: server.go:1836 handleSaveAllocProfile
+    // PORT: pprof is not ported.
+    pub fn handle_save_alloc_profile(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::ProfileParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::SaveAllocProfileResponse, GoError> {
+        unported!("pprof.SaveAllocProfile")
+    }
+
+    // Go: server.go:1845 handleStartCPUProfile
+    // PORT: pprof is not ported.
+    pub fn handle_start_cpu_profile(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::ProfileParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::StartCPUProfileResponse, GoError> {
+        unported!("pprof.CPUProfiler.StartCPUProfile")
+    }
+
+    // Go: server.go:1854 handleStopCPUProfile
+    // PORT: pprof is not ported.
+    pub fn handle_stop_cpu_profile(
+        self: &Rc<Self>,
+        _ctx: &Context,
+        _params: Option<&lsproto::NoParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::StopCPUProfileResponse, GoError> {
+        unported!("pprof.CPUProfiler.StopCPUProfile")
+    }
+
+    // Go: server.go:1863 handleProjectInfo
+    pub fn handle_project_info(
+        self: &Rc<Self>,
+        ctx: &Context,
+        params: Option<&lsproto::ProjectInfoParams>,
+        _req: &Rc<lsproto::RequestMessage>,
+    ) -> Result<lsproto::CustomProjectInfoResponse, GoError> {
+        let uri = &params.expect(NIL_DEREF).text_document.uri;
+        let (default_project, _, _) = self
+            .session_ref()
+            .get_language_service_and_projects_for_file(ctx, uri)?;
+        let mut config_file_path = String::new();
+        let default_project = default_project.borrow();
+        if default_project.kind == project::Kind::CONFIGURED {
+            config_file_path = default_project.name();
+        }
+        Ok(Some(lsproto::ProjectInfoResult { config_file_path }))
+    }
+}

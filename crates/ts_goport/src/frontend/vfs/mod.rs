@@ -2,6 +2,7 @@
 pub mod cachedvfs;
 pub mod mod_impl;
 pub mod osvfs;
+pub mod trackingvfs;
 pub mod vfsmatch;
 pub mod wrapvfs;
 pub use cachedvfs::*;

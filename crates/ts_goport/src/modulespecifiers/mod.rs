@@ -10,6 +10,7 @@
 
 pub mod compare;
 pub mod deps;
+pub mod entrypoint_ending;
 pub mod host;
 pub mod packagejson;
 pub mod preferences;
@@ -19,6 +20,7 @@ pub mod types;
 pub mod util;
 
 pub use compare::*;
+pub use entrypoint_ending::*;
 pub use host::ProgramHost;
 pub use preferences::*;
 pub use specifiers::*;

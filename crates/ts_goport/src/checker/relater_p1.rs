@@ -1717,40 +1717,52 @@ impl Checker {
 
     // PORT: perf. `is_deeply_nested_type` for the inference stacks. `ids[i]`
     // is `stack_recursion_id(stack[i])`. An entry with an id is compared
-    // directly. The probe type and the `None` entries run the Go code, so
+    // directly. `probe_id` is `stack_recursion_id(t)` when the caller has it
+    // (`invoke_once` probes with the entry it just pushed), else `None`. A
+    // probe with an id is not an instantiated mapped type or an
+    // intersection, so the Go code would only compute that same id. The
+    // other probes and the `None` entries run the Go code, so
     // `get_mapped_target_with_symbol` runs for the same types in Go order.
     // The relater stacks keep `is_deeply_nested_type`.
     // Go: checker/relater.go:773 isDeeplyNestedType
     pub fn is_deeply_nested_type_with_ids(
         &mut self,
         t: TypeId,
+        probe_id: Option<RecursionId>,
         stack: &[TypeId],
         ids: &[Option<RecursionId>],
         max_depth: i32,
     ) -> bool {
         debug_assert_eq!(stack.len(), ids.len());
-        let mut t = t;
+        debug_assert!(probe_id.is_none() || probe_id == self.stack_recursion_id(t));
         if stack.len() as i32 >= max_depth {
-            if self
-                .ty(t)
-                .object_flags
-                .contains(ObjectFlags::INSTANTIATED_MAPPED)
-            {
-                t = self.get_mapped_target_with_symbol(t);
-            }
-            if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                for i in 0..self.ty(t).types().len() {
-                    if self.is_deeply_nested_type_with_ids(
-                        self.type_at(t, i),
-                        stack,
-                        ids,
-                        max_depth,
-                    ) {
-                        return true;
+            let identity = match probe_id {
+                Some(id) => id,
+                None => {
+                    let mut t = t;
+                    if self
+                        .ty(t)
+                        .object_flags
+                        .contains(ObjectFlags::INSTANTIATED_MAPPED)
+                    {
+                        t = self.get_mapped_target_with_symbol(t);
                     }
+                    if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
+                        for i in 0..self.ty(t).types().len() {
+                            if self.is_deeply_nested_type_with_ids(
+                                self.type_at(t, i),
+                                None,
+                                stack,
+                                ids,
+                                max_depth,
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                    self.get_recursion_identity(t)
                 }
-            }
-            let identity = self.get_recursion_identity(t);
+            };
             let mut count: i32 = 0;
             let mut last_type_id = TypeId(0);
             for (&t, &id) in stack.iter().zip(ids) {
