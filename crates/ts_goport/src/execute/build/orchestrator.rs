@@ -15,6 +15,11 @@
 //! reported, a task starts when its upstream tasks are done, workers run in
 //! parallel, and tasks report in `order`.
 //!
+//! PORT: Go shares `o.host`'s cached file system with every task. Each
+//! worker gets the orchestrator's cache when it starts, and its additions
+//! are merged back when its program is made and when its result arrives
+//! (see shared_fs.rs, which also says what stays timing dependent).
+//!
 //! PORT: the aggregate `--extendedDiagnostics` statistics are not
 //! collected (see build_task.rs); `report` calls `unported!` when they are
 //! asked for.
@@ -24,7 +29,7 @@ use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, parse_build_command_line};
 use crate::execute::build::host::BuildHost;
 use crate::execute::build::worker::{
-    SystemParseConfigHost, WorkerLauncher, compare_paths_options_of_sys,
+    SystemParseConfigHost, WorkerLauncher, compare_paths_options_of_sys, marshal_worker_fs_cache,
 };
 use crate::execute::incremental::build_info::BuildInfo;
 use crate::execute::incremental::incremental::new_build_info_reader;
@@ -377,6 +382,12 @@ impl Orchestrator {
             Running,
             Done,
         }
+        // A running worker sends its program's file system cache entries
+        // before its result (see shared_fs.rs).
+        enum WorkerMessage {
+            ProgramFsCache(CachedFsState),
+            Done(WorkerCompileResult),
+        }
         let num_routines = self.num_routines();
         if num_routines <= 0 {
             return;
@@ -390,7 +401,7 @@ impl Orchestrator {
             .map(|(i, p)| (p.clone(), i))
             .collect();
         let mut states = vec![State::NotTaken; paths.len()];
-        let (tx, rx) = mpsc::channel::<(usize, WorkerCompileResult)>();
+        let (tx, rx) = mpsc::channel::<(usize, WorkerMessage)>();
         let mut next_task = 0;
         let mut next_report = 0;
         let mut taken = 0;
@@ -433,9 +444,13 @@ impl Orchestrator {
                 } else if task.build_project_start(self, &paths[index]) {
                     let worker = self.opts.worker.clone();
                     let config = task.config.clone();
+                    let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
                     let tx = tx.clone();
                     std::thread::spawn(move || {
-                        let _ = tx.send((index, worker.run(&config)));
+                        let result = worker.run(&config, &fs_cache, &mut |state| {
+                            let _ = tx.send((index, WorkerMessage::ProgramFsCache(state)));
+                        });
+                        let _ = tx.send((index, WorkerMessage::Done(result)));
                     });
                     states[index] = State::Running;
                 } else {
@@ -451,7 +466,15 @@ impl Orchestrator {
                 progressed = true;
             }
             if !progressed {
-                let (index, result) = rx.recv().expect("a build worker is running");
+                let (index, message) = rx.recv().expect("a build worker is running");
+                let result = match message {
+                    WorkerMessage::Done(result) => result,
+                    WorkerMessage::ProgramFsCache(program_fs_cache) => {
+                        self.host.cached_fs.load_state(&program_fs_cache);
+                        continue;
+                    }
+                };
+                self.host.cached_fs.load_state(&result.fs_cache);
                 let task = self.get_task(&paths[index]);
                 task.borrow_mut()
                     .build_project_finish(self, &paths[index], result);
@@ -575,7 +598,12 @@ impl BuildTaskOrchestrator for Orchestrator {
     }
 
     fn compile_and_emit_in_worker(&self, config: &str, _config_path: &Path) -> WorkerCompileResult {
-        self.opts.worker.run(config)
+        let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
+        let result = self.opts.worker.run(config, &fs_cache, &mut |state| {
+            self.host.cached_fs.load_state(&state);
+        });
+        self.host.cached_fs.load_state(&result.fs_cache);
+        result
     }
 }
 

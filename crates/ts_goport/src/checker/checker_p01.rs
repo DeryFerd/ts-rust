@@ -315,6 +315,9 @@ pub struct InferenceContext {
     pub outer_return_mapper: MapperId,
     /// Inferred type parameters for function result
     pub inferred_type_parameters: Vec<TypeId>,
+    // PORT: slice identity of `inferred_type_parameters` (see
+    // `Signature::type_parameters_origin`); 0 while the list is empty.
+    pub inferred_type_parameters_origin: u32,
     pub intra_expression_inference_sites: Vec<IntraExpressionInferenceSite>,
 }
 
@@ -333,6 +336,7 @@ impl Default for InferenceContext {
             return_mapper: MapperId::NIL,
             outer_return_mapper: MapperId::NIL,
             inferred_type_parameters: Vec::new(),
+            inferred_type_parameters_origin: 0,
             intra_expression_inference_sites: Vec::new(),
         }
     }
@@ -603,6 +607,11 @@ pub struct Checker {
     pub type_count: u32,
     pub symbol_count: u32,
     pub signature_count: u32,
+    // PORT: counter for `Signature::type_parameters_origin`, and the origin
+    // of each class's `LocalTypeParameters()` slice (Go returns the same
+    // slice on every call).
+    pub type_parameters_origin_count: u32,
+    pub class_type_parameters_origins: FxHashMap<TypeId, u32>,
     pub total_instantiation_count: u32,
     pub instantiation_count: u32,
     pub instantiation_depth: u32,
@@ -1038,6 +1047,8 @@ impl Checker {
             type_count: 0,
             symbol_count: 0,
             signature_count: 0,
+            type_parameters_origin_count: 0,
+            class_type_parameters_origins: FxHashMap::default(),
             total_instantiation_count: 0,
             instantiation_count: 0,
             instantiation_depth: 0,

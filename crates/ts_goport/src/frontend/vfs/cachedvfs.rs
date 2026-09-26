@@ -65,6 +65,114 @@ impl CachedFs {
     }
 }
 
+// PORT: not in Go. Go `tsc -b` runs every project of a build cycle on one
+// cached file system (build/orchestrator.go:618). goport_build compiles
+// each project in its own worker process (build-mode plan D1), so the
+// orchestrator hands its cache to each worker and merges back what the
+// worker added. `CachedFsState` is the content of the five caches.
+#[derive(Clone, Debug, Default)]
+pub struct CachedFsState {
+    pub directory_exists: FxHashMap<String, bool>,
+    pub file_exists: FxHashMap<String, bool>,
+    pub get_accessible_entries: FxHashMap<String, Entries>,
+    pub realpath: FxHashMap<String, String>,
+    pub stat: FxHashMap<String, Option<FileInfo>>,
+}
+
+impl CachedFsState {
+    pub fn is_empty(&self) -> bool {
+        self.directory_exists.is_empty()
+            && self.file_exists.is_empty()
+            && self.get_accessible_entries.is_empty()
+            && self.realpath.is_empty()
+            && self.stat.is_empty()
+    }
+}
+
+// The entries of `cache` whose key is in none of `excluded`.
+fn entries_excluding<V: Clone>(
+    cache: &RefCell<FxHashMap<String, V>>,
+    excluded: &[&FxHashMap<String, V>],
+) -> FxHashMap<String, V> {
+    cache
+        .borrow()
+        .iter()
+        .filter(|(key, _)| !excluded.iter().any(|map| map.contains_key(*key)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+// Adds the entries of `state` that `cache` does not have. A lookup that is
+// already cached is not replaced: it was made first.
+fn load_entries<V: Clone>(cache: &RefCell<FxHashMap<String, V>>, state: &FxHashMap<String, V>) {
+    let mut cache = cache.borrow_mut();
+    for (key, value) in state {
+        if !cache.contains_key(key) {
+            cache.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+impl CachedFs {
+    // PORT: not in Go (see `CachedFsState`). The cached entries whose key is
+    // in none of `excluded`: after `load_state(base)`, `state_excluding(&[base])`
+    // is what this cache added.
+    pub fn state_excluding(&self, excluded: &[&CachedFsState]) -> CachedFsState {
+        CachedFsState {
+            directory_exists: entries_excluding(
+                &self.directory_exists_cache,
+                &excluded
+                    .iter()
+                    .map(|state| &state.directory_exists)
+                    .collect::<Vec<_>>(),
+            ),
+            file_exists: entries_excluding(
+                &self.file_exists_cache,
+                &excluded
+                    .iter()
+                    .map(|state| &state.file_exists)
+                    .collect::<Vec<_>>(),
+            ),
+            get_accessible_entries: entries_excluding(
+                &self.get_accessible_entries_cache,
+                &excluded
+                    .iter()
+                    .map(|state| &state.get_accessible_entries)
+                    .collect::<Vec<_>>(),
+            ),
+            realpath: entries_excluding(
+                &self.realpath_cache,
+                &excluded.iter().map(|state| &state.realpath).collect::<Vec<_>>(),
+            ),
+            stat: entries_excluding(
+                &self.stat_cache,
+                &excluded.iter().map(|state| &state.stat).collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    // PORT: not in Go (see `CachedFsState`). All cached entries.
+    pub fn state(&self) -> CachedFsState {
+        self.state_excluding(&[])
+    }
+
+    // PORT: not in Go (see `CachedFsState`). Adds the entries of `state`
+    // that are not cached yet. Does nothing when the cache is disabled.
+    pub fn load_state(&self, state: &CachedFsState) {
+        if !self.enabled.get() {
+            return;
+        }
+        load_entries(&self.directory_exists_cache, &state.directory_exists);
+        load_entries(&self.file_exists_cache, &state.file_exists);
+        load_entries(
+            &self.get_accessible_entries_cache,
+            &state.get_accessible_entries,
+        );
+        load_entries(&self.realpath_cache, &state.realpath);
+        load_entries(&self.stat_cache, &state.stat);
+    }
+}
+
 impl Fs for CachedFs {
     // Go: cachedvfs.go:48 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {

@@ -577,13 +577,15 @@ impl Checker {
             let merged = self.get_merged_symbol(declaration.parent().symbol());
             class_type = self.get_declared_type_of_class_or_interface(merged);
         }
-        let type_parameters: Vec<TypeId> = if class_type.is_some() {
-            self.ty(class_type)
+        let (type_parameters, type_parameters_origin) = if class_type.is_some() {
+            let type_parameters = self
+                .ty(class_type)
                 .as_interface_type()
                 .local_type_parameters()
-                .to_vec()
+                .to_vec();
+            (type_parameters, self.class_type_parameters_origin(class_type))
         } else {
-            self.get_type_parameters_from_declaration(declaration)
+            self.get_type_parameters_from_declaration_ex(declaration)
         };
         if has_rest_parameter(declaration) {
             flags |= SignatureFlags::HAS_REST_PARAMETER;
@@ -611,22 +613,34 @@ impl Checker {
             TypePredicateId::NIL, /*resolvedTypePredicate*/
             min_argument_count,
         );
+        self.sig_mut(sig).type_parameters_origin = type_parameters_origin;
         self.signature_links.get(declaration).resolved_signature = sig;
         sig
     }
 
     // Go: checker/checker.go:19811 getTypeParametersFromDeclaration
     pub fn get_type_parameters_from_declaration(&mut self, declaration: Node) -> Vec<TypeId> {
+        self.get_type_parameters_from_declaration_ex(declaration).0
+    }
+
+    // PORT: `getTypeParametersFromDeclaration` plus the slice identity of
+    // the result (`Signature::type_parameters_origin`): Go returns the
+    // full signature's own slice, or a new one.
+    pub fn get_type_parameters_from_declaration_ex(
+        &mut self,
+        declaration: Node,
+    ) -> (Vec<TypeId>, u32) {
         let sig = self.get_signature_of_full_signature_type(declaration);
         if sig.is_some() {
-            return self.sig(sig).type_parameters().to_vec();
+            let origin = self.share_type_parameters_origin(sig);
+            return (self.sig(sig).type_parameters().to_vec(), origin);
         }
         let mut result: Vec<TypeId> = Vec::new();
         for node in declaration.type_parameters().iter() {
             let t = self.get_declared_type_of_type_parameter(node.symbol());
             append_if_unique_p22(&mut result, t);
         }
-        result
+        (result, 0)
     }
 
     // Go: checker/checker.go:19822 getAnnotatedAccessorThisParameter

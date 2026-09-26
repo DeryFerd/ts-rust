@@ -251,6 +251,14 @@ impl Checker {
                             }
                         }
                     }
+                    // PORT: Go `core.Concatenate` returns a new slice whenever
+                    // `uniqueTypeParameters` is not empty (the fresh slice from
+                    // getUniqueTypeParameters itself, or a copy).
+                    if !unique_type_parameters.is_empty() {
+                        let origin = self.new_type_parameters_origin();
+                        self.inference_context_mut(context).inferred_type_parameters_origin =
+                            origin;
+                    }
                     self.inference_context_mut(context)
                         .inferred_type_parameters
                         .extend(unique_type_parameters.iter().copied());

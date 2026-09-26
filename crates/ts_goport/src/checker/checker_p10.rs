@@ -1032,11 +1032,11 @@ impl Checker {
                     }
                 }
                 let mut inferred_type_parameters: Vec<TypeId> = Vec::new();
+                let mut inferred_type_parameters_origin = 0;
                 if inference_context.is_some() {
-                    inferred_type_parameters = self
-                        .inference_context(inference_context)
-                        .inferred_type_parameters
-                        .clone();
+                    let context = self.inference_context(inference_context);
+                    inferred_type_parameters = context.inferred_type_parameters.clone();
+                    inferred_type_parameters_origin = context.inferred_type_parameters_origin;
                 }
                 let candidate_declaration = self.sig(candidate).declaration;
                 check_candidate = self.get_signature_instantiation(
@@ -1044,6 +1044,7 @@ impl Checker {
                     &type_argument_types,
                     is_in_js_file(candidate_declaration),
                     &inferred_type_parameters,
+                    inferred_type_parameters_origin,
                 );
                 // If the original signature has a generic rest type, instantiation may produce a
                 // signature with different arity and we need to perform another arity check.
@@ -1087,16 +1088,16 @@ impl Checker {
                         s.arg_check_mode,
                         inference_context,
                     );
-                    let inferred_type_parameters = self
-                        .inference_context(inference_context)
-                        .inferred_type_parameters
-                        .clone();
+                    let context = self.inference_context(inference_context);
+                    let inferred_type_parameters = context.inferred_type_parameters.clone();
+                    let inferred_type_parameters_origin = context.inferred_type_parameters_origin;
                     let candidate_declaration = self.sig(candidate).declaration;
                     check_candidate = self.get_signature_instantiation(
                         candidate,
                         &type_argument_types,
                         is_in_js_file(candidate_declaration),
                         &inferred_type_parameters,
+                        inferred_type_parameters_origin,
                     );
                     // If the original signature has a generic rest type, instantiation may produce a
                     // signature with different arity and we need to perform another arity check.

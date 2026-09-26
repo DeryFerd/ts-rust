@@ -80,6 +80,10 @@ pub struct BuildHost {
     compare_paths_options: ComparePathsOptions,
 
     host: Rc<dyn CompilerHost>,
+    // PORT: the `*cachedvfs.FS` of `host`, kept so the orchestrator can
+    // share it with the build workers (see `CachedFsState`). Go reaches it
+    // as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
+    pub cached_fs: Rc<CachedFs>,
 
     // Caches that last only for build cycle and then cleared out
     pub extended_config_cache: TscExtendedConfigCache,
@@ -95,14 +99,17 @@ impl BuildHost {
     // PORT: Go builds the host inline in `NewOrchestrator`
     // (orchestrator.go:618): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
     // sys.DefaultLibraryPath(), nil, nil)` and an empty mTimes map.
+    // `NewCachedFSCompilerHost` is written out (compiler/host.go:34) to keep
+    // the cached file system.
     pub fn new(
         sys: Rc<dyn System>,
         command: Rc<ParsedBuildCommandLine>,
         compare_paths_options: ComparePathsOptions,
     ) -> BuildHost {
-        let host = new_cached_fs_compiler_host(
+        let cached_fs = cachedvfs_from(sys.fs());
+        let host = new_compiler_host(
             &sys.get_current_directory(),
-            sys.fs(),
+            cached_fs.clone(),
             &sys.default_library_path(),
             None,
             None,
@@ -112,6 +119,7 @@ impl BuildHost {
             command,
             compare_paths_options,
             host,
+            cached_fs,
             extended_config_cache: TscExtendedConfigCache::default(),
             source_files: ParseCache::default(),
             config_times: RefCell::new(FxHashMap::default()),

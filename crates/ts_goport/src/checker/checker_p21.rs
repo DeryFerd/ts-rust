@@ -1121,6 +1121,7 @@ impl Checker {
                     &type_arguments,
                     is_in_js_file(location),
                     &[],
+                    0,
                 ));
             } else {
                 result.push(sig);
@@ -1157,6 +1158,9 @@ impl Checker {
         type_arguments: &[TypeId],
         is_java_script: bool,
         inferred_type_parameters: &[TypeId],
+        // PORT: slice identity of `inferred_type_parameters`
+        // (`InferenceContext::inferred_type_parameters_origin`; 0 when empty).
+        inferred_type_parameters_origin: u32,
     ) -> SignatureId {
         let type_parameters = self.sig(sig).type_parameters.clone();
         let min_type_argument_count = self.get_min_type_argument_count(&type_parameters);
@@ -1173,8 +1177,9 @@ impl Checker {
             let return_signature = self.get_single_call_or_construct_signature(return_type);
             if return_signature.is_some() {
                 let new_return_signature = self.clone_signature(return_signature);
-                self.sig_mut(new_return_signature).type_parameters =
-                    inferred_type_parameters.to_vec();
+                let r = self.sig_mut(new_return_signature);
+                r.type_parameters = inferred_type_parameters.to_vec();
+                r.type_parameters_origin = inferred_type_parameters_origin;
                 let new_return_type = self.get_or_create_type_from_signature(new_return_signature);
                 let instantiated_mapper = self.sig(instantiated_signature).mapper;
                 self.ty_mut(new_return_type).as_object_type_mut().mapper = instantiated_mapper;
@@ -1209,10 +1214,13 @@ impl Checker {
             TypePredicateId::NIL,
             min_argument_count,
         );
+        // Go shares the type parameter slice with the clone.
+        let origin = self.share_type_parameters_origin(sig);
         let r = self.sig_mut(result);
         r.target = target;
         r.mapper = mapper;
         r.composite = composite;
+        r.type_parameters_origin = origin;
         result
     }
 
@@ -1420,6 +1428,7 @@ impl Checker {
             &type_arguments,
             is_in_js_file(declaration),
             &[], /*inferredTypeParameters*/
+            0,
         )
     }
 
@@ -1536,6 +1545,7 @@ impl Checker {
             &inferred_types,
             is_in_js_file(declaration),
             &[], /*inferredTypeParameters*/
+            0,
         )
     }
 

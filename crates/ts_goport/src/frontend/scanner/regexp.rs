@@ -7,8 +7,9 @@
 //! `DecodeJSStringRune`), so they are `Vec<u8>` here, and the private
 //! `encode_js_string_rune_bytes`, `decode_js_string_rune_bytes` and
 //! `decode_rune_in_bytes` helpers do the Go byte math on them. Lone
-//! surrogates use the valid-UTF-8 plane-16 sentinel from
-//! `scanner_util::encode_js_string_rune` instead of Go's WTF-8 bytes.
+//! surrogates use the valid-UTF-8 escape form from
+//! `scanner_util::encode_js_string_rune` (see
+//! `scanner_util::LONE_SURROGATE_MARKER`) instead of Go's WTF-8 bytes.
 //!
 //! Go `rune` values from `Scanner.char()` and `Scanner.charAt()` are `i32`
 //! (a raw byte, or -1 at the end). `match rune(ch)` stands in for a Go
@@ -1720,8 +1721,9 @@ fn code_point_to_surrogate_pair_i32(ch: i32) -> (i32, i32) {
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
 // PORT: byte form of `scanner_util::encode_js_string_rune`. A lone surrogate
-// becomes the same plane-16 sentinel (see its PORT note), so these bytes match
-// what `scan_escape_sequence` returns.
+// becomes the same escape unit (see `scanner_util::LONE_SURROGATE_MARKER`), so
+// these bytes match what `scan_escape_sequence` returns. Other runes are their
+// UTF-8 bytes. A lone U+FDD0 decodes as itself, so it needs no escape here.
 fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
     match u32::try_from(ch) {
         Ok(code) if crate::scanner_util::is_surrogate(code) => {
@@ -1732,15 +1734,20 @@ fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
 }
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
-// PORT: byte form of `scanner_util::decode_js_string_rune`. It maps the
-// plane-16 sentinel back to the lone surrogate, and keeps the Go
-// `utf8.DecodeRuneInString` results for invalid bytes.
+// PORT: byte form of `scanner_util::decode_js_string_rune`. It reads one
+// escape unit (see `scanner_util::LONE_SURROGATE_MARKER`) from the valid
+// UTF-8 prefix, and keeps the Go `utf8.DecodeRuneInString` results for
+// invalid bytes.
 fn decode_js_string_rune_bytes(s: &[u8]) -> (i32, usize) {
     let (ch, size) = decode_rune_in_bytes(s);
     if ch != RUNE_ERROR && size > 0 {
-        let (code, _) = crate::scanner_util::decode_js_string_rune(
-            std::str::from_utf8(&s[..size as usize]).unwrap_or_default(),
-        );
+        // An escape unit is at most two chars (8 bytes).
+        let head = &s[..s.len().min(8)];
+        let valid = match std::str::from_utf8(head) {
+            Ok(text) => text,
+            Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).unwrap_or_default(),
+        };
+        let (code, size) = crate::scanner_util::decode_js_string_rune(valid);
         return (code as i32, size as usize);
     }
     (ch, size as usize)

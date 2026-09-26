@@ -222,7 +222,7 @@ pub fn unquote_string(str: &str) -> String {
     result
 }
 
-/// First surrogate code point. It maps to `LONE_SURROGATE_SENTINEL_BASE`.
+/// First surrogate code point. It maps to `LONE_SURROGATE_UNIT_BASE`.
 const SURROGATE_HIGH_START: u32 = 0xD800;
 /// Go `SurrogateLowStart`.
 pub const SURROGATE_LOW_START: u32 = 0xDC00;
@@ -257,65 +257,109 @@ pub fn surrogate_pair_to_code_point(high: u32, low: u32) -> u32 {
     }
 }
 
-// PORT: Go stores a lone surrogate (U+D800..U+DFFF) as the 3-byte WTF-8
-// sentinel 0xED 0xA0..0xBF 0x80..0xBF. Those bytes are not valid UTF-8, so a
-// Rust `String` cannot hold them. This port stores a lone surrogate `cp` as
-// the plane-16 private-use code point U+10F800 + (cp - 0xD800) instead. It is
-// valid UTF-8 (4 bytes, lead byte 0xF4), and the range U+10F800..U+10FFFF has
-// exactly one code point per surrogate. The divergence: a real U+10F800..
-// U+10FFFF character in source text decodes as a lone surrogate here. Byte
-// sizes of a sentinel also differ (4, not 3), but callers only use them to
-// slice the same string.
-const LONE_SURROGATE_SENTINEL_BASE: u32 = 0x10F800;
+// PORT: Go stores a lone surrogate (U+D800..U+DFFF) in a string value as the
+// 3-byte WTF-8 form 0xED 0xA0..0xBF 0x80..0xBF. Those bytes are not valid
+// UTF-8, so a Rust `String` cannot hold them. This port uses an escape with a
+// marker character M = LONE_SURROGATE_MARKER (U+FDD0, a Unicode
+// noncharacter). One "unit" of a string value is one of:
+// - M + char(LONE_SURROGATE_UNIT_BASE + (cp - 0xD800)): the lone surrogate
+//   `cp`. The second char is in U+10F800..U+10FFFF (7 bytes in total).
+// - M + M: a real U+FDD0 (6 bytes). `encode_js_string_rune` and the scanner
+//   write a real U+FDD0 in this form, so the encoding is injective.
+// - Any other char: itself. A real U+10F800..U+10FFFF char is itself, so it
+//   does not collide with a lone surrogate.
+// `decode_js_string_rune` reads one unit. A lone M that is not followed by
+// M or a surrogate char also decodes as a real U+FDD0 (3 bytes), so a raw
+// text slice that was not escaped still reads correctly unless it holds U+FDD0
+// followed by U+FDD0 or U+10F800..U+10FFFF.
+// Divergences from Go: unit sizes are 7 and 6 bytes, not 3; callers only use
+// them to slice the same string. A real U+FDD0 in a string value that is
+// written without `escape_string_worker` (for example a symbol name) prints
+// twice. A substring search can match inside a unit.
+pub const LONE_SURROGATE_MARKER: char = '\u{FDD0}';
+const LONE_SURROGATE_MARKER_STR: &str = "\u{FDD0}";
+const LONE_SURROGATE_UNIT_BASE: u32 = 0x10F800;
 
-// UTF-8 lead byte of every code point in U+100000..U+10FFFF, which includes
-// the whole sentinel range. `combine_surrogate_pairs` uses it as a fast check.
-const LONE_SURROGATE_SENTINEL_LEAD: u8 = 0xF4;
+/// Appends the port string form of the Go rune `ch` (see
+/// `LONE_SURROGATE_MARKER`) to `out`.
+pub fn push_js_string_rune(out: &mut String, ch: u32) {
+    if is_surrogate(ch) {
+        out.push(LONE_SURROGATE_MARKER);
+        // The unit base maps the surrogate range onto valid chars.
+        out.push(
+            char::from_u32(LONE_SURROGATE_UNIT_BASE + (ch - SURROGATE_HIGH_START))
+                .unwrap_or(char::REPLACEMENT_CHARACTER),
+        );
+        return;
+    }
+    let c = char::from_u32(ch).unwrap_or(char::REPLACEMENT_CHARACTER);
+    if c == LONE_SURROGATE_MARKER {
+        out.push(LONE_SURROGATE_MARKER);
+    }
+    out.push(c);
+}
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
+// PORT: writes the escape form (see LONE_SURROGATE_MARKER), not WTF-8.
 pub fn encode_js_string_rune(ch: u32) -> String {
-    if is_surrogate(ch) {
-        // PORT: the sentinel is U+10F800 + (ch - 0xD800), not WTF-8. See
-        // LONE_SURROGATE_SENTINEL_BASE.
-        let sentinel = LONE_SURROGATE_SENTINEL_BASE + (ch - SURROGATE_HIGH_START);
-        return char::from_u32(sentinel)
-            .unwrap_or(char::REPLACEMENT_CHARACTER)
-            .to_string();
+    let mut out = String::with_capacity(8);
+    push_js_string_rune(&mut out, ch);
+    out
+}
+
+/// Escapes each real U+FDD0 in raw source text as it enters a string value
+/// (see `LONE_SURROGATE_MARKER`). Text without U+FDD0 is borrowed.
+pub fn escape_lone_surrogate_markers(text: &str) -> Cow<'_, str> {
+    if !contains_lone_surrogate_marker(text) {
+        return Cow::Borrowed(text);
     }
-    char::from_u32(ch)
-        .unwrap_or(char::REPLACEMENT_CHARACTER)
-        .to_string()
+    Cow::Owned(text.replace(LONE_SURROGATE_MARKER_STR, "\u{FDD0}\u{FDD0}"))
+}
+
+/// Reports whether `text` holds U+FDD0 (bytes EF B7 90).
+#[inline]
+pub fn contains_lone_surrogate_marker(text: &str) -> bool {
+    // The lead byte check is one fast pass. Most text has no 0xEF byte.
+    let bytes = text.as_bytes();
+    memchr::memchr(0xEF, bytes).is_some_and(|first| {
+        memchr::memmem::find(&bytes[first..], LONE_SURROGATE_MARKER_STR.as_bytes()).is_some()
+    })
 }
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
 // PORT: returns the Go `rune` as `u32`, because a lone surrogate is not a
-// valid Rust `char`. The sentinel check matches the plane-16 sentinel (see
-// LONE_SURROGATE_SENTINEL_BASE) instead of the WTF-8 bytes. Invalid UTF-8
-// cannot occur in a `&str`, so the other results come from the first `char`
+// valid Rust `char`. It reads one unit of the escape form (see
+// LONE_SURROGATE_MARKER) instead of the WTF-8 bytes. Invalid UTF-8 cannot
+// occur in a `&str`, so the other results come from the first `char`
 // (U+FFFD with size 0 for an empty string, as `utf8.DecodeRuneInString`).
 pub fn decode_js_string_rune(s: &str) -> (u32, i32) {
     let (ch, size) = decode_rune_at(s, 0);
-    let code = ch as u32;
-    if code >= LONE_SURROGATE_SENTINEL_BASE {
-        return (
-            code - LONE_SURROGATE_SENTINEL_BASE + SURROGATE_HIGH_START,
-            size as i32,
-        );
+    if ch == LONE_SURROGATE_MARKER {
+        let (next, next_size) = decode_rune_at(s, size);
+        let code = next as u32;
+        if next_size > 0 && code >= LONE_SURROGATE_UNIT_BASE {
+            return (
+                code - LONE_SURROGATE_UNIT_BASE + SURROGATE_HIGH_START,
+                (size + next_size) as i32,
+            );
+        }
+        if next_size > 0 && next == LONE_SURROGATE_MARKER {
+            return (ch as u32, (size + next_size) as i32);
+        }
     }
-    (code, size as i32)
+    (ch as u32, size as i32)
 }
 
 // PORT: Go `strings.Compare` on the Go bytes of a string. Plain `str` order
 // differs from Go in two places, because this port stores two Go byte forms
-// as other characters:
-// - A lone surrogate sentinel (see LONE_SURROGATE_SENTINEL_BASE) is the
-//   3-byte WTF-8 form `ED A0..BF 80..BF` in Go, so it sorts below every
-//   4-byte character. Here it is a plane-16 character with lead byte F4.
+// in other ways:
+// - A lone surrogate unit (see LONE_SURROGATE_MARKER) is the 3-byte WTF-8
+//   form `ED A0..BF 80..BF` in Go. A real U+FDD0 unit (M + M) is `EF B7 90`.
 // - `INTERNAL_SYMBOL_NAME_PREFIX_CHAR` (U+FFFE) is the single byte `\xFE` in
 //   Go, so it sorts above every other lead byte. A real U+FFFE in source text
 //   also sorts as `\xFE` here (U+FFFE is a noncharacter, so this is rare).
-// Go byte encodings are prefix free, so comparing the first different
-// character by its Go bytes gives the Go result.
+// Go byte encodings are prefix free, so comparing the first different unit
+// by its Go bytes gives the Go result.
 pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
     // Equal bytes are equal characters, so skip the common byte prefix and
     // step back to the start of the first different character.
@@ -323,46 +367,64 @@ pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
     while !a.is_char_boundary(p) {
         p -= 1;
     }
-    match (a[p..].chars().next(), b[p..].chars().next()) {
-        (Some(x), Some(y)) => {
+    // Step back to the start of the unit. Every M starts a unit or is the
+    // second M of an M + M unit, so a run of M chars before `p` starts at a
+    // unit start. An odd run means `p` is the second char of a unit.
+    let marker = LONE_SURROGATE_MARKER_STR.as_bytes();
+    let mut run = 0usize;
+    while p >= marker.len() * (run + 1)
+        && &a.as_bytes()[p - marker.len() * (run + 1)..p - marker.len() * run] == marker
+    {
+        run += 1;
+    }
+    if run % 2 == 1 {
+        p -= marker.len();
+    }
+    let (ra, rb) = (&a[p..], &b[p..]);
+    match (ra.is_empty(), rb.is_empty()) {
+        (false, false) => {
             let (mut bx, mut by) = ([0u8; 4], [0u8; 4]);
-            go_char_bytes(x, &mut bx).cmp(go_char_bytes(y, &mut by))
+            go_unit_bytes(ra, &mut bx).cmp(go_unit_bytes(rb, &mut by))
         }
-        (x, y) => x.is_some().cmp(&y.is_some()),
+        (x, y) => y.cmp(&x),
     }
 }
 
-/// The Go bytes of one character of a port string (see `compare_go_strings`).
-fn go_char_bytes(ch: char, buf: &mut [u8; 4]) -> &[u8] {
-    let code = ch as u32;
-    if code >= LONE_SURROGATE_SENTINEL_BASE {
-        let cp = code - LONE_SURROGATE_SENTINEL_BASE + SURROGATE_HIGH_START;
+/// The Go bytes of the first unit of a non-empty port string (see
+/// `compare_go_strings`).
+fn go_unit_bytes<'a>(s: &str, buf: &'a mut [u8; 4]) -> &'a [u8] {
+    let (code, _) = decode_js_string_rune(s);
+    if is_surrogate(code) {
         *buf = [
             0xED,
-            0x80 | ((cp >> 6) & 0x3F) as u8,
-            0x80 | (cp & 0x3F) as u8,
+            0x80 | ((code >> 6) & 0x3F) as u8,
+            0x80 | (code & 0x3F) as u8,
             0,
         ];
         return &buf[..3];
     }
+    let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
     if ch == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR {
         buf[0] = 0xFE;
         return &buf[..1];
     }
-    ch.encode_utf8(buf).as_bytes()
+    let len = ch.encode_utf8(&mut buf[..]).len();
+    &buf[..len]
 }
 
 // PORT: converts a legacy `ts_scanner` UTF-16 token value to the Go string
 // form. A valid pair becomes one code point and a lone surrogate becomes the
-// `encode_js_string_rune` sentinel, as the Go scanner writes it.
+// `encode_js_string_rune` unit, as the Go scanner writes it.
 // `JsString::to_string_lossy` would turn a lone surrogate into U+FFFD instead.
 pub(crate) fn js_string_to_token_value(value: &ts_core::JsString) -> String {
-    char::decode_utf16(value.as_units().iter().copied())
-        .map(|result| match result {
-            Ok(ch) => ch.to_string(),
-            Err(err) => encode_js_string_rune(u32::from(err.unpaired_surrogate())),
-        })
-        .collect()
+    let mut out = String::new();
+    for result in char::decode_utf16(value.as_units().iter().copied()) {
+        match result {
+            Ok(ch) => push_js_string_rune(&mut out, ch as u32),
+            Err(err) => push_js_string_rune(&mut out, u32::from(err.unpaired_surrogate())),
+        }
+    }
+    out
 }
 
 // Go: stringutil/util.go:352 CombineSurrogatePairs
@@ -371,8 +433,9 @@ pub(crate) fn js_string_to_token_value(value: &ts_core::JsString) -> String {
 // written by EncodeJSStringRune) into the single supplementary code point they
 // represent. Strings without a lone-surrogate sentinel (the common case) are
 // returned unchanged.
+// PORT: the sentinel check looks for LONE_SURROGATE_MARKER.
 pub fn combine_surrogate_pairs(s: &str) -> String {
-    if !s.as_bytes().contains(&LONE_SURROGATE_SENTINEL_LEAD) {
+    if !contains_lone_surrogate_marker(s) {
         return s.to_string();
     }
     let mut b = String::with_capacity(s.len());
@@ -478,7 +541,8 @@ pub fn to_lower_js(str: &str) -> String {
                 builder.push_str(lower);
             }
         } else {
-            builder.push(r);
+            // PORT: keeps the U+FDD0 escape (see LONE_SURROGATE_MARKER).
+            push_js_string_rune(&mut builder, code);
         }
         if !is_unicode_case_ignorable(r) {
             cased_before = is_sigma_cased(r);
@@ -509,7 +573,8 @@ pub fn to_upper_js(str: &str) -> String {
         {
             builder.push_str(upper);
         } else {
-            builder.push(r);
+            // PORT: keeps the U+FDD0 escape (see LONE_SURROGATE_MARKER).
+            push_js_string_rune(&mut builder, code);
         }
         i += size;
     }
@@ -23744,7 +23809,71 @@ static UNICODE_CASE_IGNORABLE_RANGES: &[(u32, u32, u32)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_ecma_line_starts, is_line_break};
+    use super::{
+        combine_surrogate_pairs, compare_go_strings, compute_ecma_line_starts,
+        decode_js_string_rune, encode_js_string_rune, is_line_break,
+    };
+
+    /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
+    fn go_bytes(ch: u32) -> Vec<u8> {
+        if (0xD800..0xE000).contains(&ch) {
+            return vec![
+                0xED,
+                0x80 | ((ch >> 6) & 0x3F) as u8,
+                0x80 | (ch & 0x3F) as u8,
+            ];
+        }
+        char::from_u32(ch).unwrap().to_string().into_bytes()
+    }
+
+    // Runes near the lone surrogate escape form (see LONE_SURROGATE_MARKER).
+    const RUNES: [u32; 10] = [
+        0x61, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xFDD0, 0xFFFD, 0x10F800, 0x10FFFF, 0x1F600,
+    ];
+
+    #[test]
+    fn js_string_runes_round_trip_and_sort_as_go() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut values: Vec<(String, Vec<u32>)> = Vec::new();
+        for _ in 0..2_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut bits = seed;
+            let mut runes = Vec::new();
+            for _ in 0..(bits % 5) {
+                bits = bits.rotate_right(7) ^ seed;
+                runes.push(RUNES[(bits % RUNES.len() as u64) as usize]);
+            }
+            let text: String = runes.iter().map(|&r| encode_js_string_rune(r)).collect();
+            // Each value decodes back to the same runes.
+            let mut decoded = Vec::new();
+            let mut i = 0;
+            while i < text.len() {
+                let (r, size) = decode_js_string_rune(&text[i..]);
+                decoded.push(r);
+                i += size as usize;
+            }
+            assert_eq!(decoded, runes, "{text:?}");
+            values.push((text, runes));
+        }
+        for pair in values.windows(2) {
+            let (a, ra) = &pair[0];
+            let (b, rb) = &pair[1];
+            let ga: Vec<u8> = ra.iter().flat_map(|&r| go_bytes(r)).collect();
+            let gb: Vec<u8> = rb.iter().flat_map(|&r| go_bytes(r)).collect();
+            assert_eq!(compare_go_strings(a, b), ga.cmp(&gb), "{a:?} {b:?}");
+        }
+    }
+
+    #[test]
+    fn combine_surrogate_pairs_keeps_real_plane_16() {
+        let pair = encode_js_string_rune(0xDBFF) + &encode_js_string_rune(0xDFFF);
+        assert_eq!(combine_surrogate_pairs(&pair), "\u{10FFFF}");
+        let real = encode_js_string_rune(0x10FFFF) + &encode_js_string_rune(0xFDD0);
+        assert_eq!(decode_js_string_rune(&real), (0x10FFFF, 4));
+        assert_eq!(combine_surrogate_pairs(&real), real);
+    }
 
     /// `compute_ecma_line_starts` written as a plain char scan.
     fn line_starts_by_char(text: &str) -> Vec<i32> {

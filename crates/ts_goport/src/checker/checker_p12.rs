@@ -106,7 +106,10 @@ impl Checker {
                 return;
             }
             let context_type_parameters = self.sig(context).type_parameters.clone();
-            self.sig_mut(sig).type_parameters = context_type_parameters;
+            let origin = self.share_type_parameters_origin(context);
+            let s = self.sig_mut(sig);
+            s.type_parameters = context_type_parameters;
+            s.type_parameters_origin = origin;
         }
         let context_this_parameter = self.sig(context).this_parameter;
         if context_this_parameter.is_some() {
@@ -669,6 +672,7 @@ impl Checker {
                     &type_argument_types,
                     is_in_js_file(declaration),
                     &[],
+                    0,
                 ));
             } else {
                 result.push(sig);

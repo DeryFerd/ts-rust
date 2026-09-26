@@ -1910,6 +1910,13 @@ pub struct Signature {
     pub resolved_min_argument_count: i32,
     pub declaration: Node,
     pub type_parameters: Vec<TypeId>,
+    // PORT: Go compares signature type parameter lists by slice identity
+    // (`core.Same` in compareSignaturesRelated). A Rust signature owns its
+    // `Vec`, so a list that Go shares between signatures (cloneSignature,
+    // class local type parameters, inferred type parameters, ...) carries
+    // the same nonzero origin here. 0 means the list belongs only to this
+    // signature. See `Checker::same_signature_type_parameters`.
+    pub type_parameters_origin: u32,
     pub parameters: Vec<SymbolId>,
     pub this_parameter: SymbolId,
     pub resolved_return_type: TypeId,

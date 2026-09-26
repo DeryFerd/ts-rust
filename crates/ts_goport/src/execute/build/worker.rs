@@ -13,8 +13,14 @@
 //!
 //! Protocol (stdout, one line, compact JSON):
 //! `{"exitStatus":0,"output":"...","diagnosticsCount":0,"emittedFiles":[...],
-//!   "hasChangedDtsFile":false,"buildInfoFileName":"..." | null}`
-//! The worker writes nothing else to stdout. Traces and diagnostics go to
+//!   "hasChangedDtsFile":false,"buildInfoFileName":"..." | null,
+//!   "fsCache":{...}}`
+//! Before it, right after the program is made, the worker writes one
+//! `{"fsCacheProgram":{...}}` line: the cached file system entries the
+//! program load added. The worker writes nothing else to stdout. On stdin
+//! the orchestrator sends the build's cached file system (see
+//! shared_fs.rs); `fsCache` is what the worker added after the program
+//! line. Traces and diagnostics go to
 //! `output`. Unported code and panics are reported on stderr, which the
 //! worker shares with the orchestrator.
 
@@ -22,6 +28,7 @@ use crate::emitter::program_emit::{WriteFile, WriteFileData};
 use crate::execute::build::build_task::WorkerCompileResult;
 use crate::execute::build::command_line::parse_build_command_line;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost};
+use crate::execute::build::shared_fs::{decode_cached_fs_state, marshal_cached_fs_state};
 use crate::execute::incremental::incremental::Host as IncrementalHost;
 use crate::execute::incremental::program::{
     new_program as new_incremental_program, read_build_info_program,
@@ -66,6 +73,10 @@ pub fn compare_paths_options_of_sys(sys: &dyn System) -> ComparePathsOptions {
 //
 // `build_command_line` is the full `-b` command line of the orchestrator
 // (Go `o.opts.Command`). `config` is the task config name (Go `t.config`).
+// `fs_cache` is the orchestrator's cached file system (Go `o.host.FS()`,
+// see shared_fs.rs); it is loaded before the config is parsed.
+// `report_program_fs_cache` gets the entries that `NewProgram` added, as
+// soon as the program is made.
 //
 // PORT: Go `t.reportDiagnostic` also appends to `t.errors`; the worker has
 // no task, so only the count goes back (see `WorkerCompileResult`).
@@ -75,6 +86,8 @@ pub fn compile_and_emit_worker(
     sys: Rc<dyn System>,
     config: &str,
     build_command_line: &[String],
+    fs_cache: &CachedFsState,
+    report_program_fs_cache: &mut dyn FnMut(&CachedFsState),
 ) -> WorkerCompileResult {
     let command = Rc::new(parse_build_command_line(
         build_command_line,
@@ -85,6 +98,7 @@ pub fn compile_and_emit_worker(
         command.clone(),
         compare_paths_options_of_sys(&*sys),
     ));
+    host.cached_fs.load_state(fs_cache);
     let path = host.to_path(config);
     // Go `t.resolved`, parsed by the orchestrator host in createBuildTasks.
     let resolved = host
@@ -137,6 +151,10 @@ pub fn compile_and_emit_worker(
     }
     compile_times.borrow_mut().parse_time =
         sys.now().duration_since(parse_start).unwrap_or_default();
+    // PORT: in Go the program's lookups are in the shared cache as they
+    // happen; send them now, not only when the worker ends (shared_fs.rs).
+    let program_fs_cache = host.cached_fs.state_excluding(&[fs_cache]);
+    report_program_fs_cache(&program_fs_cache);
     let changes_compute_start = sys.now();
     let program = new_incremental_program(
         old_program.as_ref(),
@@ -179,6 +197,7 @@ pub fn compile_and_emit_worker(
         emitted_files: result.emit_result.emitted_files.clone(),
         has_changed_dts_file: program.has_changed_dts_file(),
         build_info_file_name,
+        fs_cache: host.cached_fs.state_excluding(&[fs_cache, &program_fs_cache]),
     }
 }
 
@@ -246,6 +265,8 @@ impl MarshalerTo for WorkerCompileResult {
             Some(name) => name.marshal_json_to(enc)?,
             None => enc.push_str("null"),
         }
+        enc.push_str(",\"fsCache\":");
+        marshal_cached_fs_state(&self.fs_cache, enc)?;
         enc.push('}');
         Ok(())
     }
@@ -277,6 +298,7 @@ fn decode_worker_compile_result(
         emitted_files: Vec::new(),
         has_changed_dts_file: false,
         build_info_file_name: None,
+        fs_cache: CachedFsState::default(),
     };
     if dec.read_token()? != JsonToken::BeginObject {
         return Err(invalid());
@@ -318,6 +340,7 @@ fn decode_worker_compile_result(
                     result.build_info_file_name = Some(name);
                 }
             }
+            "fsCache" => result.fs_cache = decode_cached_fs_state(dec)?,
             _ => dec.skip_value()?,
         }
     }
@@ -348,21 +371,62 @@ impl WorkerLauncher {
         }
     }
 
-    /// Runs one worker for `config` and waits for its result.
+    /// Runs one worker for `config` and waits for its result. `fs_cache` is
+    /// the orchestrator's cached file system as JSON (shared_fs.rs); the
+    /// worker reads it from stdin. `on_program_fs_cache` gets the worker's
+    /// `fsCacheProgram` line while the worker still runs.
     // PORT: a worker that fails (unported code, a panic, or no result line)
     // has no Go equivalent. Its stderr already shows the reason; the task
     // gets `ExitStatus::NotImplemented` and the worker's stdout as output,
     // so the build goes on. The failure is counted as unported, so the
     // process exits with `EXIT_UNPORTED`.
-    pub fn run(&self, config: &str) -> WorkerCompileResult {
+    pub fn run(
+        &self,
+        config: &str,
+        fs_cache: &str,
+        on_program_fs_cache: &mut dyn FnMut(CachedFsState),
+    ) -> WorkerCompileResult {
         let output = std::process::Command::new(&self.exe)
             .arg(BUILD_WORKER_FLAG)
             .arg(config)
             .args(&self.build_command_line)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .output();
+            .spawn()
+            .and_then(|mut child| {
+                // The worker reads all of stdin before it writes to stdout,
+                // so writing first cannot block on a full stdout pipe. A
+                // worker that exits early closes stdin; its status reports
+                // that, so the write error is ignored.
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(fs_cache.as_bytes());
+                }
+                // Read stdout line by line so the program line arrives
+                // while the worker still checks and emits.
+                let mut stdout = Vec::new();
+                if let Some(pipe) = child.stdout.take() {
+                    use std::io::BufRead;
+                    let mut reader = std::io::BufReader::new(pipe);
+                    loop {
+                        let start = stdout.len();
+                        if reader.read_until(b'\n', &mut stdout)? == 0 {
+                            break;
+                        }
+                        if let Some(state) = parse_worker_program_fs_cache(&stdout[start..]) {
+                            on_program_fs_cache(state);
+                            stdout.truncate(start);
+                        }
+                    }
+                }
+                let status = child.wait()?;
+                Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            });
         let failed = |message: String, output: String| {
             eprintln!("goport_build: build worker for {config} failed: {message}");
             crate::core::record_unported("build worker");
@@ -373,6 +437,7 @@ impl WorkerLauncher {
                 emitted_files: Vec::new(),
                 has_changed_dts_file: false,
                 build_info_file_name: None,
+                fs_cache: CachedFsState::default(),
             }
         };
         let output = match output {
@@ -392,4 +457,61 @@ impl WorkerLauncher {
             _ => failed(format!("{}", output.status), stdout),
         }
     }
+}
+
+/// Reads the cached file system that the orchestrator sends on stdin (see
+/// `WorkerLauncher::run`). Empty input (or a terminal) is an empty cache.
+pub fn read_worker_fs_cache(input: &mut dyn std::io::Read) -> Result<CachedFsState, String> {
+    let mut bytes = Vec::new();
+    input
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(CachedFsState::default());
+    }
+    let mut dec = json_new_decoder(&bytes);
+    let state = decode_cached_fs_state(&mut dec).map_err(|err| err.message)?;
+    dec.check_eof().map_err(|err| err.message)?;
+    Ok(state)
+}
+
+const PROGRAM_FS_CACHE_PREFIX: &str = "{\"fsCacheProgram\":";
+
+/// The worker's `fsCacheProgram` line (no trailing newline).
+pub fn marshal_worker_program_fs_cache(state: &CachedFsState) -> String {
+    let mut text = PROGRAM_FS_CACHE_PREFIX.to_string();
+    marshal_cached_fs_state(state, &mut text).expect("file system cache marshals");
+    text.push('}');
+    text
+}
+
+/// Reads a `fsCacheProgram` line back. `None` for any other line.
+fn parse_worker_program_fs_cache(line: &[u8]) -> Option<CachedFsState> {
+    if !line.starts_with(PROGRAM_FS_CACHE_PREFIX.as_bytes()) {
+        return None;
+    }
+    let mut dec = json_new_decoder(line);
+    let mut state = None;
+    if dec.read_token().ok()? != JsonToken::BeginObject {
+        return None;
+    }
+    while dec.peek_kind() != b'}' {
+        let mut key = String::new();
+        json_unmarshal_decode(&mut dec, &mut key).ok()?;
+        if key == "fsCacheProgram" {
+            state = Some(decode_cached_fs_state(&mut dec).ok()?);
+        } else {
+            dec.skip_value().ok()?;
+        }
+    }
+    dec.read_token().ok()?;
+    dec.check_eof().ok()?;
+    state
+}
+
+/// The orchestrator's cached file system as worker input (shared_fs.rs).
+pub fn marshal_worker_fs_cache(state: &CachedFsState) -> String {
+    let mut text = String::new();
+    marshal_cached_fs_state(state, &mut text).expect("file system cache marshals");
+    text
 }

@@ -390,6 +390,56 @@ impl Checker {
         id
     }
 
+    // PORT: helpers for Go slice identity of signature type parameter lists
+    // (`Signature::type_parameters_origin`). A new origin stands for a newly
+    // allocated Go slice.
+    pub fn new_type_parameters_origin(&mut self) -> u32 {
+        self.type_parameters_origin_count += 1;
+        self.type_parameters_origin_count
+    }
+
+    // Returns the origin of the type parameter list of `sig`, giving the
+    // list one first when Go is about to share its slice with another
+    // signature. Empty lists need none (`core.Same` compares lengths first).
+    pub fn share_type_parameters_origin(&mut self, sig: SignatureId) -> u32 {
+        let s = self.sig(sig);
+        if s.type_parameters.is_empty() || s.type_parameters_origin != 0 {
+            return s.type_parameters_origin;
+        }
+        let origin = self.new_type_parameters_origin();
+        self.sig_mut(sig).type_parameters_origin = origin;
+        origin
+    }
+
+    // Origin of the Go slice `classType.AsInterfaceType().LocalTypeParameters()`.
+    pub fn class_type_parameters_origin(&mut self, class_type: TypeId) -> u32 {
+        if self
+            .ty(class_type)
+            .as_interface_type()
+            .local_type_parameters()
+            .is_empty()
+        {
+            return 0;
+        }
+        if let Some(&origin) = self.class_type_parameters_origins.get(&class_type) {
+            return origin;
+        }
+        let origin = self.new_type_parameters_origin();
+        self.class_type_parameters_origins.insert(class_type, origin);
+        origin
+    }
+
+    // Go `core.Same(source.typeParameters, target.typeParameters)`: same
+    // length, and either empty or the same backing slice.
+    pub fn same_signature_type_parameters(&self, source: SignatureId, target: SignatureId) -> bool {
+        let (s, t) = (self.sig(source), self.sig(target));
+        s.type_parameters.len() == t.type_parameters.len()
+            && (s.type_parameters.is_empty()
+                || source == target
+                || s.type_parameters_origin != 0
+                    && s.type_parameters_origin == t.type_parameters_origin)
+    }
+
     // Go: checker/checker.go:25165 newIndexInfo
     pub fn new_index_info(
         &mut self,

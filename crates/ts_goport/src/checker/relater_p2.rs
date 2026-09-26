@@ -957,9 +957,9 @@ impl Checker {
             return Ternary::FALSE;
         }
         // PORT: Go `core.Same` compares slice identity (same length and same
-        // backing array). Handles are compared by value here.
+        // backing array), not the elements. See `same_signature_type_parameters`.
         if !self.sig(source).type_parameters.is_empty()
-            && self.sig(source).type_parameters != self.sig(target).type_parameters
+            && !self.same_signature_type_parameters(source, target)
         {
             target = self.get_canonical_signature(target);
             source = self.instantiate_signature_in_context_of(

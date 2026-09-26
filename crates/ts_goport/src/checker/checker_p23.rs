@@ -734,7 +734,7 @@ impl Checker {
                 .as_interface_type()
                 .local_type_parameters()
                 .to_vec();
-            return vec![self.new_signature(
+            let sig = self.new_signature(
                 flags,
                 Node::NIL,
                 &local_type_parameters,
@@ -743,7 +743,10 @@ impl Checker {
                 class_type,
                 TypePredicateId::NIL,
                 0,
-            )];
+            );
+            let origin = self.class_type_parameters_origin(class_type);
+            self.sig_mut(sig).type_parameters_origin = origin;
+            return vec![sig];
         }
         let base_type_node = self.get_base_type_node_of_class(class_type);
         let is_java_script = declaration.is_some() && is_in_js_file(declaration);
@@ -774,8 +777,10 @@ impl Checker {
                     .as_interface_type()
                     .local_type_parameters()
                     .to_vec();
+                let origin = self.class_type_parameters_origin(class_type);
                 let s = self.sig_mut(sig);
                 s.type_parameters = local_type_parameters;
+                s.type_parameters_origin = origin;
                 s.resolved_return_type = class_type;
                 if is_abstract {
                     s.flags |= SignatureFlags::ABSTRACT;
@@ -1329,10 +1334,10 @@ impl Checker {
     ) -> SignatureId {
         let left_type_parameters = self.sig(left).type_parameters.clone();
         let right_type_parameters = self.sig(right).type_parameters.clone();
-        let type_params = if left_type_parameters.is_empty() {
-            right_type_parameters.clone()
+        let (type_params, type_params_origin) = if left_type_parameters.is_empty() {
+            (right_type_parameters.clone(), self.share_type_parameters_origin(right))
         } else {
-            left_type_parameters.clone()
+            (left_type_parameters.clone(), self.share_type_parameters_origin(left))
         };
         let mut param_mapper = MapperId::NIL;
         if !left_type_parameters.is_empty() && !right_type_parameters.is_empty() {
@@ -1377,6 +1382,7 @@ impl Checker {
             TypePredicateId::NIL,
             min_arg_count,
         );
+        self.sig_mut(result).type_parameters_origin = type_params_origin;
         let left_composite = self.sig(left).composite.clone();
         let left_mapper = self.sig(left).mapper;
         let mut left_signatures: Vec<SignatureId> = match &left_composite {

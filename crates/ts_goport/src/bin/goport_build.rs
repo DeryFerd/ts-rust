@@ -9,6 +9,8 @@
 //!   Go build task does and prints one JSON result line (see
 //!   `execute::build::worker`). The orchestrator starts these itself.
 //!   Without a `-b` command line it runs with the default build options.
+//!   It reads the build's cached file system from stdin (empty input, or
+//!   a terminal, is an empty cache).
 //!
 //! Only build mode is ported. Other command lines (Go `tscCompilation`)
 //! exit with `EXIT_UNPORTED` (70).
@@ -19,14 +21,16 @@
 //! uses 0 to 5), like `goport` and `goport_emit`.
 
 use std::any::Any;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ts_goport::execute::build::orchestrator::tsc_build_compilation;
 use ts_goport::execute::build::worker::{
     BUILD_WORKER_FLAG, compile_and_emit_worker, marshal_worker_compile_result,
+    marshal_worker_program_fs_cache, read_worker_fs_cache,
 };
 use ts_goport::execute::tsc::compile::{EXIT_UNPORTED, ExitStatus, System, new_os_system};
+use ts_goport::frontend::vfs::CachedFsState;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -101,8 +105,35 @@ fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
         return EXIT_UNPORTED;
     };
     let build_command_line = &args[1..];
+    let stdin = std::io::stdin();
+    let fs_cache = if stdin.is_terminal() {
+        Ok(Default::default())
+    } else {
+        read_worker_fs_cache(&mut stdin.lock())
+    };
+    let fs_cache = match fs_cache {
+        Ok(fs_cache) => fs_cache,
+        Err(message) => {
+            eprintln!("goport_build: build worker: cannot read the file system cache: {message}");
+            record_unported("build worker");
+            report_unported();
+            return EXIT_UNPORTED;
+        }
+    };
+    let mut report_program_fs_cache = |state: &CachedFsState| {
+        let line = marshal_worker_program_fs_cache(state);
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
-        compile_and_emit_worker(sys.clone(), config, build_command_line)
+        compile_and_emit_worker(
+            sys.clone(),
+            config,
+            build_command_line,
+            &fs_cache,
+            &mut report_program_fs_cache,
+        )
     }));
     match result {
         Ok(result) => {

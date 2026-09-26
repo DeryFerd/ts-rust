@@ -5,6 +5,7 @@ pub mod command_line;
 pub mod host;
 pub mod orchestrator;
 pub mod parse_cache;
+pub mod shared_fs;
 pub mod up_to_date_status;
 pub mod worker;
 

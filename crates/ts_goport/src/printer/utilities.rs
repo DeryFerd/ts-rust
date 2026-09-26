@@ -82,9 +82,9 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // Note that this doesn't actually wrap the input in double quotes.
 // PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch runs only
 // for U+FFFE, the port form of Go's `\xFE` prefix byte. Lone surrogates use
-// the plane-16 sentinel from `encode_js_string_rune` (see scanner_util.rs),
-// which `decode_js_string_rune` maps back to the surrogate, so they print as
-// `\uD800` like Go. `ch` is the
+// the escape unit from `encode_js_string_rune` (see
+// `scanner_util::LONE_SURROGATE_MARKER`), which `decode_js_string_rune` maps
+// back to the surrogate, so they print as `\uD800` like Go. `ch` is the
 // `char` form of `code`. For a surrogate it is U+FFFD, which matches no `ch`
 // case, the same as the surrogate rune in Go.
 fn escape_string_worker(
@@ -197,6 +197,12 @@ fn escape_string_worker(
             } else {
                 encode_utf16_escape_sequence(b, code);
             }
+            pos = i + size;
+        } else if size > ch.len_utf8() {
+            // PORT: an unescaped U+FDD0 unit is stored as two chars (see
+            // `scanner_util::LONE_SURROGATE_MARKER`). Write it once.
+            b.push_str(&s[pos..i]);
+            b.push(ch);
             pos = i + size;
         }
 

@@ -113,6 +113,8 @@ impl TaskResult {
 // - `has_changed_dts_file`: `incremental.Program.HasChangedDtsFile()`.
 // - `build_info_file_name`: the file name that `writeFile` wrote with
 //   `data.BuildInfo != nil`, or `None` when no build info was written.
+// - `fs_cache`: the cached file system entries the worker added (see
+//   shared_fs.rs). The orchestrator merges them into its cache.
 #[derive(Clone, Debug)]
 pub struct WorkerCompileResult {
     pub exit_status: ExitStatus,
@@ -121,6 +123,7 @@ pub struct WorkerCompileResult {
     pub emitted_files: Vec<String>,
     pub has_changed_dts_file: bool,
     pub build_info_file_name: Option<String>,
+    pub fs_cache: CachedFsState,
 }
 
 // The parts of Go `*Orchestrator` (and its `host`) that a build task uses.
