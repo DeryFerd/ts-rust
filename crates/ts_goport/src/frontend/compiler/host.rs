@@ -18,6 +18,16 @@ pub trait CompilerHost {
         file_name: &str,
         path: &Path,
     ) -> Option<Rc<ParsedCommandLine>>;
+
+    /// True when `fs()` shows the plain OS file system (Go `sys.FS()`,
+    /// maybe behind `cachedvfs`), so a parse worker thread reads the same
+    /// files, directories and bytes as this host. Then the loader can use
+    /// what the workers read and resolved.
+    // PORT: not in Go. Go reads and resolves on the host in every parse
+    // task; here the parse workers use the OS file system of their thread.
+    fn is_plain_os_fs(&self) -> bool {
+        false
+    }
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.
@@ -33,6 +43,8 @@ pub struct CompilerHostImpl {
     // PORT: Go nil interface is `None`.
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: TraceFn,
+    /// `fs` is `bundled::is_wrapped_os_fs` (maybe behind the cache).
+    plain_os_fs: bool,
 }
 
 // Go: host.go:34 NewCachedFSCompilerHost
@@ -43,12 +55,14 @@ pub fn new_cached_fs_compiler_host(
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
 ) -> Rc<dyn CompilerHost> {
-    new_compiler_host(
+    let plain_os_fs = is_wrapped_os_fs(&fs);
+    new_compiler_host_with(
         current_directory,
         cachedvfs_from(fs),
         default_library_path,
         extended_config_cache,
         trace,
+        plain_os_fs,
     )
 }
 
@@ -60,6 +74,27 @@ pub fn new_compiler_host(
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
 ) -> Rc<dyn CompilerHost> {
+    let plain_os_fs = is_wrapped_os_fs(&fs);
+    new_compiler_host_with(
+        current_directory,
+        fs,
+        default_library_path,
+        extended_config_cache,
+        trace,
+        plain_os_fs,
+    )
+}
+
+/// Go `NewCompilerHost` body. `plain_os_fs`: `fs` shows the plain OS file
+/// system (`CompilerHost::is_plain_os_fs`).
+fn new_compiler_host_with(
+    current_directory: &str,
+    fs: Rc<dyn Fs>,
+    default_library_path: &str,
+    extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
+    trace: Option<TraceFn>,
+    plain_os_fs: bool,
+) -> Rc<dyn CompilerHost> {
     // PORT: Go nil func is `None`.
     let trace = trace.unwrap_or_else(|| Rc::new(|_msg: &'static Message, _args: Vec<String>| {}));
     Rc::new(CompilerHostImpl {
@@ -68,6 +103,7 @@ pub fn new_compiler_host(
         default_library_path: default_library_path.to_string(),
         extended_config_cache,
         trace,
+        plain_os_fs,
     })
 }
 
@@ -93,20 +129,44 @@ impl CompilerHost for CompilerHostImpl {
     }
 
     // Go: host.go:78 (*compilerHost).GetSourceFile
+    // PORT: a parse worker may have parsed the file already (`FilesParser`
+    // prefetch, `take_prefetched`). The parser takes `&'static str` (node
+    // data points into the text), so a file text is leaked for the program
+    // lifetime.
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let (text, ok) = CompilerHost::fs(self).read_file(&opts.file_name);
-        if !ok {
-            return None;
-        }
         let script_kind = get_script_kind_from_file_name(&opts.file_name);
-        // PORT: a parse worker may have parsed this text already
-        // (`FilesParser` prefetch).
-        if let Some(file) = take_prefetched_parse(opts, &text, script_kind) {
-            return Some(Rc::new(file));
-        }
-        // PORT: the parser takes `&'static str` (node data points into the
-        // text), so the file text is leaked for the program lifetime.
-        let text: &'static str = Box::leak(text.into_boxed_str());
+        let text: &'static str = if self.plain_os_fs {
+            // PERF: on the plain OS file system a worker read the same
+            // bytes, so the file is read once, as in Go. A bundled lib is
+            // its embedded text (what `WrappedFs::read_file` copies).
+            match take_prefetched(opts, script_kind, None) {
+                Prefetched::Parse(file) => return Some(Rc::new(file)),
+                Prefetched::Text(text) => text,
+                Prefetched::Nothing => match bundled_text(&opts.file_name) {
+                    Some(text) => text,
+                    None => {
+                        let (text, ok) = self.fs.read_file(&opts.file_name);
+                        if !ok {
+                            return None;
+                        }
+                        Box::leak(text.into_boxed_str())
+                    }
+                },
+            }
+        } else {
+            let (text, ok) = CompilerHost::fs(self).read_file(&opts.file_name);
+            if !ok {
+                return None;
+            }
+            // Another file system can show other bytes than the worker's
+            // OS file system, so a worker result is used only for the same
+            // text.
+            match take_prefetched(opts, script_kind, Some(text.as_str())) {
+                Prefetched::Parse(file) => return Some(Rc::new(file)),
+                Prefetched::Text(worker_text) => worker_text,
+                Prefetched::Nothing => Box::leak(text.into_boxed_str()),
+            }
+        };
         Some(Rc::new(parse_source_file(opts, text, script_kind)))
     }
 
@@ -125,6 +185,10 @@ impl CompilerHost for CompilerHostImpl {
             self.extended_config_cache.as_deref(),
         );
         command_line.map(Into::into)
+    }
+
+    fn is_plain_os_fs(&self) -> bool {
+        self.plain_os_fs
     }
 }
 

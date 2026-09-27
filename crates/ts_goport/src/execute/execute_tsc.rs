@@ -567,6 +567,7 @@ fn perform_incremental_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    start_lib_prefetch(sys, &config, testing.is_some());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
@@ -640,6 +641,7 @@ fn perform_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    start_lib_prefetch(sys, &config, testing.is_some());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
@@ -675,6 +677,24 @@ fn perform_compilation(
     stop_tracing(sys);
 
     result(emit_result.status)
+}
+
+/// Starts the parse of the default lib files of `config` on the parse
+/// workers, before the compiler host, the build info read and the loader
+/// setup (`start_default_lib_prefetch`). The program loaded next on this
+/// thread takes the parses; its loader checks each one.
+// PORT: not in Go (see `start_default_lib_prefetch`). A test run
+// (`testing`) keeps the Go order.
+fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
+    if testing {
+        return;
+    }
+    start_default_lib_prefetch(
+        config,
+        &sys.get_current_directory(),
+        sys.fs().use_case_sensitive_file_names(),
+        &sys.default_library_path(),
+    );
 }
 
 // Go: execute/tsc.go:373 showConfig

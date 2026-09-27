@@ -35,6 +35,16 @@ impl Binder {
         );
         self.node_bind.get_mut(node.node_id().index())
     }
+
+    /// Writes the `flow_node` of a node. Flow nodes are kept apart from the
+    /// other node data while binding (`NodeBindBuilder::set_flow_node`).
+    fn p3_set_node_flow(&mut self, node: Node, flow: FlowNodeId) {
+        debug_assert!(
+            node.file_index() == self.file.file_index(),
+            "binder data for a node in another file"
+        );
+        self.node_bind.set_flow_node(node.node_id().index(), flow);
+    }
 }
 
 // PORT: Go `node.FlowNodeData() != nil`. True for node kinds whose Go data
@@ -493,7 +503,7 @@ impl Binder {
                 // separate field, and case/default clauses have no Go `FlowNodeData`, so the fallthrough
                 // flow node is stored in the clause's `flow_node` slot (read it with `clause.flow_node()`).
                 let current_flow = self.current_flow;
-                self.p3_node_bind_mut(clause).flow_node = current_flow;
+                self.p3_set_node_flow(clause, current_flow);
             }
             i += 1;
         }
@@ -965,9 +975,7 @@ impl Binder {
     // in the binder until the file is bound, so this is a `Binder` method.
     pub fn set_flow_node(&mut self, node: Node, flow_node: FlowNodeId) {
         if p3_has_flow_node_data(node) {
-            debug_assert_eq!(node.file_index(), self.file.file_index());
-            self.node_bind
-                .set_flow_node(node.node_id().index(), flow_node);
+            self.p3_set_node_flow(node, flow_node);
         }
     }
 

@@ -5,6 +5,7 @@ use super::hash::FileInfo;
 use super::hash::*;
 use super::snapshot::*;
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 // Go: incremental/buildinfotosnapshot.go:14 buildInfoToSnapshot
 // PORT: the options read from the build info are leaked to get the
@@ -48,7 +49,9 @@ pub fn build_info_to_snapshot(
         file_paths,
         file_path_set: Vec::new(),
     };
-    let file_path_set: Vec<IndexSet<Path>> = build_info
+    // PORT: the sets stay `IndexSet<Path>` (SipHash): `ReferenceMap` keeps
+    // that type (see `reference_map.rs`).
+    let file_path_set: Vec<Arc<IndexSet<Path>>> = build_info
         .file_ids_list
         .iter()
         .flatten()
@@ -58,7 +61,7 @@ pub fn build_info_to_snapshot(
             for &file_id in file_id_list {
                 file_set.insert(to.to_file_path(file_id));
             }
-            file_set
+            Arc::new(file_set)
         })
         .collect();
     to.file_path_set = file_path_set;
@@ -89,7 +92,9 @@ struct ToSnapshot<'a> {
     build_info_directory: String,
     snapshot: Snapshot,
     file_paths: Vec<Path>,
-    file_path_set: Vec<IndexSet<Path>>,
+    // PORT: Go `[]*collections.Set`. Each referenced map entry with the same
+    // file id list shares the set, as the Go pointer does (`Arc`).
+    file_path_set: Vec<Arc<IndexSet<Path>>>,
 }
 
 impl ToSnapshot<'_> {
@@ -104,8 +109,8 @@ impl ToSnapshot<'_> {
     }
 
     // Go: incremental/buildinfotosnapshot.go:66 toFilePathSet
-    fn to_file_path_set(&self, file_id_list_id: BuildInfoFileIdListId) -> IndexSet<Path> {
-        self.file_path_set[(file_id_list_id.0 - 1) as usize].clone()
+    fn to_file_path_set(&self, file_id_list_id: BuildInfoFileIdListId) -> Arc<IndexSet<Path>> {
+        Arc::clone(&self.file_path_set[(file_id_list_id.0 - 1) as usize])
     }
 
     // Go: incremental/buildinfotosnapshot.go:70 toBuildInfoDiagnosticsWithFileName
@@ -217,12 +222,12 @@ impl ToSnapshot<'_> {
 
     // Go: incremental/buildinfotosnapshot.go:151 setSemanticDiagnostics
     fn set_semantic_diagnostics(&mut self) {
-        let paths: Vec<Path> = self.snapshot.file_infos.keys().cloned().collect();
-        for path in paths {
+        let snapshot = &mut self.snapshot;
+        for path in snapshot.file_infos.keys() {
             // Initialize to have no diagnostics if its not changed file
-            if !self.snapshot.changed_files_set.contains(&path) {
-                self.snapshot.semantic_diagnostics_per_file.insert(
-                    path,
+            if !snapshot.changed_files_set.contains(path) {
+                snapshot.semantic_diagnostics_per_file.insert(
+                    path.clone(),
                     DiagnosticsOrBuildInfoDiagnosticsWithFileName::default(),
                 );
             }

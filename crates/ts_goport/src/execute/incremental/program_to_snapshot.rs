@@ -11,6 +11,7 @@ use super::hash::*;
 use super::program::Program;
 use super::snapshot::*;
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 // Go: incremental/programtosnapshot.go:16 programToSnapshot
 #[must_use]
@@ -109,10 +110,15 @@ impl ToProgramSnapshot<'_> {
             });
 
         let files = source_files();
-        // PORT: perf. Go runs this loop in a WorkGroup. The checker part of
-        // `getReferencedFiles` runs on the file's checker thread, so the jobs
-        // of every file are sent first and run in parallel; the loop takes
-        // each result in file order. Each checker still gets its files in
+        // PORT: perf. Go hashes each file text in the file's WorkGroup job.
+        // Here another thread hashes the texts while the files bind and the
+        // checkers start (`start_text_hashes`), and the loop takes each hash
+        // in file order. The hash values do not depend on the thread.
+        let versions = start_text_hashes(&files, self.snapshot.hash_with_text);
+        // PORT: perf. Go runs this loop in a WorkGroup. `getReferencedFiles`
+        // runs on the file's checker thread (`start_referenced_files_job`),
+        // so the jobs of every file are sent first and run in parallel; the
+        // loop takes each result in file order. Each checker still gets its files in
         // the same order. Binding comes first, as in the first iteration of
         // the loop (`file_affects_global_scope`).
         bind_all();
@@ -122,20 +128,21 @@ impl ToProgramSnapshot<'_> {
             .collect();
         for file in files {
             let file_path = Path(source_file_info(file).path.clone());
-            let version = self.snapshot.compute_hash(source_file_text(file));
+            let version = versions.recv().expect("one text hash per file");
             let implied_node_format = get_source_file_meta_data(&file_path).implied_node_format;
             let affects_global_scope = file_affects_global_scope(file);
             let mut signature = String::new();
-            let new_references = finish_referenced_files(
-                file,
-                reference_jobs
-                    .pop_front()
-                    .expect("one referenced files job per file"),
-            );
+            // PORT: Go stores the `newReferences` pointer and still reads it
+            // below. `Arc` shares the set in the same way, without a copy.
+            let new_references = reference_jobs
+                .pop_front()
+                .expect("one referenced files job per file")
+                .wait()
+                .map(Arc::new);
             if let Some(new_references) = &new_references {
                 self.snapshot
                     .referenced_map
-                    .store_references(file_path.clone(), new_references.clone());
+                    .store_references(file_path.clone(), Arc::clone(new_references));
             }
             if let Some(old_snapshot) = old_snapshot {
                 if let Some(old_file_info) = old_snapshot.file_infos.get(&file_path) {
@@ -145,13 +152,13 @@ impl ToProgramSnapshot<'_> {
                         || old_file_info.implied_node_format != implied_node_format
                     {
                         self.snapshot.add_file_to_change_set(file_path.clone());
-                    } else if new_references.as_ref()
+                    } else if new_references.as_deref()
                         != old_snapshot.referenced_map.get_references(&file_path)
                     {
                         // Referenced files changed
                         self.snapshot.add_file_to_change_set(file_path.clone());
                     } else if let Some(new_references) = &new_references {
-                        for ref_path in new_references {
+                        for ref_path in new_references.iter() {
                             if get_source_file_by_path(ref_path).is_nil()
                                 && old_snapshot.file_infos.contains_key(ref_path)
                             {
@@ -287,6 +294,35 @@ impl ToProgramSnapshot<'_> {
     }
 }
 
+/// Starts the Go `t.snapshot.computeHash(file.Text())` of each file in
+/// `files`. The receiver gives the hashes in file order as they are ready.
+// PORT: perf. The hashes run on one new thread, so that they overlap the
+// bind and the checker start in `compute_program_file_changes` (the texts
+// are `'static`). With `--singleThreaded` they run here, before the bind.
+// One thread is enough: it reads each text once (about 16 MB for Effect),
+// which takes much less time than the bind.
+fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::Receiver<String> {
+    let texts: Vec<&'static str> = files.iter().map(|&file| source_file_text(file)).collect();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let hash_texts = move || {
+        for text in texts {
+            // A send fails only when the loop stopped (it panicked).
+            if sender.send(compute_hash(text, hash_with_text)).is_err() {
+                return;
+            }
+        }
+    };
+    if single_threaded() {
+        hash_texts();
+    } else {
+        std::thread::Builder::new()
+            .name("goport-text-hash".to_string())
+            .spawn(hash_texts)
+            .expect("start the text hash thread");
+    }
+    receiver
+}
+
 // Go: incremental/programtosnapshot.go:203 fileAffectsGlobalScope
 #[must_use]
 pub fn file_affects_global_scope(file: Node) -> bool {
@@ -318,11 +354,10 @@ pub fn file_affects_global_scope(file: Node) -> bool {
 
 // Go: incremental/programtosnapshot.go:227 addReferencedFilesFromSymbol
 // PORT: the symbol belongs to the checker, so its arena is a parameter.
-// The paths are pushed in Go order; the caller adds them to the set.
 fn add_referenced_files_from_symbol(
     checker: &Checker,
     file: Node,
-    referenced_files: &mut Vec<Path>,
+    referenced_files: &mut IndexSet<Path>,
     symbol: SymbolId,
 ) {
     if symbol.is_nil() {
@@ -334,7 +369,7 @@ fn add_referenced_files_from_symbol(
             continue;
         }
         if file != file_of_decl {
-            referenced_files.push(Path(source_file_info(file_of_decl).path.clone()));
+            referenced_files.insert(Path(source_file_info(file_of_decl).path.clone()));
         }
     }
 }
@@ -343,7 +378,7 @@ fn add_referenced_files_from_symbol(
 // Get the module source file and all augmenting files from the import name node from file
 fn add_referenced_files_from_import_literal(
     file: Node,
-    referenced_files: &mut Vec<Path>,
+    referenced_files: &mut IndexSet<Path>,
     checker: &mut Checker,
     import_name: Node,
 ) {
@@ -353,20 +388,22 @@ fn add_referenced_files_from_import_literal(
 
 // Go: incremental/programtosnapshot.go:249 addReferencedFileFromFileName
 // Gets the path to reference file from file name, it could be resolvedPath if present otherwise path
+// PORT: the paths are pushed in Go order; the checker job adds them to the
+// set (see `start_referenced_files_job`).
 fn add_referenced_file_from_file_name(
     file_name: &str,
-    referenced_files: &mut IndexSet<Path>,
+    referenced_files: &mut Vec<Path>,
     source_file_directory: &str,
 ) {
     let redirect = get_parse_file_redirect(file_name);
     if !redirect.is_empty() {
-        referenced_files.insert(to_path(
+        referenced_files.push(to_path(
             &redirect,
             get_current_directory(),
             use_case_sensitive_file_names(),
         ));
     } else {
-        referenced_files.insert(to_path(
+        referenced_files.push(to_path(
             file_name,
             source_file_directory,
             use_case_sensitive_file_names(),
@@ -376,32 +413,41 @@ fn add_referenced_file_from_file_name(
 
 // Go: incremental/programtosnapshot.go:258 getReferencedFiles
 // Gets the referenced files for a file from the program with values for the keys as referenced file's path to be true
-// PORT: the checker work (imports, module augmentations, ambient modules)
-// runs in one job on the file's checker thread, which gives back the paths
-// of each part. They are added to the set in Go order.
 #[must_use]
 pub fn get_referenced_files(file: Node) -> Option<IndexSet<Path>> {
-    finish_referenced_files(file, start_referenced_files_job(file))
+    start_referenced_files_job(file).wait()
 }
 
-/// The paths that the checker part of `get_referenced_files` finds: imports,
-/// module augmentations and ambient modules.
-pub type ReferencedFilesJob = CheckerJob<(Vec<Path>, Vec<Path>, Vec<Path>)>;
+/// The result of `get_referenced_files`, computed on the file's checker
+/// thread.
+pub type ReferencedFilesJob = CheckerJob<Option<IndexSet<Path>>>;
 
-/// Sends the checker part of `get_referenced_files` for `file` to its checker
-/// thread without waiting (see `compute_program_file_changes`).
+/// Sends `get_referenced_files` for `file` to its checker thread without
+/// waiting (see `compute_program_file_changes`).
+// PORT: perf. The whole set is built in the job, on the checker thread, in
+// Go order, so the checkers build the sets in parallel. Only the triple
+// slash and type reference paths are found here first, because they read
+// the Go frontend program, which works on the loading thread only. The set
+// work is large: in Hono, the ambient module part tries about 110 paths for
+// each file (the `@types/node` modules).
 pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
     // We need to use a set here since the code can contain the same import twice,
     // but that will only be one dependency.
     // To avoid invernal conversion, the key of the referencedFiles map must be of type Path
     let imports = source_file_info(file).imports.clone();
     let module_augmentations = source_file_info(file).module_augmentations.clone();
+    let file_name_paths = referenced_file_name_paths(file);
     send_type_checker_job_for_file(file, move |checker| {
-        let mut import_paths = Vec::new();
+        let mut referenced_files: IndexSet<Path> = IndexSet::default();
         for import_name in imports {
-            add_referenced_files_from_import_literal(file, &mut import_paths, checker, import_name);
+            add_referenced_files_from_import_literal(
+                file,
+                &mut referenced_files,
+                checker,
+                import_name,
+            );
         }
-        let mut augmentation_paths = Vec::new();
+        referenced_files.extend(file_name_paths);
         // Add module augmentation as references
         for module_name in module_augmentations {
             if !is_string_literal(module_name) {
@@ -409,27 +455,27 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
             }
             add_referenced_files_from_import_literal(
                 file,
-                &mut augmentation_paths,
+                &mut referenced_files,
                 checker,
                 module_name,
             );
         }
-        let mut ambient_paths = Vec::new();
         // From ambient modules
         for ambient_module in checker.get_ambient_modules() {
-            add_referenced_files_from_symbol(checker, file, &mut ambient_paths, ambient_module);
+            add_referenced_files_from_symbol(checker, file, &mut referenced_files, ambient_module);
         }
-        (import_paths, augmentation_paths, ambient_paths)
+        if referenced_files.is_empty() {
+            None
+        } else {
+            Some(referenced_files)
+        }
     })
 }
 
-/// The rest of `get_referenced_files`, with the result of its checker job.
-#[must_use]
-pub fn finish_referenced_files(file: Node, job: ReferencedFilesJob) -> Option<IndexSet<Path>> {
-    let mut referenced_files: IndexSet<Path> = IndexSet::default();
-    let (import_paths, augmentation_paths, ambient_paths) = job.wait();
-    referenced_files.extend(import_paths);
-
+/// The triple slash and type reference parts of `get_referenced_files`, in
+/// Go order.
+fn referenced_file_name_paths(file: Node) -> Vec<Path> {
+    let mut referenced_files = Vec::new();
     let source_file_directory = get_directory_path(source_file_file_name(file));
     // Handle triple slash references
     for referenced_file in &source_file_info(file).referenced_files {
@@ -441,8 +487,11 @@ pub fn finish_referenced_files(file: Node, job: ReferencedFilesJob) -> Option<In
     }
 
     // Handle type reference directives
-    let file_path = Path(source_file_info(file).path.clone());
-    if let Some(type_refs_in_file) = get_resolved_type_reference_directives().get(&file_path) {
+    // PORT: perf. The map key is a `Path`; `Borrow<str>` looks it up without
+    // a copy of the path.
+    if let Some(type_refs_in_file) =
+        get_resolved_type_reference_directives().get(source_file_info(file).path.as_str())
+    {
         for type_ref in type_refs_in_file.values() {
             if !type_ref.resolved_file_name.is_empty() {
                 add_referenced_file_from_file_name(
@@ -453,14 +502,7 @@ pub fn finish_referenced_files(file: Node, job: ReferencedFilesJob) -> Option<In
             }
         }
     }
-
-    referenced_files.extend(augmentation_paths);
-    referenced_files.extend(ambient_paths);
-    if referenced_files.is_empty() {
-        None
-    } else {
-        Some(referenced_files)
-    }
+    referenced_files
 }
 
 // Go: incremental/programtosnapshot.go:302 repopulateDiagnosticsOfFile

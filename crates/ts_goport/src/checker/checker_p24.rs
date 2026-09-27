@@ -435,7 +435,10 @@ impl Checker {
             .iter()
             .map(|&prop| self.sym(prop).declarations.len())
             .sum();
-        let mut declarations: Vec<Node> = Vec::with_capacity(declaration_count);
+        // PERF: the declarations are collected on the stack. A list of 0 or 1
+        // declarations is stored with no heap list (no malloc). A longer list
+        // moves into one `Vec` for `Declarations::from`, as before.
+        let mut declarations: SmallVec<[Node; 4]> = SmallVec::with_capacity(declaration_count);
         let mut first_type = TypeId::NIL;
         let mut name_type = TypeId::NIL;
         let mut prop_types: SmallVec<[TypeId; 4]> =
@@ -483,7 +486,16 @@ impl Checker {
             table_key_name(name),
             check_flags | synthetic_flag,
         );
-        self.sym_mut(result).declarations = declarations.into();
+        let declarations = if declarations.len() < 2 {
+            let mut list = Declarations::default();
+            if let Some(&node) = declarations.first() {
+                list.push(node);
+            }
+            list
+        } else {
+            Declarations::from(declarations.into_vec())
+        };
+        self.sym_mut(result).declarations = declarations;
         if !has_non_uniform_value_declaration && first_value_declaration.is_some() {
             self.sym_mut(result).value_declaration = first_value_declaration;
             // Inherit information about parent type.
@@ -1602,8 +1614,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:22074 clearActiveMapperCaches
+    // PORT: Go `popActiveMapper` reslices `activeTypeMappersCaches` to the
+    // active length, so Go clears only the active caches. Here the caches
+    // past `active_mappers.len()` stay in the list for reuse and are always
+    // empty (`pop_active_mapper` clears them), so they are skipped too.
     pub fn clear_active_mapper_caches(&mut self) {
-        for cache in self.active_type_mappers_caches.iter_mut() {
+        let active = self.active_mappers.len();
+        debug_assert!(
+            self.active_type_mappers_caches[active..]
+                .iter()
+                .all(ActiveMapperCache::is_empty)
+        );
+        for cache in &mut self.active_type_mappers_caches[..active] {
             cache.clear_plain(false);
             if !cache.aliased.is_empty() {
                 cache.aliased.clear();

@@ -303,11 +303,20 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   Other crates keep the default release settings. The binaries land in
   `<target>/goport/`, not `<target>/release/`.
 - Allocator: glibc malloc is the default. `bin/goport.rs`
-  `set_malloc_tunables` re-execs once with `GLIBC_TUNABLES` set. The
-  `jemalloc` feature is faster (about 10% on query, 5% on zod and effect)
-  but puts query peak RSS about 15% over tsgo, so it is off. It can become
-  the default if query peak RSS drops by about 20 MB elsewhere (for example
-  fewer parse or bind threads). Then retest query RSS with `narenas:4`.
+  `set_malloc_tunables` re-execs once with `GLIBC_TUNABLES` set; `tsgo` and
+  `goport_build` have copies. `top_pad=67108864` makes each thread heap
+  read-write in full when glibc makes it, so THP `always` maps it with
+  2 MiB pages. Without it, glibc before 2.44 (cup2, alvin) grows the heaps
+  in 4 KiB steps and every new page faults. On cup2 the settings cut
+  `tsgo` wall time by 26% to 42% (perf9 round 1). `arena_max` is 6 in
+  `goport` and 7 in `tsgo`: one arena for each thread that is alive while
+  the checkers run (tsgo also has a signal thread). `goport_build` runs
+  about 20 threads per program and uses 16. More arenas go to the parse
+  threads and raise query peak RSS. Keep query peak RSS under 1.15 times Go
+  tsgo: at 16 cores `goport` and `tsgo` have 133 MB against 119 MB (with 8
+  arenas 142 and 139 MB). jemalloc and mimalloc have the same speed as
+  these settings on cup2 but more RSS (jemalloc query 143 to 153 MB), so
+  the `jemalloc` feature stays off.
 - PGO: `scripts/build-pgo.sh [out-dir]` does an instrumented build
   (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
   about 200 corpus cases (plus `tsgo --noEmit` on the five projects and
