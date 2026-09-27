@@ -199,9 +199,13 @@ methods reach the AST through it.
 - New code reads node data through `by_data!`, `data_accessor!` or the
   binder `_in` pair. Do not add `ast_data_of` call sites: the multiprog D3
   to D5 port removes `ast_data_of`.
-- New store columns are read through one file lookup helper, not
-  `FROZEN.get()` directly, so the multiprog port can make that lookup
-  tier 1 aware in one place.
+- Store columns and the other registry tables of a published file are read
+  through one file lookup (`frozen_of` in `ast/store.rs`), not
+  `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
+  inline, tier 1 (every later publish), so the nodes of a later program
+  (`tsc -b`, an edited file) read the same columns as the nodes of the
+  first program. A new column gets a `Frozen` table and a reader that
+  calls `frozen_of` with that table.
 
 ## Program (owned by program.rs)
 
