@@ -20,8 +20,9 @@
 //!    file with each, the programs taking turns file by file. For each file
 //!    it writes the semantic diagnostics and the type of each top-level
 //!    variable (printed at its declaration, so a type from a module the file
-//!    does not import is an `import(...)` type) to `<out-dir>/<i>/checker.txt`.
-//!    The two checkers of a program must write the same text.
+//!    does not import is an `import(...)` type) to `<out-dir>/<i>/checker.txt`,
+//!    in Go bytes: a type cut inside a char keeps the bytes of that char, as
+//!    in Go. The two checkers of a program must write the same text.
 //! 4. Symbol ids of those checkers: a binder symbol has one id in every
 //!    checker, and the symbols that a checker adds have ids that no other
 //!    symbol has.
@@ -273,7 +274,7 @@ fn check_on_this_thread(lives: &[Live]) -> Vec<[Checker; 2]> {
                 .all(|checker| std::ptr::eq(checker.program, live.program)),
             "a checker has another program"
         );
-        write(&live.dir.join("checker.txt"), text[0].as_bytes());
+        write(&live.dir.join("checker.txt"), &go_string_bytes(&text[0]));
     }
     checkers
 }
