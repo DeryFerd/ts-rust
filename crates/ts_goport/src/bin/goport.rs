@@ -118,13 +118,16 @@ fn main() {
 ///   works only in THP `madvise` mode, so the top pad is necessary for THP
 ///   `always`.
 /// - `arena_max` comes from `budget` (`ThreadBudget::one_program`), which
-///   also caps the parse and bind threads. Here it is 6: one arena for each
+///   also caps the parse and bind threads. Here it has one arena for each
 ///   thread that is alive while the checkers run (main, the worker and the
-///   4 checkers). With fewer arenas, two checkers share one arena lock. With
-///   more threads than arenas, parse threads share arena locks. Each arena
-///   in use raises peak RSS (query at 16 cores with 8 parse threads, with
-///   the top pad: 133 MB at 6 arenas, 137 MB at 7, 142 MB at 8; tsgo 119
-///   MB).
+///   4 checkers: 6), plus one for each parse worker that a large program
+///   adds on these cores (3 at 8 or more cores: 9). With fewer arenas, two
+///   checkers share one arena lock. With more threads than arenas, parse
+///   threads share arena locks. Each arena in use raises peak RSS (query at
+///   16 cores with 8 parse threads, with the top pad: 133 MB at 6 arenas,
+///   137 MB at 7, 142 MB at 8; tsgo 119 MB), so a program that is not large
+///   binds on fewer threads when there are spare arenas, and makes no more
+///   arenas than with 6.
 /// - Setting `top_pad` turns off the dynamic mmap threshold of glibc. A
 ///   fixed `mmap_threshold=33554432` had mixed results on query, so it is
 ///   not set.

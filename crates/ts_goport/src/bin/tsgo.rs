@@ -83,9 +83,11 @@ fn main() {
 
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
 /// values. `arena_max` comes from `budget` (`ThreadBudget::one_program`):
-/// with the signal thread it is 7 here. At 6, two checkers share one arena
-/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). Build workers
-/// inherit the variable, so they do not exec again.
+/// with the signal thread it is 7 here, and 10 at 8 or more cores (3 spare
+/// arenas for the parse workers that a large program adds). At 6, two
+/// checkers share one arena lock (zod: 3.9k voluntary context switches,
+/// 0.5k at 7). Build workers inherit the variable, so they do not exec
+/// again.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;

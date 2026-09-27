@@ -2,6 +2,7 @@
 //! `getProcessedFiles`).
 
 use crate::frontend::prelude::*;
+use crate::program::ThreadBudget;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -307,6 +308,8 @@ impl FilesParser {
             self.run(loader, tasks);
             return;
         }
+        // A large program gets more parse workers (below) and bind threads.
+        let large = crate::program::note_program_load(tasks.len());
         // Workers that `start_default_lib_prefetch` started for this load.
         let early = EARLY_POOL.with(|early| early.borrow_mut().take());
         let workers = if self.single_threaded {
@@ -322,7 +325,7 @@ impl FilesParser {
             return;
         }
         let config = PrefetchConfig::of_loader(loader);
-        let pool = match early {
+        let mut pool = match early {
             Some(pool) if pool.shared.config == config => pool,
             other => {
                 if let Some(other) = other {
@@ -339,6 +342,8 @@ impl FilesParser {
         self.start(loader, tasks, 0);
         pool.shared
             .rank_roots(tasks, ROOT_RANK_PER_WORKER * pool.threads.len());
+        // The root jobs are queued now, so the added workers start at once.
+        pool.add_workers(extra_worker_count(large));
         self.run_queue(loader);
         // Closes the queue, then waits for the workers.
         drop(prefetch);
@@ -361,16 +366,32 @@ impl FilesParser {
 
     // Go: filesparser.go:245 (*filesParser).start
     pub fn start(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef], depth: i32) {
+        let prefetch = PREFETCH.with(|p| p.borrow().clone());
+        let mut requests = Vec::new();
         for task in tasks {
             let path = loader.to_path(&task.borrow().normalized_file_path);
             task.borrow_mut().path = path.clone();
             let (data, loaded) = match self.task_data_by_path.get(&path) {
-                Some(data) => (data.clone(), true),
+                Some(data) => {
+                    // No queued task of this path ran yet, so the loader
+                    // loads the file later (a job to move up).
+                    if prefetch.is_some() && data.borrow().lowest_depth == i32::MAX {
+                        requests.extend(self.prefetch_request(loader, &task.borrow(), None, depth));
+                    }
+                    (data.clone(), true)
+                }
                 None => {
                     let candidate = get_parse_task_data(task);
                     self.task_data_by_path
                         .insert(path.clone(), candidate.clone());
-                    self.prefetch(loader, &task.borrow(), path, depth);
+                    if prefetch.is_some() {
+                        requests.extend(self.prefetch_request(
+                            loader,
+                            &task.borrow(),
+                            Some(path),
+                            depth,
+                        ));
+                    }
                     (candidate, false)
                 }
             };
@@ -382,16 +403,25 @@ impl FilesParser {
                 depth,
             });
         }
+        if let Some(prefetch) = prefetch {
+            prefetch.queue_batch(requests);
+        }
     }
 
-    /// Queues the parse of a new task's file for a parse worker, when the
-    /// queued run of the task will probably load it (`ParseTask::load`).
-    /// A wrong guess only costs worker time: the loader uses a worker parse
-    /// only when it gives the same result (`take_prefetched`).
-    fn prefetch(&self, loader: &FileLoader, task: &ParseTask, path: Path, depth: i32) {
-        let Some(prefetch) = PREFETCH.with(|p| p.borrow().clone()) else {
-            return;
-        };
+    /// The parse of a task's file that the parse workers can do ahead of
+    /// the loader, when the queued run of the task will probably load it
+    /// (`ParseTask::load`). `path`: the task is the first of its path, so
+    /// the file may need a new job; `None`: an earlier task queued the
+    /// path, so only a job that exists can move up. A wrong guess only
+    /// costs worker time: the loader uses a worker parse only when it gives
+    /// the same result (`take_prefetched`).
+    fn prefetch_request(
+        &self,
+        loader: &FileLoader,
+        task: &ParseTask,
+        path: Option<Path>,
+        depth: i32,
+    ) -> Option<PrefetchRequest> {
         let current_depth = if task.increase_depth {
             depth + 1
         } else {
@@ -401,9 +431,12 @@ impl FilesParser {
             || task.loaded
             || task.elide_on_depth && current_depth > self.max_depth
         {
-            return;
+            return None;
         }
         let file_name = &task.normalized_file_path;
+        let Some(path) = path else {
+            return Some(PrefetchRequest::Known(file_name.clone()));
+        };
         let script_kind = get_script_kind_from_file_name(file_name);
         if script_kind == ScriptKind::UNKNOWN
             || !has_extension(file_name)
@@ -418,7 +451,7 @@ impl FilesParser {
                     loader.compare_paths_options.use_case_sensitive_file_names,
                 ))
         {
-            return;
+            return None;
         }
         // PORT: the metadata (package.json scope) is not known yet. Most
         // parses do not read these options; a parse that read other options
@@ -428,14 +461,14 @@ impl FilesParser {
             &loader.opts.config.compiler_options(),
             &SourceFileMetaData::default(),
         );
-        prefetch.queue(
+        Some(PrefetchRequest::New(
             SourceFileParseOptions {
                 file_name: file_name.clone(),
                 path,
                 external_module_indicator_options,
             },
             script_kind,
-        );
+        ))
     }
 
     /// The body of the closure that Go `start` queues.
@@ -1081,17 +1114,35 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 /// loading thread.
 const PARSE_STACK_SIZE: usize = 1 << 30;
 
-/// Number of parse workers next to the loading thread: one per core, up to
-/// `ThreadBudget::parse` parse threads with the loading thread.
+/// Number of parse workers next to the loading thread at the start of a
+/// load: the parse threads of a program that is not large
+/// (`ThreadBudget::parse_threads`), less the loading thread.
 /// `GOPORT_PARSE_THREADS` sets it (0 turns prefetch off).
 fn prefetch_worker_count() -> usize {
-    if let Some(count) = std::env::var("GOPORT_PARSE_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-    {
+    if let Some(count) = parse_threads_from_env() {
         return count;
     }
-    crate::program::available_cores().min(crate::program::ThreadBudget::current().parse) - 1
+    ThreadBudget::current().parse_threads(false) - 1
+}
+
+/// The parse workers that `FilesParser::parse` adds for a large program
+/// (`note_program_load`), up to `ThreadBudget::parse_large` parse threads.
+/// None when `GOPORT_PARSE_THREADS` sets the count.
+fn extra_worker_count(large: bool) -> usize {
+    if parse_threads_from_env().is_some() {
+        return 0;
+    }
+    let budget = ThreadBudget::current();
+    budget
+        .parse_threads(large)
+        .saturating_sub(budget.parse_threads(false))
+}
+
+/// The parse thread count that `GOPORT_PARSE_THREADS` sets, if any.
+fn parse_threads_from_env() -> Option<usize> {
+    std::env::var("GOPORT_PARSE_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 /// True when a program load on this thread starts parse workers
@@ -1145,12 +1196,23 @@ pub enum Prefetched {
     Nothing,
 }
 
+/// A parse that `FilesParser::start` asks the parse workers for
+/// (`FilesParser::prefetch_request`).
+enum PrefetchRequest {
+    /// The file of the first task of a path: a new job, unless the file
+    /// has one.
+    New(SourceFileParseOptions, ScriptKind),
+    /// The file of a later task of a path that the loader has not reached:
+    /// the file name of a job to move up, when one exists.
+    Known(String),
+}
+
 #[derive(Default)]
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
     /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
-    /// can be in the list twice (`rank_largest`); a worker skips a job that
-    /// is no longer queued.
+    /// can be in the list twice (`rank_largest`, `queue_batch`); a worker
+    /// skips a job that is no longer queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The queued `lib.dom.d.ts` job. It is the largest file of most
     /// programs, so its parse starts first to end before the loader needs it.
@@ -1162,6 +1224,54 @@ struct PrefetchQueue {
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
     next_job: usize,
     closed: bool,
+}
+
+impl PrefetchQueue {
+    /// Makes the job of a file that has none and records it by name. A
+    /// `lib.dom.d.ts` job goes to `first`; the caller pushes other jobs.
+    /// `None` when the queue is closed or full.
+    fn add(
+        &mut self,
+        opts: SourceFileParseOptions,
+        script_kind: ScriptKind,
+    ) -> Option<Arc<PrefetchJob>> {
+        if self.closed || self.next_job >= DETACHED_STORE_LIMIT {
+            return None;
+        }
+        let job = Arc::new(PrefetchJob {
+            job: self.next_job,
+            opts,
+            script_kind,
+            state: Mutex::new(PrefetchState::Queued),
+            done: Condvar::new(),
+        });
+        self.next_job += 1;
+        self.by_name.insert(job.opts.file_name.clone(), job.clone());
+        if job.opts.file_name.ends_with("/lib.dom.d.ts") {
+            self.first = Some(job.clone());
+        }
+        Some(job)
+    }
+
+    /// The job of the file of `request`: the job that exists, or else for
+    /// a `New` request a new one (`add`).
+    fn job_of(&mut self, request: PrefetchRequest) -> Option<Arc<PrefetchJob>> {
+        let (opts, script_kind) = match request {
+            PrefetchRequest::New(opts, script_kind) => (opts, script_kind),
+            PrefetchRequest::Known(file_name) => return self.by_name.get(&file_name).cloned(),
+        };
+        match self.by_name.get(&opts.file_name) {
+            Some(job) => Some(job.clone()),
+            None => self.add(opts, script_kind),
+        }
+    }
+
+    /// True for the `first` job while no worker has taken it.
+    fn is_first(&self, job: &Arc<PrefetchJob>) -> bool {
+        self.first
+            .as_ref()
+            .is_some_and(|first| Arc::ptr_eq(first, job))
+    }
 }
 
 /// What a parse worker needs to guess the files that a parsed file
@@ -1394,30 +1504,64 @@ impl PrefetchShared {
     /// Queues a parse of `opts.file_name`, unless one is queued already.
     fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
         let mut queue = lock(&self.queue);
-        if queue.closed
-            || queue.next_job >= DETACHED_STORE_LIMIT
-            || queue.by_name.contains_key(&opts.file_name)
-        {
+        if queue.by_name.contains_key(&opts.file_name) {
             return;
         }
-        let job = Arc::new(PrefetchJob {
-            job: queue.next_job,
-            opts,
-            script_kind,
-            state: Mutex::new(PrefetchState::Queued),
-            done: Condvar::new(),
-        });
-        queue.next_job += 1;
-        queue
-            .by_name
-            .insert(job.opts.file_name.clone(), job.clone());
-        if job.opts.file_name.ends_with("/lib.dom.d.ts") {
-            queue.first = Some(job);
-        } else {
+        let Some(job) = queue.add(opts, script_kind) else {
+            return;
+        };
+        if !queue.is_first(&job) {
             queue.pending.push(job);
         }
         drop(queue);
         self.ready.notify_one();
+    }
+
+    /// Queues the parses of one `FilesParser::start` batch: new jobs, and
+    /// the jobs of files that the loader has not reached yet (`Known`),
+    /// which move up. Jobs that a worker started or that the loader took
+    /// stay where they are.
+    // PERF: effect R3-E2. The loader loads the batch newest first, and each
+    // file's imports before the next file of the batch, so it needs the
+    // newest file at once. It gets there before a worker wakes, so it
+    // parses that file itself anyway, and a worker that takes it only
+    // makes the loader wait. So the newest job goes below the others and
+    // wakes no worker; the workers take the file the loader needs next
+    // first. The jobs of files that an earlier batch or a worker queued
+    // move up too, so the loader does not reach them while they are deep
+    // in the list. Before, the loader parsed 117 to 182 effect files itself
+    // (`GOPORT_PREFETCH_STATS` "claimed"), among them root files such as
+    // `Layer.ts` and `@types/node` files that were queued long before.
+    fn queue_batch(&self, requests: Vec<PrefetchRequest>) {
+        if requests.is_empty() {
+            return;
+        }
+        let mut queue = lock(&self.queue);
+        if queue.closed {
+            return;
+        }
+        let mut jobs = Vec::with_capacity(requests.len());
+        let mut woken = 0;
+        for request in requests {
+            let Some(job) = queue.job_of(request) else {
+                continue;
+            };
+            if queue.is_first(&job) {
+                // A worker takes it before all others.
+                woken += 1;
+            } else if matches!(*lock(&job.state), PrefetchState::Queued) {
+                jobs.push(job);
+            }
+        }
+        if let Some(newest) = jobs.pop() {
+            woken += jobs.len();
+            queue.pending.push(newest);
+            queue.pending.extend(jobs);
+        }
+        drop(queue);
+        for _ in 0..woken {
+            self.ready.notify_one();
+        }
     }
 
     /// Queues a parse of each file in `names` that the parser can take (a
@@ -1510,19 +1654,25 @@ struct PrefetchPool {
 
 impl PrefetchPool {
     fn start(config: PrefetchConfig, workers: usize) -> Self {
-        let shared = Arc::new(PrefetchShared::new(config));
-        let threads = (0..workers)
-            .filter_map(|_| {
-                let shared = shared.clone();
-                // A worker that cannot start only makes the parse less parallel.
-                std::thread::Builder::new()
-                    .name("goport-parse".to_string())
-                    .stack_size(PARSE_STACK_SIZE)
-                    .spawn(move || run_prefetch_worker(&shared))
-                    .ok()
-            })
-            .collect();
-        Self { shared, threads }
+        let mut pool = Self {
+            shared: Arc::new(PrefetchShared::new(config)),
+            threads: Vec::new(),
+        };
+        pool.add_workers(workers);
+        pool
+    }
+
+    /// Starts `workers` more parse workers on the queue of this pool.
+    fn add_workers(&mut self, workers: usize) {
+        for _ in 0..workers {
+            let shared = self.shared.clone();
+            // A worker that cannot start only makes the parse less parallel.
+            let spawned = std::thread::Builder::new()
+                .name("goport-parse".to_string())
+                .stack_size(PARSE_STACK_SIZE)
+                .spawn(move || run_prefetch_worker(&shared));
+            self.threads.extend(spawned.ok());
+        }
     }
 
     /// Stops an unused pool without waiting: each worker ends after its

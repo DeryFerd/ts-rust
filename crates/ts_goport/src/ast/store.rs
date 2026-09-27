@@ -2750,6 +2750,89 @@ impl StoreChildLinks {
     }
 }
 
+/// R3-2: parser.go `overrideParentInImmediateChildren` for `parent` in one
+/// borrow of its store: Go `child.Parent = parent` for each child in Go
+/// `ForEachChild` order (`for_each_store_child_id`), and the R2-5 chain of
+/// `parent`, with the same writes as `StoreChildLinks`. False when `parent`
+/// is not a node of an unfinished store of this thread, or when a child is
+/// not a node slot of that store (an alias slot, or a nil list entry). The
+/// caller then runs the `StoreChildLinks` walk, which gives the same result
+/// from any state this left: it frees the chain of `parent` first, and sets
+/// the same parents again.
+// PERF: R3-2. The `StoreChildLinks` walk found the store once per child
+// (`try_with_build_slot`: the `FROZEN` check, the thread-local lookup and a
+// `RefCell` borrow) and read the data and each child through the node
+// reads. This reads the data from the slot and writes the children by slot
+// index.
+pub fn set_parent_in_store_children(parent: Node) -> bool {
+    let Some(store) = thread_build_cell(parent) else {
+        return false;
+    };
+    let mut guard = store.borrow_mut();
+    let s = &mut *guard;
+    let index = slot_index(parent);
+    // A finished file: the `StoreChildLinks` walk panics on the first write.
+    if s.frozen {
+        return false;
+    }
+    let Some(node) = s.nodes[index] else {
+        return false;
+    };
+    let kind = s.headers[index].kind;
+    // `NodeHeader::stored_parent` of a child in the store of `parent`.
+    let stored = handle(LOCAL_STORE, index as u32);
+    // `StoreChildLinks::new`.
+    s.unlink_children(index);
+    s.build_links[index].first_child = LINK_END;
+    let mut last = LINK_END;
+    let mut linking = true;
+    let stopped = super::node::for_each_store_child_id(kind, node, |child| {
+        let child = child as usize;
+        if s.nodes[child].is_none() {
+            return true;
+        }
+        // `StoreChildLinks::set_parent`.
+        s.headers[child].parent = stored;
+        if linking && !s.link_child(index, &mut last, child) {
+            linking = false;
+            s.unlink_children(index);
+        }
+        false
+    });
+    !stopped
+}
+
+/// R3-2, debug builds: the slot index, stored parent and R2-5 links of
+/// `parent` and of each child that the generic walk (`Node::iter_children`)
+/// visits. Every child must be a node of the store of `parent`, an
+/// unfinished store of this thread (`set_parent_in_store_children` made
+/// its parents).
+#[cfg(debug_assertions)]
+pub fn debug_store_child_link_state(parent: Node) -> Vec<(u32, Node, u32, u32)> {
+    // The walk reads the store, so it runs before the borrow below.
+    let children = parent.iter_children();
+    let store = thread_build_cell(parent).expect("R3-2: parent is not a build store node");
+    let s = store.borrow();
+    std::iter::once(parent)
+        .chain(children)
+        .map(|n| {
+            assert_eq!(
+                n.file_index(),
+                parent.file_index(),
+                "R3-2: a child in another store"
+            );
+            let index = slot_index(n);
+            let links = s.build_links[index];
+            (
+                index as u32,
+                s.headers[index].parent,
+                links.first_child,
+                links.next_sibling,
+            )
+        })
+        .collect()
+}
+
 /// Go `node.Parent = parent` on a node of an unfrozen file.
 pub fn set_store_node_parent(n: Node, parent: Node) {
     let parent = NodeHeader::stored_parent(n.file_index(), parent);
@@ -2809,6 +2892,314 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
         // (`StoreChildLinks`; reparser.go `finishMutatedNode`).
         s.unlink_children(index);
     });
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Lib parse snapshot (R3-1, frontend/parser/lib_parse_snapshot.rs)
+// ──────────────────────────────────────────────────────────────────────
+
+/// R3-1: one node slot of a lib parse snapshot: what the parse left in the
+/// slot when it froze the file, besides what the freeze and the U1 and U4
+/// build entries make from it. A snapshot store has no alias slot, and slot
+/// 0 (nil) is not in the snapshot.
+pub(crate) struct LibParseSlot {
+    pub(crate) kind: SyntaxKind,
+    pub(crate) flags: NodeFlags,
+    pub(crate) loc: TextRange,
+    /// The slot of the Go parent, 0 for nil.
+    pub(crate) parent: u32,
+    /// The R2-5 links (`SlotLinks`): a slot, `Self::LINK_END` or
+    /// `Self::LINK_NONE`.
+    pub(crate) first_child: u32,
+    pub(crate) next_sibling: u32,
+    /// The node data. `None`: the slot points at the shared name node of
+    /// `kind` (S1, `alloc_store_shared_name_node`).
+    pub(crate) data: Option<NodeData>,
+    /// The name column entry and the keyword bit (`slot_text_name`):
+    /// `Name::default()` and false for a kind other than Identifier and
+    /// PrivateIdentifier.
+    pub(crate) name: Name,
+    pub(crate) text_is_keyword: bool,
+}
+
+impl LibParseSlot {
+    pub(crate) const LINK_END: u32 = LINK_END;
+    pub(crate) const LINK_NONE: u32 = LINK_NONE;
+}
+
+/// R3-1: fills store `file`, which `new_file_store` or
+/// `new_detached_file_store` just made on this thread, with `count` slots
+/// after slot 0 from `next`, in slot order, as the parse made them: the
+/// header, data, name and link entries of each slot, and the U1 (b) and U4
+/// build entries made from the data as `alloc_store_slot_node` makes them.
+/// The caller freezes the store, which makes the other tables as for a live
+/// parse. False when `next` fails; the store then holds part of the slots
+/// (`reset_file_store` empties it).
+// PERF: R3-1. One store borrow for all slots. The vectors are made at their
+// final size, which `freeze` keeps.
+pub(crate) fn load_lib_parse_slots(
+    file: usize,
+    count: usize,
+    mut next: impl FnMut() -> Option<LibParseSlot>,
+) -> bool {
+    with_store_mut(file, |s| {
+        assert!(
+            !s.frozen && s.headers.len() == 1,
+            "a lib parse snapshot loads into a new store"
+        );
+        s.headers.reserve_exact(count);
+        s.nodes.reserve_exact(count);
+        s.build_names.reserve_exact(count);
+        s.build_modifier_bits.reserve_exact(count);
+        s.build_children.reserve_exact(count);
+        s.build_links.reserve_exact(count);
+        for _ in 0..count {
+            let Some(slot) = next() else {
+                return false;
+            };
+            s.push_lib_parse_slot(slot);
+        }
+        s.debug_assert_build_columns();
+        true
+    })
+}
+
+impl FileStore {
+    /// `load_lib_parse_slots` for one slot.
+    fn push_lib_parse_slot(&mut self, slot: LibParseSlot) {
+        let LibParseSlot {
+            kind,
+            flags,
+            loc,
+            parent,
+            first_child,
+            next_sibling,
+            data,
+            name,
+            text_is_keyword,
+        } = slot;
+        let node = match data {
+            Some(data) => leak_ast_node(kind, data),
+            None => shared_name_node(kind),
+        };
+        self.headers.push(NodeHeader {
+            // `NodeHeader::stored_parent` of a parent in this store.
+            parent: if parent == NIL_SLOT {
+                Node::NIL
+            } else {
+                handle(LOCAL_STORE, parent)
+            },
+            loc,
+            flags,
+            kind,
+            source_file_is_root: false,
+            text_is_keyword,
+        });
+        self.nodes.push(Some(node));
+        self.build_names.push(name);
+        let modifier_bits =
+            self.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
+        self.build_modifier_bits.push(modifier_bits);
+        self.build_children
+            .push(super::node::store_node_children(kind, node));
+        self.build_links.push(SlotLinks {
+            first_child,
+            next_sibling,
+        });
+    }
+}
+
+/// R3-1: empties store `file`, an unfinished store of this thread, to what
+/// `new_file_store` made, after a snapshot load failed part way. The file
+/// is then parsed into it, so its id does not change.
+pub(crate) fn reset_file_store(file: usize) {
+    with_store_mut(file, |s| {
+        assert!(!s.frozen, "cannot reset a finished store");
+        *s = FileStore::new(s.file_name, s.text);
+    });
+}
+
+/// R3-1, tests: one slot of a finished store as a snapshot keeps it
+/// (`LibParseSlot`), with the data by reference.
+#[cfg(test)]
+pub(crate) struct LibParseSlotView {
+    pub(crate) kind: SyntaxKind,
+    pub(crate) flags: NodeFlags,
+    pub(crate) loc: TextRange,
+    pub(crate) parent: u32,
+    pub(crate) first_child: u32,
+    pub(crate) next_sibling: u32,
+    pub(crate) node: &'static ts_ast::Node,
+    /// The slot points at the shared name node of its kind (S1).
+    pub(crate) shared_name: bool,
+    pub(crate) name: Name,
+    pub(crate) text_is_keyword: bool,
+}
+
+/// R3-1, tests: the slots after slot 0 of store `file`, a store of this
+/// thread whose parse is finished and that is not published. An error when
+/// a snapshot cannot keep the store: an alias slot, a parent in another
+/// store, or a ts_ast node with other base fields than `ast_node` gives.
+#[cfg(test)]
+pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>, String> {
+    with_store(file, |s| {
+        if !s.frozen || s.names.len() != s.headers.len() || s.links.len() != s.headers.len() {
+            return Err("the store is not frozen".into());
+        }
+        if !s.aliases.is_empty() {
+            return Err("the store has alias slots".into());
+        }
+        let base = ast_node(
+            SyntaxKind::Unknown,
+            NodeData::Token(Box::new(ts_ast::TokenData)),
+        );
+        let mut views = Vec::with_capacity(s.headers.len());
+        for index in 1..s.headers.len() {
+            let header = &s.headers[index];
+            let node = s.nodes[index].ok_or_else(|| format!("slot {index} is not a node slot"))?;
+            if node.kind != header.kind
+                || node.flags != base.flags
+                || node.range != base.range
+                || node.parent.is_some()
+            {
+                return Err(format!(
+                    "slot {index}: the ts_ast node has other base fields"
+                ));
+            }
+            let parent = match header.parent {
+                p if p.is_nil() => NIL_SLOT,
+                p if p.file_index() == LOCAL_STORE => slot_index(p) as u32,
+                _ => return Err(format!("slot {index}: a parent in another store")),
+            };
+            let is_name = matches!(
+                header.kind,
+                SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+            );
+            let shared_name = is_name && std::ptr::eq(node, shared_name_node(header.kind));
+            let links = s.links[index];
+            views.push(LibParseSlotView {
+                kind: header.kind,
+                flags: header.flags,
+                loc: header.loc,
+                parent,
+                first_child: links.first_child,
+                next_sibling: links.next_sibling,
+                node,
+                shared_name,
+                name: s.names[index].clone(),
+                text_is_keyword: header.text_is_keyword,
+            });
+        }
+        Ok(views)
+    })
+}
+
+/// R3-1, tests: one line for each part of store `file` (a store of this
+/// thread whose parse is finished) that the snapshot load and the freeze
+/// make, in a form that does not depend on the store id, so the store of a
+/// live parse and of a snapshot load can be compared. The node data is not
+/// in it (the snapshot test compares it field by field).
+#[cfg(test)]
+pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
+    let local = |n: Node| {
+        if n.is_nil() {
+            "nil".to_string()
+        } else if n.file_index() == file {
+            format!("#{}", slot_index(n))
+        } else {
+            format!("{n:?}")
+        }
+    };
+    with_store(file, |s| {
+        let mut jsdoc: Vec<String> = s
+            .jsdoc_cache
+            .iter()
+            .map(|(&n, jsdocs)| {
+                let list: Vec<String> = jsdocs.iter().map(|&j| local(j)).collect();
+                format!("{} {list:?}", local(n))
+            })
+            .collect();
+        jsdoc.sort();
+        let diagnostics: Vec<String> = s
+            .diagnostics
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} {} {} {} {} {:?}",
+                    local(d.file),
+                    d.pos,
+                    d.end,
+                    d.code,
+                    d.message.key(),
+                    d.message_args
+                )
+            })
+            .collect();
+        let mut lines = vec![
+            format!("file {} text {}", s.file_name, s.text.len()),
+            format!(
+                "frozen {} root_slot {} root {} aliases {} resolved {}",
+                s.frozen,
+                s.root_slot,
+                local(s.root),
+                s.aliases.len(),
+                s.resolved.len()
+            ),
+            format!("parser_flags {:?}", s.parser_flags),
+            format!("jsdoc {jsdoc:?}"),
+            format!(
+                "lazy {:?} lazy_cache {}",
+                s.lazy_js_doc,
+                s.lazy_jsdoc_cache.len()
+            ),
+            format!(
+                "variant {:?} diagnostics {diagnostics:?} non_ascii {}",
+                s.language_variant, s.contains_non_ascii
+            ),
+            format!(
+                "facts {:?} bind {:?} overflow {}",
+                s.facts, s.bind_estimate, s.modifier_bits_overflow
+            ),
+            format!(
+                "build {} {} {} {} {} names {}",
+                s.build_names.len(),
+                s.build_modifier_bits.len(),
+                s.build_children.len(),
+                s.build_links.len(),
+                s.identifier_names.len(),
+                s.ecma_line_starts.get().is_some()
+            ),
+            format!(
+                "columns {} {} {} {} {} {} {}",
+                s.headers.len(),
+                s.nodes.len(),
+                s.kinds.len(),
+                s.names.len(),
+                s.modifier_bits.len(),
+                s.children.len(),
+                s.links.len()
+            ),
+        ];
+        for index in 0..s.headers.len() {
+            let shared = s.nodes[index].is_some_and(|node| {
+                matches!(
+                    node.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+                ) && std::ptr::eq(node, shared_name_node(node.kind))
+            });
+            lines.push(format!(
+                "{index}: {:?} node {} shared {shared} kind {:?} name {:?} bits {:?} children {:?} links {:?}",
+                s.headers[index],
+                s.nodes[index].is_some(),
+                s.kinds.get(index),
+                s.names.get(index).map(Name::as_str),
+                s.modifier_bits.get(index),
+                s.children.get(index),
+                s.links.get(index),
+            ));
+        }
+        lines
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────

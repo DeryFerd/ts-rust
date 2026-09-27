@@ -59,7 +59,7 @@ pub const MIN_TEXT_LEN: usize = 200_000;
 /// Set in a stored name entry (and in a names column entry of the parse
 /// hash) when text follows. The bits below it hold the text length. A
 /// clear bit means the entry is a stable name id, which is always lower.
-const TEXT_BIT: u32 = 1 << 31;
+pub(crate) const TEXT_BIT: u32 = 1 << 31;
 
 // Symbol mask bits: which optional fields follow.
 const S_CHECK_FLAGS: u8 = 1;
@@ -133,10 +133,11 @@ const SOURCE_SNAPSHOT: u64 = const_hash(include_bytes!("lib_snapshot.rs"));
 
 /// A 64-bit hash of `bytes` that runs at compile time (`SOURCES_HASH`). It
 /// only has to change when a file changes. It is not xxh3: xxhash-rust has
-/// no const xxh3 in the features this crate uses.
+/// no const xxh3 in the features this crate uses. The lib parse snapshot
+/// (`frontend/parser/lib_parse_snapshot.rs`) uses it too.
 // The slice patterns need no bounds check per byte, so the compile-time
 // evaluation of the largest file stays far below the rustc step limit.
-const fn const_hash(bytes: &[u8]) -> u64 {
+pub(crate) const fn const_hash(bytes: &[u8]) -> u64 {
     let mut hash = bytes.len() as u64;
     let mut rest = bytes;
     while let [b0, b1, b2, b3, b4, b5, b6, b7, tail @ ..] = rest {
@@ -154,7 +155,7 @@ const fn const_hash(bytes: &[u8]) -> u64 {
 }
 
 /// Multiplies by a 64-bit odd constant and folds the 128-bit product.
-const fn mix(value: u64) -> u64 {
+pub(crate) const fn mix(value: u64) -> u64 {
     let product = (value as u128) * 0x9E37_79B9_7F4A_7C15u128;
     (product as u64) ^ ((product >> 64) as u64)
 }
@@ -303,40 +304,52 @@ fn local_flow(file: usize, flow: FlowNodeId) -> Option<u32> {
 // Load
 // ──────────────────────────────────────────────────────────────────────
 
+/// A snapshot switch (`GOPORT_LIB_SNAPSHOT`, and
+/// `GOPORT_LIB_PARSE_SNAPSHOT` for the lib parse snapshot).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Off,
     On,
     /// On, with one stderr line per lib file.
     Trace,
 }
 
+impl Mode {
+    /// Environment variable `var`: "0" turns the snapshot off, "trace"
+    /// traces it.
+    pub(crate) fn from_env(var: &str) -> Mode {
+        match std::env::var(var).as_deref() {
+            Ok("0") => Mode::Off,
+            Ok("trace") => Mode::Trace,
+            _ => Mode::On,
+        }
+    }
+}
+
 /// `GOPORT_LIB_SNAPSHOT`: "0" turns the snapshot off, "trace" traces it.
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("GOPORT_LIB_SNAPSHOT").as_deref() {
-        Ok("0") => Mode::Off,
-        Ok("trace") => Mode::Trace,
-        _ => Mode::On,
-    })
+    *MODE.get_or_init(|| Mode::from_env("GOPORT_LIB_SNAPSHOT"))
 }
 
-/// One lib file in `BLOB`.
-struct SnapshotEntry {
+/// One lib file in a snapshot blob.
+pub(crate) struct SnapshotEntry {
     /// The base name, for example `lib.dom.d.ts`.
-    name: &'static str,
-    section: &'static [u8],
+    pub(crate) name: &'static str,
+    pub(crate) section: &'static [u8],
 }
 
 /// The lib files in `BLOB`, read once. Empty when the blob does not read.
 fn entries() -> &'static [SnapshotEntry] {
     static ENTRIES: OnceLock<Vec<SnapshotEntry>> = OnceLock::new();
-    ENTRIES.get_or_init(|| read_entries(BLOB).unwrap_or_default())
+    ENTRIES.get_or_init(|| read_entries(BLOB, MAGIC).unwrap_or_default())
 }
 
-fn read_entries(blob: &'static [u8]) -> Option<Vec<SnapshotEntry>> {
+/// The entries of a blob that `write_blob` wrote with `magic`. `None` when
+/// the blob does not read.
+pub(crate) fn read_entries(blob: &'static [u8], magic: &[u8; 8]) -> Option<Vec<SnapshotEntry>> {
     let mut r = SnapshotReader::new(blob);
-    if r.bytes(MAGIC.len())? != MAGIC {
+    if r.bytes(magic.len())? != magic {
         return None;
     }
     let count = r.count()?;
@@ -390,52 +403,52 @@ fn load_section(file: Node, section: &[u8]) -> Result<(BoundFile, SymbolArena), 
 }
 
 /// A cursor over blob bytes. Every read returns `None` past the end.
-struct SnapshotReader<'a> {
+pub(crate) struct SnapshotReader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> SnapshotReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         SnapshotReader { data, pos: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
 
-    fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
         let bytes = self.data.get(self.pos..self.pos.checked_add(len)?)?;
         self.pos += len;
         Some(bytes)
     }
 
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         let value = *self.data.get(self.pos)?;
         self.pos += 1;
         Some(value)
     }
 
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.bytes(4)?.try_into().ok()?))
     }
 
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.bytes(8)?.try_into().ok()?))
     }
 
     /// A count of items that take at least one byte each. A count past the
     /// end is an error, so a bad count cannot ask for a huge allocation.
-    fn count(&mut self) -> Option<usize> {
+    pub(crate) fn count(&mut self) -> Option<usize> {
         let count = self.u32()? as usize;
         (count <= self.remaining()).then_some(count)
     }
 
-    fn text(&mut self, len: usize) -> Option<&'a str> {
+    pub(crate) fn text(&mut self, len: usize) -> Option<&'a str> {
         std::str::from_utf8(self.bytes(len)?).ok()
     }
 
-    fn str(&mut self) -> Option<&'a str> {
+    pub(crate) fn str(&mut self) -> Option<&'a str> {
         let len = self.u32()? as usize;
         self.text(len)
     }
@@ -1109,9 +1122,10 @@ fn encode(
     Ok(out)
 }
 
-/// The blob with `sections` (lib base name, section), in this order.
-fn write_blob(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+/// The blob with `magic` and `sections` (lib base name, section), in this
+/// order (`read_entries`).
+pub(crate) fn write_blob(magic: &[u8; 8], sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut out = magic.to_vec();
     let put_len = |out: &mut Vec<u8>, len: usize| {
         out.extend_from_slice(&u32::try_from(len).expect("blob length").to_le_bytes());
     };
@@ -1125,6 +1139,22 @@ fn write_blob(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// The bundled libs that get a snapshot, largest first: every lib with at
+/// least `MIN_TEXT_LEN` text bytes. The lib parse snapshot uses the same
+/// list.
+#[cfg(test)]
+pub(crate) fn snapshot_libs() -> Vec<&'static str> {
+    let mut libs: Vec<(&'static str, usize)> = bundled::LIB_NAMES
+        .iter()
+        .filter_map(|&name| {
+            let text = bundled::bundled_text(&format!("{}/{name}", bundled::lib_path()))?;
+            (text.len() >= MIN_TEXT_LEN).then_some((name, text.len()))
+        })
+        .collect();
+    libs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    libs.into_iter().map(|(name, _)| name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,20 +1163,6 @@ mod tests {
     const REGENERATE: &str = "run `cargo test -p ts_goport --lib \
         binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact` \
         (through scripts/run-cargo-capped.sh)";
-
-    /// The bundled libs that get a snapshot, largest first: every lib with
-    /// at least `MIN_TEXT_LEN` text bytes.
-    fn snapshot_libs() -> Vec<&'static str> {
-        let mut libs: Vec<(&'static str, usize)> = bundled::LIB_NAMES
-            .iter()
-            .filter_map(|&name| {
-                let text = bundled::bundled_text(&format!("{}/{name}", bundled::lib_path()))?;
-                (text.len() >= MIN_TEXT_LEN).then_some((name, text.len()))
-            })
-            .collect();
-        libs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
-        libs.into_iter().map(|(name, _)| name).collect()
-    }
 
     /// Loads a program version that holds every snapshot lib and runs `f`
     /// on each lib file, in `snapshot_libs` order, with the program current.
@@ -1238,7 +1254,7 @@ mod tests {
             );
             sections.push((lib, section));
         });
-        let blob = write_blob(&sections);
+        let blob = write_blob(MAGIC, &sections);
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/binder/lib_bind.bin");
         std::fs::write(path, &blob).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
         eprintln!("wrote {path}: {} bytes", blob.len());

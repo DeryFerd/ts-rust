@@ -653,21 +653,33 @@ impl Parser {
     // Go: parser/parser.go:5940 overrideParentInImmediateChildren
     // PORT: Go calls the `p.setParentFromContext` closure field (set in
     // initializeClosures: `n.Parent = p.currentParent; return false`). The
-    // closure body is inlined here, because the visitor cannot borrow the
-    // parser while `for_each_child` runs.
+    // closure body is in the two walks below, because the visitor cannot
+    // borrow the parser while `for_each_child` runs.
     // PERF: R2-5. The same visit writes the binder child links of `node`
     // (`StoreChildLinks`), while its data is hot, so the binder can walk
     // the children without loading the node data (`bind_each_child`).
+    // PERF: R3-2. A node of the parse store whose children are all nodes of
+    // that store (nearly every node) takes one store borrow for the whole
+    // visit (`set_parent_in_store_children`). Any other node takes the
+    // generic walk. Debug builds run the generic walk after the fast one
+    // and check that it writes the same parents and links.
     pub fn override_parent_in_immediate_children(&mut self, node: Node) {
         self.current_parent = node;
         let parent = self.current_parent;
-        let mut links = StoreChildLinks::new(parent);
-        node.for_each_child(|n| {
-            if !links.set_parent(n) {
-                set_node_parent(n, parent);
+        if set_parent_in_store_children(parent) {
+            #[cfg(debug_assertions)]
+            {
+                let fast = debug_store_child_link_state(parent);
+                set_parent_in_children_generic(node, parent);
+                debug_assert_eq!(
+                    fast,
+                    debug_store_child_link_state(parent),
+                    "R3-2: the store walk differs from the generic walk"
+                );
             }
-            false
-        });
+        } else {
+            set_parent_in_children_generic(node, parent);
+        }
         self.current_parent = Node::NIL;
     }
 
@@ -1362,6 +1374,21 @@ pub fn do_in_context<T>(
     let result = f(p);
     p.context_flags = save_context_flags;
     result
+}
+
+/// The body of `override_parent_in_immediate_children` through the node
+/// reads (`StoreChildLinks`): the path for a node that
+/// `set_parent_in_store_children` does not take.
+// PORT: Go calls the `p.setParentFromContext` closure field (set in
+// initializeClosures: `n.Parent = p.currentParent; return false`).
+fn set_parent_in_children_generic(node: Node, parent: Node) {
+    let mut links = StoreChildLinks::new(parent);
+    node.for_each_child(|n| {
+        if !links.set_parent(n) {
+            set_node_parent(n, parent);
+        }
+        false
+    });
 }
 
 // Go: parser/parser.go:6413 isReservedWord

@@ -3046,51 +3046,215 @@ impl Node {
     }
 }
 
-fn for_each_child_impl(
-    n: Node,
-    v: &mut dyn FnMut(Node) -> bool,
-    mut lists: Option<ListHook>,
+fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
+    let mut visit = NodeChildVisit {
+        n,
+        file: n.file_index(),
+        v,
+        lists,
+    };
+    walk_children(data(n), &mut visit)
+}
+
+/// R3-2: calls `v` with the slot index of each child id in the data of
+/// store node `node` (Go kind `kind`), in Go `ForEachChild` order, and
+/// stops when `v` returns true. It reads only the node data: no store and
+/// no node read. A nil single child field is skipped, as Go `visit` skips
+/// nil; list entries are all passed, so `v` sees slot 0 (nil) for a nil
+/// list entry. `v` must resolve each index in the store of `node`: a node
+/// slot is that node, and any other slot (nil, alias) is not.
+// PERF: R3-2. The parser sets the parents of the children of each node it
+// finishes (`set_parent_in_store_children`). The generic walk read the
+// data and every child through the node reads (`ast_node_of_slow`,
+// `Node::new_slow`), a store lookup each.
+pub(crate) fn for_each_store_child_id(
+    kind: SyntaxKind,
+    node: &'static ts_ast::Node,
+    v: impl FnMut(u32) -> bool,
 ) -> bool {
-    let f = n.file_index();
-    let mut report = |l: NodeList, is_mod: bool| {
-        if let Some(h) = lists.as_mut() {
+    walk_children(&node.data, &mut StoreChildIds { kind, v })
+}
+
+/// R3-2: the fields that one arm of `walk_children` visits, in Go
+/// `ForEachChild` order. Each method returns true to stop the walk. The
+/// generic walk (`NodeChildVisit`) turns the ids into `Node` handles; the
+/// parser's walk over a store node (`StoreChildIds`) keeps the slot
+/// indexes. One match serves both, so they visit the same fields.
+trait ChildVisit {
+    /// A required child field (Go `visit`).
+    fn node(&mut self, id: ts_ast::NodeId) -> bool;
+    /// An optional child field (Go `visit`).
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool;
+    /// A required list field (Go `visitNodeList`).
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool;
+    /// An optional list field (Go `visitNodeList`).
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool;
+    /// A modifier list field (Go `visitModifiers`).
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool;
+    /// A Go `[]*Node` field with no list (Go `visitNodes`).
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool;
+    /// Go `CaseOrDefaultClause.Expression` (see `case_expression`).
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool;
+    /// Go `MappedTypeNode.Members` (see `mapped_type_members`).
+    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool;
+}
+
+/// The generic walk of `for_each_child_impl`.
+// PERF: the methods are always inlined, so each arm of `walk_children`
+// compiles to the same code as the macros of the old single match.
+struct NodeChildVisit<'a, 'b> {
+    n: Node,
+    file: usize,
+    v: &'a mut dyn FnMut(Node) -> bool,
+    lists: Option<ListHook<'b>>,
+}
+
+impl NodeChildVisit<'_, '_> {
+    #[inline(always)]
+    fn report(&mut self, l: NodeList, is_mod: bool) {
+        if let Some(h) = self.lists.as_mut() {
             if l.is_some() {
                 h(l, is_mod);
             }
         }
-    };
+    }
+
+    #[inline(always)]
+    fn visit_list(&mut self, l: NodeList) -> bool {
+        self.report(l, false);
+        visit_node_list(self.v, l)
+    }
+}
+
+impl ChildVisit for NodeChildVisit<'_, '_> {
+    #[inline(always)]
+    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+        visit(self.v, req(self.file, id))
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+        visit(self.v, opt(self.file, id))
+    }
+
+    #[inline(always)]
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+        self.visit_list(list(self.file, l))
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+        self.visit_list(opt_list(self.file, l))
+    }
+
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+        let m = mods(self.file, m);
+        self.report(m.node_list(), true);
+        visit_modifiers(self.v, m)
+    }
+
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+        visit_nodes(self.v, NodeSlice::from_ids(self.file, ids))
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+        visit(self.v, case_expression(self.n, self.file, id))
+    }
+
+    #[inline(always)]
+    fn mapped_type_members(&mut self, _: &'static Option<ts_ast::NodeList>) -> bool {
+        self.visit_list(mapped_type_members(self.n))
+    }
+}
+
+/// R3-2: the walk of `for_each_store_child_id`. The ids are slot indexes of
+/// the store of the node. Slot 0 resolves to Go `nil`
+/// (`resolve_store_id`), so a single child field with id 0 is skipped.
+struct StoreChildIds<F> {
+    /// The Go kind of the node (`case_expression` reads it).
+    kind: SyntaxKind,
+    v: F,
+}
+
+impl<F: FnMut(u32) -> bool> ChildVisit for StoreChildIds<F> {
+    #[inline(always)]
+    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+        id.index() != 0 && (self.v)(id.index() as u32)
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+        id.is_some_and(|id| self.node(id))
+    }
+
+    // `NodeList::is_nil` of a store list: the nil marker list.
+    #[inline(always)]
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+        !is_nil_list_marker(l) && self.ids(&l.nodes)
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+        l.as_ref().is_some_and(|l| self.list(l))
+    }
+
+    // `ModifierList::is_nil` is only `None`.
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+        m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
+    }
+
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+        ids.iter().any(|id| (self.v)(id.index() as u32))
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+        self.kind == SyntaxKind::CaseClause && self.node(id)
+    }
+
+    // A store file keeps the Go list as parsed (`mapped_type_members`).
+    #[inline(always)]
+    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool {
+        self.opt_list(members)
+    }
+}
+
+/// The Go `ForEachChild` fields of node data `data`, in Go order, for `w`.
+// Go: ast_generated.go ForEachChild (one method per node struct)
+// PORT: the per-struct Go methods are merged into one match. The order of
+// each arm follows the generated Go code.
+fn walk_children(data: &'static NodeData, w: &mut impl ChildVisit) -> bool {
     macro_rules! n {
         ($x:expr) => {
-            visit(v, req(f, $x))
+            w.node($x)
         };
     }
     macro_rules! o {
         ($x:expr) => {
-            visit(v, opt(f, $x))
+            w.opt($x)
         };
     }
     macro_rules! l {
-        ($x:expr) => {{
-            let l = list(f, &$x);
-            report(l, false);
-            visit_node_list(v, l)
-        }};
+        ($x:expr) => {
+            w.list(&$x)
+        };
     }
     macro_rules! ol {
-        ($x:expr) => {{
-            let l = opt_list(f, &$x);
-            report(l, false);
-            visit_node_list(v, l)
-        }};
+        ($x:expr) => {
+            w.opt_list(&$x)
+        };
     }
     macro_rules! m {
-        ($x:expr) => {{
-            let m = mods(f, &$x);
-            report(m.node_list(), true);
-            visit_modifiers(v, m)
-        }};
+        ($x:expr) => {
+            w.mods(&$x)
+        };
     }
-    match data(n) {
+    match data {
         NodeData::QualifiedName(d) => n!(d.left) || n!(d.right),
         NodeData::ComputedPropertyName(d) => n!(d.expression),
         NodeData::Decorator(d) => n!(d.expression),
@@ -3111,9 +3275,7 @@ fn for_each_child_impl(
         NodeData::WithStatement(d) => n!(d.expression) || n!(d.statement),
         NodeData::SwitchStatement(d) => n!(d.expression) || n!(d.case_block),
         NodeData::CaseBlock(d) => l!(d.clauses),
-        NodeData::CaseOrDefaultClause(d) => {
-            visit(v, case_expression(n, f, d.expression)) || l!(d.statements)
-        }
+        NodeData::CaseOrDefaultClause(d) => w.case_expression(d.expression) || l!(d.statements),
         NodeData::ThrowStatement(d) => n!(d.expression),
         NodeData::TryStatement(d) => n!(d.try_block) || o!(d.catch_clause) || o!(d.finally_block),
         NodeData::CatchClause(d) => o!(d.variable_declaration) || n!(d.block),
@@ -3344,11 +3506,7 @@ fn for_each_child_impl(
                 || o!(d.name_type)
                 || o!(d.question_token)
                 || o!(d.type_)
-                || {
-                    let l = mapped_type_members(n);
-                    report(l, false);
-                    visit_node_list(v, l)
-                }
+                || w.mapped_type_members(&d.members)
         }
         NodeData::TypeLiteralNode(d) => l!(d.members),
         NodeData::TupleTypeNode(d) => l!(d.elements),
@@ -3382,7 +3540,7 @@ fn for_each_child_impl(
         NodeData::JsxSpreadAttribute(d) => n!(d.expression),
         NodeData::JsxClosingElement(d) => n!(d.tag_name),
         NodeData::JsxExpression(d) => o!(d.dot_dot_dot_token) || o!(d.expression),
-        NodeData::SyntaxList(d) => visit_nodes(v, NodeSlice::from_ids(f, &d.children)),
+        NodeData::SyntaxList(d) => w.ids(&d.children),
         NodeData::JsDoc(d) => l!(d.comment) || ol!(d.tags),
         NodeData::JsDocTypeExpression(d) => n!(d.type_),
         NodeData::JsDocNonNullableType(d) => n!(d.type_),
@@ -3454,7 +3612,7 @@ fn for_each_child_impl(
         }
         NodeData::SyntheticReferenceExpression(d) => n!(d.expression) || n!(d.this_arg),
         NodeData::JsDocTypeLiteral(d) => match &d.js_doc_property_tags {
-            Some(tags) => visit_nodes(v, NodeSlice::from_ids(f, tags)),
+            Some(tags) => w.ids(tags),
             None => false,
         },
         NodeData::SourceFile(d) => l!(d.statements) || n!(d.end_of_file_token),

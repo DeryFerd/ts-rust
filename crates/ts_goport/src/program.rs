@@ -816,7 +816,8 @@ fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     )
 }
 
-/// Number of bind threads: one per core up to `ThreadBudget::bind`.
+/// Number of bind threads: `ThreadBudget::bind_threads` of the last
+/// program load on this thread (`note_program_load`).
 /// `GOPORT_BIND_THREADS` sets it (below 2 binds serially).
 fn bind_thread_count() -> usize {
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
@@ -825,35 +826,68 @@ fn bind_thread_count() -> usize {
     {
         return count;
     }
-    available_cores().min(ThreadBudget::current().bind)
+    ThreadBudget::current().bind_threads(LARGE_LOAD.get())
 }
 
-/// The cores that this process may run on.
+/// A program load with at least this many root tasks (root files, `lib`
+/// entries and the automatic type directive task) is large.
+// PERF (perf9 round 3, effect R3-E1): root tasks are query 27, hono 190,
+// elysia 241, zod 324 and effect 459. At 16 threads, 7 parse workers
+// parsed effect 12 ms and zod 9 ms faster than 4, and hono in the same
+// time. Query gains nothing from more parse threads (lib.dom bounds its
+// parse), and its peak RSS is near the 1.15x rule.
+const LARGE_LOAD_ROOT_TASKS: usize = 128;
+
+thread_local! {
+    /// Whether the last program load on this thread was large
+    /// (`note_program_load`). The bind of that program reads it.
+    static LARGE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records whether a program load on this thread with `root_tasks` root
+/// tasks is large, and returns it. A large load gets more parse threads
+/// (`ThreadBudget::parse_threads`) and bind threads
+/// (`ThreadBudget::bind_threads`). Call it when the load starts.
+pub(crate) fn note_program_load(root_tasks: usize) -> bool {
+    let large = root_tasks >= LARGE_LOAD_ROOT_TASKS;
+    LARGE_LOAD.set(large);
+    large
+}
+
+/// The cores that this process may run on, read once: each read asks the
+/// kernel and the cgroup files, and a program load asks several times.
 pub fn available_cores() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
 /// The most parse threads (the loading thread included) and bind threads
 /// of a program load, and the glibc malloc arenas of the process, in one
-/// budget.
+/// budget. A large program load (`note_program_load`) has its own limits.
 ///
 /// glibc gives each thread that mallocs its own arena until `arena_max`
-/// arenas exist. A later thread shares the arena of another thread, and
-/// when both malloc at once they wait on its lock. Each arena in use also
-/// adds peak RSS, because freed per-file data stays in it. The parse
-/// mallocs most (a quarter of the parse thread cycles), so the parse
-/// threads must fit the arenas: with 7 arenas at 16 cores, the 7 parse
-/// workers of effect made 3,763 futex waits (19 at 4 cores). The bind
-/// threads malloc little (about 5% of their cycles), so they can share
-/// arenas: 8 bind threads bind effect in the same time with 7 arenas as
-/// with 16. In the check, the checkers and the loading thread malloc.
-/// Main, and in `tsgo` the signal and text hash threads, hold an arena too.
+/// arenas exist. A new thread first takes the arena of a thread that
+/// ended, if there is one. When `arena_max` arenas exist, a later thread
+/// shares the arena of another thread, and when both malloc at once they
+/// wait on its lock. Each arena in use also adds peak RSS, because freed
+/// per-file data stays in it. The parse mallocs most (a quarter of the
+/// parse thread cycles), so the parse threads must fit the arenas: with 7
+/// arenas at 16 cores, the 7 parse workers of effect made 3,763 futex waits
+/// (19 at 4 cores). The bind threads malloc little (about 5% of their
+/// cycles), so they can share arenas: 8 bind threads bind effect in the
+/// same time with 7 arenas as with 16. In the check, the checkers and the
+/// loading thread malloc. Main, and in `tsgo` the signal and text hash
+/// threads, hold an arena too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadBudget {
     /// The most parse threads, the loading thread included.
     pub parse: usize,
-    /// The most bind threads.
+    /// The most parse threads of a large program load.
+    pub parse_large: usize,
+    /// The most bind threads of a large program load.
     pub bind: usize,
+    /// The most bind threads of other program loads.
+    pub bind_small: usize,
     /// `glibc.malloc.arena_max`.
     pub arena_max: usize,
 }
@@ -869,30 +903,63 @@ impl ThreadBudget {
     /// no budget.
     pub const WIDE: ThreadBudget = ThreadBudget {
         parse: 8,
+        parse_large: 8,
         bind: 8,
+        bind_small: 8,
         arena_max: 16,
     };
 
-    /// The budget of a one-program process (`tsgo`, `goport`): one arena
-    /// for each thread alive while the checkers run (the checkers, main,
-    /// the loading thread and `extra`; `tsgo` has 1 extra, its signal
-    /// thread). The parse uses as many threads as the check (4 parse
-    /// workers with the loading thread), so with main and `extra` it fits
-    /// these arenas. The bind keeps 8 threads.
+    /// The budget of a one-program process (`tsgo`, `goport`) on the cores
+    /// of this process. `arena_max` gives one arena to each thread alive
+    /// while the checkers run (the checkers, main, the loading thread and
+    /// `extra`; `tsgo` has 1 extra, its signal thread), and one to each
+    /// parse worker that only a large load adds (the spare arenas).
+    /// - A load that is not large parses on as many threads as the check (4
+    ///   workers and the loading thread), which fit the check arenas.
+    /// - A large load adds up to 3 parse workers, which use the spare
+    ///   arenas, and binds on 8 threads.
+    /// - With spare arenas, a load that is not large binds on as many
+    ///   threads as it had parse workers. The bind threads then take the
+    ///   arenas of the parse workers, which ended, and make no new ones.
     // PERF (perf9 round 2, env-only runs on cup2 and zbook): with 8 parse
     // threads at 8 and 16 cores, the parse threads shared arena locks. With
     // 5, the query parse on cup2 took 21 ms instead of 29 (wall 8% to 12%
     // less) and query peak RSS was 135 MB instead of 136 to 137 (Go 119).
     // 7 parse threads with 10 arenas were faster on effect, but query then
     // needs 143 MB, over the 1.15x RSS rule. 4 bind threads cost zod 13 ms
-    // and effect 18 ms of bind. At 4 cores nothing changes: the counts are
-    // the core count there.
+    // and effect 18 ms of bind.
+    // PERF (perf9 round 3, effect R3-E1): so only a large program starts
+    // more parse workers (7 workers with 12 arenas at 16 threads: effect
+    // parse -12 ms, zod -9 ms; 9 or 11 workers gave no more). tsgo query
+    // at 16 threads on zbook, env runs: `arena_max` 7 with 8 bind threads
+    // (round 2) makes 7 arenas and 131 MB peak RSS; `arena_max` 10 with 8
+    // bind threads makes 10 arenas and 135 MB, with 4 bind threads 7 arenas
+    // and 129 MB (5 bind threads: 8 arenas). At 4 cores nothing changes:
+    // the counts are the core count there, so there are no spare arenas.
     pub fn one_program(extra: usize) -> Self {
+        let cores = available_cores();
+        let parse = DEFAULT_CHECKERS + 1;
+        let parse_large = parse + 3;
+        let spare = cores.min(parse_large) - cores.min(parse);
         ThreadBudget {
-            parse: DEFAULT_CHECKERS + 1,
+            parse,
+            parse_large,
             bind: 8,
-            arena_max: DEFAULT_CHECKERS + 2 + extra,
+            bind_small: if spare > 0 { parse - 1 } else { 8 },
+            arena_max: DEFAULT_CHECKERS + 2 + extra + spare,
         }
+    }
+
+    /// Parse threads of a program load, the loading thread included: one
+    /// per core, up to `parse_large` for a large load and `parse` for others.
+    pub fn parse_threads(&self, large: bool) -> usize {
+        available_cores().min(if large { self.parse_large } else { self.parse })
+    }
+
+    /// Bind threads of a program: one per core, up to `bind` for a large
+    /// load and `bind_small` for others.
+    pub fn bind_threads(&self, large: bool) -> usize {
+        available_cores().min(if large { self.bind } else { self.bind_small })
     }
 
     /// Makes this the budget of the program loads of this process. The
