@@ -1045,7 +1045,7 @@ pub struct RefState<'c> {
     pub inherits_from_cache: FxHashMap<InheritKey, bool>,
     pub seen_containing_type_references: FxHashSet<Node>, // node seen tracker
     pub seen_re_export_rhs: FxHashSet<Node>,              // node seen tracker
-    pub import_tracker: Option<ImportTracker>,
+    pub import_tracker: Option<ImportTracker<'c>>,
     pub symbol_to_references: FxHashMap<SymbolId, Rc<RefCell<SymbolAndEntries>>>,
     pub source_file_to_seen_symbols: FxHashMap<Node, FxHashSet<SymbolId>>,
 }
