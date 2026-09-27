@@ -10,11 +10,13 @@
 //!   API sessions. It runs the sync part of each handler and then its async
 //!   part inline (Go starts the async part on a goroutine, so Go can answer
 //!   requests out of order; the port answers them in order). After each
-//!   message and each wake-up it runs `gostd::local::run_pending()`.
+//!   message and each wake-up it runs `gostd::local::run_pending()`. When
+//!   no message waits, it runs `gostd::local::run_idle()`.
 //! - The reader thread owns the `Reader`. It routes responses to
 //!   `pending_server_requests`, handles `$/cancelRequest` and the first
 //!   `initialize`, and queues all other messages (Go does the same on the
-//!   read goroutine).
+//!   read goroutine). It also cancels the auto-import warm when a file
+//!   event arrives (below).
 //! - The writer thread owns the `Writer` and drains the outgoing queue.
 //! - The progress thread (`progress.rs`) and the parent watchdog
 //!   (`cmd/tsgo/lsp.rs`) touch only `Send` data.
@@ -37,11 +39,25 @@
 //! - A background client request (`update_watches` registerCapability, 1 s
 //!   timeout) blocks the dispatch thread until the client answers. Go waits
 //!   on a goroutine.
+//! - A request that arrives while the auto-import warm runs waits for it,
+//!   unless it is a file event, which cancels the warm (below). Go runs
+//!   the request at the same time.
 //!
 //! Background tasks and timers stay on the dispatch thread at message
 //! boundaries, after the answer of the request that queued them. Do not
 //! move them to another thread: the oracle compares where background
-//! publishDiagnostics land.
+//! publishDiagnostics land. Do not hold them back while messages wait
+//! either: a task queued by didOpen (the `update_watches`
+//! registerCapability) must go out before the answer of the next request,
+//! as Go's does.
+//!
+//! The one exception is idle work (`gostd::local::go_idle`): the clone of
+//! the auto-import warm, which sends nothing to the client. It runs only
+//! when the request queue is empty (`queued_requests`). When a didOpen,
+//! didChange, didClose or didChangeWatchedFiles arrives, the reader thread
+//! cancels the warm (`project::WarmAutoImportPreempt`), as Go's dispatch
+//! goroutine does when it handles them. The warm stops at its next context
+//! check.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -67,7 +83,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -128,6 +144,7 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         init_started: AtomicBool::new(false),
         client_seq: AtomicI32::new(0),
         request_queue: new_dynamic_queue(),
+        queued_requests: AtomicUsize::new(0),
         outgoing_queue: new_dynamic_queue(),
         pending_client_requests: Mutex::new(FxHashMap::default()),
         pending_server_requests: Mutex::new(FxHashMap::default()),
@@ -141,6 +158,7 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         progress_delay,
         project_progress: OnceLock::new(),
         start_watchdog: set_parent_process_id,
+        warm_auto_import_preempt: OnceLock::new(),
     });
 
     Rc::new(Server {
@@ -301,6 +319,9 @@ pub struct ServerShared {
     pub init_started: AtomicBool,
     pub client_seq: AtomicI32,
     pub request_queue: DynamicQueue<QueuedRequest>,
+    // PORT: the number of items in `request_queue` (see `queue_request`).
+    // The dispatch loop runs idle work only when it is 0.
+    pub queued_requests: AtomicUsize,
     pub outgoing_queue: DynamicQueue<lsproto::Message>,
     // PORT: Go `pendingClientRequestsMu` and `pendingServerRequestsMu` are
     // the mutexes. A pending server request holds the sending end of its
@@ -325,6 +346,10 @@ pub struct ServerShared {
     pub project_progress: OnceLock<Arc<ProjectLoadingProgress>>,
 
     pub start_watchdog: Option<Box<dyn Fn(i32) + Send + Sync>>,
+
+    // PORT: the session's `warm_auto_import_preempt`, set by
+    // `handle_initialized`. The reader thread cancels the warm with it.
+    pub warm_auto_import_preempt: OnceLock<project::WarmAutoImportPreempt>,
 }
 
 // Go: server.go:153 Server (the dispatch-thread fields)
@@ -922,6 +947,16 @@ fn recv_or_done<T: Send + 'static>(
     }
 }
 
+/// PORT: the notifications whose Go handlers call
+/// `cancelWarmAutoImportCache` (through `Session.DidOpenFile`,
+/// `DidChangeFile`, `DidCloseFile` and `DidChangeWatchedFiles`).
+fn cancels_warm_auto_import(method: &lsproto::Method) -> bool {
+    *method == lsproto::Method::TEXT_DOCUMENT_DID_OPEN
+        || *method == lsproto::Method::TEXT_DOCUMENT_DID_CHANGE
+        || *method == lsproto::Method::TEXT_DOCUMENT_DID_CLOSE
+        || *method == lsproto::Method::WORKSPACE_DID_CHANGE_WATCHED_FILES
+}
+
 impl ServerShared {
     // Go: server.go:447 readLoop
     // PORT: `r` is the reader, which this thread owns.
@@ -987,10 +1022,30 @@ impl ServerShared {
                     );
                     self.cancel_request(&params.id);
                 } else {
-                    self.request_queue.put(ctx, QueuedRequest::Request(req))?;
+                    if cancels_warm_auto_import(&req.method) {
+                        // PORT: Go's handler cancels the warm when the
+                        // dispatch goroutine reaches this message. Here the
+                        // warm holds the dispatch thread, so cancel it now.
+                        if let Some(preempt) = self.warm_auto_import_preempt.get() {
+                            preempt.cancel(&*self.logger);
+                        }
+                    }
+                    self.queue_request(ctx, QueuedRequest::Request(req))?;
                 }
             }
         }
+    }
+
+    /// PORT: `request_queue.put` that also counts the item in
+    /// `queued_requests`. The count goes up before the put, so the dispatch
+    /// loop never sees 0 while an item is in the queue.
+    pub fn queue_request(&self, ctx: &Context, item: QueuedRequest) -> Result<(), GoError> {
+        self.queued_requests.fetch_add(1, Ordering::SeqCst);
+        let result = self.request_queue.put(ctx, item);
+        if result.is_err() {
+            self.queued_requests.fetch_sub(1, Ordering::SeqCst);
+        }
+        result
     }
 
     // Go: server.go:509 cancelRequest
@@ -1027,12 +1082,25 @@ impl Server {
             let shared = self.shared.clone();
             let wake_ctx = ctx.clone();
             gostd::local::set_waker(Arc::new(move || {
-                let _ = shared.request_queue.put(&wake_ctx, QueuedRequest::Wake);
+                let _ = shared.queue_request(&wake_ctx, QueuedRequest::Wake);
             }));
         }
 
         loop {
-            let req = match self.shared.request_queue.get(&ctx)? {
+            // PORT: idle work (the auto-import warm) runs only while no
+            // message waits, so it does not delay a request that has
+            // arrived. Work it queues runs right after it, as it did when
+            // the warm ran inside `run_pending`.
+            while ctx.err().is_none()
+                && self.shared.queued_requests.load(Ordering::SeqCst) == 0
+                && gostd::local::run_idle()
+            {
+                gostd::local::run_pending();
+            }
+
+            let item = self.shared.request_queue.get(&ctx)?;
+            self.shared.queued_requests.fetch_sub(1, Ordering::SeqCst);
+            let req = match item {
                 QueuedRequest::Request(req) => Rc::new(req),
                 QueuedRequest::Wake => {
                     gostd::local::run_pending();
@@ -2461,6 +2529,10 @@ impl Server {
             parse_cache: self.parse_cache.clone(),
         });
         *self.session.borrow_mut() = Some(session.clone());
+        let _ = self
+            .shared
+            .warm_auto_import_preempt
+            .set(session.warm_auto_import_preempt.clone());
 
         let user_preferences = self.request_configuration(ctx)?;
         session.initialize_with_user_config(user_preferences);

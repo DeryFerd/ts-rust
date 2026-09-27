@@ -64,6 +64,28 @@ pub fn get_token_at_position(source_file: Node, position: i32) -> Node {
     )
 }
 
+/// Go `core.BinarySearchUniqueFunc` over a `NodeSlice`, read in place with
+/// `NodeSlice::get`. Same steps and result as `binary_search_unique_func`.
+fn binary_search_node_slice(x: NodeSlice, mut cmp: impl FnMut(i32, Node) -> i32) -> (i32, bool) {
+    let n = x.len() as i32;
+    if n == 0 {
+        return (0, false);
+    }
+    let (mut low, mut high) = (0i32, n - 1);
+    while low <= high {
+        let middle = low + ((high - low) >> 1);
+        let value = cmp(middle, x.get(middle as usize));
+        if value < 0 {
+            low = middle + 1;
+        } else if value > 0 {
+            high = middle - 1;
+        } else {
+            return (middle, true);
+        }
+    }
+    (low, false)
+}
+
 // PORT: Go `getTokenAtPosition` has the same snake name as the exported
 // `GetTokenAtPosition`. The exported one keeps the plain name because other
 // packages call it; this private one gets the `_unexported` suffix.
@@ -186,9 +208,12 @@ fn get_token_at_position_unexported(
                 left.set(node_list.end());
                 node_after_left.set(Node::NIL);
             } else if node_list.pos() <= position {
-                let mut nodes: Vec<Node> = node_list.nodes().to_vec();
-                let (mut index, mut match_) =
-                    binary_search_unique_func(&nodes, |middle: i32, node: Node| -> i32 {
+                // PERF: search the list in place, like Go `nodes := nodeList.Nodes`.
+                // A `Vec` copy here cost one node lookup per list element at
+                // each level of descent.
+                let nodes = node_list.nodes();
+                let (index, match_) =
+                    binary_search_node_slice(nodes, |middle: i32, node: Node| -> i32 {
                         if node.flags().intersects(NodeFlags::REPARSED) {
                             return 0;
                         }
@@ -197,8 +222,9 @@ fn get_token_at_position_unexported(
                             left.set(node.end());
                             node_after_left.set(Node::NIL);
                             for i in (middle + 1) as usize..nodes.len() {
-                                if !nodes[i].flags().intersects(NodeFlags::REPARSED) {
-                                    node_after_left.set(nodes[i]);
+                                let after = nodes.get(i);
+                                if !after.flags().intersects(NodeFlags::REPARSED) {
+                                    node_after_left.set(after);
                                     break;
                                 }
                             }
@@ -206,32 +232,35 @@ fn get_token_at_position_unexported(
                         cmp
                     });
                 if match_
-                    && nodes[index as usize]
+                    && nodes
+                        .get(index as usize)
                         .flags()
                         .intersects(NodeFlags::REPARSED)
                 {
                     // filter and search again
-                    nodes = nodes
+                    // PORT: only this path collects a `Vec`, like Go `core.Filter`.
+                    let filtered: Vec<Node> = nodes
                         .iter()
-                        .copied()
                         .filter(|node| !node.flags().intersects(NodeFlags::REPARSED))
                         .collect();
-                    (index, match_) =
-                        binary_search_unique_func(&nodes, |middle: i32, node: Node| -> i32 {
+                    let (index, match_) =
+                        binary_search_unique_func(&filtered, |middle: i32, node: Node| -> i32 {
                             let cmp = test_node(node);
                             if cmp < 0 {
                                 left.set(node.end());
-                                if ((middle + 1) as usize) < nodes.len() {
-                                    node_after_left.set(nodes[(middle + 1) as usize]);
+                                if ((middle + 1) as usize) < filtered.len() {
+                                    node_after_left.set(filtered[(middle + 1) as usize]);
                                 } else {
                                     node_after_left.set(Node::NIL);
                                 }
                             }
                             cmp
                         });
-                }
-                if match_ {
-                    next.set(nodes[index as usize]);
+                    if match_ {
+                        next.set(filtered[index as usize]);
+                    }
+                } else if match_ {
+                    next.set(nodes.get(index as usize));
                 }
             }
         }
