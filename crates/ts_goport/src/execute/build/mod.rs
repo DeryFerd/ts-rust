@@ -7,9 +7,6 @@ pub mod orchestrator;
 pub mod orchestrator_watch;
 pub mod parse_cache;
 pub mod up_to_date_status;
-// PORT: not in Go. A stub of the removed build worker for the bins until
-// they drop their worker entry (see worker.rs).
-pub mod worker;
 
 pub use build_task::*;
 pub use command_line::*;

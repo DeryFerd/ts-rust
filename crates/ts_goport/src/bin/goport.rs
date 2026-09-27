@@ -286,8 +286,8 @@ fn run(args: &[String], start: Instant) -> i32 {
 struct CheckBin;
 
 impl TscCompilationHooks for CheckBin {
-    // PORT: `-b` is unported here: goport never writes an output, and the
-    // build workers re-run the bin. `goport_build` runs build mode.
+    // PORT: `-b` is unported here: goport never writes an output.
+    // `goport_build` runs build mode.
     fn build_mode(&self) -> bool {
         false
     }

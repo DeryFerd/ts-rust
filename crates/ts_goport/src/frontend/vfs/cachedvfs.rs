@@ -65,13 +65,6 @@ impl CachedFs {
     }
 }
 
-// PORT: not in Go. The build worker was removed (tsc -b compiles every
-// project in one process, on one cached file system, as Go does). This
-// empty type is left only for the worker entry of the bins
-// (execute/build/worker.rs); mp2/bins.patch deletes it with that entry.
-#[derive(Clone, Debug, Default)]
-pub struct CachedFsState {}
-
 impl Fs for CachedFs {
     // Go: cachedvfs.go:48 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
