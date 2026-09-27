@@ -4,14 +4,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ts_goport::fswatch::walk_dir_generic;
 use ts_goport::fswatch::walkdir_unix::walk_dir;
 use ts_goport::gostd::{GoError, errors};
 
 use super::fswatch_watcher::new_tmp_dir;
-use crate::astnav_api::jstest::TempDir;
 
 type WalkFn<'a> = Option<&'a mut dyn FnMut(&str, bool) -> Result<(), GoError>>;
 
@@ -55,8 +54,8 @@ fn walk_all(walk: Walk, root: &str) -> HashMap<String, bool> {
 fn test_walk_dir_does_not_follow_symlinked_dir() {
     run_walk_dir_test(|name, walk| {
         let (_tmp, root) = new_tmp_dir();
-        let other = TempDir::new();
-        let target = other.path().join("target");
+        let (_other, other) = new_tmp_dir();
+        let target = other.join("target");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("child"), "hidden").unwrap();
         let link = root.join("link");
@@ -79,8 +78,8 @@ fn test_walk_dir_does_not_follow_symlinked_dir() {
 
 fn geteuid() -> u32 {
     // The owner of a file this process makes is its effective uid.
-    let other = TempDir::new();
-    let p = other.path().join("uid");
+    let (_other, other) = new_tmp_dir();
+    let p = other.join("uid");
     std::fs::write(&p, "").unwrap();
     std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&p).unwrap())
 }
@@ -118,8 +117,8 @@ fn test_walk_dir_ignores_unreadable_subdir() {
 #[test]
 fn test_walk_dir_missing_dir() {
     run_walk_dir_test(|name, walk| {
-        let tmp = TempDir::new();
-        let dir = tmp.path().join("nonexistent");
+        let (_tmp, tmp) = new_tmp_dir();
+        let dir = tmp.join("nonexistent");
         assert!(
             walk(&s(&dir), true, None).is_err(),
             "{name}: expected error for missing directory"
@@ -131,8 +130,8 @@ fn test_walk_dir_missing_dir() {
 #[test]
 fn test_walk_dir_not_a_dir() {
     run_walk_dir_test(|name, walk| {
-        let tmp = TempDir::new();
-        let f = tmp.path().join("file");
+        let (_tmp, tmp) = new_tmp_dir();
+        let f = tmp.join("file");
         std::fs::write(&f, "x").unwrap();
         assert!(
             walk(&s(&f), true, None).is_err(),
@@ -204,6 +203,3 @@ fn test_walk_dir_callback_error() {
         }
     });
 }
-
-#[allow(dead_code)]
-fn unused(_: PathBuf) {}

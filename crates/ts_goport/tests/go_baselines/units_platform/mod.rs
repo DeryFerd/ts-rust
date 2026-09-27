@@ -19,6 +19,7 @@ mod fswatch_eventlist;
 mod fswatch_walkdir;
 mod fswatch_watcher;
 mod jsnum;
+mod lspwatcher;
 mod osvfs;
 mod packagejson;
 mod semver;
@@ -30,6 +31,17 @@ mod vfsmatch;
 mod vfsmock;
 
 use std::fmt::Debug;
+
+/// This test binary, for tests that run a child process of it. On Linux
+/// `/proc/self/exe` still names the running binary when a concurrent build
+/// replaces the file on disk.
+pub(crate) fn self_exe() -> std::path::PathBuf {
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    if proc_exe.exists() {
+        return proc_exe.to_path_buf();
+    }
+    std::env::current_exe().expect("current test binary")
+}
 
 /// The failed subtests of one Go test function.
 pub(crate) struct Failures {

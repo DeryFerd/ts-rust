@@ -86,7 +86,7 @@ fn temp_dir(name: &str) -> PathBuf {
 /// its `trace.json`.
 fn trace_events(kind: &str) -> Vec<TraceEvent> {
     let dir = temp_dir(kind);
-    let exe = std::env::current_exe().expect("current test binary");
+    let exe = super::self_exe();
     let output = std::process::Command::new(exe)
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
         .env(CHILD_ENV, kind)
