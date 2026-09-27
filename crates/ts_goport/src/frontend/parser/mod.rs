@@ -1,5 +1,6 @@
 //! Go package `parser`.
 pub mod jsdoc;
+pub mod lib_parse_snapshot;
 pub mod parser_p1;
 pub mod parser_p2;
 pub mod parser_p3;

@@ -205,7 +205,8 @@ struct FileStore {
     /// slot, interned (`Frozen::names`). `Name::default()` for other slots.
     /// Moved from `build_names` when `kinds` is made (`move_build_columns`),
     /// same length rule. U1 (d): the only copy of the text of a node that
-    /// `alloc_store_name_node` made (`store_identifier_name`).
+    /// `alloc_store_name_node` or `alloc_store_shared_name_node` made
+    /// (`store_identifier_name`).
     names: Box<[Name]>,
     /// U1 (b): `ModifierList::modifier_flags` of the node's own modifier list
     /// for every slot, 0 when it has none (`Frozen::modifier_bits`). Moved
@@ -230,6 +231,13 @@ struct FileStore {
     /// U4 while the parser runs: the `children` entry of every slot, pushed
     /// when the slot is made and made again when its data is replaced.
     build_children: Vec<SlotChildren>,
+    /// R2-5: the `SlotLinks` of every slot (`FrozenStore::links`). Moved
+    /// from `build_links` when `kinds` is made, same length rule.
+    links: Box<[SlotLinks]>,
+    /// R2-5 while the parser runs: the `links` entry of every slot, pushed
+    /// (`SlotLinks::NONE`) when the slot is made and written by
+    /// `StoreChildLinks` and `replace_store_node_data`.
+    build_links: Vec<SlotLinks>,
     /// Go parser `identifiers` (`internIdentifier`): the name and keyword
     /// bit of each identifier text of this file, keyed by the interned text.
     /// Dropped by the freeze.
@@ -305,7 +313,9 @@ impl StoreFacts {
 /// U4 (CH6, bind A): two child ids of a node slot, so that `Node::name`,
 /// `Node::expression`, `Node::postfix_token` and `Node::question_token` of a
 /// published store node need no load of its ts_ast node and data
-/// (`FileStore::children`, `frozen_store_child`). The ids are store-local
+/// (`FileStore::children`, `frozen_store_child`). C2 adds a third field for
+/// `Node::type_`, `Node::initializer`, `Node::type_name` and
+/// `Node::type_argument_list`. The ids are store-local
 /// slot indexes, like the child ids in the node data, so they stay valid
 /// when a detached store gets its real id. `node.rs`
 /// (`store_node_children`) makes the value from the node data with the arm
@@ -318,17 +328,29 @@ impl StoreFacts {
 ///   tag 0 with id 0 for a kind with none of the fields), `TAG_POSTFIX` (Go
 ///   `PostfixToken()`) or `TAG_QUESTION` (the node's own Go
 ///   `QuestionToken` field). All ones (`UNKNOWN_ID`) is unknown.
+/// - `typed` (C2): a tag in the top three bits, the `NO_TYPE_ARGUMENTS` bit
+///   and an id below, for Go `Type()`, `Initializer()` and
+///   `AsTypeReference().TypeName`. `TYPED_TYPE`: `Type()` is the id and
+///   `Initializer()` is nil (also id 0 for a node where both are nil, as for
+///   a kind with neither field). `TYPED_INITIALIZER`: `Type()` is nil and
+///   `Initializer()` is the id. `TYPED_TYPE_WITH_INITIALIZER`: `Type()` is
+///   the id, and `Initializer()` is set too but not held. `TYPED_TYPE_NAME`
+///   (TypeReference): `TypeName` is the id, `Type()` and `Initializer()`
+///   are nil. `NO_TYPE_ARGUMENTS` is set when Go `TypeArgumentList()` is nil
+///   and the node data has no list (`Node::type_argument_list` then gives
+///   `NodeList::NIL`).
 ///
 /// Unknown means "read the node data": nil and alias slots, the kinds whose
 /// accessor arm is not a plain field read (QualifiedName,
 /// CaseOrDefaultClause) and an id that does not fit.
-// PERF: one 8-byte entry per slot. A read is the entry and the per-store
+// PERF: one 12-byte entry per slot. A read is the entry and the per-store
 // record of `Node::new`, not the chain kind table, node pointer, node tag,
 // data box, field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotChildren {
     name: u32,
     other: u32,
+    typed: u32,
 }
 
 impl SlotChildren {
@@ -342,14 +364,31 @@ impl SlotChildren {
     pub(crate) const TAG_QUESTION: u32 = 2;
     const TAG_UNKNOWN: u32 = 3;
 
+    const TYPED_TAG_SHIFT: u32 = 29;
+    /// C2: Go `TypeArgumentList()` is nil (see the type doc).
+    const NO_TYPE_ARGUMENTS: u32 = 1 << 28;
+    /// The largest id that `typed` can hold.
+    const MAX_TYPED_ID: u32 = Self::NO_TYPE_ARGUMENTS - 1;
+    pub(crate) const TYPED_TYPE: u32 = 0;
+    pub(crate) const TYPED_INITIALIZER: u32 = 1;
+    pub(crate) const TYPED_TYPE_WITH_INITIALIZER: u32 = 2;
+    pub(crate) const TYPED_TYPE_NAME: u32 = 3;
+    /// Tags 4 to 6 are not used.
+    const TYPED_UNKNOWN: u32 = 7;
+    /// `typed` when unknown: every read takes the node data. The
+    /// `NO_TYPE_ARGUMENTS` bit is clear.
+    const TYPED_UNKNOWN_VALUE: u32 = Self::TYPED_UNKNOWN << Self::TYPED_TAG_SHIFT;
+
     /// Every read takes the node data.
     pub(crate) const UNKNOWN: Self = Self {
         name: Self::UNKNOWN_ID,
         other: Self::UNKNOWN_ID,
+        typed: Self::TYPED_UNKNOWN_VALUE,
     };
 
     /// `name` is the name child id (0 for nil or no field, `None` for
-    /// unknown); `other` is `(tag, id)` (`None` for unknown).
+    /// unknown); `other` is `(tag, id)` (`None` for unknown). The `typed`
+    /// field is unknown (see `with_typed`).
     #[inline]
     pub(crate) fn new(name: Option<u32>, other: Option<(u32, u32)>) -> Self {
         let other = match other {
@@ -363,6 +402,28 @@ impl SlotChildren {
             // it reads as unknown, which is always exact.
             name: name.unwrap_or(Self::UNKNOWN_ID),
             other,
+            typed: Self::TYPED_UNKNOWN_VALUE,
+        }
+    }
+
+    /// C2: this entry with `typed` set from `typed` (`(tag, id)`, `None`
+    /// for unknown) and `no_type_arguments`.
+    #[inline]
+    pub(crate) fn with_typed(self, typed: Option<(u32, u32)>, no_type_arguments: bool) -> Self {
+        let typed = match typed {
+            Some((tag, id)) if tag <= Self::TYPED_TYPE_NAME && id <= Self::MAX_TYPED_ID => {
+                (tag << Self::TYPED_TAG_SHIFT) | id
+            }
+            _ => Self::TYPED_UNKNOWN_VALUE,
+        };
+        let no_type_arguments = if no_type_arguments {
+            Self::NO_TYPE_ARGUMENTS
+        } else {
+            0
+        };
+        Self {
+            typed: typed | no_type_arguments,
+            ..self
         }
     }
 
@@ -373,6 +434,21 @@ impl SlotChildren {
             self.other >> Self::TAG_SHIFT,
             self.other & Self::MAX_TAGGED_ID,
         )
+    }
+
+    /// C2: the tag and id of `typed`.
+    #[inline]
+    fn typed_parts(self) -> (u32, u32) {
+        (
+            self.typed >> Self::TYPED_TAG_SHIFT,
+            self.typed & Self::MAX_TYPED_ID,
+        )
+    }
+
+    /// C2: Go `TypeArgumentList()` is nil.
+    #[inline]
+    fn has_no_type_arguments(self) -> bool {
+        self.typed & Self::NO_TYPE_ARGUMENTS != 0
     }
 }
 
@@ -388,6 +464,55 @@ pub enum StoreChild {
     /// Go `node.QuestionToken()`: the own field, else the postfix token when
     /// it is a `?` token.
     QuestionToken,
+    /// C2: Go `node.Type()`.
+    Type,
+    /// C2: Go `node.Initializer()`.
+    Initializer,
+    /// C2: Go `node.AsTypeReference().TypeName`. `None` (read the data, which
+    /// panics like Go) for other kinds.
+    TypeName,
+}
+
+/// R2-5: the binder child links of one slot (`FileStore::links`): the
+/// children of a node in Go `ForEachChild` order as a chain, first child
+/// and next sibling, so `Binder::bind_each_child` walks them without the
+/// node data. The ids are store-local slot indexes, so they stay valid when
+/// a detached store gets its real id.
+///
+/// - `first_child`: the first child of this node, `LINK_END` for a node
+///   with no child, `LINK_NONE` when the chain of this node is not known.
+/// - `next_sibling`: the next child in the chain that holds this slot,
+///   `LINK_END` for the last one, `LINK_NONE` when no chain holds it.
+///
+/// Rules that keep a known chain equal to Go `ForEachChild` of its node:
+/// - The parser links a node when it sets the parents of its children
+///   (`StoreChildLinks`), in the same visit. A chain holds only node slots
+///   of the same store.
+/// - A slot is in at most one chain. A child that another chain holds
+///   (a node that two parents share, or a child twice in one node), a
+///   child of another store and an alias child make the node unknown.
+/// - A new data write to a node (`replace_store_node_data`) frees its chain
+///   and makes it unknown until the parser links it again.
+/// - A store whose parse did not finish gets no links (`publish`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotLinks {
+    first_child: u32,
+    next_sibling: u32,
+}
+
+/// R2-5: a `SlotLinks` field value: the chain ends (slot 0, the nil slot,
+/// is never a child in a chain).
+const LINK_END: u32 = NIL_SLOT;
+/// R2-5: a `SlotLinks` field value: not known (`first_child`) or in no
+/// chain (`next_sibling`).
+const LINK_NONE: u32 = u32::MAX;
+
+impl SlotLinks {
+    /// A slot with no known chain that no chain holds.
+    const NONE: Self = Self {
+        first_child: LINK_NONE,
+        next_sibling: LINK_NONE,
+    };
 }
 
 /// U1 (e): capacity hints for the binder of a store file, counted from the
@@ -641,6 +766,8 @@ struct FrozenStore {
     /// U4: `FileStore::children`. Next to `resolved`, so a child read loads
     /// one per-store record.
     children: &'static [SlotChildren],
+    /// R2-5: `FileStore::links`.
+    links: &'static [SlotLinks],
 }
 
 /// `try_resolve_store_id(file, index)` for store `file` of publish `f`, whose
@@ -797,7 +924,7 @@ fn inactive_unpublished_store(file: usize) -> StoreCell {
 
 /// Writes the header of the node slot of a store handle. Panics on a frozen
 /// store. Data writes go through `replace_store_node_data`, which keeps the
-/// U1 and U4 build entries of the slot.
+/// U1, U4 and R2-5 build entries of the slot.
 fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut NodeHeader) -> R) -> R {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
@@ -860,6 +987,8 @@ impl FileStore {
         build_modifier_bits.push(0);
         let mut build_children = Vec::with_capacity(slots);
         build_children.push(SlotChildren::UNKNOWN);
+        let mut build_links = Vec::with_capacity(slots);
+        build_links.push(SlotLinks::NONE);
         // PERF: U1 (a). About one distinct identifier text per 16 slots, so
         // the map of a large file does not rehash while it grows.
         let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
@@ -871,6 +1000,7 @@ impl FileStore {
             build_names,
             build_modifier_bits,
             build_children,
+            build_links,
             identifier_names,
             ..Self::default()
         }
@@ -921,6 +1051,40 @@ impl FileStore {
         debug_assert_eq!(self.build_names.len(), self.headers.len());
         debug_assert_eq!(self.build_modifier_bits.len(), self.headers.len());
         debug_assert_eq!(self.build_children.len(), self.headers.len());
+        debug_assert_eq!(self.build_links.len(), self.headers.len());
+    }
+
+    /// R2-5: frees the chain of slot `index` (no chain holds its old
+    /// children then) and makes the chain of `index` unknown.
+    fn unlink_children(&mut self, index: usize) {
+        let mut child = std::mem::replace(&mut self.build_links[index].first_child, LINK_NONE);
+        if child == LINK_NONE {
+            return;
+        }
+        while child != LINK_END {
+            let links = &mut self.build_links[child as usize];
+            child = std::mem::replace(&mut links.next_sibling, LINK_NONE);
+            debug_assert_ne!(child, LINK_NONE, "R2-5 chain without an end");
+        }
+    }
+
+    /// R2-5: appends slot `child` to the chain of slot `parent`, whose last
+    /// child is `*last` (`LINK_END` before the first). False, with nothing
+    /// written, when a chain already holds `child`.
+    #[inline]
+    fn link_child(&mut self, parent: usize, last: &mut u32, child: usize) -> bool {
+        if self.build_links[child].next_sibling != LINK_NONE {
+            return false;
+        }
+        self.build_links[child].next_sibling = LINK_END;
+        let child = child as u32;
+        if *last == LINK_END {
+            self.build_links[parent].first_child = child;
+        } else {
+            self.build_links[*last as usize].next_sibling = child;
+        }
+        *last = child;
+        true
     }
 }
 
@@ -1040,8 +1204,9 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
         // The lazy JSDoc nodes are synthetic nodes of the parse worker.
         store.lazy_jsdoc_cache = FxHashMap::default();
         // The resolved table holds handles of the store id, which changes
-        // here. `publish_file_stores` makes it for the real id. The U1 and
-        // U4 columns are slot-indexed and hold no store id, so they stay.
+        // here. `publish_file_stores` makes it for the real id. The U1, U4
+        // and R2-5 columns are slot-indexed and hold no store id, so they
+        // stay.
         store.resolved = Box::default();
         let cell: StoreCell = leak_in_ast_arena(RefCell::new(store));
         b.stores.push(cell);
@@ -1277,9 +1442,9 @@ impl FileStore {
     }
 
     /// Makes `kinds`, `facts` and the U1 (e) `bind_estimate` in one pass over
-    /// the slots, and calls `each` on every slot header. Then moves the U1
-    /// and U4 build vectors into the `names`, `modifier_bits` and `children`
-    /// columns (`move_build_columns`).
+    /// the slots, and calls `each` on every slot header. Then moves the U1,
+    /// U4 and R2-5 build vectors into the `names`, `modifier_bits`,
+    /// `children` and `links` columns (`move_build_columns`).
     fn set_kinds_and_facts(&mut self, mut each: impl FnMut(&NodeHeader)) {
         let mut facts = StoreFacts::ONLY_NIL_SLOT;
         let mut kinds = Vec::with_capacity(self.headers.len());
@@ -1298,11 +1463,12 @@ impl FileStore {
         self.move_build_columns();
     }
 
-    /// U1 (a) (b), U4: moves `build_names`, `build_modifier_bits` and
-    /// `build_children`, made when each slot was made, into `names`,
-    /// `modifier_bits` and `children`, and drops `identifier_names`. Needs
-    /// `kinds`. A modifier vector without one entry per slot is not used:
-    /// `modifier_bits_column` makes that column from the slots.
+    /// U1 (a) (b), U4, R2-5: moves `build_names`, `build_modifier_bits`,
+    /// `build_children` and `build_links`, made when each slot was made,
+    /// into `names`, `modifier_bits`, `children` and `links`, and drops
+    /// `identifier_names`. Needs `kinds`. A modifier vector without one entry
+    /// per slot is not used: `modifier_bits_column` makes that column from
+    /// the slots.
     // PERF: no pass over the node data. Debug builds check the moved columns
     // and the header keyword bits against the node data.
     fn move_build_columns(&mut self) {
@@ -1310,8 +1476,9 @@ impl FileStore {
         self.identifier_names = FxHashMap::default();
         let names = std::mem::take(&mut self.build_names);
         // PORT: U1 (d). The name column is the only copy of the text of an
-        // identifier that `alloc_store_name_node` made, so it cannot be made
-        // again from the node data. Every slot push adds its entry.
+        // identifier that `alloc_store_name_node` or
+        // `alloc_store_shared_name_node` made, so it cannot be made again
+        // from the node data. Every slot push adds its entry.
         assert_eq!(
             names.len(),
             slots,
@@ -1345,10 +1512,19 @@ impl FileStore {
         };
         // PORT: a child written after the slot was made must have gone
         // through `replace_store_node_data`, which makes the entry again.
+        // C2: the check covers the `typed` field too.
         debug_assert!(
             self.children_column_matches(),
             "U4 children column differs from the node data"
         );
+        // R2-5: the same rule. The chains are checked against Go
+        // `ForEachChild` when the binder walks them (`bind_each_child`).
+        let links = std::mem::take(&mut self.build_links);
+        self.links = if links.len() == slots {
+            links.into_boxed_slice()
+        } else {
+            vec![SlotLinks::NONE; slots].into_boxed_slice()
+        };
     }
 
     /// U4, debug builds: true when every `children` entry is unknown or
@@ -1370,7 +1546,8 @@ impl FileStore {
     /// U1 (a) (d), debug builds: checks `names` and the `text_is_keyword`
     /// header bits against `kinds` and the node data. An identifier slot
     /// whose data has a text has that name; one whose data text is empty
-    /// (`alloc_store_name_node`) keeps the name it was made with.
+    /// (`alloc_store_name_node`, `alloc_store_shared_name_node`) keeps the
+    /// name it was made with.
     #[cfg(debug_assertions)]
     fn debug_check_text_names(&self) {
         let slots = self.kinds.iter().zip(&self.nodes).zip(&self.headers);
@@ -1441,6 +1618,10 @@ impl FileStore {
         if !self.frozen {
             // PORT: a store whose parse did not finish (a parse panic).
             self.end_parse();
+            // R2-5: a panic can stop the parser between two children of a
+            // node, so its chains may be partial. No links: the binder uses
+            // Go `ForEachChild` (`move_build_columns`).
+            self.build_links = Vec::new();
         }
         self.aliases = FxHashMap::default();
         self.jsdoc_cache = FxHashMap::default();
@@ -1619,6 +1800,7 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
                 nil: resolve_slot(base + i, NIL_SLOT as usize, &s.nodes, &s.headers),
                 facts: s.facts,
                 children: &s.children[..],
+                links: &s.links[..],
             })
             .collect(),
         go_files: go_files.into_boxed_slice(),
@@ -1942,8 +2124,9 @@ fn try_resolve_store_id_slow(file: usize, index: usize) -> Option<Node> {
 }
 
 /// The text in the data of an Identifier or PrivateIdentifier node. Empty
-/// for a store node made by `alloc_store_name_node` (see
-/// `store_identifier_name`) and for other kinds.
+/// for a store node made by `alloc_store_name_node` or
+/// `alloc_store_shared_name_node` (see `store_identifier_name`) and for
+/// other kinds.
 fn identifier_text(node: &ts_ast::Node) -> &str {
     match &node.data {
         NodeData::Identifier(d) => &d.text,
@@ -2136,9 +2319,10 @@ pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
 /// U4 (CH6, bind A): Go `n.Name()`, `n.Expression()`, `n.PostfixToken()` or
 /// `n.QuestionToken()` (`which`) of a tier 0 store node, from the
 /// `children` column of its store (`SlotChildren`), resolved like
-/// `Node::new`. `None` when the entry is unknown and for any other node
-/// (nil, synthetic, legacy, tier 1, unpublished): the caller reads the node
-/// data.
+/// `Node::new`. C2: also Go `n.Type()`, `n.Initializer()` and
+/// `n.AsTypeReference().TypeName`. `None` when the entry is unknown and for
+/// any other node (nil, synthetic, legacy, tier 1, unpublished): the caller
+/// reads the node data.
 #[inline]
 #[must_use]
 pub fn frozen_store_child(n: Node, which: StoreChild) -> Option<Node> {
@@ -2149,30 +2333,118 @@ pub fn frozen_store_child(n: Node, which: StoreChild) -> Option<Node> {
     let (f, local) = column_store(file)?;
     let s = &f.per_store[local];
     let entry = *s.children.get(slot_index(n))?;
-    let id = if which == StoreChild::Name {
-        if entry.name == SlotChildren::UNKNOWN_ID {
-            return None;
-        }
-        entry.name
-    } else {
-        let (tag, id) = entry.other_parts();
-        match (which, tag) {
-            (_, SlotChildren::TAG_UNKNOWN) => return None,
-            (StoreChild::Expression, SlotChildren::TAG_EXPRESSION)
-            | (StoreChild::PostfixToken, SlotChildren::TAG_POSTFIX)
-            | (StoreChild::QuestionToken, SlotChildren::TAG_QUESTION) => id,
-            // Go `QuestionToken()` of a kind with a postfix token: that
-            // token when it is a `?` token (`question_of_postfix`).
-            (StoreChild::QuestionToken, SlotChildren::TAG_POSTFIX) => {
-                let postfix = column_child(f, s, file, id);
-                let is_question = postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken;
-                return Some(if is_question { postfix } else { Node::NIL });
+    let id = match which {
+        StoreChild::Name => {
+            if entry.name == SlotChildren::UNKNOWN_ID {
+                return None;
             }
-            // The kind of `n` has no such field.
-            _ => NIL_SLOT,
+            entry.name
+        }
+        StoreChild::Expression | StoreChild::PostfixToken | StoreChild::QuestionToken => {
+            let (tag, id) = entry.other_parts();
+            match (which, tag) {
+                (_, SlotChildren::TAG_UNKNOWN) => return None,
+                (StoreChild::Expression, SlotChildren::TAG_EXPRESSION)
+                | (StoreChild::PostfixToken, SlotChildren::TAG_POSTFIX)
+                | (StoreChild::QuestionToken, SlotChildren::TAG_QUESTION) => id,
+                // Go `QuestionToken()` of a kind with a postfix token: that
+                // token when it is a `?` token (`question_of_postfix`).
+                (StoreChild::QuestionToken, SlotChildren::TAG_POSTFIX) => {
+                    let postfix = column_child(f, s, file, id);
+                    let is_question =
+                        postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken;
+                    return Some(if is_question { postfix } else { Node::NIL });
+                }
+                // The kind of `n` has no such field.
+                _ => NIL_SLOT,
+            }
+        }
+        StoreChild::Type | StoreChild::Initializer | StoreChild::TypeName => {
+            let (tag, id) = entry.typed_parts();
+            match (which, tag) {
+                (_, SlotChildren::TYPED_UNKNOWN) => return None,
+                (
+                    StoreChild::Type,
+                    SlotChildren::TYPED_TYPE | SlotChildren::TYPED_TYPE_WITH_INITIALIZER,
+                )
+                | (StoreChild::Initializer, SlotChildren::TYPED_INITIALIZER)
+                | (StoreChild::TypeName, SlotChildren::TYPED_TYPE_NAME) => id,
+                // An initializer that the column does not hold.
+                (StoreChild::Initializer, SlotChildren::TYPED_TYPE_WITH_INITIALIZER) => {
+                    return None;
+                }
+                // Go `AsTypeReference()` panics on other kinds; the data read
+                // keeps the panic.
+                (StoreChild::TypeName, _) => return None,
+                // The field is nil, or the kind of `n` has no such field.
+                _ => NIL_SLOT,
+            }
         }
     };
     Some(column_child(f, s, file, id))
+}
+
+/// C2: true when `n` is a tier 0 store node whose Go `TypeArgumentList()`
+/// is nil with no list in its node data (`SlotChildren` `NO_TYPE_ARGUMENTS`),
+/// so `Node::type_argument_list` is `NodeList::NIL`. False when not known and
+/// for any other node (nil, synthetic, legacy, tier 1, unpublished).
+#[inline]
+#[must_use]
+pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
+    if n.is_nil() {
+        return false;
+    }
+    column_store(n.file_index()).is_some_and(|(f, local)| {
+        f.per_store[local]
+            .children
+            .get(slot_index(n))
+            .is_some_and(|entry| entry.has_no_type_arguments())
+    })
+}
+
+/// R2-5: the children of a tier 0 store node in Go `ForEachChild` order,
+/// from the link column of its store (`SlotLinks`), without its node data.
+/// `None` when the chain of `n` is not known and for any other node (nil,
+/// synthetic, legacy, tier 1, unpublished): the caller uses `for_each_child`.
+#[inline]
+#[must_use]
+pub fn frozen_store_children(n: Node) -> Option<StoreChildren> {
+    if n.is_nil() {
+        return None;
+    }
+    let file = n.file_index();
+    let (f, local) = column_store(file)?;
+    let links = f.per_store[local].links;
+    let first = links.get(slot_index(n))?.first_child;
+    (first != LINK_NONE).then_some(StoreChildren {
+        file,
+        links,
+        next: first,
+    })
+}
+
+/// R2-5: the iterator of `frozen_store_children`. A chain holds only node
+/// slots of its store, so each child is the handle of its slot.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreChildren {
+    file: usize,
+    links: &'static [SlotLinks],
+    /// The next child, `LINK_END` at the end.
+    next: u32,
+}
+
+impl Iterator for StoreChildren {
+    type Item = Node;
+
+    #[inline]
+    fn next(&mut self) -> Option<Node> {
+        if self.next == LINK_END {
+            return None;
+        }
+        let index = self.next;
+        self.next = self.links[index as usize].next_sibling;
+        Some(handle(self.file, index))
+    }
 }
 
 /// The node of child id `id` of store `file` in a `children` entry.
@@ -2335,13 +2607,13 @@ pub fn frozen_store_bind_estimate(file: usize) -> Option<(usize, usize)> {
 // Go field writes during the parse
 // ──────────────────────────────────────────────────────────────────────
 
-/// Runs `f` on the header of `n` when `n` is a node slot of an unpublished
-/// store of this thread (built or detached), with one thread-local access.
-/// False when `n` is not such a node (for example a synthetic or a
-/// published node). Panics on a finished store, like `with_slot_mut`.
-fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
+/// The cell of the unpublished store of this thread (built or detached)
+/// that holds `n`, with one thread-local access. `None` when `n` is not a
+/// node of such a store (for example nil, a synthetic or a published node).
+#[inline]
+fn thread_build_cell(n: Node) -> Option<StoreCell> {
     if n.is_nil() {
-        return false;
+        return None;
     }
     let file = n.file_index();
     // A tier 0 node or a synthetic node leaves here, inline: one load and
@@ -2350,16 +2622,24 @@ fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
     if let Some(tier0) = FROZEN.get()
         && (file < tier0.headers.len() || is_storeless_id(file) || tier0.legacy)
     {
-        return false;
+        return None;
     }
     // PERF: query Q8. The parse writes the active store, which is never
     // published (see `ACTIVE`).
-    let store = match active_store(file) {
-        Some(store) => store,
-        None => match inactive_thread_store(file) {
-            Some(store) => store,
-            None => return false,
-        },
+    match active_store(file) {
+        Some(store) => Some(store),
+        None => inactive_thread_store(file),
+    }
+}
+
+/// Runs `f` on the store and the slot index of `n` when `n` is a node slot
+/// of an unpublished store of this thread (built or detached), with one
+/// thread-local access. False when `n` is not such a node (for example a
+/// synthetic or a published node). Panics on a finished store, like
+/// `with_slot_mut`.
+fn try_with_build_slot(n: Node, f: impl FnOnce(&mut FileStore, usize)) -> bool {
+    let Some(store) = thread_build_cell(n) else {
+        return false;
     };
     let mut s = store.borrow_mut();
     assert!(!s.frozen, "cannot mutate a node of a finished file");
@@ -2368,13 +2648,18 @@ fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
         s.nodes[index].is_some(),
         "store handle does not name a node slot"
     );
-    f(&mut s.headers[index]);
+    f(&mut *s, index);
     true
 }
 
-/// `try_with_build_header` for a file that is not in tier 0 and not the
-/// active store: `None` for a tier 1 file (published), else the detached
-/// store, then the build stores of this thread.
+/// `try_with_build_slot` on the header of `n`.
+fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
+    try_with_build_slot(n, |s, index| f(&mut s.headers[index]))
+}
+
+/// `thread_build_cell` for a file that is not in tier 0 and not the active
+/// store: `None` for a tier 1 file (published), else the detached store,
+/// then the build stores of this thread.
 #[inline(never)]
 fn inactive_thread_store(file: usize) -> Option<StoreCell> {
     if FROZEN.get().is_some() && later(file).is_some() {
@@ -2401,6 +2686,153 @@ pub fn try_set_store_node_parent(n: Node, parent: Node) -> bool {
     try_with_build_header(n, |h| h.parent = parent)
 }
 
+/// R2-5: Go `child.Parent = parent` for each child of `parent` in Go
+/// `ForEachChild` order (parser.go `overrideParentInImmediateChildren`),
+/// which also makes the chain of `parent` in the link column (`SlotLinks`).
+/// `new` starts the chain; `set_parent` sets the parent of one child and
+/// links it, in the same store access.
+pub struct StoreChildLinks {
+    parent: Node,
+    /// The last child linked so far, `LINK_END` before the first.
+    last: u32,
+    /// True while the chain of `parent` is made. False when `parent` is not
+    /// a node of an unfinished store of this thread, or a child could not be
+    /// linked (the chain of `parent` is then unknown).
+    linking: bool,
+}
+
+impl StoreChildLinks {
+    /// Starts the chain of `parent`: frees its old chain (the parser can set
+    /// the parents of the same children again) and marks it as a node with
+    /// no child yet.
+    #[must_use]
+    pub fn new(parent: Node) -> Self {
+        let linking = thread_build_cell(parent).is_some_and(|store| {
+            let mut s = store.borrow_mut();
+            let index = slot_index(parent);
+            // Nothing to link in a finished file; a child write panics there.
+            if s.frozen || s.nodes[index].is_none() {
+                return false;
+            }
+            s.unlink_children(index);
+            s.build_links[index].first_child = LINK_END;
+            true
+        });
+        Self {
+            parent,
+            last: LINK_END,
+            linking,
+        }
+    }
+
+    /// Go `child.Parent = parent` for the next child of `parent`, and links
+    /// `child` after the children before it. False (nothing written) when
+    /// `child` is not a store node of this thread; the caller then sets the
+    /// parent itself (`set_node_parent`).
+    pub fn set_parent(&mut self, child: Node) -> bool {
+        let parent = self.parent;
+        let stored = NodeHeader::stored_parent(child.file_index(), parent);
+        // A chain holds only node slots of the store of `parent`.
+        let link = self.linking && child.file_index() == parent.file_index();
+        let last = &mut self.last;
+        let mut linked = false;
+        let written = try_with_build_slot(child, |s, index| {
+            s.headers[index].parent = stored;
+            linked = link && s.link_child(slot_index(parent), last, index);
+        });
+        if self.linking && !linked {
+            // PORT: Go has no such case; only the link column cannot hold it
+            // (see `SlotLinks`). The binder then uses Go `ForEachChild`.
+            self.linking = false;
+            try_with_build_slot(self.parent, |s, index| s.unlink_children(index));
+        }
+        written
+    }
+}
+
+/// R3-2: parser.go `overrideParentInImmediateChildren` for `parent` in one
+/// borrow of its store: Go `child.Parent = parent` for each child in Go
+/// `ForEachChild` order (`for_each_store_child_id`), and the R2-5 chain of
+/// `parent`, with the same writes as `StoreChildLinks`. False when `parent`
+/// is not a node of an unfinished store of this thread, or when a child is
+/// not a node slot of that store (an alias slot, or a nil list entry). The
+/// caller then runs the `StoreChildLinks` walk, which gives the same result
+/// from any state this left: it frees the chain of `parent` first, and sets
+/// the same parents again.
+// PERF: R3-2. The `StoreChildLinks` walk found the store once per child
+// (`try_with_build_slot`: the `FROZEN` check, the thread-local lookup and a
+// `RefCell` borrow) and read the data and each child through the node
+// reads. This reads the data from the slot and writes the children by slot
+// index.
+pub fn set_parent_in_store_children(parent: Node) -> bool {
+    let Some(store) = thread_build_cell(parent) else {
+        return false;
+    };
+    let mut guard = store.borrow_mut();
+    let s = &mut *guard;
+    let index = slot_index(parent);
+    // A finished file: the `StoreChildLinks` walk panics on the first write.
+    if s.frozen {
+        return false;
+    }
+    let Some(node) = s.nodes[index] else {
+        return false;
+    };
+    let kind = s.headers[index].kind;
+    // `NodeHeader::stored_parent` of a child in the store of `parent`.
+    let stored = handle(LOCAL_STORE, index as u32);
+    // `StoreChildLinks::new`.
+    s.unlink_children(index);
+    s.build_links[index].first_child = LINK_END;
+    let mut last = LINK_END;
+    let mut linking = true;
+    let stopped = super::node::for_each_store_child_id(kind, node, |child| {
+        let child = child as usize;
+        if s.nodes[child].is_none() {
+            return true;
+        }
+        // `StoreChildLinks::set_parent`.
+        s.headers[child].parent = stored;
+        if linking && !s.link_child(index, &mut last, child) {
+            linking = false;
+            s.unlink_children(index);
+        }
+        false
+    });
+    !stopped
+}
+
+/// R3-2, debug builds: the slot index, stored parent and R2-5 links of
+/// `parent` and of each child that the generic walk (`Node::iter_children`)
+/// visits. Every child must be a node of the store of `parent`, an
+/// unfinished store of this thread (`set_parent_in_store_children` made
+/// its parents).
+#[cfg(debug_assertions)]
+pub fn debug_store_child_link_state(parent: Node) -> Vec<(u32, Node, u32, u32)> {
+    // The walk reads the store, so it runs before the borrow below.
+    let children = parent.iter_children();
+    let store = thread_build_cell(parent).expect("R3-2: parent is not a build store node");
+    let s = store.borrow();
+    std::iter::once(parent)
+        .chain(children)
+        .map(|n| {
+            assert_eq!(
+                n.file_index(),
+                parent.file_index(),
+                "R3-2: a child in another store"
+            );
+            let index = slot_index(n);
+            let links = s.build_links[index];
+            (
+                index as u32,
+                s.headers[index].parent,
+                links.first_child,
+                links.next_sibling,
+            )
+        })
+        .collect()
+}
+
 /// Go `node.Parent = parent` on a node of an unfrozen file.
 pub fn set_store_node_parent(n: Node, parent: Node) {
     let parent = NodeHeader::stored_parent(n.file_index(), parent);
@@ -2420,7 +2852,7 @@ pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
 /// Go write to a data field of a node of an unfrozen file (reparser.go,
 /// `internIdentifier`). The new data replaces the old; the old node leaks.
 /// The U1 and U4 build entries and the keyword bit of the slot follow the
-/// new data.
+/// new data, and its R2-5 chain becomes unknown.
 pub fn replace_store_node_data(n: Node, data: NodeData) {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
@@ -2439,8 +2871,10 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
         // `debug_check_text_names` and `modifier_bits_column` read).
         let kind = s.headers[index].kind;
         // PORT: U1 (d). Data cloned from a store identifier has an empty text
-        // (`alloc_store_name_node`), so an empty text keeps the slot name. A
-        // new text replaces it. Go writes no empty identifier text here.
+        // (`alloc_store_name_node`, `alloc_store_shared_name_node`), so an
+        // empty text keeps the slot name. A new text replaces it. Go writes
+        // no empty identifier text here. S1: the new data gets a new node;
+        // a shared name node does not change.
         let keeps_name = matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
             && identifier_text(node).is_empty();
         if !keeps_name {
@@ -2451,8 +2885,321 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
         let modifier_bits = s.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
         s.build_modifier_bits[index] = modifier_bits;
         // U4: a reparser write can change a child that the column holds.
+        // C2: the same for the `typed` field.
         s.build_children[index] = super::node::store_node_children(kind, node);
+        // R2-5: the children of the node can change, so its chain is freed
+        // and unknown until the parser sets their parents again
+        // (`StoreChildLinks`; reparser.go `finishMutatedNode`).
+        s.unlink_children(index);
     });
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Lib parse snapshot (R3-1, frontend/parser/lib_parse_snapshot.rs)
+// ──────────────────────────────────────────────────────────────────────
+
+/// R3-1: one node slot of a lib parse snapshot: what the parse left in the
+/// slot when it froze the file, besides what the freeze and the U1 and U4
+/// build entries make from it. A snapshot store has no alias slot, and slot
+/// 0 (nil) is not in the snapshot.
+pub(crate) struct LibParseSlot {
+    pub(crate) kind: SyntaxKind,
+    pub(crate) flags: NodeFlags,
+    pub(crate) loc: TextRange,
+    /// The slot of the Go parent, 0 for nil.
+    pub(crate) parent: u32,
+    /// The R2-5 links (`SlotLinks`): a slot, `Self::LINK_END` or
+    /// `Self::LINK_NONE`.
+    pub(crate) first_child: u32,
+    pub(crate) next_sibling: u32,
+    /// The node data. `None`: the slot points at the shared name node of
+    /// `kind` (S1, `alloc_store_shared_name_node`).
+    pub(crate) data: Option<NodeData>,
+    /// The name column entry and the keyword bit (`slot_text_name`):
+    /// `Name::default()` and false for a kind other than Identifier and
+    /// PrivateIdentifier.
+    pub(crate) name: Name,
+    pub(crate) text_is_keyword: bool,
+}
+
+impl LibParseSlot {
+    pub(crate) const LINK_END: u32 = LINK_END;
+    pub(crate) const LINK_NONE: u32 = LINK_NONE;
+}
+
+/// R3-1: fills store `file`, which `new_file_store` or
+/// `new_detached_file_store` just made on this thread, with `count` slots
+/// after slot 0 from `next`, in slot order, as the parse made them: the
+/// header, data, name and link entries of each slot, and the U1 (b) and U4
+/// build entries made from the data as `alloc_store_slot_node` makes them.
+/// The caller freezes the store, which makes the other tables as for a live
+/// parse. False when `next` fails; the store then holds part of the slots
+/// (`reset_file_store` empties it).
+// PERF: R3-1. One store borrow for all slots. The vectors are made at their
+// final size, which `freeze` keeps.
+pub(crate) fn load_lib_parse_slots(
+    file: usize,
+    count: usize,
+    mut next: impl FnMut() -> Option<LibParseSlot>,
+) -> bool {
+    with_store_mut(file, |s| {
+        assert!(
+            !s.frozen && s.headers.len() == 1,
+            "a lib parse snapshot loads into a new store"
+        );
+        s.headers.reserve_exact(count);
+        s.nodes.reserve_exact(count);
+        s.build_names.reserve_exact(count);
+        s.build_modifier_bits.reserve_exact(count);
+        s.build_children.reserve_exact(count);
+        s.build_links.reserve_exact(count);
+        for _ in 0..count {
+            let Some(slot) = next() else {
+                return false;
+            };
+            s.push_lib_parse_slot(slot);
+        }
+        s.debug_assert_build_columns();
+        true
+    })
+}
+
+impl FileStore {
+    /// `load_lib_parse_slots` for one slot.
+    fn push_lib_parse_slot(&mut self, slot: LibParseSlot) {
+        let LibParseSlot {
+            kind,
+            flags,
+            loc,
+            parent,
+            first_child,
+            next_sibling,
+            data,
+            name,
+            text_is_keyword,
+        } = slot;
+        let node = match data {
+            Some(data) => leak_ast_node(kind, data),
+            None => shared_name_node(kind),
+        };
+        self.headers.push(NodeHeader {
+            // `NodeHeader::stored_parent` of a parent in this store.
+            parent: if parent == NIL_SLOT {
+                Node::NIL
+            } else {
+                handle(LOCAL_STORE, parent)
+            },
+            loc,
+            flags,
+            kind,
+            source_file_is_root: false,
+            text_is_keyword,
+        });
+        self.nodes.push(Some(node));
+        self.build_names.push(name);
+        let modifier_bits =
+            self.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
+        self.build_modifier_bits.push(modifier_bits);
+        self.build_children
+            .push(super::node::store_node_children(kind, node));
+        self.build_links.push(SlotLinks {
+            first_child,
+            next_sibling,
+        });
+    }
+}
+
+/// R3-1: empties store `file`, an unfinished store of this thread, to what
+/// `new_file_store` made, after a snapshot load failed part way. The file
+/// is then parsed into it, so its id does not change.
+pub(crate) fn reset_file_store(file: usize) {
+    with_store_mut(file, |s| {
+        assert!(!s.frozen, "cannot reset a finished store");
+        *s = FileStore::new(s.file_name, s.text);
+    });
+}
+
+/// R3-1, tests: one slot of a finished store as a snapshot keeps it
+/// (`LibParseSlot`), with the data by reference.
+#[cfg(test)]
+pub(crate) struct LibParseSlotView {
+    pub(crate) kind: SyntaxKind,
+    pub(crate) flags: NodeFlags,
+    pub(crate) loc: TextRange,
+    pub(crate) parent: u32,
+    pub(crate) first_child: u32,
+    pub(crate) next_sibling: u32,
+    pub(crate) node: &'static ts_ast::Node,
+    /// The slot points at the shared name node of its kind (S1).
+    pub(crate) shared_name: bool,
+    pub(crate) name: Name,
+    pub(crate) text_is_keyword: bool,
+}
+
+/// R3-1, tests: the slots after slot 0 of store `file`, a store of this
+/// thread whose parse is finished and that is not published. An error when
+/// a snapshot cannot keep the store: an alias slot, a parent in another
+/// store, or a ts_ast node with other base fields than `ast_node` gives.
+#[cfg(test)]
+pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>, String> {
+    with_store(file, |s| {
+        if !s.frozen || s.names.len() != s.headers.len() || s.links.len() != s.headers.len() {
+            return Err("the store is not frozen".into());
+        }
+        if !s.aliases.is_empty() {
+            return Err("the store has alias slots".into());
+        }
+        let base = ast_node(
+            SyntaxKind::Unknown,
+            NodeData::Token(Box::new(ts_ast::TokenData)),
+        );
+        let mut views = Vec::with_capacity(s.headers.len());
+        for index in 1..s.headers.len() {
+            let header = &s.headers[index];
+            let node = s.nodes[index].ok_or_else(|| format!("slot {index} is not a node slot"))?;
+            if node.kind != header.kind
+                || node.flags != base.flags
+                || node.range != base.range
+                || node.parent.is_some()
+            {
+                return Err(format!(
+                    "slot {index}: the ts_ast node has other base fields"
+                ));
+            }
+            let parent = match header.parent {
+                p if p.is_nil() => NIL_SLOT,
+                p if p.file_index() == LOCAL_STORE => slot_index(p) as u32,
+                _ => return Err(format!("slot {index}: a parent in another store")),
+            };
+            let is_name = matches!(
+                header.kind,
+                SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+            );
+            let shared_name = is_name && std::ptr::eq(node, shared_name_node(header.kind));
+            let links = s.links[index];
+            views.push(LibParseSlotView {
+                kind: header.kind,
+                flags: header.flags,
+                loc: header.loc,
+                parent,
+                first_child: links.first_child,
+                next_sibling: links.next_sibling,
+                node,
+                shared_name,
+                name: s.names[index].clone(),
+                text_is_keyword: header.text_is_keyword,
+            });
+        }
+        Ok(views)
+    })
+}
+
+/// R3-1, tests: one line for each part of store `file` (a store of this
+/// thread whose parse is finished) that the snapshot load and the freeze
+/// make, in a form that does not depend on the store id, so the store of a
+/// live parse and of a snapshot load can be compared. The node data is not
+/// in it (the snapshot test compares it field by field).
+#[cfg(test)]
+pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
+    let local = |n: Node| {
+        if n.is_nil() {
+            "nil".to_string()
+        } else if n.file_index() == file {
+            format!("#{}", slot_index(n))
+        } else {
+            format!("{n:?}")
+        }
+    };
+    with_store(file, |s| {
+        let mut jsdoc: Vec<String> = s
+            .jsdoc_cache
+            .iter()
+            .map(|(&n, jsdocs)| {
+                let list: Vec<String> = jsdocs.iter().map(|&j| local(j)).collect();
+                format!("{} {list:?}", local(n))
+            })
+            .collect();
+        jsdoc.sort();
+        let diagnostics: Vec<String> = s
+            .diagnostics
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} {} {} {} {} {:?}",
+                    local(d.file),
+                    d.pos,
+                    d.end,
+                    d.code,
+                    d.message.key(),
+                    d.message_args
+                )
+            })
+            .collect();
+        let mut lines = vec![
+            format!("file {} text {}", s.file_name, s.text.len()),
+            format!(
+                "frozen {} root_slot {} root {} aliases {} resolved {}",
+                s.frozen,
+                s.root_slot,
+                local(s.root),
+                s.aliases.len(),
+                s.resolved.len()
+            ),
+            format!("parser_flags {:?}", s.parser_flags),
+            format!("jsdoc {jsdoc:?}"),
+            format!(
+                "lazy {:?} lazy_cache {}",
+                s.lazy_js_doc,
+                s.lazy_jsdoc_cache.len()
+            ),
+            format!(
+                "variant {:?} diagnostics {diagnostics:?} non_ascii {}",
+                s.language_variant, s.contains_non_ascii
+            ),
+            format!(
+                "facts {:?} bind {:?} overflow {}",
+                s.facts, s.bind_estimate, s.modifier_bits_overflow
+            ),
+            format!(
+                "build {} {} {} {} {} names {}",
+                s.build_names.len(),
+                s.build_modifier_bits.len(),
+                s.build_children.len(),
+                s.build_links.len(),
+                s.identifier_names.len(),
+                s.ecma_line_starts.get().is_some()
+            ),
+            format!(
+                "columns {} {} {} {} {} {} {}",
+                s.headers.len(),
+                s.nodes.len(),
+                s.kinds.len(),
+                s.names.len(),
+                s.modifier_bits.len(),
+                s.children.len(),
+                s.links.len()
+            ),
+        ];
+        for index in 0..s.headers.len() {
+            let shared = s.nodes[index].is_some_and(|node| {
+                matches!(
+                    node.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+                ) && std::ptr::eq(node, shared_name_node(node.kind))
+            });
+            lines.push(format!(
+                "{index}: {:?} node {} shared {shared} kind {:?} name {:?} bits {:?} children {:?} links {:?}",
+                s.headers[index],
+                s.nodes[index].is_some(),
+                s.kinds.get(index),
+                s.names.get(index).map(Name::as_str),
+                s.modifier_bits.get(index),
+                s.children.get(index),
+                s.links.get(index),
+            ));
+        }
+        lines
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2501,16 +3248,71 @@ pub(crate) fn ast_arena_used() -> usize {
     AST_ARENA.with(|arena| arena.allocated_bytes() - arena.chunk_capacity())
 }
 
-/// A leaked ts_ast node. Only kind and data are read for store and
-/// synthetic nodes; the header lives in the slot.
-fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
-    leak_in_ast_arena(ts_ast::Node {
+/// A ts_ast node with kind `kind` and data `data`. Only kind and data are
+/// read for store and synthetic nodes; the header lives in the slot.
+fn ast_node(kind: SyntaxKind, data: NodeData) -> ts_ast::Node {
+    ts_ast::Node {
         kind,
         flags: ts_ast::NodeFlags(0),
         range: ts_range(TextRange::undefined()),
         parent: None,
         data,
-    })
+    }
+}
+
+/// `ast_node(kind, data)`, leaked in this thread's AST arena.
+fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
+    leak_in_ast_arena(ast_node(kind, data))
+}
+
+/// S1: the one ts_ast node that every store Identifier (or
+/// PrivateIdentifier, by `kind`) made by `alloc_store_shared_name_node`
+/// points at. Its data is the Go factory payload with the default fields:
+/// no flow node (the binder keeps flow nodes in its tables) and an empty
+/// text (the name column holds the text).
+fn shared_name_node(kind: SyntaxKind) -> &'static ts_ast::Node {
+    static IDENTIFIER: OnceLock<&'static ts_ast::Node> = OnceLock::new();
+    static PRIVATE_IDENTIFIER: OnceLock<&'static ts_ast::Node> = OnceLock::new();
+    let leak = |data| -> &'static ts_ast::Node { Box::leak(Box::new(ast_node(kind, data))) };
+    match kind {
+        SyntaxKind::Identifier => *IDENTIFIER.get_or_init(|| {
+            leak(NodeData::Identifier(Box::new(ts_ast::IdentifierData {
+                flow_node: None,
+                text: String::new(),
+            })))
+        }),
+        SyntaxKind::PrivateIdentifier => *PRIVATE_IDENTIFIER.get_or_init(|| {
+            leak(NodeData::PrivateIdentifier(Box::new(
+                ts_ast::PrivateIdentifierData {
+                    text: String::new(),
+                },
+            )))
+        }),
+        _ => panic!("{kind:?} is not a name kind"),
+    }
+}
+
+/// S1, debug builds: panics unless `data` (the payload the factory builds
+/// for a store name node of kind `kind`) equals the data of the shared node
+/// of `kind`. The struct patterns name every field, so a new ts_ast field
+/// does not compile here until it is checked.
+#[cfg(debug_assertions)]
+pub fn debug_assert_shared_name_data(kind: SyntaxKind, data: &NodeData) {
+    let same = match (data, &shared_name_node(kind).data) {
+        (NodeData::Identifier(a), NodeData::Identifier(b)) => {
+            let ts_ast::IdentifierData { flow_node, text } = &**a;
+            *flow_node == b.flow_node && *text == b.text
+        }
+        (NodeData::PrivateIdentifier(a), NodeData::PrivateIdentifier(b)) => {
+            let ts_ast::PrivateIdentifierData { text } = &**a;
+            *text == b.text
+        }
+        _ => false,
+    };
+    assert!(
+        same,
+        "S1: the factory payload of a store {kind:?} differs from the shared node"
+    );
 }
 
 /// Go `newNode(kind, data, hooks)` in store `file`: `Loc =
@@ -2531,6 +3333,22 @@ pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: NodeData, text
     alloc_store_slot(file, kind, data, Some(text))
 }
 
+/// S1: `alloc_store_name_node` for the Go factory payload of a name node
+/// (no flow node, empty data text), without a new data box or ts_ast node:
+/// the slot points at the process-wide node of `kind` (`shared_name_node`).
+/// The name column holds `text`. The factory checks its payload against the
+/// shared one in debug builds (`debug_assert_shared_name_data`).
+// PERF: S1. Saves one malloc and about 88 bytes per identifier (a 32-byte
+// data box and a 40-byte arena node). Sharing one node is safe because a
+// ts_ast node is never changed in place: its data has no interior
+// mutability, the crate forbids unsafe code, and a data write gives the slot
+// a new node (`replace_store_node_data`). No code uses the address of a
+// ts_ast node as an identity (the `data_accessor!` `_in` debug check only
+// compares the data of one node with itself).
+pub fn alloc_store_shared_name_node(file: usize, kind: SyntaxKind, text: &str) -> Node {
+    alloc_store_slot_node(file, kind, shared_name_node(kind), Some(text))
+}
+
 /// `alloc_store_node` with the name text `text` (`slot_text_name`).
 #[inline]
 fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<&str>) -> Node {
@@ -2538,7 +3356,17 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
-    let node = leak_ast_node(kind, data);
+    alloc_store_slot_node(file, kind, leak_ast_node(kind, data), text)
+}
+
+/// `alloc_store_slot` for a ts_ast node that is already made.
+#[inline]
+fn alloc_store_slot_node(
+    file: usize,
+    kind: SyntaxKind,
+    node: &'static ts_ast::Node,
+    text: Option<&str>,
+) -> Node {
     debug_assert!(
         text.is_none() || identifier_text(node).is_empty(),
         "a name node keeps its text in the name column"
@@ -2563,6 +3391,7 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
         let modifier_bits = s.slot_modifier_bits(modifier_bits);
         s.build_modifier_bits.push(modifier_bits);
         s.build_children.push(children);
+        s.build_links.push(SlotLinks::NONE);
         s.debug_assert_build_columns();
         handle(file, index)
     })
@@ -2599,6 +3428,7 @@ fn store_alias_id(file: usize, n: Node) -> ts_ast::NodeId {
         s.build_names.push(Name::default());
         s.build_modifier_bits.push(0);
         s.build_children.push(SlotChildren::UNKNOWN);
+        s.build_links.push(SlotLinks::NONE);
         s.debug_assert_build_columns();
         s.aliases.insert(n, index);
         ts_ast::NodeId::new(index)
@@ -2932,24 +3762,38 @@ mod tests {
         with_store(file, |st| {
             let entry = |n: Node| st.children[slot_index(n)];
             let expression = SlotChildren::TAG_EXPRESSION;
+            // C2: none of these nodes has a type, an initializer or type
+            // arguments.
+            let untyped = |e: SlotChildren| e.with_typed(Some((SlotChildren::TYPED_TYPE, 0)), true);
+            let no_type =
+                |e: SlotChildren| e.with_typed(Some((SlotChildren::TYPED_INITIALIZER, 0)), true);
             assert_eq!(
                 entry(access),
-                SlotChildren::new(Some(id(b)), Some((expression, id(a))))
+                untyped(SlotChildren::new(Some(id(b)), Some((expression, id(a)))))
             );
             assert_eq!(
                 entry(statement),
-                SlotChildren::new(Some(0), Some((expression, id(c))))
+                untyped(SlotChildren::new(Some(0), Some((expression, id(c)))))
             );
             assert_eq!(
                 entry(signature),
-                SlotChildren::new(Some(id(p)), Some((SlotChildren::TAG_POSTFIX, id(question))))
+                no_type(SlotChildren::new(
+                    Some(id(p)),
+                    Some((SlotChildren::TAG_POSTFIX, id(question)))
+                ))
             );
             assert_eq!(
                 entry(parameter),
-                SlotChildren::new(Some(id(x)), Some((SlotChildren::TAG_QUESTION, 0)))
+                no_type(SlotChildren::new(
+                    Some(id(x)),
+                    Some((SlotChildren::TAG_QUESTION, 0))
+                ))
             );
-            assert_eq!(entry(a), SlotChildren::new(Some(0), Some((expression, 0))));
-            assert_eq!(entry(qualified), SlotChildren::UNKNOWN);
+            assert_eq!(
+                entry(a),
+                untyped(SlotChildren::new(Some(0), Some((expression, 0))))
+            );
+            assert_eq!(entry(qualified), untyped(SlotChildren::UNKNOWN));
             // The nil slot and alias slots are unknown; an aliased child has
             // its alias slot id, as in the node data.
             assert_eq!(st.children[NIL_SLOT as usize], SlotChildren::UNKNOWN);
@@ -2957,10 +3801,185 @@ mod tests {
             assert_eq!(st.children[alias as usize], SlotChildren::UNKNOWN);
             assert_eq!(
                 entry(aliased),
-                SlotChildren::new(Some(id(b)), Some((expression, alias)))
+                untyped(SlotChildren::new(Some(id(b)), Some((expression, alias))))
             );
             assert!(st.children_column_matches());
         });
+    }
+
+    #[test]
+    fn slots_get_the_typed_column() {
+        let file = new_file_store("/i.ts", "");
+        let f = NodeFactory::for_file(file);
+        let id = |n: Node| slot_index(n) as u32;
+        let x = f.new_identifier("x");
+        let t = f.new_keyword_type_node(SyntaxKind::NumberKeyword);
+        let one = f.new_numeric_literal("1", TokenFlags::NONE);
+        let both = f.new_variable_declaration(x, Node::NIL, t, one);
+        let only_initializer = f.new_variable_declaration(x, Node::NIL, Node::NIL, one);
+        let only_type = f.new_variable_declaration(x, Node::NIL, t, Node::NIL);
+        let name = f.new_identifier("T");
+        let plain_reference = f.new_type_reference_node(name, NodeList::NIL);
+        let generic_reference = f.new_type_reference_node(name, f.new_node_list(&[t]));
+        let call = f.new_call_expression(
+            x,
+            Node::NIL,
+            NodeList::NIL,
+            f.new_node_list(&[]),
+            NodeFlags::NONE,
+        );
+        freeze_file_store(file);
+
+        with_store(file, |st| {
+            let typed = |n: Node| {
+                let entry = st.children[slot_index(n)];
+                (entry.typed_parts(), entry.has_no_type_arguments())
+            };
+            // Both set: the column holds the type only.
+            assert_eq!(
+                typed(both),
+                ((SlotChildren::TYPED_TYPE_WITH_INITIALIZER, id(t)), true)
+            );
+            // One set: the column holds it, and the other reads as nil.
+            assert_eq!(
+                typed(only_initializer),
+                ((SlotChildren::TYPED_INITIALIZER, id(one)), true)
+            );
+            assert_eq!(typed(only_type), ((SlotChildren::TYPED_TYPE, id(t)), true));
+            assert_eq!(
+                typed(plain_reference),
+                ((SlotChildren::TYPED_TYPE_NAME, id(name)), true)
+            );
+            assert_eq!(
+                typed(generic_reference),
+                ((SlotChildren::TYPED_TYPE_NAME, id(name)), false)
+            );
+            assert_eq!(typed(call), ((SlotChildren::TYPED_TYPE, 0), true));
+            assert_eq!(typed(x), ((SlotChildren::TYPED_TYPE, 0), true));
+            // Unknown never claims a nil type argument list.
+            assert!(!SlotChildren::UNKNOWN.has_no_type_arguments());
+            assert!(st.children_column_matches());
+        });
+    }
+
+    /// R2-5: the chain of `n` in the build links of its store, or `None`
+    /// when it is not known.
+    fn build_chain(n: Node) -> Option<Vec<Node>> {
+        let file = n.file_index();
+        with_store(file, |s| {
+            let mut next = s.build_links[slot_index(n)].first_child;
+            if next == LINK_NONE {
+                return None;
+            }
+            let mut chain = Vec::new();
+            while next != LINK_END {
+                chain.push(handle(file, next));
+                next = s.build_links[next as usize].next_sibling;
+            }
+            Some(chain)
+        })
+    }
+
+    /// R2-5: what `override_parent_in_immediate_children` does for `parent`.
+    fn link_children(parent: Node) {
+        let mut links = StoreChildLinks::new(parent);
+        parent.for_each_child(|child| {
+            if !links.set_parent(child) {
+                set_node_parent(child, parent);
+            }
+            false
+        });
+    }
+
+    #[test]
+    fn child_links_follow_the_parent_writes() {
+        let file = new_file_store("/h.ts", "");
+        let f = NodeFactory::for_file(file);
+        let a = f.new_identifier("a");
+        let b = f.new_identifier("b");
+        let q = f.new_qualified_name(a, b);
+        link_children(q);
+        assert_eq!(build_chain(q), Some(vec![a, b]));
+        assert_eq!(a.parent(), q);
+        // Setting the parents again makes the same chain.
+        link_children(q);
+        assert_eq!(build_chain(q), Some(vec![a, b]));
+        // A leaf has an empty chain; a node the parser did not finish has
+        // none.
+        link_children(a);
+        assert_eq!(build_chain(a), Some(Vec::new()));
+        assert_eq!(build_chain(b), None);
+        // A second parent of linked children is unknown; the first keeps
+        // its chain, as Go keeps them in its fields.
+        let q2 = f.new_qualified_name(a, b);
+        link_children(q2);
+        assert_eq!(build_chain(q2), None);
+        assert_eq!(build_chain(q), Some(vec![a, b]));
+        assert_eq!(a.parent(), q2);
+        // A data write frees the chain, so the children can be linked again.
+        replace_store_node_data(q, store_ast_node(q).data.clone());
+        assert_eq!(build_chain(q), None);
+        link_children(q2);
+        assert_eq!(build_chain(q2), Some(vec![a, b]));
+        // A child twice in one node, or a child of another store, makes the
+        // chain unknown and frees the children linked before it.
+        let twice = f.new_qualified_name(q, q);
+        link_children(twice);
+        assert_eq!(build_chain(twice), None);
+        let synthetic = NodeFactory::new().new_identifier("s");
+        let mixed = f.new_qualified_name(q, synthetic);
+        link_children(mixed);
+        assert_eq!(build_chain(mixed), None);
+        assert_eq!(synthetic.parent(), mixed);
+        link_children(twice);
+        assert_eq!(build_chain(twice), None);
+        freeze_file_store(file);
+        with_store(file, |s| {
+            assert_eq!(s.links.len(), s.headers.len());
+            assert_eq!(s.links[slot_index(q2)].first_child, slot_index(a) as u32);
+            assert_eq!(s.links[slot_index(a)].next_sibling, slot_index(b) as u32);
+            assert_eq!(s.links[slot_index(b)].next_sibling, LINK_END);
+        });
+    }
+
+    #[test]
+    fn parsed_chains_equal_for_each_child() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let text = "function f(a: number, b = 1) { return a + b; }\n\
+            let x: Array<string> = [1, 2].map(y => `${y}`);\n\
+            type T = { a?: string } | number;\n\
+            class C<U> extends Object { m(): U | undefined { return undefined; } }\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/links.ts".to_string(),
+            ..Default::default()
+        };
+        let parsed = parse_source_file(&opts, text, ScriptKind::TS);
+        let file = parsed.store;
+        let links = with_store(file, |s| s.links.clone());
+        assert_eq!(links.len(), file_store_slot_count(file));
+        let mut known = 0;
+        for index in 1..links.len() as u32 {
+            let mut next = links[index as usize].first_child;
+            if next == LINK_NONE {
+                continue;
+            }
+            known += 1;
+            let mut chain = Vec::new();
+            while next != LINK_END {
+                chain.push(handle(file, next));
+                next = links[next as usize].next_sibling;
+            }
+            let n = handle(file, index);
+            assert_eq!(
+                chain,
+                n.iter_children().collect::<Vec<_>>(),
+                "{:?}",
+                n.kind()
+            );
+        }
+        assert!(known > 0);
+        // The parser links the root too.
+        assert_ne!(links[slot_index(parsed.root)].first_child, LINK_NONE);
     }
 
     #[test]
@@ -2973,6 +3992,14 @@ mod tests {
         assert_eq!(big.other, SlotChildren::UNKNOWN_ID);
         assert_eq!(big.other_parts().0, SlotChildren::TAG_UNKNOWN);
         assert_eq!(SlotChildren::new(None, None), SlotChildren::UNKNOWN);
+        // C2: the tag, the id and the type arguments bit round trip, and an
+        // id that does not fit is unknown.
+        let typed = entry.with_typed(Some((SlotChildren::TYPED_TYPE_NAME, 11)), true);
+        assert_eq!(typed.typed_parts(), (SlotChildren::TYPED_TYPE_NAME, 11));
+        assert!(typed.has_no_type_arguments());
+        let big = entry.with_typed(Some((SlotChildren::TYPED_TYPE, 1 << 28)), false);
+        assert_eq!(big.typed_parts().0, SlotChildren::TYPED_UNKNOWN);
+        assert_eq!(std::mem::size_of::<SlotChildren>(), 12);
     }
 
     #[test]
@@ -2983,12 +4010,25 @@ mod tests {
         let private = f.new_private_identifier("#p");
         let missing = f.new_identifier("");
         assert!(identifier_text(store_ast_node(id)).is_empty());
+        // S1: every store identifier points at one shared ts_ast node.
+        assert!(std::ptr::eq(store_ast_node(id), store_ast_node(missing)));
+        assert!(std::ptr::eq(
+            store_ast_node(id),
+            shared_name_node(SyntaxKind::Identifier)
+        ));
+        assert!(std::ptr::eq(
+            store_ast_node(private),
+            shared_name_node(SyntaxKind::PrivateIdentifier)
+        ));
         assert_eq!(id.text(), "abc");
         assert_eq!(private.text(), "#p");
         assert_eq!(missing.text(), "");
         // Data cloned from a store identifier has no text; the name stays.
         replace_store_node_data(id, store_ast_node(id).data.clone());
         assert_eq!(id.text(), "abc");
+        // S1: the write gives the slot its own node; the shared one stays.
+        assert!(!std::ptr::eq(store_ast_node(id), store_ast_node(missing)));
+        assert_eq!(missing.text(), "");
         // A synthetic identifier keeps its text in the data.
         assert_eq!(NodeFactory::new().new_identifier("syn").text(), "syn");
         freeze_file_store(file);
