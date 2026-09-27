@@ -39,13 +39,11 @@ fn opt_node(file: usize, id: Option<ts_ast::NodeId>) -> Node {
 
 /// Builds the `NodeList` handle for a ts_ast list. `None` is Go `nil`.
 // PORT: PORTING.md gives `NodeList` only as an example shape
-// (`{ file: u32, list: Option<&'static ts_ast::NodeList> }`). This is the one
-// place that depends on that shape.
+// (`{ file: u32, list: Option<&'static ts_ast::NodeList> }`). The handle is
+// `NodeList::from_ts` of that pair (U1 (e) adds a pending form for parser
+// lists that no node holds yet).
 fn make_node_list(file: usize, list: Option<&'static ts_ast::NodeList>) -> NodeList {
-    NodeList {
-        file: file as u32,
-        list,
-    }
+    NodeList::from_ts(file, list)
 }
 
 /// Go panics with a failed type assertion when `AsX()` gets the wrong kind.

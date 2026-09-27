@@ -712,12 +712,19 @@ fn has_relative_path_segment(p: &str) -> bool {
     }
     // PORT: fast path. Every relative segment starts the path with '.' or
     // contains "/." or "//", so a path with none of these has no segment.
-    if b[0] != b'.'
-        && !b
-            .windows(2)
-            .any(|w| w[0] == b'/' && (w[1] == b'.' || w[1] == b'/'))
-    {
-        return false;
+    // memchr jumps from '/' to '/' and tests only the next byte, instead of
+    // testing every byte pair.
+    if b[0] != b'.' {
+        let has_slash_dot_or_slash =
+            memchr::memchr_iter(b'/', b).any(|i| matches!(b.get(i + 1), Some(b'.' | b'/')));
+        debug_assert_eq!(
+            has_slash_dot_or_slash,
+            b.windows(2)
+                .any(|w| w[0] == b'/' && (w[1] == b'.' || w[1] == b'/'))
+        );
+        if !has_slash_dot_or_slash {
+            return false;
+        }
     }
 
     if p == "." || p == ".." {

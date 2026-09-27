@@ -1,7 +1,8 @@
 //! Go `cmd/tsgo/isprocessalive_unix.go` (`//go:build unix`; the module is
 //! declared under `#[cfg(unix)]`).
 
-use crate::cmd::tsgo::prelude::*;
+use rustix::io::Errno;
+use rustix::process::{Pid, test_kill_process};
 
 // Go: cmd/tsgo/isprocessalive_unix.go:11 processAliveSupported
 pub const PROCESS_ALIVE_SUPPORTED: bool = true;
@@ -12,12 +13,17 @@ pub const PROCESS_ALIVE_SUPPORTED: bool = true;
 // process. If the signal returns nil or EPERM, the process exists (EPERM
 // means it exists but we lack permission to signal it). ESRCH or any
 // other error indicates the process is gone.
-// PORT: sending a signal needs `libc` and `unsafe`, which the crate does
-// not allow. On Linux, `/proc/<pid>` exists exactly when signal 0 finds
-// the process: also for a zombie and for a process of another user (EPERM).
+// PORT: `proc.Signal(syscall.Signal(0))` is `kill(pid, 0)`
+// (`test_kill_process`). On Linux Go signals through a pidfd; for a live
+// pid both give the same result. The only caller passes a pid above 0; Go
+// fails for 0 ("os: process not initialized") and -1 (released), so the
+// port returns false for any pid of 0 or less.
 pub fn is_process_alive(pid: i32) -> bool {
-    if cfg!(target_os = "linux") {
-        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    let Some(pid) = Pid::from_raw(pid.max(0)) else {
+        return false;
+    };
+    match test_kill_process(pid) {
+        Ok(()) | Err(Errno::PERM) => true,
+        Err(_) => false,
     }
-    unported!("os.Process.Signal")
 }

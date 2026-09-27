@@ -344,8 +344,7 @@ pub fn add_project_reference_output_mappings(
 // PORT: Go makes up to GOMAXPROCS new checkers with `checker.NewChecker(program,
 // nil)` over any `checker.Program`. Here `program` is a `NewProgram` and each
 // checker is `ls_program::new_checker(program)` (contract C3): a new checker
-// on the dispatch thread, like Go. It calls `unported!("multi-program
-// runtime")` for a program that is not installed (D-LS1). The Go channel is
+// on the dispatch thread, like Go. The Go channel is
 // a FIFO queue; the atomic counter is a `Cell`. Extraction runs serially in
 // Go start order, so a released checker is back in the pool before the next
 // request and only one checker is made. Go blocks on an empty pool at the

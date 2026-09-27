@@ -1,10 +1,4 @@
 //! Go `cmd/tsgo/lsp.go`.
-//!
-//! PORT: Go `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)` needs
-//! signal handling, which the crate does not have (plan decision D-W3).
-//! The context here is a plain cancel context; SIGINT and SIGTERM keep
-//! their default action, so the process dies from the signal where Go
-//! cancels and exits 0.
 
 use crate::cmd::tsgo::prelude::*;
 
@@ -12,7 +6,8 @@ use crate::cmd::tsgo::prelude::*;
 use crate::cmd::tsgo::isprocessalive_other::{PROCESS_ALIVE_SUPPORTED, is_process_alive};
 #[cfg(unix)]
 use crate::cmd::tsgo::isprocessalive_unix::{PROCESS_ALIVE_SUPPORTED, is_process_alive};
-use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set};
+use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
+use crate::execute::tsc::compile::Writer;
 use crate::frontend::bundled;
 use crate::frontend::tspath;
 use crate::frontend::vfs::osvfs;
@@ -42,19 +37,23 @@ pub fn run_lsp(args: &[String]) -> i32 {
         return 1;
     }
 
-    if !pprof_dir.borrow().is_empty() {
+    // Go: profileSession := pprof.BeginProfiling(*pprofDir, os.Stderr); defer profileSession.Stop()
+    // PORT: the session stops when it drops at the return of `run_lsp`,
+    // after `stop`, as the Go defers run (last in, first out).
+    let _profile_session = if pprof_dir.borrow().is_empty() {
+        None
+    } else {
         eprintln!("pprof profiles will be written to: {}", pprof_dir.borrow());
-        // PORT: pprof is not ported.
-        unported!("pprof.BeginProfiling");
-    }
+        let stderr: Writer = Rc::new(RefCell::new(std::io::stderr()));
+        Some(crate::pprof::begin_profiling(&pprof_dir.borrow(), stderr))
+    };
 
     let fs = bundled::wrap_fs_exported(osvfs::osvfs_fs());
     let default_library_path = bundled::lib_path_exported();
     let typings_location = get_global_typings_cache_location();
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    // PORT: see the file comment.
-    let (ctx, stop) = context::with_cancel(&context::background());
+    let (ctx, stop) = notify_context(&context::background());
 
     let s = crate::lsp::new_server(crate::lsp::ServerOptions {
         in_: crate::lsp::to_reader(Box::new(std::io::BufReader::new(std::io::stdin()))),

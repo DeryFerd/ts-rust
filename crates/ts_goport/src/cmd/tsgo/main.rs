@@ -1,14 +1,18 @@
 //! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
 //! package main needs and the crate does not have yet: `flag` (bool and
-//! string flags, `Parse`, the default usage text) and `os.Getwd`.
+//! string flags, `Parse`, the default usage text), `os.Getwd` and
+//! `signal.NotifyContext`.
 
 use crate::cmd::tsgo::prelude::*;
 
 use crate::cmd::tsgo::api::run_api;
 use crate::cmd::tsgo::lsp::run_lsp;
+use crate::gostd::context::{self, CancelFunc};
 use crate::gostd::errors;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::cell::Cell;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 // Go: cmd/tsgo/main.go:13 main
 // PORT: `bin/goport.rs` `main` calls `run_main` before its own compile
@@ -23,7 +27,8 @@ const STACK_SIZE: usize = 1 << 30;
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT
 // override) becomes the 1 GiB stack of the thread that runs the command.
-// Go `signal.NotifyContext` is not ported (no signal handling).
+// PORT: Go `signal.NotifyContext` before `execute.CommandLine` is in
+// `bin/tsgo.rs`, which runs that path; the goport compile path has none.
 pub fn run_main(args: &[String]) -> Option<i32> {
     if !args.is_empty() {
         match args[0].as_str() {
@@ -46,6 +51,74 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,
         _ => crate::execute::tsc::EXIT_UNPORTED,
+    }
+}
+
+// Go: os/signal/signal.go:281 NotifyContext (go1.26.8)
+// NotifyContext returns a copy of the parent context that is marked done
+// (its Done channel is closed) when one of the listed signals arrives,
+// when the returned stop function is called, or when the parent context's
+// Done channel is closed, whichever happens first.
+// PORT: the signals are fixed. Every tsgo caller passes SIGINT
+// (`os.Interrupt`) and SIGTERM. Go `Notify(c.ch, ...)` is a signal-hook
+// `Signals`, and the goroutine is a thread that waits on it. Closing its
+// handle ends the wait: that is the `<-c.Done()` case of the `select`.
+// PORT: after Go `Stop(c.ch)`, a later SIGINT or SIGTERM kills the process
+// (the Go runtime default). The signal-hook handler stays installed, so
+// the port ignores such a signal. Every caller returns right after `stop`.
+pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
+    let (ctx, cancel) = context::with_cancel_cause(parent);
+    // Go: c.ch = make(chan os.Signal, 1); Notify(c.ch, c.signals...)
+    let mut signals =
+        Signals::new([SIGINT, SIGTERM]).expect("signal.Notify: cannot register SIGINT and SIGTERM");
+    let handle = signals.handle();
+    if ctx.err().is_none() {
+        // Go: the `<-c.Done()` case of the `select` below.
+        if let Some(done) = ctx.done() {
+            let handle = handle.clone();
+            let _ = done.register_waker(move || handle.close());
+        }
+        let cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("signal.NotifyContext".to_string())
+            .spawn(move || {
+                // Go: select { case s := <-c.ch: ...; case <-c.Done(): }
+                if let Some(s) = signals.forever().next() {
+                    let text = format!("{} signal received", signal_string(s));
+                    cancel(Some(errors::from_value(SignalError(text))));
+                }
+            })
+            .expect("signal.NotifyContext: failed to start the goroutine");
+    }
+    // Go: signal.go:310 signalCtx.stop
+    let stop: CancelFunc = Arc::new(move || {
+        cancel(None);
+        // Go: Stop(c.ch)
+        handle.close();
+    });
+    (ctx, stop)
+}
+
+// Go: os/signal/signal.go:340 signalError
+// PORT: Go `Is(target error) bool` (true for `context.Canceled`) has no
+// port form. No port code reads the cause.
+#[derive(Debug, PartialEq)]
+struct SignalError(String);
+
+impl std::fmt::Display for SignalError {
+    // Go: signal.go:342 signalError.Error
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// Go: syscall/syscall_unix.go Signal.String, with the Linux `signalList`
+// names of the two signals that `notify_context` registers.
+fn signal_string(s: i32) -> String {
+    match s {
+        SIGINT => "interrupt".to_string(),
+        SIGTERM => "terminated".to_string(),
+        _ => format!("signal {s}"),
     }
 }
 

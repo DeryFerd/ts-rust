@@ -299,11 +299,10 @@ pub fn fanotify() -> Arc<dyn Watcher> {
 /// Default returns the recommended watcher for the current OS.
 ///
 /// PORT: Go `runtime.GOOS` is `std::env::consts::OS` ("macos" for Go
-/// "darwin"). On Linux `fanotify_available()` is false while
-/// `unix.FanotifyInit` is unported (D-W1), so this returns inotify. Both
-/// report `has_fast_recursive_backend() == false`, as Go does on Linux.
-/// On macOS and Windows Go picks a fast recursive backend; those backends
-/// are not ported, so the port diverges there.
+/// "darwin"). On Linux this returns fanotify when the `fanotify_init` probe
+/// succeeds and inotify when it fails, as Go does. On macOS and Windows Go
+/// picks a fast recursive backend; those backends are not ported, so the
+/// port diverges there.
 pub fn default() -> Arc<dyn Watcher> {
     match std::env::consts::OS {
         "linux" => {

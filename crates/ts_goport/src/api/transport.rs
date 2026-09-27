@@ -215,12 +215,15 @@ use crate::api::transport_unix::new_pipe_listener;
 
 // Go: transport_windows.go:12 newPipeListener
 // newPipeListener creates a Windows named pipe listener.
-// PORT: Go uses `winio.ListenPipe`; there is no named pipe listener without
-// a new dependency.
+// PORT: Go uses `winio.ListenPipe`, which is not ported (Windows only). The
+// port fails the way `ListenPipe` fails when named pipes are unavailable:
+// it returns an error, and `runAPI` prints it and exits 1. The text is Go
+// `errors.ErrUnsupported`, wrapped like a Go `net.OpError`.
 #[cfg(windows)]
 pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
-    let _ = path;
-    unported!("newPipeListener (windows)")
+    Err(errors::new(format!(
+        "listen pipe {path}: unsupported operation"
+    )))
 }
 
 // Go: transport_windows.go:17 GeneratePipePath

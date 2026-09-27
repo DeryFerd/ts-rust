@@ -82,8 +82,6 @@ fn get_organize_imports_ordinal_string_comparer(ignore_case: bool) -> StringComp
 
 // Go: ls/lsutil/organizeimports.go:65 getOrganizeImportsUnicodeStringComparer
 // PORT: a Go collator keeps iterator state, so each one is in a `RefCell`.
-// `gostd::collate` holds a subset of the Go collation tables; see its module
-// note.
 fn get_organize_imports_unicode_string_comparer(
     ignore_case: bool,
     preferences: &UserPreferences,

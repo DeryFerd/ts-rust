@@ -3,6 +3,18 @@ use crate::prelude::*;
 impl Checker {
     // Go: checker/jsdoc.go:9 checkUnmatchedJSDocParameters
     pub fn check_unmatched_js_doc_parameters(&mut self, node: Node) {
+        // PERF: most JSDoc has no parameter tag. Skip the lazy JSDoc parse
+        // when the source text shows that no tag can be one. With no
+        // parameter tag, jsdoc_parameters is empty and Go returns below.
+        if !may_have_js_doc_parameter_tag(node) {
+            debug_assert!(
+                get_all_js_doc_tags(node)
+                    .iter()
+                    .all(|tag| tag.kind() != SyntaxKind::JsDocParameterTag),
+                "JSDoc parameter tag missed by the text precheck"
+            );
+            return;
+        }
         let mut jsdoc_parameters: Vec<Node> = Vec::new();
         for tag in get_all_js_doc_tags(node) {
             if tag.kind() == SyntaxKind::JsDocParameterTag {
@@ -94,6 +106,42 @@ impl Checker {
             }
         }
     }
+}
+
+// PERF: a text precheck for check_unmatched_js_doc_parameters. It walks the
+// same hosts as get_all_js_doc_tags. The JSDoc of a host is parsed from the
+// comment ranges at host.pos(), and those ranges all end before
+// skip_trivia(host.pos()). A parameter tag name is `param`, `arg` or
+// `argument` right after `@`, or an identifier with a unicode escape. False
+// means that no host can have a JsDocParameterTag. True is conservative.
+fn may_have_js_doc_parameter_tag(node: Node) -> bool {
+    let file = get_source_file_of_node(node);
+    if file.is_nil() {
+        return true;
+    }
+    let text = source_file_text(file);
+    let mut current = node;
+    while current.is_some() {
+        if current.flags().intersects(NodeFlags::HAS_JS_DOC) {
+            let pos = current.pos();
+            if pos < 0 {
+                return true;
+            }
+            let end = skip_trivia(text, pos);
+            let Some(range) = text.as_bytes().get(pos as usize..end as usize) else {
+                return true;
+            };
+            let found = memchr::memchr2_iter(b'@', b'\\', range).any(|i| {
+                let rest = &range[i + 1..];
+                range[i] == b'\\' || rest.starts_with(b"param") || rest.starts_with(b"arg")
+            });
+            if found {
+                return true;
+            }
+        }
+        current = get_next_js_doc_comment_location(current);
+    }
+    false
 }
 
 // Go: checker/jsdoc.go:86 getAllJSDocTags

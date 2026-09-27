@@ -246,10 +246,7 @@ pub fn viable_keyword_suggestions() -> &'static [String] {
 // list ends) and an empty list cannot have a trailing comma.
 #[must_use]
 pub fn is_missing_node_list(list: NodeList) -> bool {
-    !list.is_nil()
-        && list
-            .list
-            .is_some_and(|l| l.nodes.is_empty() && l.has_trailing_comma)
+    !list.is_nil() && list.nodes().is_empty() && list.stored_trailing_comma()
 }
 
 // Go: parser.go:137 ParseSourceFile
@@ -649,8 +646,11 @@ impl Parser {
     // Go: parser.go:383 nextToken
     pub fn next_token(&mut self) -> SyntaxKind {
         // if the keyword had an escape
-        if is_keyword(self.token)
-            && (self.scanner.has_unicode_escape() || self.scanner.has_extended_unicode_escape())
+        // PERF: U1 (c). The escape flags are tested first. Both tests are
+        // pure, so the result is the same, and most tokens skip the load of
+        // `self.token` that was just stored.
+        if (self.scanner.has_unicode_escape() || self.scanner.has_extended_unicode_escape())
+            && is_keyword(self.token)
         {
             // issue a parse error for the escape
             self.parse_error_at_current_token(
@@ -1096,23 +1096,10 @@ impl Parser {
 
     // Go: parser.go:726 createMissingList
     // PORT: see `is_missing_node_list`. The empty list is copied with the
-    // marker bit set and leaked like every other list.
+    // marker bit set and leaked like every other list
+    // (`NodeList::with_missing_marker`).
     pub fn create_missing_list(&mut self) -> NodeList {
-        let result = self.parse_empty_node_list();
-        match result.list {
-            Some(l) => {
-                let marked: &'static ts_ast::NodeList = Box::leak(Box::new(ts_ast::NodeList {
-                    range: l.range,
-                    nodes: Vec::new(),
-                    has_trailing_comma: true,
-                }));
-                NodeList {
-                    file: result.file,
-                    list: Some(marked),
-                }
-            }
-            None => result,
-        }
+        self.parse_empty_node_list().with_missing_marker()
     }
 
     // Go: parser.go:733 abortParsingListOrMoveToNextToken

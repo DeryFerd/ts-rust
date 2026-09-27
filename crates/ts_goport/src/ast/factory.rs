@@ -149,6 +149,31 @@ impl NodeFactory {
         self.new_node(kind, data)
     }
 
+    /// `new_text_node` for an Identifier or PrivateIdentifier with Go text
+    /// `text`. `data` makes the node data from the text it holds.
+    // PERF: U1 (d). A store node gets an empty data text, which needs no
+    // allocation. The store keeps `text` in the name column of the slot
+    // (`alloc_store_name_node`), and `Node::text` reads it there. A
+    // synthetic node keeps the text in its data.
+    fn new_name_node(
+        &self,
+        kind: SyntaxKind,
+        text: impl AsRef<str> + Into<String>,
+        data: impl FnOnce(String) -> D,
+    ) -> Node {
+        let NodeFactoryTarget::File(store) = self.target else {
+            return self.new_text_node(kind, data(text.into()));
+        };
+        self.text_count.set(self.text_count.get() + 1);
+        self.node_count.set(self.node_count.get() + 1);
+        let node = alloc_store_name_node(store, kind, data(String::new()), text.as_ref());
+        // Go: ast.go:73
+        if let Some(h) = &self.hooks.on_create {
+            h(node);
+        }
+        node
+    }
+
     /// `newNode` plus Go `node.Flags |= flags & NodeFlagsOptionalChain`.
     fn new_chain_node(&self, kind: SyntaxKind, data: D, flags: NodeFlags) -> Node {
         let node = self.new_node(kind, data);
@@ -287,24 +312,20 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:792 NewIdentifier
-    pub fn new_identifier(&self, text: impl Into<String>) -> Node {
-        self.new_text_node(
-            SyntaxKind::Identifier,
+    pub fn new_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
+        self.new_name_node(SyntaxKind::Identifier, text, |text| {
             D::Identifier(Box::new(ts_ast::IdentifierData {
                 flow_node: None,
-                text: text.into(),
-            })),
-        )
+                text,
+            }))
+        })
     }
 
     // Go: ast/ast_generated.go:816 NewPrivateIdentifier
-    pub fn new_private_identifier(&self, text: impl Into<String>) -> Node {
-        self.new_text_node(
-            SyntaxKind::PrivateIdentifier,
-            D::PrivateIdentifier(Box::new(ts_ast::PrivateIdentifierData {
-                text: text.into(),
-            })),
-        )
+    pub fn new_private_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
+        self.new_name_node(SyntaxKind::PrivateIdentifier, text, |text| {
+            D::PrivateIdentifier(Box::new(ts_ast::PrivateIdentifierData { text }))
+        })
     }
 
     // Go: ast/ast_generated.go:843 NewQualifiedName

@@ -547,8 +547,11 @@ pub struct Scanner {
     // PORT: maps a token value to its interned `jsnum` string, so a hit
     // needs no second intern lookup.
     pub(crate) number_cache: FxHashMap<&'static str, &'static str>,
-    pub(crate) hex_number_cache: FxHashMap<String, String>,
-    pub(crate) hex_digit_cache: FxHashMap<String, String>,
+    // PORT: values (and `hex_number_cache` keys) are interned `&'static str`,
+    // like Go strings, so a cache hit needs no allocation or clone. The
+    // `hex_digit_cache` key is looked up by `&str` and owned only on a miss.
+    pub(crate) hex_number_cache: FxHashMap<&'static str, &'static str>,
+    pub(crate) hex_digit_cache: FxHashMap<Box<str>, &'static str>,
 
     pub(crate) comment_directives: Vec<CommentDirective>,
 }
@@ -775,7 +778,8 @@ impl Scanner {
     pub(crate) fn scan_js_doc_comment_for_tags(&mut self, comment_start: i32, comment_end: i32) {
         let mut comment_text: &str = &self.text[comment_start as usize..comment_end as usize];
         loop {
-            let Some(i) = comment_text.as_bytes().iter().position(|&b| b == b'@') else {
+            // Go `strings.IndexByte`: memchr does the same vectorized byte scan.
+            let Some(i) = memchr::memchr(b'@', comment_text.as_bytes()) else {
                 return;
             };
             comment_text = &comment_text[i + 1..];
@@ -1271,21 +1275,22 @@ impl Scanner {
                                 let mut digits = self.scan_hex_digits(1, true, true);
                                 if digits.is_empty() {
                                     self.error(diag::Hexadecimal_digit_expected);
-                                    digits = "0".to_string();
+                                    digits = "0";
                                 }
-                                if let Some(cached_value) = self.hex_number_cache.get(&digits) {
-                                    self.scanner_state.token_value =
-                                        intern_token_value(cached_value);
+                                if let Some(&cached_value) = self.hex_number_cache.get(digits) {
+                                    self.scanner_state.token_value = cached_value;
                                 } else {
-                                    let raw_text =
-                                        &self.text[start as usize..self.scanner_state.pos as usize];
+                                    let (start, end) =
+                                        (start as usize, self.scanner_state.pos as usize);
+                                    let raw_text = &self.text[start..end];
                                     let value =
-                                        if raw_text.starts_with("0x") && raw_text[2..] == digits {
-                                            raw_text.to_string()
+                                        if raw_text.starts_with("0x") && &raw_text[2..] == digits {
+                                            // Go `s.tokenValue = rawText` shares the text.
+                                            self.text_token_value(start, end)
                                         } else {
-                                            format!("0x{digits}")
+                                            intern_token_value(&format!("0x{digits}"))
                                         };
-                                    self.scanner_state.token_value = intern_token_value(&value);
+                                    self.scanner_state.token_value = value;
                                     self.hex_number_cache.insert(digits, value);
                                 }
                                 self.scanner_state.token_flags |= TokenFlags::HEX_SPECIFIER;

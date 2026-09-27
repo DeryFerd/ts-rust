@@ -13,9 +13,8 @@
 //! PORT: Go strings may hold invalid UTF-8. A Rust `&str` cannot, so Go's
 //! `ErrInvalidUTF8` checks (`checkUTF8`, `nextRune` errors) never fail here.
 //!
-//! PORT: `\p{Name}` and `\P{Name}` need the `unicode` category and script
-//! tables (about 7,000 lines). Only `Any` and `ASCII` are ported. Every
-//! other name calls `unported!("unicodeTable")`.
+//! `\p{Name}` and `\P{Name}` read the `unicode` category and script tables
+//! in `unicode_tables.rs` (generated from go1.26.8, Unicode 15.0.0).
 
 use crate::prelude::*;
 
@@ -548,8 +547,10 @@ impl<'a> Machine<'a> {
 pub mod syntax {
     use std::collections::HashMap;
     use std::fmt;
+    use std::sync::LazyLock;
 
     use super::unicode;
+    use crate::gostd::unicode_tables::{self, RangeTable, map_get};
 
     /// Go `rune`.
     pub type Rune = i32;
@@ -2683,26 +2684,21 @@ pub mod syntax {
         Some(CharGroup { sign, class })
     }
 
-    // Go: unicode/letter.go:21 RangeTable
-    /// A RangeTable lists (lo, hi, stride) ranges of code points.
-    pub struct RangeTable {
-        r16: &'static [(u16, u16, u16)],
-        r32: &'static [(u32, u32, u32)],
-    }
-
-    // Go: regexp/syntax/parse.go:1636 anyTable
+    // Go: regexp/syntax/parse.go:1638 anyTable
     static ANY_TABLE: RangeTable = RangeTable {
         r16: &[(0, u16::MAX, 1)], // 1<<16 - 1
         r32: &[(1 << 16, MAX_RUNE as u32, 1)],
+        latin_offset: 0,
     };
 
-    // Go: regexp/syntax/parse.go:1641 asciiTable
+    // Go: regexp/syntax/parse.go:1643 asciiTable
     static ASCII_TABLE: RangeTable = RangeTable {
         r16: &[(0, 0x7F, 1)],
         r32: &[],
+        latin_offset: 0,
     };
 
-    // Go: regexp/syntax/parse.go:1645 asciiFoldTable
+    // Go: regexp/syntax/parse.go:1647 asciiFoldTable
     static ASCII_FOLD_TABLE: RangeTable = RangeTable {
         r16: &[
             (0, 0x7F, 1),
@@ -2710,7 +2706,25 @@ pub mod syntax {
             (0x212A, 0x212A, 1), // Kelvin K, folds to K/k.
         ],
         r32: &[],
+        latin_offset: 0,
     };
+
+    // Go: regexp/syntax/parse.go:1657 categoryAliases
+    /// categoryAliases is a lazily constructed copy of unicode.CategoryAliases
+    /// but with the keys passed through canonicalName, to support inexact matches.
+    // PORT: a LazyLock replaces the struct's sync.Once.
+    static CATEGORY_ALIASES: LazyLock<HashMap<String, &'static str>> =
+        LazyLock::new(init_category_aliases);
+
+    // Go: regexp/syntax/parse.go:1663 initCategoryAliases
+    /// initCategoryAliases initializes categoryAliases by canonicalizing unicode.CategoryAliases.
+    fn init_category_aliases() -> HashMap<String, &'static str> {
+        let mut m = HashMap::new();
+        for &(name, actual) in unicode_tables::CATEGORY_ALIASES {
+            m.insert(canonical_name(name), actual);
+        }
+        m
+    }
 
     // Go: regexp/syntax/parse.go:1675 canonicalName
     /// canonicalName returns the canonical lookup string for name.
@@ -2763,14 +2777,35 @@ pub mod syntax {
         let name = canonical_name(name);
 
         // Special cases: Any, Assigned, and ASCII.
+        // Also LC is the only non-canonical Categories key, so handle it here.
         match name.as_str() {
-            "Any" => Some((&ANY_TABLE, Some(&ANY_TABLE), 1)),
-            "Ascii" => Some((&ASCII_TABLE, Some(&ASCII_FOLD_TABLE), 1)),
-            // PORT: "Assigned", "Lc", unicode.Categories, unicode.Scripts
-            // and unicode.CategoryAliases need the unicode tables, which are
-            // not ported. An unknown name would be an error in Go.
-            _ => crate::unported!("unicodeTable"),
+            "Any" => return Some((&ANY_TABLE, Some(&ANY_TABLE), 1)),
+            "Assigned" => {
+                // invert Cn (unassigned)
+                return Some((&unicode_tables::CN, Some(&unicode_tables::CN), -1));
+            }
+            "Ascii" => return Some((&ASCII_TABLE, Some(&ASCII_FOLD_TABLE), 1)),
+            "Lc" => {
+                let t = map_get(unicode_tables::CATEGORIES, "LC")?;
+                return Some((t, map_get(unicode_tables::FOLD_CATEGORY, "LC"), 1));
+            }
+            _ => {}
         }
+        if let Some(t) = map_get(unicode_tables::CATEGORIES, &name) {
+            return Some((t, map_get(unicode_tables::FOLD_CATEGORY, &name), 1));
+        }
+        if let Some(t) = map_get(unicode_tables::SCRIPTS, &name) {
+            return Some((t, map_get(unicode_tables::FOLD_SCRIPT, &name), 1));
+        }
+
+        // unicode.CategoryAliases makes liberal use of underscores in its names
+        // (they are defined that way by Unicode), but we want to match ignoring
+        // the underscores, so make our own map with canonical names.
+        if let Some(&actual) = CATEGORY_ALIASES.get(&name) {
+            let t = map_get(unicode_tables::CATEGORIES, actual)?;
+            return Some((t, map_get(unicode_tables::FOLD_CATEGORY, actual), 1));
+        }
+        None
     }
 
     // Go: regexp/syntax/parse.go:1923 cleanClass

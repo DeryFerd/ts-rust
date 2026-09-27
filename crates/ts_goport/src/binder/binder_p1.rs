@@ -10,6 +10,7 @@
 //! friends, which only see the data after binding finishes.
 
 use crate::prelude::*;
+use ts_ast::NodeData;
 
 // Go: binder/binder.go:44 ExpandoAssignmentInfo
 #[derive(Clone, Copy, Debug, Default)]
@@ -162,11 +163,17 @@ impl NodeBindBuilder {
     pub fn new(node_count: usize) -> Self {
         // About one node in four gets data; reserving that avoids copies
         // as the entries grow.
-        let mut entries = Vec::with_capacity(node_count / 4 + 1);
-        entries.push(NodeBindData::default());
+        Self::with_entry_capacity(node_count, node_count / 4 + 1)
+    }
+
+    /// `new` with room for `entries` entries before the first copy.
+    #[must_use]
+    pub fn with_entry_capacity(node_count: usize, entries: usize) -> Self {
+        let mut data = Vec::with_capacity(entries.max(1));
+        data.push(NodeBindData::default());
         NodeBindBuilder {
             slots: vec![0; node_count],
-            entries,
+            entries: data,
         }
     }
 
@@ -221,12 +228,23 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     let file_index = file.file_index();
     let go_file = crate::ast::go_file(file_index);
     let node_count = go_file.parser_flags.len();
+    // PERF: U1 (e). A store file has counts from its slot kinds, made when
+    // it was frozen, so the entries and the flow nodes grow with no copy.
+    // Capacity only: the output does not change.
+    let (node_bind, flow_nodes) = match frozen_store_bind_estimate(file_index) {
+        Some((entries, flow_nodes)) => (
+            NodeBindBuilder::with_entry_capacity(node_count, entries),
+            Vec::with_capacity(flow_nodes),
+        ),
+        None => (NodeBindBuilder::new(node_count), Vec::new()),
+    };
     let mut b = Binder {
         file,
         file_index,
         parser_flags: &go_file.parser_flags,
         symbols: std::mem::take(symbols),
-        node_bind: NodeBindBuilder::new(node_count),
+        node_bind,
+        flow_nodes,
         ..Binder::default()
     };
     b.unreachable_flow = b.new_flow_node(FlowFlags::UNREACHABLE);
@@ -339,6 +357,8 @@ impl Binder {
 
     /// Go `node.LocalsContainerData().Locals = locals`.
     pub fn set_node_locals(&mut self, node: Node, locals: SymbolTable) {
+        // U1 (d): `Node::locals` reads nil for other kinds.
+        debug_assert!(is_locals_container(node), "locals on a {:?}", node.kind());
         self.node_data_mut(node).locals = locals;
     }
 
@@ -351,6 +371,12 @@ impl Binder {
         let locals = self
             .symbols
             .new_table_with_capacity(locals_size_hint(container));
+        // U1 (d): `Node::locals` reads nil for other kinds.
+        debug_assert!(
+            is_locals_container(container),
+            "locals on a {:?}",
+            container.kind()
+        );
         self.node_data_mut(container).locals = locals;
         locals
     }
@@ -494,16 +520,20 @@ impl Binder {
         is_replaceable_by_method: bool,
         is_computed_name: bool,
     ) -> SymbolId {
-        debug_assert!(is_computed_name || !has_dynamic_name(node));
-        let is_default_export = has_syntactic_modifier(node, ModifierFlags::DEFAULT)
-            || is_export_specifier(node) && module_export_name_is_default(node.name());
+        // PERF: query Q7-3. The node data is looked up once here, and the
+        // field reads below (modifiers, name) use it. The reads and their
+        // order are the same as Go's.
+        let data = ast_data_of(node);
+        debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
+        let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
+            || is_export_specifier(node) && module_export_name_is_default(node.name_in(data));
         // The exported symbol for an export default function/class node is always named "default"
         let name: Name = if is_computed_name {
             Name::from(INTERNAL_SYMBOL_NAME_COMPUTED)
         } else if is_default_export && parent.is_some() {
             Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
         } else {
-            self.get_declaration_name(node)
+            self.get_declaration_name_in(node, data)
         };
         let mut symbol: SymbolId;
         if name == INTERNAL_SYMBOL_NAME_MISSING {
@@ -606,7 +636,7 @@ impl Binder {
                             }
                         }
                     }
-                    let mut declaration_name = get_name_of_declaration(node);
+                    let mut declaration_name = get_name_of_declaration_in(node, data);
                     if declaration_name.is_nil() {
                         declaration_name = node;
                     }
@@ -701,6 +731,12 @@ impl Binder {
     // and allocates nothing for an identifier name. `&mut self` only to note
     // a private identifier name in the arena (`note_private_name`).
     pub fn get_declaration_name(&mut self, node: Node) -> Name {
+        self.get_declaration_name_in(node, ast_data_of(node))
+    }
+
+    /// `get_declaration_name` on `d`, the data of `node` that the caller
+    /// already loaded with `ast_data_of` (query Q7-3). It holds the body.
+    pub fn get_declaration_name_in(&mut self, node: Node, d: &'static NodeData) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
                 Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
@@ -708,7 +744,7 @@ impl Binder {
                 Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
             };
         }
-        let name = get_name_of_declaration(node);
+        let name = get_name_of_declaration_in(node, d);
         if name.is_some() {
             if is_ambient_module(node) {
                 let module_name = name.text();
@@ -733,6 +769,11 @@ impl Binder {
                 return private_name;
             }
             if is_property_name_literal(name) || is_jsx_namespaced_name(name) {
+                // PERF: U1 (a). An identifier name reads the name interned at
+                // parse (`Node::text_name`), with no text load and no intern.
+                if is_identifier(name) {
+                    return name.text_name();
+                }
                 return Name::from(name.text());
             }
             if is_computed_property_name(name) {
@@ -1265,6 +1306,9 @@ impl Binder {
         // However, not all symbols will end up in any of these tables. 'Anonymous' symbols
         // (like TypeLiterals for example) will not be put in any table.
         // PORT: the kind is read once. The binder never changes a node's kind.
+        // PERF: query Q7-3. The property, method and accessor arms load the
+        // node data once (`ast_data_of`) and pass it on, so their field reads
+        // (`postfix_token`, `modifiers`, `name`) skip the node lookup.
         let kind = node.kind();
         match kind {
             SyntaxKind::Identifier => {
@@ -1346,11 +1390,12 @@ impl Binder {
                 self.bind_variable_declaration_or_binding_element(node);
             }
             SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
-                self.bind_property_worker(node);
+                self.bind_property_worker(node, ast_data_of(node));
             }
             SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment => {
                 self.bind_property_or_method_or_accessor(
                     node,
+                    ast_data_of(node),
                     SymbolFlags::PROPERTY,
                     SymbolFlags::PROPERTY_EXCLUDES,
                 );
@@ -1358,6 +1403,7 @@ impl Binder {
             SyntaxKind::EnumMember => {
                 self.bind_property_or_method_or_accessor(
                     node,
+                    ast_data_of(node),
                     SymbolFlags::ENUM_MEMBER,
                     SymbolFlags::ENUM_MEMBER_EXCLUDES,
                 );
@@ -1372,6 +1418,7 @@ impl Binder {
                 );
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
+                let d = ast_data_of(node);
                 // Go `ast.IsObjectLiteralMethod(node)` with the kind known.
                 let excludes = if kind == SyntaxKind::MethodDeclaration
                     && node.parent().kind() == SyntaxKind::ObjectLiteralExpression
@@ -1382,7 +1429,8 @@ impl Binder {
                 };
                 self.bind_property_or_method_or_accessor(
                     node,
-                    SymbolFlags::METHOD | get_optional_symbol_flag_for_node(node),
+                    d,
+                    SymbolFlags::METHOD | get_optional_symbol_flag_for_node(node, d),
                     excludes,
                 );
             }
@@ -1399,6 +1447,7 @@ impl Binder {
             SyntaxKind::GetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
+                    ast_data_of(node),
                     SymbolFlags::GET_ACCESSOR,
                     SymbolFlags::GET_ACCESSOR_EXCLUDES,
                 );
@@ -1406,6 +1455,7 @@ impl Binder {
             SyntaxKind::SetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
+                    ast_data_of(node),
                     SymbolFlags::SET_ACCESSOR,
                     SymbolFlags::SET_ACCESSOR_EXCLUDES,
                 );
@@ -1544,8 +1594,11 @@ impl Binder {
     }
 
     // Go: binder/binder.go:752 bindPropertyWorker
-    pub fn bind_property_worker(&mut self, node: Node) {
-        let is_auto_accessor = is_auto_accessor_property_declaration(node);
+    // PERF: query Q7-3. `d` is the data of `node`, loaded once by `bind`.
+    pub fn bind_property_worker(&mut self, node: Node, d: &'static NodeData) {
+        // Go `ast.IsAutoAccessorPropertyDeclaration(node)` on the loaded data.
+        let is_auto_accessor = is_property_declaration(node)
+            && has_syntactic_modifier_in(node, d, ModifierFlags::ACCESSOR);
         let includes = if is_auto_accessor {
             SymbolFlags::ACCESSOR
         } else {
@@ -1558,7 +1611,8 @@ impl Binder {
         };
         self.bind_property_or_method_or_accessor(
             node,
-            includes | get_optional_symbol_flag_for_node(node),
+            d,
+            includes | get_optional_symbol_flag_for_node(node, d),
             excludes,
         );
     }

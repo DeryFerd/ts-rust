@@ -93,8 +93,9 @@ impl Checker {
         // Checker copies (instantiated, transient, merged, union and spread
         // properties) keep the name of a symbol that has that value
         // declaration. Any other name gives false without a declaration load.
-        let name = sym.name.as_str();
-        if !name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX) && name != INTERNAL_SYMBOL_NAME_DEFAULT {
+        // PERF: effect P7-2. Both tests read only the name id: the id holds
+        // the internal bit, and "default" has a fixed id.
+        if !sym.name.is_internal() && !sym.name.is_default_symbol_name() {
             return false;
         }
         let value_declaration = sym.value_declaration;
@@ -529,6 +530,11 @@ impl Checker {
     /// The `compareSymbolsWorker` inputs of one symbol.
     /// `last_file` caches the last `(file, file_index_map[file])` lookup,
     /// with -1 for a file that is not in the map.
+    // PERF: always inlined into `get_named_members` and `sort_symbols`, so
+    // the key is written straight into its `Vec` slot. Out of line, the
+    // callee stored the 48-byte key through the return pointer and the
+    // caller read it back with wider loads that could not forward.
+    #[inline(always)]
     pub(crate) fn symbol_sort_key(
         &self,
         symbol: SymbolId,
@@ -704,6 +710,11 @@ pub(crate) struct SymbolSortKey {
     /// Its text is read only when the declarations tie.
     name: Name,
 }
+
+// The std stable small-sort picks its algorithm by `size_of::<T>()`, so a
+// key of another size changes the comparison sequence and with it the order
+// of the lazy `get_symbol_id` calls. Keep the key at 48 bytes.
+const _: () = assert!(std::mem::size_of::<SymbolSortKey>() == 48);
 
 /// `SymbolSortKey::order` when the packed order does not apply. A real
 /// order is below 2^63.

@@ -14,7 +14,7 @@
 //!
 //! PORT: Go `c.program.X(...)` methods are free functions with the Go snake
 //! names (see `PORTING.md`, Program section). `*module.ResolvedModule` is
-//! `Option<ResolvedModule>`.
+//! `Option<&ResolvedModule>`.
 
 use crate::prelude::*;
 use ts_diagnostics::Message;
@@ -25,10 +25,8 @@ fn message_is_p17(message: Option<&'static Message>, target: &'static Message) -
 }
 
 // PORT: Go `resolvedModule.IsResolved()` (nil-safe method on `*ResolvedModule`).
-fn is_resolved_p17(resolved_module: &Option<ResolvedModule>) -> bool {
-    resolved_module
-        .as_ref()
-        .is_some_and(|r| !r.resolved_file_name.is_empty())
+fn is_resolved_p17(resolved_module: Option<&ResolvedModule>) -> bool {
+    resolved_module.is_some_and(|r| !r.resolved_file_name.is_empty())
 }
 
 impl Checker {
@@ -484,33 +482,35 @@ impl Checker {
             mode = get_default_resolution_mode_for_file(importing_source_file);
         }
 
-        let resolved_module = get_resolved_module(importing_source_file, module_reference, mode);
+        // PERF: borrow the program's resolution instead of cloning it.
+        let resolved_module_owner =
+            get_resolved_module(importing_source_file, module_reference, mode);
+        let resolved_module = resolved_module_owner.as_deref();
 
         let mut resolution_diagnostic: Option<&'static Message> = None;
-        if error_node.is_some() && is_resolved_p17(&resolved_module) {
+        if error_node.is_some() && is_resolved_p17(resolved_module) {
             resolution_diagnostic = module_p17::get_resolution_diagnostic(
                 self.compiler_options,
-                resolved_module.as_ref().unwrap(),
+                resolved_module.unwrap(),
                 importing_source_file,
             );
         }
 
         let mut source_file = Node::NIL;
-        if is_resolved_p17(&resolved_module)
+        if is_resolved_p17(resolved_module)
             && (resolution_diagnostic.is_none()
                 || message_is_p17(
                     resolution_diagnostic,
                     diag::Module_0_was_resolved_to_1_but_jsx_is_not_set,
                 ))
         {
-            source_file = get_source_file_for_resolved_module(
-                &resolved_module.as_ref().unwrap().resolved_file_name,
-            );
+            source_file =
+                get_source_file_for_resolved_module(&resolved_module.unwrap().resolved_file_name);
         }
 
         if source_file.is_some() {
             // PORT: `resolvedModule` is resolved here, so the Go dereferences never see nil.
-            let rm = resolved_module.as_ref().unwrap();
+            let rm = resolved_module.unwrap();
             // If there's a resolutionDiagnostic we need to report it even if a sourceFile is found.
             if let Some(resolution_diagnostic) = resolution_diagnostic {
                 self.error(
@@ -764,8 +764,8 @@ impl Checker {
             return SymbolId::NIL;
         }
 
-        if is_resolved_p17(&resolved_module)
-            && !resolution_extension_is_ts_or_json(&resolved_module.as_ref().unwrap().extension)
+        if is_resolved_p17(resolved_module)
+            && !resolution_extension_is_ts_or_json(&resolved_module.unwrap().extension)
             && resolution_diagnostic.is_none()
             || message_is_p17(
                 resolution_diagnostic,
@@ -773,7 +773,7 @@ impl Checker {
             )
         {
             // PORT: both sides of the condition imply `resolvedModule` is resolved.
-            let rm = resolved_module.as_ref().unwrap();
+            let rm = resolved_module.unwrap();
             if is_for_augmentation {
                 self.error(
                     error_node,
@@ -794,8 +794,8 @@ impl Checker {
 
         if let Some(module_not_found_error) = module_not_found_error {
             // See if this was possibly a projectReference redirect
-            if is_resolved_p17(&resolved_module) {
-                let rm = resolved_module.as_ref().unwrap();
+            if is_resolved_p17(resolved_module) {
+                let rm = resolved_module.unwrap();
                 let redirect = get_project_reference_from_source(&tspath_p17::to_path(
                     &rm.resolved_file_name,
                     &get_current_directory().to_string(),
@@ -813,7 +813,7 @@ impl Checker {
 
             if let Some(resolution_diagnostic) = resolution_diagnostic {
                 // PORT: a non-nil `resolutionDiagnostic` implies `resolvedModule` is resolved.
-                let rm = resolved_module.as_ref().unwrap();
+                let rm = resolved_module.unwrap();
                 self.error(
                     error_node,
                     resolution_diagnostic,
@@ -858,9 +858,7 @@ impl Checker {
                             args![],
                         );
                     }
-                } else if let Some(rm) = resolved_module
-                    .as_ref()
-                    .filter(|r| !r.alternate_result.is_empty())
+                } else if let Some(rm) = resolved_module.filter(|r| !r.alternate_result.is_empty())
                 {
                     let error_info = self.create_module_not_found_chain(
                         rm,
@@ -1511,25 +1509,29 @@ impl Checker {
         let mut symbol;
         match name.kind() {
             SyntaxKind::Identifier => {
-                let mut message: Option<&'static Message> = None;
+                let mut message: Option<NameNotFound> = None;
                 if !ignore_errors {
                     if meaning == SymbolFlags::NAMESPACE || node_is_synthesized(name) {
-                        message = Some(diag::Cannot_find_namespace_0);
+                        message = Some(NameNotFound::Message(diag::Cannot_find_namespace_0));
                     } else {
-                        message =
-                            Some(self.get_cannot_find_name_diagnostic_for_name(
-                                get_first_identifier(name),
-                            ));
+                        // PERF: the resolver builds this message only when
+                        // the name is not found (see `NameNotFound`).
+                        message = Some(NameNotFound::CannotFindName(get_first_identifier(name)));
                     }
                 }
                 let mut resolve_location = location;
                 if resolve_location.is_nil() {
                     resolve_location = name;
                 }
+                // PERF: U1 (a). The name interned at parse
+                // (`Node::text_name`) goes to each resolve call with its
+                // text (`resolver_name_text`), so neither the node data nor
+                // an intern is needed.
+                let name_key = name.text_name();
                 if meaning == SymbolFlags::NAMESPACE {
                     let resolved = self.resolve_name(
                         resolve_location,
-                        name.text(),
+                        resolver_name_text(name_key.clone()),
                         meaning,
                         None,
                         true,  /*isUse*/
@@ -1539,7 +1541,7 @@ impl Checker {
                     if symbol.is_nil() {
                         let resolved_alias = self.resolve_name(
                             resolve_location,
-                            name.text(),
+                            resolver_name_text(name_key.clone()),
                             SymbolFlags::ALIAS,
                             None,
                             true,  /*isUse*/
@@ -1554,9 +1556,11 @@ impl Checker {
                         }
                     }
                     if symbol.is_nil() && message.is_some() {
-                        self.resolve_name(
+                        let resolve_name = self.resolve_name.clone();
+                        resolve_name(
+                            self,
                             resolve_location,
-                            name.text(),
+                            resolver_name_text(name_key.clone()),
                             meaning,
                             message,
                             true,  /*isUse*/
@@ -1564,9 +1568,11 @@ impl Checker {
                         );
                     }
                 } else {
-                    let resolved = self.resolve_name(
+                    let resolve_name = self.resolve_name.clone();
+                    let resolved = resolve_name(
+                        self,
                         resolve_location,
-                        name.text(),
+                        resolver_name_text(name_key.clone()),
                         meaning,
                         message,
                         true,  /*isUse*/
@@ -2344,20 +2350,32 @@ pub(crate) mod tspath_p17 {
     }
 
     // Go: tspath/path.go:840 GetBaseFileName
-    fn get_base_file_name(path: &str) -> String {
-        let path = normalize_slashes(path);
+    // PERF: returns a slice of `path`. NormalizeSlashes swaps one byte for
+    // one byte, and the base name has no separator, so the same byte range
+    // of `path` holds the same text. Only a path with a backslash builds the
+    // normalized copy.
+    fn get_base_file_name(path: &str) -> &str {
+        let range = if path.contains('\\') {
+            base_file_name_range(&normalize_slashes(path))
+        } else {
+            base_file_name_range(path)
+        };
+        &path[range]
+    }
 
+    // The byte range of the Go GetBaseFileName result in the normalized `path`.
+    fn base_file_name_range(path: &str) -> std::ops::Range<usize> {
         // if the path provided is itself the root, then it has no file name.
-        let root_length = get_root_length(&path);
+        let root_length = get_root_length(path);
         if root_length == path.len() {
-            return String::new();
+            return 0..0;
         }
 
         // return the trailing portion of the path starting after the last (non-terminal) directory
         // separator but not including any trailing directory separator.
-        let path = remove_trailing_directory_separator(&path);
+        let path = remove_trailing_directory_separator(path);
         let after_last = path.rfind('/').map_or(0, |i| i + 1);
-        path[get_root_length(path).max(after_last)..].to_string()
+        get_root_length(path).max(after_last)..path.len()
     }
 
     // Go: tspath/path.go:866 GetAnyExtensionFromPath
@@ -2515,19 +2533,20 @@ pub(crate) mod tspath_p17 {
     }
 
     // Go: tspath/extension.go GetDeclarationFileExtension
-    fn get_declaration_file_extension(file_name: &str) -> String {
+    // PERF: returns a slice of `file_name` or a constant, not a copy.
+    fn get_declaration_file_extension(file_name: &str) -> &str {
         let base = get_base_file_name(file_name);
         for ext in SUPPORTED_DECLARATION_EXTENSIONS {
             if base.ends_with(ext) {
-                return ext.to_string();
+                return ext;
             }
         }
         if base.ends_with(EXTENSION_TS) {
             if let Some(index) = base.find(".d.") {
-                return base[index..].to_string();
+                return &base[index..];
             }
         }
-        String::new()
+        ""
     }
 }
 

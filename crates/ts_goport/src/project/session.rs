@@ -13,10 +13,11 @@
 //! functions run on the dispatch thread. `WaitForBackgroundTasks` drains
 //! `gostd::local` through `Queue::wait`.
 //!
-//! Go runtime metrics (`runtime/metrics`, `go-osstat`) exist only in the Go
-//! runtime. Performance telemetry reads them, so it calls `unported!` there
-//! (telemetry only). The log-only runtime metrics and `runtime.GC()` are
-//! PORT skips, so an ordinary session never reaches `unported!`.
+//! Go runtime metrics (`runtime/metrics`) exist only in the Go runtime.
+//! Performance telemetry reads them as `KindBad` (`metrics_read`), so its
+//! Go runtime fields are 0; the system memory fields come from
+//! `/proc/meminfo` (`osmemory_get`). The log-only runtime metrics and
+//! `runtime.GC()` are PORT skips.
 
 use crate::project::prelude::*;
 
@@ -753,9 +754,19 @@ enum MetricsValue {
     Float64Histogram,
 }
 
-// PORT: Go `metrics.Read` reads Go runtime metrics. Telemetry only.
-fn metrics_read(_samples: &mut [MetricsSample]) {
-    unported!("runtime/metrics")
+// Go: runtime/metrics/sample.go:45 Read (go1.26.8), which runs
+// runtime/metrics.go:1028 readMetricsLocked.
+// PORT: Go computes each metric from Go runtime statistics (heap, GC,
+// scheduler, goroutines). The port has no Go runtime, so it has none of
+// these metrics. Go gives `KindBad` for a name it does not have, so every
+// sample is `KindBad` and every Go runtime field of the telemetry event is
+// 0 (`memoryUsedBytes`, `goMemLimit`, `goGCPercent`, the heap and GC
+// fields, `goMaxProcs`, `goroutineCount`, `gcCpuSeconds`, `userCpuSeconds`).
+fn metrics_read(samples: &mut [MetricsSample]) {
+    // Sample.
+    for sample in samples.iter_mut() {
+        sample.value = MetricsValue::Bad;
+    }
 }
 
 // PORT: Go `go-osstat/memory.Stats` (the two fields session.go reads).
@@ -764,9 +775,91 @@ struct OsMemoryStats {
     used: u64,
 }
 
-// PORT: Go `osmemory.Get()` (third-party `go-osstat`). Telemetry only.
+// Go: github.com/mackerelio/go-osstat@v0.2.7 memory/memory_linux.go:15 Get
+// Get memory statistics
 fn osmemory_get() -> Result<OsMemoryStats, GoError> {
-    unported!("go-osstat/memory")
+    // Reference: man 5 proc, Documentation/filesystems/proc.txt in Linux source code
+    let mut file = match std::fs::File::open("/proc/meminfo") {
+        Ok(file) => file,
+        Err(err) => return Err(crate::pprof::path_error("open", "/proc/meminfo", &err)),
+    };
+    // Go: defer file.Close(). The file closes when it drops.
+    collect_memory_stats(&mut file)
+}
+
+// Go: github.com/mackerelio/go-osstat@v0.2.7 memory/memory_linux.go:33 collectMemoryStats
+// PORT: Go fills every `Stats` field. The port keeps the fields that
+// `Total` and `Used` need (`OsMemoryStats`); the other `memStats` names set
+// only fields that nobody reads. Go reads lines with `bufio.Scanner`, which
+// stops at the first read error; the port reads the whole file first. A
+// meminfo line is never longer than the 64 KiB scanner limit.
+fn collect_memory_stats(out: &mut dyn std::io::Read) -> Result<OsMemoryStats, GoError> {
+    let mut data = Vec::new();
+    if let Err(err) = out.read_to_end(&mut data) {
+        return Err(gostd::errors::new(format!(
+            "scan error for /proc/meminfo: {err}"
+        )));
+    }
+    let (mut total, mut free, mut available, mut buffers, mut cached) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut mem_available_enabled = false;
+    // Go: bufio.ScanLines. A line ends at "\n" and loses a final "\r"; the
+    // empty piece after the last "\n" has no ':' and is skipped.
+    for line in data.split(|&c| c == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(i) = line.iter().position(|&c| c == b':') else {
+            continue;
+        };
+        let fld = &line[..i];
+        let ptr = match fld {
+            b"MemTotal" => &mut total,
+            b"MemFree" => &mut free,
+            b"MemAvailable" => &mut available,
+            b"Buffers" => &mut buffers,
+            b"Cached" => &mut cached,
+            _ => continue,
+        };
+        // Go: strings.TrimSpace(strings.TrimRight(line[i+1:], "kB"))
+        let mut val = &line[i + 1..];
+        while let [rest @ .., b'k' | b'B'] = val {
+            val = rest;
+        }
+        // PORT: Go TrimSpace also trims non-ASCII spaces, which meminfo does
+        // not have.
+        let is_space = |c: &u8| matches!(c, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ');
+        while let [c, rest @ ..] = val
+            && is_space(c)
+        {
+            val = rest;
+        }
+        while let [rest @ .., c] = val
+            && is_space(c)
+        {
+            val = rest;
+        }
+        // Go: strconv.ParseUint(val, 10, 64). Rust also takes a leading '+'.
+        if val.first() != Some(&b'+')
+            && let Some(v) = std::str::from_utf8(val)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        {
+            *ptr = v.wrapping_mul(1024);
+        }
+        if fld == b"MemAvailable" {
+            mem_available_enabled = true;
+        }
+    }
+
+    let used = if mem_available_enabled {
+        total.wrapping_sub(available)
+    } else {
+        total
+            .wrapping_sub(free)
+            .wrapping_sub(buffers)
+            .wrapping_sub(cached)
+    };
+
+    Ok(OsMemoryStats { total, used })
 }
 
 impl Session {

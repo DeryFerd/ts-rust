@@ -5,6 +5,7 @@
 //! `newLiteralType`).
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 use ts_jsnum::Number;
 
 impl Checker {
@@ -1372,32 +1373,77 @@ impl Checker {
 
     // Go: checker/checker.go:24854 getConditionalFlowTypeOfType
     pub fn get_conditional_flow_type_of_type(&mut self, t: TypeId, node: Node) -> TypeId {
-        let mut constraints: Vec<TypeId> = Vec::new();
-        let mut covariant = true;
-        let mut node = node;
-        while node.is_some() && !is_statement(node) && node.kind() != SyntaxKind::JsDoc {
-            let parent = node.parent();
-            // only consider variance flipped by parameter locations - `keyof` types would usually be considered variance inverting, but
-            // often get used in indexed accesses where they behave sortof invariantly, but our checking is lax
-            if is_parameter_declaration(parent) {
-                covariant = !covariant;
+        if let Some(facts) = frozen_node_store_facts(node) {
+            // PERF: hono P7-C7. The loop adds a constraint only under a
+            // ConditionalType or MappedType parent, and its other tests have no
+            // side effects. From a node of an alias-free store with local
+            // parents, the parent walk stays in that store, so a store with
+            // neither kind gives `t`.
+            if facts.alias_free && facts.parents_local && !facts.has_flow_constraint_kind {
+                return t;
             }
-            // Always substitute on type parameters, regardless of variance, since even
-            // in contravariant positions, they may rely on substituted constraints to be valid
-            if (covariant || self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE))
-                && is_conditional_type_node(parent)
-                && node == parent.true_type()
+            // PERF: the walk reads only the parents and child fields of
+            // frozen nodes, and with local parents it stays in this frozen
+            // store, so its steps are the same on every call. A node with
+            // type node links keeps them (it never gets links here); each
+            // call then runs only the tests on `t` and the same calls in the
+            // same order.
+            if facts.parents_local
+                && let Some(links) = self.type_node_links.try_get(node)
             {
-                let constraint =
-                    self.get_implied_constraint(t, parent.check_type(), parent.extends_type());
-                if constraint.is_some() {
-                    constraints.push(constraint);
+                let steps = if links.flow_steps_known {
+                    links.flow_steps.clone()
+                } else {
+                    let mut found: SmallVec<[FlowStep; 4]> = SmallVec::new();
+                    for_each_conditional_flow_step(node, |step| found.push(step));
+                    let steps: Option<Rc<[FlowStep]>> =
+                        (!found.is_empty()).then(|| Rc::from(&found[..]));
+                    let links = self.type_node_links.get(node);
+                    links.flow_steps_known = true;
+                    links.flow_steps = steps.clone();
+                    steps
+                };
+                let Some(steps) = steps else {
+                    return t;
+                };
+                let mut constraints: SmallVec<[TypeId; 4]> = SmallVec::new();
+                for &step in steps.iter() {
+                    self.add_conditional_flow_constraint(t, step, &mut constraints);
                 }
-            } else if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER)
-                && is_mapped_type_node(parent)
-                && parent.name_type().is_nil()
-                && node == parent.type_()
-            {
+                return self.conditional_flow_type(t, &constraints);
+            }
+        }
+        let mut constraints: SmallVec<[TypeId; 4]> = SmallVec::new();
+        for_each_conditional_flow_step(node, |step| {
+            self.add_conditional_flow_constraint(t, step, &mut constraints);
+        });
+        self.conditional_flow_type(t, &constraints)
+    }
+
+    /// The part of the `getConditionalFlowTypeOfType` loop body that reads
+    /// `t`, at one step of the walk (`for_each_conditional_flow_step`).
+    fn add_conditional_flow_constraint(
+        &mut self,
+        t: TypeId,
+        step: FlowStep,
+        constraints: &mut SmallVec<[TypeId; 4]>,
+    ) {
+        match step {
+            FlowStep::Conditional { parent, covariant } => {
+                // Always substitute on type parameters, regardless of variance, since even
+                // in contravariant positions, they may rely on substituted constraints to be valid
+                if covariant || self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE) {
+                    let constraint =
+                        self.get_implied_constraint(t, parent.check_type(), parent.extends_type());
+                    if constraint.is_some() {
+                        constraints.push(constraint);
+                    }
+                }
+            }
+            FlowStep::Mapped { parent } => {
+                if !self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+                    return;
+                }
                 let mapped_type = self.get_type_from_type_node(parent);
                 let mapped_type_parameter = self.get_type_parameter_from_mapped_type(mapped_type);
                 if mapped_type_parameter == self.get_actual_type_variable(t) {
@@ -1417,10 +1463,14 @@ impl Checker {
                     }
                 }
             }
-            node = parent;
         }
+    }
+
+    /// The end of `getConditionalFlowTypeOfType`: `t`, or its substitution
+    /// type when the walk found constraints.
+    fn conditional_flow_type(&mut self, t: TypeId, constraints: &[TypeId]) -> TypeId {
         if !constraints.is_empty() {
-            let intersection = self.get_intersection_type(&constraints);
+            let intersection = self.get_intersection_type(constraints);
             return self.get_substitution_type(t, intersection);
         }
         t
@@ -1454,31 +1504,77 @@ pub fn is_unary_tuple_type_node(node: Node) -> bool {
     is_tuple_type_node(node) && node.elements().len() == 1
 }
 
+/// The parent walk of Go `getConditionalFlowTypeOfType`, without the tests
+/// on the type: calls `f` with each step where a branch of the loop body
+/// can fire, in walk order. It reads only the AST. The loop body at other
+/// steps adds nothing for any type, and a conditional step never takes the
+/// mapped branch (its parent is not a MappedType).
+fn for_each_conditional_flow_step(node: Node, mut f: impl FnMut(FlowStep)) {
+    let mut covariant = true;
+    let mut node = node;
+    while node.is_some() && !is_statement(node) && node.kind() != SyntaxKind::JsDoc {
+        let parent = node.parent();
+        // only consider variance flipped by parameter locations - `keyof` types would usually be considered variance inverting, but
+        // often get used in indexed accesses where they behave sortof invariantly, but our checking is lax
+        if is_parameter_declaration(parent) {
+            covariant = !covariant;
+        }
+        if is_conditional_type_node(parent) && node == parent.true_type() {
+            f(FlowStep::Conditional { parent, covariant });
+        } else if is_mapped_type_node(parent)
+            && parent.name_type().is_nil()
+            && node == parent.type_()
+        {
+            f(FlowStep::Mapped { parent });
+        }
+        node = parent;
+    }
+}
+
 impl Checker {
-    // PORT: Go sets `t.checker = c`; the checker back pointer is out of scope.
-    // Go `t.id = TypeId(c.TypeCount)` equals the arena index, so the new entry
-    // is pushed at that index.
+    // PERF: always inlined, so each caller writes its `data` straight into
+    // the arena slot. Out of line (LLVM did not inline it), `data` came in by
+    // pointer and was copied twice with `memcpy`: 168 bytes into a stack
+    // `Type`, then the 192-byte `Type` into the chunk.
     // Go: checker/checker.go:24905 newType
+    #[inline(always)]
     pub fn new_type(
         &mut self,
         flags: TypeFlags,
         object_flags: ObjectFlags,
         data: TypeData,
     ) -> TypeId {
+        self.new_type_with(flags, object_flags, move || data)
+    }
+
+    /// `new_type` with the data that `make_data` returns. `make_data` runs
+    /// after the arena slot is ready (`ChunkedArena::push_with`), so a caller
+    /// that builds a large `TypeData` in it has no stack copy.
+    // PORT: Go sets `t.checker = c` and records the type with the tracer; the
+    // checker back pointer and tracer are out of scope. Go `t.id = TypeId(c.TypeCount)`
+    // equals the arena index, so the new entry is pushed at that index.
+    #[inline(always)]
+    pub fn new_type_with(
+        &mut self,
+        flags: TypeFlags,
+        object_flags: ObjectFlags,
+        make_data: impl FnOnce() -> TypeData,
+    ) -> TypeId {
         self.type_count += 1;
         let id = TypeId(self.types.len() as u32);
         debug_assert_eq!(id.0, self.type_count);
-        self.types.push(Type {
+        let object_flags = object_flags.without(
+            ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+                | ObjectFlags::MEMBERS_RESOLVED,
+        );
+        self.types.push_with(move || Type {
             flags,
-            object_flags: object_flags.without(
-                ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
-                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
-                    | ObjectFlags::MEMBERS_RESOLVED,
-            ),
+            object_flags,
             id,
             symbol: SymbolId::NIL,
             alias: None,
-            data,
+            data: make_data(),
         });
         if let Some(tracer) = self.tracer {
             tracer.record_type(id);

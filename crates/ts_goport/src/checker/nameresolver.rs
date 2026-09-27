@@ -41,6 +41,27 @@ pub type NameResolverOnFailedToResolveSymbolFn =
 pub type NameResolverOnSuccessfullyResolvedSymbolFn =
     Rc<dyn Fn(&mut Checker, Node, SymbolId, SymbolFlags, Node, Node, bool)>;
 
+/// A non-nil Go `nameNotFoundMessage` of `Resolve`.
+// PERF: `CannotFindName(node)` stands for
+// `c.get_cannot_find_name_diagnostic_for_name(node)`. `resolve` reads the
+// message only when the name is not found, so it builds it only then. That
+// function reads only the node and the options, so the message is the same.
+#[derive(Clone, Copy)]
+pub enum NameNotFound {
+    Message(&'static Message),
+    CannotFindName(Node),
+}
+
+impl NameNotFound {
+    /// The Go message this value stands for.
+    pub fn message(self, c: &Checker) -> &'static Message {
+        match self {
+            NameNotFound::Message(message) => message,
+            NameNotFound::CannotFindName(node) => c.get_cannot_find_name_diagnostic_for_name(node),
+        }
+    }
+}
+
 /// Go `binder.NameResolver`. The checker builds one with
 /// `create_name_resolver` / `create_name_resolver_for_suggestion` and calls
 /// `resolve(c, ...)` on it.
@@ -62,24 +83,76 @@ pub struct NameResolver {
     pub on_successfully_resolved_symbol: Option<NameResolverOnSuccessfullyResolvedSymbolFn>,
 }
 
+thread_local! {
+    /// U1 (a): the text and name of the last `resolver_name_text` call on
+    /// this thread, for the next `NameResolver::resolve`.
+    static NAME_HINT: Cell<Option<(&'static str, Name)>> = const { Cell::new(None) };
+}
+
+/// `name.as_str()`, and a note for the next `NameResolver::resolve` on this
+/// thread that this text is `name`, so it does not intern the text again.
+/// Pass the result as the `name` of a resolve call (the checker's
+/// `resolve_name` field or method, whose closures take `&str`).
+// PERF: U1 (a). The checker reaches the resolver only through closures that
+// take the name as `&str` (checker_p01). `resolve` uses the note only when
+// its `name` is this same text (same address and length), and then the note
+// is the name of that text, so a stale note can never give a wrong name.
+#[must_use]
+pub fn resolver_name_text(name: Name) -> &'static str {
+    let text = name.as_str();
+    NAME_HINT.set(Some((text, name)));
+    text
+}
+
 impl NameResolver {
     // Go: binder/nameresolver.go:25 Resolve
     // PORT: Go `nameNotFoundMessage *diagnostics.Message` may be nil, so it is
-    // `Option<&'static Message>`.
-    // PERF: `name` is interned once here as `name_key`. Each scope lookup
-    // below uses it, so a table lookup reads the hash the interner keeps and
-    // compares name ids, with no hashing and no text compare per scope.
+    // `Option<NameNotFound>`.
+    // PERF: `name` is interned once here (see `resolve_name`), or taken from
+    // the note of `resolver_name_text`.
     pub fn resolve(
         &self,
         c: &mut Checker,
         location: Node,
         name: &str,
         meaning: SymbolFlags,
-        name_not_found_message: Option<&'static Message>,
+        name_not_found_message: Option<NameNotFound>,
         is_use: bool,
         exclude_globals: bool,
     ) -> SymbolId {
-        let name_key = Name::from(name);
+        let name_key = match NAME_HINT.take() {
+            Some((text, key)) if std::ptr::eq(text, name) => key,
+            _ => Name::from(name),
+        };
+        debug_assert_eq!(name_key, Name::from(name));
+        self.resolve_name(
+            c,
+            location,
+            &name_key,
+            meaning,
+            name_not_found_message,
+            is_use,
+            exclude_globals,
+        )
+    }
+
+    /// `resolve` with the name already interned. It holds the body of Go
+    /// `Resolve`.
+    // PERF: each scope lookup below uses `name_key`, so a table lookup reads
+    // the hash the interner keeps and compares name ids, with no hashing
+    // and no text compare per scope.
+    pub fn resolve_name(
+        &self,
+        c: &mut Checker,
+        location: Node,
+        name_key: &Name,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<NameNotFound>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> SymbolId {
+        let name_key = name_key.clone();
+        let name: &'static str = name_key.as_str();
         let mut location = location;
         let mut result = SymbolId::NIL;
         let mut last_location = Node::NIL;
@@ -567,6 +640,7 @@ impl NameResolver {
             }
             if result.is_nil() {
                 if let Some(on_failed_to_resolve_symbol) = &self.on_failed_to_resolve_symbol {
+                    let name_not_found_message = name_not_found_message.message(c);
                     on_failed_to_resolve_symbol(
                         c,
                         original_location,

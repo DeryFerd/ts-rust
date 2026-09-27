@@ -4,6 +4,10 @@
 //! node (`finishNode`). The Rust parser does not track these contexts, so
 //! this file replays them with one walk over the finished Rust tree. The
 //! binder and checker read the result as `go_file.parser_flags[idx]`.
+//!
+//! Only legacy (ts_parser) arena nodes come here, so the `IdentifierData`
+//! text reads below see the text. U1 (d) empties only the data text of node
+//! store identifiers (`store::alloc_store_name_node`).
 
 use crate::prelude::*;
 

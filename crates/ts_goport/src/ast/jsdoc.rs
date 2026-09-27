@@ -781,7 +781,7 @@ struct Parser {
     // copied into the node data, so the list is known by its address until
     // then, and a function or constructor type with a missing parameter list
     // is kept in `missing_parameter_hosts`.
-    missing_lists: Vec<*const ts_ast::NodeList>,
+    missing_lists: Vec<*const ()>,
     missing_parameter_hosts: Vec<Node>,
 }
 
@@ -1033,16 +1033,16 @@ impl Parser {
     // PORT: see `Parser::missing_lists`.
     fn create_missing_list(&mut self) -> NodeList {
         let result = self.parse_empty_node_list();
-        if let Some(l) = result.list {
-            self.missing_lists.push(l as *const ts_ast::NodeList);
+        if let Some(l) = result.list_ptr() {
+            self.missing_lists.push(l);
         }
         result
     }
 
     // Go: parser.go:118 isMissingNodeList
     fn is_missing_node_list(&self, list: NodeList) -> bool {
-        list.list
-            .is_some_and(|l| self.missing_lists.contains(&(l as *const ts_ast::NodeList)))
+        list.list_ptr()
+            .is_some_and(|l| self.missing_lists.contains(&l))
     }
 
     // Go: parser.go:733 abortParsingListOrMoveToNextToken

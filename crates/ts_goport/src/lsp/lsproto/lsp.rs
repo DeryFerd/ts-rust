@@ -23,7 +23,7 @@ impl DocumentUri {
         if uri.starts_with("file://") {
             let parsed = match gostd::url::parse(uri) {
                 Ok(parsed) => parsed,
-                Err(_) => panic!("invalid file URI: {uri}"),
+                Err(_) => crate::core::go_panic(format!("invalid file URI: {uri}")),
             };
             if !parsed.host.is_empty() {
                 return format!("//{}{}", parsed.host, parsed.path);
@@ -34,13 +34,13 @@ impl DocumentUri {
         // Leave all other URIs escaped so we can round-trip them.
 
         let Some((scheme, mut path)) = uri.split_once(':') else {
-            panic!("invalid URI: {uri}");
+            crate::core::go_panic(format!("invalid URI: {uri}"));
         };
 
         let mut authority = "ts-nul-authority";
         if let Some(rest) = path.strip_prefix("//") {
             let Some((a, p)) = rest.split_once('/') else {
-                panic!("invalid URI: {uri}");
+                crate::core::go_panic(format!("invalid URI: {uri}"));
             };
             authority = a;
             path = p;

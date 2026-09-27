@@ -14,7 +14,6 @@ use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
 };
-use crate::frontend::module::ModeAwareCacheKey;
 use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{
     ParseConfigHost, ParsedCommandLine, get_parsed_command_line_of_config_file,
@@ -37,8 +36,14 @@ pub(super) struct GoFrontendState {
 // Rust frontend uses `Rc` and `RefCell`, so the values the checker asks for
 // are copied here instead.
 pub(super) struct GoSharedState {
-    /// Go `processedFiles.resolvedModules`, by file path. Shared with the
+    /// Go `processedFiles.resolvedModules`, by file path, then by module
+    /// name. Each name holds its (mode, resolution) pairs. Shared with the
     /// version this one was updated from when the frontend shares the map.
+    // PERF: keyed by name, not by `ModeAwareCacheKey`, so a lookup borrows
+    // the specifier text instead of copying it into an owned key. The keys
+    // and resolutions borrow the leaked frontend program instead of copying
+    // each `ResolvedModule`. Only the loading thread touches the frontend
+    // `Rc` counts; checker threads read the immutable values.
     resolved_modules: Arc<ResolvedModules>,
     /// Go `processedFiles.jsxRuntimeImportSpecifiers`, by file path.
     jsx_runtime_import_specifiers: FxHashMap<String, (String, Node)>,
@@ -89,7 +94,10 @@ pub(super) struct GoSharedState {
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
 
 /// `GoSharedState::resolved_modules`.
-type ResolvedModules = FxHashMap<String, FxHashMap<ModeAwareCacheKey, ResolvedModule>>;
+type ResolvedModules = FxHashMap<
+    &'static str,
+    FxHashMap<&'static str, Vec<(ResolutionMode, &'static ResolvedModule)>>,
+>;
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
@@ -359,7 +367,7 @@ fn case_sensitivity() -> CaseSensitivity {
 /// A store that is not a program file is a file that the language server
 /// parsed outside a program load (`PARSED_UNPUBLISHED`), or a config file.
 fn go_files_of_unpublished_stores(
-    parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>,
+    parsed: &FxHashMap<usize, &'static ParsedSourceFile>,
     cwd: &str,
     case_sensitivity: CaseSensitivity,
 ) -> Vec<GoFile> {
@@ -377,7 +385,16 @@ fn go_files_of_unpublished_stores(
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
         }
-        let file = parsed.get(&store).or_else(|| outside.get(&store));
+        // PERF: `program_file_info` borrows the parse. A published file is
+        // never freed, so a parse outside a program is kept for good, like
+        // the leaked frontend program keeps the parses of its files.
+        let file: Option<&'static ParsedSourceFile> = match parsed.get(&store) {
+            Some(&file) => Some(file),
+            None => outside.get(&store).map(|file| {
+                let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
+                &**kept
+            }),
+        };
         let info = match file {
             Some(file) => program_file_info(store, file),
             None => other_store_info(store, cwd, case_sensitivity),
@@ -501,11 +518,13 @@ fn build_program(
     let case_sensitivity = case_sensitivity();
     let options = np.options().clone();
 
-    let mut parsed = FxHashMap::default();
+    // PERF: the program is leaked, so its files are `&'static` and each
+    // `SourceFileInfo` can borrow their fields instead of copying them.
+    let mut parsed: FxHashMap<usize, &'static ParsedSourceFile> = FxHashMap::default();
     let mut source_file_order = Vec::new();
     for file in np.source_files() {
         source_file_order.push(file.store);
-        parsed.insert(file.store, file.clone());
+        parsed.insert(file.store, &**file);
     }
 
     let files = go_files_of_unpublished_stores(&parsed, &cwd, case_sensitivity);
@@ -528,8 +547,12 @@ fn build_program(
     // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
     // package dedup redirect path maps to the first file with the same
     // package id, so `GetSourceFileByPath` finds that file.
+    // PERF: copies the path only when it adds an entry (`entry` needs an
+    // owned key even when the path is already there).
     for (path, file) in np.files_by_path() {
-        file_by_path.entry(path.0.clone()).or_insert(file.store);
+        if !file_by_path.contains_key(&path.0) {
+            file_by_path.insert(path.0.clone(), file.store);
+        }
     }
 
     let id = next_program_id();
@@ -604,7 +627,11 @@ fn trace_from_sys() -> TraceFn {
 
 /// `SourceFileInfo` of a program file, from the Go parser fields. The Go
 /// program fields are in `ProgramState::file_meta`.
-fn program_file_info(store: usize, file: &ParsedSourceFile) -> SourceFileInfo {
+// PERF: the diagnostics, reparsed clones and JSDoc cache borrow the leaked
+// parsed file. The other lists stay copies: `source_file_parser_fields`
+// (ast/synthetic.rs) copies them out as owned lists, and the frontend
+// program still reads the parsed file.
+fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFileInfo {
     let info = SourceFileInfo {
         file_name: file.file_name().to_string(),
         path: file.path().0.clone(),
@@ -617,9 +644,9 @@ fn program_file_info(store: usize, file: &ParsedSourceFile) -> SourceFileInfo {
         type_reference_directives: file.type_reference_directives.clone(),
         lib_reference_directives: file.lib_reference_directives.clone(),
         comment_directives: file.comment_directives.clone(),
-        diagnostics: file.diagnostics.clone(),
-        js_diagnostics: file.js_diagnostics.clone(),
-        jsdoc_diagnostics: file.jsdoc_diagnostics.clone(),
+        diagnostics: &file.diagnostics,
+        js_diagnostics: &file.js_diagnostics,
+        jsdoc_diagnostics: &file.jsdoc_diagnostics,
         has_lazy_js_doc: file.has_lazy_js_doc,
         contains_non_ascii: file.contains_non_ascii,
         trivia: crate::ast::go_view::TriviaRuns::default(),
@@ -628,12 +655,12 @@ fn program_file_info(store: usize, file: &ParsedSourceFile) -> SourceFileInfo {
     let late = LateSourceFileInfo {
         file_index: store,
         external_module_indicator: file.external_module_indicator,
-        reparsed_clones: file.reparsed_clones.clone(),
+        reparsed_clones: &file.reparsed_clones,
         imports: file.imports.clone(),
         module_augmentations: file.module_augmentations.clone(),
         ambient_module_names: file.ambient_module_names.clone(),
         uses_uri_style_node_core_modules: file.uses_uri_style_node_core_modules,
-        jsdoc_cache: file.jsdoc_cache.clone(),
+        jsdoc_cache: &file.jsdoc_cache,
         post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
@@ -657,9 +684,9 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         type_reference_directives: Vec::new(),
         lib_reference_directives: Vec::new(),
         comment_directives: Vec::new(),
-        diagnostics: Vec::new(),
-        js_diagnostics: Vec::new(),
-        jsdoc_diagnostics: Vec::new(),
+        diagnostics: &[],
+        js_diagnostics: &[],
+        jsdoc_diagnostics: &[],
         has_lazy_js_doc: false,
         // The parser flag of the config file, when the store was parsed.
         contains_non_ascii: file_store_contains_non_ascii(store),
@@ -669,12 +696,12 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
     let late = LateSourceFileInfo {
         file_index: store,
         external_module_indicator: Node::NIL,
-        reparsed_clones: Vec::new(),
+        reparsed_clones: &[],
         imports: Vec::new(),
         module_augmentations: Vec::new(),
         ambient_module_names: Vec::new(),
         uses_uri_style_node_core_modules: Tristate::Unknown,
-        jsdoc_cache: FxHashMap::default(),
+        jsdoc_cache: &EMPTY_JSDOC_CACHE,
         post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
@@ -689,8 +716,8 @@ impl GoSharedState {
     /// changed. A version is never freed, so each copy would leak once per
     /// edit.
     fn new(
-        p: &NewProgram,
-        parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>,
+        p: &'static NewProgram,
+        parsed: &FxHashMap<usize, &'static ParsedSourceFile>,
         previous: Option<(&NewProgram, &GoSharedState)>,
     ) -> Self {
         let files = &p.processed_files;
@@ -716,11 +743,17 @@ impl GoSharedState {
                     .resolved_modules
                     .iter()
                     .map(|(path, cache)| {
-                        let cache = cache
-                            .iter()
-                            .map(|(key, resolved)| (key.clone(), (**resolved).clone()))
-                            .collect();
-                        (path.0.clone(), cache)
+                        let mut by_name: FxHashMap<
+                            &'static str,
+                            Vec<(ResolutionMode, &'static ResolvedModule)>,
+                        > = FxHashMap::default();
+                        for (key, resolved) in cache {
+                            by_name
+                                .entry(key.name.as_str())
+                                .or_default()
+                                .push((key.mode, &**resolved));
+                        }
+                        (path.0.as_str(), by_name)
                     })
                     .collect(),
             ),
@@ -1020,20 +1053,21 @@ impl GoSharedState {
     }
 
     // Go: compiler/program.go:494 GetResolvedModule
+    // PERF: returns a borrow, and looks the name up as `&str`. A name has at
+    // most one entry per mode, so the mode scan finds the Go map entry.
     pub(super) fn get_resolved_module(
         &self,
         file: Node,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> Option<ResolvedModule> {
-        let path = &source_file_info(file).path;
+    ) -> Option<&ResolvedModule> {
+        let path = source_file_info(file).path.as_str();
         self.resolved_modules
             .get(path)?
-            .get(&ModeAwareCacheKey {
-                name: module_reference.to_string(),
-                mode,
-            })
-            .cloned()
+            .get(module_reference)?
+            .iter()
+            .find(|(entry_mode, _)| *entry_mode == mode)
+            .map(|&(_, resolved)| resolved)
     }
 
     // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier

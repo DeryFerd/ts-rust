@@ -652,10 +652,7 @@ fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> ts_ast::
 pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
     let list: &'static ts_ast::NodeList =
         crate::ast::store::leak_in_ast_arena(ts_list(nodes, loc, false));
-    NodeList {
-        file: SYNTHETIC_NODE_FILE as u32,
-        list: Some(list),
-    }
+    NodeList::from_ts(SYNTHETIC_NODE_FILE, Some(list))
 }
 
 /// Go `f.NewModifierList(nodes)` with a given `Loc`. `modifier_flags()` in
@@ -667,10 +664,7 @@ pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierLi
             list: ts_list(nodes, loc, false),
             flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
         });
-    ModifierList {
-        file: SYNTHETIC_NODE_FILE as u32,
-        list: Some(list),
-    }
+    ModifierList::from_ts(SYNTHETIC_NODE_FILE, Some(list))
 }
 
 /// A list value to store inside new synthetic `NodeData`. Go stores the
@@ -684,12 +678,14 @@ pub fn synthetic_list_value(list: NodeList) -> Option<ts_ast::NodeList> {
     if list.is_nil() {
         return None;
     }
-    let l = list.list?;
-    if list.file as usize == SYNTHETIC_NODE_FILE {
+    // A synthetic list is a ts_ast list (`new_synthetic_node_list`).
+    if list.file() == SYNTHETIC_NODE_FILE
+        && let Some(l) = list.ts_list()
+    {
         return Some(l.clone());
     }
     let nodes = list.nodes().to_vec();
-    Some(ts_list(&nodes, list.loc(), l.has_trailing_comma))
+    Some(ts_list(&nodes, list.loc(), list.stored_trailing_comma()))
 }
 
 /// Like `synthetic_list_value` for a list field that ts_ast requires. Go
@@ -703,13 +699,21 @@ pub fn synthetic_req_list_value(list: NodeList) -> ts_ast::NodeList {
 /// A modifier list value to store inside new synthetic `NodeData`.
 #[must_use]
 pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<ts_ast::ModifierList> {
-    let m = modifiers.list?;
-    if modifiers.file as usize == SYNTHETIC_NODE_FILE {
+    if modifiers.is_nil() {
+        return None;
+    }
+    if modifiers.file() == SYNTHETIC_NODE_FILE
+        && let Some(m) = modifiers.ts_list()
+    {
         return Some(m.clone());
     }
     let nodes = modifiers.nodes().to_vec();
     Some(ts_ast::ModifierList {
-        list: ts_list(&nodes, modifiers.loc(), m.list.has_trailing_comma),
+        list: ts_list(
+            &nodes,
+            modifiers.loc(),
+            modifiers.node_list().stored_trailing_comma(),
+        ),
         flags: ts_ast::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
     })
 }

@@ -743,8 +743,10 @@ fn get_possible_values(option: &CommandLineOption) -> String {
 }
 
 // Go: execute/tsc/help.go:397 getPrettyOutput
-// PORT: Go cuts `right` at a byte index. A cut inside a UTF-8 sequence
-// writes invalid UTF-8, which a Rust `String` cannot hold.
+// PORT: Go cuts `right` at a byte index, so a cut inside a UTF-8 sequence
+// writes invalid UTF-8. The loop cuts the Go bytes of `right` and keeps
+// each piece in port form (see `scanner_util::GO_STRING_MARKER`). The
+// process output writes the Go bytes back (`compile::GoOutput`).
 fn get_pretty_output(
     colors: &Colors,
     left: &str,
@@ -757,7 +759,8 @@ fn get_pretty_output(
     // !!! How does terminalWidth interact with UTF-8 encoding? Strada just assumed UTF-16.
     let mut res = Vec::with_capacity(4);
     let mut is_first_line = true;
-    let mut remain_right = right;
+    let right = go_string_bytes(right);
+    let mut remain_right: &[u8] = &right;
     let right_character_number = terminal_width - left_align_of_right;
     while !remain_right.is_empty() {
         let cur_left = if is_first_line {
@@ -776,12 +779,13 @@ fn get_pretty_output(
         let Ok(idx) = usize::try_from(idx) else {
             panic!("slice bounds out of range [:{idx}]");
         };
-        if !remain_right.is_char_boundary(idx) {
-            unported!("getPrettyOutput cut inside a UTF-8 sequence");
-        }
         let (cur_right, rest) = remain_right.split_at(idx);
         remain_right = rest;
-        res.extend([cur_left, cur_right.to_string(), "\n".to_string()]);
+        res.extend([
+            cur_left,
+            go_string_from_bytes(cur_right.to_vec()),
+            "\n".to_string(),
+        ]);
         is_first_line = false;
     }
     res

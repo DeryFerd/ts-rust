@@ -23,8 +23,8 @@ use crate::api::prelude::*;
 //   releases the checker when `setup` drops at the end of the handler.
 // - Go mutexes (`snapshotsMu`, the registry mutexes) are dropped: the
 //   session runs on the dispatch thread (PORTING "Threads").
-// - pprof is not ported (PORTING "Not ported"); the profile handlers check
-//   their parameters and then call `unported!`.
+// - The profile handlers run `crate::pprof`, which writes profiles with no
+//   samples (see its module comment).
 
 use crate::api::encoder;
 use crate::astnav;
@@ -426,7 +426,6 @@ pub fn checker_signature(
 // It implements the Handler interface to process incoming API requests.
 // The session supports multiple active snapshots, each with their own
 // symbol and type registries for maintaining object identity.
-// PORT: `cpuProfiler pprof.CPUProfiler` is dropped (pprof is not ported).
 pub struct Session {
     pub id: String,
     pub project_session: Rc<project::Session>,
@@ -440,6 +439,8 @@ pub struct Session {
 
     // latestSnapshot tracks the most recently created snapshot for computing diffs.
     pub latest_snapshot: Cell<SnapshotID>,
+
+    pub cpu_profiler: crate::pprof::CpuProfiler,
 }
 
 // Go: api/session.go:284 `var _ Handler = (*Session)(nil)`
@@ -467,6 +468,7 @@ pub fn new_session(
         use_binary_responses: false,
         snapshots: RefCell::new(FxHashMap::default()),
         latest_snapshot: Cell::new(SnapshotID(0)),
+        cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
         s.use_binary_responses = options.use_binary_responses;
@@ -933,20 +935,33 @@ impl Session {
         _ctx: &Context,
         params: Option<&ProfileParams>,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-        if params.is_none_or(|params| params.dir.is_empty()) {
+        let Some(params) = params.filter(|params| !params.dir.is_empty()) else {
             return Err(errors::errorf(
                 format!("{}: dir is required", *ERR_CLIENT_ERROR),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
+        };
+        if let Err(err) = self.cpu_profiler.start_cpu_profile(&params.dir) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: failed to start CPU profile: {}",
+                    *ERR_CLIENT_ERROR, err
+                ),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
         }
-        // PORT: pprof is not ported (PORTING "Not ported").
-        unported!("pprof.CPUProfiler.StartCPUProfile")
+        Ok(None)
     }
 
     // Go: api/session.go:589 handleStopCPUProfile
     pub fn handle_stop_cpu_profile(&self, _ctx: &Context) -> Result<ProfileResult, GoError> {
-        // PORT: pprof is not ported (PORTING "Not ported").
-        unported!("pprof.CPUProfiler.StopCPUProfile")
+        match self.cpu_profiler.stop_cpu_profile() {
+            Ok(file_path) => Ok(ProfileResult { file: file_path }),
+            Err(err) => Err(errors::errorf(
+                format!("{}: failed to stop CPU profile: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            )),
+        }
     }
 
     // Go: api/session.go:597 handleSaveHeapProfile
@@ -955,14 +970,22 @@ impl Session {
         _ctx: &Context,
         params: Option<&ProfileParams>,
     ) -> Result<ProfileResult, GoError> {
-        if params.is_none_or(|params| params.dir.is_empty()) {
+        let Some(params) = params.filter(|params| !params.dir.is_empty()) else {
             return Err(errors::errorf(
                 format!("{}: dir is required", *ERR_CLIENT_ERROR),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
+        };
+        match crate::pprof::save_heap_profile(&params.dir) {
+            Ok(file_path) => Ok(ProfileResult { file: file_path }),
+            Err(err) => Err(errors::errorf(
+                format!(
+                    "{}: failed to save heap profile: {}",
+                    *ERR_CLIENT_ERROR, err
+                ),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            )),
         }
-        // PORT: pprof is not ported (PORTING "Not ported").
-        unported!("pprof.SaveHeapProfile")
     }
 
     // Go: api/session.go:614 handleInitialize

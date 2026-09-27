@@ -25,6 +25,34 @@
 //! `Server` (`Rc`, dispatch thread) holds the rest. Go methods that the
 //! reader thread calls (`readLoop`, `sendError`, `handleInitialize`, the
 //! send functions) are on `ServerShared`.
+//!
+//! Effects of the one dispatch thread (lsp-concurrency.md D1, D5, D7). The
+//! LS oracle keeps one request in flight, so it sees none of them:
+//!
+//! - Answers come in arrival order (above). A fast request waits for a slow
+//!   one; Go answers the fast one first.
+//! - `gostd::local` timers (diagnostics refresh, snapshot update, idle cache
+//!   clean) fire at the next message boundary, after the running request.
+//!   Go fires them on time.
+//! - A background client request (`update_watches` registerCapability, 1 s
+//!   timeout) blocks the dispatch thread until the client answers. Go waits
+//!   on a goroutine.
+//!
+//! Background tasks and timers stay on the dispatch thread at message
+//! boundaries, after the answer of the request that queued them. Do not
+//! move them to another thread: the oracle compares where background
+//! publishDiagnostics land.
+//!
+//! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
+//! dispatch loop took (`pending_client_requests`); a cancel for a queued
+//! request is dropped. The LS loops check the request context. The checker
+//! does not (`Checker::is_canceled` is always false), so a canceled
+//! diagnostic request answers `-32800` only after the full check.
+//!
+//! When the `run` context ends (Go `signal.NotifyContext` in
+//! `cmd/tsgo/lsp.go`), every loop returns `context canceled`, as in Go. A
+//! request on the dispatch thread first runs to its next cancel check. Its
+//! answer is not written, because `send` uses the ended group context.
 
 use crate::lsp::prelude::*;
 
@@ -135,6 +163,7 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         compiler_options_for_inferred_projects: RefCell::new(None),
         parse_cache,
         npm_install,
+        cpu_profiler: crate::pprof::CpuProfiler::default(),
     })
 }
 
@@ -344,8 +373,8 @@ pub struct Server {
     pub parse_cache: Option<Rc<project::ParseCache>>,
 
     pub npm_install: Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>>,
-    // PORT: Go `cpuProfiler pprof.CPUProfiler` is not ported (pprof); the
-    // profile handlers call `unported!`.
+
+    pub cpu_profiler: crate::pprof::CpuProfiler,
     // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
     // `startWatchdog` is `ServerShared::start_watchdog`.
 }
@@ -754,10 +783,15 @@ fn lsp_any_type_name(v: &LspAny) -> &'static str {
 }
 
 /// PORT: a panic on a Go goroutine without `recover` ends the Go process.
-/// goport ends it the way `bin/goport.rs` ends a failed run: the unported
-/// report on stderr and `EXIT_UNPORTED` (70). The panic hook already
-/// printed any other panic.
-pub fn go_crash(_payload: Box<dyn Any + Send>) -> ! {
+/// A Go panic that the port keeps (`core::go_panic`) ends it as the Go
+/// runtime does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2).
+/// Any other panic is a port gap and ends it the way `bin/goport.rs` ends a
+/// failed run: the unported report on stderr and `EXIT_UNPORTED` (70). The
+/// panic hook already printed such a panic.
+pub fn go_crash(payload: Box<dyn Any + Send>) -> ! {
+    if crate::core::print_go_panic(payload.as_ref()) {
+        std::process::exit(crate::core::EXIT_GO_PANIC);
+    }
     let mut stderr = std::io::stderr().lock();
     for (name, count) in crate::core::unported_report() {
         let _ = writeln!(stderr, "unported: {name} {count}");
@@ -768,7 +802,9 @@ pub fn go_crash(_payload: Box<dyn Any + Send>) -> ! {
 
 /// The text of a panic value (Go `%v` of the recovered value).
 pub fn panic_value_string(r: &(dyn Any + Send)) -> String {
-    if let Some(message) = r.downcast_ref::<&str>() {
+    if let Some(panic) = r.downcast_ref::<crate::core::GoPanic>() {
+        panic.message.clone()
+    } else if let Some(message) = r.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = r.downcast_ref::<String>() {
         message.clone()
@@ -3438,58 +3474,70 @@ impl ata::NpmExecutor for Server {
 
 impl Server {
     // Go: server.go:1821 handleRunGC
-    // PORT: pprof is not ported.
     pub fn handle_run_gc(
         self: &Rc<Self>,
         _ctx: &Context,
         _params: Option<&lsproto::NoParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::RunGCResponse, GoError> {
-        unported!("pprof.RunGC")
+        crate::pprof::run_gc();
+        self.logger.info("GC triggered");
+        Ok(lsproto::Null)
     }
 
     // Go: server.go:1827 handleSaveHeapProfile
-    // PORT: pprof is not ported.
     pub fn handle_save_heap_profile(
         self: &Rc<Self>,
         _ctx: &Context,
-        _params: Option<&lsproto::ProfileParams>,
+        params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::SaveHeapProfileResponse, GoError> {
-        unported!("pprof.SaveHeapProfile")
+        let file_path = crate::pprof::save_heap_profile(&params.expect(NIL_DEREF).dir)?;
+        self.logger
+            .info(&format!("Heap profile saved to: {file_path}"));
+        Ok(Some(lsproto::ProfileResult { file: file_path }))
     }
 
     // Go: server.go:1836 handleSaveAllocProfile
-    // PORT: pprof is not ported.
     pub fn handle_save_alloc_profile(
         self: &Rc<Self>,
         _ctx: &Context,
-        _params: Option<&lsproto::ProfileParams>,
+        params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::SaveAllocProfileResponse, GoError> {
-        unported!("pprof.SaveAllocProfile")
+        let file_path = crate::pprof::save_alloc_profile(&params.expect(NIL_DEREF).dir)?;
+        self.logger
+            .info(&format!("Allocation profile saved to: {file_path}"));
+        Ok(Some(lsproto::ProfileResult { file: file_path }))
     }
 
     // Go: server.go:1845 handleStartCPUProfile
-    // PORT: pprof is not ported.
     pub fn handle_start_cpu_profile(
         self: &Rc<Self>,
         _ctx: &Context,
-        _params: Option<&lsproto::ProfileParams>,
+        params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::StartCPUProfileResponse, GoError> {
-        unported!("pprof.CPUProfiler.StartCPUProfile")
+        let params = params.expect(NIL_DEREF);
+        self.cpu_profiler.start_cpu_profile(&params.dir)?;
+        self.logger.info(&format!(
+            "CPU profiling started, will save to: {}",
+            params.dir
+        ));
+        Ok(lsproto::Null)
     }
 
     // Go: server.go:1854 handleStopCPUProfile
-    // PORT: pprof is not ported.
     pub fn handle_stop_cpu_profile(
         self: &Rc<Self>,
         _ctx: &Context,
         _params: Option<&lsproto::NoParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::StopCPUProfileResponse, GoError> {
-        unported!("pprof.CPUProfiler.StopCPUProfile")
+        let file_path = self.cpu_profiler.stop_cpu_profile()?;
+        self.logger
+            .info(&format!("CPU profile saved to: {file_path}"));
+        Ok(Some(lsproto::ProfileResult { file: file_path }))
     }
 
     // Go: server.go:1863 handleProjectInfo

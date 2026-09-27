@@ -2,15 +2,19 @@
 //! `src/net/url/encoding_table.go`; identical in go1.26.4): `Parse` for
 //! `lsproto.DocumentUri.FileName`, `PathEscape`, `QueryEscape`,
 //! `PathUnescape` and what they call. Other `net/url` functions are not
-//! ported; a caller that needs one uses `unported!("url.X")`.
+//! ported.
 //!
-//! PORT: Go strings hold any bytes; Rust strings are UTF-8. Escaping only
-//! adds ASCII, so its result is always UTF-8. An unescape whose bytes are
-//! not UTF-8 (for example "%FF") calls `unported!("url.unescape")`.
+//! PORT: Go strings hold any bytes. A port string is the port form of a Go
+//! string (see `scanner_util::GO_STRING_MARKER`). `unescape` and `escape`
+//! read its Go bytes (`go_string_bytes`). A string that `unescape` builds
+//! from bytes, for example "caf\xff" from "caf%FF", is in the value form
+//! (`go_value_from_bytes`), like a file name from the OS. `escape` escapes
+//! every byte that is not ASCII, so its result is ASCII.
 
 use crate::prelude::*;
 
 use crate::gostd::errors::{self, GoError};
+use crate::gostd::netip;
 use crate::gostd::strconv;
 use std::fmt;
 
@@ -132,7 +136,8 @@ pub fn path_unescape(s: &str) -> Result<String, GoError> {
 /// unescape unescapes a string; the mode specifies
 /// which section of the URL string is being unescaped.
 fn unescape(s: &str, mode: Encoding) -> Result<String, GoError> {
-    let b = s.as_bytes();
+    let b = go_string_bytes(s);
+    let b: &[u8] = &b;
     // Count %, check that they're well-formed.
     let mut n = 0;
     let mut has_plus = false;
@@ -213,19 +218,14 @@ fn unescape(s: &str, mode: Encoding) -> Result<String, GoError> {
         }
         i += 1;
     }
-    match String::from_utf8(t) {
-        Ok(t) => Ok(t),
-        Err(_) => unported!("url.unescape"),
-    }
+    Ok(go_string(&t))
 }
 
-// PORT: a Go string made from bytes of a Rust string. A slice that cuts a
-// UTF-8 sequence cannot be a Rust string.
+/// Go `string(b)` for Go bytes `b`, in the value form (see the module
+/// comment). The bytes can hold invalid UTF-8, for example "%\xe6\x97" from
+/// a slice that cuts a character.
 fn go_string(b: &[u8]) -> String {
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_string(),
-        Err(_) => unported!("url.unescape"),
-    }
+    go_value_from_bytes(b).into_owned()
 }
 
 // Go: net/url/url.go:186 QueryEscape
@@ -244,7 +244,8 @@ pub fn path_escape(s: &str) -> String {
 
 // Go: net/url/url.go:196 escape
 fn escape(s: &str, mode: Encoding) -> String {
-    let b = s.as_bytes();
+    let b = go_string_bytes(s);
+    let b: &[u8] = &b;
     let (mut space_count, mut hex_count) = (0, 0);
     for &c in b {
         if should_escape(c, mode) {
@@ -270,7 +271,7 @@ fn escape(s: &str, mode: Encoding) -> String {
                 t[i] = b'+';
             }
         }
-        return String::from_utf8(t).expect("escape keeps UTF-8");
+        return String::from_utf8(t).expect("escape writes ASCII");
     }
 
     let mut j = 0;
@@ -288,7 +289,7 @@ fn escape(s: &str, mode: Encoding) -> String {
             j += 1;
         }
     }
-    String::from_utf8(t).expect("escape keeps UTF-8")
+    String::from_utf8(t).expect("escape writes ASCII")
 }
 
 // Go: net/url/url.go:276 URL
@@ -624,7 +625,7 @@ fn parse_host(scheme: &str, host: &str) -> Result<String, GoError> {
                 vec![],
             ));
         }
-        let _unescaped_colon_port = unescape(colon_port, ENCODE_HOST)?;
+        let unescaped_colon_port = unescape(colon_port, ENCODE_HOST)?;
 
         let hostname = &host[1..close_bracket_idx];
         // RFC 6874 defines that %25 (%-encoded percent) introduces
@@ -633,7 +634,9 @@ fn parse_host(scheme: &str, host: &str) -> Result<String, GoError> {
         // can only %-encode non-ASCII bytes.
         // We do impose some restrictions on the zone, to avoid stupidity
         // like newlines.
-        let _unescaped_hostname = match hostname.find("%25") {
+        // PORT: the zone part starts with the '%' of "%25", so the join
+        // cannot put invalid bytes next to each other.
+        let unescaped_hostname = match hostname.find("%25") {
             Some(zone_idx) => {
                 let host_part = unescape(&hostname[..zone_idx], ENCODE_HOST)?;
                 let zone_part = unescape(&hostname[zone_idx..], ENCODE_ZONE)?;
@@ -645,8 +648,19 @@ fn parse_host(scheme: &str, host: &str) -> Result<String, GoError> {
         // Per RFC 3986, only a host identified by a valid
         // IPv6 address can be enclosed by square brackets.
         // This excludes any IPv4, but notably not IPv4-mapped addresses.
-        // PORT: `netip.ParseAddr` is not ported.
-        unported!("netip.ParseAddr");
+        let addr = match netip::parse_addr(&unescaped_hostname) {
+            Ok(addr) => addr,
+            Err(err) => {
+                return Err(errors::errorf(
+                    format!("invalid host: {}", err.error()),
+                    vec![err],
+                ));
+            }
+        };
+        if addr.is4() {
+            return Err(errors::new("invalid IP-literal"));
+        }
+        return Ok(format!("[{unescaped_hostname}]{unescaped_colon_port}"));
     } else if let Some(i) = host.find(':') {
         let mut i = i;
         let last_colon = host.rfind(':').expect("contains ':'");

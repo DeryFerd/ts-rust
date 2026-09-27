@@ -295,7 +295,7 @@ impl Checker {
             Node::NIL,
             name,
             meaning,
-            diagnostic,
+            diagnostic.map(NameNotFound::Message),
             false, /*isUse*/
             false, /*excludeGlobals*/
         )
@@ -1388,13 +1388,15 @@ impl Checker {
     // computed first (same order), because the name callback and the
     // `compareSymbols` callback both need `&mut self`. The selection result
     // is the same.
+    // PERF: the names are `&'static str` borrows of interned or node text,
+    // so no candidate makes a `String`.
     pub fn get_spelling_suggestion_for_name(
         &mut self,
         name: &str,
         symbols: &[SymbolId],
         meaning: SymbolFlags,
     ) -> SymbolId {
-        let mut named: Vec<(SymbolId, String)> = Vec::with_capacity(symbols.len());
+        let mut named: Vec<(SymbolId, &'static str)> = Vec::with_capacity(symbols.len());
         for &candidate in symbols {
             let candidate_name =
                 self.get_candidate_name_for_spelling_suggestion(candidate, meaning);
@@ -1403,8 +1405,10 @@ impl Checker {
         let (best, _) = get_spelling_suggestion(
             name,
             named,
-            |entry: &(SymbolId, String)| entry.1.clone(),
-            |a: &(SymbolId, String), b: &(SymbolId, String)| self.compare_symbols_worker(a.0, b.0),
+            |entry: &(SymbolId, &'static str)| entry.1,
+            |a: &(SymbolId, &'static str), b: &(SymbolId, &'static str)| {
+                self.compare_symbols_worker(a.0, b.0)
+            },
         );
         best
     }
@@ -1415,15 +1419,27 @@ impl Checker {
         &mut self,
         candidate: SymbolId,
         meaning: SymbolFlags,
-    ) -> String {
-        let candidate_name = symbol_name(&self.symbols, candidate);
+    ) -> &'static str {
+        // PERF: the text of `symbol_name` without its `String` copy. Both
+        // sources (a private identifier's text and the interned symbol name)
+        // live until the process ends.
+        let candidate_name: &'static str = {
+            let s = self.sym(candidate);
+            if s.value_declaration.is_some()
+                && is_private_identifier_class_element_declaration(s.value_declaration)
+            {
+                s.value_declaration.name().text()
+            } else {
+                s.name.as_str()
+            }
+        };
         // PORT: Go compares the first byte with '\xFE', which is
         // INTERNAL_SYMBOL_NAME_PREFIX in the port form.
         if candidate_name.is_empty()
             || candidate_name.starts_with('"')
             || candidate_name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)
         {
-            return String::new();
+            return "";
         }
         if self.sym(candidate).flags.intersects(meaning) {
             return candidate_name;
@@ -1434,7 +1450,7 @@ impl Checker {
                 return candidate_name;
             }
         }
-        String::new()
+        ""
     }
 
     // Go: checker/checker.go:1804 onSuccessfullyResolvedSymbol

@@ -1,6 +1,7 @@
 //! Port of typescript-go `internal/ast/utilities.go` lines 2729-3631.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 
 // Go: ast/utilities.go:2729 IsRequireCall
 pub fn is_require_call(node: Node, require_string_literal_like_argument: bool) -> bool {
@@ -609,6 +610,14 @@ pub fn is_shorthand_property_name_use_site(use_site: Node) -> bool {
 
 // Go: ast/utilities.go:3141 GetPropertyNameForPropertyNameNode
 pub fn get_property_name_for_property_name_node(name: Node) -> String {
+    property_name_text(name).into_owned()
+}
+
+// Go: ast/utilities.go:3141 GetPropertyNameForPropertyNameNode
+// Same logic, but it does not allocate. Node texts are `&'static str`, so
+// only the minus-signed numeric name (`[-1]`) needs a new String. Hot
+// callers (getLiteralTypeFromPropertyName) use this to skip a String per call.
+pub fn property_name_text(name: Node) -> Cow<'static, str> {
     match name.kind() {
         SyntaxKind::Identifier
         | SyntaxKind::PrivateIdentifier
@@ -617,21 +626,21 @@ pub fn get_property_name_for_property_name_node(name: Node) -> String {
         | SyntaxKind::NumericLiteral
         | SyntaxKind::BigIntLiteral
         | SyntaxKind::JsxNamespacedName => {
-            return name.text().to_string();
+            return Cow::Borrowed(name.text());
         }
         SyntaxKind::ComputedPropertyName => {
             let name_expression = name.expression();
             if is_string_or_numeric_literal_like(name_expression) {
-                return name_expression.text().to_string();
+                return Cow::Borrowed(name_expression.text());
             }
             if is_signed_numeric_literal(name_expression) {
-                let mut text = name_expression.operand().text().to_string();
+                let text = name_expression.operand().text();
                 if name_expression.operator() == SyntaxKind::MinusToken {
-                    text = format!("-{text}");
+                    return Cow::Owned(format!("-{text}"));
                 }
-                return text;
+                return Cow::Borrowed(text);
             }
-            return INTERNAL_SYMBOL_NAME_MISSING.to_string();
+            return Cow::Borrowed(INTERNAL_SYMBOL_NAME_MISSING);
         }
         _ => {}
     }

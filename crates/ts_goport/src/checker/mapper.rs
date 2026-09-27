@@ -247,6 +247,13 @@ pub struct InferenceTypeMapper {
 
 impl Checker {
     /// Pushes a mapper into the arena. Go allocates with `&XxxTypeMapper{}`.
+    ///
+    /// PERF: this and the small `new_*_type_mapper` constructors that call it
+    /// are `inline(always)`, with the arena push, so the `TypeMapper` is built
+    /// once in its arena slot. Out of line (a plain `#[inline]` hint was not
+    /// taken), the 64-byte `TypeMapper` went through the stack, and most of
+    /// this function's time was the reload of that copy.
+    #[inline(always)]
     pub fn alloc_type_mapper(&mut self, data: TypeMapper) -> MapperId {
         let id = MapperId(u32::try_from(self.mappers.len()).expect("mapper overflow"));
         self.mappers.push(data);
@@ -420,6 +427,7 @@ impl Checker {
     }
 
     // Go: checker/mapper.go:100 newSimpleTypeMapper
+    #[inline(always)]
     pub fn new_simple_type_mapper(&mut self, source: TypeId, target: TypeId) -> MapperId {
         // Go: checker/mapper.go:119 (*SimpleTypeMapper).MapsThisOnly
         let maps_this_only = self.is_this_type_parameter(source);
@@ -439,6 +447,7 @@ impl Checker {
 
     /// `new_array_type_mapper` over lists that are already shared, so the
     /// mapper keeps them without a copy, like Go keeps the slices.
+    #[inline(always)]
     pub fn new_array_type_mapper_shared(
         &mut self,
         sources: SharedList<TypeId>,
@@ -454,6 +463,7 @@ impl Checker {
     }
 
     // Go: checker/mapper.go:160 newArrayToSingleTypeMapper
+    #[inline(always)]
     pub fn new_array_to_single_type_mapper(
         &mut self,
         sources: &[TypeId],

@@ -6,14 +6,17 @@
 //!
 //! PORT: x/text is ported only as far as tsgo reaches it. tsgo parses a
 //! `--locale` value with `language.Parse` and matches the result against its
-//! fixed list of shipped locales. Left out: `Compose`, `Builder`,
-//! `SetTypeForKey`, `Parent`, `Extensions`, the Accept-Language parser,
-//! coverage, match options, and the part of `Match` that adjusts the matched
-//! tag (tsgo drops the tag and reads only the index and the confidence).
+//! fixed list of shipped locales. `gostd::collate` (organize imports) also
+//! needs `Compose`, `Builder`, `TypeForKey`, `SetTypeForKey`, `Parent`,
+//! `Extensions`, `Base` and the compact tags. Left out: the Accept-Language
+//! parser, coverage, match options, and the part of `Match` that adjusts the
+//! matched tag (tsgo drops the tag and reads only the index and the
+//! confidence).
 //!
 //! PORT: Go `language.Tag` is a `compact.Tag`: common tags are stored as an
 //! index, and other tags keep the full `internal/language.Tag`. The compact
-//! form is not ported; `language::Tag` is the full tag. `compact.Make`
+//! form is ported (`compact`) but only `gostd::collate` uses it (through
+//! `language::make_tag`); elsewhere `language::Tag` is the full tag. `compact.Make`
 //! followed by `(*compact.Tag).Tag` gives back the same language, script,
 //! region and variants, which is all that the matcher reads. A tag equals
 //! Go `language.Und` exactly when it equals `Tag::UND`. Only the tag text can
@@ -116,7 +119,104 @@ pub mod language {
 
     // Go: language/language.go:24 makeTag
     // Go: language/language.go:28 (*Tag).tag
-    // PORT: identity; see the module note on `compact.Tag`.
+    /// Go `makeTag(t).tag()`: the full tag of the compact tag that Go keeps
+    /// for t. It equals t except that a `-u-rg-` extension that names the
+    /// tag's own region is dropped.
+    /// PORT: most of the port keeps a public tag as its full tag and skips
+    /// this step (see the module note). `gostd::collate` calls it where Go
+    /// makes a tag, so that tag equality matches Go's compact `==`.
+    pub fn make_tag(t: &Tag) -> Tag {
+        super::compact::make(t).tag()
+    }
+
+    // Go: language/parse.go:107 update (the part types)
+    /// PORT: Go `Compose` takes `...interface{}`. These are the part types
+    /// that the port passes.
+    pub enum ComposePart<'a> {
+        Tag(&'a Tag),
+        Base(Language),
+        Script(Script),
+        Region(Region),
+        /// Go `[]Extension`
+        Extensions(&'a [String]),
+    }
+
+    // Go: language/parse.go:89 (CanonType).Compose
+    /// Compose creates a Tag from individual parts, which may be of type Tag, Base,
+    /// Script, Region, Variant, []Variant, Extension, []Extension or error. If a
+    /// Base, Script or Region or slice of type Variant or Extension is passed more
+    /// than once, the latter will overwrite the former. Variants and Extensions are
+    /// accumulated, but if two extensions of the same type are passed, the latter
+    /// will replace the former. For -u extensions, though, the key-type pairs are
+    /// added, where later values overwrite older ones. A Tag overwrites all former
+    /// values and typically only makes sense as the first argument. The resulting
+    /// tag is returned after canonicalizing using CanonType c. If one or more errors
+    /// are encountered, one of the errors is returned.
+    /// PORT: no part type the port passes gives an error, so none is returned.
+    pub fn compose(c: CanonType, parts: &[ComposePart<'_>]) -> Tag {
+        let mut b = il::Builder::default();
+        // Go: language/parse.go:107 update
+        for x in parts {
+            match x {
+                ComposePart::Tag(v) => b.set_tag(v),
+                ComposePart::Base(v) => b.tag.lang_id = *v,
+                ComposePart::Script(v) => b.tag.script_id = *v,
+                // TODO: if range region is not a specific region (such as 001), use
+                // the default region.
+                ComposePart::Region(v) => b.tag.region_id = *v,
+                ComposePart::Extensions(v) => {
+                    b.clear_extensions();
+                    for e in *v {
+                        b.add_ext(e);
+                    }
+                }
+            }
+        }
+        (b.tag, _) = canonicalize(c, b.tag.clone());
+        make_tag(&b.make())
+    }
+
+    // Go: language/language.go:246 (Tag).Base
+    /// Base returns the base language of the language tag. If the base language is
+    /// unspecified, an attempt will be made to infer it from the context.
+    /// It uses a variant of CLDR's Add Likely Subtags algorithm. This is subject to change.
+    pub fn tag_base(t: &Tag) -> (Language, Confidence) {
+        if t.lang_id.0 != 0 {
+            return (t.lang_id, Confidence::Exact);
+        }
+        let mut c = Confidence::High;
+        if t.script_id.0 == 0 && !t.region_id.is_country() {
+            c = Confidence::Low;
+        }
+        let (tag, err) = t.maximize();
+        if err.is_none() && tag.lang_id.0 != 0 {
+            return (tag.lang_id, c);
+        }
+        (Language(0), Confidence::No)
+    }
+
+    // Go: language/language.go:343 (Tag).Parent
+    /// Parent returns the CLDR parent of t. In CLDR, missing fields in data for a
+    /// specific language are substituted with fields from the parent language.
+    /// The parent for a language may change for newer versions of CLDR.
+    ///
+    /// Parent returns a tag for a less specific language that is mutually
+    /// intelligible or Und if there is no such language. This may not be the same
+    /// as simply stripping the last BCP 47 subtag. For instance, the parent of
+    /// "zh-TW" is "zh-Hant", and the parent of "zh-Hant" is "und".
+    pub fn tag_parent(t: &Tag) -> Tag {
+        super::compact::make(t).parent().tag()
+    }
+
+    // Go: language/language.go:432 (Tag).SetTypeForKey
+    /// SetTypeForKey returns a new Tag with the key set to type, where key and type
+    /// are of the allowed values defined for the Unicode locale extension ('u') in
+    /// https://www.unicode.org/reports/tr35/#Unicode_Language_and_Locale_Identifiers.
+    /// An empty value removes an existing pair with the same key.
+    pub fn set_type_for_key(t: &Tag, key: &str, value: &str) -> (Tag, Option<Error>) {
+        let (tt, err) = t.set_type_for_key(key, value);
+        (make_tag(&tt), err)
+    }
 
     // Go: language/language.go:119 canonicalize
     /// canonicalize returns the canonicalized equivalent of the tag and
@@ -1060,6 +1160,10 @@ pub mod internal_language {
         Value(ValueError),
         /// Go `ErrMissingLikelyTagsData`.
         MissingLikelyTagsData,
+        /// Go `errPrivateUse` (`SetTypeForKey` on a private use tag).
+        PrivateUse,
+        /// Go `errInvalidArguments` (`SetTypeForKey`).
+        InvalidArguments,
     }
 
     impl Error {
@@ -1072,6 +1176,8 @@ pub mod internal_language {
                 }
                 Error::Value(e) => e.error(),
                 Error::MissingLikelyTagsData => "missing likely tags data".to_string(),
+                Error::PrivateUse => "cannot set a key on a private use tag".to_string(),
+                Error::InvalidArguments => "invalid key or type".to_string(),
             }
         }
     }
@@ -1278,6 +1384,598 @@ pub mod internal_language {
         pub fn maximize(&self) -> (Tag, Option<Error>) {
             add_tags(self.clone())
         }
+
+        // Go: internal/language/language.go:84 (Tag).Raw
+        /// Raw returns the raw base language, script and region, without making an
+        /// attempt to infer their values.
+        pub fn raw(&self) -> (Language, Script, Region) {
+            (self.lang_id, self.script_id, self.region_id)
+        }
+
+        // Go: internal/language/language.go:174 (Tag).Variants
+        /// Variants returns the part of the tag holding all variants or the empty string
+        /// if there are no variants defined.
+        pub fn variants(&self) -> &str {
+            if self.p_variant == 0 {
+                return "";
+            }
+            &self.str[usize::from(self.p_variant)..usize::from(self.p_ext)]
+        }
+
+        // Go: internal/language/language.go:191 (Tag).HasString
+        /// HasString reports whether this tag defines more than just the raw
+        /// components.
+        pub fn has_string(&self) -> bool {
+            !self.str.is_empty()
+        }
+
+        // Go: internal/language/language.go:198 (Tag).Parent
+        /// Parent returns the CLDR parent of t. In CLDR, missing fields in data for a
+        /// specific language are substituted with fields from the parent language.
+        /// The parent for a language may change for newer versions of CLDR.
+        pub fn parent(&self) -> Tag {
+            if !self.str.is_empty() {
+                // Strip the variants and extensions.
+                let (b, s, r) = self.raw();
+                let t = Tag {
+                    lang_id: b,
+                    script_id: s,
+                    region_id: r,
+                    ..Tag::UND
+                };
+                if t.region_id.0 == 0 && t.script_id.0 != 0 && t.lang_id.0 != 0 {
+                    let (base, _) = add_tags(Tag {
+                        lang_id: t.lang_id,
+                        ..Tag::UND
+                    });
+                    if base.script_id == t.script_id {
+                        return Tag {
+                            lang_id: t.lang_id,
+                            ..Tag::UND
+                        };
+                    }
+                }
+                return t;
+            }
+            if self.lang_id.0 != 0 {
+                if self.region_id.0 != 0 {
+                    let mut max_script = self.script_id;
+                    if max_script.0 == 0 {
+                        let (max, _) = add_tags(self.clone());
+                        max_script = max.script_id;
+                    }
+
+                    for p in &PARENTS {
+                        if Language(p.lang) == self.lang_id && Script(p.max_script) == max_script {
+                            for &r in p.from_region {
+                                if Region(r) == self.region_id {
+                                    return Tag {
+                                        lang_id: self.lang_id,
+                                        script_id: Script(p.script),
+                                        region_id: Region(p.to_region),
+                                        ..Tag::UND
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    // Strip the script if it is the default one.
+                    let (base, _) = add_tags(Tag {
+                        lang_id: self.lang_id,
+                        ..Tag::UND
+                    });
+                    if base.script_id != max_script {
+                        return Tag {
+                            lang_id: self.lang_id,
+                            script_id: max_script,
+                            ..Tag::UND
+                        };
+                    }
+                    return Tag {
+                        lang_id: self.lang_id,
+                        ..Tag::UND
+                    };
+                } else if self.script_id.0 != 0 {
+                    // The parent for an base-script pair with a non-default script is
+                    // "und" instead of the base language.
+                    let (base, _) = add_tags(Tag {
+                        lang_id: self.lang_id,
+                        ..Tag::UND
+                    });
+                    if base.script_id != self.script_id {
+                        return Tag::UND;
+                    }
+                    return Tag {
+                        lang_id: self.lang_id,
+                        ..Tag::UND
+                    };
+                }
+            }
+            Tag::UND
+        }
+
+        // Go: internal/language/language.go:275 (Tag).HasVariants
+        /// HasVariants reports whether t has variants.
+        pub fn has_variants(&self) -> bool {
+            u16::from(self.p_variant) < self.p_ext
+        }
+
+        // Go: internal/language/language.go:280 (Tag).HasExtensions
+        /// HasExtensions reports whether t has extensions.
+        pub fn has_extensions(&self) -> bool {
+            usize::from(self.p_ext) < self.str.len()
+        }
+
+        // Go: internal/language/language.go:287 (Tag).Extension
+        /// Extension returns the extension of type x for tag t. It will return
+        /// false for ok if t does not have the requested extension. The returned
+        /// extension will be invalid in this case.
+        pub fn extension(&self, x: u8) -> Option<&str> {
+            let mut i = usize::from(self.p_ext);
+            while i + 1 < self.str.len() {
+                let ext;
+                (i, ext) = get_extension(&self.str, i);
+                if ext.as_bytes()[0] == x {
+                    return Some(ext);
+                }
+            }
+            None
+        }
+
+        // Go: internal/language/language.go:299 (Tag).Extensions
+        /// Extensions returns all extensions of t.
+        pub fn extensions(&self) -> Vec<String> {
+            let mut e = Vec::new();
+            let mut i = usize::from(self.p_ext);
+            while i + 1 < self.str.len() {
+                let ext;
+                (i, ext) = get_extension(&self.str, i);
+                e.push(ext.to_string());
+            }
+            e
+        }
+
+        // Go: internal/language/language.go:317 (Tag).TypeForKey
+        /// TypeForKey returns the type associated with the given key, where key and type
+        /// are of the allowed values defined for the Unicode locale extension ('u') in
+        /// https://www.unicode.org/reports/tr35/#Unicode_Language_and_Locale_Identifiers.
+        /// TypeForKey will traverse the inheritance chain to get the correct value.
+        ///
+        /// If there are multiple types associated with a key, only the first will be
+        /// returned. If there is no type associated with a key, it returns the empty
+        /// string.
+        pub fn type_for_key(&self, key: &str) -> String {
+            let (_, start, end, _) = self.find_type_for_key(key);
+            if end != start {
+                let mut s = &self.str[start..end];
+                if let Some(p) = s.find('-') {
+                    s = &s[..p];
+                }
+                return s.to_string();
+            }
+            String::new()
+        }
+
+        // Go: internal/language/language.go:337 (Tag).SetTypeForKey
+        /// SetTypeForKey returns a new Tag with the key set to type, where key and type
+        /// are of the allowed values defined for the Unicode locale extension ('u') in
+        /// https://www.unicode.org/reports/tr35/#Unicode_Language_and_Locale_Identifiers.
+        /// An empty value removes an existing pair with the same key.
+        pub fn set_type_for_key(&self, key: &str, value: &str) -> (Tag, Option<Error>) {
+            let mut t = self.clone();
+            if t.is_private_use() {
+                return (t, Some(Error::PrivateUse));
+            }
+            if key.len() != 2 {
+                return (t, Some(Error::InvalidArguments));
+            }
+
+            // Remove the setting if value is "".
+            if value.is_empty() {
+                let (mut start, sep, end, _) = t.find_type_for_key(key);
+                if start != sep {
+                    // Remove a possible empty extension.
+                    let sb = t.str.as_bytes();
+                    if sb[start - 2] != b'-' {
+                        // has previous elements.
+                    } else if end == sb.len() // end of string
+                        || (end + 2 < sb.len() && sb[end + 2] == b'-')
+                    {
+                        // end of extension
+                        start -= 2;
+                    }
+                    if start == usize::from(t.p_variant) && end == t.str.len() {
+                        t.str = String::new();
+                        t.p_variant = 0;
+                        t.p_ext = 0;
+                    } else {
+                        t.str = format!("{}{}", &t.str[..start], &t.str[end..]);
+                    }
+                }
+                return (t, None);
+            }
+
+            if value.len() < 3 || value.len() > 8 {
+                return (t, Some(Error::InvalidArguments));
+            }
+
+            // Generate the tag string if needed.
+            // PORT: Go builds the string in a fixed buffer; `buf` is its used
+            // part.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut u_start = 0; // start of the -u extension.
+            if t.str.is_empty() {
+                buf = t.gen_core_bytes();
+                u_start = buf.len();
+                buf.push(b'-');
+                u_start += 1;
+            }
+
+            // Create new key-type pair and parse it to verify.
+            let mut b = b"u-".to_vec();
+            b.extend_from_slice(key.as_bytes());
+            b.push(b'-');
+            b.extend_from_slice(value.as_bytes());
+            let mut scan = make_scanner(b);
+            match parse_extensions(&mut scan) {
+                Ok(_) => {}
+                // PORT: Go panics here and nothing recovers it; the key and
+                // value are checked above, so the parser does not panic.
+                Err(GoPanic) => panic!("language: SetTypeForKey parse panicked"),
+            }
+            if scan.err.is_some() {
+                return (t, scan.err);
+            }
+            // PORT: Go reads `b` again, which shares its bytes with the
+            // scanner; for one key-type pair `parseExtensions` keeps them in
+            // place.
+            let b = scan.buf[..scan.n].to_vec();
+
+            // Assemble the replacement string.
+            if t.str.is_empty() {
+                t.p_variant = (u_start - 1) as u8;
+                t.p_ext = (u_start - 1) as u16;
+                buf.extend_from_slice(&b);
+                t.str = String::from_utf8_lossy(&buf).into_owned();
+            } else {
+                let s = t.str.clone();
+                let (start, sep, end, has_ext) = t.find_type_for_key(key);
+                if start == sep {
+                    let b = if has_ext { &b[2..] } else { &b[..] };
+                    t.str = format!("{}-{}{}", &s[..sep], String::from_utf8_lossy(b), &s[end..]);
+                } else {
+                    t.str = format!("{}-{}{}", &s[..start + 3], value, &s[end..]);
+                }
+            }
+            (t, None)
+        }
+
+        // Go: internal/language/language.go:417 (Tag).findTypeForKey
+        /// findTypeForKey returns the start and end position for the type corresponding
+        /// to key or the point at which to insert the key-value pair if the type
+        /// wasn't found. The hasExt return value reports whether an -u extension was present.
+        /// Note: the extensions are typically very small and are likely to contain
+        /// only one key-type pair.
+        fn find_type_for_key(&self, key: &str) -> (usize, usize, usize, bool) {
+            let mut p = usize::from(self.p_ext);
+            if key.len() != 2 || p == self.str.len() || p == 0 {
+                return (p, p, p, false);
+            }
+            let s = self.str.as_bytes();
+
+            // Find the correct extension.
+            p += 1;
+            while s[p] != b'u' {
+                if s[p] > b'u' {
+                    p -= 1;
+                    return (p, p, p, false);
+                }
+                p = next_extension(&self.str, p);
+                if p == s.len() {
+                    return (s.len(), s.len(), s.len(), false);
+                }
+                p += 1;
+            }
+            // Proceed to the hyphen following the extension name.
+            p += 1;
+
+            // curKey is the key currently being processed.
+            let mut cur_key: &[u8] = b"";
+            let (mut start, mut sep) = (0, 0);
+
+            // Iterate over keys until we get the end of a section.
+            loop {
+                let end = p;
+                p += 1;
+                while p < s.len() && s[p] != b'-' {
+                    p += 1;
+                }
+                let n = p - end - 1;
+                if n <= 2 && cur_key == key.as_bytes() {
+                    if sep < end {
+                        sep += 1;
+                    }
+                    return (start, sep, end, true);
+                }
+                match n {
+                    // invalid string, next extension
+                    0 | 1 => return (end, end, end, true),
+                    2 => {
+                        // next key
+                        cur_key = &s[end + 1..p];
+                        if cur_key > key.as_bytes() {
+                            return (end, end, end, true);
+                        }
+                        start = end;
+                        sep = p;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Go: internal/language/language.go:513 ParseRegion
+    /// ParseRegion parses a 2- or 3-letter ISO 3166-1 or a UN M.49 code.
+    /// It returns a ValueError if s is a well-formed but unknown region identifier
+    /// or another error if another error occurred.
+    pub fn parse_region(s: &str) -> (Region, Option<Error>) {
+        let n = s.len();
+        if !(2..=3).contains(&n) {
+            return (Region(0), Some(Error::Syntax));
+        }
+        let mut buf = s.as_bytes().to_vec();
+        match get_region_id(&mut buf) {
+            Ok(r) => r,
+            // Go recovers a panic here and returns ErrSyntax.
+            Err(GoPanic) => (Region(0), Some(Error::Syntax)),
+        }
+    }
+
+    impl Region {
+        // Go: internal/language/language.go:530 (Region).IsCountry
+        /// IsCountry returns whether this region is a country or autonomous area. This
+        /// includes non-standard definitions from CLDR.
+        pub fn is_country(self) -> bool {
+            if self.0 == 0 || self.is_group() || (self.is_private_use() && self.0 != _XK) {
+                return false;
+            }
+            true
+        }
+
+        // Go: internal/language/language.go:539 (Region).IsGroup
+        /// IsGroup returns whether this region defines a collection of regions. This
+        /// includes non-standard definitions from CLDR.
+        pub fn is_group(self) -> bool {
+            if self.0 == 0 {
+                return false;
+            }
+            usize::from(REGION_INCLUSION[usize::from(self.0)]) < REGION_CONTAINMENT.len()
+        }
+
+        // Go: internal/language/lookup.go:327 (Region).IsPrivateUse
+        /// IsPrivateUse reports whether r has the ISO 3166 User-assigned status. This
+        /// may include private-use tags that are assigned by CLDR and used in this
+        /// implementation. So IsPrivateUse and IsCountry can be simultaneously true.
+        pub fn is_private_use(self) -> bool {
+            // Go: lookup.go:278 iso3166UserAssigned = 1 << iota
+            const ISO3166_USER_ASSIGNED: u8 = 1 << 0;
+            REGION_TYPES[usize::from(self.0)] & ISO3166_USER_ASSIGNED != 0
+        }
+    }
+
+    // Go: internal/language/parse.go:581 getExtension
+    /// getExtension returns the name, body and end position of the extension.
+    pub(super) fn get_extension(s: &str, mut p: usize) -> (usize, &str) {
+        let b = s.as_bytes();
+        if b[p] == b'-' {
+            p += 1;
+        }
+        if b[p] == b'x' {
+            return (s.len(), &s[p..]);
+        }
+        let end = next_extension(s, p);
+        (end, &s[p..end])
+    }
+
+    // Go: internal/language/parse.go:596 nextExtension
+    /// nextExtension finds the next extension within the string, searching
+    /// for the -<char>- pattern from position p.
+    /// In the fast majority of cases, language tags will have at most
+    /// one extension and extensions tend to be small.
+    pub(super) fn next_extension(s: &str, mut p: usize) -> usize {
+        let b = s.as_bytes();
+        let n = b.len().saturating_sub(3);
+        while p < n {
+            if b[p] == b'-' {
+                if b[p + 2] == b'-' {
+                    return p;
+                }
+                p += 3;
+            } else {
+                p += 1;
+            }
+        }
+        s.len()
+    }
+
+    // Go: internal/language/compose.go:13 Builder
+    /// A Builder allows constructing a Tag from individual components.
+    /// Its main user is Compose in the top-level language package.
+    #[derive(Clone, Debug, Default)]
+    pub struct Builder {
+        pub tag: Tag,
+
+        /// the x extension
+        private: String,
+        variants: Vec<String>,
+        extensions: Vec<String>,
+    }
+
+    impl Builder {
+        // Go: internal/language/compose.go:23 (*Builder).Make
+        /// Make returns a new Tag from the current settings.
+        pub fn make(&mut self) -> Tag {
+            let mut t = self.tag.clone();
+
+            if !self.extensions.is_empty() || !self.variants.is_empty() {
+                // Go: sort.Sort(sortVariants(b.variants)) (an insertion sort
+                // for 12 or fewer elements, so stable).
+                self.variants.sort_by_key(|v| variant_index(v));
+                self.extensions.sort();
+
+                if !self.private.is_empty() {
+                    self.extensions.push(self.private.clone());
+                }
+                let mut buf = t.gen_core_bytes();
+                let p = buf.len();
+                t.p_variant = p as u8;
+                append_tokens(&mut buf, &self.variants);
+                t.p_ext = buf.len() as u16;
+                append_tokens(&mut buf, &self.extensions);
+                t.str = String::from_utf8_lossy(&buf).into_owned();
+                // We may not always need to remake the string, but when or when not
+                // to do so is rather tricky.
+                let mut scan = make_scanner(buf);
+                return match parse_inner(&mut scan, "") {
+                    Ok((t, _)) => t,
+                    // PORT: Go panics here; `Compose` recovers it and
+                    // returns `(und, ErrSyntax)`. The tokens come from a
+                    // parsed tag, so the parser does not panic.
+                    Err(GoPanic) => panic!("language: Builder.Make parse panicked"),
+                };
+            } else if !self.private.is_empty() {
+                t.str = self.private.clone();
+                t.remake_string();
+            }
+            t
+        }
+
+        // Go: internal/language/compose.go:55 (*Builder).SetTag
+        /// SetTag copies all the settings from a given Tag. Any previously set values
+        /// are discarded.
+        pub fn set_tag(&mut self, t: &Tag) {
+            self.tag.lang_id = t.lang_id;
+            self.tag.region_id = t.region_id;
+            self.tag.script_id = t.script_id;
+            // TODO: optimize
+            self.variants.clear();
+            let variants = t.variants();
+            if !variants.is_empty() {
+                for vr in variants[1..].split('-') {
+                    self.variants.push(vr.to_string());
+                }
+            }
+            self.extensions.clear();
+            self.private.clear();
+            for e in t.extensions() {
+                self.add_ext(&e);
+            }
+        }
+
+        // Go: internal/language/compose.go:75 (*Builder).AddExt
+        /// AddExt adds extension e to the tag. e must be a valid extension as returned
+        /// by Tag.Extension. If the extension already exists, it will be discarded,
+        /// except for a -u extension, where non-existing key-type pairs will added.
+        pub fn add_ext(&mut self, e: &str) {
+            let e0 = e.as_bytes()[0];
+            if e0 == b'x' {
+                if self.private.is_empty() {
+                    self.private = e.to_string();
+                }
+                return;
+            }
+            for s in &mut self.extensions {
+                if s.as_bytes()[0] == e0 {
+                    if e0 == b'u' {
+                        s.push_str(&e[1..]);
+                    }
+                    return;
+                }
+            }
+            self.extensions.push(e.to_string());
+        }
+
+        // Go: internal/language/compose.go:115 (*Builder).AddVariant
+        /// AddVariant adds any number of variants.
+        pub fn add_variant(&mut self, v: &[&str]) {
+            for v in v {
+                if !v.is_empty() {
+                    self.variants.push((*v).to_string());
+                }
+            }
+        }
+
+        // Go: internal/language/compose.go:125 (*Builder).ClearVariants
+        /// ClearVariants removes any variants previously added, including those
+        /// copied from a Tag in SetTag.
+        pub fn clear_variants(&mut self) {
+            self.variants.clear();
+        }
+
+        // Go: internal/language/compose.go:131 (*Builder).ClearExtensions
+        /// ClearExtensions removes any extensions previously added, including those
+        /// copied from a Tag in SetTag.
+        pub fn clear_extensions(&mut self) {
+            self.private.clear();
+            self.extensions.clear();
+        }
+    }
+
+    // Go: internal/language/compose.go:144 appendTokens
+    // PORT: appends to `buf` instead of writing into a sized buffer.
+    fn append_tokens(buf: &mut Vec<u8>, token: &[String]) {
+        for t in token {
+            buf.push(b'-');
+            buf.extend_from_slice(t.as_bytes());
+        }
+    }
+
+    /// Go `variantIndex[s]` (the zero value for a missing key).
+    fn variant_index(s: &str) -> u8 {
+        VARIANT_INDEX
+            .binary_search_by(|(key, _)| (*key).cmp(s))
+            .map_or(0, |k| VARIANT_INDEX[k].1)
+    }
+
+    // Go: internal/language/compact.go:8 CompactCoreInfo
+    /// CompactCoreInfo is a compact integer with the three core tags encoded.
+    pub type CompactCoreInfo = u32;
+
+    // Go: internal/language/compact.go:12 GetCompactCore
+    /// GetCompactCore generates a uint32 value that is guaranteed to be unique for
+    /// different language, region, and script values.
+    pub fn get_compact_core(t: &Tag) -> Option<CompactCoreInfo> {
+        if t.lang_id.0 > LANG_NO_INDEX_OFFSET {
+            return None;
+        }
+        let mut cci = u32::from(t.lang_id.0) << (8 + 12);
+        cci |= u32::from(t.script_id.0) << 12;
+        cci |= u32::from(t.region_id.0);
+        Some(cci)
+    }
+
+    // Go: internal/language/compact.go:24 (CompactCoreInfo).Tag
+    /// Tag generates a tag from c.
+    pub fn compact_core_tag(c: CompactCoreInfo) -> Tag {
+        Tag {
+            lang_id: Language((c >> 20) as u16),
+            region_id: Region((c & 0x3ff) as u16),
+            script_id: Script(((c >> 12) & 0xff) as u16),
+            ..Tag::UND
+        }
+    }
+
+    // Go: internal/language/language.go:55 MustParse
+    /// MustParse is like Parse, but panics if the given BCP 47 tag cannot be
+    /// parsed.
+    pub fn must_parse(s: &str) -> Tag {
+        let (t, err) = parse(s);
+        if let Some(err) = err {
+            panic!("{}", err.error());
+        }
+        t
     }
 
     // Go: internal/language/language.go:60 Make
@@ -1860,6 +2558,26 @@ pub mod internal_language {
         done: bool,
     }
 
+    // Go: internal/language/parse.go:98 makeScanner
+    /// makeScanner returns a scanner using b as the input buffer.
+    /// b is not copied and may be modified by the scanner routines.
+    fn make_scanner(b: Vec<u8>) -> Scanner {
+        let n = b.len();
+        let mut scan = Scanner {
+            buf: b,
+            n,
+            tok_start: 0,
+            tok_len: 0,
+            start: 0,
+            end: 0,
+            next: 0,
+            err: None,
+            done: false,
+        };
+        scan.init();
+        scan
+    }
+
     // Go: internal/language/parse.go:83 makeScannerString
     fn make_scanner_string(s: &str) -> Scanner {
         let mut scan = Scanner {
@@ -2431,6 +3149,220 @@ pub mod internal_language {
         let m = src.len().min(scan.n - p);
         scan.buf[p..p + m].copy_from_slice(&src[..m]);
         Ok(())
+    }
+}
+
+/// Go: `golang.org/x/text/internal/language/compact` (compact.go,
+/// language.go): the compact form of a `language.Tag`.
+/// PORT: the rest of the port keeps a public `language.Tag` as its full
+/// `internal/language.Tag` (see the module note). `gostd::collate` needs the
+/// compact form where Go's result depends on it: tag equality (`==` on
+/// compact tags) and `Tag.Parent`, which maps a tag with a compact index to
+/// the nearest compact tag.
+pub mod compact {
+    use super::internal_language::{self as il, Tag};
+    use super::tables::{CORE_TAGS, SPECIAL_TAGS_STR};
+    use std::sync::LazyLock;
+
+    // Go: internal/language/compact/compact.go:23 ID
+    /// ID is an integer identifying a single tag.
+    pub type Id = u16;
+
+    // Go: internal/language/compact/language.go:21 Tag
+    /// Tag represents a BCP 47 language tag. It is used to specify an instance of a
+    /// specific language or locale. All language tag values are guaranteed to be
+    /// well-formed.
+    /// PORT: Go `full fullTag` (an interface that always holds a
+    /// `language.Tag`) is `Option<Tag>`. Go compares the interface by the
+    /// dynamic value, as `PartialEq` does here.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct CompactTag {
+        language: Id,
+        locale: Id,
+        full: Option<Tag>,
+    }
+
+    // Go: internal/language/compact/language.go:29 _und
+    const UND: Id = 0;
+
+    // Go: internal/language/compact/compact.go:53 specialTags
+    static SPECIAL_TAGS: LazyLock<Vec<Tag>> =
+        LazyLock::new(|| SPECIAL_TAGS_STR.split(' ').map(il::must_parse).collect());
+
+    // Go: internal/language/compact/compact.go:26 getCoreIndex
+    fn get_core_index(t: &Tag) -> Option<Id> {
+        let cci = il::get_compact_core(t)?;
+        let i = CORE_TAGS.partition_point(|&c| c < cci);
+        if i == CORE_TAGS.len() || CORE_TAGS[i] != cci {
+            return None;
+        }
+        Some(i as Id)
+    }
+
+    // Go: internal/language/compact/compact.go:46 (ID).Tag
+    /// Tag converts id to an internal language Tag.
+    fn id_tag(id: Id) -> Tag {
+        let id = usize::from(id);
+        if id >= CORE_TAGS.len() {
+            return SPECIAL_TAGS[id - CORE_TAGS.len()].clone();
+        }
+        il::compact_core_tag(CORE_TAGS[id])
+    }
+
+    // Go: internal/language/compact/language.go:37 Make
+    /// Make a compact Tag from a fully specified internal language Tag.
+    pub fn make(t: &Tag) -> CompactTag {
+        let region = t.type_for_key("rg");
+        if region.len() == 6 && &region[2..] == "zzzz" {
+            let (r, err) = il::parse_region(&region[..2]);
+            if err.is_none() {
+                let t_full = t.clone();
+                let (mut t, _) = t.set_type_for_key("rg", "");
+                // TODO: should we not consider "va" for the language tag?
+                let (language, exact1) = from_tag(&t);
+                t.region_id = r;
+                let (locale, exact2) = from_tag(&t);
+                return CompactTag {
+                    language,
+                    locale,
+                    full: (!exact1 || !exact2).then_some(t_full),
+                };
+            }
+        }
+        let (lang, ok) = from_tag(t);
+        CompactTag {
+            language: lang,
+            locale: lang,
+            full: (!ok).then(|| t.clone()),
+        }
+    }
+
+    impl CompactTag {
+        // Go: internal/language/compact/language.go:63 (Tag).Tag
+        /// Tag returns an internal language Tag version of this tag.
+        pub fn tag(&self) -> Tag {
+            if let Some(full) = &self.full {
+                return full.clone();
+            }
+            let mut tag = id_tag(self.language);
+            if self.language != self.locale {
+                let loc = id_tag(self.locale);
+                (tag, _) =
+                    tag.set_type_for_key("rg", &(loc.region_id.string().to_lowercase() + "zzzz"));
+            }
+            tag
+        }
+
+        // Go: internal/language/compact/language.go:105 (Tag).Parent
+        /// Parent returns the CLDR parent of t. In CLDR, missing fields in data for a
+        /// specific language are substituted with fields from the parent language.
+        /// The parent for a language may change for newer versions of CLDR.
+        pub fn parent(&self) -> CompactTag {
+            if let Some(full) = &self.full {
+                return make(&full.parent());
+            }
+            if self.language != self.locale {
+                // Simulate stripping -u-rg-xxxxxx
+                return CompactTag {
+                    language: self.language,
+                    locale: self.language,
+                    full: None,
+                };
+            }
+            // TODO: use parent lookup table once cycle from internal package is
+            // removed. Probably by internalizing the table and declaring this fast
+            // enough.
+            // lang := compactID(internal.Parent(uint16(t.language)))
+            let (lang, _) = from_tag(&id_tag(self.language).parent());
+            CompactTag {
+                language: lang,
+                locale: lang,
+                full: None,
+            }
+        }
+    }
+
+    // Go: internal/language/compact/language.go:192 FromTag
+    /// FromTag reports closest matching ID for an internal language Tag.
+    pub fn from_tag(t: &Tag) -> (Id, bool) {
+        // TODO: perhaps give more frequent tags a lower index.
+        // TODO: we could make the indexes stable. This will excluded some
+        //       possibilities for optimization, so don't do this quite yet.
+        let mut exact = true;
+
+        let (b, s, r) = t.raw();
+        let mut t = t.clone();
+        if t.has_string() {
+            if t.is_private_use() {
+                // We have no entries for user-defined tags.
+                return (0, false);
+            }
+            let mut has_extra = false;
+            if t.has_variants() {
+                if t.has_extensions() {
+                    let mut build = il::Builder::default();
+                    build.set_tag(&Tag {
+                        lang_id: b,
+                        script_id: s,
+                        region_id: r,
+                        ..Tag::UND
+                    });
+                    build.add_variant(&[t.variants()]);
+                    exact = false;
+                    t = build.make();
+                }
+                has_extra = true;
+            } else if t.extension(b'u').is_some() {
+                // TODO: va may mean something else. Consider not considering it.
+                // Strip all but the 'va' entry.
+                let old = t.clone();
+                let variant = t.type_for_key("va");
+                t = Tag {
+                    lang_id: b,
+                    script_id: s,
+                    region_id: r,
+                    ..Tag::UND
+                };
+                if !variant.is_empty() {
+                    (t, _) = t.set_type_for_key("va", &variant);
+                    has_extra = true;
+                }
+                exact = old == t;
+            } else {
+                exact = false;
+            }
+            if has_extra {
+                // We have some variants.
+                for (i, s) in SPECIAL_TAGS.iter().enumerate() {
+                    if *s == t {
+                        return ((i + CORE_TAGS.len()) as Id, exact);
+                    }
+                }
+                exact = false;
+            }
+        }
+        if let Some(x) = get_core_index(&t) {
+            return (x, exact);
+        }
+        exact = false;
+        if r.0 != 0 && s.0 == 0 {
+            // Deal with cases where an extra script is inserted for the region.
+            let (t, _) = t.maximize();
+            if let Some(x) = get_core_index(&t) {
+                return (x, exact);
+            }
+        }
+        t = t.parent();
+        while t != Tag::UND {
+            // No variants specified: just compare core components.
+            // The key has the form lllssrrr, where l, s, and r are nibbles for
+            // respectively the langID, scriptID, and regionID.
+            if let Some(x) = get_core_index(&t) {
+                return (x, exact);
+            }
+            t = t.parent();
+        }
+        (UND, exact)
     }
 }
 
@@ -5898,4 +6830,212 @@ mod tables {
         ri(0x3c0, 0x0, 0x80, 0x5),
         ri(0x529, 0x3c, 0x80, 0x5),
     ];
+
+    // Go: internal/language/tables.go:3477 parentRel
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ParentRel {
+        pub(super) lang: u16,
+        pub(super) script: u16,
+        pub(super) max_script: u16,
+        pub(super) to_region: u16,
+        pub(super) from_region: &'static [u16],
+    }
+
+    // The tables below were printed by
+    // target/continuation-r97-goport/complete/gen/collate/gen.sh
+    // (zz_dump_test.go in internal/language and internal/language/compact).
+    // Go: internal/language/tables.go:1044 _XK
+    pub(super) const _XK: u16 = 334;
+    // Go: internal/language/tables.go:1054 regionTypes
+    pub(super) static REGION_TYPES: [u8; 359] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x05, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x04, 0x04, 0x06, 0x04, 0x00,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x04, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x00, 0x06,
+        0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x00, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x00, 0x04,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x00,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x00,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x00, 0x06, 0x06, 0x06, 0x06, 0x00, 0x06, 0x04, 0x06,
+        0x06, 0x06, 0x06, 0x00, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x00, 0x06, 0x06, 0x00, 0x06, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0x05, 0x05, 0x05, 0x05, 0x06, 0x00, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x02, 0x06, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x00, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x00, 0x06, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0x05, 0x05, 0x05, 0x05, 0x05, 0x04, 0x06, 0x06, 0x04, 0x06, 0x06, 0x04, 0x06, 0x05,
+    ];
+    // Go: internal/language/tables.go:3486 parents
+    pub(super) static PARENTS: [ParentRel; 5] = [
+        ParentRel {
+            lang: 0x139,
+            script: 0x0,
+            max_script: 0x5b,
+            to_region: 0x1,
+            from_region: &[
+                0x1a, 0x25, 0x26, 0x2f, 0x34, 0x36, 0x3d, 0x42, 0x46, 0x48, 0x49, 0x4a, 0x50, 0x52,
+                0x5d, 0x5e, 0x62, 0x65, 0x6e, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0x80, 0x81, 0x82, 0x84,
+                0x8d, 0x8e, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0xa0, 0xa1, 0xa5, 0xa8, 0xaa, 0xae, 0xb2,
+                0xb5, 0xb6, 0xc0, 0xc7, 0xcb, 0xcc, 0xcd, 0xcf, 0xd1, 0xd3, 0xd6, 0xd7, 0xde, 0xe0,
+                0xe1, 0xe7, 0xe8, 0xe9, 0xec, 0xf1, 0x108, 0x10a, 0x10b, 0x10c, 0x10e, 0x10f,
+                0x113, 0x118, 0x11c, 0x11e, 0x120, 0x126, 0x12a, 0x12d, 0x12e, 0x130, 0x132, 0x13a,
+                0x13d, 0x140, 0x143, 0x162, 0x163, 0x165,
+            ],
+        },
+        ParentRel {
+            lang: 0x139,
+            script: 0x0,
+            max_script: 0x5b,
+            to_region: 0x1a,
+            from_region: &[0x2e, 0x4e, 0x61, 0x64, 0x73, 0xda, 0x10d, 0x110],
+        },
+        ParentRel {
+            lang: 0x13e,
+            script: 0x0,
+            max_script: 0x5b,
+            to_region: 0x1f,
+            from_region: &[
+                0x2c, 0x3f, 0x41, 0x48, 0x51, 0x54, 0x57, 0x5a, 0x66, 0x6a, 0x8a, 0x90, 0xd0, 0xd9,
+                0xe3, 0xe5, 0xed, 0xf2, 0x11b, 0x136, 0x137, 0x13c,
+            ],
+        },
+        ParentRel {
+            lang: 0x3c0,
+            script: 0x0,
+            max_script: 0x5b,
+            to_region: 0xef,
+            from_region: &[0x2a, 0x4e, 0x5b, 0x87, 0x8c, 0xb8, 0xc7, 0xd2, 0x119, 0x127],
+        },
+        ParentRel {
+            lang: 0x529,
+            script: 0x3c,
+            max_script: 0x3c,
+            to_region: 0x8e,
+            from_region: &[0xc7],
+        },
+    ];
+    // Go: internal/language/compact/tables.go:791 coreTags
+    pub(super) static CORE_TAGS: [u32; 773] = [
+        0x00000000, 0x01600000, 0x016000d3, 0x01600162, 0x01c00000, 0x01c00052, 0x02100000,
+        0x02100081, 0x02700000, 0x02700070, 0x03a00000, 0x03a00001, 0x03a00023, 0x03a00039,
+        0x03a00063, 0x03a00068, 0x03a0006c, 0x03a0006d, 0x03a0006e, 0x03a00098, 0x03a0009c,
+        0x03a000a2, 0x03a000a9, 0x03a000ad, 0x03a000b1, 0x03a000ba, 0x03a000bb, 0x03a000ca,
+        0x03a000e2, 0x03a000ee, 0x03a000f4, 0x03a00109, 0x03a0010c, 0x03a00116, 0x03a00118,
+        0x03a0011d, 0x03a00121, 0x03a00129, 0x03a0015f, 0x04000000, 0x04300000, 0x0430009a,
+        0x04400000, 0x04400130, 0x04800000, 0x0480006f, 0x05800000, 0x05820000, 0x05820032,
+        0x0585b000, 0x0585b032, 0x05e00000, 0x05e00052, 0x07100000, 0x07100047, 0x07500000,
+        0x07500163, 0x07900000, 0x07900130, 0x07e00000, 0x07e00038, 0x08200000, 0x0a000000,
+        0x0a0000c4, 0x0a500000, 0x0a500035, 0x0a50009a, 0x0a900000, 0x0a900053, 0x0a90009a,
+        0x0b200000, 0x0b200079, 0x0b500000, 0x0b50009a, 0x0b700000, 0x0b720000, 0x0b720033,
+        0x0b75b000, 0x0b75b033, 0x0d700000, 0x0d700022, 0x0d70006f, 0x0d700079, 0x0d70009f,
+        0x0db00000, 0x0db00035, 0x0db0009a, 0x0dc00000, 0x0dc00107, 0x0df00000, 0x0df00132,
+        0x0e500000, 0x0e500136, 0x0e900000, 0x0e90009c, 0x0e90009d, 0x0fa00000, 0x0fa0005f,
+        0x0fe00000, 0x0fe00107, 0x10000000, 0x1000007c, 0x10100000, 0x10100064, 0x10100083,
+        0x10800000, 0x108000a5, 0x10d00000, 0x10d0002e, 0x10d00036, 0x10d0004e, 0x10d00061,
+        0x10d0009f, 0x10d000b3, 0x10d000b8, 0x11700000, 0x117000d5, 0x11f00000, 0x11f00061,
+        0x12400000, 0x12400052, 0x12800000, 0x12b00000, 0x12b00115, 0x12d00000, 0x12d00043,
+        0x12f00000, 0x12f000a5, 0x13000000, 0x13000081, 0x13000123, 0x13600000, 0x1360005e,
+        0x13600088, 0x13900000, 0x13900001, 0x1390001a, 0x13900025, 0x13900026, 0x1390002d,
+        0x1390002e, 0x1390002f, 0x13900034, 0x13900036, 0x1390003a, 0x1390003d, 0x13900042,
+        0x13900046, 0x13900048, 0x13900049, 0x1390004a, 0x1390004e, 0x13900050, 0x13900052,
+        0x1390005d, 0x1390005e, 0x13900061, 0x13900062, 0x13900064, 0x13900065, 0x1390006e,
+        0x13900073, 0x13900074, 0x13900075, 0x13900076, 0x1390007c, 0x1390007d, 0x13900080,
+        0x13900081, 0x13900082, 0x13900084, 0x1390008b, 0x1390008d, 0x1390008e, 0x13900097,
+        0x13900098, 0x13900099, 0x1390009a, 0x1390009b, 0x139000a0, 0x139000a1, 0x139000a5,
+        0x139000a8, 0x139000aa, 0x139000ae, 0x139000b2, 0x139000b5, 0x139000b6, 0x139000c0,
+        0x139000c1, 0x139000c7, 0x139000c8, 0x139000cb, 0x139000cc, 0x139000cd, 0x139000cf,
+        0x139000d1, 0x139000d3, 0x139000d6, 0x139000d7, 0x139000da, 0x139000de, 0x139000e0,
+        0x139000e1, 0x139000e7, 0x139000e8, 0x139000e9, 0x139000ec, 0x139000ed, 0x139000f1,
+        0x13900108, 0x1390010a, 0x1390010b, 0x1390010c, 0x1390010d, 0x1390010e, 0x1390010f,
+        0x13900110, 0x13900113, 0x13900118, 0x1390011c, 0x1390011e, 0x13900120, 0x13900126,
+        0x1390012a, 0x1390012d, 0x1390012e, 0x13900130, 0x13900132, 0x13900134, 0x13900136,
+        0x1390013a, 0x1390013d, 0x1390013e, 0x13900140, 0x13900143, 0x13900162, 0x13900163,
+        0x13900165, 0x13c00000, 0x13c00001, 0x13e00000, 0x13e0001f, 0x13e0002c, 0x13e0003f,
+        0x13e00041, 0x13e00048, 0x13e00051, 0x13e00054, 0x13e00057, 0x13e0005a, 0x13e00066,
+        0x13e00069, 0x13e0006a, 0x13e0006f, 0x13e00087, 0x13e0008a, 0x13e00090, 0x13e00095,
+        0x13e000d0, 0x13e000d9, 0x13e000e3, 0x13e000e5, 0x13e000e8, 0x13e000ed, 0x13e000f2,
+        0x13e0011b, 0x13e00136, 0x13e00137, 0x13e0013c, 0x14000000, 0x1400006b, 0x14500000,
+        0x1450006f, 0x14600000, 0x14600052, 0x14800000, 0x14800024, 0x1480009d, 0x14e00000,
+        0x14e00052, 0x14e00085, 0x14e000ca, 0x14e00115, 0x15100000, 0x15100073, 0x15300000,
+        0x153000e8, 0x15800000, 0x15800064, 0x15800077, 0x15e00000, 0x15e00036, 0x15e00037,
+        0x15e0003a, 0x15e0003b, 0x15e0003c, 0x15e00049, 0x15e0004b, 0x15e0004c, 0x15e0004d,
+        0x15e0004e, 0x15e0004f, 0x15e00052, 0x15e00063, 0x15e00068, 0x15e00079, 0x15e0007b,
+        0x15e0007f, 0x15e00085, 0x15e00086, 0x15e00087, 0x15e00092, 0x15e000a9, 0x15e000b8,
+        0x15e000bb, 0x15e000bc, 0x15e000bf, 0x15e000c0, 0x15e000c4, 0x15e000c9, 0x15e000ca,
+        0x15e000cd, 0x15e000d4, 0x15e000d5, 0x15e000e6, 0x15e000eb, 0x15e00103, 0x15e00108,
+        0x15e0010b, 0x15e00115, 0x15e0011d, 0x15e00121, 0x15e00123, 0x15e00129, 0x15e00140,
+        0x15e00141, 0x15e00160, 0x16900000, 0x1690009f, 0x16d00000, 0x16d000da, 0x16e00000,
+        0x16e00097, 0x17e00000, 0x17e0007c, 0x19000000, 0x1900006f, 0x1a300000, 0x1a30004e,
+        0x1a300079, 0x1a3000b3, 0x1a400000, 0x1a40009a, 0x1a900000, 0x1ab00000, 0x1ab000a5,
+        0x1ac00000, 0x1ac00099, 0x1b400000, 0x1b400081, 0x1b4000d5, 0x1b4000d7, 0x1b800000,
+        0x1b800136, 0x1bc00000, 0x1bc00098, 0x1be00000, 0x1be0009a, 0x1d100000, 0x1d100033,
+        0x1d100091, 0x1d200000, 0x1d200061, 0x1d500000, 0x1d500093, 0x1d700000, 0x1d700028,
+        0x1e100000, 0x1e100096, 0x1e700000, 0x1e7000d7, 0x1ea00000, 0x1ea00053, 0x1f300000,
+        0x1f500000, 0x1f800000, 0x1f80009e, 0x1f900000, 0x1f90004e, 0x1f90009f, 0x1f900114,
+        0x1f900139, 0x1fa00000, 0x1fb00000, 0x20000000, 0x200000a3, 0x20300000, 0x20700000,
+        0x20700052, 0x20800000, 0x20a00000, 0x20a00130, 0x20e00000, 0x20f00000, 0x21000000,
+        0x2100007e, 0x21200000, 0x21200068, 0x21600000, 0x21700000, 0x217000a5, 0x21f00000,
+        0x22300000, 0x22300130, 0x22700000, 0x2270005b, 0x23400000, 0x234000c4, 0x23900000,
+        0x239000a5, 0x24200000, 0x242000af, 0x24400000, 0x24400052, 0x24500000, 0x24500083,
+        0x24600000, 0x246000a5, 0x24a00000, 0x24a000a7, 0x25100000, 0x2510009a, 0x25400000,
+        0x254000ab, 0x254000ac, 0x25600000, 0x2560009a, 0x26a00000, 0x26a0009a, 0x26b00000,
+        0x26b00130, 0x26d00000, 0x26d00052, 0x26e00000, 0x26e00061, 0x27400000, 0x28100000,
+        0x2810007c, 0x28a00000, 0x28a000a6, 0x29100000, 0x29100130, 0x29500000, 0x295000b8,
+        0x2a300000, 0x2a300132, 0x2af00000, 0x2af00136, 0x2b500000, 0x2b50002a, 0x2b50004b,
+        0x2b50004c, 0x2b50004d, 0x2b800000, 0x2b8000b0, 0x2bf00000, 0x2bf0009c, 0x2bf0009d,
+        0x2c000000, 0x2c0000b7, 0x2c200000, 0x2c20004b, 0x2c400000, 0x2c4000a5, 0x2c500000,
+        0x2c5000a5, 0x2c700000, 0x2c7000b9, 0x2d100000, 0x2d1000a5, 0x2d100130, 0x2e900000,
+        0x2e9000a5, 0x2ed00000, 0x2ed000cd, 0x2f100000, 0x2f1000c0, 0x2f200000, 0x2f2000d2,
+        0x2f400000, 0x2f400052, 0x2ff00000, 0x2ff000c3, 0x30400000, 0x3040009a, 0x30b00000,
+        0x30b000c6, 0x31000000, 0x31b00000, 0x31b0009a, 0x31f00000, 0x31f0003e, 0x31f000d1,
+        0x31f0010e, 0x32000000, 0x320000cc, 0x32500000, 0x32500052, 0x33100000, 0x331000c5,
+        0x33a00000, 0x33a0009d, 0x34100000, 0x34500000, 0x345000d3, 0x34700000, 0x347000db,
+        0x34700111, 0x34e00000, 0x34e00165, 0x35000000, 0x35000061, 0x350000da, 0x35100000,
+        0x3510009a, 0x351000dc, 0x36700000, 0x36700030, 0x36700036, 0x36700040, 0x3670005c,
+        0x367000da, 0x36700117, 0x3670011c, 0x36800000, 0x36800052, 0x36a00000, 0x36a000db,
+        0x36c00000, 0x36c00052, 0x36f00000, 0x37500000, 0x37600000, 0x37a00000, 0x38000000,
+        0x38000118, 0x38700000, 0x38900000, 0x38900132, 0x39000000, 0x39000070, 0x390000a5,
+        0x39500000, 0x3950009a, 0x39800000, 0x3980007e, 0x39800107, 0x39d00000, 0x39d05000,
+        0x39d050e9, 0x39d36000, 0x39d3609a, 0x3a100000, 0x3b300000, 0x3b3000ea, 0x3bd00000,
+        0x3bd00001, 0x3be00000, 0x3be00024, 0x3c000000, 0x3c00002a, 0x3c000041, 0x3c00004e,
+        0x3c00005b, 0x3c000087, 0x3c00008c, 0x3c0000b8, 0x3c0000c7, 0x3c0000d2, 0x3c0000ef,
+        0x3c000119, 0x3c000127, 0x3c400000, 0x3c40003f, 0x3c40006a, 0x3c4000e5, 0x3d400000,
+        0x3d40004e, 0x3d900000, 0x3d90003a, 0x3dc00000, 0x3dc000bd, 0x3dc00105, 0x3de00000,
+        0x3de00130, 0x3e200000, 0x3e200047, 0x3e2000a6, 0x3e2000af, 0x3e2000bd, 0x3e200107,
+        0x3e200131, 0x3e500000, 0x3e500108, 0x3e600000, 0x3e600130, 0x3eb00000, 0x3eb00107,
+        0x3ec00000, 0x3ec000a5, 0x3f300000, 0x3f300130, 0x3fa00000, 0x3fa000e9, 0x3fc00000,
+        0x3fd00000, 0x3fd00073, 0x3fd000db, 0x3fd0010d, 0x3ff00000, 0x3ff000d2, 0x40100000,
+        0x401000c4, 0x40200000, 0x4020004c, 0x40700000, 0x40800000, 0x4085b000, 0x4085b0bb,
+        0x408eb000, 0x408eb0bb, 0x40c00000, 0x40c000b4, 0x41200000, 0x41200112, 0x41600000,
+        0x41600110, 0x41c00000, 0x41d00000, 0x41e00000, 0x41f00000, 0x41f00073, 0x42200000,
+        0x42300000, 0x42300165, 0x42900000, 0x42900063, 0x42900070, 0x429000a5, 0x42900116,
+        0x43100000, 0x43100027, 0x431000c3, 0x4310014e, 0x43200000, 0x43220000, 0x43220033,
+        0x432200be, 0x43220106, 0x4322014e, 0x4325b000, 0x4325b033, 0x4325b0be, 0x4325b106,
+        0x4325b14e, 0x43700000, 0x43a00000, 0x43b00000, 0x44400000, 0x44400031, 0x44400073,
+        0x4440010d, 0x44500000, 0x4450004b, 0x445000a5, 0x44500130, 0x44500132, 0x44e00000,
+        0x45000000, 0x4500009a, 0x450000b4, 0x450000d1, 0x4500010e, 0x46100000, 0x4610009a,
+        0x46400000, 0x464000a5, 0x46400132, 0x46700000, 0x46700125, 0x46b00000, 0x46b00124,
+        0x46f00000, 0x46f0006e, 0x46f00070, 0x47100000, 0x47600000, 0x47600128, 0x47a00000,
+        0x48000000, 0x48200000, 0x4820012a, 0x48a00000, 0x48a0005e, 0x48a0012c, 0x48e00000,
+        0x49400000, 0x49400107, 0x4a400000, 0x4a4000d5, 0x4a900000, 0x4a9000bb, 0x4ac00000,
+        0x4ac00053, 0x4ae00000, 0x4ae00131, 0x4b400000, 0x4b40009a, 0x4b4000e9, 0x4bc00000,
+        0x4bc05000, 0x4bc05024, 0x4bc20000, 0x4bc20138, 0x4bc5b000, 0x4bc5b138, 0x4be00000,
+        0x4be5b000, 0x4be5b0b5, 0x4bef4000, 0x4bef40b5, 0x4c000000, 0x4c300000, 0x4c30013f,
+        0x4c900000, 0x4c900001, 0x4cc00000, 0x4cc00130, 0x4ce00000, 0x4cf00000, 0x4cf0004e,
+        0x4e500000, 0x4e500115, 0x4f200000, 0x4fb00000, 0x4fb00132, 0x50900000, 0x50900052,
+        0x51200000, 0x51200001, 0x51800000, 0x5180003b, 0x518000d7, 0x51f00000, 0x51f3b000,
+        0x51f3b053, 0x51f3c000, 0x51f3c08e, 0x52800000, 0x528000bb, 0x52900000, 0x5293b000,
+        0x5293b053, 0x5293b08e, 0x5293b0c7, 0x5293b10e, 0x5293c000, 0x5293c08e, 0x5293c0c7,
+        0x5293c12f, 0x52f00000, 0x52f00162,
+    ];
+    // Go: internal/language/compact/tables.go:1013 specialTagsStr
+    pub(super) const SPECIAL_TAGS_STR: &str = "ca-ES-valencia en-US-u-va-posix";
 }

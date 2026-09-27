@@ -670,7 +670,9 @@ impl Checker {
             return Ternary::FALSE;
         }
         // If source and target are already being compared, consider them related with assumptions
-        if r.borrow().maybe_keys_set.contains(&id) {
+        // PORT: perf. A linear scan while the stack is small (see
+        // `Relater::maybe_keys_contain`).
+        if r.borrow().maybe_keys_contain(&id) {
             return Ternary::MAYBE;
         }
         // A constrained key indicates that we have type references that reference constrained
@@ -684,7 +686,7 @@ impl Checker {
                 is_identity,
                 true, /*ignoreConstraints*/
             );
-            if r.borrow().maybe_keys_set.contains(&broadest_equivalent_id) {
+            if r.borrow().maybe_keys_contain(&broadest_equivalent_id) {
                 return Ternary::MAYBE;
             }
         }
@@ -692,19 +694,25 @@ impl Checker {
         // isDeeplyNestedType, which cannot reach `r` (it is not in the
         // relater pool while in use).
         let (maybe_start, save_expanding_flags) = {
-            let mut rb = r.borrow_mut();
+            let mut guard = r.borrow_mut();
+            // Reborrow so the stack and its ids can be borrowed apart.
+            let rb = &mut *guard;
             if rb.source_stack.len() == 100 || rb.target_stack.len() == 100 {
                 rb.overflow = true;
                 return Ternary::FALSE;
             }
             let maybe_start = rb.maybe_keys.len() as i32;
-            rb.maybe_keys.push(id);
-            rb.maybe_keys_set.insert(id);
+            rb.push_maybe_key(id);
             let save_expanding_flags = rb.expanding_flags;
             if recursion_flags.intersects(RecursionFlags::SOURCE) {
                 rb.source_stack.push(source);
                 if !rb.expanding_flags.intersects(ExpandingFlags::SOURCE)
-                    && self.is_deeply_nested_type(source, &rb.source_stack, 3)
+                    && self.is_deeply_nested_relater_type(
+                        source,
+                        &rb.source_stack,
+                        &mut rb.source_ids,
+                        3,
+                    )
                 {
                     rb.expanding_flags |= ExpandingFlags::SOURCE;
                 }
@@ -712,7 +720,12 @@ impl Checker {
             if recursion_flags.intersects(RecursionFlags::TARGET) {
                 rb.target_stack.push(target);
                 if !rb.expanding_flags.intersects(ExpandingFlags::TARGET)
-                    && self.is_deeply_nested_type(target, &rb.target_stack, 3)
+                    && self.is_deeply_nested_relater_type(
+                        target,
+                        &rb.target_stack,
+                        &mut rb.target_ids,
+                        3,
+                    )
                 {
                     rb.expanding_flags |= ExpandingFlags::TARGET;
                 }
@@ -756,12 +769,15 @@ impl Checker {
         let propagating_variance_flags = self.reliability_flags;
         self.reliability_flags |= save_reliability_flags;
         let at_depth_zero = {
-            let mut rb = r.borrow_mut();
+            let mut guard = r.borrow_mut();
+            let rb = &mut *guard;
             if recursion_flags.intersects(RecursionFlags::SOURCE) {
                 rb.source_stack.pop();
+                rb.source_ids.truncate(rb.source_stack.len());
             }
             if recursion_flags.intersects(RecursionFlags::TARGET) {
                 rb.target_stack.pop();
+                rb.target_ids.truncate(rb.target_stack.len());
             }
             rb.expanding_flags = save_expanding_flags;
             rb.source_stack.is_empty() && rb.target_stack.is_empty()
@@ -806,10 +822,9 @@ impl Checker {
         // Reborrow so the fields can be borrowed apart.
         let rb = &mut *guard;
         let maybe_start = maybe_start as usize;
-        let mut relation = mark_all_as_succeeded.then(|| rb.relation.borrow_mut());
-        for &key in &rb.maybe_keys[maybe_start..] {
-            rb.maybe_keys_set.remove(&key);
-            if let Some(relation) = relation.as_mut() {
+        if mark_all_as_succeeded {
+            let mut relation = rb.relation.borrow_mut();
+            for &key in &rb.maybe_keys[maybe_start..] {
                 relation.set(
                     key,
                     RelationComparisonResult::SUCCEEDED | propagating_variance_flags,
@@ -817,16 +832,24 @@ impl Checker {
                 rb.relation_count -= 1;
             }
         }
-        drop(relation);
-        rb.maybe_keys.truncate(maybe_start);
+        // PORT: perf. The set deletes happen here, in one step when the
+        // stack becomes small (see `Relater::truncate_maybe_keys`).
+        rb.truncate_maybe_keys(maybe_start);
     }
 
     // Go: checker/relater.go:3180 getErrorState
+    // PORT: perf. `related_info` is almost always empty; `Vec::new()` then
+    // skips the out-of-line `Vec::clone` call.
+    #[inline]
     pub fn get_error_state(&self, r: &Rc<RefCell<Relater>>) -> ErrorState {
         let rb = r.borrow();
         ErrorState {
             error_chain: rb.error_chain.clone(),
-            related_info: rb.related_info.clone(),
+            related_info: if rb.related_info.is_empty() {
+                Vec::new()
+            } else {
+                rb.related_info.clone()
+            },
         }
     }
 
@@ -1533,11 +1556,13 @@ impl Checker {
         } else if target_flags.intersects(TypeFlags::CONDITIONAL) {
             // If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
             // conditional type and bail out with a Ternary.Maybe result.
-            // PORT: read under a shared borrow; nothing reached from
-            // isDeeplyNestedType can use `r`.
+            // PORT: read under a borrow of `r`; nothing reached from
+            // isDeeplyNestedType can use `r`. The borrow is mutable because
+            // the check can fill the stack's recursion ids.
             let nested = {
-                let rb = r.borrow();
-                self.is_deeply_nested_type(target, &rb.target_stack, 10)
+                let mut guard = r.borrow_mut();
+                let rb = &mut *guard;
+                self.is_deeply_nested_relater_type(target, &rb.target_stack, &mut rb.target_ids, 10)
             };
             if nested {
                 return Ternary::MAYBE;
@@ -1892,11 +1917,13 @@ impl Checker {
         } else if source_flags.intersects(TypeFlags::CONDITIONAL) {
             // If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
             // conditional type and bail out with a Ternary.Maybe result.
-            // PORT: read under a shared borrow; nothing reached from
-            // isDeeplyNestedType can use `r`.
+            // PORT: read under a borrow of `r`; nothing reached from
+            // isDeeplyNestedType can use `r`. The borrow is mutable because
+            // the check can fill the stack's recursion ids.
             let nested = {
-                let rb = r.borrow();
-                self.is_deeply_nested_type(source, &rb.source_stack, 10)
+                let mut guard = r.borrow_mut();
+                let rb = &mut *guard;
+                self.is_deeply_nested_relater_type(source, &rb.source_stack, &mut rb.source_ids, 10)
             };
             if nested {
                 return Ternary::MAYBE;

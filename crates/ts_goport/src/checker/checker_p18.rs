@@ -11,9 +11,13 @@
 use crate::prelude::*;
 
 // Go: checker/checker.go:16048 ExportCollision
+// PERF: Go stores `specifierText`, the text of the first export node's
+// module specifier. We store that export node and make the text only when a
+// TS2308 diagnostic uses it. Most entries never report, so this saves one
+// String per re-exported name.
 #[derive(Clone, Debug, Default)]
 pub struct ExportCollision {
-    pub specifier_text: String,
+    pub export_node: Node,
     pub exports_with_duplicate: Vec<Node>,
 }
 
@@ -21,7 +25,9 @@ pub struct ExportCollision {
 // PORT: Go `map[string]*ExportCollision`. Go iterates this map to report
 // diagnostics; Go map order is random, so we keep insertion order
 // (`IndexMap`) to be deterministic. Diagnostics are sorted later.
-pub type ExportCollisionTable = IndexMap<String, ExportCollision>;
+// PERF: keyed by interned `Name`, so an insert copies no text. The Fx hasher
+// does not change the order: an `IndexMap` iterates in insertion order.
+pub type ExportCollisionTable = FxIndexMap<Name, ExportCollision>;
 
 // PORT: state captured by the Go `visit` closure in `getExportsOfModuleWorker`.
 struct ExportsOfModuleVisitState {
@@ -638,7 +644,7 @@ impl Checker {
             .get(symbol_exports, INTERNAL_SYMBOL_NAME_EXPORT_STAR);
         if export_stars.is_some() {
             let nested_symbols = self.symbols.new_table();
-            let mut lookup_table: ExportCollisionTable = IndexMap::new();
+            let mut lookup_table = ExportCollisionTable::default();
             let declarations = self.sym(export_stars).declarations.clone();
             for &node in declarations.iter() {
                 // PORT: Go `node.ModuleSpecifier()` panics for other kinds,
@@ -677,17 +683,21 @@ impl Checker {
             }
             for (id, s) in &lookup_table {
                 // It's not an error if the file with multiple `export *`s with duplicate names exports a member with that name itself
-                if id == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
-                    || s.exports_with_duplicate.is_empty()
-                    || self.symbols.get(symbols, id).is_some()
+                // PERF: the empty test is first; it skips most entries without
+                // a text compare. The three tests have no side effects.
+                if s.exports_with_duplicate.is_empty()
+                    || id == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
+                    || self.symbols.get_name(symbols, id).is_some()
                 {
                     continue;
                 }
+                // Go `s.specifierText`, made here (see `ExportCollision`).
+                let specifier_text = get_text_of_node(s.export_node.module_specifier());
                 for &node in &s.exports_with_duplicate {
                     let diagnostic = create_diagnostic_for_node(
                         node,
                         diag::Module_0_has_already_exported_a_member_named_1_Consider_explicitly_re_exporting_to_resolve_the_ambiguity,
-                        args![s.specifier_text, id],
+                        args![specifier_text, id],
                     );
                     self.add_diagnostic(diagnostic);
                 }
@@ -714,19 +724,25 @@ impl Checker {
         mut lookup_table: Option<&mut ExportCollisionTable>,
         export_node: Node,
     ) {
+        // PERF: names are interned, so equal texts have equal ids. `default`
+        // is interned once here and each name test is an id compare. The
+        // target lookup uses the stored hash and an id compare (`get_slot`),
+        // and the store reuses that slot. The loop changes `target` and
+        // resolves symbols, so it walks an `entries` snapshot.
+        let default_name = Name::from(INTERNAL_SYMBOL_NAME_DEFAULT);
         for (id, source_symbol) in self.symbols.entries(source) {
-            if id == INTERNAL_SYMBOL_NAME_DEFAULT {
+            if id == default_name {
                 continue;
             }
-            let target_symbol = self.symbols.get(target, &id);
+            let (target_symbol, slot) = self.symbols.get_slot(target, &id);
             if target_symbol.is_nil() {
-                self.symbols.set(target, id.clone(), source_symbol);
+                self.symbols.set_slot(slot, source_symbol);
                 if let Some(table) = lookup_table.as_deref_mut() {
                     if export_node.is_some() {
                         table.insert(
-                            id.to_string(),
+                            id,
                             ExportCollision {
-                                specifier_text: get_text_of_node(export_node.module_specifier()),
+                                export_node,
                                 exports_with_duplicate: Vec::new(),
                             },
                         );
@@ -739,7 +755,7 @@ impl Checker {
                 let table = lookup_table.as_deref_mut().unwrap();
                 // PORT: Go dereferences the map entry; a missing entry is a nil
                 // pointer panic there.
-                let s = table.get_mut(id.as_str()).expect("nil ExportCollision");
+                let s = table.get_mut(&id).expect("nil ExportCollision");
                 s.exports_with_duplicate.push(export_node);
             }
         }

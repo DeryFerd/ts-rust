@@ -22,6 +22,193 @@ impl std::hash::Hash for InferenceKey {
     }
 }
 
+// PORT: perf. The same word through an Fx mix, which is the hash that
+// `FxHashMap` computes for this key.
+impl FlatKey for InferenceKey {
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        h.write_u64(((self.s.0 as u64) << 32) | self.t.0 as u64);
+        h.finish()
+    }
+}
+
+/// The map type of `InferenceState::visited`. For an A/B run against
+/// hashbrown, change it to `FxHashMap<InferenceKey, InferencePriority>`.
+pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
+
+/// PORT: perf. Not in Go. `stack_recursion_id` as one word, so the inference
+/// stacks store and compare ids with plain 8-byte moves. 0 is `None`. A node
+/// handle has nonzero low 32 bits, so it is its own key. A symbol or type
+/// id goes in the high 32 bits with zero low bits: a symbol as its id, a
+/// type as its id with bit 31 set. An id that does not fit (a node with
+/// zero low bits, a nil symbol, or a symbol or type id of 2^31 or more) is
+/// stored as `None`. Such an entry is not a mapped type or an
+/// intersection, so `has_matching_recursion_identity` on it only compares
+/// `get_recursion_identity` and gives the same answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecursionKey(u64);
+
+impl RecursionKey {
+    pub const NONE: Self = Self(0);
+    const TYPE_BIT: u32 = 1 << 31;
+
+    #[inline]
+    #[must_use]
+    pub fn new(id: Option<RecursionId>) -> Self {
+        match id {
+            Some(RecursionId::Node(n)) if n.0 as u32 != 0 => Self(n.0),
+            Some(RecursionId::Symbol(s)) if s.0 != 0 && s.0 < Self::TYPE_BIT => {
+                Self(u64::from(s.0) << 32)
+            }
+            Some(RecursionId::Type(t)) if t.0 < Self::TYPE_BIT => {
+                Self(u64::from(t.0 | Self::TYPE_BIT) << 32)
+            }
+            _ => Self::NONE,
+        }
+    }
+}
+
+impl From<RecursionKey> for Option<RecursionId> {
+    #[inline]
+    fn from(key: RecursionKey) -> Self {
+        let high = (key.0 >> 32) as u32;
+        if key.0 as u32 != 0 {
+            Some(RecursionId::Node(Node(key.0)))
+        } else if high == 0 {
+            None
+        } else if high & RecursionKey::TYPE_BIT != 0 {
+            Some(RecursionId::Type(TypeId(high & !RecursionKey::TYPE_BIT)))
+        } else {
+            Some(RecursionId::Symbol(SymbolId(high)))
+        }
+    }
+}
+
+impl FlatKey for RecursionKey {
+    // The murmur3 finalizer: node keys differ in both halves and symbol and
+    // type keys only in the high half, so both halves are mixed into the
+    // low bits.
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^ (x >> 33)
+    }
+}
+
+/// `StackEntry::prev` of an entry with no earlier same-id entry.
+const NO_PREV: u32 = u32::MAX;
+
+/// PORT: perf. Not in Go. Per entry of an `InferenceStack`: `id` is
+/// `RecursionKey::new(stack_recursion_id(t))`, `prev` is the index of the
+/// next lower entry with the same id (or `NO_PREV`), and `steps` counts the
+/// same-id entry pairs up to this entry whose type id does not go down.
+// PERF: the three fields share one 16-byte element, so a push reads the id
+// and the steps of `prev` from one cache line.
+#[derive(Clone, Copy, Debug)]
+struct StackEntry {
+    id: RecursionKey,
+    prev: u32,
+    steps: u32,
+}
+
+/// The id list that `is_deeply_nested_type_with_ids` reads.
+impl From<StackEntry> for Option<RecursionId> {
+    #[inline]
+    fn from(entry: StackEntry) -> Self {
+        entry.id.into()
+    }
+}
+
+/// PORT: perf. Not in Go. Go `sourceStack` or `targetStack` of
+/// `InferenceState`, with the recursion id of each entry and the data that
+/// gives `is_deeply_nested_type` for the top entry in O(1).
+///
+/// The Go scan counts the first entry with the probe's id, then each later
+/// entry with that id whose type id is not lower than the one before it.
+/// The count only grows. When the probe is the top entry, `1 + steps` of the
+/// top entry is that count, and each push finds the entry before it through
+/// `top`. `top[id]` is the index of the topmost entry with `id` whenever
+/// `id` is on the stack. An index left from a popped entry fails the
+/// `prev < idx && entries[prev].id == id` test, so keys of `top` are never
+/// removed.
+#[derive(Default)]
+pub struct InferenceStack {
+    /// The entry types, in their own list for the scan.
+    pub types: Vec<TypeId>,
+    entries: Vec<StackEntry>,
+    top: FlatMap<RecursionKey, u32>,
+    /// Entries whose id is `RecursionKey::NONE`.
+    none: u32,
+}
+
+impl InferenceStack {
+    // PERF: `inline(always)`, because `#[inline]` left push and pop out of
+    // line.
+    #[inline(always)]
+    pub fn push(&mut self, t: TypeId, id: RecursionKey) {
+        let idx = self.types.len() as u32;
+        let mut entry = StackEntry {
+            id,
+            prev: NO_PREV,
+            steps: 0,
+        };
+        if id == RecursionKey::NONE {
+            self.none += 1;
+        } else if let Some(prev) = self.top.insert(id, idx)
+            && prev < idx
+        {
+            let prev_entry = self.entries[prev as usize];
+            if prev_entry.id == id {
+                entry.prev = prev;
+                entry.steps = prev_entry.steps + u32::from(t >= self.types[prev as usize]);
+            }
+        }
+        self.types.push(t);
+        self.entries.push(entry);
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) {
+        self.types.pop();
+        let entry = self.entries.pop().unwrap();
+        if entry.id == RecursionKey::NONE {
+            self.none -= 1;
+        } else if entry.prev != NO_PREV {
+            self.top.insert(entry.id, entry.prev);
+        }
+    }
+
+    /// The Go deeply nested answer for the top entry as the probe, when it
+    /// needs no scan: the top has an id and no entry lacks one.
+    #[inline]
+    #[must_use]
+    pub fn top_deeply_nested(&self, max_depth: i32) -> Option<bool> {
+        let top = self.entries.last()?;
+        if top.id == RecursionKey::NONE || self.none != 0 {
+            return None;
+        }
+        let steps = top.steps;
+        let max_depth = i64::from(max_depth);
+        Some(self.types.len() as i64 >= max_depth && 1 + i64::from(steps) >= max_depth)
+    }
+
+    /// Empties the stack and keeps the allocations. `top` keeps its stale
+    /// indexes (they fail the validity test), but a large `top` is dropped
+    /// so ids of earlier root inferences do not fill it.
+    pub fn clear(&mut self) {
+        self.types.clear();
+        self.entries.clear();
+        self.none = 0;
+        if self.top.len() > 1024 {
+            self.top = FlatMap::default();
+        }
+    }
+}
+
 // Go: checker/inference.go:16 InferenceState
 // PORT: Go `inferences []*InferenceInfo` is the inference list of an inference
 // context, so it is the `InferenceContextId` that owns the list (nil when the
@@ -38,13 +225,14 @@ pub struct InferenceState {
     pub bivariant: bool,
     pub expanding_flags: ExpandingFlags,
     pub propagation_type: TypeId,
-    pub visited: Option<FxHashMap<InferenceKey, InferencePriority>>,
-    pub source_stack: Vec<TypeId>,
-    pub target_stack: Vec<TypeId>,
-    // PORT: perf. `stack_recursion_id` of each `source_stack` and
-    // `target_stack` entry, for `is_deeply_nested_type_with_ids`. Not in Go.
-    pub source_ids: Vec<Option<RecursionId>>,
-    pub target_ids: Vec<Option<RecursionId>>,
+    pub visited: Option<InferenceVisitedMap>,
+    // PORT: perf. Not in Go. The largest `visited` length that a root
+    // inference on this pooled state reached (see `invoke_once`).
+    pub max_visited_len: usize,
+    // PORT: perf. Go `sourceStack` and `targetStack` with the recursion id
+    // of each entry (see `InferenceStack`).
+    pub source_stack: InferenceStack,
+    pub target_stack: InferenceStack,
     pub next: Option<Rc<RefCell<InferenceState>>>,
 }
 
@@ -64,11 +252,14 @@ impl Checker {
         {
             let mut s = n.borrow_mut();
             let mut visited = s.visited.take();
+            let max_visited_len = s
+                .max_visited_len
+                .max(visited.as_ref().map_or(0, InferenceVisitedMap::len));
             if let Some(v) = visited.as_mut() {
                 // PORT: Go `clear(n.visited)`. Clearing costs time in the map
                 // capacity, so a mostly empty large map is dropped instead.
                 if v.capacity() > 256 && v.len() < v.capacity() / 8 {
-                    *v = FxHashMap::default();
+                    *v = InferenceVisitedMap::default();
                 } else {
                     v.clear();
                 }
@@ -77,19 +268,14 @@ impl Checker {
             source_stack.clear();
             let mut target_stack = std::mem::take(&mut s.target_stack);
             target_stack.clear();
-            let mut source_ids = std::mem::take(&mut s.source_ids);
-            source_ids.clear();
-            let mut target_ids = std::mem::take(&mut s.target_ids);
-            target_ids.clear();
             // PORT: Go `inferences: n.inferences[:0]` keeps only the slice
             // capacity; the context id has none, so it becomes nil.
             *s = InferenceState {
                 inferences: InferenceContextId::NIL,
                 visited,
+                max_visited_len,
                 source_stack,
                 target_stack,
-                source_ids,
-                target_ids,
                 next: self.freeinference_state.take(),
                 ..InferenceState::default()
             };
@@ -634,30 +820,35 @@ impl Checker {
             s: source,
             t: target,
         };
-        // PORT: perf. One `entry` probe does the Go lookup and the first
-        // `CIRCULARITY` insert. The map is made first; a lookup on Go's nil
-        // map misses, and the miss path makes the map anyway, so the map
-        // contents are the same.
+        // PORT: perf. The map is made first; a lookup on Go's nil map misses,
+        // and the miss path makes the map anyway, so the map contents are the
+        // same. The insert after a miss finds the probed slots in cache.
         {
             let mut guard = n.borrow_mut();
             let s = &mut *guard;
-            match s.visited.get_or_insert_with(FxHashMap::default).entry(key) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    s.inference_priority = std::cmp::min(s.inference_priority, *e.get());
-                    return;
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(InferencePriority::CIRCULARITY);
-                }
+            let visited = s.visited.get_or_insert_with(InferenceVisitedMap::default);
+            if let Some(&p) = visited.get(&key) {
+                s.inference_priority = std::cmp::min(s.inference_priority, p);
+                return;
             }
+            // PORT: perf. Not in Go. `put_inference_state` drops a mostly
+            // empty large map, so a later large inference would grow it again
+            // by doubling. Once this inference reaches a quarter of the
+            // largest length seen, the map grows in one step to that length.
+            // A map sized so is not dropped at that fill, and smaller
+            // inferences never make it. The map is never iterated.
+            if visited.len() == s.max_visited_len / 4 {
+                visited.reserve(s.max_visited_len - visited.len());
+            }
+            visited.insert(key, InferencePriority::CIRCULARITY);
         }
         let save_inference_priority;
         let save_expanding_flags;
         // PORT: perf. Each stack entry keeps its recursion id, so the deeply
         // nested checks below compare ids instead of reading every entry's
         // type again (see `is_deeply_nested_type_with_ids`).
-        let source_id = self.stack_recursion_id(source);
-        let target_id = self.stack_recursion_id(target);
+        let source_id = RecursionKey::new(self.stack_recursion_id(source));
+        let target_id = RecursionKey::new(self.stack_recursion_id(target));
         {
             let mut s = n.borrow_mut();
             save_inference_priority = s.inference_priority;
@@ -665,37 +856,22 @@ impl Checker {
             // We stop inferring and report a circularity if we encounter duplicate recursion identities on both
             // the source side and the target side.
             save_expanding_flags = s.expanding_flags;
-            s.source_stack.push(source);
-            s.source_ids.push(source_id);
-            s.target_stack.push(target);
-            s.target_ids.push(target_id);
+            s.source_stack.push(source, source_id);
+            s.target_stack.push(target, target_id);
         }
         // PORT: the stacks are read through a shared borrow of `n`, instead
         // of cloned. Nothing reached from isDeeplyNestedType can use `n`; if
-        // that changes, the borrow check panics. The probe is the entry just
-        // pushed, so its stored id is passed as the probe identity.
+        // that changes, the borrow check panics.
         let source_nested = {
             let s = n.borrow();
-            self.is_deeply_nested_type_with_ids(
-                source,
-                source_id,
-                &s.source_stack,
-                &s.source_ids,
-                2,
-            )
+            self.is_deeply_nested_inference_top(&s.source_stack, 2)
         };
         if source_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
         }
         let target_nested = {
             let s = n.borrow();
-            self.is_deeply_nested_type_with_ids(
-                target,
-                target_id,
-                &s.target_stack,
-                &s.target_ids,
-                2,
-            )
+            self.is_deeply_nested_inference_top(&s.target_stack, 2)
         };
         if target_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
@@ -709,23 +885,44 @@ impl Checker {
         {
             let mut s = n.borrow_mut();
             s.target_stack.pop();
-            s.target_ids.pop();
             s.source_stack.pop();
-            s.source_ids.pop();
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
-            // PORT: perf. The key was inserted above and nothing removes it
-            // while `n` is in use, so this overwrites it in place. The insert
-            // is the Go map write, kept in case that changes.
-            if let Some(p) = s.visited.as_mut().and_then(|v| v.get_mut(&key)) {
-                *p = inference_priority;
-            } else {
-                s.visited
-                    .get_or_insert_with(FxHashMap::default)
-                    .insert(key, inference_priority);
-            }
+            // PORT: the key was inserted above, so this overwrites it in
+            // place (one probe).
+            s.visited
+                .get_or_insert_with(InferenceVisitedMap::default)
+                .insert(key, inference_priority);
             s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
         }
+    }
+
+    // PORT: perf. Go `isDeeplyNestedType(t, stack, maxDepth)` where `t` is
+    // the entry just pushed on `stack`. When the top entry has an id and no
+    // entry lacks one, the Go scan only compares ids, so the answer comes
+    // from `InferenceStack` with no scan (debug builds also scan and
+    // compare). Else the scan runs as in Go, with
+    // `has_matching_recursion_identity` for the same types in the same order.
+    // Go: checker/relater.go:773 isDeeplyNestedType
+    #[inline]
+    fn is_deeply_nested_inference_top(&mut self, stack: &InferenceStack, max_depth: i32) -> bool {
+        let fast = stack.top_deeply_nested(max_depth);
+        if let Some(nested) = fast
+            && !cfg!(debug_assertions)
+        {
+            return nested;
+        }
+        let t = *stack.types.last().unwrap();
+        let probe_id: Option<RecursionId> = (*stack.entries.last().unwrap()).into();
+        let nested = self.is_deeply_nested_type_with_ids(
+            t,
+            probe_id,
+            &stack.types,
+            &stack.entries,
+            max_depth,
+        );
+        debug_assert!(fast.is_none_or(|fast| fast == nested));
+        nested
     }
 
     // Go: checker/inference.go:370 inferFromMatchingTypes
@@ -1800,5 +1997,109 @@ impl Checker {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recursion_key_round_trip() {
+        let ids = [
+            RecursionId::Node(Node(1)),
+            RecursionId::Node(Node((7 << 32) | 3)),
+            RecursionId::Node(Node((0xffff_fffe << 32) | 0xffff_ffff)),
+            RecursionId::Symbol(SymbolId(1)),
+            RecursionId::Symbol(SymbolId(0x7fff_ffff)),
+            RecursionId::Type(TypeId(0)),
+            RecursionId::Type(TypeId(1)),
+            RecursionId::Type(TypeId(0x7fff_ffff)),
+        ];
+        for (i, &a) in ids.iter().enumerate() {
+            let key = RecursionKey::new(Some(a));
+            assert_ne!(key, RecursionKey::NONE);
+            assert_eq!(Option::<RecursionId>::from(key), Some(a));
+            for &b in &ids[i + 1..] {
+                assert_ne!(key, RecursionKey::new(Some(b)));
+            }
+        }
+        for id in [
+            None,
+            Some(RecursionId::Node(Node(5 << 32))),
+            Some(RecursionId::Symbol(SymbolId(0))),
+            Some(RecursionId::Symbol(SymbolId(0x8000_0000))),
+            Some(RecursionId::Type(TypeId(0x8000_0000))),
+        ] {
+            assert_eq!(RecursionKey::new(id), RecursionKey::NONE);
+        }
+    }
+
+    /// The Go scan of `isDeeplyNestedType` with the top entry as the probe,
+    /// comparing stored ids.
+    fn scan(stack: &InferenceStack, max_depth: i32) -> bool {
+        if (stack.types.len() as i32) < max_depth {
+            return false;
+        }
+        let probe = stack.entries.last().unwrap().id;
+        let mut count = 0;
+        let mut last = TypeId(0);
+        for (&t, entry) in stack.types.iter().zip(&stack.entries) {
+            if entry.id == probe {
+                if t >= last {
+                    count += 1;
+                    if count >= max_depth {
+                        return true;
+                    }
+                }
+                last = t;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn stack_answer_matches_scan() {
+        let keys = [
+            RecursionKey::NONE,
+            RecursionKey::new(Some(RecursionId::Node(Node((1 << 32) | 9)))),
+            RecursionKey::new(Some(RecursionId::Symbol(SymbolId(9)))),
+            RecursionKey::new(Some(RecursionId::Type(TypeId(9)))),
+            RecursionKey::new(Some(RecursionId::Type(TypeId(10)))),
+        ];
+        let mut stack = InferenceStack::default();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut fast_answers = 0;
+        for _ in 0..200_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let r = rng >> 16;
+            match r % 100 {
+                0 => stack.clear(),
+                1..=54 if stack.types.len() < 30 => {
+                    // NONE entries are rare, so most stacks have none.
+                    let key = if r % 1000 < 20 {
+                        keys[0]
+                    } else {
+                        keys[1 + (r / 100 % 4) as usize]
+                    };
+                    stack.push(TypeId((r / 1000 % 6) as u32 + 1), key);
+                    let has_none = stack.entries.iter().any(|e| e.id == RecursionKey::NONE);
+                    for max_depth in 1..=4 {
+                        let fast = stack.top_deeply_nested(max_depth);
+                        if has_none {
+                            assert_eq!(fast, None);
+                        } else {
+                            assert_eq!(fast, Some(scan(&stack, max_depth)));
+                            fast_answers += 1;
+                        }
+                    }
+                }
+                _ if !stack.types.is_empty() => stack.pop(),
+                _ => {}
+            }
+        }
+        assert!(fast_answers > 1000);
     }
 }

@@ -1183,9 +1183,19 @@ pub struct Relater {
     pub error_chain: Option<Rc<ErrorChain>>,
     pub related_info: Vec<Diagnostic>,
     pub maybe_keys: Vec<CacheHashKey>,
+    // PORT: perf. Go keeps the set in sync with `maybeKeys` at all times.
+    // Here it is empty while `maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT` and
+    // holds exactly the stack keys above that. Use `maybe_keys_contain`,
+    // `push_maybe_key` and `truncate_maybe_keys`, not the fields directly.
     pub maybe_keys_set: CacheKeySet,
     pub source_stack: Vec<TypeId>,
     pub target_stack: Vec<TypeId>,
+    // PORT: perf. Not in Go. `stack_recursion_id` of a prefix of
+    // `source_stack` and `target_stack`. `is_deeply_nested_relater_type`
+    // fills them to the full stack when it reaches its scan; a pop truncates
+    // them to the stack length.
+    pub source_ids: Vec<Option<RecursionId>>,
+    pub target_ids: Vec<Option<RecursionId>>,
     pub maybe_count: i32,
     pub source_depth: i32,
     pub target_depth: i32,
@@ -1193,6 +1203,89 @@ pub struct Relater {
     pub overflow: bool,
     pub relation_count: i32,
     pub next: Option<Rc<RefCell<Relater>>>,
+}
+
+// PORT: perf. Up to this many maybe keys, membership is a linear scan of
+// `maybe_keys` and `maybe_keys_set` stays empty. The stack is almost always
+// this small, and the scan is cheaper than the hash probe and the set writes.
+const MAYBE_KEYS_SCAN_LIMIT: usize = 16;
+
+// PORT: perf. A set that grew past this capacity is dropped when the stack
+// becomes small again, because hashbrown never shrinks and `clear` costs time
+// in its capacity.
+const MAYBE_KEYS_SET_KEEP_CAPACITY: usize = 256;
+
+// Empties the maybe keys set. Drops a large allocation instead of keeping it,
+// so an empty set never holds more than the keep capacity.
+fn clear_maybe_keys_set(set: &mut CacheKeySet) {
+    // Clearing an empty set still costs time in its capacity.
+    if set.is_empty() {
+        return;
+    }
+    if set.capacity() > MAYBE_KEYS_SET_KEEP_CAPACITY {
+        *set = CacheKeySet::default();
+    } else {
+        set.clear();
+    }
+}
+
+impl Relater {
+    // PORT: perf. Replaces Go `r.maybeKeysSet.Has(key)` (relater.go:3091,
+    // 3099) with the same result: the stack keys are unique (a key is pushed
+    // only when absent), and the set mirrors them above the scan limit.
+    #[inline]
+    pub fn maybe_keys_contain(&self, key: &CacheHashKey) -> bool {
+        if self.maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT {
+            self.maybe_keys.contains(key)
+        } else {
+            self.maybe_keys_set.contains(key)
+        }
+    }
+
+    // PORT: perf. Replaces the Go `maybeKeys` append and `maybeKeysSet.Add`
+    // (relater.go:3108). The set is written only above the scan limit. The
+    // push that crosses the limit fills it with every stack key.
+    #[inline]
+    pub fn push_maybe_key(&mut self, key: CacheHashKey) {
+        self.maybe_keys.push(key);
+        let len = self.maybe_keys.len();
+        if len == MAYBE_KEYS_SCAN_LIMIT + 1 {
+            self.maybe_keys_set.extend(self.maybe_keys.iter().copied());
+        } else if len > MAYBE_KEYS_SCAN_LIMIT {
+            self.maybe_keys_set.insert(key);
+        }
+        self.debug_check_maybe_keys();
+    }
+
+    // PORT: perf. Replaces the `maybeKeysSet.Delete` calls and the
+    // `maybeKeys[:maybeStart]` cut of Go resetMaybeStack (relater.go:3169).
+    // A cut to the scan limit or less clears the set in one step.
+    pub fn truncate_maybe_keys(&mut self, maybe_start: usize) {
+        if maybe_start <= MAYBE_KEYS_SCAN_LIMIT {
+            clear_maybe_keys_set(&mut self.maybe_keys_set);
+        } else {
+            for key in &self.maybe_keys[maybe_start..] {
+                self.maybe_keys_set.remove(key);
+            }
+        }
+        self.maybe_keys.truncate(maybe_start);
+        self.debug_check_maybe_keys();
+    }
+
+    fn debug_check_maybe_keys(&self) {
+        if cfg!(debug_assertions) {
+            if self.maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT {
+                debug_assert!(self.maybe_keys_set.is_empty());
+            } else {
+                debug_assert_eq!(self.maybe_keys_set.len(), self.maybe_keys.len());
+                debug_assert!(
+                    self.maybe_keys
+                        .iter()
+                        .all(|key| self.maybe_keys_set.contains(key))
+                );
+            }
+        }
+    }
 }
 
 impl Checker {
@@ -1228,6 +1321,8 @@ impl Checker {
                 maybe_keys_set,
                 source_stack,
                 target_stack,
+                source_ids,
+                target_ids,
                 maybe_count,
                 source_depth,
                 target_depth,
@@ -1240,13 +1335,12 @@ impl Checker {
             *error_chain = None;
             related_info.clear();
             maybe_keys.clear();
-            // PORT: resetMaybeStack already removed every key, and clearing
-            // an empty set still costs time in its capacity.
-            if !maybe_keys_set.is_empty() {
-                maybe_keys_set.clear();
-            }
+            // PORT: resetMaybeStack usually removed every key already.
+            clear_maybe_keys_set(maybe_keys_set);
             source_stack.clear();
             target_stack.clear();
+            source_ids.clear();
+            target_ids.clear();
             *maybe_count = 0;
             *source_depth = 0;
             *target_depth = 0;

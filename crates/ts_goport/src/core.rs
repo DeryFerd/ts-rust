@@ -148,10 +148,13 @@ impl Node {
     #[inline]
     #[must_use]
     pub fn new(file: usize, node: ts_ast::NodeId) -> Self {
-        // After freeze, a store file resolves every child id in one read.
+        // After freeze, a store file resolves every child id with no store
+        // borrow: an alias-free store gives the slot 0 value for id 0 and
+        // the raw handle `(file << 32) | (id + 1)` for any other id, with no
+        // table load; a store with alias slots reads its resolved table.
         // The synthetic file has no store, so it takes the slow path.
-        if let Some(resolved) = crate::ast::frozen_resolved(file) {
-            return resolved[node.index()];
+        if let Some(n) = crate::ast::frozen_resolve_store_id(file, node) {
+            return n;
         }
         Self::new_slow(file, node)
     }
@@ -185,7 +188,8 @@ impl Node {
 /// stored once for the whole process (see `intern`), and a `Name` is the
 /// 4-byte id of that text. Clones copy the id. Equal names have equal ids,
 /// so `==` compares ids. It orders, hashes and prints like the `str` it
-/// holds.
+/// holds. The low bit of the id is set when the text starts with
+/// `INTERNAL_SYMBOL_NAME_PREFIX` (`Name::is_internal`).
 #[derive(PartialEq, Eq)]
 pub struct Name(u32);
 
@@ -194,6 +198,22 @@ impl Name {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         intern::text(self.0)
+    }
+
+    /// True when the text starts with `INTERNAL_SYMBOL_NAME_PREFIX`.
+    /// The id holds this bit, so this reads no text.
+    #[inline]
+    #[must_use]
+    pub fn is_internal(&self) -> bool {
+        self.0 & intern::INTERNAL_BIT != 0
+    }
+
+    /// True when the text is `INTERNAL_SYMBOL_NAME_DEFAULT` ("default").
+    /// That name is interned first, at a fixed id, so this reads no text.
+    #[inline]
+    #[must_use]
+    pub fn is_default_symbol_name(&self) -> bool {
+        self.0 == intern::DEFAULT_ID
     }
 
     /// `table_hash` of the text. The interner keeps it, so this reads one
@@ -302,45 +322,68 @@ impl From<Name> for String {
     }
 }
 
+impl Name {
+    /// True when the text is `other`. The `str` compares below use it.
+    // PERF: the internal bit is set from this same prefix test at intern
+    // time, so a name and a text that differ in it are not equal, and the
+    // text is not read. For a constant `other` the prefix test folds at
+    // compile time (`name != INTERNAL_SYMBOL_NAME_COMPUTED` reads no text
+    // for a normal name).
+    #[inline]
+    fn eq_text(&self, other: &str) -> bool {
+        self.is_internal() == other.starts_with(crate::ast::INTERNAL_SYMBOL_NAME_PREFIX)
+            && self.as_str() == other
+    }
+}
+
 impl PartialEq<str> for Name {
+    #[inline]
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.eq_text(other)
     }
 }
 
 impl PartialEq<&str> for Name {
+    #[inline]
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.eq_text(other)
     }
 }
 
 impl PartialEq<String> for Name {
+    #[inline]
     fn eq(&self, other: &String) -> bool {
-        self.as_str() == other
+        self.eq_text(other)
     }
 }
 
 impl PartialEq<Name> for str {
+    #[inline]
     fn eq(&self, other: &Name) -> bool {
-        self == other.as_str()
+        other.eq_text(self)
     }
 }
 
 impl PartialEq<Name> for &str {
+    #[inline]
     fn eq(&self, other: &Name) -> bool {
-        *self == other.as_str()
+        other.eq_text(self)
     }
 }
 
 impl PartialEq<Name> for String {
+    #[inline]
     fn eq(&self, other: &Name) -> bool {
-        self == other.as_str()
+        other.eq_text(self)
     }
 }
 
 /// The process-wide string interner behind `Name`. Text is copied once into
-/// leaked blocks and never freed. Ids start at 1 and are close to dense
-/// (see `next_id`); id 0 is "".
+/// leaked blocks and never freed. A name id is `seq << 1 | internal`, where
+/// `seq` is a sequence number that starts at 1 and is close to dense (see
+/// `next_id`) and `internal` is `Name::is_internal`. The text tables are
+/// indexed by `seq` (`id >> 1`). Id 0 is "". Sequence number 1 is
+/// "default" (`DEFAULT_ID`), interned when the shards are made.
 /// `text` reads without a lock; `intern` takes one shard lock on a miss in
 /// the per-thread cache.
 mod intern {
@@ -357,7 +400,13 @@ mod intern {
     const CHUNKS: usize = 23;
     const SHARDS: usize = 32;
     const BLOCK: usize = 16 * 1024;
-    const CACHE_SLOTS: usize = 1024;
+    /// `CACHE` sets. Each set holds `CACHE_WAYS` slots, so the cache holds
+    /// 2048 names.
+    const CACHE_SETS: usize = 1024;
+    const CACHE_WAYS: usize = 2;
+    /// Initial capacity of each shard map (at least 32K names in all), so
+    /// interning a project rarely grows and rehashes a map under its lock.
+    const SHARD_CAPACITY: usize = 1024;
 
     type Slots = Box<[OnceLock<&'static str>]>;
     static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
@@ -365,10 +414,21 @@ mod intern {
     /// chunks as `TEXTS`. A table lookup by `Name` reads it instead of
     /// reading and hashing the text again.
     static HASHES: [OnceLock<Box<[AtomicU32]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
-    /// The next id block. Only `next_id` reads it.
-    static NEXT: AtomicU32 = AtomicU32::new(1);
-    /// Ids that a thread takes from `NEXT` at once.
+    /// The next sequence number block. Only `next_id` reads it. Sequence
+    /// number 1 is `DEFAULT_ID`.
+    static NEXT: AtomicU32 = AtomicU32::new(2);
+    /// Sequence numbers that a thread takes from `NEXT` at once.
     const ID_BLOCK: u32 = 64;
+    /// Every sequence number is below this, so `seq << 1 | 1` fits in a
+    /// `u32`.
+    const SEQ_LIMIT: u32 = 1 << 31;
+    /// The id bit that `Name::is_internal` reads.
+    pub(super) const INTERNAL_BIT: u32 = 1;
+    /// The id of `INTERNAL_SYMBOL_NAME_DEFAULT` ("default"): sequence
+    /// number 1, not internal. `shards` interns it first.
+    // PERF: effect P7-2. `is_static_private_identifier_property` tests for
+    // this name with an id compare instead of a text load.
+    pub(super) const DEFAULT_ID: u32 = 1 << 1;
 
     /// Hasher for `u64` keys that already are a `hash_str` hash, so a
     /// lookup does not hash the text again. The halves swap because the
@@ -409,32 +469,45 @@ mod intern {
     /// One `CACHE` slot: (hash, id, text). Id 0 marks an empty slot.
     type CacheSlot = Cell<(u64, u32, &'static str)>;
 
+    /// One `CACHE` set: slot 0 is the most recently used. Two 32-byte
+    /// slots on one 64-byte line, so a lookup reads one cache line.
+    #[repr(align(64))]
+    struct CacheSet([CacheSlot; CACHE_WAYS]);
+
     thread_local! {
-        /// Direct-mapped cache of recent `intern` results. It is a const
-        /// array with no destructor, so a hit reads thread-local memory
-        /// directly and needs no lazy init, borrow flag or `text` lookup.
-        static CACHE: [CacheSlot; CACHE_SLOTS] =
-            const { [const { Cell::new((0, 0, "")) }; CACHE_SLOTS] };
+        /// 2-way set-associative cache of recent `intern` results. It is a
+        /// const array with no destructor, so a hit reads thread-local
+        /// memory directly and needs no lazy init, borrow flag or `text`
+        /// lookup.
+        // PERF: two ways in place of one direct-mapped slot, so two hot
+        // names with the same set do not evict each other. The cache only
+        // holds ids the shards gave out, so it never changes an id.
+        static CACHE: [CacheSet; CACHE_SETS] = const {
+            [const { CacheSet([const { Cell::new((0, 0, "")) }; CACHE_WAYS]) }; CACHE_SETS]
+        };
 
         /// The ids this thread took from `NEXT` and did not use yet:
         /// (next, end).
         static IDS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     }
 
-    /// A new name id.
-    // PERF: a thread takes `ID_BLOCK` ids from `NEXT` at once, so threads
-    // that intern new names do not contend on one atomic, and the names of
-    // one file get close ids (their `HASHES` and `TEXTS` slots share cache
-    // lines). An id only has to be unique: ids already came in thread race
-    // order, and no output orders by id (`Name` orders by text). A thread
-    // that ends leaves its unused ids as empty slots.
+    /// A new sequence number. The name id is `seq << 1 | internal`.
+    // PERF: a thread takes `ID_BLOCK` numbers from `NEXT` at once, so
+    // threads that intern new names do not contend on one atomic, and the
+    // names of one file get close numbers (their `HASHES` and `TEXTS` slots
+    // share cache lines). An id only has to be unique: ids already came in
+    // thread race order, and no output orders by id (`Name` orders by
+    // text). A thread that ends leaves its unused numbers as empty slots.
     fn next_id() -> u32 {
         IDS.with(|ids| {
             let (mut next, mut end) = ids.get();
             if next == end {
                 next = NEXT.fetch_add(ID_BLOCK, Ordering::Relaxed);
-                // `end` fits, so no id is `u32::MAX`.
-                end = next.checked_add(ID_BLOCK).expect("name id overflow");
+                // `end` is below `SEQ_LIMIT`, so no id is `u32::MAX`.
+                end = next
+                    .checked_add(ID_BLOCK)
+                    .filter(|&end| end < SEQ_LIMIT)
+                    .expect("name id overflow");
             }
             ids.set((next + 1, end));
             next
@@ -449,13 +522,57 @@ mod intern {
         hasher.finish()
     }
 
-    /// Chunk and slot of `id`.
+    /// Chunk and slot of `id`, by its sequence number `id >> 1`.
     #[inline]
     fn slot(id: u32) -> (usize, usize) {
-        let v = (id >> FIRST_CHUNK_SHIFT) + 1;
+        let seq = id >> 1;
+        let v = (seq >> FIRST_CHUNK_SHIFT) + 1;
         let k = 31 - v.leading_zeros();
         let start = ((1u32 << k) - 1) << FIRST_CHUNK_SHIFT;
-        (k as usize, (id - start) as usize)
+        (k as usize, (seq - start) as usize)
+    }
+
+    /// Shard of a text with `hash_str` hash `hash`.
+    #[inline]
+    fn shard_index(hash: u64) -> usize {
+        (hash >> 59) as usize % SHARDS
+    }
+
+    /// Records the text and table hash of new id `id`.
+    fn set_slot(id: u32, hash: u64, stored: &'static str) {
+        let (chunk, index) = slot(id);
+        let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
+        let hashes =
+            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
+        hashes[index].store(super::fold_hash(hash), Ordering::Relaxed);
+        let slots = TEXTS[chunk].get_or_init(|| (0..chunk_len).map(|_| OnceLock::new()).collect());
+        let _ = slots[index].set(stored);
+    }
+
+    /// The shard locks, made on first use with "default" at `DEFAULT_ID`.
+    /// A `Name` with any id other than 0 comes from `intern_shared`, which
+    /// calls this first, so the text of `DEFAULT_ID` is always set.
+    fn shards() -> &'static [PaddedShard; SHARDS] {
+        SHARD_LOCKS.get_or_init(|| {
+            let mut shards: [PaddedShard; SHARDS] = std::array::from_fn(|_| {
+                PaddedShard(Mutex::new(Shard {
+                    ids: HashMap::with_capacity_and_hasher(SHARD_CAPACITY, Default::default()),
+                    collisions: FxHashMap::with_hasher(FxBuildHasher),
+                    free: Default::default(),
+                }))
+            });
+            let text: &'static str = crate::ast::INTERNAL_SYMBOL_NAME_DEFAULT;
+            debug_assert!(!text.starts_with(crate::ast::INTERNAL_SYMBOL_NAME_PREFIX));
+            let hash = hash_str(text);
+            set_slot(DEFAULT_ID, hash, text);
+            shards[shard_index(hash)]
+                .0
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ids
+                .insert(hash, (text, DEFAULT_ID));
+            shards
+        })
     }
 
     /// The text of name id `id`.
@@ -491,31 +608,38 @@ mod intern {
             return Name(0);
         }
         let hash = hash_str(s);
-        let cache_slot = (hash as usize) & (CACHE_SLOTS - 1);
+        let set = (hash as usize) & (CACHE_SETS - 1);
         let cached = CACHE.with(|cache| {
-            let (h, id, stored) = cache[cache_slot].get();
-            (id != 0 && h == hash && stored == s).then_some(id)
+            let [first, second] = &cache[set].0;
+            let (h, id, stored) = first.get();
+            if id != 0 && h == hash && stored == s {
+                return Some(id);
+            }
+            let entry = second.get();
+            let (h, id, stored) = entry;
+            if id != 0 && h == hash && stored == s {
+                // Least recently used goes second.
+                second.set(first.get());
+                first.set(entry);
+                return Some(id);
+            }
+            None
         });
         if let Some(id) = cached {
             return Name(id);
         }
         let (id, stored) = intern_shared(s, hash);
-        CACHE.with(|cache| cache[cache_slot].set((hash, id, stored)));
+        CACHE.with(|cache| {
+            let [first, second] = &cache[set].0;
+            second.set(first.get());
+            first.set((hash, id, stored));
+        });
         Name(id)
     }
 
     /// The id and stored text of `s`, from the shared map.
     fn intern_shared(s: &str, hash: u64) -> (u32, &'static str) {
-        let shards = SHARD_LOCKS.get_or_init(|| {
-            std::array::from_fn(|_| {
-                PaddedShard(Mutex::new(Shard {
-                    ids: HashMap::default(),
-                    collisions: FxHashMap::with_hasher(FxBuildHasher),
-                    free: Default::default(),
-                }))
-            })
-        });
-        let mut shard = shards[(hash >> 59) as usize % SHARDS]
+        let mut shard = shards()[shard_index(hash)]
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -537,14 +661,10 @@ mod intern {
         shard.free = tail;
         let head: &'static [u8] = head;
         let stored = std::str::from_utf8(head).expect("interned text is UTF-8");
-        let id = next_id();
-        let (chunk, index) = slot(id);
-        let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
-        let hashes =
-            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
-        hashes[index].store(super::fold_hash(hash), Ordering::Relaxed);
-        let slots = TEXTS[chunk].get_or_init(|| (0..chunk_len).map(|_| OnceLock::new()).collect());
-        let _ = slots[index].set(stored);
+        let internal = stored.starts_with(crate::ast::INTERNAL_SYMBOL_NAME_PREFIX);
+        // `INTERNAL_BIT` is the low bit.
+        let id = (next_id() << 1) | u32::from(internal);
+        set_slot(id, hash, stored);
         if hash_taken {
             shard.collisions.insert(stored, id);
         } else {
@@ -557,7 +677,9 @@ mod intern {
 /// `Symbol::declarations` (Go `[]*ast.Node`). An empty list allocates
 /// nothing and a single declaration is stored inline. Longer lists share one
 /// `Vec` between clones; the first write copies it, so each symbol still owns
-/// its own list, like a Go slice that is copied before an append.
+/// its own list, like a Go slice that is copied before an append. Program
+/// symbols keep longer lists in a leaked slice (`make_static`), with the same
+/// copy on the first write.
 #[derive(Clone, Default)]
 pub struct Declarations(DeclarationList);
 
@@ -567,6 +689,7 @@ enum DeclarationList {
     Empty,
     One(Node),
     Many(Arc<Vec<Node>>),
+    Static(&'static [Node]),
 }
 
 impl Declarations {
@@ -578,6 +701,25 @@ impl Declarations {
                 self.0 = DeclarationList::Many(Arc::new(vec![*first, node]));
             }
             DeclarationList::Many(list) => Arc::make_mut(list).push(node),
+            DeclarationList::Static(list) => {
+                let mut owned = Vec::with_capacity(list.len() + 1);
+                owned.extend_from_slice(*list);
+                owned.push(node);
+                self.0 = DeclarationList::Many(Arc::new(owned));
+            }
+        }
+    }
+
+    /// Moves a `Many` list into a leaked slice. Call it only for symbols
+    /// that live until exit (program symbols, like the AST).
+    // PERF: a clone of a `Static` list copies a pointer. A clone of a `Many`
+    // list changes a reference count that the checker threads share
+    // (`instantiate_symbol`, `clone_symbol`, member code).
+    fn make_static(&mut self) {
+        if matches!(self.0, DeclarationList::Many(_)) {
+            if let DeclarationList::Many(list) = std::mem::take(&mut self.0) {
+                self.0 = DeclarationList::Static(Arc::unwrap_or_clone(list).leak());
+            }
         }
     }
 }
@@ -590,16 +732,22 @@ impl std::ops::Deref for Declarations {
             DeclarationList::Empty => &[],
             DeclarationList::One(node) => std::slice::from_ref(node),
             DeclarationList::Many(list) => list,
+            DeclarationList::Static(list) => list,
         }
     }
 }
 
 impl std::ops::DerefMut for Declarations {
     fn deref_mut(&mut self) -> &mut [Node] {
+        if let DeclarationList::Static(list) = self.0 {
+            // The first write copies the list, so the symbol owns it.
+            self.0 = DeclarationList::Many(Arc::new(list.to_vec()));
+        }
         match &mut self.0 {
             DeclarationList::Empty => &mut [],
             DeclarationList::One(node) => std::slice::from_mut(node),
             DeclarationList::Many(list) => Arc::make_mut(list).as_mut_slice(),
+            DeclarationList::Static(_) => unreachable!("static list was just copied"),
         }
     }
 }
@@ -626,11 +774,13 @@ impl From<Declarations> for Vec<Node> {
             DeclarationList::Empty => Vec::new(),
             DeclarationList::One(node) => vec![node],
             DeclarationList::Many(list) => Arc::unwrap_or_clone(list),
+            DeclarationList::Static(list) => list.to_vec(),
         }
     }
 }
 
-/// By-value iterator over `Declarations`. It reads the shared list in place.
+/// By-value iterator over `Declarations`. It reads a shared or static list
+/// in place.
 pub struct DeclarationsIntoIter {
     list: Declarations,
     next: usize,
@@ -762,7 +912,30 @@ impl<T: Clone> CowChunks<T> {
         self.len == 0
     }
 
+    // PERF: the value is written into the owned last chunk inline on every
+    // path, and the out-of-line `make_room` takes no value. So an inlined
+    // caller builds the value in its slot and does not copy it from the
+    // stack.
+    #[inline(always)]
     pub fn push(&mut self, value: T) {
+        let values = match self.chunks.last_mut() {
+            Some(Chunk::Owned(values))
+                if self.len & COW_CHUNK_MASK != 0 && values.len() < values.capacity() =>
+            {
+                values
+            }
+            _ => self.make_room(),
+        };
+        values.push(value);
+        self.len += 1;
+    }
+
+    /// `push` when the last chunk is full, shared or at capacity: starts a
+    /// chunk, takes a shared chunk back or grows the first chunk. Returns
+    /// the owned last chunk, which has room for one value.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self) -> &mut Vec<T> {
         if self.len & COW_CHUNK_MASK == 0 {
             // The first chunk grows on demand, so a one-file arena on a bind
             // thread stays small.
@@ -772,12 +945,10 @@ impl<T: Clone> CowChunks<T> {
                 Vec::with_capacity(COW_CHUNK_LEN)
             }));
         }
-        self.chunks
-            .last_mut()
-            .expect("cow chunk")
-            .owned()
-            .push(value);
-        self.len += 1;
+        let values = self.chunks.last_mut().expect("cow chunk").owned();
+        // The same growth as `Vec::push` on a full chunk.
+        values.reserve(1);
+        values
     }
 
     /// Pushes every value in order, like `push` in a loop. Each chunk is
@@ -1314,6 +1485,7 @@ impl SymbolArena {
     }
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
+    #[inline]
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
         self.push_symbol(Symbol {
             flags,
@@ -1324,6 +1496,9 @@ impl SymbolArena {
 
     /// Pushes a complete symbol and returns its id. Use it instead of
     /// `new_symbol` plus `sym_mut` writes when every field is known.
+    // PERF: inlined with `CowChunks::push`, so the symbol is built in its
+    // chunk slot.
+    #[inline]
     pub fn push_symbol(&mut self, symbol: Symbol) -> SymbolId {
         let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
         self.symbols.push(symbol);
@@ -1360,6 +1535,9 @@ impl SymbolArena {
     /// Go `table[name]`, plus the slot of `name` in `table`, so that
     /// `set_slot` stores it without a second lookup. The table must not
     /// change between the two calls. A nil table reads as empty.
+    // PERF: always inlined, so the (id, slot) pair stays in registers in the
+    // caller and is not returned through memory.
+    #[inline(always)]
     #[must_use]
     pub fn get_slot(&self, table: SymbolTable, name: &Name) -> (SymbolId, TableSlot) {
         let hash = name.table_hash();
@@ -1381,6 +1559,8 @@ impl SymbolArena {
 
     /// Go `table[name] = symbol` for the `table` and `name` of `slot`
     /// (`get_slot`). Panics on a nil table, like Go.
+    // PERF: always inlined, so the slot is passed in registers.
+    #[inline(always)]
     pub fn set_slot(&mut self, slot: TableSlot, symbol: SymbolId) {
         assert!(slot.table.is_some(), "assignment to entry in nil map");
         let current = self.tables.get_mut(slot.table.index());
@@ -1465,6 +1645,8 @@ impl SymbolArena {
             symbol.exports = offsets.table(symbol.exports);
             symbol.parent = offsets.symbol(symbol.parent);
             symbol.export_symbol = offsets.symbol(symbol.export_symbol);
+            // Program symbols live until exit, so their lists can leak.
+            symbol.declarations.make_static();
         });
         let tables = tables.into_aligned(1, offsets.tables as usize + 1, |table| {
             let mut renamed = false;
@@ -1659,6 +1841,15 @@ impl SymbolArena {
             .map(|e| (intern::text(e.name), e.symbol))
     }
 
+    /// Borrowed `(name, symbol)` pairs in insertion order, like `iter`, but
+    /// it yields the `Name` and reads no text. Use it when the loop tests
+    /// the name by id or bit (`Name::is_internal`) or stores it.
+    pub fn iter_names(&self, table: SymbolTable) -> impl Iterator<Item = (Name, SymbolId)> {
+        self.table_entries(table)
+            .iter()
+            .map(|e| (Name(e.name), e.symbol))
+    }
+
     /// Snapshot of the values in insertion order.
     #[must_use]
     pub fn values(&self, table: SymbolTable) -> Vec<SymbolId> {
@@ -1828,7 +2019,10 @@ impl FileNodeBind {
     pub fn new<'a>(nodes: impl ExactSizeIterator<Item = &'a NodeBindData>) -> Self {
         let mut slots = Vec::with_capacity(nodes.len());
         let mut bases = Vec::with_capacity(nodes.len().div_ceil(NODE_BIND_BLOCK));
-        let mut entries: Vec<NodeBindData> = Vec::new();
+        // PERF: reserve what `NodeBindBuilder::new` reserves for its entries
+        // (one node in four), so the entries do not grow and copy step by
+        // step. `shrink_to_fit` below gives back the unused part.
+        let mut entries: Vec<NodeBindData> = Vec::with_capacity(nodes.len() / 4 + 1);
         let mut block_start = 0;
         for (index, data) in nodes.enumerate() {
             if index & (NODE_BIND_BLOCK - 1) == 0 {
@@ -1995,33 +2189,74 @@ impl LinkKey for FlowNodeId {
     }
 }
 
-/// Slots per page for arena keys. Pages are allocated on first use, so a
-/// store that few keys use stays small. Larger pages make the page table
-/// smaller, but cost memory in sparse stores (check query peak RSS).
-const ARENA_PAGE_SIZE: usize = 1 << 6;
-/// Slots per page for file keys. Small pages keep sparse stores small.
-const FILE_PAGE_SIZE: usize = 1 << 6;
+/// Slots per page. Pages are handed out on first use, so a store that few
+/// keys use stays small. Larger pages make the page tables smaller, but
+/// cost memory in sparse stores (check query peak RSS).
+const LINK_PAGE_SIZE: usize = 1 << 6;
+/// Pages per `LinkPages` chunk.
+const LINK_CHUNK_PAGES: usize = 1 << 6;
+/// Slots per `LinkPages` chunk.
+const LINK_CHUNK_SLOTS: usize = LINK_PAGE_SIZE * LINK_CHUNK_PAGES;
 
-/// A page table: pages of `N` slots, allocated on first use. A slot holds
+/// A page table: for each page of `LINK_PAGE_SIZE` keys, the `LinkPages`
+/// page index + 1, or zero when the page is absent.
+type PageTable = Vec<u32>;
+
+/// The slot pages of one `LinkStore`, for all its page tables. A slot holds
 /// the value index + 1; zero is absent.
-type SlotPages<const N: usize> = Vec<Option<Box<[u32; N]>>>;
-
-/// The slot of `index` in `pages`, or zero when its page is absent.
-#[inline]
-fn page_slot<const N: usize>(pages: &[Option<Box<[u32; N]>>], index: usize) -> u32 {
-    match pages.get(index / N) {
-        Some(Some(page)) => page[index % N],
-        _ => 0,
-    }
+// PERF: pages come from chunks of `LINK_CHUNK_PAGES` pages, so one zeroed
+// allocation serves 64 pages, and a page table entry is a 4-byte index in
+// place of an 8-byte page pointer.
+#[derive(Clone, Debug, Default)]
+struct LinkPages {
+    chunks: Vec<Box<[u32; LINK_CHUNK_SLOTS]>>,
+    /// Pages handed out.
+    len: usize,
 }
 
-/// The slot of `index` in `pages`. Adds the page if it is absent.
-fn page_slot_mut<const N: usize>(pages: &mut SlotPages<N>, index: usize) -> &mut u32 {
-    let page = index / N;
-    if page >= pages.len() {
-        pages.resize_with(page + 1, || None);
+impl LinkPages {
+    /// The slot of key `index` in `table`, or zero when its page is absent.
+    #[inline]
+    fn slot(&self, table: &[u32], index: usize) -> u32 {
+        match table.get(index / LINK_PAGE_SIZE) {
+            Some(&page) if page != 0 => {
+                let page = page as usize - 1;
+                self.chunks[page / LINK_CHUNK_PAGES]
+                    [(page % LINK_CHUNK_PAGES) * LINK_PAGE_SIZE + index % LINK_PAGE_SIZE]
+            }
+            _ => 0,
+        }
     }
-    &mut pages[page].get_or_insert_with(|| Box::new([0; N]))[index % N]
+
+    /// The slot of key `index` in `page`, a nonzero page table entry: the
+    /// page-hit path of `slot_mut`.
+    #[inline]
+    fn page_slot_mut(&mut self, page: u32, index: usize) -> &mut u32 {
+        let page = page as usize - 1;
+        &mut self.chunks[page / LINK_CHUNK_PAGES]
+            [(page % LINK_CHUNK_PAGES) * LINK_PAGE_SIZE + index % LINK_PAGE_SIZE]
+    }
+
+    /// The slot of key `index` in `table`. Adds the page if it is absent.
+    /// Only the out-of-line `LinkStore::add_record` calls it; the usual
+    /// case (the page exists) is `page_slot_mut` inline.
+    fn slot_mut(&mut self, table: &mut PageTable, index: usize) -> &mut u32 {
+        let entry = index / LINK_PAGE_SIZE;
+        if entry >= table.len() {
+            table.resize(entry + 1, 0);
+        }
+        if table[entry] == 0 {
+            if self.len % LINK_CHUNK_PAGES == 0 {
+                // `vec!` of zeros allocates zeroed memory (`calloc`), so
+                // the pages that stay unused are not written.
+                let chunk = vec![0u32; LINK_CHUNK_SLOTS].into_boxed_slice();
+                self.chunks.push(chunk.try_into().expect("link chunk size"));
+            }
+            self.len += 1;
+            table[entry] = u32::try_from(self.len).expect("link page overflow");
+        }
+        self.page_slot_mut(table[entry], index)
+    }
 }
 
 /// Go `core.LinkStore[K, V]`: lazily created per-key link records.
@@ -2029,11 +2264,13 @@ fn page_slot_mut<const N: usize>(pages: &mut SlotPages<N>, index: usize) -> &mut
 /// map. `get` reads an existing record inline and adds a new one out of line.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    /// Slot pages of arena keys. One flat table, so a hit reads the page
-    /// pointer, the slot and the value, with no per-group hop.
-    arena: SlotPages<ARENA_PAGE_SIZE>,
-    /// Slot pages of file keys, by file.
-    files: Vec<SlotPages<FILE_PAGE_SIZE>>,
+    /// Page table of arena keys. One flat table, so a hit reads the table
+    /// entry, the slot and the value, with no per-group hop.
+    arena: PageTable,
+    /// Page tables of file keys, by file.
+    files: Vec<PageTable>,
+    /// The slot pages of all page tables.
+    pages: LinkPages,
     /// Dense values in fixed-size chunks, so growth never copies or
     /// over-allocates a large block.
     values: Vec<Vec<V>>,
@@ -2049,6 +2286,7 @@ impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
         Self {
             arena: Vec::new(),
             files: Vec::new(),
+            pages: LinkPages::default(),
             values: Vec::new(),
             len: 0,
             map: FxHashMap::default(),
@@ -2061,11 +2299,11 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     #[inline]
     fn slot_value(&self, slot: LinkSlot) -> Option<usize> {
         let stored = match slot {
-            LinkSlot::Arena(index) => page_slot(&self.arena, index),
+            LinkSlot::Arena(index) => self.pages.slot(&self.arena, index),
             LinkSlot::File(file, index) => self
                 .files
                 .get(file)
-                .map_or(0, |pages| page_slot(pages, index)),
+                .map_or(0, |table| self.pages.slot(table, index)),
             LinkSlot::Map => 0,
         };
         (stored as usize).checked_sub(1)
@@ -2085,7 +2323,7 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         }
         let value = match self.slot_value(slot) {
             Some(value) => value,
-            None => self.create(slot),
+            None => self.create(key),
         };
         &mut self.values[value / LINK_CHUNK_SIZE][value % LINK_CHUNK_SIZE]
     }
@@ -2096,18 +2334,83 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         self.map.entry(key).or_default()
     }
 
-    /// Adds the record of a key with slots, which has none, and returns its
-    /// value index. Records get value indexes in creation order.
+    /// Adds the default record of a key with slots, which has none, and
+    /// returns its value index.
+    // PERF: not `#[cold]`: `get` calls it for every new record. Its usual
+    // case is inline (`new_record`).
+    #[inline(never)]
+    fn create(&mut self, key: K) -> usize {
+        let value = self.len;
+        self.new_record(key).push(V::default());
+        value
+    }
+
+    /// Go `store.Get(key)` followed by writes to the new record, for a key
+    /// that has no record (a symbol or type made just before): adds the
+    /// record with `value` and returns it.
+    // PERF: an inlined caller builds `value` in its chunk slot, and the
+    // default record is not written first.
+    #[inline(always)]
+    pub fn insert_new(&mut self, key: K, value: V) -> &mut V {
+        debug_assert!(!self.has(key), "insert_new on a key with a record");
+        if matches!(key.link_slot(), LinkSlot::Map) {
+            return self.map_insert_new(key, value);
+        }
+        let values = self.new_record(key);
+        values.push(value);
+        values.last_mut().expect("link record")
+    }
+
     #[cold]
     #[inline(never)]
-    fn create(&mut self, slot: LinkSlot) -> usize {
-        let stored = match slot {
-            LinkSlot::Arena(index) => page_slot_mut(&mut self.arena, index),
+    fn map_insert_new(&mut self, key: K, value: V) -> &mut V {
+        self.map.entry(key).insert_entry(value).into_mut()
+    }
+
+    /// Gives a key with slots, which has no record, the next value index
+    /// (records get value indexes in creation order). Returns the values
+    /// chunk that the caller pushes the value of the record into next.
+    // PERF: it takes no value, so an inlined caller builds the value in its
+    // chunk slot. The usual case (the page of the key exists and the last
+    // chunk has room) is inline; `add_record` does the rest. The key, not
+    // its 24-byte `LinkSlot`, is passed on, so it goes in a register.
+    #[inline(always)]
+    fn new_record(&mut self, key: K) -> &mut Vec<V> {
+        let (table, index) = match key.link_slot() {
+            LinkSlot::Arena(index) => (self.arena.as_slice(), index),
+            LinkSlot::File(file, index) => {
+                (self.files.get(file).map_or(&[][..], Vec::as_slice), index)
+            }
+            LinkSlot::Map => unreachable!("map keys have no slot"),
+        };
+        let page = table.get(index / LINK_PAGE_SIZE).copied().unwrap_or(0);
+        let has_room = page != 0
+            && self.len % LINK_CHUNK_SIZE != 0
+            && self
+                .values
+                .last()
+                .is_some_and(|values| values.len() < values.capacity());
+        if !has_room {
+            return self.add_record(key);
+        }
+        self.len += 1;
+        *self.pages.page_slot_mut(page, index) =
+            u32::try_from(self.len).expect("link store overflow");
+        self.values.last_mut().expect("link chunk")
+    }
+
+    /// `new_record` when the page of the key or room in the last chunk is
+    /// missing: adds them first.
+    #[cold]
+    #[inline(never)]
+    fn add_record(&mut self, key: K) -> &mut Vec<V> {
+        let stored = match key.link_slot() {
+            LinkSlot::Arena(index) => self.pages.slot_mut(&mut self.arena, index),
             LinkSlot::File(file, index) => {
                 if file >= self.files.len() {
                     self.files.resize_with(file + 1, Vec::new);
                 }
-                page_slot_mut(&mut self.files[file], index)
+                self.pages.slot_mut(&mut self.files[file], index)
             }
             LinkSlot::Map => unreachable!("map keys have no slot"),
         };
@@ -2119,14 +2422,12 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
                 Vec::with_capacity(LINK_CHUNK_SIZE)
             });
         }
-        self.values
-            .last_mut()
-            .expect("link chunk")
-            .push(V::default());
-        let value = self.len;
         self.len += 1;
         *stored = u32::try_from(self.len).expect("link store overflow");
-        value
+        let values = self.values.last_mut().expect("link chunk");
+        // The same growth as `Vec::push` on a full first chunk.
+        values.reserve(1);
+        values
     }
 
     /// Go `store.Has(key)`.
@@ -2324,6 +2625,13 @@ static DEFAULT: std::sync::OnceLock<&'static GoProgram> = std::sync::OnceLock::n
 
 /// Set by `register_program_version`. Then `set_prog` panics.
 static MULTI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True in a multi-program process (watch, language server, tests): a
+/// program version was registered, and `release_program` can free checkers.
+#[inline]
+pub fn is_multi_program() -> bool {
+    MULTI.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Installs the program of a one-program process and makes it current on
 /// this thread. Call once. The caller publishes the files of the program

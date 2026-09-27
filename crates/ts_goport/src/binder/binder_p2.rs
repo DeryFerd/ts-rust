@@ -14,6 +14,7 @@
 //! The small module-private helpers below read and write that state.
 
 use crate::prelude::*;
+use ts_ast::NodeData;
 
 // ---------------------------------------------------------------------------
 // Module-private access helpers (not Go functions).
@@ -214,9 +215,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:977 bindPropertyOrMethodOrAccessor
+    // PERF: query Q7-3. `d` is the data of `node`, which the caller already
+    // loaded with `ast_data_of`.
     pub fn bind_property_or_method_or_accessor(
         &mut self,
         node: Node,
+        d: &'static NodeData,
         symbol_flags: SymbolFlags,
         symbol_excludes: SymbolFlags,
     ) {
@@ -232,7 +236,7 @@ impl Binder {
             let current_flow = self.current_flow;
             self.set_flow_node(node, current_flow);
         }
-        if has_dynamic_name(node) {
+        if has_dynamic_name_in(node, d) {
             self.bind_anonymous_declaration(node, symbol_flags, INTERNAL_SYMBOL_NAME_COMPUTED);
         } else {
             self.declare_symbol_and_add_to_symbol_table(node, symbol_flags, symbol_excludes);
@@ -602,7 +606,10 @@ impl Binder {
 
     // Go: binder/binder.go:1195 bindParameter
     pub fn bind_parameter(&mut self, node: Node) {
-        let decl_name = node.name();
+        // PERF: query Q7-3. The node data is looked up once, and the field
+        // reads below (name, modifiers, question token) use it.
+        let d = ast_data_of(node);
+        let decl_name = node.name_in(d);
         if !node_flags(self, node).intersects(NodeFlags::AMBIENT) {
             // It is a SyntaxError if the identifier eval or arguments appears within a FormalParameterList of a
             // strict mode FunctionLikeDeclaration or FunctionExpression(13.1)
@@ -629,10 +636,15 @@ impl Binder {
         }
         // If this is a property-parameter, then also declare the property symbol into the
         // containing class.
-        if is_parameter_property_declaration(node, node.parent()) {
-            let class_declaration = node.parent().parent();
+        // Go `ast.IsParameterPropertyDeclaration(node, node.Parent)` on the loaded data.
+        let parent = node.parent();
+        if is_parameter_declaration(node)
+            && has_syntactic_modifier_in(node, d, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
+            && parent.kind() == SyntaxKind::Constructor
+        {
+            let class_declaration = parent.parent();
             let flags = SymbolFlags::PROPERTY
-                | if node.question_token().is_some() {
+                | if node.question_token_in(d).is_some() {
                     SymbolFlags::OPTIONAL
                 } else {
                     SymbolFlags::NONE
@@ -823,6 +835,18 @@ impl Binder {
     pub fn check_contextual_identifier(&mut self, node: Node) {
         // Report error only if there are no parse errors in file
         let flags = node_flags(self, node);
+        // PERF: U1 (a). Every test below is pure, and the code below does
+        // nothing for an ambient or JSDoc node or for a text that is no
+        // keyword (`original_keyword_kind == Identifier`). So these cases
+        // return here: the flag tests first, then the keyword bit made at
+        // parse (`Node::text_is_keyword`), without the diagnostics lookup,
+        // `is_identifier_name` and the text load.
+        if flags.intersects(NodeFlags::AMBIENT)
+            || flags.intersects(NodeFlags::JS_DOC)
+            || !node.text_is_keyword()
+        {
+            return;
+        }
         if source_file_info(self.file).diagnostics.is_empty()
             && !flags.intersects(NodeFlags::AMBIENT)
             && !flags.intersects(NodeFlags::JS_DOC)
@@ -1027,11 +1051,16 @@ impl Binder {
     }
 }
 
+/// `eval` and `arguments`, interned once for `is_eval_or_arguments_identifier`.
+static EVAL_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("eval"));
+static ARGUMENTS_NAME: std::sync::LazyLock<Name> =
+    std::sync::LazyLock::new(|| Name::from("arguments"));
+
 // Go: binder/binder.go:1447 isEvalOrArgumentsIdentifier
+// PERF: U1 (a). Compares name ids (`Node::text_is`), with no text load.
 pub fn is_eval_or_arguments_identifier(node: Node) -> bool {
     if is_identifier(node) {
-        let text = node.text();
-        return text == "eval" || text == "arguments";
+        return node.text_is(&EVAL_NAME) || node.text_is(&ARGUMENTS_NAME);
     }
     false
 }
@@ -1102,10 +1131,14 @@ impl Binder {
             if container_flags.intersects(ContainerFlags::HAS_LOCALS) {
                 // localsContainer := node
                 // localsContainer.LocalsContainerData().locals = make(SymbolTable)
+                // U1 (d): `Node::next_container` reads nil for other kinds.
+                debug_assert!(is_locals_container(node), "container chain on a {:?}", kind);
                 self.add_to_container_chain(node);
             }
         } else if container_flags.intersects(ContainerFlags::IS_BLOCK_SCOPED_CONTAINER) {
             self.block_scope_container = node;
+            // U1 (d): as above.
+            debug_assert!(is_locals_container(node), "container chain on a {:?}", kind);
             self.add_to_container_chain(node);
         }
         if container_flags.intersects(ContainerFlags::IS_THIS_CONTAINER) {

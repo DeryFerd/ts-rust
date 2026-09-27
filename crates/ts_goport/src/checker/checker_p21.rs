@@ -862,7 +862,7 @@ impl Checker {
                 self.instantiate_signatures(&declared_construct_signatures, mapper);
             index_infos = self.instantiate_index_infos(&declared_index_infos, mapper);
         }
-        let base_types = self.get_base_types(source);
+        let base_types = self.get_base_types_shared(source);
         if !base_types.is_empty() {
             if !instantiated {
                 // PORT: Go `maps.Clone(members)`; a nil map clones to nil.
@@ -944,12 +944,17 @@ impl Checker {
 
     // Go: checker/checker.go:19066 getBaseTypes
     pub fn get_base_types(&mut self, t: TypeId) -> Vec<TypeId> {
+        self.get_base_types_shared(t).to_vec()
+    }
+
+    /// Go `getBaseTypes` as a shared list: no element copy.
+    pub fn get_base_types_shared(&mut self, t: TypeId) -> SharedList<TypeId> {
         if !self
             .ty(t)
             .object_flags
             .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
         {
-            return Vec::new();
+            return SharedList::default();
         }
         if !self.ty(t).as_interface_type().base_types_resolved {
             if !self.push_type_resolution(
@@ -961,7 +966,8 @@ impl Checker {
             let t_symbol = self.ty(t).symbol;
             if self.ty(t).object_flags.intersects(ObjectFlags::TUPLE) {
                 let base = self.get_tuple_base_type(t);
-                self.ty_mut(t).as_interface_type_mut().resolved_base_types = vec![base];
+                self.ty_mut(t).as_interface_type_mut().resolved_base_types =
+                    SharedList::from(&[base][..]);
             } else if self
                 .sym(t_symbol)
                 .flags
@@ -1114,7 +1120,8 @@ impl Checker {
             );
             return;
         }
-        self.ty_mut(t).as_interface_type_mut().resolved_base_types = vec![reduced_base_type];
+        self.ty_mut(t).as_interface_type_mut().resolved_base_types =
+            SharedList::from(&[reduced_base_type][..]);
     }
 
     // Go: checker/checker.go:19166 getBaseTypeNodeOfClass
@@ -1474,8 +1481,17 @@ impl Checker {
             }
         }
         // PORT: copied only on a cache miss, like `get_erased_signature`.
-        let type_parameters = self.sig(signature).type_parameters.clone();
-        let mut constraints = Vec::with_capacity(type_parameters.len());
+        // PERF: the type parameters, the constraints and the passes use
+        // stack lists (`base_constraints` and `scratch` swap after each
+        // pass). The calls and their order are Go's; each mapper still keeps
+        // its own `SharedList` copy.
+        let type_parameters: SmallVec<[TypeId; 8]> = self
+            .sig(signature)
+            .type_parameters
+            .iter()
+            .copied()
+            .collect();
+        let mut constraints: SmallVec<[TypeId; 8]> = SmallVec::with_capacity(type_parameters.len());
         for &tp in &type_parameters {
             let constraint = self.get_constraint_of_type_parameter(tp);
             constraints.push(if constraint.is_some() {
@@ -1485,19 +1501,24 @@ impl Checker {
             });
         }
         let base_constraint_mapper = self.new_type_mapper(&type_parameters, &constraints);
-        let mut base_constraints = Vec::with_capacity(type_parameters.len());
-        for &tp in &type_parameters {
-            base_constraints.push(self.instantiate_type(tp, base_constraint_mapper));
-        }
+        let mut base_constraints: SmallVec<[TypeId; 8]> = SmallVec::new();
+        self.instantiate_types_into(
+            &type_parameters,
+            base_constraint_mapper,
+            &mut base_constraints,
+        );
+        let mut scratch: SmallVec<[TypeId; 8]> = SmallVec::new();
         // Run the immediate constraint mapper N-1 times so non-circular interdependent type parameters
         // resolve to their external dependencies without adding an extra expansion step for self-recursive constraints.
         for _ in 0..type_parameters.len() - 1 {
-            base_constraints = self.instantiate_types(&base_constraints, base_constraint_mapper);
+            self.instantiate_types_into(&base_constraints, base_constraint_mapper, &mut scratch);
+            std::mem::swap(&mut base_constraints, &mut scratch);
         }
         // and then apply a type eraser to remove any remaining circularly dependent type parameters
         let any_type = self.any_type;
         let eraser = self.new_array_to_single_type_mapper(&type_parameters, any_type);
-        base_constraints = self.instantiate_types(&base_constraints, eraser);
+        self.instantiate_types_into(&base_constraints, eraser, &mut scratch);
+        std::mem::swap(&mut base_constraints, &mut scratch);
         let mapper = self.new_type_mapper(&type_parameters, &base_constraints);
         let result =
             self.instantiate_signature_ex(signature, mapper, true /*eraseTypeParameters*/);
@@ -1588,10 +1609,16 @@ impl Checker {
                     if !self.is_error_type(base_type) {
                         if self.is_valid_base_type(base_type) {
                             if t != base_type && !self.has_base_type(base_type, t) {
-                                self.ty_mut(t)
-                                    .as_interface_type_mut()
-                                    .resolved_base_types
-                                    .push(base_type);
+                                // Go `append`. The list is shared, so it is
+                                // rebuilt with the new element; a reentrant
+                                // read sees each partial list, like Go.
+                                let base_types =
+                                    &mut self.ty_mut(t).as_interface_type_mut().resolved_base_types;
+                                let mut appended: SmallVec<[TypeId; 8]> =
+                                    SmallVec::with_capacity(base_types.len() + 1);
+                                appended.extend(base_types.iter().copied());
+                                appended.push(base_type);
+                                *base_types = SharedList::from(&appended[..]);
                             } else {
                                 self.report_circular_base_type(declaration, t);
                             }
