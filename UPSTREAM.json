@@ -78,6 +78,27 @@
         "go": "go1.26.8",
         "build": "scripts/upstream/record.py typesyms (go build -overlay with typesyms/tools/typesymdump-main.go)"
       }
+    },
+    "16c25522e123": {
+      "repo": "microsoft/typescript-go",
+      "commit": "16c25522e1230b69b11210cfad066d779e6319ba",
+      "date": "2026-08-19",
+      "layout": "typescript-go",
+      "equivalent": {
+        "repo": "microsoft/TypeScript",
+        "commit": "51c91ec1dd16769887153914ed283d96f578155e",
+        "subdir": "tsc",
+        "note": "tree-identical: 51c91ec1d:tsc = 16c25522e^{tree} = 21d917b05. Last old-repo commit before the migration (tsgo#4917). Bump B target."
+      },
+      "typescriptSubmodule": "5848bc5157b22ff7f4e3369f4645a514a433b15f",
+      "goCheckout": "/home/theo/.explore/repos/microsoft__typescript-go@16c25522e",
+      "oracle": {
+        "path": "/home/theo/.local/bin/tsgo-oracle-16c25522e123",
+        "sha256": "5751c96046ed2ef6f25eb3b5a220c144ea542aea184a043c8db2cc8b5e0209d3",
+        "go": "go1.26.4",
+        "version": "Version 7.1.0-dev",
+        "build": "CGO_ENABLED=0 GOAMD64=v1 go build ./cmd/tsgo"
+      }
     }
   }
 }

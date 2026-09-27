@@ -56,18 +56,23 @@ impl dirty::Cloneable for Rc<RefCell<RealpathAliasSet>> {
 }
 
 // Go: project/snapshotfs.go:55 SnapshotFS
+// PORT: Go shares `diskFiles`, `diskDirectories` and
+// `nodeModulesRealpathAliases` between snapshots until one of them changes
+// (a Go map is a reference). They are `Rc` maps here, so a snapshot clone
+// with no disk change copies no map, and dropping an old snapshot frees
+// nothing that the next one still uses.
 pub struct SnapshotFS {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub fs: Rc<dyn vfs::Fs>,
     pub overlays: IndexMap<tspath::Path, Rc<Overlay>>,
     pub overlay_directories: FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>>,
-    pub disk_files: FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>,
-    pub disk_directories: FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>,
+    pub disk_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>>,
+    pub disk_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
     pub read_files: RefCell<FxHashMap<tspath::Path, MemoizedDiskFile>>,
     // nodeModulesRealpathAliases maps realpath-based keys to sets of symlink-based keys,
     // for files inside node_modules that are accessed through directory symlinks.
     // This allows watch events (which use realpaths) to invalidate files cached under symlink paths.
-    pub node_modules_realpath_aliases: FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>,
+    pub node_modules_realpath_aliases: Rc<FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
 }
 
 // Go: project/snapshotfs.go:69 memoizedDiskFile
@@ -225,16 +230,16 @@ pub struct SnapshotFSBuilder {
 }
 
 // Go: project/snapshotfs.go:145 newSnapshotFSBuilder
-// PORT: Go shares the base maps; here the caller passes owned copies.
-// `position_encoding` is unused, as in Go.
+// PORT: the base maps are shared `Rc` maps, as Go shares its maps (no
+// copy). `position_encoding` is unused, as in Go.
 #[allow(clippy::too_many_arguments)]
 pub fn new_snapshot_fs_builder(
     fs: Rc<dyn vfs::Fs>,
     prev_overlays: IndexMap<tspath::Path, Rc<Overlay>>,
     overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    disk_files: FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>,
-    disk_directories: FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>,
-    node_modules_realpath_aliases: FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>,
+    disk_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>>,
+    disk_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    node_modules_realpath_aliases: Rc<FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
     _position_encoding: lsproto::PositionEncodingKind,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 ) -> Rc<SnapshotFSBuilder> {
@@ -270,9 +275,9 @@ pub fn new_snapshot_fs_builder(
         prev_overlays,
         overlays,
         overlay_directories,
-        disk_files: dirty::new_sync_map(disk_files),
-        disk_directories: dirty::new_map(disk_directories),
-        node_modules_realpath_aliases: dirty::new_sync_map(node_modules_realpath_aliases),
+        disk_files: dirty::new_sync_map_shared(disk_files),
+        disk_directories: dirty::new_map_shared(disk_directories),
+        node_modules_realpath_aliases: dirty::new_sync_map_shared(node_modules_realpath_aliases),
         to_path,
         accessible_entries: RefCell::default(),
     })
@@ -345,7 +350,8 @@ impl SnapshotFSBuilder {
                 .file_name();
             on_added_file(key, &file_name);
         };
-        let (disk_files, changed) = self.disk_files.finalize_with(dirty::FinalizationHooks {
+        // Go: s.diskFiles.FinalizeWith(...) (PORT: the shared form)
+        let (disk_files, changed) = self.disk_files.finalize_shared(dirty::FinalizationHooks {
             on_delete: Some(&mut on_delete),
             on_change: None,
             on_add: Some(&mut on_add),
@@ -387,8 +393,10 @@ impl SnapshotFSBuilder {
             }
         }
 
-        let (node_modules_realpath_aliases, aliases_changed) =
-            self.node_modules_realpath_aliases.finalize_exported();
+        // Go: s.nodeModulesRealpathAliases.Finalize() (PORT: the shared form)
+        let (node_modules_realpath_aliases, aliases_changed) = self
+            .node_modules_realpath_aliases
+            .finalize_shared(dirty::FinalizationHooks::default());
 
         (
             Rc::new(SnapshotFS {
@@ -397,7 +405,7 @@ impl SnapshotFSBuilder {
                 overlay_directories: self.overlay_directories.clone(),
                 disk_files,
                 // Go: core.FirstResult(s.diskDirectories.Finalize())
-                disk_directories: self.disk_directories.finalize().0,
+                disk_directories: self.disk_directories.finalize_shared().0,
                 read_files: RefCell::new(FxHashMap::default()),
                 node_modules_realpath_aliases,
                 to_path: self.to_path.clone(),

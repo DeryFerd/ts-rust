@@ -49,20 +49,21 @@ fn text(s: &str) -> MapFile {
 }
 
 /// Go `newSnapshotFSBuilder(fs, prevOverlays{}, overlays, diskFiles, diskDirectories, aliases, UTF16, toPath)`.
+/// The maps are new (owned) or shared with a previous snapshot (`Rc`).
 fn builder(
     fs: Rc<dyn Fs>,
     overlays: Overlays,
-    disk_files: DiskFiles,
-    dirs: Dirs,
-    aliases: Aliases,
+    disk_files: impl Into<Rc<DiskFiles>>,
+    dirs: impl Into<Rc<Dirs>>,
+    aliases: impl Into<Rc<Aliases>>,
 ) -> Rc<SnapshotFSBuilder> {
     new_snapshot_fs_builder(
         fs,
         IndexMap::default(), // prevOverlays
         overlays,
-        disk_files,
-        dirs,
-        aliases,
+        disk_files.into(),
+        dirs.into(),
+        aliases.into(),
         lsproto::PositionEncodingKind::UTF16,
         to_path(),
     )
@@ -557,10 +558,10 @@ fn snapshot_fs(
         fs,
         overlays,
         overlay_directories,
-        disk_files,
-        disk_directories,
+        disk_files: Rc::new(disk_files),
+        disk_directories: Rc::new(disk_directories),
         read_files: RefCell::default(),
-        node_modules_realpath_aliases: Aliases::default(),
+        node_modules_realpath_aliases: Rc::new(Aliases::default()),
     })
 }
 

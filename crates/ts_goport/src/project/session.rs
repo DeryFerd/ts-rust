@@ -10,11 +10,12 @@
 //! `background::Queue`, which posts them to `gostd::local::go` in Go
 //! enqueue order. Debounce sleeps, the idle cache clean timer and the
 //! telemetry ticker are `gostd::local::after_func` timers, so their
-//! functions run on the dispatch thread. `WaitForBackgroundTasks` drains
-//! `gostd::local` through `Queue::wait`. The one exception is the clone of
-//! the auto-import warm, which is `gostd::local` idle work: it runs only
-//! when no message waits, and the reader thread can cancel it
-//! (`WarmAutoImportPreempt`).
+//! functions run on the dispatch thread; a debounced task keeps a
+//! `background::TaskHold` until its timer has run. `WaitForBackgroundTasks`
+//! drains `gostd::local` through `Queue::wait`. The one exception is the
+//! clone of the auto-import warm, which is `gostd::local` idle work: the
+//! LSP server runs it only after a quiet period with no message, and the
+//! reader thread can cancel it (`WarmAutoImportPreempt`).
 //!
 //! Go runtime metrics (`runtime/metrics`) exist only in the Go runtime.
 //! Performance telemetry reads them as `KindBad` (`metrics_read`), so its
@@ -171,6 +172,10 @@ pub struct Session {
     // PORT: the `Send` copy of `warm_auto_import_cancel` for the LSP reader
     // thread. See `WarmAutoImportPreempt`.
     pub warm_auto_import_preempt: WarmAutoImportPreempt,
+    // PORT: the auto-import warm whose clone waits for idle time (see
+    // `warm_auto_import_cache`), and whether an idle job for it is queued.
+    pub warm_auto_import_pending: RefCell<Option<PendingWarm>>,
+    pub warm_auto_import_queued: Cell<bool>,
 
     // idleCacheCleanTimer is a resettable timer for scheduling idle disk
     // cache cleans. The timer resets on any file event (open, close,
@@ -236,10 +241,10 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
                 fs: init.fs.clone(),
                 overlays: IndexMap::default(),
                 overlay_directories: FxHashMap::default(),
-                disk_files: FxHashMap::default(),
-                disk_directories: FxHashMap::default(),
+                disk_files: Rc::new(FxHashMap::default()),
+                disk_directories: Rc::new(FxHashMap::default()),
                 read_files: RefCell::new(FxHashMap::default()),
-                node_modules_realpath_aliases: FxHashMap::default(),
+                node_modules_realpath_aliases: Rc::new(FxHashMap::default()),
             }),
             init.options.clone(),
             Rc::new(ConfigFileRegistry::default()),
@@ -286,6 +291,8 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         diagnostics_refresh_generation: Cell::new(0),
         warm_auto_import_cancel: RefCell::new(None),
         warm_auto_import_preempt: WarmAutoImportPreempt::default(),
+        warm_auto_import_pending: RefCell::new(None),
+        warm_auto_import_queued: Cell::new(false),
         idle_cache_clean_timer: RefCell::new(None),
         performance_telemetry_cancel: RefCell::new(None),
         seen_projects: RefCell::new(FxHashSet::default()),
@@ -508,8 +515,9 @@ impl Session {
     // `select { case <-time.After(delay): case <-ctx.Done(): }`. Here the
     // task arms a `gostd::local::after_func` timer for the delay, and the
     // rest of the task runs when it fires; a cancelled context makes it
-    // return then (Go returns at once; nothing else differs). `Queue::wait`
-    // does not wait for the armed timer.
+    // return then (Go returns at once; nothing else differs). The task
+    // keeps a `background::TaskHold` until then, so `Queue::wait` (Go
+    // `WaitForBackgroundTasks`) waits for the refresh, as Go's does.
     pub fn schedule_diagnostics_refresh(self: &Rc<Self>) {
         // Cancel any existing scheduled diagnostics refresh
         let existing_cancel = self.diagnostics_refresh_cancel.borrow().clone();
@@ -532,6 +540,7 @@ impl Session {
         self.background_queue.enqueue(&debounce_ctx, move |ctx| {
             let ctx = ctx.clone();
             let delay = s.options.debounce_delay;
+            let hold = s.background_queue.hold();
             let mut task = Some(move || {
                 let run = || {
                     // Sleep for the debounce delay
@@ -565,6 +574,7 @@ impl Session {
                 run();
                 // Go: defer cancel()
                 cancel();
+                drop(hold);
             });
             gostd::local::after_func(
                 delay,
@@ -590,8 +600,9 @@ impl Session {
     }
 
     // Go: project/session.go:453 ScheduleSnapshotUpdate
-    // PORT: the debounce sleep is a `gostd::local::after_func` timer, as in
-    // `schedule_diagnostics_refresh`.
+    // PORT: the debounce sleep is a `gostd::local::after_func` timer, and
+    // the task keeps a `background::TaskHold` until the update has run, as
+    // in `schedule_diagnostics_refresh`.
     pub fn schedule_snapshot_update(self: &Rc<Self>, reason: UpdateReason) {
         // Cancel any existing scheduled snapshot update
         let existing_cancel = self.scheduled_snapshot_update_cancel.borrow().clone();
@@ -616,6 +627,7 @@ impl Session {
         self.background_queue.enqueue(&debounce_ctx, move |ctx| {
             let ctx = ctx.clone();
             let delay = s.options.debounce_delay;
+            let hold = s.background_queue.hold();
             let mut task = Some(move || {
                 let run = || {
                     // Sleep for the debounce delay
@@ -655,6 +667,7 @@ impl Session {
                 run();
                 // Go: defer cancel()
                 cancel();
+                drop(hold);
             });
             gostd::local::after_func(
                 delay,
@@ -689,7 +702,25 @@ impl Session {
             *self.warm_auto_import_cancel.borrow_mut() = None;
             self.warm_auto_import_preempt.clear();
         }
+        // PORT: a cancelled warm whose clone has not started lets its
+        // snapshot go now (see `run_pending_warm`).
+        match self.warm_auto_import_pending.take() {
+            Some(warm) if warm.ctx.err().is_some() => self.end_pending_warm(warm),
+            pending => *self.warm_auto_import_pending.borrow_mut() = pending,
+        }
     }
+}
+
+/// PORT: the state that Go's `warmAutoImportCache` keeps for its clone,
+/// while the clone waits for idle time. It holds a reference on
+/// `new_snapshot` (Go `tryRef`).
+pub struct PendingWarm {
+    ctx: Context,
+    cancel: gostd::context::CancelFunc,
+    changed_file: lsproto::DocumentUri,
+    new_snapshot: Rc<Snapshot>,
+    /// The id that Go's clone takes when the warm starts.
+    snapshot_id: u64,
 }
 
 /// PORT: cancels the auto-import warm from the LSP reader thread.
@@ -1926,7 +1957,8 @@ impl Session {
     // WaitForBackgroundTasks waits for all background tasks to complete.
     // This is intended to be used only for testing purposes.
     // PORT: `Queue::wait` runs `gostd::local::run_pending` until the
-    // queue's tasks have finished. The auto-import warm clone is idle work
+    // queue's tasks have finished, including the debounced ones, which
+    // count until their timer has run. The auto-import warm clone is idle work
     // (see `warm_auto_import_cache`); Go waits for it as part of its task,
     // so this runs the idle work too.
     pub fn wait_for_background_tasks(&self) {
@@ -2880,12 +2912,16 @@ impl Session {
     // every return; the port calls them on each path, in Go's defer order.
     //
     // PORT: the clone (the export extraction, which can take hundreds of
-    // ms) runs as idle work (`gostd::local::go_idle`), after the checks and
-    // the cancel setup that Go does first. The dispatch loop starts it only
-    // when no message waits, so a request that has arrived does not wait
-    // for it. Go runs the whole warm on a goroutine. A file event cancels
-    // the context before or during the clone (`WarmAutoImportPreempt`); the
-    // clone still runs, as Go's does, and its result is discarded.
+    // ms) runs as idle work (`gostd::local::go_idle`, `run_pending_warm`),
+    // after the checks and the cancel setup that Go does first. The LSP
+    // dispatch loop starts it only after a quiet period with no message, so
+    // a request does not wait for it. Go runs the whole warm on a goroutine.
+    // A file event or a newer warm cancels the context before or during the
+    // clone (`WarmAutoImportPreempt`). A clone that has started still runs,
+    // as Go's does, and its result is discarded. A clone that has not
+    // started is skipped: Go's would run and be discarded, and the only
+    // trace it leaves is its snapshot id, which is taken here, where Go's
+    // clone takes it.
     pub fn warm_auto_import_cache(
         self: &Rc<Self>,
         ctx: &Context,
@@ -2964,40 +3000,85 @@ impl Session {
             }
             // Go: defer newSnapshot.Deref(s)
 
-            let s = self.clone();
-            let new_snapshot = new_snapshot.clone();
-            gostd::local::go_idle(Box::new(move || {
-                let warm_change = SnapshotChange {
-                    reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
-                    resource_request: ResourceRequest {
-                        documents: vec![changed_file.clone()],
-                        auto_imports: changed_file.clone(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let cloned_snapshot = Snapshot::clone_(
-                    &new_snapshot,
-                    &warm_ctx,
-                    warm_change,
-                    &new_snapshot.fs.overlays,
-                    &s,
-                );
-
-                // If cancelled during clone, discard the incomplete result.
-                if warm_ctx.err().is_some() {
-                    Snapshot::deref(&cloned_snapshot, &s);
-                    Snapshot::deref(&new_snapshot, &s);
-                    cancel();
-                    return;
-                }
-
-                // Conditionally adopt: if the session hasn't moved past newSnapshot,
-                // promote the clone so future requests benefit from the warmed cache.
-                s.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
-                Snapshot::deref(&new_snapshot, &s);
-                cancel();
-            }));
+            // PORT: Go's clone would take its snapshot id now.
+            let snapshot_id = self.snapshot_id.get() + 1;
+            self.snapshot_id.set(snapshot_id);
+            let warm = PendingWarm {
+                ctx: warm_ctx,
+                cancel,
+                changed_file,
+                new_snapshot: new_snapshot.clone(),
+                snapshot_id,
+            };
+            // A pending warm here was cancelled above (`previous_cancel`).
+            if let Some(previous) = self.warm_auto_import_pending.replace(Some(warm)) {
+                self.end_pending_warm(previous);
+            }
+            if !self.warm_auto_import_queued.replace(true) {
+                let s = self.clone();
+                gostd::local::go_idle(Box::new(move || s.run_pending_warm()));
+            }
         }
+    }
+
+    /// PORT: the part of Go `warmAutoImportCache` after `tryRef`, run as
+    /// idle work for the pending warm (see `warm_auto_import_cache`).
+    pub fn run_pending_warm(self: &Rc<Self>) {
+        self.warm_auto_import_queued.set(false);
+        let Some(warm) = self.warm_auto_import_pending.take() else {
+            return;
+        };
+        if warm.ctx.err().is_some() {
+            self.end_pending_warm(warm);
+            return;
+        }
+        let PendingWarm {
+            ctx: warm_ctx,
+            cancel,
+            changed_file,
+            new_snapshot,
+            snapshot_id,
+        } = warm;
+
+        let warm_change = SnapshotChange {
+            reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
+            resource_request: ResourceRequest {
+                documents: vec![changed_file.clone()],
+                auto_imports: changed_file,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // PORT: the clone takes the id kept for it when the warm started.
+        let next_snapshot_id = self.snapshot_id.replace(snapshot_id - 1);
+        let cloned_snapshot = Snapshot::clone_(
+            &new_snapshot,
+            &warm_ctx,
+            warm_change,
+            &new_snapshot.fs.overlays,
+            self,
+        );
+        self.snapshot_id.set(next_snapshot_id);
+
+        // If cancelled during clone, discard the incomplete result.
+        if warm_ctx.err().is_some() {
+            Snapshot::deref(&cloned_snapshot, self);
+            Snapshot::deref(&new_snapshot, self);
+            cancel();
+            return;
+        }
+
+        // Conditionally adopt: if the session hasn't moved past newSnapshot,
+        // promote the clone so future requests benefit from the warmed cache.
+        self.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
+        Snapshot::deref(&new_snapshot, self);
+        cancel();
+    }
+
+    /// PORT: Go's deferred `newSnapshot.Deref(s)` and `cancel()` for a
+    /// pending warm that ends without its clone.
+    fn end_pending_warm(&self, warm: PendingWarm) {
+        Snapshot::deref(&warm.new_snapshot, self);
+        (warm.cancel)();
     }
 }

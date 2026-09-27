@@ -11,13 +11,15 @@
 //! Contract with the dispatch loop: the server calls `set_waker(f)` once. A
 //! timer thread calls the waker when a `LocalTimer` becomes due. The
 //! dispatch loop calls `run_pending()` after each message and after each
-//! wake-up; Go `WaitForBackgroundTasks` calls it until `has_pending()` is
-//! false.
+//! wake-up. Go `WaitForBackgroundTasks` (`background::Queue::wait`) calls
+//! `run_pending()`, and `wait_pending()` while a queued task sleeps on a
+//! timer, until the queue's tasks have finished.
 //!
 //! Idle work (`go_idle`) is a second, separate queue for long work that
 //! sends nothing to the client (the auto-import warm). The dispatch loop
-//! runs it with `run_idle()` only while no message waits, so it does not
-//! delay a request that has arrived. `run_pending` does not run it.
+//! runs it with `run_idle()` only after a quiet period with no message, so
+//! it does not delay a request that has arrived. `run_pending` does not run
+//! it.
 //!
 //! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`
 //! and `run_idle` act on the calling thread's queues.
@@ -41,6 +43,8 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 struct LocalShared {
     /// Ready work in the order it became ready.
     queue: Mutex<VecDeque<Entry>>,
+    /// Signalled when a timer thread adds to `queue` (for `wait_pending`).
+    ready: Condvar,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -65,7 +69,11 @@ struct LocalState {
 
 thread_local! {
     static LOCAL: LocalState = LocalState {
-        shared: Arc::new(LocalShared { queue: Mutex::new(VecDeque::new()), waker: Mutex::new(None) }),
+        shared: Arc::new(LocalShared {
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            waker: Mutex::new(None),
+        }),
         next_id: Cell::new(1),
         jobs: RefCell::new(FxHashMap::default()),
         timers: RefCell::new(FxHashMap::default()),
@@ -98,6 +106,11 @@ pub fn go_idle(f: Box<dyn FnOnce()>) {
     LOCAL.with(|l| l.idle.borrow_mut().push_back(f));
 }
 
+/// Whether idle work of this thread waits for `run_idle`.
+pub fn has_idle() -> bool {
+    LOCAL.with(|l| !l.idle.borrow().is_empty())
+}
+
 /// Runs the oldest idle job of this thread. Returns false if there was none.
 /// Work that the job queues with `go` waits for the next `run_pending`.
 pub fn run_idle() -> bool {
@@ -123,6 +136,37 @@ pub fn set_waker(f: Waker) {
 /// `run_pending`. Armed timers that are not due yet do not count.
 pub fn has_pending() -> bool {
     LOCAL.with(|l| !lock(&l.shared.queue).is_empty())
+}
+
+/// Blocks until ready work waits for `run_pending`. Returns false at once
+/// when nothing is ready and no timer of this thread is armed, so nothing
+/// can become ready (only this thread arms timers).
+pub fn wait_pending() -> bool {
+    let shared = LOCAL.with(|l| l.shared.clone());
+    loop {
+        if has_pending() {
+            return true;
+        }
+        // A timer state lock is not taken under the queue lock: the timer
+        // thread takes them in the other order.
+        let armed = LOCAL.with(|l| {
+            l.timers
+                .borrow()
+                .values()
+                .any(|t| lock(&t.core.state).when.is_some())
+        });
+        if !armed {
+            // A timer that fired after the first check cleared `when` and
+            // queued its entry under one hold of its state lock, so the
+            // entry is there now.
+            return has_pending();
+        }
+        let queue = lock(&shared.queue);
+        if queue.is_empty() {
+            // The timeout only bounds a missed signal; a due timer signals.
+            drop(shared.ready.wait_timeout(queue, Duration::from_millis(50)));
+        }
+    }
 }
 
 /// Runs the ready work of this thread in the order it became ready, until
@@ -319,6 +363,7 @@ fn run_local_timer(core: Arc<LocalTimerCore>) {
         state.when = None;
         state.queued += 1;
         lock(&core.shared.queue).push_back(Entry::Timer(core.id));
+        core.shared.ready.notify_all();
         drop(state);
         let waker = lock(&core.shared.waker).clone();
         if let Some(waker) = waker {

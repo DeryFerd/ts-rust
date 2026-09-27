@@ -4,8 +4,3 @@
 # moduleresolution, unionordering, parentpointers, test, crash.
 # key: <local|submodule>/<compiler|conformance>/<configured name>.
 # Bug ids are in target/continuation-r97-goport/tests2/bugs/S1.md.
-
-# S1-001: CommonJS exported variable statement with no output is an empty
-# SyntaxList, not nil (commonjs_module_p2.rs visit_top_level_variable_statement).
-output submodule/conformance/exportNonInitializedVariablesInIfThenStatementNoCrash1(module=commonjs).ts S1-001
-output submodule/conformance/labeledStatementExportDeclarationNoCrash1(module=commonjs).ts S1-001

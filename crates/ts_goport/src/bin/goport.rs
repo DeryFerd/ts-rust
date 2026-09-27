@@ -55,11 +55,17 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// projects.
 const STACK_SIZE: usize = 1 << 30;
 
-/// The opt-in `jemalloc` feature makes jemalloc the global allocator. See
-/// `set_malloc_tunables` for why it is not the default.
+/// jemalloc is the global allocator (default feature `jemalloc`). A build
+/// without the feature uses glibc malloc. See `set_malloc_tunables`.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// The jemalloc settings that `set_malloc_tunables` sets. `tsgo.rs` and
+/// `goport_build.rs` have the same value, and `scripts/build-release.sh`
+/// reads it from this line for its BOLT runs.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
 fn main() {
     // One budget sets the parse and bind threads and the malloc arenas.
@@ -106,7 +112,20 @@ fn main() {
 
 /// Sets the malloc tunables for this process.
 ///
-/// glibc malloc (the default):
+/// jemalloc (default feature `jemalloc`): `_RJEM_MALLOC_CONF` is
+/// `JEMALLOC_CONF`.
+/// - `narenas:4` has the same speed as the default (4 arenas per CPU), with
+///   less RSS (query: 140 MB against 160 MB).
+/// - `thp:always` and `metadata_thp:always` make jemalloc ask for huge pages
+///   (`madvise`). Without them, a kernel in THP `madvise` mode gives jemalloc
+///   none (dbook: query 26k minor faults, effect 286k, against 1k and 6k for
+///   a static glibc build with the tunables below). release2 measurement,
+///   geometric mean against that static build: without them 12 to 14% slower
+///   on dbook (THP `madvise`) and 3 to 7% slower on cup2 (THP `always`); with
+///   them 0.5 to 6% faster on dbook and 2 to 4% slower on cup2. On cup2
+///   jemalloc peak RSS is 2 to 11% above the static build.
+///
+/// glibc malloc (a build without the `jemalloc` feature):
 /// - `top_pad=67108864` (64 MiB) makes each thread heap read-write in full
 ///   when glibc makes it (malloc.c `new_heap` adds `top_pad`, up to the
 ///   64 MiB heap size). With THP `always` the kernel then maps the heaps with
@@ -132,17 +151,11 @@ fn main() {
 ///   fixed `mmap_threshold=33554432` had mixed results on query, so it is
 ///   not set.
 ///
-/// jemalloc (feature `jemalloc`): `narenas:4` has the same speed as the
-/// default (4 arenas per CPU), with less RSS (query: 140 MB against 160 MB).
-/// On cup2 it has the same speed as glibc with the tunables above, but query
-/// peak RSS is 143 to 153 MB (tsgo 120 MB). Only `thp:never` brings jemalloc
-/// under tsgo on query (119 MB), and that makes it slower than glibc on all
-/// projects. So glibc stays the default.
-///
 /// The allocator reads these settings only at process start, so this runs
 /// the same binary again once with them set. It does nothing when the caller
-/// already set the variable, and the run continues without the settings when
-/// the exec fails.
+/// already set the variable (`_RJEM_MALLOC_CONF` or `GLIBC_TUNABLES`), so the
+/// caller can override the values. The run continues without the settings
+/// when the exec fails.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
@@ -152,7 +165,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
         #[cfg(not(feature = "jemalloc"))]
         let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from("narenas:4"));
+        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
         if std::env::var_os(name).is_some() {
             return;
         }
