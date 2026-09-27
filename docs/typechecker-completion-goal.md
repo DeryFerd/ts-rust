@@ -8,7 +8,7 @@ authorize more feature branches. Full port requirements remain in force.
 
 - Status: active; execution approved
 - Plan date: 2026-07-16
-- Integration branch: `july-ultra`
+- Integration branch: `main` (was `july-ultra` until 2026-09-27)
 - Planning baseline: `ded5eaa`
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Primary outcome: accurate checking of real-world modern TypeScript projects
