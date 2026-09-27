@@ -28,6 +28,17 @@ pub trait CompilerHost {
     fn is_plain_os_fs(&self) -> bool {
         false
     }
+
+    /// True when a program load with this host starts parse workers that
+    /// parse the queued files ahead of the loader (`FilesParser::parse`).
+    /// A host that gives most files from its own cache returns false: the
+    /// loader does not use a worker parse of a cached file, and the nodes
+    /// of that parse stay in the worker's AST arena. With false, the loader
+    /// parses each file itself, so the output is the same.
+    // PORT: not in Go. Go parses only when the host asks (`GetSourceFile`).
+    fn prefetch_parses(&self) -> bool {
+        true
+    }
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.

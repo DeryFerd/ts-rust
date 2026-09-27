@@ -312,7 +312,10 @@ impl FilesParser {
         let large = crate::program::note_program_load(tasks.len());
         // Workers that `start_default_lib_prefetch` started for this load.
         let early = EARLY_POOL.with(|early| early.borrow_mut().take());
-        let workers = if self.single_threaded {
+        // A host with its own file cache (`CompilerHost::prefetch_parses`)
+        // gets no workers. This does not set `single_threaded`, so the
+        // queue order stays that of a parallel load.
+        let workers = if self.single_threaded || !loader.opts.host.prefetch_parses() {
             0
         } else {
             prefetch_worker_count()

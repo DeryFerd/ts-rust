@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+# Builds the release goport binaries: PGO, then BOLT. Only build options
+# change, not the source.
+#
+# Default (the shipped build): dynamic glibc with jemalloc as the allocator
+# (default cargo feature `jemalloc`; the bins set
+# _RJEM_MALLOC_CONF=narenas:4,thp:always,metadata_thp:always, see
+# bin/goport.rs `set_malloc_tunables`). The bins link against glibc 2.28, so
+# they start on any x86-64 Linux with glibc 2.28 or later (Debian 10, RHEL 8,
+# Ubuntu 20.04 and later).
+# RELEASE_STATIC=1: static glibc with glibc malloc, for comparison.
+#
+# Usage: build-release.sh [out-dir]
+#   out-dir  default: <data-root>/target/goport-release
+#
+# Steps:
+#   0. Dynamic build: make the glibc 2.28 sysroot once (floor_sysroot).
+#   1. Instrumented build (-Cprofile-generate) of goport, tsgo and goport_emit.
+#   2. PGO training: the same runs as build-pgo.sh.
+#   3. Merge the raw profiles with llvm-profdata.
+#   4. PGO use build of the shipped bins (tsgo, goport, goport_emit,
+#      goport_build, goport_typesyms), linked with --emit-relocs. BOLT needs
+#      the relocations. They do not change the code.
+#      Dynamic build: check that no bin needs a GLIBC_ symbol version above
+#      the floor (objdump -T).
+#   5. BOLT: record each bin with perf branch sampling on training runs,
+#      convert with perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
+#   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
+#      glibc 2.28 of the sysroot.
+#   The binaries land in <out-dir>/bin, with BUILD.txt.
+#
+# Measured on R121 source, against the plain goport profile and build-pgo.sh:
+#   - zbook (glibc 2.44), paired perf stat: 14 to 15% fewer cycles than plain
+#     and 1.3 to 2.6% fewer than PGO (BOLT; svelte, not trained: 1.7%).
+#     Static glibc changes nothing on zbook.
+#   - cup2 (glibc 2.41), wall time: 24 to 36% less than the PGO build. A
+#     dynamic glibc malloc build uses the host glibc malloc, which is slow in
+#     glibc 2.41 with the tunables that tsgo sets.
+# Measured on R122 source (target/continuation-r97-goport/release2/measure.md),
+# geometric mean against the static glibc build: the dynamic jemalloc build
+# with narenas:4 only was 12 to 14% slower on dbook (THP madvise: jemalloc got
+# no huge pages) and 3 to 7% slower on cup2 (THP always). With
+# thp:always,metadata_thp:always set by hand it was 0.5 to 6% faster on dbook
+# and 2 to 4% slower on cup2. So the bins now set those. A dynamic build has
+# no LGPL relink duties (glibc stays a shared library). Linked against the
+# host glibc it needed glibc 2.39 (pidfd_spawnp in Rust std), hence the floor.
+# Not used: -C target-cpu=x86-64-v3 (no measurable gain, and no AVX2 means
+# SIGILL), -C relocation-model=static (0.3 ms per process, loses ASLR), and
+# panic=abort (the port catches panics for Go recover parity).
+#
+# Environment:
+#   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
+#                     llvm-profdata (LLVM 22).
+#   GOPORT_DATA_ROOT  checkout that holds target/project-inputs and the corpus
+#                     (default: the main checkout of this repository)
+#   LLVM_PROFDATA     llvm-profdata to use (same rule as build-pgo.sh)
+#   RELEASE_STATIC    0 (default): dynamic glibc, linked against the floor
+#                     sysroot. 1: static-pie, glibc linked in. Static glibc
+#                     brings LGPL relink duties when shipped, and the glibc
+#                     must support the oldest kernel we ship to.
+#   RELEASE_JEMALLOC  1: jemalloc (default when dynamic). 0: glibc malloc
+#                     (default when static; the build passes
+#                     --no-default-features).
+#   RELEASE_FEATURES  more cargo features of ts_goport for both builds
+#                     (default none). "jemalloc" there sets RELEASE_JEMALLOC=1.
+#   RELEASE_GLIBC_FLOOR  dynamic build: the newest GLIBC_ symbol version a
+#                     bin may need (default 2.28). Change it together with
+#                     RELEASE_SYSROOT.
+#   RELEASE_SYSROOT   Dynamic build: the glibc to link against, with
+#                     usr/include, usr/lib (libc.so.6, crt files, libgcc_s.so)
+#                     and lib64/ld-linux-x86-64.so.2 for the qemu run.
+#                     Default: <data-root>/target/goport-release-sysroot/glibc-2.28,
+#                     made by floor_sysroot on first use.
+#                     Static build: dir with the static glibc and libgcc to
+#                     link: usr/lib/{libc.a,rcrt1.o,...} and libgcc.a,
+#                     libgcc_eh.a and crtbeginS.o at the host cc's path under
+#                     it. Default: the build host's. They must be built for
+#                     plain x86-64. CachyOS builds them for its CPU level
+#                     (zbook: AVX-512), so there use the Arch core glibc and
+#                     gcc packages of the same versions, extracted.
+#   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt
+#                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
+#   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
+#   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
+#
+# Rules this script keeps:
+#   - Both cargo builds pass --target. The flags then reach only the shipped
+#     code, not build scripts or proc macros (a proc macro cannot link static
+#     code). --target also changes every mangled name, so a profile from a
+#     build without --target (build-pgo.sh) does not match. Train here.
+#   - Each run trains PGO and BOLT again. Do not reuse a profile after a
+#     source change: a stale profile only makes rustc or BOLT warn.
+#   - The BOLT runs of a jemalloc build set _RJEM_MALLOC_CONF to the
+#     JEMALLOC_CONF line of the bin source, so the bin does not exec itself.
+#     The glibc tunables depend on the core count (ThreadBudget in
+#     program.rs), so glibc bins exec themselves under perf. The perf2bolt
+#     check below fails when the samples do not map to the bin.
+#   - The bins must run on any x86-64 CPU. Step 4 scans the libc and jemalloc
+#     code for AVX and BMI, and step 6 runs tsgo in qemu-x86_64 with a CPU
+#     model without AVX (package qemu-user).
+#   - A dynamic build links against glibc 2.28 (the sysroot), not the host
+#     glibc: a symbol version binds to the glibc it is linked against. The C
+#     code of jemalloc builds against the same sysroot (CFLAGS_<target>), so
+#     its headers do not ask for newer symbols.
+#
+# The training runs only read project inputs: emit writes to a temp --outDir,
+# tsgo writes .tsbuildinfo to a temp file, goport_build runs on a temp copy.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd -- "$script_dir/../../.." && pwd)"
+data_root="${GOPORT_DATA_ROOT:-$(cd -- "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)}"
+out="${1:-$data_root/target/goport-release}"
+static="${RELEASE_STATIC:-0}"
+jemalloc="${RELEASE_JEMALLOC:-$((static == 1 ? 0 : 1))}"
+features="${RELEASE_FEATURES:-}"
+[[ ",${features// /,}," == *,jemalloc,* ]] && jemalloc=1
+glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
+bolt="${RELEASE_BOLT:-1}"
+corpus_step="${PGO_CORPUS_STEP:-60}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
+shipped=(tsgo goport goport_emit goport_build goport_typesyms)
+mkdir -p "$out"
+out="$(cd -- "$out" && pwd)"
+cd "$repo"
+
+# llvm-profdata must not be newer than rustc's LLVM (see build-pgo.sh).
+sysroot="$(rustc --print sysroot)"
+host="$(rustc -vV | sed -n 's/^host: //p')"
+rustc_llvm="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+profdata="${LLVM_PROFDATA:-}"
+if [[ -z "$profdata" ]]; then
+  if [[ -x "$sysroot/lib/rustlib/$host/bin/llvm-profdata" ]]; then
+    profdata="$sysroot/lib/rustlib/$host/bin/llvm-profdata"
+  else
+    profdata="$(command -v llvm-profdata)"
+  fi
+fi
+profdata_llvm="$("$profdata" --version | sed -n 's/.*LLVM version \([0-9]*\).*/\1/p' | head -1)"
+echo "rustc $(rustc -V | cut -d' ' -f2) LLVM $rustc_llvm, $profdata LLVM $profdata_llvm"
+# A rustc that is not a rustup proxy (for example /usr/bin/rustc first on
+# PATH) ignores RUSTUP_TOOLCHAIN.
+if [[ $RUSTUP_TOOLCHAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $(rustc -V) != "rustc $RUSTUP_TOOLCHAIN "* ]]; then
+  echo "error: rustc on PATH is $(rustc -V), not $RUSTUP_TOOLCHAIN (put the rustup proxies first on PATH)" >&2
+  exit 1
+fi
+if ((profdata_llvm > rustc_llvm)); then
+  echo "error: llvm-profdata (LLVM $profdata_llvm) is newer than rustc's LLVM $rustc_llvm" >&2
+  exit 1
+fi
+if [[ $bolt == 1 ]]; then
+  for tool in llvm-bolt perf2bolt merge-fdata llvm-objcopy perf; do
+    command -v "$tool" > /dev/null || { echo "error: $tool not found (or set RELEASE_BOLT=0)" >&2; exit 1; }
+  done
+  perf record -q -e cycles:u -j any,u -o /dev/null -- true 2> /dev/null \
+    || { echo "error: perf branch sampling (-j any,u) does not work here (or set RELEASE_BOLT=0)" >&2; exit 1; }
+fi
+
+command -v qemu-x86_64 > /dev/null || { echo "error: qemu-x86_64 not found (package qemu-user); step 6 needs it" >&2; exit 1; }
+
+# floor_sysroot <dir>: makes the glibc 2.28 sysroot of the dynamic build in
+# <dir>, from Arch Linux packages of April 2019 (built for plain x86-64):
+# glibc 2.28 (headers, libc.so.6, crt files), linux-api-headers 5.0.7 (kernel
+# headers for the jemalloc C code) and gcc-libs 8.3.0 (libgcc_s, which rustc
+# links). The sha256 pins fix the files. Their signatures were checked with
+# pacman-key when the pins were written (2026-09-27). lib and lib64 point at
+# usr/lib, so `qemu-x86_64 -L <dir>` loads this glibc (step 6).
+floor_sysroot() {
+  local dir=$1 sum pkg
+  [[ -f $dir/.complete ]] && return
+  rm -rf "$dir"
+  mkdir -p "$dir/pkgs"
+  while read -r sum pkg; do
+    curl -sfL -o "$dir/pkgs/${pkg##*/}" "https://archive.archlinux.org/packages/$pkg" \
+      || { echo "error: cannot download $pkg" >&2; exit 1; }
+    echo "$sum  $dir/pkgs/${pkg##*/}" | sha256sum -c --quiet - || { echo "error: $pkg does not match its sha256" >&2; exit 1; }
+  done << 'PKGS'
+34fa06bac690f62f7167ef68c04978cad90d0fcf505abbac2bd563f20ee0803b g/glibc/glibc-2.28-6-x86_64.pkg.tar.xz
+5c891731216b2752ddd15cd5851216d85e9a17dd5807ba02b88ff6597909e805 l/linux-api-headers/linux-api-headers-5.0.7-1-any.pkg.tar.xz
+400e2ecb1b2dfb40e09cdb6805f0075cbc88e6fcef9b73f23c64a6e709dcd61b g/gcc-libs/gcc-libs-8.3.0-1-x86_64.pkg.tar.xz
+PKGS
+  tar -C "$dir" -xf "$dir/pkgs/glibc-2.28-6-x86_64.pkg.tar.xz" --exclude=usr/lib/getconf usr/include usr/lib
+  tar -C "$dir" -xf "$dir/pkgs/linux-api-headers-5.0.7-1-any.pkg.tar.xz" usr/include
+  tar -C "$dir" -xf "$dir/pkgs/gcc-libs-8.3.0-1-x86_64.pkg.tar.xz" --wildcards 'usr/lib/libgcc_s.so*'
+  ln -s usr/lib "$dir/lib"
+  ln -s usr/lib "$dir/lib64"
+  touch "$dir/.complete"
+}
+
+link_flags=""
+# CFLAGS_<target> for the C code (jemalloc), in both builds.
+c_env=()
+glibc_root=""
+if [[ $static == 1 ]]; then
+  link_flags="-C target-feature=+crt-static"
+  if [[ -n ${RELEASE_SYSROOT:-} ]]; then
+    RELEASE_SYSROOT="$(cd -- "$RELEASE_SYSROOT" && pwd)"
+    # -B and -L come before gcc's own paths, so the linker takes the startup
+    # files, libc.a and libgcc from here. --sysroot makes the absolute paths
+    # in linker scripts (libm.a is one) point into it too.
+    # The same libgcc dir as the host cc uses (not a multilib dir like 32/).
+    libgcc_dir="$RELEASE_SYSROOT$(dirname "$(cc -print-libgcc-file-name)")"
+    [[ -f $RELEASE_SYSROOT/usr/lib/libc.a && -f $libgcc_dir/libgcc_eh.a ]] \
+      || { echo "error: RELEASE_SYSROOT needs usr/lib/libc.a and $libgcc_dir/libgcc_eh.a" >&2; exit 1; }
+    link_flags+=" -C link-arg=--sysroot=$RELEASE_SYSROOT"
+    for d in "$RELEASE_SYSROOT/usr/lib" "$libgcc_dir"; do
+      link_flags+=" -C link-arg=-B$d -C link-arg=-L$d"
+    done
+  fi
+else
+  glibc_root="${RELEASE_SYSROOT:-$data_root/target/goport-release-sysroot/glibc-2.28}"
+  [[ -n ${RELEASE_SYSROOT:-} ]] || floor_sysroot "$glibc_root"
+  glibc_root="$(cd -- "$glibc_root" && pwd)"
+  [[ -f $glibc_root/usr/lib/libc.so.6 && -f $glibc_root/usr/include/stdio.h && -e $glibc_root/lib64/ld-linux-x86-64.so.2 ]] \
+    || { echo "error: $glibc_root needs usr/lib/libc.so.6, usr/include/stdio.h and lib64/ld-linux-x86-64.so.2" >&2; exit 1; }
+  # -B and -L come before gcc's own paths (gcc otherwise also searches the
+  # host /usr/lib), so crt files, libc.so, libgcc_s.so come from here.
+  # --sysroot sends the absolute paths in libc.so (a linker script) and the
+  # C headers here too.
+  floor_flags="--sysroot=$glibc_root -B$glibc_root/usr/lib -L$glibc_root/usr/lib"
+  for f in $floor_flags; do link_flags+=" -C link-arg=$f"; done
+  c_env=("CFLAGS_${host//-/_}=$floor_flags")
+fi
+
+cargo_cmd=(cargo)
+[[ -x "$repo/scripts/run-cargo-capped.sh" ]] && cargo_cmd=("$repo/scripts/run-cargo-capped.sh")
+# Both builds need the same features, or the profile does not match the code.
+feature_args=()
+[[ $jemalloc == 1 ]] || feature_args+=(--no-default-features)
+[[ -n $features ]] && feature_args+=(--features "$features")
+
+# malloc_env <bin>: with jemalloc, the _RJEM_MALLOC_CONF=value that <bin>
+# sets before it execs itself (its JEMALLOC_CONF line), or nothing for a bin
+# that does not exec itself. With glibc malloc, nothing (see the rules above).
+malloc_env() {
+  local src="$repo/crates/ts_goport/src/bin/$1.rs"
+  if [[ $jemalloc == 1 ]]; then
+    sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/_RJEM_MALLOC_CONF=\1/p' "$src" 2> /dev/null | head -1 || true
+  fi
+}
+
+# build <target-subdir> <rustflags> <bin>...: goport profile, own target dir.
+# sccache is off: it could reuse an object built with an older profile.
+build() {
+  local name=$1 flags=$2 bin_args=() b
+  shift 2
+  for b in "$@"; do bin_args+=(--bin "$b"); done
+  echo "== build $name ($flags) ${feature_args[*]}"
+  env "${c_env[@]}" CARGO_TARGET_DIR="$out/$name" TS_CARGO_SEPARATE_TARGET=1 TS_CARGO_SCCACHE=0 RUSTFLAGS="$flags" \
+    "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport --target "$host" "${feature_args[@]}" "${bin_args[@]}" \
+    > "$out/build-$name.log" 2>&1 || { tail -20 "$out/build-$name.log" >&2; exit 1; }
+}
+
+P="$data_root/target/project-inputs"
+declare -A projects=(
+  [query]="$P/query/source/packages/query-core/tsconfig.prod.json"
+  [hono]="$P/hono/source/tsconfig.build.json"
+  [zod]="$P/zod/source/packages/zod/tsconfig.json"
+  [effect]="$P/effect/source/packages/effect/tsconfig.json"
+  [elysia]="$data_root/target/project-inputs-extra/elysia/src/tsconfig.json"
+)
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# 1. Instrumented build. Training runs only these three bins; the other two
+# share their code, so they use the same profile.
+profiles="$out/profiles"
+rm -rf "$profiles"
+mkdir -p "$profiles"
+build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
+gen="$out/target-gen/$host/goport"
+
+# 2. PGO training. Exit codes are ignored: some inputs have diagnostics on purpose.
+for name in query hono zod effect elysia; do
+  "$gen/goport" -p "${projects[$name]}" > /dev/null 2>&1 || true
+  "$gen/tsgo" -p "${projects[$name]}" --noEmit --tsBuildInfoFile "$tmp/$name.tsbuildinfo" > /dev/null 2>&1 || true
+done
+for name in query hono; do
+  "$gen/goport_emit" -p "${projects[$name]}" --outDir "$tmp/out" > /dev/null 2>&1 || true
+  rm -rf "$tmp/out"
+done
+cases="$data_root/target/continuation-r97-goport/corpus-full/cases"
+n=0 i=0
+for dir in "$cases"/*/; do
+  if ((i++ % corpus_step == 0)) && [[ -f "$dir/tsconfig.json" ]]; then
+    (cd "$dir" && timeout 60 "$gen/goport" -p tsconfig.json > /dev/null 2>&1) || true
+    n=$((n + 1))
+  fi
+done
+echo "trained on 5 projects and $n corpus cases, $(find "$profiles" -name '*.profraw' | wc -l) profraw files"
+
+# 3. Merge. The file name holds the profile hash: cargo does not track the
+# profile content, but it rebuilds when RUSTFLAGS change.
+rm -f "$out"/goport-*.profdata
+"$profdata" merge -o "$tmp/merged.profdata" "$profiles"
+merged="$out/goport-$(sha256sum "$tmp/merged.profdata" | cut -c1-12).profdata"
+mv "$tmp/merged.profdata" "$merged"
+
+# 4. Optimized build. rustc only warns when it cannot read the profile.
+build target-use "-Cprofile-use=$merged -C link-arg=-Wl,--emit-relocs $link_flags" "${shipped[@]}"
+if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; then
+  grep "profile format version\|profile-use" "$out/build-target-use.log" | head -3 >&2
+  echo "error: rustc did not use the profile" >&2
+  exit 1
+fi
+use="$out/target-use/$host/goport"
+if [[ $static == 1 ]] && readelf -d "$use/tsgo" | grep -q NEEDED; then
+  echo "error: $use/tsgo still loads shared libraries" >&2
+  exit 1
+fi
+# glibc floor: no bin may need a GLIBC_ symbol version above the floor. BOLT
+# does not change the dynamic symbols, so the check runs here, before it.
+if [[ $static != 1 ]]; then
+  for b in "${shipped[@]}"; do
+    need="$(objdump -T "$use/$b" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1)"
+    [[ -n $need ]] || { echo "error: objdump -T shows no GLIBC_ version in $use/$b" >&2; exit 1; }
+    if [[ $(printf '%s\n' "$need" "GLIBC_$glibc_floor" | sort -V | tail -1) != "GLIBC_$glibc_floor" ]]; then
+      echo "error: $b needs $need, above the glibc floor $glibc_floor: $(objdump -T "$use/$b" | grep "($need)" | awk '{print $NF}' | head -5 | xargs)" >&2
+      exit 1
+    fi
+    echo "glibc floor: $b needs $need at most"
+  done
+fi
+# CPU check, part a: a static bin carries its own libc code, and a jemalloc
+# bin its own C allocator. That code must run on any x86-64 CPU. No AVX or BMI
+# instruction may appear in non-Rust code, except in the variants that glibc
+# picks at run time (names with avx, evex, fma or xsave). Rust code is built
+# for plain x86-64 and checks the CPU itself.
+if [[ $static == 1 || $jemalloc == 1 ]]; then
+  for b in "${shipped[@]}"; do
+    objdump -d --no-show-raw-insn "$use/$b" | awk '
+      /^[0-9a-f]+ <.*>:$/ { fn = substr($2, 2, length($2) - 3); next }
+      fn !~ /^_(ZN|R)/ && fn !~ /avx|evex|fma|xsave/ &&
+        /\t(v[a-z0-9]+|andn|bextr|blsi|blsmsk|blsr|bzhi|pdep|pext|mulx|rorx|sarx|shlx|shrx|k[a-z]+[bwdq]) / { bad[fn]++ }
+      END { for (f in bad) print f }' > "$out/cpu-check-$b.txt"
+    if [[ -s $out/cpu-check-$b.txt ]]; then
+      echo "error: $b has AVX or BMI code in $(wc -l < "$out/cpu-check-$b.txt") non-Rust functions, for example $(sort "$out/cpu-check-$b.txt" | head -3 | xargs)." >&2
+      echo "The static libc or libgcc (see RELEASE_SYSROOT) or jemalloc (see CFLAGS) is not built for plain x86-64." >&2
+      exit 1
+    fi
+  done
+fi
+rm -rf "${out:?}/bin"
+mkdir -p "$out/bin"
+if [[ $bolt != 1 ]]; then
+  for b in "${shipped[@]}"; do cp "$use/$b" "$out/bin/$b"; done
+fi
+
+# 5. BOLT.
+bolt_opts=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh -use-gnu-stack)
+p2b_opts=()
+if [[ $static == 1 ]]; then
+  # The static libgcc unwinder has jump tables that point into ".cold" parts
+  # that BOLT cannot tie to their parent (3 local copies of
+  # read_encoded_value_with_base). perf2bolt is strict by default and stops on
+  # them. Keep these functions where they are. They only run on a panic.
+  p2b_opts=(--strict=0)
+  bolt_opts+=("-skip-funcs=read_encoded_value_with_base.*,linear_search_fdes.*,fde_single_encoding_extract.*,fde_mixed_encoding_extract.*")
+fi
+bolt_dir="$out/bolt"
+declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3) # about 5 s of work per recording
+
+# rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
+# old .tsbuildinfo or emit output in $tmp.
+rec() {
+  local name=$1 count=$2
+  shift 2
+  perf record -q -e cycles:u -j any,u -F "${BOLT_PERF_FREQ:-20000}" -o "$bolt_dir/data/$name.data" -- bash -c \
+    'n=$1; t=$2; shift 2; for ((i = 0; i < n; i++)); do rm -rf "$t"/*.tsbuildinfo "$t"/out-*; "$@"; done; true' \
+    _ "$count" "$tmp" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
+  [[ -s "$bolt_dir/data/$name.data" ]] || { echo "error: no perf data for $name" >&2; exit 1; }
+}
+
+# bolt_train <bin> <path>: the training runs of one bin.
+bolt_train() {
+  local b=$2 name src dst e
+  case $1 in
+    tsgo)
+      for name in query hono zod effect; do
+        rec "tsgo-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
+      done
+      for name in query hono; do
+        rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
+      done ;;
+    goport)
+      for name in query hono zod effect; do rec "goport-$name" "${reps[$name]}" "$b" -p "${projects[$name]}"; done ;;
+    goport_emit)
+      for name in query hono; do rec "goport_emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --outDir "$tmp/out-$name"; done ;;
+    goport_typesyms)
+      for name in query hono; do rec "goport_typesyms-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" -o "$tmp/out-$name"; done ;;
+    goport_build)
+      # Writable copy of the query monorepo; the top-level node_modules is a link.
+      src="$P/query/source" dst="$tmp/query-build"
+      mkdir -p "$dst"
+      for e in "$src"/* "$src"/.[!.]*; do
+        [[ -e $e || -L $e ]] || continue
+        if [[ $(basename "$e") == node_modules && -d $e && ! -L $e ]]; then ln -s "$e" "$dst/node_modules"; else cp -a "$e" "$dst/"; fi
+      done
+      chmod -R u+w "$dst"
+      find "$dst" -path '*/node_modules' -prune -o -name '*.tsbuildinfo' -print0 | xargs -0 -r rm -f
+      (cd "$dst" && rec goport_build-query-chain 1 "$b" -b packages/query-sync-storage-persister/tsconfig.json)
+      rm -rf "$dst" ;;
+  esac
+}
+
+if [[ $bolt == 1 ]]; then
+  rm -rf "$bolt_dir"
+  mkdir -p "$bolt_dir/input" "$bolt_dir/data"
+  for b in "${shipped[@]}"; do
+    # BOLT reads a symbol with ".cold" or ".warm" in it as a split fragment and
+    # stops ("parent function not found"). Rust paths make such names
+    # ("Session..warm_auto_import_cache"). Rename them in a copy: "..warm" to
+    # "..Warm" (same length, only .symtab changes).
+    nm "$use/$b" | awk '$2 ~ /^[tT]$/ && $3 ~ /\.\.(cold|warm)/ {r = $3; gsub(/\.\.cold/, "..Cold", r); gsub(/\.\.warm/, "..Warm", r); print $3, r}' > "$bolt_dir/$b.rename.txt"
+    llvm-objcopy --redefine-syms="$bolt_dir/$b.rename.txt" "$use/$b" "$bolt_dir/input/$b"
+    # The bin sets its malloc variable and execs itself unless the caller set it.
+    unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
+    tunables="$(malloc_env "$b")"
+    [[ -n $tunables ]] && export "${tunables?}"
+    bolt_train "$b" "$bolt_dir/input/$b"
+    for d in "$bolt_dir/data/$b"-*.data; do
+      perf2bolt "${p2b_opts[@]}" -p "$d" -o "${d%.data}.fdata" "$bolt_dir/input/$b" > "${d%.data}.p2b.log" 2>&1 \
+        || { tail -5 "${d%.data}.p2b.log" >&2; exit 1; }
+      # Samples in the kernel (and, when dynamic, in libc) count as unknown:
+      # 10 to 25%. Most of them unknown means the samples did not map to the bin.
+      pct="$(sed -n 's/.*involving unknown regions: [0-9]* (\([0-9]*\)\..*/\1/p' "${d%.data}.p2b.log")"
+      [[ -n $pct ]] && ((pct < 50)) || { echo "error: the samples in $d do not map to $b" >&2; exit 1; }
+    done
+    merge-fdata "$bolt_dir/data/$b"-*.fdata > "$bolt_dir/$b.fdata" 2> "$bolt_dir/$b.merge.log"
+    llvm-bolt "$bolt_dir/input/$b" -o "$out/bin/$b" -data="$bolt_dir/$b.fdata" "${bolt_opts[@]}" > "$bolt_dir/$b.bolt.log" 2>&1 \
+      || { tail -20 "$bolt_dir/$b.bolt.log" >&2; exit 1; }
+    echo "bolt $b: $(grep -m1 -o '[0-9]* out of [0-9]* functions in the binary ([0-9.]*%) have non-empty execution profile' "$bolt_dir/$b.bolt.log" || true)"
+  done
+  unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
+fi
+
+# 6. CPU check, part b: tsgo on query and hono in qemu with a CPU model
+# without AVX (qemu64). A dynamic tsgo loads the glibc 2.28 of the sysroot
+# there (qemu -L; its libs are built for plain x86-64), so this also checks
+# that it starts on the floor glibc. The run must give the same output and
+# exit code as a native run: a loader error ("version `GLIBC_2.xx' not
+# found") exits 1, which is also a tsgo exit code. The malloc variable is set
+# so the run stays in qemu: an exec would run the new image on the host CPU.
+# Any GLIBC_TUNABLES value stops the glibc re-exec.
+tunables="$(malloc_env tsgo)"
+[[ $jemalloc == 1 ]] || tunables="GLIBC_TUNABLES=glibc.malloc.hugetlb=1"
+qemu=(qemu-x86_64 -cpu qemu64)
+[[ $static == 1 ]] || qemu+=(-L "$glibc_root")
+# check_run <name> <log> <cmd...>: runs tsgo on project <name>, prints the
+# exit code.
+check_run() {
+  local name=$1 log=$2 code=0
+  shift 2
+  rm -f "$tmp/cpu-check.tsbuildinfo"
+  # No core file: qemu would write it to the current dir on a crash.
+  (ulimit -c 0 && exec env ${tunables:+"$tunables"} "$@" -p "${projects[$name]}" \
+    --noEmit --pretty false --tsBuildInfoFile "$tmp/cpu-check.tsbuildinfo") > "$log" 2>&1 || code=$?
+  echo "$code"
+}
+for name in query hono; do
+  log="$out/cpu-check-$name"
+  native="$(check_run "$name" "$log-native.log" "$out/bin/tsgo")"
+  emulated="$(check_run "$name" "$log-qemu64.log" "${qemu[@]}" "$out/bin/tsgo")"
+  if ((emulated >= 128)); then
+    echo "error: tsgo on $name stops with signal $((emulated - 128)) on a plain x86-64 CPU (4 = illegal instruction); see RELEASE_SYSROOT and $log-qemu64.log" >&2
+    exit 1
+  fi
+  if [[ $emulated != "$native" ]] || ! cmp -s "$log-native.log" "$log-qemu64.log"; then
+    echo "error: tsgo on $name in qemu64${glibc_root:+ on glibc $glibc_floor} exits $emulated (native $native), or its output differs; see $log-*.log" >&2
+    exit 1
+  fi
+  # jemalloc prints "<jemalloc>: ..." to stderr for a setting that it does not
+  # support (thp:always needs madvise(MADV_HUGEPAGE) at build time).
+  if grep -q '<jemalloc>' "$log-native.log"; then
+    echo "error: jemalloc warns on $name: $(grep -m1 '<jemalloc>' "$log-native.log")" >&2
+    exit 1
+  fi
+  echo "cpu check: tsgo on $name in qemu64${glibc_root:+ on glibc $glibc_floor} exit $emulated, same output as native"
+done
+
+{
+  echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':!crates/*/scripts' || echo ' (dirty)')"
+  echo "rustc: $(rustc -V), target $host, cargo profile goport"
+  echo "pgo: $merged, trained on 5 projects and $n corpus cases"
+  if [[ $static == 1 ]]; then
+    echo "static glibc: 1${RELEASE_SYSROOT:+, sysroot $RELEASE_SYSROOT}"
+  else
+    echo "static glibc: 0, glibc floor $glibc_floor, sysroot $glibc_root"
+  fi
+  echo "allocator: $([[ $jemalloc == 1 ]] && echo "jemalloc, $(malloc_env tsgo)" || echo "glibc malloc")"
+  echo "cargo feature args: ${feature_args[*]:-none}"
+  if [[ $bolt == 1 ]]; then
+    echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
+  else
+    echo "bolt: off"
+  fi
+} > "$out/bin/BUILD.txt"
+echo "release binaries: $out/bin/{$(IFS=,; echo "${shipped[*]}")}"

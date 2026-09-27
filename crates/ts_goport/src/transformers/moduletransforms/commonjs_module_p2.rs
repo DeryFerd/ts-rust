@@ -167,7 +167,10 @@ impl CommonJSModuleTransformer {
             commit_pending_variables(&mut statements, &mut variables, modifiers);
             commit_pending_expressions(&mut statements, &mut expressions);
             statements = self.append_exports_of_variable_statement(statements, node);
-            return single_or_many(Some(&statements), f);
+            // PORT: Go `statements` is a nil slice when nothing was appended
+            // (`export const x: T;`), so SingleOrMany returns nil, not an empty
+            // SyntaxList. Callers then emit `{ }` or `;` in its place.
+            return single_or_many((!statements.is_empty()).then_some(&statements[..]), f);
         }
         self.visit_top_level_nested_variable_statement(node)
     }
