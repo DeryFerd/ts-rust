@@ -6,6 +6,7 @@
 
 use crate::frontend::prelude::*;
 use std::cell::Cell;
+use std::sync::Arc;
 
 // Go: fileloader.go:21 libResolution
 pub struct LibResolution {
@@ -54,6 +55,10 @@ pub struct FileLoader {
 
     pub path_for_lib_file_cache: RefCell<FxHashMap<String, Rc<LibFile>>>,
     pub path_for_lib_file_resolutions: RefCell<FxHashMap<Path, Rc<LibResolution>>>,
+
+    /// The resolution cache that `resolver` shares with the parse workers
+    /// (`SharedResolutionCache`), when the program shares one.
+    pub shared_resolution: Option<Arc<SharedResolutionCache>>,
 }
 
 // Go: fileloader.go:62 redirectsFile
@@ -184,6 +189,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         dts_directories: FxHashSet::default(),
         path_for_lib_file_cache: RefCell::new(FxHashMap::default()),
         path_for_lib_file_resolutions: RefCell::new(FxHashMap::default()),
+        shared_resolution: None,
         opts,
     };
     loader.add_project_reference_tasks(single_threaded);
@@ -193,12 +199,36 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         .host
         .clone()
         .expect("projectReferenceFileMapper.host is set until processing ends");
-    loader.resolver = Some(Rc::new(new_resolver(
+    let mut resolver = new_resolver(
         resolver_host,
         compiler_options.clone(),
         &loader.opts.typings_location,
         &loader.opts.project_name,
-    )));
+    );
+    // PERF: Go resolves in all parse tasks with one shared cache. Here the
+    // parse workers resolve ahead of the loader, and the loader reads their
+    // answers. Only when every resolver sees the same files: the plain OS
+    // file system (no project reference faking host) and no traced
+    // resolution (Go then skips the cache too).
+    if !single_threaded
+        && super::files_parser::parse_workers_enabled()
+        && workers_resolve_imports(&compiler_options)
+        && loader.opts.host.is_plain_os_fs()
+        && compiler_options.trace_resolution != Tristate::True
+        && loader
+            .opts
+            .config
+            .resolved_project_reference_paths()
+            .is_empty()
+    {
+        let shared = Arc::new(SharedResolutionCache::default());
+        resolver.caches.shared = Some(SharedResolutionLink {
+            cache: shared.clone(),
+            publish: false,
+        });
+        loader.shared_resolution = Some(shared);
+    }
+    loader.resolver = Some(Rc::new(resolver));
     let _trace = crate::tracing::get().map(|tr| {
         tr.push(
             crate::tracing::Phase::Program,
@@ -260,7 +290,35 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     }
 
     let files_parser = loader.files_parser.borrow();
-    files_parser.get_processed_files(&loader)
+    let processed_files = files_parser.get_processed_files(&loader);
+    drop(files_parser);
+    drop(root_tasks);
+    // PERF: in a one-program process the loader state (every parse task)
+    // lives until the process ends anyway; freeing it is serial work before
+    // the bind. Go leaves it to the garbage collector.
+    if FORGET_LOADER_STATE.with(Cell::get) {
+        std::mem::forget(loader);
+    }
+    processed_files
+}
+
+thread_local! {
+    /// Set while `with_loader_state_forgotten` runs.
+    static FORGET_LOADER_STATE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f`, in which `process_all_program_files` does not free the loader
+/// state (see there). Only for the program of a one-program process, which
+/// is never freed.
+pub fn with_loader_state_forgotten<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORGET_LOADER_STATE.with(|forget| forget.set(self.0));
+        }
+    }
+    let _restore = Restore(FORGET_LOADER_STATE.with(|forget| forget.replace(true)));
+    f()
 }
 
 impl FileLoader {
@@ -505,42 +563,11 @@ impl FileLoader {
 
     // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
     pub fn load_source_file_meta_data(&self, file_name: &str) -> SourceFileMetaData {
-        let package_json_scope = self
-            .resolver()
-            .get_package_scope_for_path(&get_directory_path(file_name));
-        let module_resolution_kind = self
-            .opts
-            .config
-            .compiler_options()
-            .get_module_resolution_kind();
-
-        let mut package_json_type = String::new();
-        let mut package_json_directory = String::new();
-        if let Some(scope) = package_json_scope.as_ref().filter(|scope| scope.exists()) {
-            package_json_directory = scope.package_directory.clone();
-            let contents = scope
-                .contents
-                .as_ref()
-                .expect("an existing package.json scope has contents");
-            let (value, ok) = contents.fields.header_fields.type_.get_value();
-            if ok
-                && (!file_extension_is_one_of(
-                    file_name,
-                    &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
-                ) && ModuleResolutionKind::NODE16 <= module_resolution_kind
-                    && module_resolution_kind <= ModuleResolutionKind::NODE_NEXT
-                    || file_name.contains("/node_modules/"))
-            {
-                package_json_type = value;
-            }
-        }
-
-        let implied_node_format = get_implied_node_format_for_file(file_name, &package_json_type);
-        SourceFileMetaData {
-            package_json_type,
-            package_json_directory,
-            implied_node_format,
-        }
+        source_file_meta_data(
+            self.resolver(),
+            self.opts.config.compiler_options(),
+            file_name,
+        )
     }
 
     // Go: fileloader.go:364 (*fileLoader).parseSourceFile
@@ -1105,6 +1132,59 @@ impl FileLoader {
     }
 }
 
+/// The body of Go `(*fileLoader).loadSourceFileMetaData` with the loader's
+/// resolver and options as parameters, so a parse worker can run it with
+/// its own resolver (`files_parser.rs`).
+// Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
+pub(crate) fn source_file_meta_data(
+    resolver: &Resolver,
+    options: &CompilerOptions,
+    file_name: &str,
+) -> SourceFileMetaData {
+    let package_json_scope = resolver.get_package_scope_for_path(&get_directory_path(file_name));
+    let module_resolution_kind = options.get_module_resolution_kind();
+
+    let mut package_json_type = String::new();
+    let mut package_json_directory = String::new();
+    if let Some(scope) = package_json_scope.as_ref().filter(|scope| scope.exists()) {
+        package_json_directory = scope.package_directory.clone();
+        let contents = scope
+            .contents
+            .as_ref()
+            .expect("an existing package.json scope has contents");
+        let (value, ok) = contents.fields.header_fields.type_.get_value();
+        if ok
+            && (!file_extension_is_one_of(
+                file_name,
+                &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
+            ) && ModuleResolutionKind::NODE16 <= module_resolution_kind
+                && module_resolution_kind <= ModuleResolutionKind::NODE_NEXT
+                || file_name.contains("/node_modules/"))
+        {
+            package_json_type = value;
+        }
+    }
+
+    let implied_node_format = get_implied_node_format_for_file(file_name, &package_json_type);
+    SourceFileMetaData {
+        package_json_type,
+        package_json_directory,
+        implied_node_format,
+    }
+}
+
+/// True when parse workers resolve the imports of the files they parse
+/// with `options`: the loader adds resolved files (no `noResolve`), and Go
+/// `ResolveModuleName` supports the module resolution kind (the others
+/// panic, on the loader too).
+pub(crate) fn workers_resolve_imports(options: &CompilerOptions) -> bool {
+    let kind = options.get_module_resolution_kind();
+    !options.no_resolve.is_true()
+        && (kind == ModuleResolutionKind::NODE16
+            || kind == ModuleResolutionKind::NODE_NEXT
+            || kind == ModuleResolutionKind::BUNDLER)
+}
+
 // Go: fileloader.go:677 getLibraryNameFromLibFileName
 pub fn get_library_name_from_lib_file_name(lib_file_name: &str) -> String {
     // Support resolving to lib.dom.d.ts -> @typescript/lib-dom, and
@@ -1259,6 +1339,30 @@ pub(crate) fn get_emit_syntax_for_usage_location_worker(
     // file, until/unless declaration emit can indicate a true ESM import. On the
     // other hand, writing CJS syntax in a definitely-ESM file is fine, since declaration
     // emit preserves the CJS syntax.
+    if file_emit_mode == ModuleKind::COMMON_JS {
+        return ModuleKind::COMMON_JS;
+    } else if file_emit_mode.is_non_node_esm() || file_emit_mode == ModuleKind::PRESERVE {
+        return ModuleKind::ES_NEXT;
+    }
+    ModuleKind::NONE
+}
+
+/// Go `getModeForUsageLocation` (with `options`) for a plain `import ..
+/// from` or `export .. from` in `file_name`, the most common form. A parse
+/// worker has no import nodes after the parse, so it resolves each import
+/// with this mode. A wrong guess only resolves another cache key: the
+/// loader resolves each import with its real mode.
+pub(crate) fn guess_import_mode(
+    file_name: &str,
+    meta: &SourceFileMetaData,
+    options: &CompilerOptions,
+) -> ResolutionMode {
+    if !import_syntax_affects_module_resolution(options) {
+        return RESOLUTION_MODE_NONE;
+    }
+    // Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker, for a
+    // usage that is not a require or an import call.
+    let file_emit_mode = get_emit_module_format_of_file_worker(file_name, options, meta);
     if file_emit_mode == ModuleKind::COMMON_JS {
         return ModuleKind::COMMON_JS;
     } else if file_emit_mode.is_non_node_esm() || file_emit_mode == ModuleKind::PRESERVE {

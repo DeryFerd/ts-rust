@@ -30,8 +30,13 @@ use ts_jsnum::{Number, PseudoBigInt};
 /// The list stays 24 bytes (asserted below). All element types are `Copy`
 /// ids, and `Default` fills the unused inline slots. A longer list is in the
 /// checker arena of a one-program process, else owned (`use_checker_arena`).
+///
+/// PERF: only an `Owned` list holds a resource, and only a multi-program
+/// process makes one. `repr` is a `ManuallyDrop`, so a drop is the one tag
+/// test in `Drop::drop`, and the `Owned` clone and drop code is out of line
+/// (`clone_owned`, `drop_owned`) and not in every caller.
 pub struct SharedList<T: 'static> {
-    repr: SharedListRepr<T>,
+    repr: std::mem::ManuallyDrop<SharedListRepr<T>>,
 }
 
 /// Number of elements a `SharedList` keeps inline.
@@ -41,12 +46,26 @@ enum SharedListRepr<T: 'static> {
     /// A longer list, in this thread's checker arena. Never freed.
     Arena(&'static [T]),
     /// A longer list of a multi-program process, freed with its last copy.
+    /// `SharedList::drop` frees it.
     Owned(Rc<[T]>),
     /// `items[..len]` is the list. Empty is `len == 0`.
     Inline {
-        len: u8,
+        len: InlineLen,
         items: [T; SHARED_LIST_INLINE],
     },
+}
+
+/// The length of an inline `SharedList`.
+///
+/// PERF: an enum and not a `u8`, so the compiler knows that the length is at
+/// most `SHARED_LIST_INLINE` and `deref` has no bounds check.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum InlineLen {
+    Zero = 0,
+    One = 1,
+    Two = 2,
+    Three = 3,
 }
 
 // A list must stay 24 bytes, or `Type` grows past 3 cache lines.
@@ -55,6 +74,15 @@ const _: () = assert!(std::mem::size_of::<SharedList<SymbolId>>() == 24);
 const _: () = assert!(std::mem::size_of::<SharedList<SignatureId>>() == 24);
 const _: () = assert!(std::mem::size_of::<SharedList<IndexInfoId>>() == 24);
 const _: () = assert!(std::mem::size_of::<SharedList<VarianceFlags>>() == 24);
+
+impl<T> SharedList<T> {
+    #[inline(always)]
+    fn from_repr(repr: SharedListRepr<T>) -> Self {
+        Self {
+            repr: std::mem::ManuallyDrop::new(repr),
+        }
+    }
+}
 
 impl<T: Copy + Default> SharedList<T> {
     /// An inline list of `items`, which has at most `SHARED_LIST_INLINE`
@@ -68,19 +96,14 @@ impl<T: Copy + Default> SharedList<T> {
         // once. The arrays are `[T; 3]`, so they stop compiling if
         // `SHARED_LIST_INLINE` changes.
         let d = T::default();
-        let buffer: [T; SHARED_LIST_INLINE] = match *items {
-            [] => [d, d, d],
-            [a] => [a, d, d],
-            [a, b] => [a, b, d],
-            [a, b, c] => [a, b, c],
+        let (len, buffer): (InlineLen, [T; SHARED_LIST_INLINE]) = match *items {
+            [] => (InlineLen::Zero, [d, d, d]),
+            [a] => (InlineLen::One, [a, d, d]),
+            [a, b] => (InlineLen::Two, [a, b, d]),
+            [a, b, c] => (InlineLen::Three, [a, b, c]),
             _ => unreachable!("inline list longer than SHARED_LIST_INLINE"),
         };
-        Self {
-            repr: SharedListRepr::Inline {
-                len: items.len() as u8,
-                items: buffer,
-            },
-        }
+        Self::from_repr(SharedListRepr::Inline { len, items: buffer })
     }
 
     /// A heap list with a copy of `items`, which has more than
@@ -98,7 +121,7 @@ impl<T: Copy + Default> SharedList<T> {
         } else {
             SharedListRepr::Owned(Rc::from(items))
         };
-        Self { repr }
+        Self::from_repr(repr)
     }
 
     /// The sub-list `range` of this list. A long sub-list of an arena list
@@ -109,13 +132,11 @@ impl<T: Copy + Default> SharedList<T> {
         if range.len() <= SHARED_LIST_INLINE {
             return Self::inline(&self[range]);
         }
-        match &self.repr {
-            SharedListRepr::Arena(items) => Self {
-                repr: SharedListRepr::Arena(&items[range]),
-            },
-            SharedListRepr::Owned(items) => Self {
-                repr: SharedListRepr::Owned(Rc::from(&items[range])),
-            },
+        match &*self.repr {
+            SharedListRepr::Arena(items) => Self::from_repr(SharedListRepr::Arena(&items[range])),
+            SharedListRepr::Owned(items) => {
+                Self::from_repr(SharedListRepr::Owned(Rc::from(&items[range])))
+            }
             // An inline list is never longer than `SHARED_LIST_INLINE`.
             SharedListRepr::Inline { .. } => unreachable!(),
         }
@@ -125,28 +146,50 @@ impl<T: Copy + Default> SharedList<T> {
 impl<T: Copy> Clone for SharedList<T> {
     #[inline]
     fn clone(&self) -> Self {
-        Self {
-            repr: match &self.repr {
-                SharedListRepr::Arena(items) => SharedListRepr::Arena(items),
-                SharedListRepr::Owned(items) => SharedListRepr::Owned(items.clone()),
-                SharedListRepr::Inline { len, items } => SharedListRepr::Inline {
-                    len: *len,
-                    items: *items,
-                },
+        Self::from_repr(match &*self.repr {
+            SharedListRepr::Arena(items) => SharedListRepr::Arena(items),
+            SharedListRepr::Owned(items) => clone_owned(items),
+            SharedListRepr::Inline { len, items } => SharedListRepr::Inline {
+                len: *len,
+                items: *items,
             },
+        })
+    }
+}
+
+/// The clone of an `Owned` list (multi-program only), out of line.
+#[cold]
+#[inline(never)]
+fn clone_owned<T: 'static>(items: &Rc<[T]>) -> SharedListRepr<T> {
+    SharedListRepr::Owned(items.clone())
+}
+
+impl<T: 'static> Drop for SharedList<T> {
+    // `repr` is a `ManuallyDrop`, so this is its only drop. An arena or
+    // inline list owns nothing; an owned one is freed by `drop_owned`.
+    #[inline]
+    fn drop(&mut self) {
+        if matches!(*self.repr, SharedListRepr::Owned(_)) {
+            drop_owned(&mut self.repr);
         }
     }
+}
+
+/// Drops the `Rc` of an `Owned` list (multi-program only), out of line. The
+/// empty arena list put in its place owns nothing.
+#[cold]
+#[inline(never)]
+fn drop_owned<T: 'static>(repr: &mut SharedListRepr<T>) {
+    drop(std::mem::replace(repr, SharedListRepr::Arena(&[])));
 }
 
 impl<T: Copy + Default> Default for SharedList<T> {
     #[inline]
     fn default() -> Self {
-        Self {
-            repr: SharedListRepr::Inline {
-                len: 0,
-                items: [T::default(); SHARED_LIST_INLINE],
-            },
-        }
+        Self::from_repr(SharedListRepr::Inline {
+            len: InlineLen::Zero,
+            items: [T::default(); SHARED_LIST_INLINE],
+        })
     }
 }
 
@@ -155,7 +198,7 @@ impl<T> std::ops::Deref for SharedList<T> {
 
     #[inline]
     fn deref(&self) -> &[T] {
-        match &self.repr {
+        match &*self.repr {
             SharedListRepr::Arena(items) => items,
             SharedListRepr::Owned(items) => items,
             SharedListRepr::Inline { len, items } => &items[..*len as usize],
@@ -417,7 +460,7 @@ pub struct TypeAliasLinks {
     pub declared_type: TypeId,
     pub type_parameters: Vec<TypeId>, // Type parameters of type alias (undefined if non-generic)
     // PORT: Go nil map (non-generic alias) is `None`.
-    pub instantiations: Option<CacheKeyMap<TypeId>>, // Instantiations of generic type alias (undefined if non-generic)
+    pub instantiations: Option<InstantiationMap>, // Instantiations of generic type alias (undefined if non-generic)
     pub is_constructor_declared_property: bool,
 }
 
@@ -1325,10 +1368,21 @@ impl<T> ArenaBox<T> {
     /// Moves `value` into this thread's checker arena, or into a `Box`.
     #[inline(always)]
     pub fn new(value: T) -> Self {
+        Self::new_with(move || value)
+    }
+
+    /// Puts the value that `make` returns in this thread's checker arena,
+    /// or in a `Box`.
+    ///
+    /// PERF: the slot is made first and `make` runs after, so a large value
+    /// is built straight in its slot (`Bump::alloc_with`, `Box::write`). A
+    /// value built before the call is copied with `memcpy`.
+    #[inline(always)]
+    pub fn new_with(make: impl FnOnce() -> T) -> Self {
         ArenaBox(if use_checker_arena() {
-            ArenaBoxRepr::Arena(checker_arena().alloc(value))
+            ArenaBoxRepr::Arena(checker_arena().alloc_with(make))
         } else {
-            ArenaBoxRepr::Owned(Box::new(value))
+            ArenaBoxRepr::Owned(Box::write(Box::new_uninit(), make()))
         })
     }
 }
@@ -1744,6 +1798,16 @@ impl StructuredType {
 // EvolvingArrayType:
 // ObjectFlagsEvolvingArray: Evolving array type
 
+/// The instantiation cache of a generic target: `ObjectType`,
+/// `TypeAliasLinks` and `ConditionalRoot` `instantiations` (Go
+/// `map[CacheHashKey]*Type`).
+///
+/// PERF: a `FlatMap` probe reads the key and value in one cache line;
+/// hashbrown reads a control group first. The maps are never iterated, so
+/// the layout cannot change any output. For an A/B run against hashbrown,
+/// change it to `CacheKeyMap<TypeId>`.
+pub type InstantiationMap = FlatMap<CacheHashKey, TypeId>;
+
 // Go: checker/types.go:975 ObjectType
 #[derive(Clone, Default)]
 pub struct ObjectType {
@@ -1751,7 +1815,7 @@ pub struct ObjectType {
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
     // PORT: Go nil map is `None`; Go creates it lazily.
-    pub instantiations: Option<CacheKeyMap<TypeId>>, // Map of type instantiations
+    pub instantiations: Option<InstantiationMap>, // Map of type instantiations
 }
 
 // TypeReference (instantiation of an InterfaceType)
@@ -2112,7 +2176,7 @@ pub struct ConditionalRoot {
     // without a copy. It never changes after the root is created.
     pub outer_type_parameters: SharedList<TypeId>,
     // PORT: Go nil map is `None`.
-    pub instantiations: Option<CacheKeyMap<TypeId>>,
+    pub instantiations: Option<InstantiationMap>,
     pub alias: Option<Rc<TypeAlias>>,
 }
 

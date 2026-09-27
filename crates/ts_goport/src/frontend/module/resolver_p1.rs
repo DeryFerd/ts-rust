@@ -364,6 +364,18 @@ impl Resolver {
             {
                 return (cached, Vec::new());
             }
+            // PERF: a parse worker may have resolved this key already (Go
+            // shares one cache between all parse tasks). The answer is the
+            // same, so it goes into this resolver's cache as its own.
+            if let Some(shared) = &self.caches.shared
+                && let Some(found) = shared.cache.get_type_ref_directive(&cache_key)
+            {
+                let found = Rc::new((*found).clone());
+                self.caches
+                    .type_ref_directive_resolution_cache
+                    .set(cache_key, found.clone());
+                return (found, Vec::new());
+            }
         }
 
         let compiler_options =
@@ -406,6 +418,11 @@ impl Resolver {
                 .trace_type_reference_directive_result(type_reference_directive_name, &result);
         }
 
+        if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
+            shared
+                .cache
+                .set_type_ref_directive(cache_key.clone(), std::sync::Arc::new((*result).clone()));
+        }
         self.caches
             .type_ref_directive_resolution_cache
             .set(cache_key, result.clone());
@@ -434,6 +451,17 @@ impl Resolver {
         if trace_builder.is_none() {
             if let Some(cached) = self.caches.module_resolution_cache.get(&cache_key) {
                 return (cached, Vec::new());
+            }
+            // PERF: a parse worker may have resolved this key already (see
+            // `resolve_type_reference_directive`).
+            if let Some(shared) = &self.caches.shared
+                && let Some(found) = shared.cache.get_module(&cache_key)
+            {
+                let found = Rc::new((*found).clone());
+                self.caches
+                    .module_resolution_cache
+                    .set(cache_key, found.clone());
+                return (found, Vec::new());
             }
         }
 
@@ -511,6 +539,12 @@ impl Resolver {
             result,
             &trace_builder,
         ));
+        if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
+            shared.cache.set_module(
+                cache_key.clone(),
+                std::sync::Arc::new((*final_result).clone()),
+            );
+        }
         self.caches
             .module_resolution_cache
             .set(cache_key, final_result.clone());

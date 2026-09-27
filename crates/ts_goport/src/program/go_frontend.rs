@@ -13,6 +13,7 @@ use crate::ast::store::{
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
+    start_default_lib_prefetch, with_loader_state_forgotten,
 };
 use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{
@@ -373,8 +374,9 @@ fn go_files_of_unpublished_stores(
 ) -> Vec<GoFile> {
     let outside = PARSED_UNPUBLISHED.with(|outside| std::mem::take(&mut *outside.borrow_mut()));
     // `files[i]` is the GoFile of store `unpublished_file_ids().start + i`.
-    let mut files = Vec::new();
-    for store in unpublished_file_ids() {
+    let stores = unpublished_file_ids();
+    let mut files = Vec::with_capacity(stores.len());
+    for store in stores {
         if !parsed.contains_key(&store)
             && let Some(file) = outside.get(&store)
         {
@@ -470,6 +472,14 @@ fn load_config(
         return Err(messages.join("\n"));
     }
     let config = config.ok_or_else(|| format!("cannot parse {config_abs}"))?;
+    // PERF: the default lib parses start now, before the host and the
+    // loader exist (`start_default_lib_prefetch`).
+    start_default_lib_prefetch(
+        &config,
+        &cwd,
+        fs.use_case_sensitive_file_names(),
+        &bundled::lib_path(),
+    );
 
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
     let host =
@@ -488,7 +498,10 @@ fn load_config(
 /// the Go files and installs the program for the process. Call it once.
 pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoProgram, String> {
     let cwd = current_directory()?;
-    let new_program: &'static NewProgram = Box::leak(Box::new(new_program(opts)));
+    // PERF: the program of a one-program process is never freed, so its
+    // loader state is not freed either (`with_loader_state_forgotten`).
+    let new_program: &'static NewProgram =
+        Box::leak(Box::new(with_loader_state_forgotten(|| new_program(opts))));
     Ok(build_program(new_program, Entry::Only, cwd, None))
 }
 
@@ -520,8 +533,11 @@ fn build_program(
 
     // PERF: the program is leaked, so its files are `&'static` and each
     // `SourceFileInfo` can borrow their fields instead of copying them.
-    let mut parsed: FxHashMap<usize, &'static ParsedSourceFile> = FxHashMap::default();
-    let mut source_file_order = Vec::new();
+    // The maps are sized up front: this is serial work before the bind.
+    let file_count = np.source_files().len();
+    let mut parsed: FxHashMap<usize, &'static ParsedSourceFile> =
+        FxHashMap::with_capacity_and_hasher(file_count, Default::default());
+    let mut source_file_order = Vec::with_capacity(file_count);
     for file in np.source_files() {
         source_file_order.push(file.store);
         parsed.insert(file.store, &**file);
@@ -533,8 +549,12 @@ fn build_program(
     // load, then the Go program fields of each.
     let mut stores: Vec<usize> = parsed.keys().copied().collect();
     stores.sort_unstable();
-    let mut file_by_path = FxHashMap::default();
-    let mut file_meta = FxHashMap::default();
+    // Every program file path is in `files_by_path` too.
+    let mut file_by_path = FxHashMap::with_capacity_and_hasher(
+        np.files_by_path().len().max(file_count),
+        Default::default(),
+    );
+    let mut file_meta = FxHashMap::with_capacity_and_hasher(file_count, Default::default());
     for store in stores {
         let path = parsed[&store].path();
         file_by_path.insert(path.0.clone(), store);
