@@ -496,8 +496,9 @@ impl Watcher {
         // PORT: Go passes a nil incremental host. The Rust `new_program`
         // takes a host, so the field is cleared after.
         program.host = None;
-        // PORT: Go drops the old program here. Its checkers and frontend are
-        // freed; its shell and file versions stay leaked.
+        // PORT: Go drops the old program here. `program::release_program`
+        // stops its checker pool, which frees its checkers. Its `GoProgram`,
+        // frontend program and file versions stay leaked.
         if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
             crate::program::release_program(old);
         }

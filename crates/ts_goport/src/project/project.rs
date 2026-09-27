@@ -14,7 +14,6 @@ use crate::frontend::core_ext::TypeAcquisition;
 use crate::frontend::vfs::Fs as _;
 use crate::program::ls_program;
 use std::cell::Cell;
-use xxhash_rust::xxh3::xxh3_128;
 
 // Go: project/project.go:22 inferredProjectName
 pub const INFERRED_PROJECT_NAME: &str = "/dev/null/inferred"; // lowercase so toPath is a no-op regardless of settings
@@ -537,34 +536,31 @@ impl Project {
                         .is_some_and(|dirty_file| Rc::ptr_eq(dirty_file, file));
                     if !is_dirty_file {
                         // UpdateProgram acquired the changed file only, so we need to ref everything else
-                        // PORT: Go `file.Hash` is the xxh3-128 of the file text.
-                        builder.parse_cache.ref_(&new_parse_cache_key(
+                        ref_program_file(
+                            &builder.parse_cache,
                             file.parse_options(),
-                            xxh3_128(file.text.as_bytes()),
+                            file.text,
                             file.script_kind,
-                        ));
+                        );
                     }
                 }
                 for file in new_program.duplicate_source_files() {
-                    // PORT: Go `file.Hash` is the xxh3-128 of the file text.
-                    builder.parse_cache.ref_(&new_parse_cache_key(
+                    ref_program_file(
+                        &builder.parse_cache,
                         &file.parse_options,
-                        xxh3_128(file.text.as_bytes()),
+                        file.text,
                         file.script_kind,
-                    ));
+                    );
                 }
             } else if let Some(dirty_file) = &dirty_file {
                 // UpdateProgram always acquires the dirty file before deciding whether it can
                 // reuse the old program. If it falls back to a full rebuild, release that
                 // speculative acquire so the rebuilt program is the only remaining owner.
-                // PORT: called by path so `std::ops::Deref::deref` can not win.
-                ParseCache::deref(
+                deref_program_file(
                     &builder().parse_cache,
-                    &new_parse_cache_key(
-                        dirty_file.parse_options(),
-                        xxh3_128(dirty_file.text.as_bytes()),
-                        dirty_file.script_kind,
-                    ),
+                    dirty_file.parse_options(),
+                    dirty_file.text,
+                    dirty_file.script_kind,
                 );
             }
         } else {
