@@ -378,16 +378,22 @@ impl PartialEq<Name> for String {
     }
 }
 
+/// The names of the bundled lib files, made by
+/// `crates/ts_goport/scripts/gen-lib-names.py` (`intern::lib_name`).
+mod lib_names;
+
 /// The process-wide string interner behind `Name`. Text is copied once into
 /// leaked blocks and never freed. A name id is `seq << 1 | internal`, where
 /// `seq` is a sequence number that starts at 1 and is close to dense (see
 /// `next_id`) and `internal` is `Name::is_internal`. The text tables are
 /// indexed by `seq` (`id >> 1`). Id 0 is "". Sequence number 1 is
-/// "default" (`DEFAULT_ID`), interned when the shards are made.
+/// "default" (`DEFAULT_ID`), interned when the shards are made. The names of
+/// the bundled lib files (`lib_names`) have the sequence numbers from
+/// `LIB_FIRST_SEQ` on, in table order, and are never in the shards.
 /// `text` reads without a lock; `intern` takes one shard lock on a miss in
-/// the per-thread cache.
+/// the per-thread cache and the lib name table.
 mod intern {
-    use super::Name;
+    use super::{Name, lib_names};
     use rustc_hash::{FxBuildHasher, FxHashMap};
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -415,8 +421,10 @@ mod intern {
     /// reading and hashing the text again.
     static HASHES: [OnceLock<Box<[AtomicU32]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
     /// The next sequence number block. Only `next_id` reads it. Sequence
-    /// number 1 is `DEFAULT_ID`.
-    static NEXT: AtomicU32 = AtomicU32::new(2);
+    /// number 1 is `DEFAULT_ID`, and the lib names come next.
+    static NEXT: AtomicU32 = AtomicU32::new(LIB_FIRST_SEQ + lib_names::COUNT as u32);
+    /// The sequence number of lib name 0 (`lib_names`).
+    const LIB_FIRST_SEQ: u32 = 2;
     /// Sequence numbers that a thread takes from `NEXT` at once.
     const ID_BLOCK: u32 = 64;
     /// Every sequence number is below this, so `seq << 1 | 1` fits in a
@@ -540,18 +548,70 @@ mod intern {
 
     /// Records the text and table hash of new id `id`.
     fn set_slot(id: u32, hash: u64, stored: &'static str) {
+        set_hash(id, hash);
         let (chunk, index) = slot(id);
         let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
-        let hashes =
-            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
-        hashes[index].store(super::fold_hash(hash), Ordering::Relaxed);
         let slots = TEXTS[chunk].get_or_init(|| (0..chunk_len).map(|_| OnceLock::new()).collect());
         let _ = slots[index].set(stored);
     }
 
+    /// Records the table hash of id `id`, from its `hash_str` hash `hash`.
+    /// Writes only a slot that does not hold it yet, so threads that find
+    /// the same lib name do not write one cache line in turn.
+    #[inline]
+    fn set_hash(id: u32, hash: u64) {
+        let (chunk, index) = slot(id);
+        let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
+        let hashes =
+            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
+        let folded = super::fold_hash(hash);
+        if hashes[index].load(Ordering::Relaxed) != folded {
+            hashes[index].store(folded, Ordering::Relaxed);
+        }
+    }
+
+    /// The text of lib name `i` (`lib_names`).
+    #[inline]
+    fn lib_text(i: usize) -> &'static str {
+        &lib_names::TEXT[lib_names::OFFSETS[i] as usize..lib_names::OFFSETS[i + 1] as usize]
+    }
+
+    /// The index of `s` in the lib name table, or `None`. `hash` is
+    /// `hash_str(s)`. The result depends only on `s`, so a text in the table
+    /// always gets the same id and never reaches the shards.
+    // PERF: most probes miss (a name that no lib file has), so a name of
+    // another length is skipped with the offsets alone, and byte slices
+    // skip the `str` char boundary checks, which read the text.
+    #[inline]
+    fn find_lib_name(s: &str, hash: u64) -> Option<usize> {
+        let bucket = (hash as usize) & ((1usize << lib_names::BUCKET_BITS) - 1);
+        let start = lib_names::BUCKETS[bucket] as usize;
+        let end = lib_names::BUCKETS[bucket + 1] as usize;
+        let text = lib_names::TEXT.as_bytes();
+        (start..end).find(|&i| {
+            let from = lib_names::OFFSETS[i] as usize;
+            let to = lib_names::OFFSETS[i + 1] as usize;
+            to - from == s.len() && &text[from..to] == s.as_bytes()
+        })
+    }
+
+    /// The id and text of `s` when it is a lib name. The id needs no lock
+    /// and no text copy. Its table hash is recorded before the id is
+    /// returned, as `intern_shared` does.
+    #[inline]
+    fn lib_name(s: &str, hash: u64) -> Option<(u32, &'static str)> {
+        let i = find_lib_name(s, hash)?;
+        // Lib names are ASCII, so none starts with the internal prefix and
+        // the internal bit stays 0.
+        let id = (LIB_FIRST_SEQ + i as u32) << 1;
+        set_hash(id, hash);
+        Some((id, lib_text(i)))
+    }
+
     /// The shard locks, made on first use with "default" at `DEFAULT_ID`.
-    /// A `Name` with any id other than 0 comes from `intern_shared`, which
-    /// calls this first, so the text of `DEFAULT_ID` is always set.
+    /// "default" is not a lib name (the generator leaves it out), so the
+    /// `DEFAULT_ID` name comes only from `intern_shared`, which calls this
+    /// first, and the text of `DEFAULT_ID` is always set.
     fn shards() -> &'static [PaddedShard; SHARDS] {
         SHARD_LOCKS.get_or_init(|| {
             let mut shards: [PaddedShard; SHARDS] = std::array::from_fn(|_| {
@@ -581,6 +641,11 @@ mod intern {
         if id == 0 {
             return "";
         }
+        // A lib name reads the static table; its `TEXTS` slot stays empty.
+        let lib = (id >> 1).wrapping_sub(LIB_FIRST_SEQ) as usize;
+        if lib < lib_names::COUNT {
+            return lib_text(lib);
+        }
         let (chunk, index) = slot(id);
         TEXTS[chunk]
             .get()
@@ -597,8 +662,9 @@ mod intern {
         }
         let (chunk, index) = slot(id);
         // Relaxed is enough: a thread gets `id` from `intern_shared` under
-        // the shard lock or through a later handoff, and both order the
-        // store in `intern_shared` before this load.
+        // the shard lock, from `lib_name` after its own store, or through a
+        // later handoff, and each orders a store of this hash before this
+        // load.
         HASHES[chunk].get().expect("unknown name id")[index].load(Ordering::Relaxed)
     }
 
@@ -628,7 +694,16 @@ mod intern {
         if let Some(id) = cached {
             return Name(id);
         }
-        let (id, stored) = intern_shared(s, hash);
+        // PERF: bind B2. A lib name (lib.dom alone brings about 7k names
+        // that no file interned before) gets its id from the static table,
+        // with no shard lock, map insert, text copy or `OnceLock` set. The
+        // table is probed before the shards on every miss, so a text never
+        // gets both a table id and a shard id. Ids are never ordered or
+        // printed (see `next_id`), so the reserved range changes no output.
+        let (id, stored) = match lib_name(s, hash) {
+            Some(found) => found,
+            None => intern_shared(s, hash),
+        };
         CACHE.with(|cache| {
             let [first, second] = &cache[set].0;
             second.set(first.get());
@@ -671,6 +746,53 @@ mod intern {
             shard.ids.insert(hash, (stored, id));
         }
         (id, stored)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Every lib name is found at its own index. A failure after a
+        /// rustc-hash update means the `hash_str` copy in
+        /// `scripts/gen-lib-names.py` is out of date: fix it and run it.
+        #[test]
+        fn lib_names_find_themselves() {
+            let mut seen = rustc_hash::FxHashSet::default();
+            for i in 0..lib_names::COUNT {
+                let text = lib_text(i);
+                assert!(!text.is_empty() && text.is_ascii(), "{text:?}");
+                assert_ne!(text, crate::ast::INTERNAL_SYMBOL_NAME_DEFAULT);
+                assert!(seen.insert(text), "lib name {text:?} twice");
+                assert_eq!(find_lib_name(text, hash_str(text)), Some(i), "{text:?}");
+            }
+            assert_eq!(
+                lib_names::OFFSETS[lib_names::COUNT] as usize,
+                lib_names::TEXT.len()
+            );
+            assert_eq!(
+                lib_names::BUCKETS[1usize << lib_names::BUCKET_BITS] as usize,
+                lib_names::COUNT
+            );
+        }
+
+        /// A lib name gets a table id, a text and a table hash like any other
+        /// name, and one id per text.
+        #[test]
+        fn lib_name_ids() {
+            let lib = Name::from("addEventListener");
+            assert!(((lib.0 >> 1) - LIB_FIRST_SEQ) < lib_names::COUNT as u32);
+            assert!(!lib.is_internal());
+            assert_eq!(lib.as_str(), "addEventListener");
+            assert_eq!(
+                lib.table_hash(),
+                super::super::table_hash("addEventListener")
+            );
+            assert_eq!(Name::from(String::from("addEventListener")).0, lib.0);
+            let other = Name::from("notALibName_u5");
+            assert!((other.0 >> 1) >= LIB_FIRST_SEQ + lib_names::COUNT as u32);
+            assert_eq!(other.as_str(), "notALibName_u5");
+            assert!(Name::from("default").is_default_symbol_name());
+        }
     }
 }
 
@@ -949,6 +1071,23 @@ impl<T: Clone> CowChunks<T> {
         // The same growth as `Vec::push` on a full chunk.
         values.reserve(1);
         values
+    }
+
+    /// Makes room for `additional` more values in the last chunk (up to its
+    /// end) and in the chunk list, so the pushes that follow do not grow
+    /// them step by step. Capacity only. A shared last chunk stays shared.
+    // PERF: bind D. A file arena starts with a one-value first chunk
+    // (`make_room`), which `push` grew by doubling for every bound file.
+    pub fn reserve(&mut self, additional: usize) {
+        let used = self.len & COW_CHUNK_MASK;
+        if used != 0
+            && let Some(Chunk::Owned(values)) = self.chunks.last_mut()
+        {
+            values.reserve_exact((COW_CHUNK_LEN - used).min(additional));
+        }
+        let chunks = (self.len + additional).div_ceil(COW_CHUNK_LEN);
+        self.chunks
+            .reserve(chunks.saturating_sub(self.chunks.len()));
     }
 
     /// Pushes every value in order, like `push` in a loop. Each chunk is
@@ -1511,6 +1650,14 @@ impl SymbolArena {
         id
     }
 
+    /// Makes room for `symbols` more symbols and `tables` more tables, so
+    /// binding a file does not grow the arena step by step. Capacity only:
+    /// ids and contents do not change.
+    pub fn reserve_arena(&mut self, symbols: usize, tables: usize) {
+        self.symbols.reserve(symbols);
+        self.tables.reserve(tables);
+    }
+
     /// Go `make(ast.SymbolTable)`.
     pub fn new_table(&mut self) -> SymbolTable {
         self.push_table(Table::default())
@@ -2015,29 +2162,37 @@ static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
 
 impl FileNodeBind {
     /// Compacts the per-node data of a bound file, given in node order.
+    /// `None` is a node with no data. At most `max_entries` items are
+    /// `Some`.
+    // PERF: bind C. The binder keeps flow nodes in their own per-node array
+    // (`NodeBindBuilder`) and merges them here. A node with no data and no
+    // flow node is `None`, so it costs one test and no 40-byte compare, and
+    // its slot is already `NO_NODE_BIND` from the fill.
     #[must_use]
-    pub fn new<'a>(nodes: impl ExactSizeIterator<Item = &'a NodeBindData>) -> Self {
-        let mut slots = Vec::with_capacity(nodes.len());
+    pub fn new(
+        nodes: impl ExactSizeIterator<Item = Option<NodeBindData>>,
+        max_entries: usize,
+    ) -> Self {
+        let mut slots = vec![NO_NODE_BIND; nodes.len()];
         let mut bases = Vec::with_capacity(nodes.len().div_ceil(NODE_BIND_BLOCK));
-        // PERF: reserve what `NodeBindBuilder::new` reserves for its entries
-        // (one node in four), so the entries do not grow and copy step by
-        // step. `shrink_to_fit` below gives back the unused part.
-        let mut entries: Vec<NodeBindData> = Vec::with_capacity(nodes.len() / 4 + 1);
+        // The entries do not grow and copy step by step. `shrink_to_fit`
+        // below gives back the unused part.
+        let mut entries: Vec<NodeBindData> = Vec::with_capacity(max_entries.min(nodes.len()));
         let mut block_start = 0;
         for (index, data) in nodes.enumerate() {
             if index & (NODE_BIND_BLOCK - 1) == 0 {
                 block_start = entries.len();
                 bases.push(u32::try_from(block_start).expect("node bind overflow"));
             }
-            if *data == EMPTY_NODE_BIND {
-                slots.push(NO_NODE_BIND);
+            let Some(data) = data else { continue };
+            if data == EMPTY_NODE_BIND {
                 continue;
             }
             // Entries are shared only inside a block, so offsets stay small.
-            if entries.len() == block_start || entries.last() != Some(data) {
-                entries.push(*data);
+            if entries.len() == block_start || entries.last() != Some(&data) {
+                entries.push(data);
             }
-            slots.push(u8::try_from(entries.len() - 1 - block_start).expect("block offset"));
+            slots[index] = u8::try_from(entries.len() - 1 - block_start).expect("block offset");
         }
         entries.shrink_to_fit();
         FileNodeBind {

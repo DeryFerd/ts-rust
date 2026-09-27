@@ -17,6 +17,7 @@ use crate::execute::incremental::incremental::{self as incremental, BuildInfoRea
 use crate::execute::tsc::compile::System;
 use crate::frontend::prelude::*;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 // Go: tsc/extendedconfigcache.go:15 ExtendedConfigCache
@@ -57,6 +58,15 @@ impl ExtendedConfigCache for TscExtendedConfigCache {
     }
 }
 
+impl TscExtendedConfigCache {
+    // PORT: Go assigns a new cache (`o.host.extendedConfigCache =
+    // tsc.ExtendedConfigCache{}`, orchestrator.go:276). The programs of a
+    // build keep the host `Rc`, so the cache is emptied in place.
+    pub fn reset(&self) {
+        self.m.borrow_mut().clear();
+    }
+}
+
 // PORT: Go keys the source file cache by `ast.SourceFileParseOptions`, a
 // comparable struct. The Rust struct has no `Hash`, so this key hashes the
 // same fields.
@@ -92,7 +102,9 @@ pub struct BuildHost {
 
     // caches that stay as long as they are needed
     pub resolved_references: ParseCache<Path, Rc<ParsedCommandLine>>,
-    pub m_times: RefCell<FxHashMap<Path, Option<SystemTime>>>,
+    // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
+    // from the checker threads.
+    pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
 }
 
 impl BuildHost {
@@ -124,7 +136,7 @@ impl BuildHost {
             source_files: ParseCache::default(),
             config_times: RefCell::new(FxHashMap::default()),
             resolved_references: ParseCache::default(),
-            m_times: RefCell::new(FxHashMap::default()),
+            m_times: Arc::default(),
         }
     }
 
@@ -155,8 +167,16 @@ impl BuildHost {
         store: bool,
     ) -> Option<SystemTime> {
         let path = self.to_path(file);
-        if let Some(existing) = self.m_times.borrow().get(&path) {
-            return *existing;
+        // PORT: Go `Load`, then `LoadOrStore` below. The lock is not held
+        // while `get_m_time` reads the file system.
+        let existing = self
+            .m_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&path)
+            .copied();
+        if let Some(existing) = existing {
+            return existing;
         }
         let mut found = false;
         let mut m_time = None;
@@ -170,7 +190,12 @@ impl BuildHost {
             m_time = incremental::get_m_time(&*self.host, file);
         }
         if store {
-            m_time = *self.m_times.borrow_mut().entry(path).or_insert(m_time);
+            m_time = *self
+                .m_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(path)
+                .or_insert(m_time);
         }
         m_time
     }
@@ -178,7 +203,10 @@ impl BuildHost {
     // Go: build/host.go:111 (*host).storeMTime
     pub fn store_m_time(&self, file: &str, m_time: Option<SystemTime>) {
         let path = self.to_path(file);
-        self.m_times.borrow_mut().insert(path, m_time);
+        self.m_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path, m_time);
     }
 
     // Go: build/host.go:116 (*host).storeMTimeFromOldCache
@@ -189,7 +217,10 @@ impl BuildHost {
     ) {
         let path = self.to_path(file);
         if let Some(m_time) = old_cache.get(&path) {
-            self.m_times.borrow_mut().insert(path, *m_time);
+            self.m_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path, *m_time);
         }
     }
 

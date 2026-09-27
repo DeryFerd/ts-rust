@@ -1,24 +1,33 @@
 //! Port of execute/incremental/referencemap.go.
 //!
-//! PORT: Go `collections.SyncMap` and `collections.Set` are `IndexMap` and
-//! `IndexSet`. Go iterates these maps in random order; the port iterates in
-//! insertion order so that runs are repeatable. Every Go caller either sorts
-//! the result or does not depend on the order.
+//! PORT: Go `collections.SyncMap` and `collections.Set` are `FxIndexMap`
+//! and `IndexSet`. Go iterates these maps in random order; the port iterates
+//! in insertion order so that runs are repeatable. Every Go caller either
+//! sorts the result or does not depend on the order.
+//!
+//! PERF: the keys are long paths, so the maps use the Fx hasher instead of
+//! SipHash. The hasher does not change the order. The stored sets stay
+//! `IndexSet<Path>` because `snapshot_to_build_info.rs` reads them as that
+//! type.
 
 use crate::frontend::prelude::*;
 use std::cell::OnceCell;
+use std::sync::Arc;
 
 // Go: incremental/referencemap.go:12 referenceMap
+// PORT: Go stores `*collections.Set` pointers, and several files can share
+// one set (`buildInfoToSnapshot` stores one set for each file id list). The
+// port shares a set with `Arc`, so storing it does not copy its paths.
 #[derive(Debug, Default)]
 pub struct ReferenceMap {
-    references: IndexMap<Path, IndexSet<Path>>,
+    references: FxIndexMap<Path, Arc<IndexSet<Path>>>,
     // PORT: Go `referencedBy` plus the `referenceBy` sync.Once.
-    referenced_by: OnceCell<FxHashMap<Path, IndexSet<Path>>>,
+    referenced_by: OnceCell<FxHashMap<Path, FxIndexSet<Path>>>,
 }
 
 impl ReferenceMap {
     // Go: incremental/referencemap.go:18 storeReferences
-    pub fn store_references(&mut self, path: Path, refs: IndexSet<Path>) {
+    pub fn store_references(&mut self, path: Path, refs: Arc<IndexSet<Path>>) {
         self.references.insert(path, refs);
     }
 
@@ -26,7 +35,7 @@ impl ReferenceMap {
     // PORT: Go returns `(*Set, bool)`; a missing entry is `None`.
     #[must_use]
     pub fn get_references(&self, path: &Path) -> Option<&IndexSet<Path>> {
-        self.references.get(path)
+        self.references.get(path).map(|refs| &**refs)
     }
 
     // Go: incremental/referencemap.go:27 getPathsWithReferences
@@ -40,9 +49,9 @@ impl ReferenceMap {
     #[must_use]
     pub fn get_referenced_by(&self, path: &Path) -> Vec<Path> {
         let referenced_by = self.referenced_by.get_or_init(|| {
-            let mut referenced_by: FxHashMap<Path, IndexSet<Path>> = FxHashMap::default();
+            let mut referenced_by: FxHashMap<Path, FxIndexSet<Path>> = FxHashMap::default();
             for (key, value) in &self.references {
-                for ref_ in value {
+                for ref_ in value.iter() {
                     referenced_by
                         .entry(ref_.clone())
                         .or_default()

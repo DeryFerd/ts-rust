@@ -1,6 +1,7 @@
 //! Port of module/cache.go.
 
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 // Go: module/cache.go:11 ModeAwareCache
 pub type ModeAwareCache<T> = FxHashMap<ModeAwareCacheKey, T>;
@@ -89,6 +90,11 @@ pub struct Caches {
     // Cached representation for `core.CompilerOptions.paths`.
     // Doesn't handle other path patterns like in `typesVersions`.
     pub parsed_patterns_for_paths: RefCell<Option<Rc<ParsedPatterns>>>,
+
+    /// The resolution caches that this resolver shares with the other
+    /// resolvers of one program load (see `SharedResolutionCache`). `None`
+    /// for a resolver that shares nothing.
+    pub shared: Option<SharedResolutionLink>,
 }
 
 impl Caches {
@@ -101,7 +107,75 @@ impl Caches {
             module_resolution_cache: ModuleResolutionCache::default(),
             type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache::default(),
             parsed_patterns_for_paths: RefCell::new(None),
+            shared: None,
         }
+    }
+}
+
+// Go: module/cache.go:20 moduleResolutionCache and :40
+// typeRefDirectiveResolutionCache, the `SyncMap`s themselves.
+// PORT: Go shares one resolver, and so these maps, between all parse tasks
+// of a program. The Rust loader resolves on one thread with `Rc` values
+// (`Caches`), and each parse worker has its own resolver. This is the part
+// they share: the loader's resolver reads what the workers resolved ahead
+// of it. A resolution is a function of its key (the key has the redirect
+// config) and of the file system, so any resolver stores the same answer
+// that the loader would find; first answer wins, as in Go. Only a program
+// that resolves on the plain OS file system, with no project references
+// and no traced resolution, shares one (`process_all_program_files`).
+#[derive(Default)]
+pub struct SharedResolutionCache {
+    modules: std::sync::Mutex<FxHashMap<ModuleResolutionCacheKey, Arc<ResolvedModule>>>,
+    type_ref_directives: std::sync::Mutex<
+        FxHashMap<TypeRefDirectiveResolutionCacheKey, Arc<ResolvedTypeReferenceDirective>>,
+    >,
+}
+
+/// A resolver's link to a `SharedResolutionCache`.
+#[derive(Clone)]
+pub struct SharedResolutionLink {
+    pub cache: Arc<SharedResolutionCache>,
+    /// True for a parse worker's resolver: it stores each answer it makes.
+    /// The loader's resolver only reads, so its serial path does no extra
+    /// copies.
+    pub publish: bool,
+}
+
+fn lock_shared<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl SharedResolutionCache {
+    /// Go `moduleResolutionCache.Get`.
+    #[must_use]
+    pub fn get_module(&self, key: &ModuleResolutionCacheKey) -> Option<Arc<ResolvedModule>> {
+        lock_shared(&self.modules).get(key).cloned()
+    }
+
+    /// Go `moduleResolutionCache.Set` (`LoadOrStore`: the first value wins).
+    pub fn set_module(&self, key: ModuleResolutionCacheKey, value: Arc<ResolvedModule>) {
+        lock_shared(&self.modules).entry(key).or_insert(value);
+    }
+
+    /// Go `typeRefDirectiveResolutionCache.Get`.
+    #[must_use]
+    pub fn get_type_ref_directive(
+        &self,
+        key: &TypeRefDirectiveResolutionCacheKey,
+    ) -> Option<Arc<ResolvedTypeReferenceDirective>> {
+        lock_shared(&self.type_ref_directives).get(key).cloned()
+    }
+
+    /// Go `typeRefDirectiveResolutionCache.Set` (`Store`: the last value
+    /// wins).
+    pub fn set_type_ref_directive(
+        &self,
+        key: TypeRefDirectiveResolutionCacheKey,
+        value: Arc<ResolvedTypeReferenceDirective>,
+    ) {
+        lock_shared(&self.type_ref_directives).insert(key, value);
     }
 }
 

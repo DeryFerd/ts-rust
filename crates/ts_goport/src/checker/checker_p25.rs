@@ -139,7 +139,7 @@ impl Checker {
         );
         if self.ty(target).as_object_type().instantiations.is_none() {
             let target_alias = self.ty(target).alias.clone();
-            let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
+            let mut instantiations = InstantiationMap::default();
             instantiations.insert(
                 get_type_instantiation_key(
                     &self.symbols,
@@ -187,7 +187,7 @@ impl Checker {
             self.ty_mut(target)
                 .as_object_type_mut()
                 .instantiations
-                .get_or_insert_with(CacheKeyMap::default)
+                .get_or_insert_with(InstantiationMap::default)
                 .insert(key, result);
             if self
                 .ty(result)
@@ -473,7 +473,7 @@ impl Checker {
                 }
                 root.borrow_mut()
                     .instantiations
-                    .get_or_insert_with(CacheKeyMap::default)
+                    .get_or_insert_with(InstantiationMap::default)
                     .insert(key, result);
             }
             return result;

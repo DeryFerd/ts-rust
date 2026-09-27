@@ -196,7 +196,7 @@ impl Checker {
     // Go: checker/utilities.go:1030 isMutableLocalVariableDeclaration
     pub fn is_mutable_local_variable_declaration(&self, declaration: Node) -> bool {
         // Return true if symbol is a non-exported and non-global `let` variable
-        declaration.parent().flags().intersects(NodeFlags::LET)
+        !declaration.parent().parser_flags(NodeFlags::LET).is_empty()
             && !(get_combined_modifier_flags(declaration).intersects(ModifierFlags::EXPORT)
                 || declaration.parent().parent().kind() == SyntaxKind::VariableStatement
                     && is_global_source_file(declaration.parent().parent().parent()))
@@ -204,12 +204,17 @@ impl Checker {
 }
 
 // Go: checker/utilities.go:1035 isInAmbientOrTypeNode
+// PERF: U4 (CH7), as `Checker::is_in_ambient_or_type_node`.
 pub fn is_in_ambient_or_type_node(node: Node) -> bool {
-    node.flags().intersects(NodeFlags::AMBIENT)
-        || find_ancestor(node, |n: Node| {
-            is_interface_declaration(n)
-                || is_type_or_js_type_alias_declaration(n)
-                || is_type_literal_node(n)
+    !node.parser_flags(NodeFlags::AMBIENT).is_empty()
+        || find_ancestor_with_kind(node, |_, kind| {
+            matches!(
+                kind,
+                SyntaxKind::InterfaceDeclaration
+                    | SyntaxKind::TypeAliasDeclaration
+                    | SyntaxKind::JsTypeAliasDeclaration
+                    | SyntaxKind::TypeLiteral
+            )
         })
         .is_some()
 }
@@ -306,7 +311,7 @@ pub fn get_binding_element_property_name(node: Node) -> Node {
 
 // Go: checker/utilities.go:1062 isCallChain
 pub fn is_call_chain(node: Node) -> bool {
-    is_call_expression(node) && node.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
+    is_call_expression(node) && !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty()
 }
 
 impl Checker {

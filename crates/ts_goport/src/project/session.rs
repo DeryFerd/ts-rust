@@ -11,7 +11,10 @@
 //! enqueue order. Debounce sleeps, the idle cache clean timer and the
 //! telemetry ticker are `gostd::local::after_func` timers, so their
 //! functions run on the dispatch thread. `WaitForBackgroundTasks` drains
-//! `gostd::local` through `Queue::wait`.
+//! `gostd::local` through `Queue::wait`. The one exception is the clone of
+//! the auto-import warm, which is `gostd::local` idle work: it runs only
+//! when no message waits, and the reader thread can cancel it
+//! (`WarmAutoImportPreempt`).
 //!
 //! Go runtime metrics (`runtime/metrics`) exist only in the Go runtime.
 //! Performance telemetry reads them as `KindBad` (`metrics_read`), so its
@@ -22,6 +25,7 @@
 use crate::project::prelude::*;
 
 use std::cell::Cell;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // PORT: the Go text of a nil pointer dereference, for the Go calls on a
@@ -164,6 +168,9 @@ pub struct Session {
     // which is not `Send`, so this is an `Rc<dyn Fn()>`, not a
     // `gostd::context::CancelFunc`.
     pub warm_auto_import_cancel: RefCell<Option<Rc<dyn Fn()>>>,
+    // PORT: the `Send` copy of `warm_auto_import_cancel` for the LSP reader
+    // thread. See `WarmAutoImportPreempt`.
+    pub warm_auto_import_preempt: WarmAutoImportPreempt,
 
     // idleCacheCleanTimer is a resettable timer for scheduling idle disk
     // cache cleans. The timer resets on any file event (open, close,
@@ -278,6 +285,7 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         diagnostics_refresh_cancel: RefCell::new(None),
         diagnostics_refresh_generation: Cell::new(0),
         warm_auto_import_cancel: RefCell::new(None),
+        warm_auto_import_preempt: WarmAutoImportPreempt::default(),
         idle_cache_clean_timer: RefCell::new(None),
         performance_telemetry_cancel: RefCell::new(None),
         seen_projects: RefCell::new(FxHashSet::default()),
@@ -679,7 +687,64 @@ impl Session {
         if let Some(cancel) = cancel {
             cancel();
             *self.warm_auto_import_cancel.borrow_mut() = None;
+            self.warm_auto_import_preempt.clear();
         }
+    }
+}
+
+/// PORT: cancels the auto-import warm from the LSP reader thread.
+///
+/// Go runs the warm on a goroutine, and the dispatch goroutine cancels it
+/// when it handles didOpen, didChange, didClose or didChangeWatchedFiles.
+/// Here the warm runs on the dispatch thread, so the dispatch thread cannot
+/// get to those messages until the warm ends. The reader thread calls
+/// `cancel` when one of them arrives, and the warm stops at its next
+/// context check. The handler's own `cancel_warm_auto_import_cache` then
+/// finds the warm done, as Go's does when the warm has ended.
+///
+/// It holds the same context and cancel function as
+/// `Session::warm_auto_import_cancel`, and is set and cleared with it.
+#[derive(Clone, Default)]
+pub struct WarmAutoImportPreempt(Arc<Mutex<Option<WarmAutoImportPreemptEntry>>>);
+
+struct WarmAutoImportPreemptEntry {
+    ctx: Context,
+    cancel: gostd::context::CancelFunc,
+    file_name: String,
+}
+
+impl WarmAutoImportPreempt {
+    fn entry(&self) -> MutexGuard<'_, Option<WarmAutoImportPreemptEntry>> {
+        // PORT: Go mutexes do not poison.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, ctx: Context, cancel: gostd::context::CancelFunc, file_name: String) {
+        *self.entry() = Some(WarmAutoImportPreemptEntry {
+            ctx,
+            cancel,
+            file_name,
+        });
+    }
+
+    fn clear(&self) {
+        *self.entry() = None;
+    }
+
+    /// Go `cancelWarmAutoImportCache`, with the log line of the stored
+    /// cancel function. Safe to call from any thread.
+    pub fn cancel(&self, logger: &dyn logging::Logger) {
+        let Some(entry) = self.entry().take() else {
+            return;
+        };
+        if entry.ctx.err().is_some() {
+            return;
+        }
+        logger.logf(&format!(
+            "Cancelling auto-import warming for file {}",
+            entry.file_name
+        ));
+        (entry.cancel)();
     }
 }
 
@@ -1862,10 +1927,15 @@ impl Session {
     // WaitForBackgroundTasks waits for all background tasks to complete.
     // This is intended to be used only for testing purposes.
     // PORT: `Queue::wait` runs `gostd::local::run_pending` until the
-    // queue's tasks have finished.
+    // queue's tasks have finished. The auto-import warm clone is idle work
+    // (see `warm_auto_import_cache`); Go waits for it as part of its task,
+    // so this runs the idle work too.
     pub fn wait_for_background_tasks(&self) {
         self.cancel_idle_cache_clean();
         self.background_queue.wait();
+        while gostd::local::run_idle() {
+            self.background_queue.wait();
+        }
     }
 }
 
@@ -2822,6 +2892,14 @@ impl Session {
     // Go: project/session.go:1777 warmAutoImportCache
     // PORT: Go `defer cancel()` and `defer newSnapshot.Deref(s)` run on
     // every return; the port calls them on each path, in Go's defer order.
+    //
+    // PORT: the clone (the export extraction, which can take hundreds of
+    // ms) runs as idle work (`gostd::local::go_idle`), after the checks and
+    // the cancel setup that Go does first. The dispatch loop starts it only
+    // when no message waits, so a request that has arrived does not wait
+    // for it. Go runs the whole warm on a goroutine. A file event cancels
+    // the context before or during the clone (`WarmAutoImportPreempt`); the
+    // clone still runs, as Go's does, and its result is discarded.
     pub fn warm_auto_import_cache(
         self: &Rc<Self>,
         ctx: &Context,
@@ -2869,6 +2947,11 @@ impl Session {
                 let stored_cancel = cancel.clone();
                 let logger = self.logger.clone();
                 let file_name = changed_file.file_name();
+                self.warm_auto_import_preempt.set(
+                    warm_ctx.clone(),
+                    cancel.clone(),
+                    file_name.clone(),
+                );
                 *self.warm_auto_import_cancel.borrow_mut() = Some(Rc::new(move || {
                     if stored_ctx.err().is_some() {
                         return;
@@ -2895,36 +2978,40 @@ impl Session {
             }
             // Go: defer newSnapshot.Deref(s)
 
-            let warm_change = SnapshotChange {
-                reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
-                resource_request: ResourceRequest {
-                    documents: vec![changed_file.clone()],
-                    auto_imports: changed_file.clone(),
+            let s = self.clone();
+            let new_snapshot = new_snapshot.clone();
+            gostd::local::go_idle(Box::new(move || {
+                let warm_change = SnapshotChange {
+                    reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
+                    resource_request: ResourceRequest {
+                        documents: vec![changed_file.clone()],
+                        auto_imports: changed_file.clone(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            };
-            let cloned_snapshot = Snapshot::clone_(
-                new_snapshot,
-                &warm_ctx,
-                warm_change,
-                &new_snapshot.fs.overlays,
-                self,
-            );
+                };
+                let cloned_snapshot = Snapshot::clone_(
+                    &new_snapshot,
+                    &warm_ctx,
+                    warm_change,
+                    &new_snapshot.fs.overlays,
+                    &s,
+                );
 
-            // If cancelled during clone, discard the incomplete result.
-            if warm_ctx.err().is_some() {
-                Snapshot::deref(&cloned_snapshot, self);
-                Snapshot::deref(new_snapshot, self);
+                // If cancelled during clone, discard the incomplete result.
+                if warm_ctx.err().is_some() {
+                    Snapshot::deref(&cloned_snapshot, &s);
+                    Snapshot::deref(&new_snapshot, &s);
+                    cancel();
+                    return;
+                }
+
+                // Conditionally adopt: if the session hasn't moved past newSnapshot,
+                // promote the clone so future requests benefit from the warmed cache.
+                s.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
+                Snapshot::deref(&new_snapshot, &s);
                 cancel();
-                return;
-            }
-
-            // Conditionally adopt: if the session hasn't moved past newSnapshot,
-            // promote the clone so future requests benefit from the warmed cache.
-            self.adopt_snapshot_change(new_snapshot, &cloned_snapshot);
-            Snapshot::deref(new_snapshot, self);
-            cancel();
+            }));
         }
     }
 }

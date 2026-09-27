@@ -922,7 +922,7 @@ impl Checker {
                 d.outer_type_parameter_count = outer_type_parameter_count as i32;
                 d.reference.resolved_type_arguments = d.type_parameters().into();
                 let key = get_type_list_key(&d.reference.resolved_type_arguments);
-                let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
+                let mut instantiations = InstantiationMap::default();
                 instantiations.insert(key, t);
                 d.reference.object.instantiations = Some(instantiations);
                 d.reference.object.target = t;

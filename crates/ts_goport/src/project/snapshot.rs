@@ -12,7 +12,6 @@ use crate::project::prelude::*;
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
-use xxhash_rust::xxh3::xxh3_128;
 
 const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
 
@@ -894,23 +893,20 @@ impl Snapshot {
                         checker_pool.discard();
                     }
                     for file in program.source_files() {
-                        // PORT: Go `file.Hash` is the parse cache's
-                        // `fh.Hash()`, the xxh3-128 of the file text
-                        // (parsecache.rs).
-                        session.parse_cache.deref(&new_parse_cache_key(
+                        deref_program_file(
+                            &session.parse_cache,
                             file.parse_options(),
-                            xxh3_128(file.text.as_bytes()),
+                            file.text,
                             file.script_kind,
-                        ));
+                        );
                     }
                     for file in program.duplicate_source_files() {
-                        // PORT: Go `DuplicateSourceFile.Hash` is the xxh3-128
-                        // of its text (compiler/file_loader.rs).
-                        session.parse_cache.deref(&new_parse_cache_key(
+                        deref_program_file(
+                            &session.parse_cache,
                             &file.parse_options,
-                            xxh3_128(file.text.as_bytes()),
+                            file.text,
                             file.script_kind,
-                        ));
+                        );
                     }
                     // PORT: Go frees the program when nothing references it.
                     // The port frees its checkers and its program version

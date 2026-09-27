@@ -5,9 +5,12 @@
 //! PORT: the process has one program (plan D1), so Go `*compiler.Program`
 //! parameters are dropped and the installed program is read through the
 //! `program.rs` free functions. Go `SyncMap` and `SyncSet` fields are
-//! `IndexMap` and `IndexSet` (see `reference_map.rs` for the order note);
-//! Go `atomic.Bool` and `sync.Once` become plain fields, because the
+//! `FxIndexMap` and `FxIndexSet` (see `reference_map.rs` for the order
+//! note); Go `atomic.Bool` and `sync.Once` become plain fields, because the
 //! snapshot is only used on the loading thread.
+//!
+//! PERF: the map keys are long paths, so the maps use the Fx hasher instead
+//! of SipHash. The hasher does not change the order: it is insertion order.
 
 use super::hash::FileInfo;
 use super::hash::*;
@@ -307,19 +310,19 @@ pub struct Snapshot {
     // These are the fields that get serialized
 
     // Information of the file eg. its version, signature etc
-    pub file_infos: IndexMap<Path, FileInfo>,
+    pub file_infos: FxIndexMap<Path, FileInfo>,
     pub options: &'static CompilerOptions,
     //  Contains the map of ReferencedSet=Referenced files of the file if module emit is enabled
     pub referenced_map: ReferenceMap,
     // Cache of semantic diagnostics for files with their Path being the key
     pub semantic_diagnostics_per_file:
-        IndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
+        FxIndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
     // Cache of dts emit diagnostics for files with their Path being the key
-    pub emit_diagnostics_per_file: IndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
+    pub emit_diagnostics_per_file: FxIndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
     // The map has key by source file's path that has been changed
-    pub changed_files_set: IndexSet<Path>,
+    pub changed_files_set: FxIndexSet<Path>,
     // Files pending to be emitted
-    pub affected_files_pending_emit: IndexMap<Path, FileEmitKind>,
+    pub affected_files_pending_emit: FxIndexMap<Path, FileEmitKind>,
     // Name of the file whose dts was the latest to change
     pub latest_changed_dts_file: String,
     // Hash of d.ts emitted for the file, use to track when emit of d.ts changes
@@ -354,13 +357,13 @@ impl Snapshot {
     #[must_use]
     pub fn new(options: &'static CompilerOptions) -> Self {
         Snapshot {
-            file_infos: IndexMap::default(),
+            file_infos: FxIndexMap::default(),
             options,
             referenced_map: ReferenceMap::default(),
-            semantic_diagnostics_per_file: IndexMap::default(),
-            emit_diagnostics_per_file: IndexMap::default(),
-            changed_files_set: IndexSet::default(),
-            affected_files_pending_emit: IndexMap::default(),
+            semantic_diagnostics_per_file: FxIndexMap::default(),
+            emit_diagnostics_per_file: FxIndexMap::default(),
+            changed_files_set: FxIndexSet::default(),
+            affected_files_pending_emit: FxIndexMap::default(),
             latest_changed_dts_file: String::new(),
             emit_signatures: FxHashMap::default(),
             has_errors: Tristate::Unknown,

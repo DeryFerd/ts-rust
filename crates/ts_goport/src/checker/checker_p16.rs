@@ -71,7 +71,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13957 IsDeprecatedDeclaration
+    // PERF: U4 (CH7). A node of a store without the flag is not deprecated
+    // (`frozen_store_lacks_deprecated_tag`), so the cached combined flags
+    // are not read. That cache is a one-entry memo of a pure function, so
+    // skipping its update changes no result.
     pub fn is_deprecated_declaration(&mut self, declaration: Node) -> bool {
+        if frozen_store_lacks_deprecated_tag(declaration) {
+            debug_assert!(
+                !get_combined_node_flags(declaration)
+                    .intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+            );
+            return false;
+        }
         let flags = self.get_combined_node_flags_cached(declaration);
         is_deprecated_declaration_with_cached_flags(declaration, flags)
     }

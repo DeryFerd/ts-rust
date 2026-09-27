@@ -456,7 +456,7 @@ pub fn declaration_belongs_to_private_ambient_member(declaration: Node) -> bool 
 pub fn is_private_within_ambient(node: Node) -> bool {
     (has_modifier(node, ModifierFlags::PRIVATE)
         || is_private_identifier_class_element_declaration(node))
-        && node.flags().intersects(NodeFlags::AMBIENT)
+        && !node.parser_flags(NodeFlags::AMBIENT).is_empty()
 }
 
 // Go: checker/utilities.go:324 isTypeAssertion

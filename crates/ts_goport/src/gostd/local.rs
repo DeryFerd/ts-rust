@@ -14,8 +14,13 @@
 //! wake-up; Go `WaitForBackgroundTasks` calls it until `has_pending()` is
 //! false.
 //!
-//! The queue is per thread: `go`, `after_func` and `run_pending` act on the
-//! calling thread's queue.
+//! Idle work (`go_idle`) is a second, separate queue for long work that
+//! sends nothing to the client (the auto-import warm). The dispatch loop
+//! runs it with `run_idle()` only while no message waits, so it does not
+//! delay a request that has arrived. `run_pending` does not run it.
+//!
+//! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`
+//! and `run_idle` act on the calling thread's queues.
 
 use crate::prelude::*;
 
@@ -54,6 +59,8 @@ struct LocalState {
     jobs: RefCell<FxHashMap<u64, Box<dyn FnOnce()>>>,
     /// Timers that are armed or have a due entry in the queue.
     timers: RefCell<FxHashMap<u64, Rc<LocalTimerInner>>>,
+    /// Jobs from `go_idle`, oldest first.
+    idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
 }
 
 thread_local! {
@@ -62,6 +69,7 @@ thread_local! {
         next_id: Cell::new(1),
         jobs: RefCell::new(FxHashMap::default()),
         timers: RefCell::new(FxHashMap::default()),
+        idle: RefCell::new(VecDeque::new()),
     };
 }
 
@@ -81,6 +89,26 @@ pub fn go(f: Box<dyn FnOnce()>) {
         l.jobs.borrow_mut().insert(id, f);
         lock(&l.shared.queue).push_back(Entry::Job(id));
     });
+}
+
+/// Queues `f` as idle work on this thread. The dispatch loop runs it with
+/// `run_idle` when no message waits. No Go counterpart: Go runs this work
+/// on a goroutine, at the same time as requests.
+pub fn go_idle(f: Box<dyn FnOnce()>) {
+    LOCAL.with(|l| l.idle.borrow_mut().push_back(f));
+}
+
+/// Runs the oldest idle job of this thread. Returns false if there was none.
+/// Work that the job queues with `go` waits for the next `run_pending`.
+pub fn run_idle() -> bool {
+    let job = LOCAL.with(|l| l.idle.borrow_mut().pop_front());
+    match job {
+        Some(job) => {
+            job();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Installs the function that timer threads call when a `LocalTimer` of this

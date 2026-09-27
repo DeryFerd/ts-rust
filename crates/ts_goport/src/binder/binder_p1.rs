@@ -151,40 +151,53 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
 
 /// Binder data per node of the file being bound. Most nodes get no data, so
 /// a node keeps a 4-byte slot into `entries`, and `entries[0]` is the empty
-/// data, which is never written.
+/// data, which is never written. The flow node of a node is kept in `flows`,
+/// not in `entries`, and `finish` merges it into the data.
+// PERF: bind C. The binder gives a flow node to every identifier (Go
+// binder.go `bind`), so a flow node in `entries` made a 40-byte entry for
+// each of them. Now it is one 4-byte write.
 #[derive(Default)]
 pub struct NodeBindBuilder {
+    /// Per node, by `NodeId::index()`: index into `entries`, 0 for none.
     slots: Vec<u32>,
     entries: Vec<NodeBindData>,
+    /// Per node, by `NodeId::index()`: the low half of its flow node id
+    /// (index + 1), 0 for nil.
+    flows: Vec<u32>,
+    /// The high half of every flow node id of the file: its file index
+    /// (`FlowNodeId::new`).
+    flow_file: u64,
+    /// Nodes that got a flow node, counted when a flow goes from nil to
+    /// set. With `entries` it bounds the nodes that have data.
+    flow_count: usize,
 }
 
 impl NodeBindBuilder {
+    /// A builder for the `node_count` nodes of file `file_index`, with room
+    /// for `entries` entries before the first copy.
     #[must_use]
-    pub fn new(node_count: usize) -> Self {
-        // About one node in four gets data; reserving that avoids copies
-        // as the entries grow.
-        Self::with_entry_capacity(node_count, node_count / 4 + 1)
-    }
-
-    /// `new` with room for `entries` entries before the first copy.
-    #[must_use]
-    pub fn with_entry_capacity(node_count: usize, entries: usize) -> Self {
+    pub fn new(file_index: usize, node_count: usize, entries: usize) -> Self {
         let mut data = Vec::with_capacity(entries.max(1));
         data.push(NodeBindData::default());
         NodeBindBuilder {
             slots: vec![0; node_count],
             entries: data,
+            flows: vec![0; node_count],
+            flow_file: (file_index as u64) << 32,
+            flow_count: 0,
         }
     }
 
-    /// The data of node `index` (`NodeId::index()`).
+    /// The data of node `index` (`NodeId::index()`), without its flow node.
+    /// Binder code never reads a flow node back from a node.
     #[inline]
     #[must_use]
     pub fn get(&self, index: usize) -> &NodeBindData {
         &self.entries[self.slots[index] as usize]
     }
 
-    /// The data of node `index`, made on first write.
+    /// The data of node `index`, made on first write. Set the flow node
+    /// with `set_flow_node`, not through this reference.
     #[inline]
     pub fn get_mut(&mut self, index: usize) -> &mut NodeBindData {
         let mut slot = self.slots[index];
@@ -196,25 +209,44 @@ impl NodeBindBuilder {
         &mut self.entries[slot as usize]
     }
 
-    /// Sets the flow node of node `index`. A nil flow on a node without
-    /// data changes nothing, so it makes no entry.
+    /// Go `node.FlowNodeData().FlowNode = flow` for node `index`.
     #[inline]
     pub fn set_flow_node(&mut self, index: usize, flow: FlowNodeId) {
-        if flow.is_some() || self.slots[index] != 0 {
-            self.get_mut(index).flow_node = flow;
-        }
+        debug_assert!(
+            flow.is_nil() || (flow.0 & !0xffff_ffff) == self.flow_file,
+            "flow node from another file"
+        );
+        let low = flow.0 as u32;
+        let old = std::mem::replace(&mut self.flows[index], low);
+        self.flow_count += usize::from(old == 0 && low != 0);
     }
 
     /// The compact form of the data, in node order.
     fn finish(&self) -> FileNodeBind {
-        FileNodeBind::new(self.slots.iter().map(|&slot| &self.entries[slot as usize]))
+        debug_assert!(
+            self.entries.iter().all(|data| data.flow_node.is_nil()),
+            "flow node written outside set_flow_node"
+        );
+        let entries = &self.entries;
+        let flow_file = self.flow_file;
+        let nodes = self.slots.iter().zip(&self.flows).map(|(&slot, &flow)| {
+            if slot == 0 && flow == 0 {
+                return None;
+            }
+            let mut data = entries[slot as usize];
+            if flow != 0 {
+                data.flow_node = FlowNodeId(flow_file | u64::from(flow));
+            }
+            Some(data)
+        });
+        FileNodeBind::new(nodes, entries.len() - 1 + self.flow_count)
     }
 }
 
 /// The binder output of one file before it is stored in its `GoFile`.
 pub struct BoundFile {
     pub file: Node,
-    /// Compacted on the bind thread, so the dense per-node array is freed
+    /// Compacted on the bind thread, so the dense per-node arrays are freed
     /// (and reused) there.
     pub node_bind: FileNodeBind,
     pub flow_nodes: Vec<FlowNode>,
@@ -229,15 +261,21 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     let go_file = crate::ast::go_file(file_index);
     let node_count = go_file.parser_flags.len();
     // PERF: U1 (e). A store file has counts from its slot kinds, made when
-    // it was frozen, so the entries and the flow nodes grow with no copy.
-    // Capacity only: the output does not change.
-    let (node_bind, flow_nodes) = match frozen_store_bind_estimate(file_index) {
-        Some((entries, flow_nodes)) => (
-            NodeBindBuilder::with_entry_capacity(node_count, entries),
-            Vec::with_capacity(flow_nodes),
-        ),
-        None => (NodeBindBuilder::new(node_count), Vec::new()),
+    // it was frozen, so the flow nodes grow with no copy. Its entry count
+    // also counts one entry per identifier flow node, which bind C keeps in
+    // `NodeBindBuilder::flows`, so the entries are sized from the node
+    // count. Capacity only: the output does not change.
+    let flow_nodes = match frozen_store_bind_estimate(file_index) {
+        Some((_, flow_nodes)) => Vec::with_capacity(flow_nodes),
+        None => Vec::new(),
     };
+    // About one node in four gets data other than a flow node (a
+    // declaration, a container or a flagged node).
+    let node_bind = NodeBindBuilder::new(file_index, node_count, node_count / 4 + 1);
+    // PERF: bind D. About one symbol per 8 nodes and one table per 16 (lib
+    // files have more), so the first arena chunk does not grow by doubling.
+    // Capacity only.
+    symbols.reserve_arena(node_count / 8 + 1, node_count / 16 + 1);
     let mut b = Binder {
         file,
         file_index,
@@ -1326,12 +1364,12 @@ impl Binder {
             SyntaxKind::QualifiedName => {
                 if self.current_flow.is_some() && is_part_of_type_query(node) {
                     let flow = self.current_flow;
-                    self.node_data_mut(node).flow_node = flow;
+                    self.node_bind.set_flow_node(node.node_id().index(), flow);
                 }
             }
             SyntaxKind::MetaProperty => {
                 let flow = self.current_flow;
-                self.node_data_mut(node).flow_node = flow;
+                self.node_bind.set_flow_node(node.node_id().index(), flow);
             }
             SyntaxKind::PrivateIdentifier => {
                 self.check_private_identifier(node);
@@ -1386,7 +1424,7 @@ impl Binder {
             }
             SyntaxKind::BindingElement => {
                 let flow = self.current_flow;
-                self.node_data_mut(node).flow_node = flow;
+                self.node_bind.set_flow_node(node.node_id().index(), flow);
                 self.bind_variable_declaration_or_binding_element(node);
             }
             SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {

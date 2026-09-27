@@ -233,7 +233,7 @@ impl Checker {
             // creates a map that is never read (instantiations are only used when
             // there are outer type parameters), so testing for non-empty is equivalent.
             if !outer_type_parameters.is_empty() {
-                let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
+                let mut instantiations = InstantiationMap::default();
                 let key = self.get_conditional_type_key(
                     &outer_type_parameters,
                     None,  /*alias*/
@@ -1146,7 +1146,7 @@ impl Checker {
         let d = self.ty_mut(t).as_tuple_type_mut();
         d.interface.this_type = this_type;
         d.interface.all_type_parameters = all_type_parameters;
-        let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
+        let mut instantiations = InstantiationMap::default();
         instantiations.insert(key, t);
         d.interface.reference.object.instantiations = Some(instantiations);
         d.interface.reference.object.target = t;
@@ -1532,10 +1532,9 @@ fn for_each_conditional_flow_step(node: Node, mut f: impl FnMut(FlowStep)) {
 }
 
 impl Checker {
-    // PERF: always inlined, so each caller writes its `data` straight into
-    // the arena slot. Out of line (LLVM did not inline it), `data` came in by
-    // pointer and was copied twice with `memcpy`: 168 bytes into a stack
-    // `Type`, then the 192-byte `Type` into the chunk.
+    // PERF: always inlined. A `data` built before the call is still copied
+    // into the slot with a 168-byte `memcpy`, so the hot constructors call
+    // `new_type_with` and build their data in its closure.
     // Go: checker/checker.go:24905 newType
     #[inline(always)]
     pub fn new_type(
@@ -1550,6 +1549,11 @@ impl Checker {
     /// `new_type` with the data that `make_data` returns. `make_data` runs
     /// after the arena slot is ready (`ChunkedArena::push_with`), so a caller
     /// that builds a large `TypeData` in it has no stack copy.
+    ///
+    /// PERF: `make_data` must not call out of line (no allocation). A call
+    /// keeps the grow path of `Vec::push`, and the whole `Type` is then built
+    /// on the stack and copied with `memcpy`. Callers allocate boxed or
+    /// arena data first and only move it in the closure.
     // PORT: Go sets `t.checker = c` and records the type with the tracer; the
     // checker back pointer and tracer are out of scope. Go `t.id = TypeId(c.TypeCount)`
     // equals the arena index, so the new entry is pushed at that index.
@@ -1594,10 +1598,10 @@ impl Checker {
         intrinsic_name: &str,
         object_flags: ObjectFlags,
     ) -> TypeId {
-        let data = IntrinsicType {
-            intrinsic_name: intrinsic_name.to_string(),
-        };
-        self.new_type(flags, object_flags, TypeData::Intrinsic(data))
+        let intrinsic_name = intrinsic_name.to_string();
+        self.new_type_with(flags, object_flags, move || {
+            TypeData::Intrinsic(IntrinsicType { intrinsic_name })
+        })
     }
 
     // Go: checker/checker.go:24929 createWideningType
@@ -1634,14 +1638,15 @@ impl Checker {
         value: Option<LiteralValue>,
         regular_type: TypeId,
     ) -> TypeId {
-        let data = LiteralType {
-            value,
-            fresh_type: TypeId::NIL,
-            regular_type: TypeId::NIL,
-            property_name: std::cell::OnceCell::new(),
-            go_plain: std::cell::OnceCell::new(),
-        };
-        let t = self.new_type(flags, ObjectFlags::NONE, TypeData::Literal(data));
+        let t = self.new_type_with(flags, ObjectFlags::NONE, move || {
+            TypeData::Literal(LiteralType {
+                value,
+                fresh_type: TypeId::NIL,
+                regular_type: TypeId::NIL,
+                property_name: std::cell::OnceCell::new(),
+                go_plain: std::cell::OnceCell::new(),
+            })
+        });
         let regular = if regular_type.is_some() {
             regular_type
         } else {

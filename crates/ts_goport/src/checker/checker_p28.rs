@@ -8,41 +8,59 @@ use ts_jsnum::{Number, PseudoBigInt};
 impl Checker {
     // Go: checker/checker.go:24957 newUniqueESSymbolType
     pub fn new_unique_es_symbol_type(&mut self, symbol: SymbolId, name: &str) -> TypeId {
-        let mut data = UniqueESSymbolType::default();
-        data.name = name.to_string();
-        let t = self.new_type(
-            TypeFlags::UNIQUE_ES_SYMBOL,
-            ObjectFlags::NONE,
-            TypeData::UniqueESSymbol(data),
-        );
+        let name = name.to_string();
+        let t = self.new_type_with(TypeFlags::UNIQUE_ES_SYMBOL, ObjectFlags::NONE, move || {
+            TypeData::UniqueESSymbol(UniqueESSymbolType { name })
+        });
         self.ty_mut(t).symbol = symbol;
         t
     }
 
     // Go: checker/checker.go:24965 newObjectType
     pub fn new_object_type(&mut self, object_flags: ObjectFlags, symbol: SymbolId) -> TypeId {
-        // PERF: the data is built in the `new_type_with` closure, so the
-        // large inline variants are written straight into the arena slot.
-        let t = self.new_type_with(TypeFlags::OBJECT, object_flags, || {
-            if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
-                TypeData::Interface(Box::default())
-            } else if object_flags.intersects(ObjectFlags::TUPLE) {
-                TypeData::Tuple(Box::default())
-            } else if object_flags.intersects(ObjectFlags::REFERENCE) {
-                TypeData::TypeReference(TypeReference::default())
-            } else if object_flags.intersects(ObjectFlags::MAPPED) {
-                TypeData::Mapped(Box::default())
-            } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
-                TypeData::ReverseMapped(Box::default())
-            } else if object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
-                TypeData::EvolvingArray(Box::default())
-            } else if object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
-                TypeData::InstantiationExpression(Box::default())
-            } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
-                TypeData::Object(ObjectType::default())
-            } else {
-                panic!("Unhandled case in newObjectType")
-            }
+        // PERF: the boxed kinds are allocated here, before `new_type_with`,
+        // so its closure makes no call and the `Type` (with the large inline
+        // `TypeReference` or `ObjectType`) is written straight into its arena
+        // slot. An allocation in the closure kept a 192-byte `memcpy`.
+        // `Kind` keeps the Go test order.
+        enum Kind {
+            Interface(Box<InterfaceType>),
+            Tuple(Box<TupleType>),
+            Reference,
+            Mapped(Box<MappedType>),
+            ReverseMapped(Box<ReverseMappedType>),
+            EvolvingArray(Box<EvolvingArrayType>),
+            InstantiationExpression(Box<InstantiationExpressionType>),
+            Anonymous,
+        }
+        let kind = if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
+            Kind::Interface(Box::default())
+        } else if object_flags.intersects(ObjectFlags::TUPLE) {
+            Kind::Tuple(Box::default())
+        } else if object_flags.intersects(ObjectFlags::REFERENCE) {
+            Kind::Reference
+        } else if object_flags.intersects(ObjectFlags::MAPPED) {
+            Kind::Mapped(Box::default())
+        } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
+            Kind::ReverseMapped(Box::default())
+        } else if object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+            Kind::EvolvingArray(Box::default())
+        } else if object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
+            Kind::InstantiationExpression(Box::default())
+        } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
+            Kind::Anonymous
+        } else {
+            panic!("Unhandled case in newObjectType")
+        };
+        let t = self.new_type_with(TypeFlags::OBJECT, object_flags, move || match kind {
+            Kind::Interface(d) => TypeData::Interface(d),
+            Kind::Tuple(d) => TypeData::Tuple(d),
+            Kind::Reference => TypeData::TypeReference(TypeReference::default()),
+            Kind::Mapped(d) => TypeData::Mapped(d),
+            Kind::ReverseMapped(d) => TypeData::ReverseMapped(d),
+            Kind::EvolvingArray(d) => TypeData::EvolvingArray(d),
+            Kind::InstantiationExpression(d) => TypeData::InstantiationExpression(d),
+            Kind::Anonymous => TypeData::Object(ObjectType::default()),
         });
         self.ty_mut(t).symbol = symbol;
         t
@@ -248,26 +266,28 @@ impl Checker {
         result & ObjectFlags::PROPAGATING_FLAGS
     }
 
+    // PERF: the data is made in its arena or heap slot (`new_with`) and
+    // `types` is written there, so the 216-byte `UnionType` is not copied.
+    // The `new_type_with` closure only moves the `ArenaBox` and makes no call.
     // Go: checker/checker.go:25090 newUnionType
     pub fn new_union_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
-        let mut data = UnionType::default();
-        data.union_or_intersection.types = types.into();
-        self.new_type(
-            TypeFlags::UNION,
-            object_flags,
-            TypeData::Union(ArenaBox::new(data)),
-        )
+        let types = SharedList::from(types);
+        let mut data = ArenaBox::new_with(UnionType::default);
+        data.union_or_intersection.types = types;
+        self.new_type_with(TypeFlags::UNION, object_flags, move || {
+            TypeData::Union(data)
+        })
     }
 
+    // PERF: built in place, as in `new_union_type`.
     // Go: checker/checker.go:25096 newIntersectionType
     pub fn new_intersection_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
-        let mut data = IntersectionType::default();
-        data.union_or_intersection.types = types.into();
-        self.new_type(
-            TypeFlags::INTERSECTION,
-            object_flags,
-            TypeData::Intersection(ArenaBox::new(data)),
-        )
+        let types = SharedList::from(types);
+        let mut data = ArenaBox::new_with(IntersectionType::default);
+        data.union_or_intersection.types = types;
+        self.new_type_with(TypeFlags::INTERSECTION, object_flags, move || {
+            TypeData::Intersection(data)
+        })
     }
 
     // Go: checker/checker.go:25102 newIndexedAccessType
@@ -288,36 +308,40 @@ impl Checker {
 
     // Go: checker/checker.go:25110 newIndexType
     pub fn new_index_type(&mut self, target: TypeId, index_flags: IndexFlags) -> TypeId {
-        let mut data = IndexType::default();
-        data.target = target;
-        data.index_flags = index_flags;
-        self.new_type(TypeFlags::INDEX, ObjectFlags::NONE, TypeData::Index(data))
+        self.new_type_with(TypeFlags::INDEX, ObjectFlags::NONE, || {
+            let mut data = IndexType::default();
+            data.target = target;
+            data.index_flags = index_flags;
+            TypeData::Index(data)
+        })
     }
 
     // Go: checker/checker.go:25117 newTemplateLiteralType
     pub fn new_template_literal_type(&mut self, texts: &[String], types: &[TypeId]) -> TypeId {
-        let mut data = TemplateLiteralType::default();
-        data.texts = texts.into();
-        data.types = types.into();
-        data.go_plain = !texts
+        // PERF: the lists are made first, so the `new_type_with` closure
+        // makes no call.
+        let texts: Rc<[String]> = texts.into();
+        let types = SharedList::from(types);
+        let go_plain = !texts
             .iter()
             .any(|text| crate::scanner_util::contains_go_string_marker(text));
-        self.new_type(
-            TypeFlags::TEMPLATE_LITERAL,
-            ObjectFlags::NONE,
-            TypeData::TemplateLiteral(data),
-        )
+        self.new_type_with(TypeFlags::TEMPLATE_LITERAL, ObjectFlags::NONE, move || {
+            TypeData::TemplateLiteral(TemplateLiteralType {
+                constrained: ConstrainedType::default(),
+                texts,
+                types,
+                go_plain,
+            })
+        })
     }
 
     // Go: checker/checker.go:25124 newStringMappingType
     pub fn new_string_mapping_type(&mut self, symbol: SymbolId, target: TypeId) -> TypeId {
-        let mut data = StringMappingType::default();
-        data.target = target;
-        let t = self.new_type(
-            TypeFlags::STRING_MAPPING,
-            ObjectFlags::NONE,
-            TypeData::StringMapping(data),
-        );
+        let t = self.new_type_with(TypeFlags::STRING_MAPPING, ObjectFlags::NONE, || {
+            let mut data = StringMappingType::default();
+            data.target = target;
+            TypeData::StringMapping(data)
+        });
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -335,29 +359,34 @@ impl Checker {
         };
         let check_type = self.instantiate_type(root_check_type, mapper);
         let extends_type = self.instantiate_type(root_extends_type, mapper);
-        let mut data = ConditionalType::default();
-        data.root = root;
-        data.check_type = check_type;
-        data.extends_type = extends_type;
-        data.mapper = mapper;
-        data.combined_mapper = combined_mapper;
-        self.new_type(
-            TypeFlags::CONDITIONAL,
-            ObjectFlags::NONE,
-            TypeData::Conditional(data),
-        )
+        // PERF: every field is written here. `ConditionalType::default()`
+        // made a default `root` (an `Rc` allocation) only to drop it, and the
+        // data was copied into the slot.
+        self.new_type_with(TypeFlags::CONDITIONAL, ObjectFlags::NONE, move || {
+            TypeData::Conditional(ConditionalType {
+                constrained: ConstrainedType::default(),
+                root,
+                check_type,
+                extends_type,
+                resolved_true_type: TypeId::NIL,
+                resolved_false_type: TypeId::NIL,
+                resolved_inferred_true_type: TypeId::NIL,
+                resolved_default_constraint: TypeId::NIL,
+                resolved_constraint_of_distributive: TypeId::NIL,
+                mapper,
+                combined_mapper,
+            })
+        })
     }
 
     // Go: checker/checker.go:25142 newSubstitutionType
     pub fn new_substitution_type(&mut self, base_type: TypeId, constraint: TypeId) -> TypeId {
-        let mut data = SubstitutionType::default();
-        data.base_type = base_type;
-        data.constraint = constraint;
-        self.new_type(
-            TypeFlags::SUBSTITUTION,
-            ObjectFlags::NONE,
-            TypeData::Substitution(data),
-        )
+        self.new_type_with(TypeFlags::SUBSTITUTION, ObjectFlags::NONE, || {
+            let mut data = SubstitutionType::default();
+            data.base_type = base_type;
+            data.constraint = constraint;
+            TypeData::Substitution(data)
+        })
     }
 
     // Go: checker/checker.go:25149 newSignature

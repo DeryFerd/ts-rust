@@ -7,9 +7,10 @@
 //! `src/a.ts`. Each report must be byte-identical to a fresh
 //! `goport -p tsconfig.json` on the same text, with the same exit code.
 //!
-//! The live tests hold several projects (`basic`, `emit` and `linked` under
-//! `fixtures/multiprog`) at once, as the language server does. Each report
-//! must equal a fresh `goport` or `goport_emit` run of that project alone.
+//! The live tests hold several projects (`basic`, `emit`, `linked` and `cut`
+//! under `fixtures/multiprog`) at once, as the language server does. Each
+//! report must equal a fresh `goport` or `goport_emit` run of that project
+//! alone.
 //!
 //! The watch test runs `tsc --watch` through `goport_watch` and edits
 //! `src/a.ts` between builds.
@@ -169,6 +170,70 @@ fn three_live_projects_report_like_fresh_runs() {
             texts[0]
         );
     }
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// A type longer than Go's limit is cut inside a 2-byte char (the `cut`
+/// fixture), in a live program next to another one. Go `typeToStringEx`
+/// keeps the first 317 bytes and adds "...", so the type line in
+/// `checker.txt` ends with the first byte of the char. Go
+/// `diagnostics.Format` turns that byte into U+FFFD in the error message.
+/// Pinned tsgo prints the same message.
+#[test]
+fn type_cut_inside_a_char_keeps_go_bytes() {
+    let root = scratch_dir("cut");
+    let fixtures = Path::new(FIXTURE).parent().expect("fixture root");
+    for dir in ["basic", "cut"] {
+        copy_dir(&fixtures.join(dir), &root.join(dir));
+    }
+    run_live_programs(
+        &root,
+        &[
+            "live",
+            "out",
+            "check:basic/tsconfig.json",
+            "check:cut/tsconfig.json",
+        ],
+    );
+    let program = root.join("out").join("1");
+
+    let source = read(&root.join("cut/src/word.ts"));
+    let word = source
+        .split('"')
+        .find(|text| text.starts_with('x') && text.len() > 320)
+        .expect("the fixture declares a long word");
+    let literal = format!("\"{word}\"");
+    let cut = &literal.as_bytes()[..317];
+    assert!(
+        std::str::from_utf8(cut).is_err(),
+        "byte 317 of the fixture type must be inside a char"
+    );
+
+    let line = [b"word: ", cut, b"..."].concat();
+    let checker = fs::read(program.join("checker.txt")).expect("read checker.txt");
+    assert!(
+        checker.split(|&b| b == b'\n').any(|text| text == line),
+        "checker.txt has no line {:?} ({})",
+        String::from_utf8_lossy(&line),
+        root.display()
+    );
+
+    let report = read_live_report(&program);
+    assert_eq!(
+        report,
+        goport(&root, Path::new("cut/tsconfig.json")),
+        "report against a fresh run ({})",
+        root.display()
+    );
+    let message = format!(
+        "Type '{}...' is not assignable to type '\"x\"'.",
+        String::from_utf8_lossy(cut)
+    );
+    assert!(
+        report.stdout.contains(&message),
+        "the report has no message {message:?}:\n{}",
+        report.stdout
+    );
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 

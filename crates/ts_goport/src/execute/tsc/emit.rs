@@ -21,6 +21,7 @@ use super::statistics::{Statistics, read_mem_stats, statistics_from_program};
 // PORT: testing (`CommandLineTesting`)
 use super::compile::CommandLineTesting;
 use crate::frontend::tspath::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 // Go: compiler/program.go:1710 ProgramLike
@@ -91,10 +92,10 @@ pub fn get_trace_with_writer_from_sys(
 // Go: execute/tsc/emit.go:30 EmitInput
 // PORT: `Program` is the installed program (see the module comment).
 // `Testing` and `TestingMTimesCache` are `None` outside Go tests; the cache
-// is the build host `m_times`. `Tracing` is the process session
-// (`crate::tracing::get`). Go `Config` is optional here: without
-// it, the program options are used, which are the config options with the
-// command line applied.
+// is the build host `m_times` (a `Mutex`, Go `SyncMap`). `Tracing` is the
+// process session (`crate::tracing::get`). Go `Config` is optional here:
+// without it, the program options are used, which are the config options
+// with the command line applied.
 pub struct EmitInput<'a> {
     pub sys: &'a dyn System,
     pub program_like: &'a dyn ProgramLike,
@@ -106,7 +107,7 @@ pub struct EmitInput<'a> {
     pub compile_times: Rc<RefCell<CompileTimes>>,
     // PORT: testing
     pub testing: Option<Rc<dyn CommandLineTesting>>,
-    pub testing_m_times_cache: Option<&'a RefCell<FxHashMap<Path, Option<SystemTime>>>>,
+    pub testing_m_times_cache: Option<&'a Mutex<FxHashMap<Path, Option<SystemTime>>>>,
 }
 
 impl EmitInput<'_> {

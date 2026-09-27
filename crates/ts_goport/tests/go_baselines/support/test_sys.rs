@@ -995,7 +995,7 @@ impl CommandLineTesting for TestSys {
     fn on_emitted_files(
         &self,
         result: &EmitResult,
-        m_times_cache: Option<&RefCell<FxHashMap<Path, Option<SystemTime>>>>,
+        m_times_cache: Option<&Mutex<FxHashMap<Path, Option<SystemTime>>>>,
     ) {
         let serialized_mtimes = self.serialized_mtimes();
         for file in &result.emitted_files {
@@ -1025,7 +1025,7 @@ impl CommandLineTesting for TestSys {
                     &self.get_current_directory(),
                     self.fs.use_case_sensitive_file_names(),
                 );
-                if let Some(entry) = m_times_cache.borrow_mut().get_mut(&path) {
+                if let Some(entry) = lock(m_times_cache).get_mut(&path) {
                     *entry = Some(now);
                 }
             }
@@ -1146,7 +1146,7 @@ impl CommandLineTesting for TestSys {
     fn on_worker_emitted_files(
         &self,
         emitted_files: &[String],
-        m_times: &RefCell<FxHashMap<Path, Option<SystemTime>>>,
+        m_times: &Mutex<FxHashMap<Path, Option<SystemTime>>>,
     ) {
         let mut results = lock(&self.worker_results);
         for file in emitted_files {
@@ -1159,7 +1159,7 @@ impl CommandLineTesting for TestSys {
                 &self.get_current_directory(),
                 self.fs.use_case_sensitive_file_names(),
             );
-            if let Some(entry) = m_times.borrow_mut().get_mut(&path) {
+            if let Some(entry) = lock(m_times).get_mut(&path) {
                 *entry = Some(now);
             }
         }

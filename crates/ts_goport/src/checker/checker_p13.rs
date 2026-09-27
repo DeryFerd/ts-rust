@@ -80,13 +80,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11208 isInAmbientOrTypeNode
+    // PERF: U4 (CH7). `AMBIENT` is a parser bit (`Node::parser_flags`), and
+    // the walk tests kinds from the store tables (`find_ancestor_with_kind`).
     pub fn is_in_ambient_or_type_node(&mut self, node: Node) -> bool {
-        node.flags().intersects(NodeFlags::AMBIENT)
-            || find_ancestor(node, |n| {
-                is_interface_declaration(n)
-                    || is_type_alias_declaration(n)
-                    || is_js_type_alias_declaration(n)
-                    || is_type_literal_node(n)
+        !node.parser_flags(NodeFlags::AMBIENT).is_empty()
+            || find_ancestor_with_kind(node, |_, kind| {
+                matches!(
+                    kind,
+                    SyntaxKind::InterfaceDeclaration
+                        | SyntaxKind::TypeAliasDeclaration
+                        | SyntaxKind::JsTypeAliasDeclaration
+                        | SyntaxKind::TypeLiteral
+                )
             })
             .is_some()
     }
@@ -98,7 +103,7 @@ impl Checker {
         check_mode: CheckMode,
         write_only: bool,
     ) -> TypeId {
-        if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
+        if !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty() {
             return self.check_property_access_chain(node, check_mode);
         }
         let expr = node.expression();
@@ -444,7 +449,7 @@ impl Checker {
                     let flow_container = self.get_control_flow_container(node);
                     if is_constructor_declaration(flow_container)
                         && flow_container.parent() == declaration.parent()
-                        && !declaration.flags().intersects(NodeFlags::AMBIENT)
+                        && declaration.parser_flags(NodeFlags::AMBIENT).is_empty()
                     {
                         assume_uninitialized = true;
                     }
@@ -486,12 +491,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11405 getControlFlowContainer
+    // PERF: U4 (CH7). The walk tests kinds from the store tables
+    // (`find_ancestor_with_kind`); `is_function_like(n)` is
+    // `is_function_like_kind(n.kind())` for a node that is not nil.
     pub fn get_control_flow_container(&mut self, node: Node) -> Node {
-        find_ancestor(node.parent(), |node| {
-            is_function_like(node) && get_immediately_invoked_function_expression(node).is_nil()
-                || is_module_block(node)
-                || is_source_file(node)
-                || is_property_declaration(node)
+        find_ancestor_with_kind(node.parent(), |node, kind| {
+            is_function_like_kind(kind)
+                && get_immediately_invoked_function_expression(node).is_nil()
+                || matches!(
+                    kind,
+                    SyntaxKind::ModuleBlock
+                        | SyntaxKind::SourceFile
+                        | SyntaxKind::PropertyDeclaration
+                )
         })
     }
 
@@ -1036,7 +1048,9 @@ impl Checker {
             ));
         } else if is_class_declaration(value_declaration)
             && !is_type_reference_node(node.parent())
-            && !value_declaration.flags().intersects(NodeFlags::AMBIENT)
+            && value_declaration
+                .parser_flags(NodeFlags::AMBIENT)
+                .is_empty()
             && !self.is_block_scoped_name_declared_before_use(value_declaration, right)
         {
             diagnostic = Some(new_diagnostic_for_node(
