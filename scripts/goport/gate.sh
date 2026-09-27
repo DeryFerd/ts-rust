@@ -25,6 +25,8 @@
 # An allow entry only applies when its condition verifies again in this run.
 # Project inputs and the existing scripts and oracle caches are only read.
 set -uo pipefail
+# GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
+[[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
 
 REPO=/home/theo/Code/sandbox/ts-rust
 R=$REPO/target/continuation-r97-goport
@@ -297,6 +299,8 @@ def cmd_corpus_diag(goport, commit, work, items_file):
     import run_shard as rs
     import run_shard_parallel as rp
     rs.here, rs.GOPORT, rs.GOPORT_COMMIT = work, Path(goport), commit
+    if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
+        rs.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
     sys.argv = ['run_shard_parallel.py', '0', '--jobs', '8', '--results', str(work / 'results')]
     rp.main()
     result = json.loads((work / 'results/shard-0-result.json').read_text())
@@ -313,6 +317,8 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file):
     sys.path.insert(0, str(R / 'emit-corpus'))
     import run_emit_shard2 as es
     es.here = work  # results must stay under here; CORPUS already points at corpus-full.
+    if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
+        es.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
     items, expected = [], 0
     # Same 1,500 cases as emit-corpus results-int3/int4: shard 0 (998) + first 502 of shard 1.
     for shard, limit in ((0, None), (1, 502)):
@@ -493,7 +499,7 @@ if [[ $MODE == full ]]; then
 fi
 
 META=$(python3 - "$LABEL" "$MODE" "$STARTED" "$COMMIT" "$COMMIT_FULL" "$BINS" "$SELF" "$ALLOW" <<'EOF'
-import hashlib, json, sys
+import hashlib, json, os, sys
 from pathlib import Path
 label, mode, started, commit_in, commit, bins, gate, allow = sys.argv[1:]
 R = Path('/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport')
@@ -513,6 +519,7 @@ print(json.dumps({
     'gate': {'path': gate, 'sha256': sha(gate)},
     'allowList': {'path': allow, 'sha256': sha(allow)},
     'scripts': {str(p): sha(p) for p in scripts},
+    **({'upstreamPin': os.environ['GOPORT_PIN_ACTIVE']} if os.environ.get('GOPORT_PIN_ACTIVE') else {}),
 }))
 EOF
 )

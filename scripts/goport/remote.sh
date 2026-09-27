@@ -40,7 +40,7 @@ sync_scripts() {
   local h=$1 r=continuation-r97-goport f
   # .git is needed: gate.sh resolves --commit with git rev-parse. --delete only acts on the included paths.
   "${RS[@]}" --delete --filter='- /.git/worktrees/' --filter='- __pycache__/' --filter='+ /.git/***' \
-    --filter='+ /scripts/***' --filter='+ /tools/***' --filter='+ /crates/' --filter='+ /crates/*/' \
+    --filter='+ /UPSTREAM.json' --filter='+ /scripts/***' --filter='+ /tools/***' --filter='+ /crates/' --filter='+ /crates/*/' \
     --filter='+ /crates/*/scripts/***' --filter='- *' "$REPO/" "$h:$REPO/" || return
   # Runner scripts under target/. lsp_oracle.py is only in the goport-int7 and goport-ls worktrees.
   cd "$T" || return
@@ -55,6 +55,8 @@ sync_scripts() {
 # A tty (when there is one) lets Ctrl-C stop the remote command too.
 run() {
   local h=$1 cmd t=(); shift
+  # GOPORT_PIN (scripts/upstream/pin.py) is passed on to the remote command.
+  [[ -n ${GOPORT_PIN:-} ]] && set -- "export GOPORT_PIN=${GOPORT_PIN//[^0-9a-f]/};" "$@"
   printf -v cmd %q "$*"; [[ -t 0 && -t 1 ]] && t=(-t)
   # A host whose home layout differs from zbook (alvin: ~/Code links to ~/code) runs through its
   # ~/.local/bin/zbook-paths wrapper, a no-root mount namespace with zbook's paths and a private /tmp.

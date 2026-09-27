@@ -5,6 +5,8 @@
 # Outputs go to measure/<round>/<label>.{out,err}. Saved oracle files are never overwritten.
 # Line format matches sweep-extra2.sh. goport never writes an output file, so it runs on the
 # read-only inputs. GOPORT_BIN picks the binary (default: accepted R118 goport).
+# GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
+[[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
 [ -n "$1" ] || { echo "usage: $0 <round>" >&2; exit 2; }
 X=/home/theo/Code/sandbox/ts-rust/target/project-inputs-wide
 B=${GOPORT_BIN:-/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/runtime/cargo-r118/goport/goport}

@@ -146,10 +146,27 @@ Under that delegation, root extended both rules to batch
 `recovery-continuation-go-checker-port-7`, and then to batch
 `recovery-continuation-go-checker-port-8`, then to batch
 `recovery-continuation-go-checker-port-9`, and then to batch
-`recovery-continuation-go-checker-port-10`, each time with the same pins and
+`recovery-continuation-go-checker-port-10`, and then to batch
+`recovery-continuation-go-checker-port-11`, each time with the same pins and
 scope. Each extension is a separate entry in `acceptanceRuleChanges`. The
 records name root as the extender. This is not a new direct approval by Theo,
 and it does not widen the rules.
+
+On 2026-09-27 Theo approved a standing **pin-bump batch** rule ("Approve bumps, start
+now"). typescript-go moved into `microsoft/TypeScript` under `tsc/`, and the pinned
+commit `dc37b5249` is tree-identical to `4d44e1c49` there. A pin-bump batch moves the Go
+pin from O to N (first N: the v7.0.2 content). At N, "pinned Go" means Go at N:
+- The oracle is rebuilt from N (`tsgo-oracle-<N12>`, sha256 recorded). Old oracle
+  binaries and old evidence stay, so old verdicts remain reproducible.
+- Go-side evidence (gate caches, corpora, typesyms dumps, LS and API goldens, Query and
+  Hono oracle outputs, Go reference baselines) is re-recorded against N into new
+  pin-keyed directories; nothing old is overwritten.
+- Acceptance happens only at N, with both independent verdicts. The protected cargo
+  roster (the 6,055 names and later passes) must not lose a name. A Rust expectation
+  that pins old Go behavior changes only with evidence from Go at N and an old-to-new
+  name mapping, reviewed independently.
+- The plan and tooling are in `target/continuation-r97-goport/upstream/drift.md`. Root
+  must not widen this rule by delegation.
 
 Any other rule change still needs Theo's approval.
 
