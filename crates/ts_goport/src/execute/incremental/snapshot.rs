@@ -2,12 +2,12 @@
 //! `emitSignature`, which is in `hash.rs`): the build info diagnostics with
 //! file names, the diagnostics repopulation, and the `snapshot` state.
 //!
-//! PORT: the process has one program (plan D1), so Go `*compiler.Program`
-//! parameters are dropped and the installed program is read through the
-//! `program.rs` free functions. Go `SyncMap` and `SyncSet` fields are
-//! `FxIndexMap` and `FxIndexSet` (see `reference_map.rs` for the order
-//! note); Go `atomic.Bool` and `sync.Once` become plain fields, because the
-//! snapshot is only used on the loading thread.
+//! PORT: Go `*compiler.Program` parameters are dropped and the current
+//! program (`prog()`) is read through the `program.rs` free functions. Go
+//! `SyncMap` and `SyncSet` fields are `FxIndexMap` and `FxIndexSet` (see
+//! `reference_map.rs` for the order note); Go `atomic.Bool` and `sync.Once`
+//! become plain fields, because the snapshot is only used on the loading
+//! thread.
 //!
 //! PERF: the map keys are long paths, so the maps use the Fx hasher instead
 //! of SipHash. The hasher does not change the order: it is insertion order.

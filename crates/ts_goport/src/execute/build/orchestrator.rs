@@ -32,7 +32,6 @@
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::BuildHost;
-use crate::execute::build::worker::{WorkerLauncher, compare_paths_options_of_sys};
 use crate::execute::incremental::build_info::BuildInfo;
 use crate::execute::incremental::incremental::new_build_info_reader;
 use crate::execute::tsc::compile::{
@@ -51,12 +50,9 @@ use crate::execute::tsc::compile::CommandLineTesting;
 use std::time::SystemTime;
 
 // Go: build/orchestrator.go:25 Options
-// PORT: `worker` is not used since the build compiles in this process. M2b
-// removes it with the build worker.
 pub struct Options {
     pub sys: Rc<dyn System>,
     pub command: Rc<ParsedBuildCommandLine>,
-    pub worker: WorkerLauncher,
     // PORT: testing. `None` outside tests.
     pub testing: Option<Rc<dyn CommandLineTesting>>,
 }
@@ -666,7 +662,11 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         opts.sys.writer(),
         Box::new(move |path: &str| fs.directory_exists(path)),
     );
-    let compare_paths_options = compare_paths_options_of_sys(&*opts.sys);
+    // Go: the `comparePathsOptions` field of the `Orchestrator` literal.
+    let compare_paths_options = ComparePathsOptions {
+        current_directory: opts.sys.get_current_directory(),
+        use_case_sensitive_file_names: opts.sys.fs().use_case_sensitive_file_names(),
+    };
     let host = Rc::new(BuildHost::new(
         opts.sys.clone(),
         opts.command.clone(),

@@ -1,12 +1,14 @@
 //! Port of execute/incremental/program.go, plus `ReadBuildInfoProgram`
 //! (incremental.go:43), which builds a `Program` from a snapshot.
 //!
-//! PORT: the process has one program (plan D1). Go `Program.program` is
-//! the installed `&'static GoProgram` (nil for a program read from build
-//! info), and its methods are the `program.rs` free functions. Go passes a
-//! context; the port has none. The `ProgramLike` methods take `&self`, so
-//! the snapshot is behind a `RefCell`; it is an `Rc` because Go
-//! `programToSnapshot` can reuse the old program's snapshot.
+//! PORT: Go `Program.program` is the current `&'static GoProgram`
+//! (`prog()`, nil for a program read from build info), and its methods are
+//! the `program.rs` free functions, which read `prog()`. A caller with
+//! several programs (the build task) makes the program current while it
+//! uses this one. Go passes a context; the port has none. The
+//! `ProgramLike` methods take `&self`, so the snapshot is behind a
+//! `RefCell`; it is an `Rc` because Go `programToSnapshot` can reuse the
+//! old program's snapshot.
 
 use super::build_info::*;
 use super::build_info_to_snapshot::build_info_to_snapshot;
@@ -44,7 +46,8 @@ pub struct Program {
 }
 
 // Go: incremental/program.go:38 NewProgram
-// PORT: Go `program` is the installed program, so it is not a parameter.
+// PORT: Go `program` is the current program (`prog()`), so it is not a
+// parameter.
 #[must_use]
 pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: bool) -> Program {
     let mut incremental_program = Program {
@@ -467,7 +470,7 @@ impl Program {
     }
 
     // Go: incremental/program.go:320 ensureHasErrorsForState
-    // PORT: Go `program` is the installed program.
+    // PORT: Go `program` is the current program.
     fn ensure_has_errors_for_state(&self) {
         let files = source_files();
         let has_include_processing_diagnostics: Box<dyn Fn() -> bool>;

@@ -1,6 +1,6 @@
 //! Port of execute/incremental/programtosnapshot.go.
 //!
-//! PORT: Go `*compiler.Program` is the installed program (plan D1), read
+//! PORT: Go `*compiler.Program` is the current program (`prog()`), read
 //! through the `program.rs` free functions. Go runs the per-file work of
 //! `computeProgramFileChanges` on a work group; here it runs in file order.
 //! Checker calls run on the file's checker thread (`checker_access.rs`).
@@ -48,7 +48,7 @@ pub fn program_to_snapshot(
 }
 
 // Go: incremental/programtosnapshot.go:40 toProgramSnapshot
-// PORT: Go `program` is the installed program and is not a field.
+// PORT: Go `program` is the current program and is not a field.
 struct ToProgramSnapshot<'a> {
     old_program: Option<&'a Program>,
     snapshot: Snapshot,

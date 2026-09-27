@@ -3,17 +3,16 @@
 //!
 //! PORT: Go `host` keeps a pointer to its `*Orchestrator` and reads
 //! `opts.Sys`, `opts.Command` and `toPath` through it. Here the host keeps
-//! those values itself, so the orchestrator process and the build worker
-//! process can both make one (plan D1). The orchestrator owns the host as
-//! `Rc<BuildHost>` and passes clones where Go passes `o.host`.
+//! those values itself, so it needs no reference back to the orchestrator.
+//! The orchestrator owns the host as `Rc<BuildHost>` and passes clones
+//! where Go passes `o.host`.
 //!
 //! PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero) and
 //! `time.Duration` is `Duration`, as in build_task.rs.
 
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::parse_cache::ParseCache;
-use crate::execute::incremental::build_info::BuildInfo;
-use crate::execute::incremental::incremental::{self as incremental, BuildInfoReader};
+use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
 use crate::frontend::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -90,9 +89,8 @@ pub struct BuildHost {
     compare_paths_options: ComparePathsOptions,
 
     host: Rc<dyn CompilerHost>,
-    // PORT: the `*cachedvfs.FS` of `host`, kept so the orchestrator can
-    // share it with the build workers (see `CachedFsState`). Go reaches it
-    // as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
+    // PORT: the `*cachedvfs.FS` of `host`, kept for `resetCaches`. Go
+    // reaches it as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
     pub cached_fs: Rc<CachedFs>,
 
     // Caches that last only for build cycle and then cleared out
@@ -225,14 +223,11 @@ impl BuildHost {
     }
 
     // Go: build/host.go:77 (*host).ReadBuildInfo
-    // PORT: Go reads through the task's `loadOrStoreBuildInfo` cache. Only
-    // `incremental.ReadBuildInfoProgram` calls this, and it runs in the
-    // build worker, which has no tasks (plan D1). The task cache was filled
-    // from the same file by the orchestrator, so the worker reads the file
-    // (`incremental.NewBuildInfoReader(h.host)`), which gives the same value.
-    pub fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo> {
-        incremental::new_build_info_reader(self.host.clone()).read_build_info(config)
-    }
+    // PORT: Go reads the build info cache of the config's task
+    // (`loadOrStoreBuildInfo`). Its only caller is `ReadBuildInfoProgram` in
+    // `compileAndEmit`, with the config of the task that compiles, so
+    // `BuildTask::compile_and_emit_start` reads its own cache (`TaskBuildInfo`)
+    // and the host does not implement `incremental.BuildInfoReader`.
 }
 
 impl CompilerHost for BuildHost {
@@ -339,13 +334,6 @@ impl ParseConfigHost for BuildHost {
 
     fn get_current_directory(&self) -> String {
         self.host.get_current_directory()
-    }
-}
-
-// Go: build/host.go:30 `_ incremental.BuildInfoReader = (*host)(nil)`
-impl BuildInfoReader for BuildHost {
-    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo> {
-        BuildHost::read_build_info(self, config)
     }
 }
 

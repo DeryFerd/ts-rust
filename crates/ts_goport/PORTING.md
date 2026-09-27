@@ -219,6 +219,15 @@ The batch that adds it is not accepted until Theo approves.
   unchanged `SourceFile` objects.
 - `program::release_program` frees the checker pool and the frontend of a
   version. The program shell and the file versions stay leaked for now.
+- A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
+  like Go: each project's program is a version made with `new_program` and
+  `program::new_program_version`, and it is released when its task
+  reports. The build host shares its parsed `.d.ts` and `.json` files
+  between the programs. A file that one program parsed and left out (a
+  deduplicated package) can be a program file of a later one, so the build
+  host notes each parse that it keeps (`program::note_parsed_source_file`)
+  and a publish gives it its complete `GoFile`. The publish asserts that
+  every program file is a source file.
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -237,29 +246,27 @@ execute/tsc/emit.go:65): 0 success, 1 diagnostics with emit skipped, 2
 diagnostics with emit not skipped. Under
 noEmit, a program with no emittable file (no inputs, or only `.d.ts`
 files) exits 2. `goport_build` returns the Go build status, which can also
-be 3 or 4. Unported code, any other panic, a worker-thread failure and a
-failed build worker exit `execute::tsc::EXIT_UNPORTED` (70,
-`EX_SOFTWARE`). Go uses 0 to 5 (3 in cmd/tsgo/sys.go:66, 4 in build mode,
-5 NotImplemented), so a harness must treat a goport exit of 70 as a crash,
-never as a tsgo status.
+be 3 or 4. Unported code, any other panic and a worker-thread failure
+exit `execute::tsc::EXIT_UNPORTED` (70, `EX_SOFTWARE`). Go uses 0 to 5 (3
+in cmd/tsgo/sys.go:66, 4 in build mode, 5 NotImplemented), so a harness
+must treat a goport exit of 70 as a crash, never as a tsgo status.
 
 A site where the pinned Go panics on the same input uses
 `core::go_panic(message)`, not `panic!`. It is not a port gap: the guards
 that keep a run going pass it on (`core::resume_go_panic`), and the bins
 end the run as the Go runtime does. The output written so far stays,
 stderr gets `panic: <message>` (then the port site in place of the
-goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`). A build
-worker exits 2 with no result line, and the orchestrator then exits 2 too.
+goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 
 ## Threads
 
 - `prog()` is the current program of the thread. A one-program process
   calls `core::set_prog` once, and every thread with no current program
   reads that program. `WorkerSeed` sets it on checker and bind threads. A
-  multi-program process (watch, language server, tests) registers each
-  version with `core::register_program_version` and makes one current for
-  a scope with `core::enter_program`. There, `prog()` panics on a thread
-  with no current program.
+  multi-program process (watch, `tsc -b`, language server, tests)
+  registers each version with `core::register_program_version` and makes
+  one current for a scope with `core::enter_program`. There, `prog()`
+  panics on a thread with no current program.
 - Programs and the program state are read only after load, so they hold
   only thread-safe data (`Arc`, `OnceLock`, `Mutex`).
 - Files bind in parallel, each into its own arena, and join the binder

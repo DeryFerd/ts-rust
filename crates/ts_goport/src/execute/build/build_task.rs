@@ -130,68 +130,6 @@ pub fn release_task_program(program: IncrementalProgram) {
     crate::program::release_program(go_program);
 }
 
-// The result of Go `compileAndEmit`'s program part, computed in a
-// `--build-worker` process (plan D1).
-// Only the build worker path (removed in M2b) uses this.
-// - `exit_status`: `result.Status` of `tsc.EmitAndReportStatistics`.
-// - `output`: everything the worker wrote to the task writer (diagnostics
-//   through the task diagnostic reporter, listFiles, traces), in order.
-// - `diagnostics`: `result.Diagnostics`, the diagnostics that went through
-//   Go `t.reportDiagnostic` (see `WorkerDiagnostic`).
-// - `diagnostic_file_texts`: the file name and text of each file that
-//   `diagnostics` names (with their message chains and related
-//   information), in first use order.
-// - `emitted_files`: `result.EmitResult.EmittedFiles`.
-// - `has_changed_dts_file`: `incremental.Program.HasChangedDtsFile()`.
-// - `build_info_emit`: the file name that `writeFile` wrote with
-//   `data.BuildInfo != nil` and the Go `Sys.Now()` of `onBuildInfoEmit`,
-//   taken at that write, or `None` when no build info was written.
-// - `statistics`: the statistics of `tsc.EmitAndReportStatistics` (`None`
-//   when Go returns nil).
-// - `output_time_stamps`: the files that `writeFile` wrote with
-//   `storeOutputTimeStamp` true, each with its Go `Sys.Now()` time
-//   (watch mode only).
-// - `fs_cache`: the cached file system entries the worker added (see
-//   shared_fs.rs). The orchestrator merges them into its cache.
-#[derive(Clone, Debug)]
-pub struct WorkerCompileResult {
-    pub exit_status: ExitStatus,
-    pub output: String,
-    pub diagnostics: Vec<WorkerDiagnostic>,
-    pub diagnostic_file_texts: Vec<(String, String)>,
-    pub emitted_files: Vec<String>,
-    pub has_changed_dts_file: bool,
-    pub build_info_emit: Option<(String, SystemTime)>,
-    pub statistics: Option<Statistics>,
-    pub output_time_stamps: Vec<(String, SystemTime)>,
-    pub fs_cache: CachedFsState,
-}
-
-// One diagnostic of the worker's `result.Diagnostics` (Go `*ast.Diagnostic`),
-// as it goes back to the orchestrator for Go `t.errors`.
-// Only the build worker path (removed in M2b) uses this.
-// - `file_name`: the file name of Go `File()`, or `None` when it is nil.
-// - `pos`, `end`, `code`, `category`, `message_args`: Go `Pos()`, `End()`,
-//   `Code()`, `Category()` and the message arguments.
-// - `message_chain`, `related_information`: Go `MessageChain()` and
-//   `RelatedInformation()`, in the same form.
-// PORT: `skippedOnNoEmit` and the repopulate information are not sent.
-// Go reads `t.errors` only for the error summary (`WriteErrorSummaryText`)
-// and in watch mode, where the diagnostic reporter prints `t.errors` again
-// for a task that it does not rebuild (`build_project_start`). Neither
-// reads them.
-#[derive(Clone, Debug)]
-pub struct WorkerDiagnostic {
-    pub file_name: Option<String>,
-    pub pos: i32,
-    pub end: i32,
-    pub code: i32,
-    pub category: ts_diagnostics::Category,
-    pub message_args: Vec<String>,
-    pub message_chain: Vec<WorkerDiagnostic>,
-    pub related_information: Vec<WorkerDiagnostic>,
-}
-
 // The parts of Go `*Orchestrator` (and its `host`) that a build task uses.
 // The orchestrator (orchestrator.rs) implements this.
 pub trait BuildTaskOrchestrator {

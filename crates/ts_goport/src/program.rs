@@ -2529,9 +2529,9 @@ pub fn get_source_of_project_reference_if_output_included(file: Node) -> String 
         .map_or_else(|| info.file_name.clone(), str::to_string)
 }
 
-/// Go `compiler.NewProgram` for a config that is already parsed (the build
-/// worker). It installs the program for the process, so call it once.
-/// `opts.host` carries the trace writer.
+/// Go `compiler.NewProgram` for a config that is already parsed, in a
+/// one-program process (`tsc`, `goport`). It installs the program for the
+/// process, so call it once. `opts.host` carries the trace writer.
 pub fn install_new_program(
     opts: crate::frontend::compiler::ProgramOptions,
 ) -> Result<&'static GoProgram, String> {

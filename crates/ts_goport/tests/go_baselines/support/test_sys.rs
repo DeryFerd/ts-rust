@@ -2,14 +2,14 @@
 //! tsc runner (`TestSys`, `TestClock`, `testFs`), its program baselines,
 //! its output sanitizer and the edit helpers of the scenarios.
 //!
-//! PORT: the port has one program per process, so the runner runs every
-//! `execute.CommandLine` in a child process (see child.rs). The test system
-//! of the runner process keeps the state and never compiles. The child
-//! process rebuilds a test system over the same state, compiles, and sends
-//! the state back. The state that every view shares (the map file system,
-//! the clock, the written files and the default libraries) is `Send +
-//! Sync`, because emit writes arrive on checker threads, which make their
-//! own `testFs` view through the osvfs override.
+//! PORT: a plain `tsc` run has one program per process, so the runner
+//! runs every `execute.CommandLine` in a child process (see child.rs). The
+//! test system of the runner process keeps the state and never compiles.
+//! The child process rebuilds a test system over the same state, compiles,
+//! and sends the state back. The state that every view shares (the map
+//! file system, the clock, the written files and the default libraries) is
+//! `Send + Sync`, because emit writes arrive on checker threads, which make
+//! their own `testFs` view through the osvfs override.
 //!
 //! PORT: strings are the port form of Go strings (see
 //! `ts_goport::scanner_util::GO_STRING_MARKER`). The map file system keeps
@@ -32,13 +32,10 @@ use ts_goport::core::version;
 use ts_goport::diag;
 use ts_goport::diagnostics_loc::message_localize;
 use ts_goport::emitter::program_emit::EmitResult;
-use ts_goport::execute::build::build_task::WorkerCompileResult;
 use ts_goport::execute::incremental::build_info::BuildInfo;
 use ts_goport::execute::incremental::incremental::marshal_build_info;
 use ts_goport::execute::incremental::program::{Program, SignatureUpdateKind};
-use ts_goport::execute::tsc::compile::{
-    BuildWorkerRunner, CommandLineTesting, System, Writer, write_str,
-};
+use ts_goport::execute::tsc::compile::{CommandLineTesting, System, Writer, write_str};
 use ts_goport::frontend::compiler::TraceFn;
 use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::tsoptions::{
@@ -48,11 +45,11 @@ use ts_goport::frontend::tspath::{
     ComparePathsOptions, EXTENSION_TS_BUILD_INFO, Path, file_extension_is,
     get_relative_path_from_directory, to_path,
 };
-use ts_goport::frontend::vfs::{CachedFsState, Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
 use ts_goport::locale::{self, Locale};
 use ts_goport::scanner_util::{go_string_bytes, go_string_from_bytes};
 
-use crate::support::child::{self, WorkerContext};
+use crate::support::child;
 use crate::support::fsbaselineutil::{FsDiffer, sanitize_internal_symbol_name};
 use crate::support::harnessutil::{FAKE_TS_VERSION, TracerForBaselining};
 use crate::support::mock_watch_backend::MockWatchBackend;
@@ -355,8 +352,6 @@ impl Fs for TestFs {
 // ---------------------------------------------------------------------------
 
 /// The program baseline of one `OnProgram` call, before the headers.
-// PORT: a build worker process keeps it and the child appends it when the
-// task reports (see `on_build_task_program`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgramParts {
     /// Go `program.Options().ConfigFilePath`.
@@ -373,22 +368,8 @@ pub struct ProgramParts {
 pub enum SysMode {
     /// The runner process: it keeps the state and never compiles.
     Runner,
-    /// A command child. `command_line_args` is its command line; a `-b`
-    /// build passes it to its build workers.
-    Child { command_line_args: Vec<String> },
-    /// A build worker. `OnProgram` keeps the program baseline for the task.
-    Worker,
-}
-
-/// The build worker results that a command child keeps until the
-/// orchestrator asks for them.
-#[derive(Default)]
-pub struct WorkerResults {
-    /// The program baselines per task config (`on_build_task_program`).
-    pub programs: FxHashMap<String, Vec<ProgramParts>>,
-    /// The time that `OnEmittedFiles` gave each emitted file in a worker
-    /// (`on_worker_emitted_files`). Files that it skipped are absent.
-    pub emitted_times: FxHashMap<String, SystemTime>,
+    /// A command child. It compiles, also every project of a `-b` build.
+    Child,
 }
 
 // Go: sys.go:155 TestSys
@@ -414,15 +395,9 @@ pub struct TestSys {
     mode: SysMode,
     /// The modification times of the last FS baseline (Go
     /// `fsDiffer.SerializedDiff().Snap[file].MTime`) when this system
-    /// runs in a child; the runner reads its own differ. Shared with the
-    /// build worker runner, and each watch cycle updates it.
+    /// runs in a child; the runner reads its own differ. Each watch cycle
+    /// updates it.
     child_serialized_mtimes: SerializedMtimes,
-    /// The files that `OnEmittedFiles` stamped, with their time.
-    emitted_times: RefCell<Vec<(String, SystemTime)>>,
-    /// The program baseline of a build worker (`SysMode::Worker`).
-    worker_programs: RefCell<Vec<ProgramParts>>,
-    /// The worker results of a command child (`SysMode::Child`).
-    worker_results: Arc<Mutex<WorkerResults>>,
 }
 
 /// The modification times of `TestSys::child_serialized_mtimes`: `None`
@@ -557,9 +532,6 @@ impl TestSys {
             env,
             mode,
             child_serialized_mtimes: Arc::new(Mutex::new(None)),
-            emitted_times: RefCell::new(Vec::new()),
-            worker_programs: RefCell::new(Vec::new()),
-            worker_results: Arc::new(Mutex::new(WorkerResults::default())),
         }
     }
 
@@ -872,21 +844,6 @@ impl TestSys {
         *lock(&self.child_serialized_mtimes) = Some(mtimes);
     }
 
-    /// The files that `OnEmittedFiles` stamped in this process.
-    pub fn take_emitted_times(&self) -> Vec<(String, SystemTime)> {
-        std::mem::take(&mut *self.emitted_times.borrow_mut())
-    }
-
-    /// The program baselines that a build worker kept.
-    pub fn take_worker_programs(&self) -> Vec<ProgramParts> {
-        std::mem::take(&mut *self.worker_programs.borrow_mut())
-    }
-
-    /// The worker results of a command child.
-    pub fn worker_results(&self) -> &Arc<Mutex<WorkerResults>> {
-        &self.worker_results
-    }
-
     // Go: sys.go:547 writeFileNoError
     pub fn write_file_no_error(&self, path: &str, content: &str) {
         if let Err(err) = self.fs_from_file_map().write_file(path, content) {
@@ -1015,9 +972,6 @@ impl CommandLineTesting for TestSys {
                     fs_error_text(&err)
                 );
             }
-            // PORT: a build worker process sends these to the orchestrator
-            // (see `on_worker_emitted_files`).
-            self.emitted_times.borrow_mut().push((file.clone(), now));
             // Update the mTime cache in --b mode to store the updated timestamp so tests will behave deteministically when finding newest output
             if let Some(m_times_cache) = m_times_cache {
                 let path = to_path(
@@ -1090,79 +1044,9 @@ impl CommandLineTesting for TestSys {
     }
 
     // Go: sys.go:325 OnProgram
-    // PORT: a build worker process keeps the text; its child appends it
-    // when the task reports (`on_build_task_program`).
     fn on_program(&self, program: &Program) {
         let parts = self.program_parts(program);
-        match self.mode {
-            SysMode::Worker => self.worker_programs.borrow_mut().push(parts),
-            _ => self.append_program_parts(&parts),
-        }
-    }
-
-    // PORT: testing. A command child runs each build worker in a process
-    // of its own, one at a time (child.rs `run_build_worker`).
-    fn build_worker_runner(&self) -> Option<BuildWorkerRunner> {
-        let SysMode::Child { command_line_args } = &self.mode else {
-            return None;
-        };
-        let context = WorkerContext {
-            shared: self.shared.clone(),
-            cwd: self.cwd.clone(),
-            env: self.env.clone(),
-            default_library_path: self.default_library_path.clone(),
-            build_command_line: command_line_args.clone(),
-            serialized_mtimes: self.child_serialized_mtimes.clone(),
-            results: self.worker_results.clone(),
-        };
-        Some(Arc::new(
-            move |config: &str,
-                  fs_cache: &str,
-                  on_program_fs_cache: &mut dyn FnMut(CachedFsState)|
-                  -> WorkerCompileResult {
-                child::run_build_worker(&context, config, fs_cache, on_program_fs_cache)
-            },
-        ))
-    }
-
-    // PORT: testing. Go `OnProgram` of a build task at report time
-    // (build/buildtask.go:109), with the text its worker kept.
-    fn on_build_task_program(&self, config: &str) {
-        let parts = lock(&self.worker_results)
-            .programs
-            .get_mut(config)
-            .and_then(|parts| (!parts.is_empty()).then(|| parts.remove(0)));
-        match parts {
-            Some(parts) => self.append_program_parts(&parts),
-            // A failed worker (see child.rs `run_build_worker`) has no
-            // program; the run already counts it as unported.
-            None => eprintln!("tsctest: OnProgram: no build worker program for {config}"),
-        }
-    }
-
-    // PORT: testing. The orchestrator part of Go `OnEmittedFiles` for a
-    // build task: the `mTimes` entries that exist get the time that the
-    // worker stamped (sys.go:255).
-    fn on_worker_emitted_files(
-        &self,
-        emitted_files: &[String],
-        m_times: &Mutex<FxHashMap<Path, Option<SystemTime>>>,
-    ) {
-        let mut results = lock(&self.worker_results);
-        for file in emitted_files {
-            let Some(now) = results.emitted_times.remove(file) else {
-                // Even though written, timestamp was reverted
-                continue;
-            };
-            let path = to_path(
-                file,
-                &self.get_current_directory(),
-                self.fs.use_case_sensitive_file_names(),
-            );
-            if let Some(entry) = lock(m_times).get_mut(&path) {
-                *entry = Some(now);
-            }
-        }
+        self.append_program_parts(&parts);
     }
 }
 
