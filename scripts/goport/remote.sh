@@ -24,7 +24,7 @@ guard() { [[ $1 != "$T"/project-inputs* || $1 == "$T"/project-inputs*/measure/?*
 # First host in order whose repo path resolves to itself (else tools print other paths), with load under half its cores.
 pick() {
   local h; for h in "${HOSTS[@]}"; do
-    ssh "$h" "[ \"\$(realpath $REPO)\" = $REPO ] && awk -v n=\$(nproc) '{exit !(\$1 < n / 2)}' /proc/loadavg" && { echo "$h"; return; }
+    ssh "$h" "{ [ -x ~/.local/bin/zbook-paths ] || [ \"\$(realpath $REPO)\" = $REPO ]; } && awk -v n=\$(nproc) '{exit !(\$1 < n / 2)}' /proc/loadavg" && { echo "$h"; return; }
   done
   die "no idle host with a correct mirror in: ${HOSTS[*]}"
 }
@@ -56,8 +56,12 @@ sync_scripts() {
 run() {
   local h=$1 cmd t=(); shift
   printf -v cmd %q "$*"; [[ -t 0 && -t 1 ]] && t=(-t)
-  exec ssh "${t[@]}" -o ServerAliveInterval=60 "$h" "cd $REPO || exit 2; [ \"\$(pwd -P)\" = $REPO ] ||
-    { echo \"$h: $REPO resolves to \$(pwd -P); outputs would not match zbook\" >&2; exit 2; }; exec bash -lc $cmd"
+  # A host whose home layout differs from zbook (alvin: ~/Code links to ~/code) runs through its
+  # ~/.local/bin/zbook-paths wrapper, a no-root mount namespace with zbook's paths and a private /tmp.
+  exec ssh "${t[@]}" -o ServerAliveInterval=60 "$h" "cd $REPO || exit 2
+    if [ -x ~/.local/bin/zbook-paths ]; then exec ~/.local/bin/zbook-paths bash -lc \"cd $REPO && \"$cmd; fi
+    [ \"\$(pwd -P)\" = $REPO ] || { echo \"$h: $REPO resolves to \$(pwd -P); outputs would not match zbook\" >&2; exit 2; }
+    exec bash -lc $cmd"
 }
 fetch() {
   local h=$1 d; shift
