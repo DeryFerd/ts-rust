@@ -258,10 +258,13 @@ impl Reader for LspReader {
         };
 
         let mut req = lsproto::Message::default();
-        // PORT: Go `json.Unmarshal(data, req)` calls `(*Message).UnmarshalJSON`.
-        // `unmarshal_json` keeps the error chain for `errors.Is`; the JSON
-        // error texts differ from Go v2 (the codes match).
-        if let Err(err) = req.unmarshal_json(&data) {
+        // Go `json.Unmarshal(data, req)` reads the raw value, then calls the
+        // v1 method `(*Message).UnmarshalJSON`. A method error gets the outer
+        // "json: cannot unmarshal JSON object into Go lsproto.Message: "
+        // text, and stays in the chain for `errors.Is`.
+        if let Err(err) =
+            json_ext::unmarshal_json_method::<lsproto::Message>(&data, |d| req.unmarshal_json(d))
+        {
             if errors::is(&err, &errors::from_value(ErrorCode::INVALID_PARAMS)) {
                 return (
                     Some(req),

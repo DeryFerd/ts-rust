@@ -879,19 +879,15 @@ fn source_file_identifiers<R>(
     source_file: Node,
     f: impl FnOnce(&FxHashSet<&'static str>) -> R,
 ) -> R {
-    // Go `UpdateSourceFile` copies `Identifiers` from the original file, so a
-    // factory SourceFile uses the parsed file with the same path.
-    let source_file = if crate::ast::is_synthetic_node(source_file) {
-        let path = crate::ast::with_synthetic_source_file(source_file, |d| d.path.clone());
-        let parsed = crate::program::get_source_file_by_path(&path);
-        if parsed == Node::NIL {
-            source_file
-        } else {
-            parsed
-        }
-    } else {
-        source_file
-    };
+    // PORT: only the parser sets Go `Identifiers`. A factory SourceFile has
+    // the set of the file that `copyFrom` copied it from, and callers map a
+    // copy to that file first (`identifiers_source_file`). A factory
+    // SourceFile that reaches here was made by `NewSourceFile`, so its Go
+    // `Identifiers` is nil and every name is unique. Do not look up a
+    // program file with the same path: Go does not.
+    if crate::ast::is_synthetic_node(source_file) {
+        return f(&FxHashSet::default());
+    }
     let cached = SOURCE_FILE_IDENTIFIERS.with(|cache| cache.borrow().get(&source_file).cloned());
     let identifiers = match cached {
         Some(identifiers) => identifiers,
