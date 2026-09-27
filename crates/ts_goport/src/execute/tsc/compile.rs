@@ -18,7 +18,7 @@ use crate::frontend::compiler::TraceFn;
 use crate::frontend::tspath::Path;
 use crate::frontend::vfs::CachedFsState;
 use crate::locale::Locale;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Go `io.Writer`. A caller that wants the text back (Go `bytes.Buffer`)
 /// keeps its own `Rc<RefCell<Vec<u8>>>` and passes a clone as a `Writer`.
@@ -132,7 +132,8 @@ pub struct CommandLineResult {
 // PORT: testing. The Go test harness hook (tsctests/sys.go `TestSys`).
 // Every real run passes `None` (Go nil), so it takes the Go nil paths. Go
 // `io.Writer` is `Writer`. Go `*collections.SyncMap[tspath.Path,
-// time.Time]` is the build host `m_times` (`None` is the Go zero time).
+// time.Time]` is the build host `m_times`, a `Mutex` (`None` is the Go zero
+// time).
 // The last three methods have no Go equivalent and do nothing by default:
 // the port compiles each build project in a worker process
 // (build/worker.rs), so a test can run the worker itself and gets the
@@ -142,7 +143,7 @@ pub trait CommandLineTesting {
     fn on_emitted_files(
         &self,
         result: &EmitResult,
-        m_times_cache: Option<&RefCell<FxHashMap<Path, Option<SystemTime>>>>,
+        m_times_cache: Option<&Mutex<FxHashMap<Path, Option<SystemTime>>>>,
     );
     fn on_list_files_start(&self, w: &Writer);
     fn on_list_files_end(&self, w: &Writer);
@@ -172,7 +173,7 @@ pub trait CommandLineTesting {
     fn on_worker_emitted_files(
         &self,
         _emitted_files: &[String],
-        _m_times: &RefCell<FxHashMap<Path, Option<SystemTime>>>,
+        _m_times: &Mutex<FxHashMap<Path, Option<SystemTime>>>,
     ) {
     }
 }

@@ -429,6 +429,7 @@ impl Emitter {
         }
         let mut data = WriteFileData {
             source_map_url_pos,
+            build_info: None,
             diagnostics: self.emitter_diagnostics.get_diagnostics(),
             skipped_dts_write: false,
         };

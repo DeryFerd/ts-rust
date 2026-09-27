@@ -20,6 +20,7 @@ use super::snapshot_to_build_info::snapshot_to_build_info;
 use crate::emitter::program_emit::{EmitOptions, EmitResult, WriteFileData};
 use crate::execute::tsc::emit::ProgramLike;
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 // Go: incremental/program.go:20 SignatureUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -432,12 +433,15 @@ impl Program {
             Ok(text) => text,
             Err(err) => panic!("Failed to marshal build info: {err}"),
         };
-        // PORT: Go passes `&compiler.WriteFileData{BuildInfo: buildInfo}`. The
-        // Rust `WriteFileData` has no build info field; the build task's
-        // `writeFile` (the only reader) compares the file name with
-        // `config.GetBuildInfoFileName()` instead.
         let err = if let Some(write_file) = &options.write_file {
-            write_file(&build_info_file_name, &text, &mut WriteFileData::default())
+            write_file(
+                &build_info_file_name,
+                &text,
+                &mut WriteFileData {
+                    build_info: Some(Arc::new(build_info)),
+                    ..WriteFileData::default()
+                },
+            )
         } else {
             host()
                 .fs()

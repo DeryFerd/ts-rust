@@ -12,10 +12,13 @@ use super::emitter::{EmitOnly, Emitter};
 use crate::sourcemap::generator::RawSourceMap;
 
 // Go: compiler/program.go:1600 WriteFileData
-// PORT: Go `BuildInfo any` is left out: `.tsbuildinfo` is not emitted.
 #[derive(Clone, Debug, Default)]
 pub struct WriteFileData {
     pub source_map_url_pos: i32,
+    // PORT: Go uses `any` to avoid an import cycle. It is `Arc` because the
+    // write callback is thread safe. Only the build info write sets it
+    // (incremental `emit_build_info`).
+    pub build_info: Option<Arc<crate::execute::incremental::BuildInfo>>,
     pub diagnostics: Vec<Diagnostic>,
     pub skipped_dts_write: bool,
 }

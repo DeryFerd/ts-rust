@@ -289,7 +289,7 @@ pub fn compile_and_emit_worker(
         write_file: Some(write_file),
         compile_times,
         testing: testing.clone(),
-        testing_m_times_cache: Some(&host.m_times),
+        testing_m_times_cache: Some(&*host.m_times),
     });
     WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
     // PORT: testing (see above)
@@ -402,13 +402,12 @@ fn task_write_file_now() -> SystemTime {
 // `orchestrator.host.FS()` (cachedvfs over bundled over osvfs); both
 // wrappers pass a write of a real path to osvfs, so this writes with the
 // osvfs of the calling thread.
-// PORT: Go tests `data.BuildInfo != nil`. The Rust `WriteFileData` has no
-// build info field. Go sets it only for the write of
+// PORT: Go tests `data.BuildInfo != nil`. Go sets it only for the write of
 // `config.GetBuildInfoFileName()` (incremental/program.go emitBuildInfo),
-// so the file name is compared instead. The worker has no task, so the
-// `onBuildInfoEmit` call is recorded as the written file name with its
-// `Sys.Now()` time, and runs in the orchestrator. The
-// `storeOutputTimeStamp` branch (watch mode) is recorded in
+// so the worker compares the file name and does not read the field. The
+// worker has no task, so the `onBuildInfoEmit` call is recorded as the
+// written file name with its `Sys.Now()` time, and runs in the orchestrator.
+// The `storeOutputTimeStamp` branch (watch mode) is recorded in
 // `output_time_stamps`, and the orchestrator stores the times
 // (`BuildTask::compile_and_emit_finish`).
 fn new_task_write_file(
