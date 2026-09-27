@@ -14,12 +14,15 @@
 //! the Go schedule: at most `numRoutines` tasks are taken and not yet
 //! reported, and tasks report in `order`. A taken task starts when its
 //! upstream tasks are done, and a task that compiles makes its program at
-//! once (`build_project_start`). The started tasks emit one at a time, the
+//! once (`build_project_start`) and starts its check on the program's
+//! checker threads, so the checkers of the started tasks work at the same
+//! time, as the Go goroutines do. The started tasks emit one at a time, the
 //! first in `order` first (`build_project_finish`). So a task that runs
 //! beside others in Go reads the file system before they write their
 //! outputs. Every task uses `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
-//! Each program is released when its task reports.
+//! Each program is released when its task reports; its checker threads
+//! free it in the background.
 //!
 //! PORT: the task keeps its project statistics (see build_task.rs), and
 //! `report_task` adds them to the aggregate `--diagnostics` and

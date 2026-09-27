@@ -43,6 +43,20 @@ pub struct Program {
 
     // Testing data
     pub(crate) testing_data: Option<RefCell<TestingData>>,
+
+    // PORT: not in Go. What `start_check` read and started (see there).
+    started: RefCell<StartedCheck>,
+}
+
+/// The work of `tsc.EmitFilesAndReportErrors` that `Program::start_check`
+/// did before the caller asks for it.
+#[derive(Default)]
+struct StartedCheck {
+    /// The first `GetGlobalDiagnostics` result. The next
+    /// `get_global_diagnostics` call takes it.
+    global_diagnostics: Option<Vec<Diagnostic>>,
+    /// The check of the affected files. `get_semantic_diagnostics` takes it.
+    check: Option<PendingSemanticDiagnostics>,
 }
 
 // Go: incremental/program.go:38 NewProgram
@@ -55,6 +69,7 @@ pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: b
         program: Some(prog()),
         host: Some(host),
         testing_data: None,
+        started: RefCell::default(),
     };
 
     if testing {
@@ -101,6 +116,7 @@ pub fn read_build_info_program(
         program: None,
         host: None,
         testing_data: None,
+        started: RefCell::default(),
     })
 }
 
@@ -240,10 +256,64 @@ impl Program {
     }
 
     // Go: incremental/program.go:141 GetGlobalDiagnostics
+    // PORT: the first call returns what `start_check` read, if it ran.
     #[must_use]
     pub fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         self.panic_if_no_program("GetGlobalDiagnostics");
+        if let Some(diagnostics) = self.started.borrow_mut().global_diagnostics.take() {
+            return diagnostics;
+        }
         get_global_diagnostics()
+    }
+
+    /// PORT: not in Go. Starts the semantic check that
+    /// `tsc.EmitFilesAndReportErrors` asks for, and returns without waiting
+    /// for it. `tsc -b` calls it when the program is made: Go builds up to 4
+    /// projects on goroutines at the same time, and here each project's
+    /// checkers check while the loading thread makes the next program or
+    /// emits an earlier one.
+    ///
+    /// It does what `EmitFilesAndReportErrors` (through
+    /// `GetDiagnosticsOfAnyProgram`) does before the check, with the same
+    /// checker jobs in the same order. When the syntactic and program
+    /// diagnostics are empty (and not `--listFilesOnly` or `--noCheck`), it
+    /// reads the global diagnostics. When those are empty too, it handles
+    /// the affected files (`collectAllAffectedFiles`) and sends the check of
+    /// the files that `get_semantic_diagnostics` would check. The next
+    /// `get_global_diagnostics` call returns the global diagnostics read
+    /// here, and `get_semantic_diagnostics` waits for the check. The caller
+    /// must use this program only through those calls, in that order, as
+    /// `EmitFilesAndReportErrors` does (`start_check_used` checks it).
+    pub fn start_check(&self) {
+        self.panic_if_no_program("StartCheck");
+        if self.snapshot.borrow().options.no_check.is_true()
+            || options().list_files_only.is_true()
+            || !get_syntactic_diagnostics(Node::NIL).is_empty()
+            || !get_program_diagnostics().is_empty()
+        {
+            return;
+        }
+        let global_diagnostics = get_global_diagnostics();
+        let has_global_diagnostics = !global_diagnostics.is_empty();
+        self.started.borrow_mut().global_diagnostics = Some(global_diagnostics);
+        if has_global_diagnostics {
+            return;
+        }
+        if let Some(affected_files) = self.semantic_diagnostics_files_to_check(Node::NIL) {
+            self.started.borrow_mut().check = Some(
+                start_semantic_diagnostics_without_no_emit_filtering(&affected_files),
+            );
+        }
+    }
+
+    /// PORT: not in Go. True when the caller used everything that
+    /// `start_check` read and started. `tsc -b` asserts it after the emit:
+    /// a result left over means the calls did not follow
+    /// `EmitFilesAndReportErrors`.
+    #[must_use]
+    pub fn start_check_used(&self) -> bool {
+        let started = self.started.borrow();
+        started.global_diagnostics.is_none() && started.check.is_none()
     }
 
     // Go: incremental/program.go:147 GetSemanticDiagnostics
@@ -339,18 +409,43 @@ impl Program {
 
     // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles
     // Handle affected files and cache the semantic diagnostics for all of them or the file asked for
+    // PORT: split in two (`semantic_diagnostics_files_to_check` and
+    // `commit_semantic_diagnostics`), so `start_check` can send the check
+    // early. A check that `start_check` sent is committed here first.
     fn collect_semantic_diagnostics_of_affected_files(&self, file: Node) {
+        let started = self.started.borrow_mut().check.take();
+        if let Some(started) = started {
+            let affected_files = started.files().to_vec();
+            self.commit_semantic_diagnostics(&affected_files, started.wait());
+            if file.is_nil() {
+                return;
+            }
+        }
+        let Some(affected_files) = self.semantic_diagnostics_files_to_check(file) else {
+            return;
+        };
+
+        // Get their diagnostics and cache them
+        let diagnostics_per_file =
+            get_semantic_diagnostics_without_no_emit_filtering(&affected_files);
+        self.commit_semantic_diagnostics(&affected_files, diagnostics_per_file);
+    }
+
+    /// The first half of `collectSemanticDiagnosticsOfAffectedFiles`: it
+    /// handles the affected files and returns the files to check, or `None`
+    /// where Go returns before the check.
+    fn semantic_diagnostics_files_to_check(&self, file: Node) -> Option<Vec<Node>> {
         if self.snapshot.borrow().can_use_incremental_state() {
             // Get all affected files
             super::affected_files::collect_all_affected_files(self);
 
             if self.snapshot.borrow().semantic_diagnostics_per_file.len() == source_files().len() {
                 // If we have all the files,
-                return;
+                return None;
             }
         }
 
-        let affected_files: Vec<Node> = if file.is_some() {
+        if file.is_some() {
             let path = Path(source_file_info(file).path.clone());
             if self
                 .snapshot
@@ -358,11 +453,12 @@ impl Program {
                 .semantic_diagnostics_per_file
                 .contains_key(&path)
             {
-                return;
+                return None;
             }
-            vec![file]
-        } else {
-            let snapshot = self.snapshot.borrow();
+            return Some(vec![file]);
+        }
+        let snapshot = self.snapshot.borrow();
+        Some(
             source_files()
                 .into_iter()
                 .filter(|&file| {
@@ -370,16 +466,20 @@ impl Program {
                         .semantic_diagnostics_per_file
                         .contains_key(source_file_info(file).path.as_str())
                 })
-                .collect()
-        };
+                .collect(),
+        )
+    }
 
-        // Get their diagnostics and cache them
-        let mut diagnostics_per_file =
-            get_semantic_diagnostics_without_no_emit_filtering(&affected_files);
-
+    /// The second half of `collectSemanticDiagnosticsOfAffectedFiles`: it
+    /// caches the check result of `affected_files` in the snapshot.
+    fn commit_semantic_diagnostics(
+        &self,
+        affected_files: &[Node],
+        mut diagnostics_per_file: FxHashMap<Node, Vec<Diagnostic>>,
+    ) {
         // Commit changes to snapshot
         let mut snapshot = self.snapshot.borrow_mut();
-        for file in &affected_files {
+        for file in affected_files {
             if let Some(diagnostics) = diagnostics_per_file.remove(file) {
                 snapshot.semantic_diagnostics_per_file.insert(
                     Path(source_file_info(*file).path.clone()),

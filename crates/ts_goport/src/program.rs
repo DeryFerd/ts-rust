@@ -264,6 +264,22 @@ impl CheckerPool {
     /// queues and waits for each thread to end, so the checkers are freed on
     /// return.
     fn shut_down(self) {
+        for thread in self.stop() {
+            // A job panic stays in its job result, so a worker ends normally.
+            let _ = thread.join();
+        }
+    }
+
+    /// `shut_down` without the wait: the workers drop their checkers and
+    /// end while the caller goes on. Nothing waits for them; at process
+    /// exit a worker that is still freeing just stops.
+    fn shut_down_in_background(self) {
+        drop(self.stop());
+    }
+
+    /// Sends each worker the job that drops its checker, closes the job
+    /// queues and returns the worker threads.
+    fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
         // A pool that only ends with the process forgets its checkers (see
         // `create_checkers`); a released program frees them here.
         for worker in &self.workers {
@@ -273,10 +289,7 @@ impl CheckerPool {
             }));
         }
         drop(self.workers);
-        for thread in self.threads {
-            // A job panic stays in its job result, so a worker ends normally.
-            let _ = thread.join();
-        }
+        self.threads
     }
 }
 
@@ -303,7 +316,10 @@ fn record_worker_arena_use() {
 /// The first AST arena chunk of checker worker `index`: what worker `index`
 /// of the last released pool used, plus a sixteenth, in whole pages. None
 /// (the 1 MiB default) before any pool is released, so a one-program
-/// process keeps the default. A released pool leaks its worker arenas (the
+/// process keeps the default. A pool released in the background
+/// (`release_program_in_background`) records its use when its worker is
+/// done, so a pool made before that reads an older pool's use. It is only
+/// a size hint. A released pool leaks its worker arenas (the
 /// nodes are `&'static`), so a 1 MiB chunk would leak about 1 MiB for each
 /// worker and program version while a Query core worker uses 25 to 80 KB.
 /// A worker checks the same files in each version, so its use changes
@@ -2611,6 +2627,19 @@ pub fn bind_file_outside_program(file: Node) {
 /// after this. Its `GoProgram`, frontend program and file versions stay
 /// leaked. Panics when `program` is current on this thread.
 pub fn release_program(program: &'static GoProgram) {
+    release_program_with(program, CheckerPool::shut_down);
+}
+
+/// `release_program` that does not wait for the checker workers: they drop
+/// their checkers on their own threads while the caller goes on (Go frees a
+/// program in the background GC). `tsc -b` uses it, so the next project
+/// does not wait for the free.
+pub fn release_program_in_background(program: &'static GoProgram) {
+    release_program_with(program, CheckerPool::shut_down_in_background);
+}
+
+/// `release_program` with the pool stop that `shut_down` names.
+fn release_program_with(program: &'static GoProgram, shut_down: fn(CheckerPool)) {
     assert!(
         !try_prog().is_some_and(|current| std::ptr::eq(current, program)),
         "program {} is released while it is current",
@@ -2618,7 +2647,7 @@ pub fn release_program(program: &'static GoProgram) {
     );
     let pool = POOLS.with(|pools| pools.borrow_mut().remove(&program.id));
     if let Some(pool) = pool {
-        pool.shut_down();
+        shut_down(pool);
     }
     FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
     if let Some(state) = program.state.get() {
@@ -3569,8 +3598,8 @@ fn create_checkers() -> CheckerPool {
                     // the process. Like Go, which never frees a checker, the
                     // checker is not dropped: freeing its arenas at thread
                     // exit cost 0.83% of query CPU. `release_program` drops
-                    // the checker first (`CheckerPool::shut_down`), so a
-                    // released program does not leak it.
+                    // the checker first (`CheckerPool::stop`), so a released
+                    // program does not leak it.
                     std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                 })
                 .expect("cannot start a checker thread");
@@ -3743,6 +3772,37 @@ fn for_each_checker_group_do(
     files: &[Node],
     cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
 ) -> Vec<Vec<Diagnostic>> {
+    start_checker_group_do(files, cb).wait()
+}
+
+/// `for_each_checker_group_do` whose jobs are sent and not waited for yet.
+// PORT: not in Go. A Go caller that does not wait runs the group on its
+// own goroutine. Here the loading thread sends the jobs and reads the
+// results later. Jobs for one checker run in the order they are sent, so
+// the results are the same as with an immediate wait.
+struct PendingCheckerGroup {
+    files: Arc<Vec<Node>>,
+    receivers: Vec<std::sync::mpsc::Receiver<JobResult<Vec<(usize, Vec<Diagnostic>)>>>>,
+}
+
+impl PendingCheckerGroup {
+    /// Waits for every checker and returns the results of `cb` by file
+    /// position (see `for_each_checker_group_do`).
+    fn wait(self) -> Vec<Vec<Diagnostic>> {
+        let mut diagnostics = vec![Vec::new(); self.files.len()];
+        for (i, result) in wait_jobs(self.receivers).into_iter().flatten() {
+            diagnostics[i] = result;
+        }
+        diagnostics
+    }
+}
+
+/// The first half of `for_each_checker_group_do`: sends one job to each
+/// checker of the current program and returns without waiting.
+fn start_checker_group_do(
+    files: &[Node],
+    cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
+) -> PendingCheckerGroup {
     let count = checker_count();
     let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
     let receivers = (0..count)
@@ -3763,11 +3823,7 @@ fn for_each_checker_group_do(
             })
         })
         .collect();
-    let mut diagnostics = vec![Vec::new(); files.len()];
-    for (i, result) in wait_jobs(receivers).into_iter().flatten() {
-        diagnostics[i] = result;
-    }
-    diagnostics
+    PendingCheckerGroup { files, receivers }
 }
 
 // ---------------------------------------------------------------------------
@@ -3893,15 +3949,44 @@ pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 pub fn get_semantic_diagnostics_without_no_emit_filtering(
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
-    let all_diags = collect_checker_diagnostics_from_files(
+    start_semantic_diagnostics_without_no_emit_filtering(source_files).wait()
+}
+
+/// A `get_semantic_diagnostics_without_no_emit_filtering` check that runs
+/// on the checker threads while the caller goes on.
+pub struct PendingSemanticDiagnostics(PendingCheckerGroup);
+
+impl PendingSemanticDiagnostics {
+    /// The files that are checked, in the order they were given.
+    #[must_use]
+    pub fn files(&self) -> &[Node] {
+        &self.0.files
+    }
+
+    /// Waits for the check. Same result as
+    /// `get_semantic_diagnostics_without_no_emit_filtering`.
+    #[must_use]
+    pub fn wait(self) -> FxHashMap<Node, Vec<Diagnostic>> {
+        let files = Arc::clone(&self.0.files);
+        files
+            .iter()
+            .zip(self.0.wait())
+            .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
+            .collect()
+    }
+}
+
+/// Sends the `get_semantic_diagnostics_without_no_emit_filtering` check of
+/// `source_files` to the checkers of the current program and returns
+/// without waiting (Go `collectCheckerDiagnosticsFromFiles` with
+/// `getBindAndCheckDiagnosticsForFile`).
+pub fn start_semantic_diagnostics_without_no_emit_filtering(
+    source_files: &[Node],
+) -> PendingSemanticDiagnostics {
+    PendingSemanticDiagnostics(start_checker_group_do(
         source_files,
         get_bind_and_check_diagnostics_with_checker,
-    );
-    source_files
-        .iter()
-        .zip(all_diags)
-        .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
-        .collect()
+    ))
 }
 
 // Go: compiler/program.go:667 GetSuggestionDiagnostics

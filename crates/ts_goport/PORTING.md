@@ -227,7 +227,16 @@ The batch that adds it is not accepted until Theo approves.
   deduplicated package) can be a program file of a later one, so the build
   host notes each parse that it keeps (`program::note_parsed_source_file`)
   and a publish gives it its complete `GoFile`. The publish asserts that
-  every program file is a source file.
+  every program file is a source file. The programs are made on one
+  thread, but each program's check starts on its own checker pool when
+  the program is made (`incremental::Program::start_check`), and a
+  released pool frees its checkers in the background
+  (`program::release_program_in_background`). So the pools of up to 4
+  started projects work at the same time, like Go's goroutines. The
+  started projects still emit one at a time in build order, and a
+  project's emit runs on its own checker threads only: the emit resolver
+  needs the file's checker, which lives on its worker thread, and
+  synthetic nodes are thread-local (`ast/synthetic.rs`).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->

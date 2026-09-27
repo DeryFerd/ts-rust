@@ -32,7 +32,10 @@ use std::time::SystemTime;
 // made the program (`build_project_start`) and the rest
 // (`build_project_finish`). The orchestrator starts a task after its
 // upstream tasks are done, finishes it later, and calls `report` in
-// `order` (see orchestrator.rs).
+// `order` (see orchestrator.rs). The work that Go does on the task
+// goroutines still runs at the same time: each program checks on its own
+// checker threads from `build_project_start` on (`start_check`), emits on
+// them, and frees them in the background (`release_task_program`).
 //
 // PORT: the watch-only `updateWatch` and `resetConfig` are in
 // orchestrator_watch.rs, with the orchestrator watch code.
@@ -121,13 +124,15 @@ impl TaskResult {
 }
 
 /// Go drops `t.result` after `report`, and with it the task's program.
-/// This frees the checker pool and the frontend of the program
-/// (`program::release_program`). Its files stay published, so the
-/// diagnostics in `t.errors` can still be written.
+/// This frees the checker pool and the frontend of the program. Its files
+/// stay published, so the diagnostics in `t.errors` can still be written.
+// PORT: Go frees the program in the background GC. The checker threads
+// free their checkers while the build goes on
+// (`program::release_program_in_background`).
 pub fn release_task_program(program: IncrementalProgram) {
     let go_program = program.get_program();
     drop(program);
-    crate::program::release_program(go_program);
+    crate::program::release_program_in_background(go_program);
 }
 
 // The parts of Go `*Orchestrator` (and its `host`) that a build task uses.
@@ -478,13 +483,20 @@ impl BuildTask {
         let changes_compute_start = sys.now();
         let incremental_program = {
             let _scope = crate::core::enter_program(Some(program));
-            new_incremental_program(
+            let incremental_program = new_incremental_program(
                 old_program.as_ref(),
                 host as Rc<dyn IncrementalHost>,
                 testing.is_some(),
-            )
+            );
+            compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
+            // PORT: Go checks this project on its goroutine while other
+            // tasks make their programs and emit. Here the check starts on
+            // this program's checker threads now, and the emit
+            // (`compile_and_emit_finish`) waits for it. The statistics'
+            // check time is the time of that wait.
+            incremental_program.start_check();
+            incremental_program
         };
-        compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
         self.compile = Some(PendingCompile {
             program,
             incremental_program,
@@ -536,6 +548,11 @@ impl BuildTask {
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
             emitted
         };
+        assert!(
+            incremental_program.start_check_used(),
+            "{}: the emit did not use the check that started with the program",
+            self.config
+        );
         let has_changed_dts_file = incremental_program.has_changed_dts_file();
         // Go appends to `t.errors` while `EmitAndReportStatistics` reports.
         self.errors.extend(errors.take());
