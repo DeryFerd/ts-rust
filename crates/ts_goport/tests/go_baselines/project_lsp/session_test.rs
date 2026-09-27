@@ -815,7 +815,6 @@ const SIBLING_INDEX: &str =
 
 child_test! {
     // Go: session_test.go:914 TestSession/DidChangeWatchedFiles/delete sibling folder schedules diagnostics refresh
-    #[ignore = "bug: S4-001 flaky: WaitForBackgroundTasks can return before the debounced RefreshDiagnostics runs"]
     fn did_change_watched_files_delete_sibling_folder_schedules_diagnostics_refresh() {
         let files = files(&[
             (
@@ -856,7 +855,6 @@ child_test! {
 
 child_test! {
     // Go: session_test.go:957 TestSession/DidChangeWatchedFiles/delete sibling folder schedules diagnostics refresh after opening third file
-    #[ignore = "bug: S4-001 flaky: WaitForBackgroundTasks can return before the debounced RefreshDiagnostics runs"]
     fn did_change_watched_files_delete_sibling_folder_schedules_diagnostics_refresh_after_opening_third_file() {
         let files = files(&[
             (

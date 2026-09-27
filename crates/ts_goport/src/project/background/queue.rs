@@ -2,8 +2,11 @@
 //!
 //! PORT: background tasks touch dispatch-thread state, so `wg.Go` posts the
 //! task to `gostd::local::go` (PORTING "Go runtime"). The dispatch loop runs
-//! it later, in enqueue order. `Wait` runs `gostd::local::run_pending` until
-//! this queue's tasks have finished. `mu` is dropped (one thread).
+//! it later, in enqueue order. A Go task that sleeps (`time.After`) goes on
+//! in a `gostd::local::after_func` timer; it takes a `TaskHold` so that it
+//! still counts as running until then. `Wait` runs
+//! `gostd::local::run_pending`, and waits for due timers, until this queue's
+//! tasks have finished. `mu` is dropped (one thread).
 
 use crate::project::background::prelude::*;
 use std::cell::Cell;
@@ -35,6 +38,14 @@ impl Drop for WaitGroupDone {
     }
 }
 
+/// PORT: the rest of a running task that goes on later on the dispatch
+/// thread (Go: the same goroutine after a sleep). A task takes it with
+/// `Queue::hold` and moves it into the timer function; the task counts as
+/// running until the hold is dropped.
+pub struct TaskHold {
+    _done: WaitGroupDone,
+}
+
 impl Queue {
     // Go: project/background/queue.go:20 Enqueue
     pub fn enqueue(&self, ctx: &Context, fn_: impl FnOnce(&Context) + 'static) {
@@ -61,15 +72,24 @@ impl Queue {
         }));
     }
 
+    /// PORT: called by a running task whose rest runs later (see
+    /// `TaskHold`). No Go counterpart: the Go task is one goroutine.
+    pub fn hold(&self) -> TaskHold {
+        self.wg.set(self.wg.get() + 1);
+        TaskHold {
+            _done: WaitGroupDone(self.wg.clone()),
+        }
+    }
+
     // Go: project/background/queue.go:42 Wait
     // Wait waits for all active tasks to complete.
     // It does not prevent new tasks from being enqueued while waiting.
     pub fn wait(&self) {
         while self.wg.get() > 0 {
-            // PORT: Go blocks forever when the tasks can never finish (for
-            // example, Wait called from inside one of them). The port panics
-            // instead of spinning.
-            if !gostd::local::has_pending() {
+            // PORT: a task that sleeps waits for its timer. Go blocks forever
+            // when the tasks can never finish (for example, Wait called from
+            // inside one of them). The port panics instead.
+            if !gostd::local::wait_pending() {
                 panic!(
                     "background.Queue.Wait: {} task(s) can not finish on the dispatch thread",
                     self.wg.get()
