@@ -5,7 +5,7 @@ use std::rc::Rc;
 use ts_goport::flags::ScriptTarget;
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
-use ts_goport::project::{FileContent, Kind};
+use ts_goport::project::Kind;
 
 use super::projecttestutil::{self, FileMap, files};
 use super::util::*;

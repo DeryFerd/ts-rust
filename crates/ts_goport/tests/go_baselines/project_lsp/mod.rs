@@ -34,6 +34,8 @@ macro_rules! child_test {
     };
 }
 
+pub(crate) mod autoimporttestutil;
+pub(crate) mod lsptestutil;
 pub(crate) mod projecttestutil;
 pub(crate) mod util;
 
@@ -41,6 +43,9 @@ mod ata_discovertypings_test;
 mod ata_installnpmpackages_test;
 mod ata_test;
 mod ata_validatepackagename_test;
+mod autoimport_index_test;
+mod autoimport_registry_test;
+mod autoimport_util_test;
 mod background_queue_test;
 mod bulkcache_test;
 mod configfilechanges_test;
@@ -49,6 +54,13 @@ mod dirty_syncmap_test;
 mod extendedconfigcache_test;
 mod logging_logtree_test;
 mod lsp_dynamic_queue_test;
+mod lsp_progress_test;
+mod lsp_server_completion_test;
+mod lsp_server_progress_test;
+mod lsp_server_projectinfo_test;
+mod lsp_server_projectreference_updates_test;
+mod lsp_server_semantictokens_test;
+mod lsp_server_shutdown_test;
 mod lsp_stack_sanitizer_test;
 mod overlayfs_test;
 mod project_test;

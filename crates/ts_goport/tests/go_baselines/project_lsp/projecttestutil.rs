@@ -662,3 +662,13 @@ pub fn wrapped_map_fs(files: FileMap, use_case_sensitive_file_names: bool) -> (M
     let fs = bundled::wrap_fs(map.fs());
     (map, fs)
 }
+
+/// The map file system of the last `setup` or `wrapped_map_fs` in this
+/// child process (Go keeps the `*vfstest.MapFS` from `FromMap`).
+pub fn current_map_fs_for_test() -> MapFs {
+    current_map_fs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("no map file system")
+}
