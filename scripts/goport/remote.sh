@@ -78,6 +78,8 @@ fetch() {
 cmd=$1 host=$2; shift 2
 case $cmd in sync-bins|sync-scripts|run|fetch) ;; *) die "unknown command $cmd" ;; esac
 [[ $cmd == sync-scripts || $# -ge 1 ]] || die "$cmd needs more arguments"
+# dbook is on the same LAN as zbook: always use the LAN alias, never the Tailscale name.
+[[ $host == dbook || $host == dbook-ts ]] && host=dbook-lan
 [[ $host == auto ]] && { host=$(pick) || exit 2; }
 if [[ $host == all ]]; then
   [[ $cmd == sync-* ]] || die "'all' only works with sync-bins and sync-scripts"
