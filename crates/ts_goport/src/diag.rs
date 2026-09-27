@@ -2,7 +2,7 @@
 //! Go `diagnostics.Name` messages. Use them as `diag::Name`.
 #![allow(non_upper_case_globals, clippy::unreadable_literal)]
 
-use ts_diagnostics::{CATALOG, Message};
+use ts_diagnostics::{CATALOG, Category, Message};
 
 pub static Unterminated_string_literal: &Message = &CATALOG[0];
 pub static Identifier_expected: &Message = &CATALOG[1];
@@ -2654,4 +2654,17 @@ pub static Fix_All: &Message = &CATALOG[2149];
 pub static Organize_Imports: &Message = &CATALOG[2150];
 pub static Remove_Unused_Imports: &Message = &CATALOG[2151];
 pub static Sort_Imports: &Message = &CATALOG[2152];
-pub static JSDoc_comment: &Message = &CATALOG[2153];
+
+// PORT: messages that Go at the pin has and `ts_diagnostics::CATALOG` (old pin) lacks.
+// `crates/ts_diagnostics` stays at the old pin because the protected `ts_compiler` crate
+// shares it (as `crates/ts_bundled/libs` does for the libs). Only the language service uses
+// these, so no code or key lookup (`message_by_code`, `message_by_key`) needs to find them.
+pub static JSDoc_comment: &Message = &Message::new(
+    100_019,
+    Category::Message,
+    "JSDoc_comment_100019",
+    "JSDoc comment",
+    false,
+    false,
+    false,
+);
