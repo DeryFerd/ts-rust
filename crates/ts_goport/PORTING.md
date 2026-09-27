@@ -308,15 +308,29 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   read-write in full when glibc makes it, so THP `always` maps it with
   2 MiB pages. Without it, glibc before 2.44 (cup2, alvin) grows the heaps
   in 4 KiB steps and every new page faults. On cup2 the settings cut
-  `tsgo` wall time by 26% to 42% (perf9 round 1). `arena_max` is 6 in
-  `goport` and 7 in `tsgo`: one arena for each thread that is alive while
-  the checkers run (tsgo also has a signal thread). `goport_build` runs
-  about 20 threads per program and uses 16. More arenas go to the parse
-  threads and raise query peak RSS. Keep query peak RSS under 1.15 times Go
-  tsgo: at 16 cores `goport` and `tsgo` have 133 MB against 119 MB (with 8
-  arenas 142 and 139 MB). jemalloc and mimalloc have the same speed as
-  these settings on cup2 but more RSS (jemalloc query 143 to 153 MB), so
-  the `jemalloc` feature stays off.
+  `tsgo` wall time by 26% to 42% (perf9 round 1). `arena_max` and the
+  parse and bind thread caps come from one budget (`program::ThreadBudget`),
+  which each binary installs at start. `goport` and `tsgo`
+  (`ThreadBudget::one_program`) have one arena for each thread that is
+  alive while the checkers run: 6 in `goport`, 7 in `tsgo` (its signal
+  thread). The parse mallocs most, so it runs at most 5 threads (4 workers
+  and the loading thread), which fit these arenas; with 8 parse threads at
+  16 cores the parse threads shared arena locks. A large program (128 or
+  more root tasks, `program::note_program_load`: hono, zod, effect,
+  elysia) adds up to 3 parse workers at 8 or more cores, and the budget
+  has one spare arena for each (9 in `goport`, 10 in `tsgo`). The bind
+  mallocs little: a large program binds on 8 threads, which share arenas.
+  A program that is not large (query) binds on 4 threads when there are
+  spare arenas, so its bind threads take the arenas of the ended parse
+  workers and it makes no more arenas than with 6 or 7 (query at 16
+  threads with 8 bind threads: 10 arenas, +4 MB). `goport_build` (about 20
+  threads per program) and bins that install no budget keep
+  `ThreadBudget::WIDE`: 8 parse and 8 bind threads, 16 arenas in
+  `goport_build`. Each arena in use raises peak RSS. Keep query peak RSS
+  under 1.15 times Go tsgo (119 MB, so 137 MB): at 16 cores `tsgo` has 129
+  to 132 MB (7 parse threads with 10 arenas: 143 MB). jemalloc and
+  mimalloc have the same speed as these settings on cup2 but more RSS
+  (jemalloc query 143 to 153 MB), so the `jemalloc` feature stays off.
 - PGO: `scripts/build-pgo.sh [out-dir]` does an instrumented build
   (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
   about 200 corpus cases (plus `tsgo --noEmit` on the five projects and
@@ -335,6 +349,21 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   The script checks that `llvm-profdata` is not newer than rustc's LLVM and
   stops on a mismatch. For another toolchain, use
   `rustup component add llvm-tools` or set `LLVM_PROFDATA`.
+- BOLT: `scripts/build-bolt.sh <bin-dir> [out-dir]` makes BOLT copies of
+  `tsgo` and `goport`, normally of the PGO bins. It runs on zbook (perf
+  LBR samples; perf cannot profile on cup2 or alvin): it records the five
+  projects at 4 cores and 16 threads, then runs `perf2bolt`, `merge-fdata`
+  and `llvm-bolt`. BOLT uses relocation mode (it also orders functions)
+  when the bin has `.rela.text`; the PGO use build links with
+  `--emit-relocs` for this. The script writes the BOLT bins only when their
+  stdout, stderr and exit code equal the input bins on every run. BOLT
+  rewrites machine code, so run the gate, the language-server batteries and
+  the `tsgo` stdout check against Go tsgo on the BOLT bins. `build-pgo.sh`
+  `PGO_LINK=nopie` or `static` links a non-PIE bin, like Go tsgo; BOLT
+  refuses static bins. Round 3 on cup2 (PGO with `PGO_LINK=nopie`, then
+  BOLT, against the plain `goport` build of the same source): query 15 to
+  20% faster, hono 13 to 20%, zod 13 to 18%, effect 21 to 24%. BOLT alone
+  (against the PGO bins) gave 0 to 9%.
 
 ## Style
 

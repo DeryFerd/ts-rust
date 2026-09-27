@@ -62,7 +62,10 @@ const STACK_SIZE: usize = 1 << 30;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    set_malloc_tunables();
+    // One budget sets the parse and bind threads and the malloc arenas.
+    let budget = ThreadBudget::one_program(0);
+    set_malloc_tunables(&budget);
+    budget.install();
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
@@ -114,11 +117,17 @@ fn main() {
 /// - `hugetlb=1` grows the heaps in huge page steps. Before glibc 2.44 it
 ///   works only in THP `madvise` mode, so the top pad is necessary for THP
 ///   `always`.
-/// - `arena_max=6` gives one arena to each thread that is alive while the
-///   checkers run: main, the worker and the 4 checkers. With fewer arenas,
-///   two checkers share one arena lock. More arenas go to the parse threads
-///   and raise peak RSS (query at 16 cores, with the top pad: 133 MB at 6,
-///   137 MB at 7, 142 MB at 8; tsgo 119 MB).
+/// - `arena_max` comes from `budget` (`ThreadBudget::one_program`), which
+///   also caps the parse and bind threads. Here it has one arena for each
+///   thread that is alive while the checkers run (main, the worker and the
+///   4 checkers: 6), plus one for each parse worker that a large program
+///   adds on these cores (3 at 8 or more cores: 9). With fewer arenas, two
+///   checkers share one arena lock. With more threads than arenas, parse
+///   threads share arena locks. Each arena in use raises peak RSS (query at
+///   16 cores with 8 parse threads, with the top pad: 133 MB at 6 arenas,
+///   137 MB at 7, 142 MB at 8; tsgo 119 MB), so a program that is not large
+///   binds on fewer threads when there are spare arenas, and makes no more
+///   arenas than with 6.
 /// - Setting `top_pad` turns off the dynamic mmap threshold of glibc. A
 ///   fixed `mmap_threshold=33554432` had mixed results on query, so it is
 ///   not set.
@@ -134,18 +143,16 @@ fn main() {
 /// the same binary again once with them set. It does nothing when the caller
 /// already set the variable, and the run continues without the settings when
 /// the exec fails.
-fn set_malloc_tunables() {
+fn set_malloc_tunables(budget: &ThreadBudget) {
+    // Unused off Linux and with jemalloc.
+    let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
         #[cfg(not(feature = "jemalloc"))]
-        const TUNABLES: (&str, &str) = (
-            "GLIBC_TUNABLES",
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6:glibc.malloc.top_pad=67108864",
-        );
+        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]
-        const TUNABLES: (&str, &str) = ("_RJEM_MALLOC_CONF", "narenas:4");
-        let (name, value) = TUNABLES;
+        let (name, value) = ("_RJEM_MALLOC_CONF", String::from("narenas:4"));
         if std::env::var_os(name).is_some() {
             return;
         }

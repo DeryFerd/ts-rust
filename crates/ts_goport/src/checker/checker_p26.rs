@@ -430,14 +430,22 @@ impl Checker {
     // PORT: Go package function `isTupleType` reads type data, so it is a
     // `Checker` method (see the PORT note in types.rs).
     // Go: checker/checker.go:23391 isTupleType
+    // PERF: most types with REFERENCE are `TypeReference` data (instances
+    // such as `T[]` and `[A, B]`), so the target is read from that variant
+    // directly. `Type::target` (a jump table over the object kinds) takes
+    // the rest: generic interface and tuple targets. The value is the same:
+    // TypeReference data always has `TypeFlags::OBJECT`.
     #[inline]
     pub fn is_tuple_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
-        ty.object_flags.intersects(ObjectFlags::REFERENCE)
-            && self
-                .ty(ty.target())
-                .object_flags
-                .intersects(ObjectFlags::TUPLE)
+        if !ty.object_flags.intersects(ObjectFlags::REFERENCE) {
+            return false;
+        }
+        let target = match &ty.data {
+            TypeData::TypeReference(r) => r.object.target,
+            _ => ty.target(),
+        };
+        self.ty(target).object_flags.intersects(ObjectFlags::TUPLE)
     }
 
     // Go: checker/checker.go:23395 isMutableTupleType

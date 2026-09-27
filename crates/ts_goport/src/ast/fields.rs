@@ -722,8 +722,20 @@ impl Node {
 
     // Go: ast/ast_generated.go:5585 TypeName
     /// Go `node.AsX().TypeName` for: TypeReferenceNode.
+    // PERF: C2 (a hand edit; keep it when this file is made again). A tier 0
+    // store TypeReference reads the child from the store column
+    // (`frozen_store_child`), as `Node::name` does. Other kinds take the
+    // data path, which panics like Go.
     #[must_use]
     pub fn type_name(self) -> Node {
+        if let Some(type_name) = frozen_store_child(self, StoreChild::TypeName) {
+            debug_assert!(
+                matches!(node_data(self), NodeData::TypeReferenceNode(d)
+                    if Node::new(self.file_index(), d.type_name) == type_name),
+                "C2 type name column"
+            );
+            return type_name;
+        }
         let file = self.file_index();
         match node_data(self) {
             NodeData::TypeReferenceNode(d) => Node::new(file, d.type_name),

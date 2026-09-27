@@ -55,7 +55,11 @@ const STACK_SIZE: usize = 1 << 30;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    set_malloc_tunables();
+    // A build keeps the wide budget (`ThreadBudget::WIDE`): parse and bind
+    // threads up to 8 and 16 malloc arenas.
+    let budget = ThreadBudget::WIDE;
+    set_malloc_tunables(&budget);
+    budget.install();
     let args: Vec<String> = ts_goport::frontend::vfs::os_args();
     install_panic_hook();
     let work = std::thread::Builder::new()
@@ -73,15 +77,15 @@ fn main() {
 
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
 /// values. A build runs about 20 threads per program, so `arena_max` is 16
-/// here. Build workers inherit the variable, so they do not exec again. The
-/// `jemalloc` build keeps the jemalloc defaults.
-fn set_malloc_tunables() {
+/// here (`ThreadBudget::WIDE`). Build workers inherit the variable, so they
+/// do not exec again. The `jemalloc` build keeps the jemalloc defaults.
+fn set_malloc_tunables(budget: &ThreadBudget) {
+    // Unused off Linux and with jemalloc.
+    let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
     {
         use std::os::unix::process::CommandExt;
         const NAME: &str = "GLIBC_TUNABLES";
-        const VALUE: &str =
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=16:glibc.malloc.top_pad=67108864";
         if std::env::var_os(NAME).is_some() {
             return;
         }
@@ -94,7 +98,7 @@ fn set_malloc_tunables() {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(NAME, VALUE).exec();
+        let _ = command.args(args).env(NAME, budget.glibc_tunables()).exec();
     }
 }
 
