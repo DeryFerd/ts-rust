@@ -20,6 +20,7 @@ and fetches the results. zbook builds. Each host keeps a mirror at zbook's absol
 - alvin, cup2: cloud hosts for gates, corpus suites, sweeps and oracle checks.
 - dbook (ssh host `dbook-lan`): LAN host with zbook's CPU (Ryzen AI Max+ 395, 32 threads) but
   only 26 GB RAM. It runs gates and checks, and quiet timing on zbook-class hardware when no gate
-- dbook is on the same LAN as zbook. Use the host name `dbook-lan` (dbook.local), never `dbook` (Tailscale); `remote.sh` maps `dbook` to `dbook-lan`.
   runs. Every dbook job takes the same lock on zbook, timing included, so the two never overlap:
   `flock /tmp/goport-remote-dbook.lock scripts/goport/remote.sh run dbook-lan <command>`.
+  dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
+  name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
