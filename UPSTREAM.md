@@ -47,3 +47,9 @@ mount namespace where the default oracle, Go checkout and caches show the pin's 
 
 The `tests/go_baselines` harness reads `TS_GO_REPO`; under `pin.py exec` its default path is
 the pin checkout.
+
+Some pin caches are inputs, not oracle outputs, because they come from the pin's Go tests or
+API: the API traces (`tests2/api/traces`, built by `scripts/goport/api_oracle.py build` under
+`GOPORT_PIN`; pins after `dc37b5249ab6` speak API protocol 2), the fourslash LS traces
+(`ls-oracle/fourslash`, recorded from the pin's fourslash tests) and the f1 sample case files
+(`record.py corpus`). Build them at each pin before its oracle recording.

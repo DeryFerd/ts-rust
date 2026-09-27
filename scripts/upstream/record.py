@@ -7,13 +7,14 @@ usage: record.py STEP KEY [--jobs N]
   projects  saved oracle outputs of the gate project checks: oracle/ (Query, Hono, zod, ts-pattern,
             rhf and their .files.txt), errcopies-oracle/, the project-inputs-extra and
             project-inputs-wide oracle files. Same cwd and flags as the recorded runs.
-  f1        continuation-r104-conformance-sample results/<id>.oracle.{out,err} (the gate f1 stage).
-            The case files stay the pinned sample; only the oracle outputs are new.
+  f1        continuation-r104-conformance-sample results/<id>.oracle.{out,err} (the gate f1 stage) on
+            the pin's case files (corpus step). Run it under pin.py exec, as rerecord.sh does.
   typesyms  builds typesymdump-go from the pin checkout (go build -overlay, the checkout is not
             changed) and dumps query, hono and effect into typesyms/go/<name>.
   corpus    corpus-full cases, list.json and shards from the pin checkout's test cases (a copy of
             prepare_full.py with the pin commits), and corpus-int3/shards/shard-0.json: the same
-            1,500-case sample, matched by source path.
+            1,500-case sample, matched by source path. Also the f1 sample case files and list.json
+            (a copy of the sample's prepare.py with the pin commits; same fixed 512-variant list).
 KEY is a pin key from UPSTREAM.json. For the current pin this writes a fresh copy under the pin
 root, so the output can be compared with the default caches.
 """
@@ -167,19 +168,25 @@ def step_typesyms(p, jobs):
     return run_all(1, [(f'typesyms/{n}', lambda n=n: one(n)) for n in TYPESYMS])
 
 
+def pinned_copy(src, dest, p, extra=()):
+    """Writes a copy of a prepare script with the pin's checkout and commits in place of the old pin's."""
+    text = src.read_text()
+    pinned = {"go = Path('/home/theo/.explore/repos/microsoft__typescript-go')": f"go = Path({str(p.checkout)!r})",
+              "GO_COMMIT = 'dc37b5249ab60e2bbce936f71b883e6c8136167e'": f"GO_COMMIT = {p.rec['commit']!r}",
+              "TS_COMMIT = 'c3bd12d888b86f676718b16e64d7d2abcb423514'": f"TS_COMMIT = {p.rec['typescriptSubmodule']!r}",
+              **dict(extra)}
+    for old, new in pinned.items():
+        if text.count(old) != 1:
+            sys.exit(f'{src.name} changed; cannot pin {old}')
+        text = text.replace(old, new)
+    dest.write_text(text)
+
+
 def step_corpus(p, jobs):
     full = p.at(R / 'corpus-full')
     if not (full / 'list.json').exists():
         full.mkdir(parents=True, exist_ok=True)
-        src = (R / 'corpus-full/prepare_full.py').read_text()
-        pinned = {"go = Path('/home/theo/.explore/repos/microsoft__typescript-go')": f"go = Path({str(p.checkout)!r})",
-                  "GO_COMMIT = 'dc37b5249ab60e2bbce936f71b883e6c8136167e'": f"GO_COMMIT = {p.rec['commit']!r}",
-                  "TS_COMMIT = 'c3bd12d888b86f676718b16e64d7d2abcb423514'": f"TS_COMMIT = {p.rec['typescriptSubmodule']!r}"}
-        for old, new in pinned.items():
-            if src.count(old) != 1:
-                sys.exit(f'prepare_full.py changed; cannot pin {old}')
-            src = src.replace(old, new)
-        (full / 'prepare_full.py').write_text(src)
+        pinned_copy(R / 'corpus-full/prepare_full.py', full / 'prepare_full.py', p)
         for d in (full / 'cases', full / 'shards'):  # pin.py exec makes empty cache dirs; prepare_full wants none
             if d.is_dir() and not any(d.iterdir()):
                 d.rmdir()
@@ -193,6 +200,15 @@ def step_corpus(p, jobs):
         shard.parent.mkdir(parents=True, exist_ok=True)
         shard.write_text(json.dumps({**old, 'count': len(keep), 'cases': keep}, indent=1))
         print(f'corpus-int3 shard-0: {len(keep)} of {len(old["cases"])} sampled cases still generated at {p.key}')
+    f1 = p.at(R104)
+    if not (f1 / 'list.json').exists():
+        f1.mkdir(parents=True, exist_ok=True)
+        # prepare.py writes cases/ and list.json next to `here`; pin.py exec may have made cases/ empty.
+        pinned_copy(R104 / 'prepare.py', f1 / 'prepare.py', p, {
+            "here = root / 'target/continuation-r104-conformance-sample'": f"here = Path({str(f1)!r})",
+            "cases_dir.mkdir()  # Fails if a previous generation exists.":
+                "cases_dir.mkdir(exist_ok=True)\nassert not any(cases_dir.iterdir()), cases_dir"})
+        subprocess.run([sys.executable, str(f1 / 'prepare.py')], check=True)
     return []
 
 

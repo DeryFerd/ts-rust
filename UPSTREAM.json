@@ -17,6 +17,8 @@
     "target/project-inputs-extra/*/variant/oracle.txt",
     "target/project-inputs-extra/*/variant-ts7/oracle.txt",
     "target/project-inputs-wide/*/oracle/",
+    "target/continuation-r104-conformance-sample/cases/",
+    "target/continuation-r104-conformance-sample/list.json",
     "target/continuation-r104-conformance-sample/results/",
     "target/continuation-r97-goport/typesyms/typesymdump-go",
     "target/continuation-r97-goport/typesyms/go/",
@@ -24,7 +26,9 @@
     "target/continuation-r97-goport/corpus-full/list.json",
     "target/continuation-r97-goport/corpus-full/shards/",
     "target/continuation-r97-goport/corpus-int3/shards/",
-    "/tmp/goport-emit-oracle/"
+    "/tmp/goport-emit-oracle/",
+    "target/continuation-r97-goport/tests2/api/traces/",
+    "target/continuation-r97-goport/ls-oracle/fourslash/"
   ],
   "pins": {
     "dc37b5249ab6": {

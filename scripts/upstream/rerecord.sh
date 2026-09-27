@@ -14,7 +14,8 @@
 #     sweep     host: oracle-sweep/, with the existing tools-port/sweep.sh and sweep-hono-runtime.sh
 #     emit      host: the emit oracle cache, with the existing emit/compare-emit.sh
 #     ls        host: LS goldens, with the existing lsp_oracle.py: record, then selfcheck --runs 2 twice
-#     api       host: API goldens, with the existing api_oracle.py: record, then selfcheck --runs 2
+#     api       host: API goldens, with scripts/goport/api_oracle.py: record, then selfcheck --runs 2. The pin's
+#               traces must exist (api_oracle.py build under GOPORT_PIN; a later pin speaks protocol 2)
 #     fetch     zbook: copy the pin root and the new golden dirs back from the host
 # Host steps run with nice 15 under GOPORT_PIN=<key>, so the existing recorders use the pin oracle and
 # write into the pin's dirs (pin.py exec). They take no host lock. The goport side of sweep and emit
@@ -26,7 +27,7 @@ set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
 R=$REPO/target/continuation-r97-goport
 PIN=$REPO/scripts/upstream/pin.py
-[[ $# -ge 1 && $1 != -* ]] || { sed -n '2,26p' "$0"; exit 2; }
+[[ $# -ge 1 && $1 != -* ]] || { sed -n '2,27p' "$0"; exit 2; }
 KEY=$(GOPORT_PIN=$1 python3 "$PIN" show | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])') || exit 2
 HOST=${2:-alvin}
 STEPS=${3:-prep,sync,projects,f1,sweep,emit,ls,api,fetch}
@@ -83,7 +84,8 @@ step_ls() {
   done
 }
 step_api() {
-  local py=(python3 "$R/tests2/api/tools/api_oracle.py") b
+  # scripts/goport/api_oracle.py speaks the pin's API protocol and reads the pin's traces (a pin cache).
+  local py=(python3 "$REPO/scripts/goport/api_oracle.py") b
   for b in $(batteries tests2/api); do
     "${py[@]}" record --battery "$b" --jobs "$JOBS" --oracle "$ORACLE" || echo "record $b exit $?"
     "${py[@]}" selfcheck --battery "$b" --jobs "$JOBS" --runs 2 --oracle "$ORACLE" || echo "selfcheck $b exit $?"
