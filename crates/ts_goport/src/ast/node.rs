@@ -540,6 +540,123 @@ macro_rules! question_arms {
     };
 }
 
+// C2: the arms of Go `Type()`, `Initializer()` and `TypeArgumentList()`,
+// shared by the accessors and the `typed` field of the store column
+// (`store_node_children`) in the same way as the U4 arms above. Every arm
+// is a plain field read.
+
+/// The arms of Go `Type()` (see above).
+// PORT: also covers JsDocVariadicType, whose Go `Type` field has no
+// generated accessor.
+macro_rules! type_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident, $req:ident) => {
+        $mac! {
+            $($pre)*
+            [JsDocParameterOrPropertyTag] => |f, d| $opt(f, d.type_expression),
+            [IndexSignatureDeclaration] => |f, d| $req(f, d.type_),
+            [
+                VariableDeclaration,
+                ParameterDeclaration,
+                PropertyDeclaration,
+                PropertyAssignment,
+                ShorthandPropertyAssignment,
+                TypePredicateNode,
+                MappedTypeNode,
+                ExportAssignment,
+                BinaryExpression,
+                ArrowFunction,
+                CallSignatureDeclaration,
+                ConstructSignatureDeclaration,
+                ConstructorDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                JsDocSignature,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                FunctionTypeNode,
+                ConstructorTypeNode,
+            ] => |f, d| $opt(f, d.type_),
+            [
+                PropertySignatureDeclaration,
+                ParenthesizedTypeNode,
+                TypeOperatorNode,
+                TypeAssertion,
+                AsExpression,
+                SatisfiesExpression,
+                TypeAliasDeclaration,
+                NamedTupleMember,
+                OptionalTypeNode,
+                RestTypeNode,
+                TemplateLiteralTypeSpan,
+                JsDocTypeExpression,
+                JsDocNullableType,
+                JsDocNonNullableType,
+                JsDocOptionalType,
+                JsDocVariadicType,
+            ] => |f, d| $req(f, d.type_),
+        }
+    };
+}
+
+/// The arms of Go `Initializer()` (see above).
+macro_rules! initializer_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident, $req:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                VariableDeclaration,
+                ParameterDeclaration,
+                BindingElement,
+                PropertyDeclaration,
+                EnumMember,
+                ForStatement,
+                JsxAttribute,
+            ] => |f, d| $opt(f, d.initializer),
+            [
+                PropertySignatureDeclaration,
+                PropertyAssignment,
+                ForInOrOfStatement,
+            ] => |f, d| $req(f, d.initializer),
+        }
+    };
+}
+
+/// The arms of Go `TypeArgumentList()` (see above). `$list` reads the
+/// optional list field.
+macro_rules! type_arguments_arms {
+    ($mac:ident!($($pre:tt)*), $list:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                CallExpression,
+                NewExpression,
+                TaggedTemplateExpression,
+                TypeReferenceNode,
+                ExpressionWithTypeArguments,
+                ImportTypeNode,
+                TypeQueryNode,
+                JsxOpeningElement,
+                JsxSelfClosingElement,
+            ] => |f, d| $list(f, &d.type_arguments),
+        }
+    };
+}
+
+/// `Node::initializer_data` and `Node::initializer_data_in`: Go
+/// `Initializer()` from the node data, over the `initializer_arms!` arms.
+macro_rules! initializer_data_accessor {
+    ($($arms:tt)*) => {
+        data_accessor! {
+            fn initializer_data, initializer_data_in(n) -> Node {
+                Node::NIL,
+                $($arms)*
+            }
+        }
+    };
+}
+
 /// One `match_data!` over the expression, postfix and own question arms for
 /// the `other` entry of `store_node_children`: `Some((tag, id))`, or `None`
 /// for unknown. The three field sets have disjoint variants, so one match
@@ -643,11 +760,13 @@ fn column_req_id(id: ts_ast::NodeId) -> u32 {
 
 /// U4 (CH6, bind A): the `SlotChildren` entry of a store node of kind `kind`
 /// with ts_ast node `node`, from the arm lists of `Node::name`,
-/// `Node::expression`, `Node::postfix_token` and `Node::question_token`.
-/// Store data always fits the header kind (`alloc_store_node`). A kind with
-/// a special arm (QualifiedName, CaseOrDefaultClause) gets an unknown field,
-/// whose reads take the node data.
-// PERF: called when the slot is made, while its data is hot (two data
+/// `Node::expression`, `Node::postfix_token` and `Node::question_token`,
+/// and (C2) of `Node::type_`, `Node::initializer`, `Node::type_name` and
+/// `Node::type_argument_list`. Store data always fits the header kind
+/// (`alloc_store_node`). A kind with a special arm (QualifiedName,
+/// CaseOrDefaultClause) gets an unknown field, whose reads take the node
+/// data.
+// PERF: called when the slot is made, while its data is hot (a few data
 // matches), so no pass over the node data is needed later.
 pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> SlotChildren {
     debug_assert!(
@@ -655,9 +774,10 @@ pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> Slot
         "{kind:?} does not fit its NodeData"
     );
     // PERF: about a third of the slots are identifiers, which have none of
-    // the fields. The early exit skips the two data matches.
+    // the fields. The early exit skips the data matches.
     if kind == SyntaxKind::Identifier {
-        let none = SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)));
+        let none = SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)))
+            .with_typed(Some((SlotChildren::TYPED_TYPE, 0)), true);
         debug_assert_eq!(none, store_node_children_from_data(&node.data));
         return none;
     }
@@ -666,12 +786,12 @@ pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> Slot
 
 /// `store_node_children` for node data `data`.
 fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
-    let name_opt = |_: usize, id: Option<ts_ast::NodeId>| Some(column_opt_id(id));
-    let name_req = |_: usize, id: ts_ast::NodeId| Some(column_req_id(id));
+    let id_opt = |_: usize, id: Option<ts_ast::NodeId>| Some(column_opt_id(id));
+    let id_req = |_: usize, id: ts_ast::NodeId| Some(column_req_id(id));
     let name = name_arms!(
         match_data!(0, data, Some(0), [QualifiedName] => |_f, _d| None,),
-        name_opt,
-        name_req
+        id_opt,
+        id_req
     );
     let tagged_opt =
         |tag: u32| move |_: usize, id: Option<ts_ast::NodeId>| Some((tag, column_opt_id(id)));
@@ -686,7 +806,31 @@ fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
         tagged_req(SlotChildren::TAG_QUESTION),
     );
     let other = other_column_match!(@expression data, expr_opt, expr_req, postfix, q_opt, q_req);
-    SlotChildren::new(name, other)
+    // C2: `None` for a kind without the field, `Some(0)` for nil. A kind can
+    // have both a type and an initializer, so each field has its own match.
+    // The column holds the one that is set; only a node where both are set
+    // keeps its initializer in the data (`TYPED_TYPE_WITH_INITIALIZER`).
+    let type_id = type_arms!(match_data!(0, data, None,), id_opt, id_req);
+    let initializer_id = initializer_arms!(match_data!(0, data, None,), id_opt, id_req);
+    let typed = match (type_id, initializer_id) {
+        (Some(ty), Some(init)) if ty != 0 && init != 0 => {
+            (SlotChildren::TYPED_TYPE_WITH_INITIALIZER, ty)
+        }
+        (Some(ty), _) if ty != 0 => (SlotChildren::TYPED_TYPE, ty),
+        (_, Some(init)) => (SlotChildren::TYPED_INITIALIZER, init),
+        (Some(_), None) => (SlotChildren::TYPED_TYPE, 0),
+        (None, None) => match data {
+            // Go `AsTypeReference().TypeName` (`Node::type_name`).
+            NodeData::TypeReferenceNode(d) => {
+                (SlotChildren::TYPED_TYPE_NAME, column_req_id(d.type_name))
+            }
+            _ => (SlotChildren::TYPED_TYPE, 0),
+        },
+    };
+    // Only a missing list gives `NodeList::NIL` itself.
+    let list_is_none = |_: usize, list: &Option<ts_ast::NodeList>| list.is_none();
+    let no_type_arguments = type_arguments_arms!(match_data!(0, data, true,), list_is_none);
+    SlotChildren::new(name, other).with_typed(Some(typed), no_type_arguments)
 }
 
 /// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants of
@@ -881,8 +1025,9 @@ fn text_range_of(r: &ts_core::TextRange) -> TextRange {
 
 /// Go `node.Text()` of Identifier or PrivateIdentifier `n`, whose data text
 /// is `text`.
-// PERF: U1 (d). A store node made by `alloc_store_name_node` has an empty
-// data text; its text is the name of its slot (`store_identifier_name`). A
+// PERF: U1 (d). A store node made by `alloc_store_name_node` or
+// `alloc_store_shared_name_node` (S1) has an empty data text; its text is
+// the name of its slot (`store_identifier_name`). A
 // data text that is not empty is the text: synthetic, cloned and legacy
 // nodes keep it, and a store slot whose data has one has that name.
 #[inline]
@@ -2279,23 +2424,24 @@ impl Node {
     }
 
     // Go: ast.go:483 TypeArgumentList
+    // PERF: C2. A tier 0 store node whose data has no list gives nil from
+    // the store column (`frozen_store_lacks_type_arguments`), without its
+    // node data. A node with a list reads it from the data.
     #[must_use]
     pub fn type_argument_list(self) -> NodeList {
-        by_data!(
-            self,
-            NodeList::NIL,
-            [
-                CallExpression,
-                NewExpression,
-                TaggedTemplateExpression,
-                TypeReferenceNode,
-                ExpressionWithTypeArguments,
-                ImportTypeNode,
-                TypeQueryNode,
-                JsxOpeningElement,
-                JsxSelfClosingElement,
-            ] => |f, d| opt_list(f, &d.type_arguments),
-        )
+        if frozen_store_lacks_type_arguments(self) {
+            debug_assert!(
+                matches!(self.type_argument_list_data().0, ListRef::Nil),
+                "C2 type arguments column"
+            );
+            return NodeList::NIL;
+        }
+        self.type_argument_list_data()
+    }
+
+    /// Go `TypeArgumentList()` from the node data (`type_arguments_arms!`).
+    fn type_argument_list_data(self) -> NodeList {
+        type_arguments_arms!(by_data!(self, NodeList::NIL,), opt_list)
     }
 
     // Go: ast.go:507 TypeArguments
@@ -2413,78 +2559,63 @@ impl Node {
     // Go: ast.go:617 Type
     // PORT: also covers JsDocVariadicType, whose Go `Type` field has no
     // generated accessor.
+    // PERF: C2. A tier 0 store node reads its type child from the store
+    // column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
     pub fn type_(self) -> Node {
-        by_data!(
-            self,
-            Node::NIL,
-            [JsDocParameterOrPropertyTag] => |f, d| opt(f, d.type_expression),
-            [IndexSignatureDeclaration] => |f, d| req(f, d.type_),
-            [
-                VariableDeclaration,
-                ParameterDeclaration,
-                PropertyDeclaration,
-                PropertyAssignment,
-                ShorthandPropertyAssignment,
-                TypePredicateNode,
-                MappedTypeNode,
-                ExportAssignment,
-                BinaryExpression,
-                ArrowFunction,
-                CallSignatureDeclaration,
-                ConstructSignatureDeclaration,
-                ConstructorDeclaration,
-                FunctionDeclaration,
-                FunctionExpression,
-                GetAccessorDeclaration,
-                SetAccessorDeclaration,
-                JsDocSignature,
-                MethodDeclaration,
-                MethodSignatureDeclaration,
-                FunctionTypeNode,
-                ConstructorTypeNode,
-            ] => |f, d| opt(f, d.type_),
-            [
-                PropertySignatureDeclaration,
-                ParenthesizedTypeNode,
-                TypeOperatorNode,
-                TypeAssertion,
-                AsExpression,
-                SatisfiesExpression,
-                TypeAliasDeclaration,
-                NamedTupleMember,
-                OptionalTypeNode,
-                RestTypeNode,
-                TemplateLiteralTypeSpan,
-                JsDocTypeExpression,
-                JsDocNullableType,
-                JsDocNonNullableType,
-                JsDocOptionalType,
-                JsDocVariadicType,
-            ] => |f, d| req(f, d.type_),
-        )
+        match frozen_store_child(self, StoreChild::Type) {
+            Some(type_) => {
+                debug_assert_eq!(type_, self.type_data(), "C2 type column");
+                type_
+            }
+            None => self.type_data(),
+        }
+    }
+
+    /// Go `Type()` from the node data (`type_arms!`).
+    fn type_data(self) -> Node {
+        type_arms!(by_data!(self, Node::NIL,), opt, req)
     }
 
     // Go: ast.go:739 Initializer
-    data_accessor! {
-        pub fn initializer, initializer_in(n) -> Node {
-            Node::NIL,
-            [
-                VariableDeclaration,
-                ParameterDeclaration,
-                BindingElement,
-                PropertyDeclaration,
-                EnumMember,
-                ForStatement,
-                JsxAttribute,
-            ] => |f, d| opt(f, d.initializer),
-            [
-                PropertySignatureDeclaration,
-                PropertyAssignment,
-                ForInOrOfStatement,
-            ] => |f, d| req(f, d.initializer),
+    // PERF: C2, as `Node::type_`. A node with both a type and an
+    // initializer keeps only the type in the column; its initializer reads
+    // take the node data.
+    #[must_use]
+    pub fn initializer(self) -> Node {
+        match frozen_store_child(self, StoreChild::Initializer) {
+            Some(initializer) => {
+                debug_assert_eq!(
+                    initializer,
+                    self.initializer_data(),
+                    "C2 initializer column"
+                );
+                initializer
+            }
+            None => self.initializer_data(),
         }
     }
+
+    /// `Node::initializer` on `d`, the data of this node that the caller
+    /// already loaded with `ast_data_of` (see `data_accessor!`).
+    #[must_use]
+    pub fn initializer_in(self, d: &'static NodeData) -> Node {
+        match frozen_store_child(self, StoreChild::Initializer) {
+            Some(initializer) => {
+                debug_assert_eq!(
+                    initializer,
+                    self.initializer_data_in(d),
+                    "C2 initializer column"
+                );
+                initializer
+            }
+            None => self.initializer_data_in(d),
+        }
+    }
+
+    // `initializer_data` and `initializer_data_in`: Go `Initializer()` from
+    // the node data.
+    initializer_arms!(initializer_data_accessor!(), opt, req);
 
     // Go: ast.go:793 TagName
     #[must_use]
@@ -2915,51 +3046,215 @@ impl Node {
     }
 }
 
-fn for_each_child_impl(
-    n: Node,
-    v: &mut dyn FnMut(Node) -> bool,
-    mut lists: Option<ListHook>,
+fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
+    let mut visit = NodeChildVisit {
+        n,
+        file: n.file_index(),
+        v,
+        lists,
+    };
+    walk_children(data(n), &mut visit)
+}
+
+/// R3-2: calls `v` with the slot index of each child id in the data of
+/// store node `node` (Go kind `kind`), in Go `ForEachChild` order, and
+/// stops when `v` returns true. It reads only the node data: no store and
+/// no node read. A nil single child field is skipped, as Go `visit` skips
+/// nil; list entries are all passed, so `v` sees slot 0 (nil) for a nil
+/// list entry. `v` must resolve each index in the store of `node`: a node
+/// slot is that node, and any other slot (nil, alias) is not.
+// PERF: R3-2. The parser sets the parents of the children of each node it
+// finishes (`set_parent_in_store_children`). The generic walk read the
+// data and every child through the node reads (`ast_node_of_slow`,
+// `Node::new_slow`), a store lookup each.
+pub(crate) fn for_each_store_child_id(
+    kind: SyntaxKind,
+    node: &'static ts_ast::Node,
+    v: impl FnMut(u32) -> bool,
 ) -> bool {
-    let f = n.file_index();
-    let mut report = |l: NodeList, is_mod: bool| {
-        if let Some(h) = lists.as_mut() {
+    walk_children(&node.data, &mut StoreChildIds { kind, v })
+}
+
+/// R3-2: the fields that one arm of `walk_children` visits, in Go
+/// `ForEachChild` order. Each method returns true to stop the walk. The
+/// generic walk (`NodeChildVisit`) turns the ids into `Node` handles; the
+/// parser's walk over a store node (`StoreChildIds`) keeps the slot
+/// indexes. One match serves both, so they visit the same fields.
+trait ChildVisit {
+    /// A required child field (Go `visit`).
+    fn node(&mut self, id: ts_ast::NodeId) -> bool;
+    /// An optional child field (Go `visit`).
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool;
+    /// A required list field (Go `visitNodeList`).
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool;
+    /// An optional list field (Go `visitNodeList`).
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool;
+    /// A modifier list field (Go `visitModifiers`).
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool;
+    /// A Go `[]*Node` field with no list (Go `visitNodes`).
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool;
+    /// Go `CaseOrDefaultClause.Expression` (see `case_expression`).
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool;
+    /// Go `MappedTypeNode.Members` (see `mapped_type_members`).
+    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool;
+}
+
+/// The generic walk of `for_each_child_impl`.
+// PERF: the methods are always inlined, so each arm of `walk_children`
+// compiles to the same code as the macros of the old single match.
+struct NodeChildVisit<'a, 'b> {
+    n: Node,
+    file: usize,
+    v: &'a mut dyn FnMut(Node) -> bool,
+    lists: Option<ListHook<'b>>,
+}
+
+impl NodeChildVisit<'_, '_> {
+    #[inline(always)]
+    fn report(&mut self, l: NodeList, is_mod: bool) {
+        if let Some(h) = self.lists.as_mut() {
             if l.is_some() {
                 h(l, is_mod);
             }
         }
-    };
+    }
+
+    #[inline(always)]
+    fn visit_list(&mut self, l: NodeList) -> bool {
+        self.report(l, false);
+        visit_node_list(self.v, l)
+    }
+}
+
+impl ChildVisit for NodeChildVisit<'_, '_> {
+    #[inline(always)]
+    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+        visit(self.v, req(self.file, id))
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+        visit(self.v, opt(self.file, id))
+    }
+
+    #[inline(always)]
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+        self.visit_list(list(self.file, l))
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+        self.visit_list(opt_list(self.file, l))
+    }
+
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+        let m = mods(self.file, m);
+        self.report(m.node_list(), true);
+        visit_modifiers(self.v, m)
+    }
+
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+        visit_nodes(self.v, NodeSlice::from_ids(self.file, ids))
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+        visit(self.v, case_expression(self.n, self.file, id))
+    }
+
+    #[inline(always)]
+    fn mapped_type_members(&mut self, _: &'static Option<ts_ast::NodeList>) -> bool {
+        self.visit_list(mapped_type_members(self.n))
+    }
+}
+
+/// R3-2: the walk of `for_each_store_child_id`. The ids are slot indexes of
+/// the store of the node. Slot 0 resolves to Go `nil`
+/// (`resolve_store_id`), so a single child field with id 0 is skipped.
+struct StoreChildIds<F> {
+    /// The Go kind of the node (`case_expression` reads it).
+    kind: SyntaxKind,
+    v: F,
+}
+
+impl<F: FnMut(u32) -> bool> ChildVisit for StoreChildIds<F> {
+    #[inline(always)]
+    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+        id.index() != 0 && (self.v)(id.index() as u32)
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+        id.is_some_and(|id| self.node(id))
+    }
+
+    // `NodeList::is_nil` of a store list: the nil marker list.
+    #[inline(always)]
+    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+        !is_nil_list_marker(l) && self.ids(&l.nodes)
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+        l.as_ref().is_some_and(|l| self.list(l))
+    }
+
+    // `ModifierList::is_nil` is only `None`.
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+        m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
+    }
+
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+        ids.iter().any(|id| (self.v)(id.index() as u32))
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+        self.kind == SyntaxKind::CaseClause && self.node(id)
+    }
+
+    // A store file keeps the Go list as parsed (`mapped_type_members`).
+    #[inline(always)]
+    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool {
+        self.opt_list(members)
+    }
+}
+
+/// The Go `ForEachChild` fields of node data `data`, in Go order, for `w`.
+// Go: ast_generated.go ForEachChild (one method per node struct)
+// PORT: the per-struct Go methods are merged into one match. The order of
+// each arm follows the generated Go code.
+fn walk_children(data: &'static NodeData, w: &mut impl ChildVisit) -> bool {
     macro_rules! n {
         ($x:expr) => {
-            visit(v, req(f, $x))
+            w.node($x)
         };
     }
     macro_rules! o {
         ($x:expr) => {
-            visit(v, opt(f, $x))
+            w.opt($x)
         };
     }
     macro_rules! l {
-        ($x:expr) => {{
-            let l = list(f, &$x);
-            report(l, false);
-            visit_node_list(v, l)
-        }};
+        ($x:expr) => {
+            w.list(&$x)
+        };
     }
     macro_rules! ol {
-        ($x:expr) => {{
-            let l = opt_list(f, &$x);
-            report(l, false);
-            visit_node_list(v, l)
-        }};
+        ($x:expr) => {
+            w.opt_list(&$x)
+        };
     }
     macro_rules! m {
-        ($x:expr) => {{
-            let m = mods(f, &$x);
-            report(m.node_list(), true);
-            visit_modifiers(v, m)
-        }};
+        ($x:expr) => {
+            w.mods(&$x)
+        };
     }
-    match data(n) {
+    match data {
         NodeData::QualifiedName(d) => n!(d.left) || n!(d.right),
         NodeData::ComputedPropertyName(d) => n!(d.expression),
         NodeData::Decorator(d) => n!(d.expression),
@@ -2980,9 +3275,7 @@ fn for_each_child_impl(
         NodeData::WithStatement(d) => n!(d.expression) || n!(d.statement),
         NodeData::SwitchStatement(d) => n!(d.expression) || n!(d.case_block),
         NodeData::CaseBlock(d) => l!(d.clauses),
-        NodeData::CaseOrDefaultClause(d) => {
-            visit(v, case_expression(n, f, d.expression)) || l!(d.statements)
-        }
+        NodeData::CaseOrDefaultClause(d) => w.case_expression(d.expression) || l!(d.statements),
         NodeData::ThrowStatement(d) => n!(d.expression),
         NodeData::TryStatement(d) => n!(d.try_block) || o!(d.catch_clause) || o!(d.finally_block),
         NodeData::CatchClause(d) => o!(d.variable_declaration) || n!(d.block),
@@ -3213,11 +3506,7 @@ fn for_each_child_impl(
                 || o!(d.name_type)
                 || o!(d.question_token)
                 || o!(d.type_)
-                || {
-                    let l = mapped_type_members(n);
-                    report(l, false);
-                    visit_node_list(v, l)
-                }
+                || w.mapped_type_members(&d.members)
         }
         NodeData::TypeLiteralNode(d) => l!(d.members),
         NodeData::TupleTypeNode(d) => l!(d.elements),
@@ -3251,7 +3540,7 @@ fn for_each_child_impl(
         NodeData::JsxSpreadAttribute(d) => n!(d.expression),
         NodeData::JsxClosingElement(d) => n!(d.tag_name),
         NodeData::JsxExpression(d) => o!(d.dot_dot_dot_token) || o!(d.expression),
-        NodeData::SyntaxList(d) => visit_nodes(v, NodeSlice::from_ids(f, &d.children)),
+        NodeData::SyntaxList(d) => w.ids(&d.children),
         NodeData::JsDoc(d) => l!(d.comment) || ol!(d.tags),
         NodeData::JsDocTypeExpression(d) => n!(d.type_),
         NodeData::JsDocNonNullableType(d) => n!(d.type_),
@@ -3323,7 +3612,7 @@ fn for_each_child_impl(
         }
         NodeData::SyntheticReferenceExpression(d) => n!(d.expression) || n!(d.this_arg),
         NodeData::JsDocTypeLiteral(d) => match &d.js_doc_property_tags {
-            Some(tags) => visit_nodes(v, NodeSlice::from_ids(f, tags)),
+            Some(tags) => w.ids(tags),
             None => false,
         },
         NodeData::SourceFile(d) => l!(d.statements) || n!(d.end_of_file_token),

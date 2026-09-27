@@ -5,7 +5,8 @@ use crate::ls::prelude::*;
 // PORT (whole file):
 // - Go `*checker.Checker` parameters are `&mut Checker`. The `ImportTracker`
 //   closure takes the checker as its first argument instead of capturing it
-//   (map-ls-navigation 2.3).
+//   (map-ls-navigation 2.3), and borrows the source file list and set for
+//   the lifetime `'a` of the search state.
 // - Go closures that share local state (`getImportersForExport`,
 //   `getSearchesFromDirectImports`, `getImportOrExportSymbol`) become a small
 //   local struct with methods, or nested functions with explicit parameters.
@@ -19,6 +20,7 @@ use crate::flags_macros::go_enum;
 use crate::frontend::compiler;
 use crate::frontend::tspath;
 use crate::gostd::Context;
+use std::rc::Weak;
 
 // Go: ls/importTracker.go:15 ImpExpKind
 go_enum!(ImpExpKind, i32 {
@@ -69,8 +71,10 @@ pub struct ImportsResult {
 
 // Go: ls/importTracker.go:55 ImportTracker
 // PORT: the checker is the first argument (Go captures it). Go returns
-// `*ImportsResult`; the result is returned by value.
-pub type ImportTracker = Rc<dyn Fn(&mut Checker, SymbolId, &ExportInfo, bool) -> ImportsResult>;
+// `*ImportsResult`; the result is returned by value. `'a` is the lifetime of
+// the source file list and set that the tracker borrows.
+pub type ImportTracker<'a> =
+    Rc<dyn Fn(&mut Checker, SymbolId, &ExportInfo, bool) -> ImportsResult + 'a>;
 
 // Go: ls/importTracker.go:57 ModuleReferenceKind
 go_enum!(ModuleReferenceKind, i32 {
@@ -92,19 +96,19 @@ pub struct ModuleReference {
 
 // Go: ls/importTracker.go:74 createImportTracker
 // Creates the imports map and returns an ImportTracker that uses it. Call this lazily to avoid calling `getDirectImportsMap` unnecessarily.
-// PORT: the returned closure owns copies of `sourceFiles` and
-// `sourceFilesSet` (Go captures the caller's slice and set, which do not
-// change during a search). It takes the checker as its first argument.
-pub fn create_import_tracker(
+// PORT: the returned closure borrows `sourceFiles` and `sourceFilesSet`
+// (Go captures the caller's slice and set, which do not change during a
+// search). It takes the checker as its first argument.
+// PERF: the map comes from `get_direct_imports_map_cached`, which reuses the
+// map of an earlier search with the same checker.
+pub fn create_import_tracker<'a>(
     ctx: &Context,
     program: &'static compiler::NewProgram,
-    source_files: &[Node],
-    source_files_set: &FxHashSet<String>,
+    source_files: &'a [Node],
+    source_files_set: &'a FxHashSet<String>,
     checker: &mut Checker,
-) -> ImportTracker {
-    let all_direct_imports = get_direct_imports_map(ctx, program, source_files, checker);
-    let source_files = source_files.to_vec();
-    let source_files_set = source_files_set.clone();
+) -> ImportTracker<'a> {
+    let all_direct_imports = get_direct_imports_map_cached(ctx, program, source_files, checker);
     Rc::new(
         move |checker: &mut Checker,
               export_symbol: SymbolId,
@@ -112,8 +116,8 @@ pub fn create_import_tracker(
               is_for_rename: bool|
               -> ImportsResult {
             let (direct_imports, indirect_users) = get_importers_for_export(
-                &source_files,
-                &source_files_set,
+                source_files,
+                source_files_set,
                 &all_direct_imports,
                 export_info,
                 checker,
@@ -159,6 +163,84 @@ pub fn get_direct_imports_map(
         );
     }
     result
+}
+
+/// A direct imports map that `get_direct_imports_map_cached` keeps for one
+/// checker of one program.
+struct CachedDirectImportsMap {
+    program: &'static compiler::NewProgram,
+    /// The checker's `identity_relation` (see `get_direct_imports_map_cached`).
+    checker: Weak<RefCell<crate::checker::Relation>>,
+    map: Rc<FxHashMap<SymbolId, Vec<Node>>>,
+}
+
+thread_local! {
+    // PORT: every language service request runs on the dispatch thread, and
+    // checkers are not shared between threads.
+    static DIRECT_IMPORTS_MAPS: RefCell<Vec<CachedDirectImportsMap>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// `get_direct_imports_map` for a search over all files of `program`, kept
+/// for the checker and reused by later searches with the same checker.
+// PERF: Go builds the map again for each `refState` that searches imports:
+// once per project in each references, rename and code lens request, and
+// once per queued node of an implementation search. On a monorepo with many
+// projects this is a large part of those requests. The map is the same for
+// each build with one checker and one file list: `getSymbolAtLocation` of a
+// module specifier (errors off) only reads the program's module resolutions
+// and the merged symbols and globals that the checker made at its start. It
+// makes no checker state. So a reused map gives the same answers.
+// Only the full file list of the program (`provideSymbolsAndEntries`) is
+// kept. Other lists (document highlights: one file) build their map as in
+// Go. A build that the context cancelled is not kept, and a search whose
+// context is already cancelled builds the map as in Go (empty).
+// `Checker::id` is the pool slot, so a new checker made after the idle
+// disposal has the same id. The checker is known by its `identity_relation`
+// Rc instead, which only `Checker::new` makes. The `Weak` keeps that address from being
+// used again, and its strong count is 0 after the checker is dropped. The
+// maps of dropped checkers are removed at the next call.
+fn get_direct_imports_map_cached(
+    ctx: &Context,
+    program: &'static compiler::NewProgram,
+    source_files: &[Node],
+    checker: &mut Checker,
+) -> Rc<FxHashMap<SymbolId, Vec<Node>>> {
+    let program_files = program.get_source_files();
+    let all_program_files = ctx.err().is_none()
+        && source_files.len() == program_files.len()
+        && source_files
+            .iter()
+            .zip(program_files)
+            .all(|(&file, parsed)| file == parsed.root);
+    if !all_program_files {
+        return Rc::new(get_direct_imports_map(ctx, program, source_files, checker));
+    }
+    let checker_key = Rc::as_ptr(&checker.identity_relation);
+    let cached = DIRECT_IMPORTS_MAPS.with(|maps| {
+        let mut maps = maps.borrow_mut();
+        maps.retain(|entry| entry.checker.strong_count() != 0);
+        maps.iter()
+            .find(|entry| {
+                std::ptr::eq(entry.program, program)
+                    && std::ptr::eq(entry.checker.as_ptr(), checker_key)
+            })
+            .map(|entry| Rc::clone(&entry.map))
+    });
+    if let Some(map) = cached {
+        return map;
+    }
+    let map = Rc::new(get_direct_imports_map(ctx, program, source_files, checker));
+    if ctx.err().is_none() {
+        DIRECT_IMPORTS_MAPS.with(|maps| {
+            maps.borrow_mut().push(CachedDirectImportsMap {
+                program,
+                checker: Rc::downgrade(&checker.identity_relation),
+                map: Rc::clone(&map),
+            });
+        });
+    }
+    map
 }
 
 // Go: ls/importTracker.go:100 forEachImport

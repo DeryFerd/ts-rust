@@ -391,7 +391,6 @@ child_test! {
 
 child_test! {
     // Go: project_test.go:453 TestPushDiagnostics/cleans tsconfig diagnostics after TS files close and restores them after TS file is reopened
-    #[ignore = "bug: S4-001 WaitForBackgroundTasks returns before the debounced snapshot update of DidCloseFile runs"]
     fn push_diagnostics_cleans_tsconfig_diagnostics_after_ts_files_close_and_restores_them_after_ts_file_is_reopened() {
         let (session, utils) = projecttestutil::setup(files(&[
             ("/src/tsconfig.json", BASE_URL_TSCONFIG),

@@ -359,20 +359,37 @@ pub fn get_root_declaration(mut node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:1161 getCombinedFlags
+// PERF: `get_root_declaration` is inlined here and each node kind is read
+// once (it was read in `get_root_declaration` and again for the
+// VariableDeclaration test, each read with the store bounds checks). The
+// walk and the `get_flags` calls are the same as Go. A nil node fails the
+// Go `node != nil` tests, so it returns early.
 fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
-    node: Node,
+    mut node: Node,
     get_flags: impl Fn(Node) -> T,
 ) -> T {
-    let mut node = get_root_declaration(node);
-    let mut flags = get_flags(node);
-    if node.kind() == SyntaxKind::VariableDeclaration {
-        node = node.parent();
+    let mut kind = node.kind();
+    while kind == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+        kind = node.kind();
     }
-    if node.is_some() && node.kind() == SyntaxKind::VariableDeclarationList {
+    let mut flags = get_flags(node);
+    if kind == SyntaxKind::VariableDeclaration {
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableDeclarationList {
         flags |= get_flags(node);
         node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
     }
-    if node.is_some() && node.kind() == SyntaxKind::VariableStatement {
+    if kind == SyntaxKind::VariableStatement {
         flags |= get_flags(node);
     }
     flags
@@ -599,14 +616,23 @@ pub fn is_void_zero(node: Node) -> bool {
         && node.expression().text() == "0"
 }
 
+/// `exports` and `module`, interned once for `is_exports_identifier` and
+/// `is_module_identifier`.
+static EXPORTS_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("exports"));
+static MODULE_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("module"));
+
 // Go: ast/utilities.go:1336 IsExportsIdentifier
+// PERF: compares name ids (`Node::text_is`), with no text load.
 pub fn is_exports_identifier(node: Node) -> bool {
-    is_identifier(node) && node.text() == "exports"
+    is_identifier(node) && node.text_is(&EXPORTS_NAME)
 }
 
 // Go: ast/utilities.go:1340 IsModuleIdentifier
+// PERF: compares name ids (`Node::text_is`), with no text load.
+// `is_module_exports_access_expression` calls this first, also for TS
+// files (`check_testing_known_truthy_types`).
 pub fn is_module_identifier(node: Node) -> bool {
-    is_identifier(node) && node.text() == "module"
+    is_identifier(node) && node.text_is(&MODULE_NAME)
 }
 
 /// `this`, interned once for `is_this_identifier`.
