@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remote measurement runners. zbook builds; alvin and cup2 run gates, corpus suites, sweeps and oracle checks.
+# Remote measurement runners. zbook builds; alvin, cup2 and dbook run gates, corpus suites, sweeps and oracle checks.
 # Each host keeps a mirror at the same absolute paths as zbook: this repo's tooling, target/project-inputs*,
 # the target/continuation-r97-goport runners, oracle caches and default binaries, ~/.local/bin/tsgo-oracle and
 # ~/.explore/repos/microsoft__typescript-go (see target/continuation-r97-goport/remote/*-manifest.txt).
@@ -8,12 +8,12 @@
 #        remote.sh sync-scripts <host>        copy repo scripts, tools, .git, runner scripts under target/, /tmp/port
 #        remote.sh run <host> <command...>    run a command in the repo root with a login shell; output streams
 #        remote.sh fetch <host> <dir>...      copy result dirs back to zbook; adds new files, never replaces one
-# <host> is alvin, cup2, "all" (sync-*: every host at the same time) or "auto" (first idle host).
-# Host order is alvin, then cup2 (REMOTE_HOSTS overrides it). Relative dirs are relative to the repo root.
+# <host> is alvin, cup2, dbook-lan, "all" (sync-*: every host at the same time) or "auto" (first idle host).
+# Host order is alvin, cup2, dbook-lan (REMOTE_HOSTS overrides it). Relative dirs are relative to the repo root.
 set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
 T=$REPO/target
-read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2}"
+read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2 dbook-lan}"
 RS=(rsync -aH --mkpath --compress --compress-choice=zstd --info=progress2)
 
 die() { echo "remote.sh: $*" >&2; exit 2; }
@@ -49,7 +49,7 @@ sync_scripts() {
       $r/{cli-complete,tsgo-bin}/audit-r3/*.{py,sh} worktrees/goport-{int7,ls}/scripts/goport project-inputs-extra/sweep-extra2.sh; do
     [[ -e $f ]] && echo "$f"
   done | "${RS[@]}" -r --exclude=__pycache__/ --files-from=- "$T/" "$h:$T/" || return
-  # compat/p5-corpus and typesyms/scale call /tmp/port/treehash.py. /tmp is tmpfs on both hosts.
+  # compat/p5-corpus and typesyms/scale call /tmp/port/treehash.py. /tmp is tmpfs on alvin and cup2.
   [[ ! -d /tmp/port ]] || "${RS[@]}" --include='*.py' --include='*.sh' --include=gate-allow.txt --exclude='*' /tmp/port/ "$h:/tmp/port/"
 }
 # A tty (when there is one) lets Ctrl-C stop the remote command too.
@@ -58,10 +58,11 @@ run() {
   printf -v cmd %q "$*"; [[ -t 0 && -t 1 ]] && t=(-t)
   # A host whose home layout differs from zbook (alvin: ~/Code links to ~/code) runs through its
   # ~/.local/bin/zbook-paths wrapper, a no-root mount namespace with zbook's paths and a private /tmp.
+  # dbook logs in as user dbook but has a real /home/theo dir, so HOME=/home/theo gives zbook's ~ paths.
   exec ssh "${t[@]}" -o ServerAliveInterval=60 "$h" "cd $REPO || exit 2
     if [ -x ~/.local/bin/zbook-paths ]; then exec ~/.local/bin/zbook-paths bash -lc \"cd $REPO && \"$cmd; fi
     [ \"\$(pwd -P)\" = $REPO ] || { echo \"$h: $REPO resolves to \$(pwd -P); outputs would not match zbook\" >&2; exit 2; }
-    exec bash -lc $cmd"
+    exec env HOME=/home/theo bash -lc $cmd"
 }
 fetch() {
   local h=$1 d; shift

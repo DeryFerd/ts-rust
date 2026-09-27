@@ -35,6 +35,7 @@ These rules apply to every goal, including `/goal` runs.
 - Use `scripts/run-cargo-capped.sh` for all Cargo work. It uses one target directory per worktree, `TS_CARGO_JOBS` jobs (16 on zbook, 1 elsewhere) and sccache when installed. Do not give agents their own `CARGO_TARGET_DIR`. Set `TS_CARGO_SEPARATE_TARGET=1` only for a deliberate fresh-target reproduction.
 
 Remote runners: zbook builds. The cloud hosts alvin and cup2 run gates, corpus suites, sweeps and oracle checks through `scripts/goport/remote.sh`. They keep a mirror at the same absolute paths as zbook. Copy the binaries and scripts to the host before a run, and fetch the results after it. For perf timing, measure all sides of one comparison on the same machine. The protected regression pipeline stays on zbook.
+dbook (`dbook-lan`) is a LAN host with zbook's CPU and 26 GB RAM. It runs gates, checks and quiet timing under `flock /tmp/goport-remote-dbook.lock`; see `scripts/goport/README.md`.
 
 ## Required checks
 
