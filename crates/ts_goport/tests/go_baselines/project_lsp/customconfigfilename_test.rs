@@ -113,7 +113,6 @@ child_test! {
 
 child_test! {
     // Go: customconfigfilename_test.go:126 TestCustomConfigFileName/schedules diagnostics refresh when custom config preference changes
-    #[ignore = "bug: S4-001 flaky: WaitForBackgroundTasks can return before the debounced RefreshDiagnostics runs"]
     fn schedules_diagnostics_refresh_when_custom_config_preference_changes() {
         let (session, utils) = projecttestutil::setup(config_files());
 
