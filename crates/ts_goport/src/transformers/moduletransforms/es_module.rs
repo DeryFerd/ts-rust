@@ -2,7 +2,11 @@
 //!
 //! PORT: Go `tx.Visitor()` is the root visitor built by `NewTransformer` with
 //! `EmitContext.NewNodeVisitor(tx.visit)`. Here `with_visitor` builds that
-//! visitor over the transformer on each use, as the declaration transform does.
+//! visitor over the transformer, as the declaration transform does. Its
+//! callback `visit_in` gets the running visitor, so the default arm and plain
+//! call expressions visit their children on it instead of building a new
+//! visitor for each node. The visitor has no state of its own, so this is the
+//! same as Go's one shared `tx.Visitor()`.
 
 use super::external_module_info::create_external_helpers_import_declaration_if_needed;
 use super::utilities::{
@@ -67,25 +71,8 @@ impl ESModuleTransformer {
         f: impl FnOnce(&mut NodeVisitor<'_, &mut ESModuleTransformer>) -> R,
     ) -> R {
         let emit_context = self.emit_context.clone();
-        let mut visitor = emit_context.new_node_visitor(
-            |node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>| v.ctx.visit(node),
-            self,
-        );
+        let mut visitor = emit_context.new_node_visitor(visit_in, self);
         f(&mut visitor)
-    }
-
-    // Go: transformers/moduletransforms/esmodule.go:35 ESModuleTransformer.visit
-    /// Visits source elements that are not top-level or top-level nested statements.
-    fn visit(&mut self, node: Node) -> Node {
-        match node.kind() {
-            SyntaxKind::SourceFile => self.visit_source_file(node),
-            SyntaxKind::ImportDeclaration => self.visit_import_declaration(node),
-            SyntaxKind::ImportEqualsDeclaration => self.visit_import_equals_declaration(node),
-            SyntaxKind::ExportAssignment => self.visit_export_assignment(node),
-            SyntaxKind::ExportDeclaration => self.visit_export_declaration(node),
-            SyntaxKind::CallExpression => self.visit_call_expression(node),
-            _ => self.with_visitor(|v| v.visit_each_child(node)),
-        }
     }
 
     // Go: transformers/moduletransforms/esmodule.go:55 ESModuleTransformer.visitSourceFile
@@ -328,21 +315,6 @@ impl ESModuleTransformer {
         single_or_many(Some(&[import_decl, export_decl]), f)
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:256 ESModuleTransformer.visitCallExpression
-    fn visit_call_expression(&mut self, node: Node) -> Node {
-        if self
-            .compiler_options
-            .rewrite_relative_import_extensions
-            .is_true()
-            && ((is_import_call(node) && !node.arguments().is_empty())
-                || (is_in_js_file(node)
-                    && is_require_call(node, false /*requireStringLiteralLikeArgument*/)))
-        {
-            return self.visit_import_or_require_call(node);
-        }
-        self.with_visitor(|v| v.visit_each_child(node))
-    }
-
     // Go: transformers/moduletransforms/esmodule.go:266 ESModuleTransformer.visitImportOrRequireCall
     fn visit_import_or_require_call(&mut self, node: Node) -> Node {
         let args = node.arguments().to_vec();
@@ -492,4 +464,36 @@ impl ESModuleTransformer {
             NodeFlags::NONE,
         )
     }
+}
+
+// Go: transformers/moduletransforms/esmodule.go:35 ESModuleTransformer.visit
+/// Visits source elements that are not top-level or top-level nested statements.
+/// This is the callback of the root visitor `v` (Go `tx.Visitor()`). `v.ctx` is `tx`.
+fn visit_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>) -> Node {
+    match node.kind() {
+        SyntaxKind::SourceFile => v.ctx.visit_source_file(node),
+        SyntaxKind::ImportDeclaration => v.ctx.visit_import_declaration(node),
+        SyntaxKind::ImportEqualsDeclaration => v.ctx.visit_import_equals_declaration(node),
+        SyntaxKind::ExportAssignment => v.ctx.visit_export_assignment(node),
+        SyntaxKind::ExportDeclaration => v.ctx.visit_export_declaration(node),
+        SyntaxKind::CallExpression => visit_call_expression_in(node, v),
+        _ => v.visit_each_child(node),
+    }
+}
+
+// Go: transformers/moduletransforms/esmodule.go:256 ESModuleTransformer.visitCallExpression
+/// Runs on the running root visitor `v` (`v.ctx` is `tx`), so a plain call
+/// visits its children without a new visitor.
+fn visit_call_expression_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>) -> Node {
+    if v.ctx
+        .compiler_options
+        .rewrite_relative_import_extensions
+        .is_true()
+        && ((is_import_call(node) && !node.arguments().is_empty())
+            || (is_in_js_file(node)
+                && is_require_call(node, false /*requireStringLiteralLikeArgument*/)))
+    {
+        return v.ctx.visit_import_or_require_call(node);
+    }
+    v.visit_each_child(node)
 }

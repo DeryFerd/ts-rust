@@ -7,9 +7,9 @@
 #
 # Steps:
 #   1. goport-profile build with -Cprofile-generate (instrumented).
-#   2. Training runs: goport and `tsgo --noEmit` on query, hono, zod, effect
-#      and elysia, goport on a spread of corpus cases, and goport_emit on
-#      query and hono.
+#   2. Training runs: goport and tsgo on query, hono, zod, effect and
+#      elysia in the timed form (see below), goport on a spread of corpus
+#      cases, and goport_emit on query and hono.
 #   3. Merge the .profraw files with llvm-profdata.
 #   4. goport-profile build with -Cprofile-use. The binaries (goport,
 #      goport_emit, goport_build, goport_typesyms, tsgo) land in
@@ -30,8 +30,8 @@
 #                     Retrain when the allocator or hot code changes.
 #
 # The training runs only read project inputs: goport does not write,
-# goport_emit writes to a temp --outDir and tsgo writes the .tsbuildinfo of
-# the composite projects to a temp file.
+# goport_emit writes to a temp --outDir and tsgo writes its .tsbuildinfo to
+# a temp file.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,6 +96,10 @@ build target-gen "-Cprofile-generate=$profiles"
 gen="$out/target-gen/goport"
 
 # 2. Training. Exit codes are ignored: some inputs have diagnostics on purpose.
+# The binaries re-exec with their built-in malloc string only when these are
+# unset (bin/goport.rs set_malloc_tunables). The timed runs have them unset,
+# so train the same way.
+unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
 P="$data_root/target/project-inputs"
 X="$data_root/target/project-inputs-extra"
 declare -A projects=(
@@ -112,11 +116,14 @@ for name in query hono zod effect elysia; do
 done
 emit_tmp="$(mktemp -d)"
 trap 'rm -rf "$emit_tmp"' EXIT
+# tsgo in the timed form: -p <cfg> --noEmit --pretty false --tsBuildInfoFile
+# <temp>. --pretty false keeps FORCE_COLOR in the caller's env from training
+# the pretty diagnostic path. Only incremental projects (hono, effect) use the
+# build info file.
 for name in query hono zod effect elysia; do
-  buildinfo=()
-  [[ $name == hono || $name == effect ]] && buildinfo=(--tsBuildInfoFile "$emit_tmp/$name.tsbuildinfo")
   s=$SECONDS
-  "$gen/tsgo" -p "${projects[$name]}" --noEmit "${buildinfo[@]}" > /dev/null 2>&1 || true
+  "$gen/tsgo" -p "${projects[$name]}" --noEmit --pretty false \
+    --tsBuildInfoFile "$emit_tmp/$name.tsbuildinfo" > /dev/null 2>&1 || true
   echo "train tsgo $name $((SECONDS - s))s"
 done
 for cfg in "${projects[query]}" "${projects[hono]}"; do

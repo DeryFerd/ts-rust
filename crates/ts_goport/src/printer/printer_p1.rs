@@ -6,6 +6,7 @@
 
 use crate::flags_macros::go_enum;
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::cell::{Cell, RefMut};
 
 // Go: printer/printer.go:35 PrinterOptions
@@ -130,6 +131,30 @@ pub struct Printer {
     // states. `PrinterState` holds the states by value, so no arena is kept.
     // PORT: a nil Go map is `None`.
     pub id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
+    // PERF: one-entry caches keyed by `current_source_file`. See
+    // `current_source_file_original` and `current_line_map`.
+    // `set_source_file` clears them.
+    pub(crate) current_original_cache: Cell<(Node, Node)>,
+    pub(crate) current_line_map_cache: Cell<(Node, &'static [i32])>,
+    pub(crate) skip_trivia_memo: SkipTriviaMemo,
+}
+
+/// One-entry memo of `skip_trivia(source_file_text(file), pos)`.
+// PERF: nested nodes often start at the same pos. The source map pos of each
+// node and the text of a leaf identifier skip the same trivia.
+#[derive(Default)]
+pub(crate) struct SkipTriviaMemo(Cell<(Node, i32, i32)>);
+
+impl SkipTriviaMemo {
+    pub(crate) fn skip_trivia(&self, file: Node, pos: i32) -> i32 {
+        let (memo_file, memo_pos, memo_result) = self.0.get();
+        if memo_file == file && memo_pos == pos && file.is_some() {
+            return memo_result;
+        }
+        let result = skip_trivia(source_file_text(file), pos);
+        self.0.set((file, pos, result));
+        result
+    }
 }
 
 // Go: printer/printer.go:146 detachedCommentsInfo
@@ -231,6 +256,9 @@ pub fn new_printer(
         name_generator: NameGenerator::default(),
         name_generator_source_file: Rc::new(Cell::new(Node::NIL)),
         id_to_symbol: None,
+        current_original_cache: Cell::default(),
+        current_line_map_cache: Cell::default(),
+        skip_trivia_memo: SkipTriviaMemo::default(),
     };
     printer.name_generator.context = Some(Rc::clone(&emit_context));
     // PORT: the Go closures capture the Printer. The Rust closures capture the
@@ -244,14 +272,16 @@ pub fn new_printer(
         let target = printer.options.target;
         printer.name_generator.get_text_of_node =
             Some(Rc::new(move |generator: &mut NameGenerator, node: Node| {
-                get_text_of_node_worker(
-                    generator,
-                    &emit_context,
-                    source_file.get(),
+                let current_source_file = source_file.get();
+                let skip_trivia_memo = SkipTriviaMemo::default();
+                let state = NodeTextState {
+                    emit_context: &emit_context,
+                    current_source_file,
+                    current_original: emit_context.most_original(current_source_file),
                     target,
-                    node,
-                    false,
-                )
+                    skip_trivia_memo: &skip_trivia_memo,
+                };
+                get_text_of_node_worker(generator, state, node, false).into_owned()
             }));
     }
     {
@@ -315,78 +345,162 @@ impl Printer {
         source_file: Node,
         flags: GetLiteralTextFlags,
     ) -> String {
-        let current_source_file = self.current_source_file;
-        let target = self.options.target;
-        let emit_context = Rc::clone(&self.emit_context);
-        get_literal_text_of_node_worker(
-            self.sync_name_generator(),
-            &emit_context,
-            current_source_file,
-            target,
-            node,
-            source_file,
-            flags,
-        )
+        self.get_literal_text_of_node_cow(node, source_file, flags)
+            .into_owned()
+    }
+
+    /// `get_literal_text_of_node` that borrows a source text slice or
+    /// `node.text()` in place of a new String.
+    // PERF: for the hot callers in this file.
+    pub(crate) fn get_literal_text_of_node_cow(
+        &mut self,
+        node: Node,
+        source_file: Node,
+        flags: GetLiteralTextFlags,
+    ) -> Cow<'static, str> {
+        let (state, generator) = self.node_text_parts();
+        get_literal_text_of_node_worker(generator, state, node, source_file, flags)
     }
 
     // Go: printer/printer.go:226 getTextOfNode
     // `node` must be one of Identifier | PrivateIdentifier | LiteralExpression | JsxNamespacedName
     pub(crate) fn get_text_of_node(&mut self, node: Node, include_trivia: bool) -> String {
-        let current_source_file = self.current_source_file;
-        let target = self.options.target;
-        let emit_context = Rc::clone(&self.emit_context);
-        get_text_of_node_worker(
-            self.sync_name_generator(),
-            &emit_context,
-            current_source_file,
-            target,
-            node,
-            include_trivia,
-        )
+        self.get_text_of_node_cow(node, include_trivia).into_owned()
     }
+
+    /// `get_text_of_node` that borrows a source text slice or `node.text()`
+    /// in place of a new String.
+    // PERF: for the hot callers in this file.
+    pub(crate) fn get_text_of_node_cow(
+        &mut self,
+        node: Node,
+        include_trivia: bool,
+    ) -> Cow<'static, str> {
+        let (state, generator) = self.node_text_parts();
+        get_text_of_node_worker(generator, state, node, include_trivia)
+    }
+
+    /// The state the text workers read, and the name generator synced to
+    /// the current source file (see `sync_name_generator`).
+    // PORT: split field borrows, so the emit context `Rc` is not cloned.
+    fn node_text_parts(&mut self) -> (NodeTextState<'_>, &mut NameGenerator) {
+        let current_original = self.current_source_file_original();
+        self.name_generator_source_file
+            .set(self.current_source_file);
+        let state = NodeTextState {
+            emit_context: &self.emit_context,
+            current_source_file: self.current_source_file,
+            current_original,
+            target: self.options.target,
+            skip_trivia_memo: &self.skip_trivia_memo,
+        };
+        (state, &mut self.name_generator)
+    }
+
+    /// `emit_context.most_original(current_source_file)`.
+    // PERF: cached for one file in `current_original_cache`.
+    pub(crate) fn current_source_file_original(&self) -> Node {
+        let file = self.current_source_file;
+        let (cached_file, cached_original) = self.current_original_cache.get();
+        if cached_file == file && file.is_some() {
+            return cached_original;
+        }
+        let original = self.emit_context.most_original(file);
+        self.current_original_cache.set((file, original));
+        original
+    }
+
+    /// Go `p.currentSourceFile.ECMALineMap()`.
+    // PERF: a transformed SourceFile is a synthetic node with the text of its
+    // most original parsed file. It reads the frozen line map of that file,
+    // as `set_source_map_source` does. `source_file_ecma_line_map` of the
+    // synthetic node would compute and leak a new map for each file. The
+    // result is cached for one file in `current_line_map_cache`.
+    pub(crate) fn current_line_map(&self) -> &'static [i32] {
+        let file = self.current_source_file;
+        let (cached_file, cached_line_map) = self.current_line_map_cache.get();
+        if cached_file == file && file.is_some() {
+            return cached_line_map;
+        }
+        let mut line_source = file;
+        if is_synthetic_node(file) {
+            let original = self.current_source_file_original();
+            if original.is_some() && !is_synthetic_node(original) && is_source_file(original) {
+                let text = source_file_text(file);
+                let original_text = source_file_text(original);
+                let same_text = std::ptr::eq(text, original_text) || text == original_text;
+                debug_assert!(
+                    same_text,
+                    "transformed SourceFile text differs from its original"
+                );
+                // Same line map only for the same text.
+                if same_text {
+                    line_source = original;
+                }
+            }
+        }
+        let line_map = source_file_ecma_line_map(line_source);
+        self.current_line_map_cache.set((file, line_map));
+        line_map
+    }
+}
+
+/// The Printer state that the text-of-node workers read.
+// PORT: Go reads `p.emitContext`, `p.currentSourceFile` and
+// `p.Options.Target`. The name generator callback has no Printer (see
+// `new_printer`), so the workers take this view.
+#[derive(Clone, Copy)]
+struct NodeTextState<'a> {
+    emit_context: &'a EmitContext,
+    current_source_file: Node,
+    /// `emit_context.most_original(current_source_file)`.
+    current_original: Node,
+    target: ScriptTarget,
+    skip_trivia_memo: &'a SkipTriviaMemo,
+}
+
+/// Go `emitContext.textSource[node]`, or nil.
+// PERF: no hash lookup while the map is empty.
+fn text_source_of(emit_context: &EmitContext, node: Node) -> Node {
+    let text_source = emit_context.text_source.borrow();
+    if text_source.is_empty() {
+        return Node::NIL;
+    }
+    text_source.get(&node).copied().unwrap_or(Node::NIL)
 }
 
 // Go: printer/printer.go:193 getLiteralTextOfNode
 // PORT: body of the Printer method as a free function over the Printer state
-// it reads (`p.emitContext`, `p.currentSourceFile`, `p.Options.Target`,
-// `p.nameGenerator`). The name generator callback runs it without the
-// Printer. See `new_printer`.
+// it reads (`NodeTextState` and `p.nameGenerator`). The name generator
+// callback runs it without the Printer. See `new_printer`.
+// PERF: returns a Cow, borrowed where the text is a source slice or
+// `node.text()`.
 fn get_literal_text_of_node_worker(
     generator: &mut NameGenerator,
-    emit_context: &EmitContext,
-    current_source_file: Node,
-    target: ScriptTarget,
+    state: NodeTextState<'_>,
     node: Node,
     source_file: Node,
     flags: GetLiteralTextFlags,
-) -> String {
+) -> Cow<'static, str> {
+    let emit_context = state.emit_context;
     let mut flags = flags;
     if is_string_literal(node) {
-        let text_source_node = emit_context.text_source.borrow().get(&node).copied();
-        if let Some(text_source_node) = text_source_node.filter(|n| n.is_some()) {
-            let text: String;
+        let text_source_node = text_source_of(emit_context, node);
+        if text_source_node.is_some() {
+            let text: Cow<'static, str>;
             match text_source_node.kind() {
                 SyntaxKind::NumericLiteral => {
-                    text = text_source_node.text().to_string();
+                    text = Cow::Borrowed(text_source_node.text());
                 }
                 SyntaxKind::Identifier
                 | SyntaxKind::PrivateIdentifier
                 | SyntaxKind::JsxNamespacedName => {
-                    text = get_text_of_node_worker(
-                        generator,
-                        emit_context,
-                        current_source_file,
-                        target,
-                        text_source_node,
-                        false,
-                    );
+                    text = get_text_of_node_worker(generator, state, text_source_node, false);
                 }
                 _ => {
                     return get_literal_text_of_node_worker(
                         generator,
-                        emit_context,
-                        current_source_file,
-                        target,
+                        state,
                         text_source_node,
                         get_source_file_of_node(text_source_node),
                         flags,
@@ -395,21 +509,24 @@ fn get_literal_text_of_node_worker(
             }
 
             if flags.intersects(GetLiteralTextFlags::JSX_ATTRIBUTE_ESCAPE) {
-                return format!(
+                return Cow::Owned(format!(
                     "\"{}\"",
                     escape_jsx_attribute_string(&text, QuoteChar::DOUBLE_QUOTE)
-                );
+                ));
             } else if flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE)
                 || emit_context
                     .emit_flags(node)
                     .intersects(EmitFlags::NO_ASCII_ESCAPING)
             {
-                return format!("\"{}\"", escape_string(&text, QuoteChar::DOUBLE_QUOTE));
+                return Cow::Owned(format!(
+                    "\"{}\"",
+                    escape_string(&text, QuoteChar::DOUBLE_QUOTE)
+                ));
             } else {
-                return format!(
+                return Cow::Owned(format!(
                     "\"{}\"",
                     escape_non_ascii_string(&text, QuoteChar::DOUBLE_QUOTE)
-                );
+                ));
             }
         }
     }
@@ -420,16 +537,16 @@ fn get_literal_text_of_node_worker(
     {
         flags |= GetLiteralTextFlags::NEVER_ASCII_ESCAPE;
     }
-    if target >= ScriptTarget::ES2021 {
+    if state.target >= ScriptTarget::ES2021 {
         flags |= GetLiteralTextFlags::ALLOW_NUMERIC_SEPARATOR;
     }
     // Go: core.Coalesce(sourceFile, p.currentSourceFile)
     let source_file = if source_file.is_some() {
         source_file
     } else {
-        current_source_file
+        state.current_source_file
     };
-    get_literal_text(node, source_file, flags)
+    get_literal_text_cow(node, source_file, flags, state.skip_trivia_memo)
 }
 
 // Go: printer/printer.go:226 getTextOfNode
@@ -437,44 +554,37 @@ fn get_literal_text_of_node_worker(
 // `get_literal_text_of_node_worker`.
 fn get_text_of_node_worker(
     generator: &mut NameGenerator,
-    emit_context: &EmitContext,
-    current_source_file: Node,
-    target: ScriptTarget,
+    state: NodeTextState<'_>,
     node: Node,
     include_trivia: bool,
-) -> String {
-    if is_member_name(node) && emit_context.auto_generate.borrow().contains_key(&node) {
-        return generator.generate_name(node);
-    }
-
-    if is_string_literal(node) {
-        let text_source_node = emit_context
-            .text_source
-            .borrow()
-            .get(&node)
-            .copied()
-            .unwrap_or(Node::NIL);
-        if text_source_node.is_some() {
-            return get_text_of_node_worker(
-                generator,
-                emit_context,
-                current_source_file,
-                target,
-                text_source_node,
-                include_trivia,
-            );
+) -> Cow<'static, str> {
+    let emit_context = state.emit_context;
+    if is_member_name(node) {
+        // PERF: no hash lookup while the map is empty.
+        let auto_generated = {
+            let auto_generate = emit_context.auto_generate.borrow();
+            !auto_generate.is_empty() && auto_generate.contains_key(&node)
+        };
+        if auto_generated {
+            return Cow::Owned(generator.generate_name(node));
         }
     }
 
+    if is_string_literal(node) {
+        let text_source_node = text_source_of(emit_context, node);
+        if text_source_node.is_some() {
+            return get_text_of_node_worker(generator, state, text_source_node, include_trivia);
+        }
+    }
+
+    let current_source_file = state.current_source_file;
     let can_use_source_file =
         current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
 
     match node.kind() {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-            if !can_use_source_file
-                || get_source_file_of_node(node) != emit_context.most_original(current_source_file)
-            {
-                return node.text().to_string();
+            if !can_use_source_file || get_source_file_of_node(node) != state.current_original {
+                return Cow::Borrowed(node.text());
             }
         }
         SyntaxKind::StringLiteral
@@ -486,9 +596,7 @@ fn get_text_of_node_worker(
         | SyntaxKind::TemplateTail => {
             return get_literal_text_of_node_worker(
                 generator,
-                emit_context,
-                current_source_file,
-                target,
+                state,
                 node,
                 Node::NIL, /*sourceFile*/
                 GetLiteralTextFlags::NONE,
@@ -496,7 +604,102 @@ fn get_text_of_node_worker(
         }
         kind => panic!("unexpected node: {:?}", kind),
     }
-    get_source_text_of_node_from_source_file(current_source_file, node, include_trivia)
+    source_text_of_node_cow(
+        current_source_file,
+        node,
+        include_trivia,
+        state.skip_trivia_memo,
+    )
+}
+
+/// Go `scanner.GetSourceTextOfNodeFromSourceFile` that borrows the source
+/// slice. The missing-node and reparser-literal cases use the String form.
+// PERF: no new String for the common case.
+fn source_text_of_node_cow(
+    source_file: Node,
+    node: Node,
+    include_trivia: bool,
+    skip_trivia_memo: &SkipTriviaMemo,
+) -> Cow<'static, str> {
+    if node_is_missing(node)
+        || node
+            .flags()
+            .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
+    {
+        return Cow::Owned(get_source_text_of_node_from_source_file(
+            source_file,
+            node,
+            include_trivia,
+        ));
+    }
+    let text = source_file_text(source_file);
+    let pos = if include_trivia {
+        node.pos()
+    } else {
+        skip_trivia_memo.skip_trivia(source_file, node.pos())
+    };
+    Cow::Borrowed(&text[pos as usize..node.end() as usize])
+}
+
+/// Go `getLiteralText` (printer/utilities.go) that borrows where the result
+/// is a source slice or `node.text()`. Other cases call `get_literal_text`.
+// PERF: no new String for the common literal cases.
+fn get_literal_text_cow(
+    node: Node,
+    source_file: Node,
+    flags: GetLiteralTextFlags,
+    skip_trivia_memo: &SkipTriviaMemo,
+) -> Cow<'static, str> {
+    let text = if source_file.is_some() && can_use_original_text(node, flags) {
+        source_text_of_node_cow(
+            source_file,
+            node,
+            false, /*includeTrivia*/
+            skip_trivia_memo,
+        )
+    } else if matches!(
+        node.kind(),
+        SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
+    ) {
+        Cow::Borrowed(node.text())
+    } else {
+        return Cow::Owned(get_literal_text(node, source_file, flags));
+    };
+    debug_assert_eq!(&*text, &*get_literal_text(node, source_file, flags));
+    text
+}
+
+// Go: printer/utilities.go:199 canUseOriginalText
+// PORT: a copy of the private `can_use_original_text` in utilities.rs, for
+// `get_literal_text_cow`. Keep the two the same. The debug_assert in
+// `get_literal_text_cow` checks the result against `get_literal_text`.
+fn can_use_original_text(node: Node, flags: GetLiteralTextFlags) -> bool {
+    // A synthetic node has no original text, nor does a node without a parent as we would be unable to find the
+    // containing SourceFile. We also cannot use the original text if the literal was unterminated and the caller has
+    // requested proper termination of unterminated literals
+    if node_is_synthesized(node)
+        || node.parent().is_nil()
+        || flags.intersects(GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS)
+            && is_unterminated_literal(node)
+    {
+        return false;
+    }
+
+    if node.kind() == SyntaxKind::NumericLiteral {
+        let token_flags = node.token_flags();
+        // For a numeric literal, we cannot use the original text if the original text was an invalid literal
+        if token_flags.intersects(TokenFlags::IS_INVALID) {
+            return false;
+        }
+        // We also cannot use the original text if the literal contains numeric separators, but numeric separators
+        // are not permitted
+        if token_flags.intersects(TokenFlags::CONTAINS_SEPARATOR) {
+            return flags.intersects(GetLiteralTextFlags::ALLOW_NUMERIC_SEPARATOR);
+        }
+    }
+
+    // Finally, we do not use the original text of a BigInt literal
+    node.kind() != SyntaxKind::BigIntLiteral
 }
 
 //
@@ -1018,7 +1221,7 @@ impl Printer {
         }
 
         let text = source_file_text(self.current_source_file);
-        let line_map = source_file_ecma_line_map(self.current_source_file);
+        let line_map = self.current_line_map();
         self.write_comment_range_worker(text, line_map, comment.kind, comment.text_range);
     }
 
@@ -1502,7 +1705,7 @@ impl Printer {
             flags |= GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS;
         }
 
-        let text = self.get_literal_text_of_node(node, Node::NIL /*sourceFile*/, flags);
+        let text = self.get_literal_text_of_node_cow(node, Node::NIL /*sourceFile*/, flags);
 
         // !!! Printer option to control source map emit, which causes us to use a different write method on the
         // emit text writer:
@@ -1608,7 +1811,7 @@ impl Printer {
                 || self.current_source_file.is_nil()
                 || source_file_file_name(f) == source_file_file_name(self.current_source_file)
         );
-        let text = self.get_text_of_node(node, false /*includeTrivia*/);
+        let text = self.get_text_of_node_cow(node, false /*includeTrivia*/);
 
         let symbol = self
             .id_to_symbol
@@ -1732,7 +1935,7 @@ impl Printer {
     // Go: printer/printer.go:1189 emitPrivateIdentifier
     pub(crate) fn emit_private_identifier(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let text = self.get_text_of_node(node, false /*includeTrivia*/);
+        let text = self.get_text_of_node_cow(node, false /*includeTrivia*/);
         self.write(&text);
         self.exit_node(node, state);
     }

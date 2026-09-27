@@ -387,6 +387,308 @@ macro_rules! store_node_modifier_bits_fn {
 
 modifiers_variants!(store_node_modifier_bits_fn! {});
 
+// U4 (CH6, bind A): the plain field arms of Go `Name()`, `Expression()`,
+// `PostfixToken()` and the own `QuestionToken` field. Each macro takes
+// `$mac!($($pre)*)` and calls `$mac! { $($pre)* arms }`: it appends its arms
+// to the tokens `$pre`, which end with a comma. The braces let the call
+// expand to items (in `impl Node`) as well as to an expression. Each arm
+// lists `NodeData` variants and reads the field with `$opt` (a field that
+// can be nil) or `$req` (a required field). The accessors and the store
+// column (`store_node_children`) both take the arms from here, so they
+// agree by construction. The special arms (QualifiedName,
+// CaseOrDefaultClause) stay with the accessors; the column marks those
+// kinds unknown.
+
+/// The plain arms of Go `Name()` (see above).
+macro_rules! name_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident, $req:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                BindingElement,
+                ClassDeclaration,
+                ClassExpression,
+                FunctionDeclaration,
+                FunctionExpression,
+                ImportClause,
+                JsDocCallbackTag,
+                JsDocLink,
+                JsDocLinkCode,
+                JsDocLinkPlain,
+                JsDocTypedefTag,
+            ] => |f, d| $opt(f, d.name),
+            [
+                EnumDeclaration,
+                EnumMember,
+                ExportSpecifier,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                ImportAttribute,
+                ImportEqualsDeclaration,
+                ImportSpecifier,
+                InterfaceDeclaration,
+                JsDocNameReference,
+                JsDocParameterOrPropertyTag,
+                JsxAttribute,
+                JsxNamespacedName,
+                MetaProperty,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                ModuleDeclaration,
+                NamedTupleMember,
+                NamespaceExport,
+                NamespaceExportDeclaration,
+                NamespaceImport,
+                ParameterDeclaration,
+                PropertyAccessExpression,
+                PropertyAssignment,
+                PropertyDeclaration,
+                PropertySignatureDeclaration,
+                ShorthandPropertyAssignment,
+                TypeAliasDeclaration,
+                TypeParameterDeclaration,
+                VariableDeclaration,
+            ] => |f, d| $req(f, d.name),
+        }
+    };
+}
+
+/// The plain arms of Go `Expression()` (see above).
+// PORT: also covers TypeParameterDeclaration and SyntheticReferenceExpression,
+// whose Go `Expression` fields have no generated accessor.
+macro_rules! expression_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident, $req:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                PropertyAccessExpression,
+                ElementAccessExpression,
+                ParenthesizedExpression,
+                CallExpression,
+                NewExpression,
+                ExpressionWithTypeArguments,
+                ComputedPropertyName,
+                NonNullExpression,
+                TypeAssertion,
+                AsExpression,
+                SatisfiesExpression,
+                TypeOfExpression,
+                SpreadAssignment,
+                SpreadElement,
+                TemplateSpan,
+                DeleteExpression,
+                VoidExpression,
+                AwaitExpression,
+                PartiallyEmittedExpression,
+                IfStatement,
+                DoStatement,
+                WhileStatement,
+                WithStatement,
+                ForInOrOfStatement,
+                SwitchStatement,
+                ExpressionStatement,
+                ThrowStatement,
+                ExternalModuleReference,
+                ExportAssignment,
+                Decorator,
+                JsxSpreadAttribute,
+                SyntheticReferenceExpression,
+            ] => |f, d| $req(f, d.expression),
+            [
+                YieldExpression,
+                ReturnStatement,
+                JsxExpression,
+                TypeParameterDeclaration,
+            ] => |f, d| $opt(f, d.expression),
+        }
+    };
+}
+
+/// The arms of Go `PostfixToken()` (see above).
+macro_rules! postfix_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                MethodDeclaration,
+                ShorthandPropertyAssignment,
+                MethodSignatureDeclaration,
+                PropertySignatureDeclaration,
+                PropertyAssignment,
+                PropertyDeclaration,
+                EnumMember,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+            ] => |f, d| $opt(f, d.postfix_token),
+        }
+    };
+}
+
+/// The arms of the node's own Go `QuestionToken` field, the first step of
+/// Go `QuestionToken()` (see above).
+macro_rules! question_arms {
+    ($mac:ident!($($pre:tt)*), $opt:ident, $req:ident) => {
+        $mac! {
+            $($pre)*
+            [
+                ParameterDeclaration,
+                MappedTypeNode,
+                NamedTupleMember,
+            ] => |f, d| $opt(f, d.question_token),
+            [ConditionalExpression] => |f, d| $req(f, d.question_token),
+        }
+    };
+}
+
+/// One `match_data!` over the expression, postfix and own question arms for
+/// the `other` entry of `store_node_children`: `Some((tag, id))`, or `None`
+/// for unknown. The three field sets have disjoint variants, so one match
+/// covers them (a variant in two sets would be an unreachable pattern). The
+/// `@` steps collect the arms of each list macro in turn.
+macro_rules! other_column_match {
+    (@expression $data:expr, $expr_opt:ident, $expr_req:ident, $postfix:ident, $q_opt:ident, $q_req:ident) => {
+        expression_arms!(
+            other_column_match!(@postfix $data, $postfix, $q_opt, $q_req,),
+            $expr_opt,
+            $expr_req
+        )
+    };
+    (@postfix $data:expr, $postfix:ident, $q_opt:ident, $q_req:ident, $($arms:tt)*) => {
+        postfix_arms!(other_column_match!(@question $data, $q_opt, $q_req, $($arms)*), $postfix)
+    };
+    (@question $data:expr, $q_opt:ident, $q_req:ident, $($arms:tt)*) => {
+        question_arms!(other_column_match!(@match $data, $($arms)*), $q_opt, $q_req)
+    };
+    (@match $data:expr, $($arms:tt)*) => {
+        match_data!(
+            0,
+            $data,
+            // A kind with none of the fields: every read gives nil.
+            Some((SlotChildren::TAG_EXPRESSION, 0)),
+            // The special arms of `Node::expression`.
+            [CaseOrDefaultClause, QualifiedName] => |_f, _d| None,
+            $($arms)*
+        )
+    };
+}
+
+/// `Node::name_data` and `Node::name_data_in`: Go `Name()` from the node
+/// data, over the `name_arms!` arms.
+macro_rules! name_data_accessor {
+    ($($arms:tt)*) => {
+        data_accessor! {
+            fn name_data, name_data_in(n) -> Node {
+                Node::NIL,
+                // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
+                [QualifiedName] => |f, d| if n.kind() == SyntaxKind::PropertyAccessExpression {
+                    req(f, d.right)
+                } else {
+                    Node::NIL
+                },
+                $($arms)*
+            }
+        }
+    };
+}
+
+/// `Node::postfix_token_data` and `Node::postfix_token_data_in`: Go
+/// `PostfixToken()` from the node data, over the `postfix_arms!` arms.
+macro_rules! postfix_token_data_accessor {
+    ($($arms:tt)*) => {
+        data_accessor! {
+            fn postfix_token_data, postfix_token_data_in(n) -> Node {
+                Node::NIL,
+                $($arms)*
+            }
+        }
+    };
+}
+
+/// `Node::own_question_token` and `Node::own_question_token_in` over the
+/// `question_arms!` arms: `Some` of the node's own question token field,
+/// `None` for kinds without that field (the first step of Go
+/// `QuestionToken`).
+macro_rules! own_question_token_accessor {
+    ($($arms:tt)*) => {
+        data_accessor! {
+            fn own_question_token, own_question_token_in(n) -> Option<Node> {
+                None,
+                $($arms)*
+            }
+        }
+    };
+}
+
+/// `Some(opt(file, id))`, for `own_question_token`.
+fn some_opt(file: usize, id: Option<ts_ast::NodeId>) -> Option<Node> {
+    Some(opt(file, id))
+}
+
+/// `Some(req(file, id))`, for `own_question_token`.
+fn some_req(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+    Some(req(file, id))
+}
+
+/// A `SlotChildren` id of an optional child field: 0 (the nil slot) for Go
+/// nil.
+fn column_opt_id(id: Option<ts_ast::NodeId>) -> u32 {
+    id.map_or(0, column_req_id)
+}
+
+/// A `SlotChildren` id of a required child field.
+fn column_req_id(id: ts_ast::NodeId) -> u32 {
+    // Child ids are `u32` slot indexes.
+    id.index() as u32
+}
+
+/// U4 (CH6, bind A): the `SlotChildren` entry of a store node of kind `kind`
+/// with ts_ast node `node`, from the arm lists of `Node::name`,
+/// `Node::expression`, `Node::postfix_token` and `Node::question_token`.
+/// Store data always fits the header kind (`alloc_store_node`). A kind with
+/// a special arm (QualifiedName, CaseOrDefaultClause) gets an unknown field,
+/// whose reads take the node data.
+// PERF: called when the slot is made, while its data is hot (two data
+// matches), so no pass over the node data is needed later.
+pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> SlotChildren {
+    debug_assert!(
+        node.data.matches_syntax_kind(kind),
+        "{kind:?} does not fit its NodeData"
+    );
+    // PERF: about a third of the slots are identifiers, which have none of
+    // the fields. The early exit skips the two data matches.
+    if kind == SyntaxKind::Identifier {
+        let none = SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)));
+        debug_assert_eq!(none, store_node_children_from_data(&node.data));
+        return none;
+    }
+    store_node_children_from_data(&node.data)
+}
+
+/// `store_node_children` for node data `data`.
+fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
+    let name_opt = |_: usize, id: Option<ts_ast::NodeId>| Some(column_opt_id(id));
+    let name_req = |_: usize, id: ts_ast::NodeId| Some(column_req_id(id));
+    let name = name_arms!(
+        match_data!(0, data, Some(0), [QualifiedName] => |_f, _d| None,),
+        name_opt,
+        name_req
+    );
+    let tagged_opt =
+        |tag: u32| move |_: usize, id: Option<ts_ast::NodeId>| Some((tag, column_opt_id(id)));
+    let tagged_req = |tag: u32| move |_: usize, id: ts_ast::NodeId| Some((tag, column_req_id(id)));
+    let (expr_opt, expr_req) = (
+        tagged_opt(SlotChildren::TAG_EXPRESSION),
+        tagged_req(SlotChildren::TAG_EXPRESSION),
+    );
+    let postfix = tagged_opt(SlotChildren::TAG_POSTFIX);
+    let (q_opt, q_req) = (
+        tagged_opt(SlotChildren::TAG_QUESTION),
+        tagged_req(SlotChildren::TAG_QUESTION),
+    );
+    let other = other_column_match!(@expression data, expr_opt, expr_req, postfix, q_opt, q_req);
+    SlotChildren::new(name, other)
+}
+
 /// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants of
 /// the Go node types that embed `LocalsContainerBase`. `is_locals_container`
 /// and the U1 (d) kind test of `Node::locals` both take the list from here,
@@ -434,6 +736,19 @@ macro_rules! data_is_variant {
         matches!($d, $(NodeData::$v(_))|+)
     };
 }
+
+/// U4 (CH7): every bit the binder adds to or removes from Go `node.Flags`
+/// (binder.go: `ExportContext`, `ContainsThis`, `ReachabilityAndEmitFlags`
+/// = `HasImplicitReturn | HasExplicitReturn | HasAsyncFunctions`,
+/// `Unreachable`, `ThisNodeOrAnySubNodesHasError`). `NodeBindData::
+/// added_flags` holds only these (checked in debug builds by
+/// `Node::added_flags`), so for a mask without them Go `node.Flags & mask`
+/// is the parser flags `& mask` (`Node::parser_flags`).
+pub const BINDER_ADDED_FLAGS: NodeFlags = NodeFlags::EXPORT_CONTEXT
+    .union(NodeFlags::CONTAINS_THIS)
+    .union(NodeFlags::REACHABILITY_AND_EMIT_FLAGS)
+    .union(NodeFlags::UNREACHABLE)
+    .union(NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR);
 
 /// Binder data for nodes of a file that is not bound yet.
 static NO_BIND: NodeBindData = NodeBindData {
@@ -1399,8 +1714,46 @@ impl Node {
     pub fn flags(self) -> NodeFlags {
         // Every tier 0 store file is published.
         match frozen_store_flags(self) {
-            Some(flags) => flags | self.bind().added_flags,
+            Some(flags) => flags | self.added_flags(),
             None => self.flags_slow(),
+        }
+    }
+
+    /// The flags the binder added to Go `node.Flags` (`NodeBindData`).
+    // U4 (CH7): debug builds check that they are binder bits
+    // (`BINDER_ADDED_FLAGS`), the rule that `Node::parser_flags` needs.
+    #[inline]
+    fn added_flags(self) -> NodeFlags {
+        let added = self.bind().added_flags;
+        debug_assert!(
+            BINDER_ADDED_FLAGS.contains(added),
+            "binder added {:#x}, outside BINDER_ADDED_FLAGS",
+            added.without(BINDER_ADDED_FLAGS).bits()
+        );
+        added
+    }
+
+    /// Go `node.Flags & mask` for a `mask` without a binder-added bit
+    /// (`BINDER_ADDED_FLAGS`). For such a mask the binder bits do not
+    /// matter, so a tier 0 store node reads only its header, not its binder
+    /// data.
+    // PERF: U4 (CH7). `Node::flags` loads the binder data of the file
+    // (`Node::bind`) for every test, also of a parser-only bit such as
+    // `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`.
+    #[inline]
+    #[must_use]
+    pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
+        debug_assert!(
+            !mask.intersects(BINDER_ADDED_FLAGS),
+            "parser_flags mask {:#x} has binder bits",
+            mask.bits()
+        );
+        match frozen_store_flags(self) {
+            Some(flags) => {
+                debug_assert_eq!(flags & mask, self.flags() & mask);
+                flags & mask
+            }
+            None => self.flags() & mask,
         }
     }
 
@@ -1419,11 +1772,11 @@ impl Node {
             // The parser reads flags before the file is published. A
             // published file has a GoFile and binder data.
             if is_published(self.file_index()) {
-                return h.flags | self.bind().added_flags;
+                return h.flags | self.added_flags();
             }
             return h.flags;
         }
-        self.go_file().parser_flags[nid(self).index()] | self.bind().added_flags
+        self.go_file().parser_flags[nid(self).index()] | self.added_flags()
     }
 
     /// Go `node.Parent`.
@@ -1520,62 +1873,35 @@ impl Node {
     }
 
     // Go: ast.go:198 Name
-    data_accessor! {
-        pub fn name, name_in(n) -> Node {
-            Node::NIL,
-            // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-            [QualifiedName] => |f, d| if n.kind() == SyntaxKind::PropertyAccessExpression {
-                req(f, d.right)
-            } else {
-                Node::NIL
-            },
-            [
-                BindingElement,
-                ClassDeclaration,
-                ClassExpression,
-                FunctionDeclaration,
-                FunctionExpression,
-                ImportClause,
-                JsDocCallbackTag,
-                JsDocLink,
-                JsDocLinkCode,
-                JsDocLinkPlain,
-                JsDocTypedefTag,
-            ] => |f, d| opt(f, d.name),
-            [
-                EnumDeclaration,
-                EnumMember,
-                ExportSpecifier,
-                GetAccessorDeclaration,
-                SetAccessorDeclaration,
-                ImportAttribute,
-                ImportEqualsDeclaration,
-                ImportSpecifier,
-                InterfaceDeclaration,
-                JsDocNameReference,
-                JsDocParameterOrPropertyTag,
-                JsxAttribute,
-                JsxNamespacedName,
-                MetaProperty,
-                MethodDeclaration,
-                MethodSignatureDeclaration,
-                ModuleDeclaration,
-                NamedTupleMember,
-                NamespaceExport,
-                NamespaceExportDeclaration,
-                NamespaceImport,
-                ParameterDeclaration,
-                PropertyAccessExpression,
-                PropertyAssignment,
-                PropertyDeclaration,
-                PropertySignatureDeclaration,
-                ShorthandPropertyAssignment,
-                TypeAliasDeclaration,
-                TypeParameterDeclaration,
-                VariableDeclaration,
-            ] => |f, d| req(f, d.name),
+    // PERF: U4 (CH6). A tier 0 store node reads its name child from the
+    // store column (`frozen_store_child`), not from its node data. Debug
+    // builds compare it with the data read.
+    #[must_use]
+    pub fn name(self) -> Node {
+        match frozen_store_child(self, StoreChild::Name) {
+            Some(name) => {
+                debug_assert_eq!(name, self.name_data(), "U4 name column");
+                name
+            }
+            None => self.name_data(),
         }
     }
+
+    /// `Node::name` on `d`, the data of this node that the caller already
+    /// loaded with `ast_data_of` (see `data_accessor!`).
+    #[must_use]
+    pub fn name_in(self, d: &'static NodeData) -> Node {
+        match frozen_store_child(self, StoreChild::Name) {
+            Some(name) => {
+                debug_assert_eq!(name, self.name_data_in(d), "U4 name column");
+                name
+            }
+            None => self.name_data_in(d),
+        }
+    }
+
+    // `name_data` and `name_data_in`: Go `Name()` from the node data.
+    name_arms!(name_data_accessor!(), opt, req);
 
     // Go: ast.go:199 Modifiers
     modifiers_variants!(modifiers_accessor! {});
@@ -1889,61 +2215,35 @@ impl Node {
     }
 
     // Go: ast.go:299 Expression
-    // PORT: also covers TypeParameterDeclaration and
-    // SyntheticReferenceExpression, whose Go `Expression` fields have no
-    // generated accessor.
+    // PERF: U4 (CH6). A tier 0 store node reads its expression child from
+    // the store column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
     pub fn expression(self) -> Node {
-        by_data!(
-            self,
-            Node::NIL,
-            [CaseOrDefaultClause] => |f, d| case_expression(self, f, d.expression),
-            // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-            [QualifiedName] => |f, d| if self.kind() == SyntaxKind::PropertyAccessExpression {
-                req(f, d.left)
-            } else {
-                Node::NIL
-            },
-            [
-                PropertyAccessExpression,
-                ElementAccessExpression,
-                ParenthesizedExpression,
-                CallExpression,
-                NewExpression,
-                ExpressionWithTypeArguments,
-                ComputedPropertyName,
-                NonNullExpression,
-                TypeAssertion,
-                AsExpression,
-                SatisfiesExpression,
-                TypeOfExpression,
-                SpreadAssignment,
-                SpreadElement,
-                TemplateSpan,
-                DeleteExpression,
-                VoidExpression,
-                AwaitExpression,
-                PartiallyEmittedExpression,
-                IfStatement,
-                DoStatement,
-                WhileStatement,
-                WithStatement,
-                ForInOrOfStatement,
-                SwitchStatement,
-                ExpressionStatement,
-                ThrowStatement,
-                ExternalModuleReference,
-                ExportAssignment,
-                Decorator,
-                JsxSpreadAttribute,
-                SyntheticReferenceExpression,
-            ] => |f, d| req(f, d.expression),
-            [
-                YieldExpression,
-                ReturnStatement,
-                JsxExpression,
-                TypeParameterDeclaration,
-            ] => |f, d| opt(f, d.expression),
+        match frozen_store_child(self, StoreChild::Expression) {
+            Some(expression) => {
+                debug_assert_eq!(expression, self.expression_data(), "U4 expression column");
+                expression
+            }
+            None => self.expression_data(),
+        }
+    }
+
+    /// Go `Expression()` from the node data (`expression_arms!`).
+    fn expression_data(self) -> Node {
+        expression_arms!(
+            by_data!(
+                self,
+                Node::NIL,
+                [CaseOrDefaultClause] => |f, d| case_expression(self, f, d.expression),
+                // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
+                [QualifiedName] => |f, d| if self.kind() == SyntaxKind::PropertyAccessExpression {
+                    req(f, d.left)
+                } else {
+                    Node::NIL
+                },
+            ),
+            opt,
+            req
         )
     }
 
@@ -2422,29 +2722,46 @@ impl Node {
     }
 
     // Go: ast.go:1056 PostfixToken
-    data_accessor! {
-        pub fn postfix_token, postfix_token_in(n) -> Node {
-            Node::NIL,
-            [
-                MethodDeclaration,
-                ShorthandPropertyAssignment,
-                MethodSignatureDeclaration,
-                PropertySignatureDeclaration,
-                PropertyAssignment,
-                PropertyDeclaration,
-                EnumMember,
-                GetAccessorDeclaration,
-                SetAccessorDeclaration,
-            ] => |f, d| opt(f, d.postfix_token),
+    // PERF: U4 (bind A). A tier 0 store node reads the token from the store
+    // column (`frozen_store_child`), as `Node::name` does.
+    #[must_use]
+    pub fn postfix_token(self) -> Node {
+        match frozen_store_child(self, StoreChild::PostfixToken) {
+            Some(token) => {
+                debug_assert_eq!(token, self.postfix_token_data(), "U4 postfix column");
+                token
+            }
+            None => self.postfix_token_data(),
         }
     }
 
+    /// `Node::postfix_token` on `d`, the data of this node that the caller
+    /// already loaded with `ast_data_of` (see `data_accessor!`).
+    #[must_use]
+    pub fn postfix_token_in(self, d: &'static NodeData) -> Node {
+        match frozen_store_child(self, StoreChild::PostfixToken) {
+            Some(token) => {
+                debug_assert_eq!(token, self.postfix_token_data_in(d), "U4 postfix column");
+                token
+            }
+            None => self.postfix_token_data_in(d),
+        }
+    }
+
+    // `postfix_token_data` and `postfix_token_data_in`: Go `PostfixToken()`
+    // from the node data.
+    postfix_arms!(postfix_token_data_accessor!(), opt);
+
     // Go: ast.go:1080 QuestionToken
+    // PERF: U4 (bind A), as `Node::postfix_token`.
     #[must_use]
     pub fn question_token(self) -> Node {
-        match self.own_question_token() {
-            Some(token) => token,
-            None => question_of_postfix(self.postfix_token()),
+        match frozen_store_child(self, StoreChild::QuestionToken) {
+            Some(token) => {
+                debug_assert_eq!(token, self.question_token_data(), "U4 question column");
+                token
+            }
+            None => self.question_token_data(),
         }
     }
 
@@ -2452,25 +2769,34 @@ impl Node {
     /// already loaded with `ast_data_of` (see `data_accessor!`).
     #[must_use]
     pub fn question_token_in(self, d: &'static NodeData) -> Node {
-        match self.own_question_token_in(d) {
-            Some(token) => token,
-            None => question_of_postfix(self.postfix_token_in(d)),
+        match frozen_store_child(self, StoreChild::QuestionToken) {
+            Some(token) => {
+                debug_assert_eq!(token, self.question_token_data_in(d), "U4 question column");
+                token
+            }
+            None => self.question_token_data_in(d),
         }
     }
 
-    data_accessor! {
-        /// The first step of Go `QuestionToken`: `Some` of the node's own
-        /// question token field, `None` for kinds without that field.
-        fn own_question_token, own_question_token_in(n) -> Option<Node> {
-            None,
-            [
-                ParameterDeclaration,
-                MappedTypeNode,
-                NamedTupleMember,
-            ] => |f, d| Some(opt(f, d.question_token)),
-            [ConditionalExpression] => |f, d| Some(req(f, d.question_token)),
+    /// Go `QuestionToken()` from the node data.
+    fn question_token_data(self) -> Node {
+        match self.own_question_token() {
+            Some(token) => token,
+            None => question_of_postfix(self.postfix_token_data()),
         }
     }
+
+    /// `question_token_data` on `d` (see `data_accessor!`).
+    fn question_token_data_in(self, d: &'static NodeData) -> Node {
+        match self.own_question_token_in(d) {
+            Some(token) => token,
+            None => question_of_postfix(self.postfix_token_data_in(d)),
+        }
+    }
+
+    // `own_question_token` and `own_question_token_in`: the first step of Go
+    // `QuestionToken`.
+    question_arms!(own_question_token_accessor!(), some_opt, some_req);
 
     // Go: ast.go:1098 QuestionDotToken
     #[must_use]
@@ -3892,7 +4218,7 @@ fn declaration_is_write_access(decl: Node) -> bool {
         return false;
     }
     // Consider anything in an ambient declaration to be a write access since it may be coming from JS.
-    if decl.flags().intersects(NodeFlags::AMBIENT) {
+    if !decl.parser_flags(NodeFlags::AMBIENT).is_empty() {
         return true;
     }
     match decl.kind() {
@@ -4129,9 +4455,10 @@ impl Node {
     // (`GOPORT_FRONTEND=go`) runs it through `program::resolve_lazy_js_doc`.
     // The legacy path has no hook, so a miss on a lazy file stops at
     // `unported!`.
+    // PERF: U4 (CH7). `HAS_JS_DOC` is a parser bit (`Node::parser_flags`).
     #[must_use]
     pub fn js_doc(self, file: Node) -> NodeSlice {
-        if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
+        if self.parser_flags(NodeFlags::HAS_JS_DOC).is_empty() {
             return NodeSlice::NIL;
         }
         let file = if file.is_nil() {
@@ -4172,7 +4499,7 @@ impl Node {
     /// JSDoc nodes that are already parsed and cached. It never parses.
     #[must_use]
     pub fn eager_js_doc(self, file: Node) -> NodeSlice {
-        if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
+        if self.parser_flags(NodeFlags::HAS_JS_DOC).is_empty() {
             return NodeSlice::NIL;
         }
         let file = if file.is_nil() {

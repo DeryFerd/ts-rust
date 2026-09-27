@@ -613,14 +613,34 @@ impl ActiveMapperCache {
         }
     }
 
+    /// Whether both maps are empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.plain.len() == 0 && self.aliased.is_empty()
+    }
+
     /// Empties `plain` and keeps its table for reuse.
+    ///
+    /// PERF: most calls find `plain` empty, so that test is inline and the
+    /// rest is out of line (`clear_plain_keys`). The test is exact:
+    /// `plain_keys` holds only keys of `plain`, so it is empty too.
+    #[inline]
+    pub fn clear_plain(&mut self, drop_sparse: bool) {
+        if self.plain.len() == 0 {
+            return;
+        }
+        self.clear_plain_keys(drop_sparse);
+    }
+
+    /// `clear_plain` for a `plain` with keys.
     ///
     /// PERF: a popped mapper often leaves a few keys in a large table. When
     /// every key is in `plain_keys`, only those keys are removed, instead of
     /// a reset of every slot. Else, with `drop_sparse`, a table of more than
     /// 256 keys that is less than 1/8 full is dropped, because a clear costs
     /// time in the table size, and any other table is cleared.
-    pub fn clear_plain(&mut self, drop_sparse: bool) {
+    #[inline(never)]
+    fn clear_plain_keys(&mut self, drop_sparse: bool) {
         let plain = &mut self.plain;
         if plain.len() == self.plain_keys.len() {
             for key in self.plain_keys.drain(..) {
@@ -1677,7 +1697,7 @@ impl Checker {
         let empty_generic_type = c.empty_generic_type;
         c.ty_mut(empty_generic_type)
             .as_object_type_mut()
-            .instantiations = Some(CacheKeyMap::default());
+            .instantiations = Some(InstantiationMap::default());
         c.any_function_type = c.new_anonymous_type(
             SymbolId::NIL, /*symbol*/
             SymbolTable::NIL,

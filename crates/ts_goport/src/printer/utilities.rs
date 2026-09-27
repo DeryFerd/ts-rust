@@ -97,7 +97,15 @@ fn escape_string_worker(
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < s.len() {
-        let (code, mut size, go_size) = decode_go_js_string_rune(&s[i..]);
+        // PORT: an ASCII byte is its own code with size 1. The Go string
+        // marker is not ASCII, so marked units still go through the decoder.
+        let (code, mut size, go_size) = if bytes[i] < 0x80 {
+            let fast = (u32::from(bytes[i]), 1, 1);
+            debug_assert_eq!(fast, decode_go_js_string_rune(&s[i..]));
+            fast
+        } else {
+            decode_go_js_string_rune(&s[i..])
+        };
         let invalid_byte = code == char::REPLACEMENT_CHARACTER as u32 && go_size == 1;
         let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
 
@@ -1352,7 +1360,7 @@ impl LineCharacterCache {
     // getLineAndCharacter returns the 0-based line number and UTF-16 code unit
     // offset from the start of that line for the given byte position.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
-        let line = compute_line_of_position(self.line_map, pos);
+        let line = self.line_of_position(pos);
         let line_start = self.line_map[line as usize];
         // When pos is beyond the source text (e.g., for error-recovery tokens like
         // missing closing braces), we can't slice past the text end. Compute the
@@ -1364,10 +1372,10 @@ impl LineCharacterCache {
         if self.has_cached && line == self.cached_line && end_pos >= self.cached_pos {
             // Incremental: only count UTF-16 code units from the last cached position.
             character = self.cached_char
-                + utf16_len(&self.text[self.cached_pos as usize..end_pos as usize]);
+                + ascii_or_utf16_len(&self.text[self.cached_pos as usize..end_pos as usize]);
         } else {
             // Full computation from line start.
-            character = utf16_len(&self.text[line_start as usize..end_pos as usize]);
+            character = ascii_or_utf16_len(&self.text[line_start as usize..end_pos as usize]);
         }
         let cached_char = character;
         character += pos - end_pos;
@@ -1376,5 +1384,38 @@ impl LineCharacterCache {
         self.cached_char = cached_char;
         self.has_cached = true;
         (line, character)
+    }
+
+    // PORT: Go calls ComputeLineOfPosition. Source map positions mostly stay
+    // on the cached line or move to the next one, so test those two lines
+    // before the binary search. Line starts strictly increase, so a line `l`
+    // with `line_map[l] <= pos < line_map[l + 1]` is the binary search result.
+    fn line_of_position(&self, pos: i32) -> i32 {
+        let map = self.line_map;
+        let holds = |l: usize| {
+            map.get(l).is_some_and(|&start| start <= pos)
+                && map.get(l + 1).is_none_or(|&next| pos < next)
+        };
+        let cached = self.cached_line as usize;
+        let line = if holds(cached) {
+            cached as i32
+        } else if holds(cached + 1) {
+            cached as i32 + 1
+        } else {
+            return compute_line_of_position(map, pos);
+        };
+        debug_assert_eq!(line, compute_line_of_position(map, pos));
+        line
+    }
+}
+
+// PORT: `utf16_len` with a word-at-a-time ASCII check first. Source map
+// slices are mostly ASCII, and for ASCII the result is the byte length. The Go
+// string marker is not ASCII, so marked text still goes to `utf16_len`.
+fn ascii_or_utf16_len(s: &str) -> i32 {
+    if s.is_ascii() {
+        s.len() as i32
+    } else {
+        utf16_len(s)
     }
 }

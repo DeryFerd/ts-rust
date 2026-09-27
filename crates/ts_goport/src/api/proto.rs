@@ -16,12 +16,12 @@
 use crate::api::prelude::*;
 
 use crate::frontend::json::{
-    JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal,
-    json_unmarshal_decode,
+    JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
 };
 use crate::frontend::json_ext::{
-    AnyValue, IsZero, LspAny, marshal_field, marshal_field_omitzero, marshal_opt_field,
-    unmarshal_struct_fields, write_object_end, write_object_start,
+    AnyValue, ErrorPos, IsZero, LspAny, SemanticError, go_type_name, marshal_field,
+    marshal_field_omitzero, marshal_opt_field, unmarshal_root, unmarshal_struct_fields,
+    wrap_method_error, write_object_end, write_object_start,
 };
 use crate::frontend::tspath;
 use crate::gostd::{GoError, errors, strconv};
@@ -139,8 +139,18 @@ pub struct SignatureID(pub u64);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeHandle(pub String);
 
+// `uint` handles use the v2 uint arshaler, `string` handles the string
+// arshaler. Unmarshal errors name the Go type (`api.SnapshotID`), not the
+// underlying one.
 macro_rules! handle_json {
-    ($($name:ident),*) => {$(
+    (@unmarshal uint, $self:ident, $dec:ident) => {{
+        $self.0 = json_ext::unmarshal_uint_as($dec, &go_type_name::<Self>())?;
+        Ok(())
+    }};
+    (@unmarshal string, $self:ident, $dec:ident) => {
+        json_ext::unmarshal_string_as($dec, &mut $self.0, &go_type_name::<Self>())
+    };
+    ($kind:ident: $($name:ident),*) => {$(
         impl MarshalerTo for $name {
             fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
                 self.0.marshal_json_to(enc)
@@ -149,7 +159,7 @@ macro_rules! handle_json {
 
         impl UnmarshalerFrom for $name {
             fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-                self.0.unmarshal_json_from(dec)
+                handle_json!(@unmarshal $kind, self, dec)
             }
         }
 
@@ -167,14 +177,8 @@ macro_rules! handle_json {
     )*};
 }
 
-handle_json!(
-    SnapshotID,
-    ProjectID,
-    SymbolID,
-    TypeID,
-    SignatureID,
-    NodeHandle
-);
+handle_json!(uint: SnapshotID, SymbolID, TypeID, SignatureID);
+handle_json!(string: ProjectID, NodeHandle);
 
 // Go: proto.go:36 ProjectHandle
 pub fn project_handle(p: &project::Project) -> ProjectID {
@@ -407,12 +411,15 @@ impl UnmarshalerFrom for DocumentIdentifier {
                 dec.read_token()?;
                 Ok(())
             }
-            _ => Err(JsonError {
-                message: format!(
+            // Go wraps the error of the method with the type (one token
+            // was read).
+            _ => Err(wrap_method_error::<Self>(SemanticError::method(
+                ErrorPos::After,
+                format!(
                     "DocumentIdentifier: expected string or object, got {}",
                     kind_string(tok.kind())
                 ),
-            }),
+            ))),
         }
     }
 }
@@ -2247,30 +2254,23 @@ pub fn unmarshal_payload(
 }
 
 // Go: proto.go:1061 unmarshallerFor
+// `unmarshal_root` is Go `json.Unmarshal` with the v2 error text.
 pub fn unmarshaller_for<T: UnmarshalerFrom + Default + AnyValue>(
     data: &[u8],
 ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
     let mut v = T::default();
-    if let Err(err) = json_unmarshal(data, &mut v, &[]) {
+    if let Err(err) = unmarshal_root(data, &mut v) {
         let err = errors::from_value(err);
         return Err(errors::errorf(
             format!(
-                "failed to unmarshal {}: {}",
-                go_pointer_type_name::<T>(),
+                "failed to unmarshal *{}: {}",
+                go_type_name::<T>(),
                 err.error()
             ),
             vec![err],
         ));
     }
     Ok(Some(Box::new(v)))
-}
-
-// Go `%T` of `(*T)(nil)` for a proto struct: `*api.Name`.
-// PORT: built from the Rust type name; every `T` here is an api struct.
-fn go_pointer_type_name<T>() -> String {
-    let name = std::any::type_name::<T>();
-    let short = name.rsplit("::").next().unwrap_or(name);
-    format!("*api.{short}")
 }
 
 // Go: proto.go:1069 noParams
@@ -2609,5 +2609,40 @@ impl MarshalerTo for CompilerOptionsJSON<'_> {
         marshal_opt_field(enc, first, "checkers", &o.checkers)?;
         write_object_end(enc);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unmarshal_error_tests {
+    use super::*;
+
+    fn err_text<T: UnmarshalerFrom + Default + AnyValue>(data: &str) -> String {
+        unmarshaller_for::<T>(data.as_bytes())
+            .expect_err("want an error")
+            .error()
+    }
+
+    // Expected texts come from the pinned Go API (tests2 S5-003 goldens and
+    // Go JSON v2); Go writes "cannot" or "unable to".
+    #[test]
+    fn decode_errors_match_go() {
+        assert_eq!(
+            err_text::<GetSymbolAtPositionParams>(
+                r#"{"snapshot":1,"project":"p","file":"a.ts","position":"x"}"#
+            ),
+            r#"failed to unmarshal *api.GetSymbolAtPositionParams: json: cannot unmarshal JSON string into Go uint32 within "/position""#
+        );
+        assert_eq!(
+            err_text::<ReleaseParams>(r#"{"snapshot":"x"}"#),
+            r#"failed to unmarshal *api.ReleaseParams: json: cannot unmarshal JSON string into Go api.SnapshotID within "/snapshot""#
+        );
+        assert_eq!(
+            err_text::<GetSymbolsAtPositionsParams>(r#"{"snapshot":1,"positions":[1,"x"]}"#),
+            r#"failed to unmarshal *api.GetSymbolsAtPositionsParams: json: cannot unmarshal JSON string into Go uint32 within "/positions/1""#
+        );
+        assert_eq!(
+            err_text::<GetSourceFileParams>(r#"{"snapshot":1,"file":5}"#),
+            r#"failed to unmarshal *api.GetSourceFileParams: json: cannot unmarshal into Go api.DocumentIdentifier within "/file": DocumentIdentifier: expected string or object, got number"#
+        );
     }
 }

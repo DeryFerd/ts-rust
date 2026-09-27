@@ -360,11 +360,19 @@ pub fn is_assignment_target(node: Node) -> bool {
 // Returns the BinaryExpression, PrefixUnaryExpression, PostfixUnaryExpression, or ForInOrOfStatement that references
 // the given node as an assignment target
 // Go: ast/utilities.go:184 GetAssignmentTarget
+// PERF: U4 (CH7). A step inside a tier 0 store reads the parent and its
+// kind with one store lookup (`frozen_store_parent_kind`).
 pub fn get_assignment_target(node: Node) -> Node {
     let mut node = node;
     loop {
-        let parent = node.parent();
-        match parent.kind() {
+        let (parent, parent_kind) = match frozen_store_parent_kind(node) {
+            Some(parent_and_kind) => parent_and_kind,
+            None => {
+                let parent = node.parent();
+                (parent, parent.kind())
+            }
+        };
+        match parent_kind {
             SyntaxKind::BinaryExpression => {
                 if is_assignment_operator(parent.operator_token().kind()) && parent.left() == node {
                     return parent;
@@ -562,17 +570,18 @@ pub fn is_signed_numeric_literal(node: Node) -> bool {
 
 // Determines if a node is part of an OptionalChain
 // Go: ast/utilities.go:344 IsOptionalChain
+// PERF: U4 (CH7). The kind test comes first (both tests are pure, so the
+// result is the same) and `OPTIONAL_CHAIN` is a parser bit
+// (`Node::parser_flags`), so most nodes load neither their flags nor their
+// binder data.
 pub fn is_optional_chain(node: Node) -> bool {
-    if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
-        match node.kind() {
-            SyntaxKind::PropertyAccessExpression
+    matches!(
+        node.kind(),
+        SyntaxKind::PropertyAccessExpression
             | SyntaxKind::ElementAccessExpression
             | SyntaxKind::CallExpression
-            | SyntaxKind::NonNullExpression => return true,
-            _ => {}
-        }
-    }
-    false
+            | SyntaxKind::NonNullExpression
+    ) && !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty()
 }
 
 // Go: ast/utilities.go:357 getQuestionDotToken

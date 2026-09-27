@@ -20,9 +20,13 @@
     dead_code
 )]
 mod astnav_api;
+mod compiler_runner;
+mod project_lsp;
 mod support;
 mod tsctests;
 mod tsoptions;
+mod units_emit;
+mod units_platform;
 
 /// Child process entry of the tsc runner. Returns at once unless the runner started it.
 #[test]

@@ -63,21 +63,24 @@ fn main() {
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
     install_panic_hook();
+    // The thread ends the process itself once `run_main` has written the
+    // output, so the exit does not wait for the thread stacks (1 GiB each)
+    // to unmap, the thread-local destructors or the join.
     let work = std::thread::Builder::new()
         .name("tsgo".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || run_main(start));
-    let code = if let Ok(Ok(code)) = work.map(std::thread::JoinHandle::join) {
-        code
-    } else {
-        eprintln!("tsgo: work thread failed");
-        EXIT_UNPORTED
-    };
-    std::process::exit(code);
+        .spawn(move || std::process::exit(run_main(start)));
+    // Reached only when the thread cannot start or `run_main` panics.
+    let _ = work.map(std::thread::JoinHandle::join);
+    eprintln!("tsgo: work thread failed");
+    std::process::exit(EXIT_UNPORTED);
 }
 
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
-/// values. Build workers inherit the variable, so they do not exec again.
+/// values. `arena_max` is 7 here because tsgo has one more thread alive
+/// while the checkers run (the `notify_context` signal thread). At 6, two
+/// checkers share one arena lock (zod: 3.9k voluntary context switches, 0.5k
+/// at 7). Build workers inherit the variable, so they do not exec again.
 fn set_malloc_tunables() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -85,7 +88,7 @@ fn set_malloc_tunables() {
         #[cfg(not(feature = "jemalloc"))]
         const TUNABLES: (&str, &str) = (
             "GLIBC_TUNABLES",
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6",
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=7:glibc.malloc.top_pad=67108864",
         );
         #[cfg(feature = "jemalloc")]
         const TUNABLES: (&str, &str) = ("_RJEM_MALLOC_CONF", "narenas:4");

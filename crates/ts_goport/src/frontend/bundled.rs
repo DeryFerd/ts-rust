@@ -73,9 +73,30 @@ struct WrappedFs {
     fs: Rc<dyn Fs>,
 }
 
+thread_local! {
+    /// `wrap_fs(osvfs_fs())` of this thread. The wrapper has no state, so
+    /// one value per thread is the same as a new one per call.
+    static WRAPPED_OS_FS: std::cell::OnceCell<Rc<dyn Fs>> = const { std::cell::OnceCell::new() };
+}
+
 // Go: embed.go:41 wrapFS
+// PERF: the wrapper of the OS file system is one value per thread, so
+// `is_wrapped_os_fs` can know it (see there).
 pub fn wrap_fs(fs: Rc<dyn Fs>) -> Rc<dyn Fs> {
+    if Rc::ptr_eq(&fs, &osvfs_fs()) {
+        return WRAPPED_OS_FS.with(|os| os.get_or_init(|| Rc::new(WrappedFs { fs })).clone());
+    }
     Rc::new(WrappedFs { fs })
+}
+
+/// True when `fs` is Go `sys.FS()` of this thread: `wrap_fs(osvfs_fs())`
+/// with no OS override installed. Then every thread reads the same bytes
+/// for a path (`bundled_text` for bundled paths, the OS file for others),
+/// so the loader can use the text that a parse worker read.
+// PORT: not in Go (the Go loader reads each file once, on its own task).
+pub fn is_wrapped_os_fs(fs: &Rc<dyn Fs>) -> bool {
+    !os_override_installed()
+        && WRAPPED_OS_FS.with(|os| os.get().is_some_and(|os| Rc::ptr_eq(os, fs)))
 }
 
 impl Fs for WrappedFs {

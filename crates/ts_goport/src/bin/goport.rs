@@ -88,36 +88,45 @@ fn main() {
     }
     // The loading thread keeps the frontend program and the checker pool, so
     // the whole run stays on it. The checkers run on their own threads.
+    // The thread ends the process itself once `run` has written the output,
+    // so the exit does not wait for the thread stacks (1 GiB each) to unmap,
+    // the thread-local destructors or the join.
     let worker = std::thread::Builder::new()
         .name("goport".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || run(&args, start));
-    let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
-        code
-    } else {
-        eprintln!("goport: worker thread failed");
-        EXIT_UNPORTED
-    };
-    std::process::exit(code);
+        .spawn(move || std::process::exit(run(&args, start)));
+    // Reached only when the thread cannot start or `run` panics.
+    let _ = worker.map(std::thread::JoinHandle::join);
+    eprintln!("goport: worker thread failed");
+    std::process::exit(EXIT_UNPORTED);
 }
 
 /// Sets the malloc tunables for this process.
 ///
 /// glibc malloc (the default):
-/// - `hugetlb=1` grows each heap in transparent huge page steps. By default
-///   the heaps grow in small steps, so the kernel maps 4 KiB pages and the
-///   first touch of each page faults (effect: 260k faults, 0.4 s system
-///   time; with huge pages 8k faults, 0.08 s).
-/// - `arena_max=6` caps the thread arenas. Every parse and bind thread would
-///   otherwise keep its own partly used huge pages, which raises peak RSS
-///   (query: 125 MB with no cap, 121 MB at 8, 117 MB at 6). At 5 or fewer
-///   the threads wait on arena locks.
+/// - `top_pad=67108864` (64 MiB) makes each thread heap read-write in full
+///   when glibc makes it (malloc.c `new_heap` adds `top_pad`, up to the
+///   64 MiB heap size). With THP `always` the kernel then maps the heaps with
+///   2 MiB pages, as it does for the Go 64 MiB heap arenas. Without it, glibc
+///   grows each heap by the bytes that it needs, and the first touch of each
+///   4 KiB page faults (cup2, glibc 2.41: query 24k faults, effect 245k; with
+///   the top pad 1k and 7k, and 27% to 38% less wall time).
+/// - `hugetlb=1` grows the heaps in huge page steps. Before glibc 2.44 it
+///   works only in THP `madvise` mode, so the top pad is necessary for THP
+///   `always`.
+/// - `arena_max=6` gives one arena to each thread that is alive while the
+///   checkers run: main, the worker and the 4 checkers. With fewer arenas,
+///   two checkers share one arena lock. More arenas go to the parse threads
+///   and raise peak RSS (query at 16 cores, with the top pad: 133 MB at 6,
+///   137 MB at 7, 142 MB at 8; tsgo 119 MB).
+/// - Setting `top_pad` turns off the dynamic mmap threshold of glibc. A
+///   fixed `mmap_threshold=33554432` had mixed results on query, so it is
+///   not set.
 ///
 /// jemalloc (feature `jemalloc`): `narenas:4` has the same speed as the
 /// default (4 arenas per CPU), with less RSS (query: 140 MB against 160 MB).
-/// Against glibc with the tunables above, jemalloc is about 10% faster on
-/// query, 5% on zod and effect and equal on hono, but query peak RSS is 15%
-/// more (140 MB against 123 MB, tsgo 122 MB). Only `thp:never` brings jemalloc
+/// On cup2 it has the same speed as glibc with the tunables above, but query
+/// peak RSS is 143 to 153 MB (tsgo 120 MB). Only `thp:never` brings jemalloc
 /// under tsgo on query (119 MB), and that makes it slower than glibc on all
 /// projects. So glibc stays the default.
 ///
@@ -132,7 +141,7 @@ fn set_malloc_tunables() {
         #[cfg(not(feature = "jemalloc"))]
         const TUNABLES: (&str, &str) = (
             "GLIBC_TUNABLES",
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6",
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6:glibc.malloc.top_pad=67108864",
         );
         #[cfg(feature = "jemalloc")]
         const TUNABLES: (&str, &str) = ("_RJEM_MALLOC_CONF", "narenas:4");

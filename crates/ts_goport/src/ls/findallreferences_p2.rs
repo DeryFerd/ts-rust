@@ -552,9 +552,12 @@ pub fn get_possible_symbol_reference_nodes(
 }
 
 // Go: ls/findallreferences.go:1538 getPossibleSymbolReferencePositions
-// PORT: Go indexes the text by byte. The search runs on the bytes
-// (`strings_index`), because `position + symbolNameLength + 1` can fall inside
-// a multi-byte character, where a `&str` slice would panic.
+// PORT: Go indexes the text by byte. The search runs on the bytes, because
+// `position + symbolNameLength + 1` can fall inside a multi-byte character,
+// where a `&str` slice would panic.
+// PERF: Go `strings.Index` is one `memmem::Finder`, built once per call. It
+// returns the same first index. A byte-by-byte compare cost 29% to 56% of
+// find-references time on large files such as lib.dom.d.ts.
 pub fn get_possible_symbol_reference_positions(
     source_file: Node,
     symbol_name: &str,
@@ -574,6 +577,8 @@ pub fn get_possible_symbol_reference_positions(
     let source_length = text.len() as i32;
     let symbol_name = symbol_name.as_bytes();
     let symbol_name_length = symbol_name.len() as i32;
+    // Go `strings.Index(s, symbolName)` is `finder.find(s)`; -1 is `None`.
+    let finder = memchr::memmem::Finder::new(symbol_name);
 
     let container = if container.is_nil() {
         source_file
@@ -583,7 +588,9 @@ pub fn get_possible_symbol_reference_positions(
 
     // PORT: as in Go, the first index is relative to `container.Pos()` and is
     // compared with the absolute `container.End()`.
-    let mut position = strings_index(&text[container.pos() as usize..], symbol_name);
+    let mut position = finder
+        .find(&text[container.pos() as usize..])
+        .map_or(-1, |index| index as i32);
     let end_pos = container.end();
     while position >= 0 && position < end_pos {
         // We found a match.  Make sure it's not part of a larger word (i.e. the char
@@ -603,7 +610,9 @@ pub fn get_possible_symbol_reference_positions(
         if start_index > source_length {
             break;
         }
-        let found_index = strings_index(&text[start_index as usize..], symbol_name);
+        let found_index = finder
+            .find(&text[start_index as usize..])
+            .map_or(-1, |index| index as i32);
         if found_index != -1 {
             position = start_index + found_index;
         } else {
@@ -612,17 +621,6 @@ pub fn get_possible_symbol_reference_positions(
     }
 
     positions
-}
-
-/// Go `strings.Index(s, substr)` over bytes: the first index of `substr` in
-/// `s`, or -1.
-fn strings_index(s: &[u8], substr: &[u8]) -> i32 {
-    if substr.is_empty() {
-        return 0;
-    }
-    s.windows(substr.len())
-        .position(|window| window == substr)
-        .map_or(-1, |index| index as i32)
 }
 
 // Go: ls/findallreferences.go:1584 findFirstJsxNode

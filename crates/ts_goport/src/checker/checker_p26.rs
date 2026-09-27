@@ -1056,7 +1056,7 @@ impl Checker {
                     let key = get_type_list_key(&type_parameters);
                     let links = self.type_alias_links.get(symbol);
                     links.type_parameters = type_parameters;
-                    let mut instantiations = CacheKeyMap::default();
+                    let mut instantiations = InstantiationMap::default();
                     instantiations.insert(key, t);
                     links.instantiations = Some(instantiations);
                 }

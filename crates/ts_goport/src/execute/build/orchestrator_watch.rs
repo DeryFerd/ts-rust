@@ -20,13 +20,13 @@
 //! process.
 
 use crate::execute::build::build_task::BuildTask;
-use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::build::orchestrator::Orchestrator;
 use crate::execute::tsc::compile::{Watcher, write_str};
 use crate::execute::watchmanager::{can_watch_directory, is_dir_covered_by_watch};
 use crate::frontend::prelude::*;
 use crate::fswatch;
 use crate::gostd::Context;
+use std::sync::PoisonError;
 use std::time::SystemTime;
 
 impl Orchestrator {
@@ -66,25 +66,26 @@ impl Orchestrator {
 
     // Go: build/orchestrator.go:264 (*Orchestrator).updateWatch
     pub fn update_watch(&self) {
-        let old_cache = std::mem::take(&mut *self.host.m_times.borrow_mut());
+        let old_cache = std::mem::take(
+            &mut *self
+                .host
+                .m_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         self.range_task(&mut |_path: &Path, task: &Rc<RefCell<BuildTask>>| {
             task.borrow().update_watch(self, &old_cache);
         });
     }
 
     // Go: build/orchestrator.go:272 (*Orchestrator).resetCaches
-    pub fn reset_caches(&mut self) {
+    pub fn reset_caches(&self) {
         // Clean out all the caches
         // PORT: Go reaches the cached file system as
         // `o.host.host.FS().(*cachedvfs.FS)`; the host keeps it as
         // `cached_fs` (host.rs).
         self.host.cached_fs.clear_cache();
-        // PORT: Go assigns a new cache to the host field. Between calls
-        // only the orchestrator holds the host `Rc`, so the field is
-        // reached with `Rc::get_mut`.
-        Rc::get_mut(&mut self.host)
-            .expect("the orchestrator holds the only build host reference")
-            .extended_config_cache = TscExtendedConfigCache::default();
+        self.host.extended_config_cache.reset();
         self.host.source_files.reset();
         *self.host.config_times.borrow_mut() = FxHashMap::default();
     }

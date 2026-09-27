@@ -8,7 +8,8 @@
 //! it lives on the LSP dispatch thread (PORTING "Threads"). Go mutexes are
 //! dropped; state is in `Cell` / `RefCell`. Go `*Watcher` and `*watch` are
 //! `Rc`. `time.AfterFunc` is `gostd::local::after_func`, so `flush` runs on
-//! the dispatch thread. The server only makes this watcher when
+//! the dispatch thread. fswatch callbacks reach the dispatch thread through
+//! `DeliveryBridge`. The server only makes this watcher when
 //! `fswatch::default().has_fast_recursive_backend()` is true, which is false
 //! on Linux (plan: dead there).
 
@@ -22,7 +23,9 @@ use crate::lsp::lsproto;
 use crate::project::logging;
 use crate::project::logging::Logger as _;
 use std::cell::Cell;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 // Go: lsp/lspwatcher/lspwatcher.go:24 throttleWindow
@@ -49,30 +52,145 @@ pub trait WatcherBackend {
 }
 
 // Go: lsp/lspwatcher/lspwatcher.go:30 defaultWatcherBackend
+// PORT: `bridge` is port-only. It moves fswatch callbacks to the dispatch
+// thread (see `DeliveryBridge`).
 pub struct DefaultWatcherBackend {
     pub watcher: Arc<dyn fswatch::Watcher>,
+    pub bridge: Rc<DeliveryBridge>,
 }
 
 impl WatcherBackend for DefaultWatcherBackend {
     // Go: lsp/lspwatcher/lspwatcher.go:34 defaultWatcherBackend.WatchDirectory
     // PORT: fswatch calls its callback on its own thread, and `fn_` must run
-    // on the dispatch thread. `gostd::local` has no queue that another thread
-    // can post to, so the delivery is unported. The server makes this watcher
-    // only for a fast recursive backend (Windows, FSEvents), so the callback
-    // is never called on Linux.
+    // on the dispatch thread. The fswatch callback only queues the batch in
+    // the bridge; the bridge calls `fn_` on the dispatch thread.
     fn watch_directory(
         &self,
         dir: &str,
         fn_: LocalWatchCallback,
         opts: &[Box<dyn fswatch::WatchOption>],
     ) -> Result<Box<dyn fswatch::Watch>, GoError> {
-        drop(fn_);
-        let callback: fswatch::WatchCallback =
-            Arc::new(|_events: Vec<fswatch::Event>, _err: Option<GoError>| {
-                unported!("lspwatcher: fswatch callback delivery to the dispatch thread");
-            });
-        self.watcher.watch_directory(dir, callback, opts)
+        let bridge = &self.bridge;
+        let id = bridge.next_id.get();
+        bridge.next_id.set(id + 1);
+        let closed = Arc::new(AtomicBool::new(false));
+        let callback: fswatch::WatchCallback = {
+            let inbox = bridge.inbox.clone();
+            let closed = closed.clone();
+            Arc::new(move |events: Vec<fswatch::Event>, err: Option<GoError>| {
+                if closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                inbox
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_back(Delivery { id, events, err });
+            })
+        };
+        let inner = self.watcher.watch_directory(dir, callback, opts)?;
+        bridge
+            .subscriptions
+            .borrow_mut()
+            .insert(id, (fn_, closed.clone()));
+        bridge.start_polling();
+        Ok(Box::new(BridgedWatch { inner, closed }))
     }
+}
+
+/// How often the dispatch thread takes the queued fswatch batches.
+// PORT: no Go source. See `DeliveryBridge`.
+const DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// One fswatch callback call, queued for the dispatch thread.
+struct Delivery {
+    id: u64,
+    events: Vec<fswatch::Event>,
+    err: Option<GoError>,
+}
+
+/// Moves fswatch callbacks from the fswatch threads to the dispatch thread.
+///
+/// PORT: no Go source. Go calls the lspwatcher callbacks on the fswatch
+/// goroutine. Here they touch dispatch-thread state (`Rc`), so the fswatch
+/// callback queues each call in `inbox`, in arrival order. `gostd::local`
+/// has no queue that another thread can post to, so a `local::after_func`
+/// timer takes the queue every `DELIVERY_POLL_INTERVAL` while a
+/// subscription is open, and calls each `LocalWatchCallback` in order. It
+/// stops when all subscriptions are closed. A batch of a closed
+/// subscription is dropped, as if Go's `Close` ran before the fswatch
+/// callback.
+#[derive(Default)]
+pub struct DeliveryBridge {
+    /// Filled by the fswatch threads.
+    inbox: Arc<Mutex<VecDeque<Delivery>>>,
+    /// Open subscriptions by id: the callback and the closed flag of its
+    /// `BridgedWatch`.
+    subscriptions: RefCell<FxHashMap<u64, (LocalWatchCallback, Arc<AtomicBool>)>>,
+    next_id: Cell<u64>,
+    poll_timer: RefCell<Option<local::LocalTimer>>,
+}
+
+impl DeliveryBridge {
+    /// Arms the poll timer if it is not armed.
+    fn start_polling(self: &Rc<Self>) {
+        if self.poll_timer.borrow().is_some() {
+            return;
+        }
+        // Weak: the timer must not keep the bridge alive.
+        let bridge = Rc::downgrade(self);
+        let timer = local::after_func(
+            DELIVERY_POLL_INTERVAL,
+            Box::new(move || {
+                if let Some(bridge) = bridge.upgrade() {
+                    bridge.poll();
+                }
+            }),
+        );
+        *self.poll_timer.borrow_mut() = Some(timer);
+    }
+
+    /// Runs on the dispatch thread when the poll timer fires.
+    fn poll(self: &Rc<Self>) {
+        *self.poll_timer.borrow_mut() = None;
+        loop {
+            let delivery = self
+                .inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            let Some(Delivery { id, events, err }) = delivery else {
+                break;
+            };
+            // Clone the callback out: it can open or close subscriptions.
+            let callback = match self.subscriptions.borrow().get(&id) {
+                Some((callback, closed)) if !closed.load(Ordering::SeqCst) => callback.clone(),
+                _ => continue,
+            };
+            callback(events, err);
+        }
+        self.subscriptions
+            .borrow_mut()
+            .retain(|_, (_, closed)| !closed.load(Ordering::SeqCst));
+        if !self.subscriptions.borrow().is_empty() {
+            self.start_polling();
+        }
+    }
+}
+
+/// The `fswatch::Watch` that `DefaultWatcherBackend` returns: closing it
+/// also stops the delivery of its queued batches.
+struct BridgedWatch {
+    inner: Box<dyn fswatch::Watch>,
+    closed: Arc<AtomicBool>,
+}
+
+impl fswatch::Watch for BridgedWatch {
+    fn close(&self) -> Result<(), GoError> {
+        self.closed.store(true, Ordering::SeqCst);
+        self.inner.close()
+    }
+
+    fn unexported(&self) {}
 }
 
 // Go: lsp/lspwatcher/lspwatcher.go:42 Watcher
@@ -155,7 +273,10 @@ pub fn new_with_fs_watcher(
 ) -> Rc<Watcher> {
     new_with_backend(
         fs,
-        Box::new(DefaultWatcherBackend { watcher }),
+        Box::new(DefaultWatcherBackend {
+            watcher,
+            bridge: Rc::default(),
+        }),
         on_changes,
         logger,
     )

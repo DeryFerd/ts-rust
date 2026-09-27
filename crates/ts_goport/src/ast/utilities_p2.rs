@@ -20,6 +20,32 @@ pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> 
     Node::NIL
 }
 
+/// `find_ancestor(node, |n| callback(n, n.kind()))`: the callback also gets
+/// the node's Go `Kind`.
+// PERF: U4 (CH7). The steps inside a tier 0 store read its kind and header
+// tables, found once (`frozen_find_ancestor`), not through the `FROZEN`
+// lookup of every `kind()` and `parent()` read. Same nodes, same order.
+pub fn find_ancestor_with_kind(
+    mut node: Node,
+    mut callback: impl FnMut(Node, SyntaxKind) -> bool,
+) -> Node {
+    loop {
+        match frozen_find_ancestor(node, &mut callback) {
+            Some(AncestorWalk::Found(found)) => return found,
+            Some(AncestorWalk::Next(next)) => node = next,
+            None => {
+                if node.is_nil() {
+                    return Node::NIL;
+                }
+                if callback(node, node.kind()) {
+                    return node;
+                }
+                node = node.parent();
+            }
+        }
+    }
+}
+
 // Go: ast/utilities.go:922 FindAncestorKind
 /// Walks up the parents of a node to find the ancestor that matches the kind.
 pub fn find_ancestor_kind(mut node: Node, kind: SyntaxKind) -> Node {
@@ -108,7 +134,14 @@ pub fn has_syntactic_modifier(node: Node, flags: ModifierFlags) -> bool {
 
 /// `has_syntactic_modifier` on `d`, the data of `node` that the caller
 /// already loaded with `ast_data_of` (query Q7-3, see `Node::modifiers_in`).
+// PERF: U4 (bind A). A tier 0 store node reads the U1 (b) modifier column
+// (`frozen_store_modifier_flags`), as `Node::modifier_flags` does, not its
+// modifier list.
 pub fn has_syntactic_modifier_in(node: Node, d: &'static NodeData, flags: ModifierFlags) -> bool {
+    if let Some(modifier_flags) = frozen_store_modifier_flags(node) {
+        debug_assert_eq!(modifier_flags, node.modifiers_in(d).modifier_flags());
+        return modifier_flags.intersects(flags);
+    }
     node.modifiers_in(d).modifier_flags().intersects(flags)
 }
 
@@ -360,16 +393,25 @@ fn get_node_flags(node: Node) -> NodeFlags {
     node.flags()
 }
 
+/// Go `GetCombinedNodeFlags(node) & mask` for a `mask` without a binder bit
+/// (see `Node::parser_flags`).
+// PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
+// binder data of each node. `(a | b | c) & mask` is
+// `(a & mask) | (b & mask) | (c & mask)`.
+fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
+    get_combined_flags(node, |n: Node| n.parser_flags(mask))
+}
+
 // Go: ast/utilities.go:1190 IsVarAwaitUsing
 /// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of an `await using` declaration.
 pub fn is_var_await_using(node: Node) -> bool {
-    get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED == NodeFlags::AWAIT_USING
+    get_combined_parser_flags(node, NodeFlags::BLOCK_SCOPED) == NodeFlags::AWAIT_USING
 }
 
 // Go: ast/utilities.go:1195 IsVarUsing
 /// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of a `using` declaration.
 pub fn is_var_using(node: Node) -> bool {
-    get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED == NodeFlags::USING
+    get_combined_parser_flags(node, NodeFlags::BLOCK_SCOPED) == NodeFlags::USING
 }
 
 // Go: ast/utilities.go:1200 GetJSDocDeprecatedTag
@@ -392,8 +434,20 @@ pub fn get_js_doc_deprecated_tag(node: Node) -> Node {
 /// Reports whether the given declaration is marked as @deprecated.
 /// It checks NodeFlagsPossiblyContainsDeprecatedTag on combined node flags, then confirms
 /// by walking up to find the node with the flag and performing a JSDoc lookup.
+// PERF: U4 (CH7). A node of a store without the flag is not deprecated
+// (`frozen_store_lacks_deprecated_tag`). Otherwise only the flag bit of the
+// combined flags is read, which is a parser bit.
 pub fn is_deprecated_declaration(declaration: Node) -> bool {
-    is_deprecated_declaration_with_cached_flags(declaration, get_combined_node_flags(declaration))
+    if frozen_store_lacks_deprecated_tag(declaration) {
+        debug_assert!(
+            !get_combined_node_flags(declaration)
+                .intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+        );
+        return false;
+    }
+    let combined =
+        get_combined_parser_flags(declaration, NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG);
+    is_deprecated_declaration_with_cached_flags(declaration, combined)
 }
 
 // Go: ast/utilities.go:1223 IsDeprecatedDeclarationWithCachedFlags
@@ -410,8 +464,9 @@ pub fn is_deprecated_declaration_with_cached_flags(
     // attached to that node (e.g. VariableStatement, not VariableDeclaration).
     let mut n = declaration;
     while n.is_some() {
-        if n.flags()
-            .intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+        if !n
+            .parser_flags(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+            .is_empty()
         {
             return get_js_doc_deprecated_tag(n).is_some();
         }
@@ -423,20 +478,20 @@ pub fn is_deprecated_declaration_with_cached_flags(
 // Go: ast/utilities.go:1238 IsVarConst
 /// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of a `const` declaration.
 pub fn is_var_const(node: Node) -> bool {
-    get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED == NodeFlags::CONST
+    get_combined_parser_flags(node, NodeFlags::BLOCK_SCOPED) == NodeFlags::CONST
 }
 
 // Go: ast/utilities.go:1243 IsVarConstLike
 /// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of a `const`, `using` or `await using` declaration.
 pub fn is_var_const_like(node: Node) -> bool {
-    let flags = get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED;
+    let flags = get_combined_parser_flags(node, NodeFlags::BLOCK_SCOPED);
     flags == NodeFlags::CONST || flags == NodeFlags::USING || flags == NodeFlags::AWAIT_USING
 }
 
 // Go: ast/utilities.go:1252 IsVarLet
 /// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of a `let` declaration.
 pub fn is_var_let(node: Node) -> bool {
-    get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED == NodeFlags::LET
+    get_combined_parser_flags(node, NodeFlags::BLOCK_SCOPED) == NodeFlags::LET
 }
 
 // Go: ast/utilities.go:1256 IsImportMeta
@@ -463,8 +518,9 @@ pub fn is_source_file_js(file: Node) -> bool {
 }
 
 // Go: ast/utilities.go:1275 IsInJSFile
+// PERF: U4 (CH7). `JAVA_SCRIPT_FILE` is a parser bit (`Node::parser_flags`).
 pub fn is_in_js_file(node: Node) -> bool {
-    node.is_some() && node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
+    node.is_some() && !node.parser_flags(NodeFlags::JAVA_SCRIPT_FILE).is_empty()
 }
 
 // Go: ast/utilities.go:1279 IsDeclaration

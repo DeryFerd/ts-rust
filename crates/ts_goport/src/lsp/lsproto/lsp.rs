@@ -3,6 +3,10 @@
 //! PORT: `DocumentUri`, `URI` and `Method` are Go string types; their JSON
 //! impls are the v2 string arshaler. `IndexMap<DocumentUri, V>` (Go
 //! `map[DocumentUri]V`) gets the v2 map arshaler here.
+//!
+//! The `err*` helpers make the plain errors that generated `UnmarshalJSONFrom`
+//! methods return. Each one records where the method left the decoder, so
+//! that `unmarshal_root` can give the error its Go v2 JSON pointer.
 
 use crate::lsp::lsproto::prelude::*;
 
@@ -123,7 +127,7 @@ impl MarshalerTo for DocumentUri {
 
 impl UnmarshalerFrom for DocumentUri {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        unmarshal_string_as(dec, &mut self.0, &go_type_name::<Self>())
     }
 }
 
@@ -141,7 +145,7 @@ impl MarshalerTo for URI {
 
 impl UnmarshalerFrom for URI {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        unmarshal_string_as(dec, &mut self.0, &go_type_name::<Self>())
     }
 }
 
@@ -160,7 +164,7 @@ impl MarshalerTo for Method {
 impl UnmarshalerFrom for Method {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = self.0.to_string();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, &go_type_name::<Self>())?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -193,7 +197,8 @@ impl<V: MarshalerTo> MarshalerTo for IndexMap<DocumentUri, V> {
 // Go v2 map arshaler (arshal_default.go:955) for `map[DocumentUri]V`: null
 // sets nil; an object merges into the existing map (a value for a key that
 // is already present decodes into a copy of the old value); a name repeated
-// in this object is an error unless duplicates are allowed.
+// in this object is an error unless duplicates are allowed. A plain error of
+// the method of `V` gets the Go type `V`.
 // PORT: Go sets a nil map for null; the Rust zero value is an empty map.
 impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<DocumentUri, V> {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
@@ -233,7 +238,7 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                         s.insert(k.clone(), ());
                     }
                     self.insert(k, v);
-                    err?;
+                    err.map_err(wrap_method_error::<V>)?;
                 }
                 dec.read_token()?;
                 Ok(())
@@ -246,41 +251,18 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                     }
                     dec.read_token()?;
                 }
-                Err(JsonError {
-                    message: "cannot unmarshal JSON value into Go map".to_string(),
-                })
+                Err(unmarshal_kind_error(tok.kind(), &go_type_name::<Self>()))
             }
         }
     }
 }
 
-// Go `%T` of `(*T)(nil)` prints `*lsproto.Name`.
-// PORT: the Rust type name without module paths; types from lsproto get
-// the `lsproto.` package prefix, other types (`Vec<..>`) print as Rust.
-fn go_type_name<T: ?Sized>() -> String {
-    let full = std::any::type_name::<T>();
-    let mut out = String::new();
-    let mut ident = String::new();
-    for c in full.chars() {
-        if c.is_alphanumeric() || c == '_' || c == ':' {
-            ident.push(c);
-        } else {
-            out.push_str(ident.rsplit("::").next().unwrap_or(""));
-            ident.clear();
-            out.push(c);
-        }
-    }
-    out.push_str(ident.rsplit("::").next().unwrap_or(""));
-    if full.contains("::lsproto::") && !full.contains('<') {
-        return format!("lsproto.{out}");
-    }
-    out
-}
-
 // Go: lsp.go:87 unmarshalPtrTo
+// `unmarshal_root` is Go `json.Unmarshal` with the v2 error text, and
+// `go_type_name` gives Go `%T` without the `*`.
 pub fn unmarshal_ptr_to<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<Box<T>, GoError> {
     let mut v = T::default();
-    if let Err(err) = json_unmarshal(data, &mut v, &[]) {
+    if let Err(err) = unmarshal_root(data, &mut v) {
         let err = gostd::errors::from_value(err);
         return Err(gostd::errors::errorf(
             format!(
@@ -297,7 +279,7 @@ pub fn unmarshal_ptr_to<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<Box
 // Go: lsp.go:95 unmarshalValue
 pub fn unmarshal_value<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<T, GoError> {
     let mut v = T::default();
-    if let Err(err) = json_unmarshal(data, &mut v, &[]) {
+    if let Err(err) = unmarshal_root(data, &mut v) {
         let err = gostd::errors::from_value(err);
         return Err(gostd::errors::errorf(
             format!(
@@ -316,7 +298,7 @@ pub fn unmarshal_value<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<T, G
 // (`None`), any other value is a boxed `LspAny`.
 pub fn unmarshal_any(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
     let mut v = LspAny::Null;
-    if let Err(err) = json_unmarshal(data, &mut v, &[]) {
+    if let Err(err) = unmarshal_root(data, &mut v) {
         let err = gostd::errors::from_value(err);
         return Err(gostd::errors::errorf(
             format!("failed to unmarshal any: {}", err.error()),
@@ -366,65 +348,77 @@ fn json_kind_string(k: u8) -> String {
 }
 
 // Go: lsp.go:125 errNotObject
+// Generated methods return it before they read the value.
 pub fn err_not_object(k: u8) -> JsonError {
-    JsonError {
-        message: format!(
+    SemanticError::method(
+        ErrorPos::Before,
+        format!(
             "expected object start, but encountered {}",
             json_kind_string(k)
         ),
-    }
+    )
 }
 
 // Go: lsp.go:129 errNull
+// Generated methods return it after the member name.
 pub fn err_null(field: &str) -> JsonError {
-    JsonError {
-        message: format!(
+    SemanticError::method(
+        ErrorPos::After,
+        format!(
             "null value is not allowed for field {}",
             gostd::strconv::quote(field)
         ),
-    }
+    )
 }
 
 // Go: lsp.go:133 errMissing
+// Generated methods return it after the closing `}`.
 pub fn err_missing<I, S>(props: I) -> JsonError
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let props: Vec<String> = props.into_iter().map(|p| p.as_ref().to_string()).collect();
-    JsonError {
-        message: format!("missing required properties: {}", props.join(", ")),
-    }
+    SemanticError::method(
+        ErrorPos::AfterEnd,
+        format!("missing required properties: {}", props.join(", ")),
+    )
 }
 
 // Go: lsp.go:137 errInvalidKind
+// Generated methods return it after a peek, before they read the value.
 pub fn err_invalid_kind(type_name: &str, got: u8) -> JsonError {
-    JsonError {
-        message: format!("invalid {}: got {}", type_name, json_kind_string(got)),
-    }
+    SemanticError::method(
+        ErrorPos::Before,
+        format!("invalid {}: got {}", type_name, json_kind_string(got)),
+    )
 }
 
 // Go: lsp.go:141 errInvalidValue
+// Generated methods return it after they read the value.
 pub fn err_invalid_value(type_name: &str, data: impl AsRef<[u8]>) -> JsonError {
-    JsonError {
-        message: format!(
+    SemanticError::method(
+        ErrorPos::After,
+        format!(
             "invalid {}: {}",
             type_name,
             String::from_utf8_lossy(data.as_ref())
         ),
-    }
+    )
 }
 
 // Go: lsp.go:145 errLiteralMismatch
+// Generated methods return it after they read the value.
 pub fn err_literal_mismatch(type_name: &str, expected: &str, got: impl AsRef<[u8]>) -> JsonError {
-    JsonError {
-        message: format!(
+    SemanticError::method(
+        ErrorPos::After,
+        format!(
             "expected {} value {}, got {}",
             type_name,
             expected,
             String::from_utf8_lossy(got.as_ref())
         ),
-    }
+    )
 }
 
 // Go: lsp.go:149 assertOnlyOne
@@ -638,9 +632,10 @@ impl UnmarshalerFrom for Null {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let data = dec.read_value()?;
         if data != b"null" {
-            return Err(JsonError {
-                message: format!("expected null, got {}", String::from_utf8_lossy(data)),
-            });
+            return Err(SemanticError::method(
+                ErrorPos::After,
+                format!("expected null, got {}", String::from_utf8_lossy(data)),
+            ));
         }
         Ok(())
     }
@@ -725,4 +720,58 @@ impl CodeActionKind {
         CodeActionKind(Cow::Borrowed("source.removeUnusedImports"));
     pub const SOURCE_SORT_IMPORTS: CodeActionKind =
         CodeActionKind(Cow::Borrowed("source.sortImports"));
+}
+
+#[cfg(test)]
+mod unmarshal_error_tests {
+    use super::*;
+
+    fn params_err_text<T: UnmarshalerFrom + Default + std::fmt::Debug>(data: &str) -> String {
+        unmarshal_ptr_to::<T>(data.as_bytes())
+            .expect_err("want an error")
+            .error()
+    }
+
+    // Expected texts come from the pinned Go LSP server (tsgo-oracle, and
+    // the tests2 S6-002 goldens); Go writes "cannot" or "unable to".
+    #[test]
+    fn params_errors_match_go() {
+        assert_eq!(
+            params_err_text::<HoverParams>(r#"{"textDocument":{"uri":"file:///a.ts"}}"#),
+            "failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal into Go lsproto.HoverParams after offset 38: missing required properties: position"
+        );
+        assert_eq!(
+            params_err_text::<SignatureHelpParams>(
+                r#"{"textDocument":{"uri":"file:///a.ts"},"position":{"line":0,"character":0},"context":5}"#
+            ),
+            r#"failed to unmarshal *lsproto.SignatureHelpParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context": expected object start, but encountered number"#
+        );
+        assert_eq!(
+            params_err_text::<HoverParams>(
+                r#"{"textDocument":{"uri":5},"position":{"line":0,"character":0}}"#
+            ),
+            r#"failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal JSON number into Go lsproto.DocumentUri within "/textDocument/uri""#
+        );
+        assert_eq!(
+            params_err_text::<HoverParams>(
+                r#"{"textDocument":{"uri":"file:///a.ts"},"position":{"line":"x","character":0}}"#
+            ),
+            r#"failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal JSON string into Go uint32 within "/position/line""#
+        );
+    }
+
+    // S6-002: both wrappers of a signatureHelp retrigger whose
+    // `activeSignatureHelp` is null (lsp server.go:121 reads the message with
+    // `json.Unmarshal(data, req)`).
+    #[test]
+    fn null_active_signature_help_matches_go() {
+        let data = br#"{"jsonrpc":"2.0","id":4,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":"file:///a.ts"},"position":{"line":0,"character":0},"context":{"triggerKind":3,"isRetrigger":true,"activeSignatureHelp":null}}}"#;
+        let mut req = Message::default();
+        let err = unmarshal_json_method::<Message>(data, |d| req.unmarshal_json(d))
+            .expect_err("want an error");
+        assert_eq!(
+            err.error(),
+            r#"json: cannot unmarshal JSON object into Go lsproto.Message: InvalidParams: failed to unmarshal *lsproto.SignatureHelpParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context/activeSignatureHelp": null value is not allowed for field "activeSignatureHelp""#
+        );
+    }
 }

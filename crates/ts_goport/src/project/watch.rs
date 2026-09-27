@@ -9,6 +9,7 @@ use crate::project::prelude::*;
 
 use crate::frontend::stringutil_ls;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Go: project/watch.go:19 minWatchLocationDepth
 pub const MIN_WATCH_LOCATION_DEPTH: i32 = 2;
@@ -171,18 +172,16 @@ impl std::fmt::Display for WatcherID {
 }
 
 // Go: project/watch.go:157 watcherID
-// PORT: Go `atomic.Uint64`. Ids reach the client (registration ids), so it
-// is one counter per dispatch thread with the Go increment order.
-thread_local! {
-    pub static WATCHER_ID: Cell<u64> = const { Cell::new(0) };
-}
+// PORT: Go `atomic.Uint64`: one process-wide counter that starts at 0. Ids
+// reach the client (registration ids), so every thread must share it.
+pub static WATCHER_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Go `watcherID.Add(1)`: increments the counter and returns the new value.
+/// Go `watcherID.Add(delta)`: adds `delta` and returns the new value. Go
+/// atomics are sequentially consistent and wrap on overflow.
 fn watcher_id_add(delta: u64) -> u64 {
-    WATCHER_ID.with(|id| {
-        id.set(id.get() + delta);
-        id.get()
-    })
+    WATCHER_ID
+        .fetch_add(delta, Ordering::SeqCst)
+        .wrapping_add(delta)
 }
 
 // Go: project/watch.go:159 WatchedFiles
