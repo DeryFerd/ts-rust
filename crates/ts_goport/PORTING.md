@@ -196,6 +196,12 @@ methods reach the AST through it.
   `ast/node.rs` (for example `{ file: u32, list: Option<&'static ts_ast::NodeList> }`).
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
+- New code reads node data through `by_data!`, `data_accessor!` or the
+  binder `_in` pair. Do not add `ast_data_of` call sites: the multiprog D3
+  to D5 port removes `ast_data_of`.
+- New store columns are read through one file lookup helper, not
+  `FROZEN.get()` directly, so the multiprog port can make that lookup
+  tier 1 aware in one place.
 
 ## Program (owned by program.rs)
 
