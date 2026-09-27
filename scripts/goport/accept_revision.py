@@ -7,7 +7,7 @@ local check, and records the acceptance only when the check passes.
 
 Usage:
   scripts/goport/accept_revision.py --revision 119 --bound r23,r23b --gate r119-full
-      --scope "<one line>" [--extra evidence.json]
+      --scope "<one line>" --outcome "<one line>" [--extra evidence.json]
 Run from the repository root. --extra is a JSON object merged into the batch (e.g. cliAudit).
 """
 import argparse, datetime, hashlib, json, subprocess, sys
@@ -39,6 +39,7 @@ def main():
     p.add_argument('--gate', required=True)
     p.add_argument('--scope', required=True)
     p.add_argument('--extra')
+    p.add_argument('--outcome', required=True, help='one-line measured outcome for the history row')
     a = p.parse_args()
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     s = export()
@@ -71,7 +72,7 @@ def main():
     b['auditor'] = verdict('audit_accepted_roster', AUDITOR)
     b['reviewer'] = verdict('independent_reviewer', REVIEWER)
     b.setdefault('verdictHistory', []).extend([b['auditor'], b['reviewer']])
-    row.update({'fullResultSha256': chk, 'fullResultRawSha256': rawsha, 'status': 'full_measured',
+    row.update({'fullResultSha256': chk, 'fullResultRawSha256': rawsha, 'status': 'full_measured', 'outcome': a.outcome,
                 'ordinaryQuery': 'complete, 0 diagnostics, matches tsgo-oracle', 'hono': 'complete, 0 diagnostics, matches tsgo-oracle'})
     s['status'], s['decision'], s['updated'] = 'ready', 'PASS', now
     put(s, f'{rev}-a')
