@@ -880,7 +880,10 @@ impl Binder {
 //
 // PORT: Go `ast.GetSymbolId` hands out lazy global ids. Here the arena index
 // is the symbol id. It is stable because every checker arena starts as a
-// clone of the binder arena, and it is unique, which is all the name needs.
+// clone of the binder arena, and it is unique, which is all the name needs
+// inside the process. Go binds files in parallel, and each file into its own
+// arena here, so a bind cannot give the Go id. Where Go shows `symbol.Name`
+// outside the process (the API), `go_symbol_name` puts the id back.
 pub fn get_symbol_name_for_private_identifier(
     symbols: &SymbolArena,
     containing_class_symbol: SymbolId,
@@ -890,6 +893,51 @@ pub fn get_symbol_name_for_private_identifier(
     format!(
         "{}#{}@{}",
         INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
+    )
+}
+
+/// Rust-only: the text of Go `symbol.Name` for `symbol`, as the API returns
+/// it (Go api/session.go:75 `newSymbolResponse`). A private identifier name
+/// holds the arena index of its class
+/// (`get_symbol_name_for_private_identifier`). Go holds `ast.GetSymbolId` of
+/// the class there, which is also the API handle of the class (Go
+/// api/proto.go:40 `SymbolHandle`). This returns the name with that id
+/// (`get_symbol_id`). Other names come back as they are. Only a symbol that
+/// a private identifier declares has such a name, as in
+/// `SymbolArena::prepare_file_arena`; a name that source text spells stays.
+#[must_use]
+pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    let s = symbols.sym(symbol);
+    let name = s.name.as_str();
+    if !s.name.is_internal() {
+        return name.to_string();
+    }
+    let Some(rest) = name
+        .strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX)
+        .and_then(|rest| rest.strip_prefix('#'))
+    else {
+        return name.to_string();
+    };
+    let Some(at) = rest.find('@') else {
+        return name.to_string();
+    };
+    let Ok(class) = rest[..at].parse::<u32>() else {
+        return name.to_string();
+    };
+    if class == 0
+        || class as usize >= symbols.symbol_count()
+        || !s
+            .declarations
+            .iter()
+            .any(|&declaration| is_private_identifier(get_name_of_declaration(declaration)))
+    {
+        return name.to_string();
+    }
+    format!(
+        "{}#{}{}",
+        INTERNAL_SYMBOL_NAME_PREFIX,
+        get_symbol_id(symbols, SymbolId(class)),
+        &rest[at..]
     )
 }
 

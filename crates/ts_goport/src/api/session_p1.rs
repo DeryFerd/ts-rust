@@ -131,7 +131,8 @@ impl SnapshotData {
         let sym = c.sym(symbol);
         let mut resp = SymbolResponse {
             id: self.register_symbol(checker, symbol),
-            name: sym.name.as_str().to_string(),
+            // PORT: Go `symbol.Name`; a private name gets the Go class id.
+            name: go_symbol_name(&c.symbols, symbol),
             flags: sym.flags.0,
             check_flags: sym.check_flags.0,
             ..Default::default()
