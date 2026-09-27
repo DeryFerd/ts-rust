@@ -86,7 +86,7 @@ impl Session {
         if result.is_nil() {
             return Ok(None);
         }
-        Ok(sd.new_symbol_response(&checker, result))
+        Ok(sd.new_symbol_response(&checker, result, &params.project))
     }
 
     // Go: api/session.go:1336 resolveSymbolPropertyOfSymbol
@@ -106,13 +106,16 @@ impl Session {
         if result.is_nil() {
             return Ok(None);
         }
-        Ok(sd.new_symbol_response(&checker, result))
+        Ok(sd.new_symbol_response(&checker, result, &params.project))
     }
 
-    // Go: api/session.go:1355 resolveSymbolTablePropertyOfSymbol
+    // Go: api/session.go:1681 resolveSymbolTablePropertyOfSymbol
     // resolveSymbolTablePropertyOfSymbol resolves a symbol property of type `SymbolTable` and returns an array of symbol responses.
+    // Results are sorted using the checker's canonical symbol ordering so that API consumers receive
+    // a stable, deterministic order instead of Go's randomized map iteration order.
     pub fn resolve_symbol_table_property_of_symbol(
         &self,
+        ctx: &Context,
         params: &GetSymbolPropertyParams,
         getter: &dyn Fn(&Checker, SymbolId) -> SymbolTable,
     ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
@@ -127,12 +130,32 @@ impl Session {
         if symbol_table.is_nil() || table_len == 0 {
             return Ok(Vec::new());
         }
-
-        // PORT: Go map order is random; the port uses table insertion order.
         let subs = checker.borrow().symbols.values(symbol_table);
-        let mut results = Vec::with_capacity(table_len);
+        if table_len == 1 {
+            return Ok(vec![sd.new_symbol_response(
+                &checker,
+                subs[0],
+                &params.project,
+            )]);
+        }
+
+        // More than one symbol, need a checker to sort
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let mut symbols: Vec<SymbolId> = Vec::with_capacity(table_len);
         for sub in subs {
-            results.push(sd.new_symbol_response(&checker, sub));
+            symbols.push(checker_symbol(&setup.checker, &checker, sub));
+        }
+        // PORT: Go `slices.SortFunc` is not stable; `compareSymbols` gives
+        // distinct symbols distinct places, so the order is the same.
+        {
+            let mut c = setup.checker.borrow_mut();
+            symbols.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+        }
+
+        let mut results = Vec::with_capacity(symbols.len());
+        for sub in symbols {
+            results.push(setup.new_symbol_response(sub));
         }
         Ok(results)
     }
@@ -157,7 +180,7 @@ impl Session {
 
         let mut results = Vec::with_capacity(symbols.len());
         for sym in symbols {
-            results.push(sd.new_symbol_response(&checker, sym));
+            results.push(sd.new_symbol_response(&checker, sym, &params.project));
         }
         Ok(results)
     }
@@ -179,7 +202,7 @@ impl Session {
         if result.is_nil() {
             return Ok(None);
         }
-        Ok(sd.new_symbol_response(&checker, result))
+        Ok(sd.new_symbol_response(&checker, result, &params.project))
     }
 
     // Go: api/session.go:1421 resolveTypeArrayPropertyOfSignature
@@ -648,6 +671,40 @@ impl Session {
         Ok(p.emit(node, Node::NIL))
     }
 
+    // Go: api/session.go:2125 handleGetWellKnownSymbols
+    // handleGetWellKnownSymbols returns the handle ids of the per-checker singleton
+    // symbols (unknown, undefined, arguments) so the client can identify them by id.
+    pub fn handle_get_well_known_symbols(
+        &self,
+        ctx: &Context,
+        params: &GetIntrinsicTypeParams,
+    ) -> Result<Option<WellKnownSymbolsResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (unknown, undefined, arguments) = {
+            let c = setup.checker.borrow();
+            (
+                c.get_unknown_symbol(),
+                c.get_undefined_symbol(),
+                c.get_arguments_symbol(),
+            )
+        };
+        let (unknown, _) = setup
+            .sd
+            .register_symbol(&setup.checker, unknown, &setup.project_id);
+        let (undefined, _) = setup
+            .sd
+            .register_symbol(&setup.checker, undefined, &setup.project_id);
+        let (arguments, _) = setup
+            .sd
+            .register_symbol(&setup.checker, arguments, &setup.project_id);
+        Ok(Some(WellKnownSymbolsResponse {
+            unknown,
+            undefined,
+            arguments,
+        }))
+    }
+
     // Go: api/session.go:1815 handleGetIntrinsicType
     // handleGetIntrinsicType returns an intrinsic type (any, string, number, etc.).
     pub fn handle_get_intrinsic_type(
@@ -776,6 +833,38 @@ impl Session {
         }
 
         Ok(Some(resp))
+    }
+
+    // Go: api/session.go:2143 handleIsArrayType
+    // handleIsArrayType returns whether a type is Array<T> or ReadonlyArray<T>.
+    pub fn handle_is_array_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup.checker.borrow().is_array_type_exported(t);
+        Ok(result)
+    }
+
+    // Go: api/session.go:2159 handleIsTupleType
+    // handleIsTupleType returns whether a type is a tuple type.
+    pub fn handle_is_tuple_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup.checker.borrow().is_tuple_type_exported(t);
+        Ok(result)
     }
 
     // Go: api/session.go:1922 handleGetBaseTypes
@@ -927,6 +1016,245 @@ impl Session {
         Ok(setup.new_type_response(constraint))
     }
 
+    // Go: api/session.go:2281 handleGetBaseConstraintOfType
+    // handleGetBaseConstraintOfType returns the base constraint of an instantiable type.
+    pub fn handle_get_base_constraint_of_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let constraint = setup
+            .checker
+            .borrow_mut()
+            .get_base_constraint_of_type_exported(t);
+        if constraint.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_type_response(constraint))
+    }
+
+    // Go: api/session.go:2302 handleGetPropertyOfType
+    // handleGetPropertyOfType returns a named property symbol of a type.
+    pub fn handle_get_property_of_type(
+        &self,
+        ctx: &Context,
+        params: &GetPropertyOfTypeParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let prop = setup
+            .checker
+            .borrow_mut()
+            .get_property_of_type_exported(t, &params.name);
+        if prop.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_symbol_response(prop))
+    }
+
+    // Go: api/session.go:2323 handleGetConstantValue
+    // handleGetConstantValue returns the constant value of an enum member or const enum access.
+    // PORT: Go returns `any`; a nil `any` (no node, or no constant value) is `None`.
+    pub fn handle_get_constant_value(
+        &self,
+        ctx: &Context,
+        params: &CheckerNodeParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let value = setup.checker.borrow_mut().get_constant_value(node);
+        match literal_value_to_json(value.as_ref()) {
+            LspAny::Null => Ok(None),
+            value => Ok(to_any(value)),
+        }
+    }
+
+    // Go: api/session.go:2342 handleGetSignatureFromDeclaration
+    // handleGetSignatureFromDeclaration returns the signature of a function-like declaration.
+    pub fn handle_get_signature_from_declaration(
+        &self,
+        ctx: &Context,
+        params: &CheckerNodeParams,
+    ) -> Result<Option<SignatureResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let sig = setup
+            .checker
+            .borrow_mut()
+            .get_signature_from_declaration_exported(node);
+        if sig.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_signature_response(sig))
+    }
+
+    // Go: api/session.go:2366 handleGetExportSpecifierLocalTargetSymbol
+    // handleGetExportSpecifierLocalTargetSymbol returns the local target symbol of an export specifier.
+    pub fn handle_get_export_specifier_local_target_symbol(
+        &self,
+        ctx: &Context,
+        params: &CheckerNodeParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(setup.program, &params.location)?;
+        if node.is_nil() {
+            return Ok(None);
+        }
+
+        let symbol = setup
+            .checker
+            .borrow_mut()
+            .get_export_specifier_local_target_symbol(node);
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:2390 handleGetAliasedSymbol
+    // handleGetAliasedSymbol resolves an alias symbol to its target.
+    pub fn handle_get_aliased_symbol(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let aliased = setup.checker.borrow_mut().get_aliased_symbol(symbol);
+        if aliased.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_symbol_response(aliased))
+    }
+
+    // Go: api/session.go:2416 handleGetExportsOfModule
+    // handleGetExportsOfModule returns the resolved exports of a module symbol,
+    // including those introduced by `export *` and re-exports.
+    pub fn handle_get_exports_of_module(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(Vec::new());
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let mut exports = setup
+            .checker
+            .borrow_mut()
+            .get_exports_of_module_exported(symbol);
+        if exports.is_empty() {
+            return Ok(Vec::new());
+        }
+        {
+            let mut c = setup.checker.borrow_mut();
+            exports.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+        }
+
+        let mut results = Vec::with_capacity(exports.len());
+        for exp in exports {
+            results.push(setup.new_symbol_response(exp));
+        }
+
+        Ok(results)
+    }
+
+    // Go: api/session.go:2446 handleGetJSDocTags
+    // handleGetJSDocTags returns the JSDoc tags of a symbol as structured name/text pairs.
+    pub fn handle_get_js_doc_tags(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Vec<JSDocTagInfo>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(Vec::new());
+        }
+
+        let lang_svc =
+            self.setup_language_service(&setup.sd, setup.program, &params.project, "")?;
+
+        // PORT: Go reads the symbol with no checker; the port reads it in
+        // the arena of the checker that owns the handle.
+        let tags = lang_svc.get_symbol_js_doc_tags(&owner.borrow(), symbol);
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(tags.len());
+        for tag in tags {
+            results.push(JSDocTagInfo {
+                name: tag.name,
+                text: tag.text,
+            });
+        }
+        Ok(results)
+    }
+
+    // Go: api/session.go:2476 handleGetDocumentationComment
+    // handleGetDocumentationComment returns the rendered documentation comment of a symbol as plain text.
+    pub fn handle_get_documentation_comment(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<String, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(String::new());
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let lang_svc =
+            self.setup_language_service(&setup.sd, setup.program, &params.project, "")?;
+
+        let result =
+            lang_svc.get_symbol_documentation_comment(&mut setup.checker.borrow_mut(), symbol);
+        Ok(result)
+    }
+
     // Go: api/session.go:2028 handleGetTypeArguments
     // handleGetTypeArguments returns the type arguments of a type reference.
     pub fn handle_get_type_arguments(
@@ -1002,6 +1330,52 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(member))
+    }
+}
+
+impl Session {
+    // Go: api/session.go:2626 handleGetTrueTypeOfConditionalType
+    pub fn handle_get_true_type_of_conditional_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup
+            .sd
+            .resolve_type_handle(&params.project, params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .get_true_type_of_conditional_type(t);
+        Ok(setup
+            .sd
+            .new_type_response(&params.project, &setup.checker, result))
+    }
+
+    // Go: api/session.go:2641 handleGetFalseTypeOfConditionalType
+    pub fn handle_get_false_type_of_conditional_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup
+            .sd
+            .resolve_type_handle(&params.project, params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .get_false_type_of_conditional_type(t);
+        Ok(setup
+            .sd
+            .new_type_response(&params.project, &setup.checker, result))
     }
 }
 
@@ -1165,34 +1539,61 @@ pub fn compute_snapshot_changes(
 }
 
 impl Session {
-    // Go: api/session.go:2141 Close
+    // Go: api/session.go:2855 Close
     // Close closes the session and releases all active snapshots,
     // regardless of their ref counts.
     pub fn close(&self) {
+        self.release_open_refs();
+
         let mut snapshots = self.snapshots.borrow_mut();
-        let handles: Vec<SnapshotID> = snapshots.keys().copied().collect();
-        for handle in handles {
-            snapshots.remove(&handle);
+        // PORT: Go deletes while it ranges over the map; the port drains it.
+        for (_, sd) in snapshots.drain() {
+            project::Snapshot::deref(&sd.snapshot, &self.project_session);
         }
+    }
+
+    // Go: api/session.go:2871 releaseOpenRefs
+    // releaseOpenRefs releases every project and file ref this session is holding open
+    // in the project session. This keeps the API's ref counts balanced when an API
+    // session is shut down while sharing a longer-lived project session (e.g. one
+    // backing an LSP server), so API-opened projects and files aren't leaked. Only
+    // refs the session currently holds are closed, so it never over-releases.
+    // PORT: the Go `updateMu` lock is not ported (one thread).
+    fn release_open_refs(&self) {
+        if self.open_projects.borrow().is_empty() && self.open_files.borrow().is_empty() {
+            return;
+        }
+
+        let mut api_request = project::APISnapshotRequest::default();
+        if !self.open_projects.borrow().is_empty() {
+            api_request.close_projects = Some(self.open_projects.borrow().clone());
+        }
+        if !self.open_files.borrow().is_empty() {
+            api_request.close_files = Some(self.open_files.borrow().clone());
+        }
+        let (snapshot, err) = self.project_session.api_update(
+            &gostd::context::background(),
+            &project::FileChangeSummary::default(),
+            api_request,
+        );
+        // APIUpdate returns a ref'd snapshot even on error; always release it.
+        project::Snapshot::deref(&snapshot, &self.project_session);
+        if err.is_some() {
+            return;
+        }
+
+        self.open_projects.borrow_mut().clear();
+        self.open_files.borrow_mut().clear();
     }
 }
 
-// Go: api/session.go:2149 formatSessionID
+// Go: api/session.go:2897 formatSessionID
 pub fn format_session_id(id: u64) -> String {
     format!("api-session-{id}")
 }
 
 impl Session {
-    // Go: api/session.go:2154 toAbsoluteFileName
-    // toAbsoluteFileName converts a file name to an absolute path.
-    pub fn to_absolute_file_name(&self, file_name: &str) -> String {
-        tspath::get_normalized_absolute_path(
-            file_name,
-            &self.project_session.get_current_directory(),
-        )
-    }
-
-    // Go: api/session.go:2159 toPath
+    // Go: api/session.go:2902 toPath
     // toPath converts a file name to a normalized path.
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         tspath::to_path(
@@ -1202,7 +1603,7 @@ impl Session {
         )
     }
 
-    // Go: api/session.go:2164 toFileChangeSummary
+    // Go: api/session.go:2907 toFileChangeSummary
     // toFileChangeSummary converts API file changes to a project.FileChangeSummary.
     pub fn to_file_change_summary(
         &self,
@@ -1217,16 +1618,17 @@ impl Session {
             summary.includes_watch_change_outside_node_modules = true;
             return summary;
         }
+        let cwd = self.project_session.get_current_directory();
         for doc in &changes.changed {
-            let uri = doc.to_uri();
+            let uri = doc.to_uri(&cwd);
             summary.changed.insert(uri);
         }
         for doc in &changes.created {
-            let uri = doc.to_uri();
+            let uri = doc.to_uri(&cwd);
             summary.created.insert(uri);
         }
         for doc in &changes.deleted {
-            let uri = doc.to_uri();
+            let uri = doc.to_uri(&cwd);
             summary.deleted.insert(uri);
         }
         if summary.changed.len() + summary.created.len() + summary.deleted.len() > 0 {
@@ -1581,7 +1983,7 @@ impl Session {
                 let (checker, _) = symbol_checker.get_or_insert_with(|| {
                     ls_program::get_type_checker_for_file(program, ctx, source_file)
                 });
-                entry.symbol = sd.new_symbol_response(checker, item.symbol);
+                entry.symbol = sd.new_symbol_response(checker, item.symbol, &params.project);
             }
             entries.push(entry);
         }
@@ -1650,7 +2052,7 @@ impl Session {
             };
             let sym = entry.definition_symbol();
             if sym.is_some() {
-                re.symbol = sd.new_symbol_response(&checker, sym);
+                re.symbol = sd.new_symbol_response(&checker, sym, &params.project);
             }
             result.push(re);
         }

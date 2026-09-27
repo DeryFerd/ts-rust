@@ -2654,3 +2654,4 @@ pub static Fix_All: &Message = &CATALOG[2149];
 pub static Organize_Imports: &Message = &CATALOG[2150];
 pub static Remove_Unused_Imports: &Message = &CATALOG[2151];
 pub static Sort_Imports: &Message = &CATALOG[2152];
+pub static JSDoc_comment: &Message = &CATALOG[2153];

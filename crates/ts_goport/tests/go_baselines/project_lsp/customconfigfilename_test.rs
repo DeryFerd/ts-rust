@@ -141,17 +141,14 @@ child_test! {
     }
 }
 
-/// Go `lsutil.ParseUserPreferences(map[string]any{"js/ts": {"native-preview": {"customConfigFileName": name}}})`.
+/// Go `lsutil.ParseUserPreferences(map[string]any{"js/ts": {"customConfigFileName": name}})`.
 fn parse_custom_config_file_name(name: &str) -> lsutil::UserPreferences {
     let mut items = indexmap::IndexMap::new();
     items.insert(
         "js/ts".to_string(),
         lsp_object(vec![(
-            "native-preview",
-            lsp_object(vec![(
-                "customConfigFileName",
-                LspAny::String(name.to_string()),
-            )]),
+            "customConfigFileName",
+            LspAny::String(name.to_string()),
         )]),
     );
     lsutil::parse_user_preferences(&items)
@@ -177,7 +174,7 @@ fn rejects_path_traversal_in_custom_config_file_name() {
     }
 }
 
-// Go: customconfigfilename_test.go:179 TestCustomConfigFileName/accepts plain base file names in customConfigFileName
+// Go: customconfigfilename_test.go:177 TestCustomConfigFileName/accepts plain base file names in customConfigFileName
 #[test]
 fn accepts_plain_base_file_names_in_custom_config_file_name() {
     for valid_name in [
@@ -194,7 +191,7 @@ fn accepts_plain_base_file_names_in_custom_config_file_name() {
 }
 
 child_test! {
-    // Go: customconfigfilename_test.go:198 TestCustomConfigFileName/cleans up inferred project when custom config covers file
+    // Go: customconfigfilename_test.go:194 TestCustomConfigFileName/cleans up inferred project when custom config covers file
     fn cleans_up_inferred_project_when_custom_config_covers_file() {
         let files_no_config = files(&[
             (

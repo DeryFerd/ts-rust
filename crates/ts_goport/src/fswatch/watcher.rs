@@ -1198,14 +1198,9 @@ pub fn new_dir_watch(
 /// physicalDirFor returns the physical path to watch for dir. If dir, or an
 /// ancestor of dir, is a symlink or reparse point, events are subscribed on its
 /// realpath while callbacks still use dir.
-///
-/// PORT: Go calls `nativepath.Realpath` (Linux: open with O_PATH, then
-/// readlink of /proc/self/fd/N). The nativepath package is not ported yet;
-/// `std::fs::canonicalize` gives the same absolute path for an existing path
-/// and fails where Go fails, which returns dir.
 pub fn physical_dir_for(dir: &str) -> String {
-    let realpath = match std::fs::canonicalize(os_path(dir)) {
-        Ok(realpath) => go_string_from_os(realpath),
+    let realpath = match crate::frontend::nativepath::realpath(dir) {
+        Ok(realpath) => realpath,
         Err(_) => return dir.to_string(),
     };
     if realpath == dir {

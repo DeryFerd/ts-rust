@@ -82,7 +82,7 @@ pub fn new_snapshot(
         configured_projects: FxHashMap::default(),
         open_files: open_file_paths(&fs.overlays),
         inferred_project: None,
-        api_opened_projects: FxHashSet::default(),
+        api_state: APIState::default(),
         open_configured_projects: std::cell::OnceCell::new(),
     });
     Rc::new(Snapshot {
@@ -287,10 +287,14 @@ impl ls::Host for Snapshot {
 
 // Go: project/snapshot.go:159 APISnapshotRequest
 // PORT: Go `*collections.Set[T]` is `Option<FxHashSet<T>>` (nil is `None`).
+// `open_files` is an `IndexSet`, so API-opened files enter the API state in
+// request order (Go map order is random).
 #[derive(Clone, Debug, Default)]
 pub struct APISnapshotRequest {
     pub open_projects: Option<FxHashSet<String>>,
     pub close_projects: Option<FxHashSet<tspath::Path>>,
+    pub open_files: Option<IndexSet<lsproto::DocumentUri>>,
+    pub close_files: Option<FxHashSet<tspath::Path>>,
 }
 
 // Go: project/snapshot.go:164 ProjectTreeRequest
@@ -586,7 +590,7 @@ impl Snapshot {
             fs.clone(),
             self.project_collection.clone(),
             self.config_file_registry.clone(),
-            &self.project_collection.api_opened_projects,
+            &self.project_collection.api_state,
             compiler_options_for_inferred_projects.clone(),
             self.session_options.clone(),
             &custom_config_file_name,

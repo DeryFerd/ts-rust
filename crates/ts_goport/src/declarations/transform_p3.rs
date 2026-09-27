@@ -862,11 +862,11 @@ impl DeclarationTransformer {
                 {
                     // there is a base type any assignments might be "from"
                     self.tracker.report_inference_fallback(this_target); // Add an isolated declarations error on this class - we can't know how to transform this prop into an assignment without referring to type information
-                    let decls = self
+                    if self
                         .resolver
-                        .get_base_declarations_for_property_declaration(node);
-                    if !decls.is_empty() {
-                        break 'case_block; // property lightly overrides a property in a base type - skip it
+                        .is_this_property_assignment_declaration_redundant(node)
+                    {
+                        break 'case_block; // skip assignments whose member is already provided by an `extends` base type (an inherited accessor/method, or an identical inherited property)
                         // TODO: If the property has an explicit `@type` annotation, we should probably emit it (maybe with an `override` modifier) instead of skipping it
                     }
                 }

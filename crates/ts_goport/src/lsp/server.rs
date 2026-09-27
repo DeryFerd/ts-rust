@@ -990,11 +990,14 @@ impl ServerShared {
             {
                 let req = msg.as_request();
                 if req.method == lsproto::Method::INITIALIZE {
-                    // Go: req.Params.(*lsproto.InitializeParams)
-                    let params = request_params::<lsproto::InitializeParams>(req).expect(
-                        "interface conversion: interface is nil, not *lsproto.InitializeParams",
-                    );
-                    let resp = self.handle_initialize(ctx, Some(params), req)?;
+                    let params = match lsproto::unmarshal_params::<lsproto::InitializeParams>(req) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            self.send_error(req.id.clone(), err)?;
+                            continue;
+                        }
+                    };
+                    let resp = self.handle_initialize(ctx, Some(&params), req)?;
                     self.send_result(req.id.clone(), Box::new(resp))?;
                 } else {
                     self.send_error(
@@ -1016,11 +1019,9 @@ impl ServerShared {
             } else {
                 let req = msg.into_request();
                 if req.method == lsproto::Method::CANCEL_REQUEST {
-                    // Go: req.Params.(*lsproto.CancelParams).Id
-                    let params = request_params::<lsproto::CancelParams>(&req).expect(
-                        "interface conversion: interface is nil, not *lsproto.CancelParams",
-                    );
-                    self.cancel_request(&params.id);
+                    if let Ok(params) = lsproto::unmarshal_params::<lsproto::CancelParams>(&req) {
+                        self.cancel_request(&params.id);
+                    }
                 } else {
                     if cancels_warm_auto_import(&req.method) {
                         // PORT: Go's handler cancels the warm when the
@@ -1197,7 +1198,10 @@ impl ServerShared {
 // otherwise a deadlock can occur.
 // PORT: the reader thread delivers the response, so the dispatch thread can
 // wait here in the sync portion too (Go's handleInitialized does).
-pub fn send_client_request<Req: AnyValue, Resp: 'static>(
+pub fn send_client_request<
+    Req: AnyValue,
+    Resp: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+>(
     ctx: &Context,
     s: &ServerShared,
     info: &lsproto::RequestInfo<Req, Resp>,
@@ -1449,19 +1453,6 @@ pub type Handler = Box<
         + Sync,
 >;
 pub type HandlerMap = FxHashMap<lsproto::Method, Handler>;
-
-/// Go `req.Params.(Req)` after the nil check of the register helpers:
-/// `None` when the request has no params.
-pub fn request_params<Req: 'static>(req: &lsproto::RequestMessage) -> Option<&Req> {
-    req.params.as_deref().map(|params| {
-        params.downcast_ref::<Req>().unwrap_or_else(|| {
-            panic!(
-                "interface conversion: interface {{}} is not {}",
-                std::any::type_name::<Req>()
-            )
-        })
-    })
-}
 
 // Go: server.go:738 handlers
 static HANDLERS: LazyLock<HandlerMap> = LazyLock::new(|| {
@@ -1756,11 +1747,14 @@ pub fn handlers() -> &'static HandlerMap {
     &HANDLERS
 }
 
-// Go: server.go:808 registerNotificationHandler
+// Go: server.go:817 registerNotificationHandler
 // PORT: Go `fn func(*Server, context.Context, Req) error`. `Req` is a
 // pointer type (or `NoParams`), so the handler gets `Option<&Req>` (`None`
-// is a nil pointer).
-pub fn register_notification_handler<Req: 'static>(
+// is a nil pointer). `lsproto.UnmarshalParams` never gives a nil pointer
+// without an error, so the register helpers pass `Some`.
+pub fn register_notification_handler<
+    Req: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+>(
     handlers: &mut HandlerMap,
     info: lsproto::NotificationInfo<Req>,
     fn_: fn(&Rc<Server>, &Context, Option<&Req>) -> Result<(), GoError>,
@@ -1776,9 +1770,8 @@ pub fn register_notification_handler<Req: 'static>(
                     return Err(errors::from_value(ErrorCode::SERVER_NOT_INITIALIZED));
                 }
 
-                // Ignore empty params; all generated params are either pointers or any.
-                let params = request_params::<Req>(req);
-                fn_(s, ctx, params)?;
+                let params = lsproto::unmarshal_params::<Req>(req)?;
+                fn_(s, ctx, Some(&params))?;
                 match ctx.err() {
                     Some(err) => Err(err),
                     None => Ok(None),
@@ -1788,9 +1781,12 @@ pub fn register_notification_handler<Req: 'static>(
     );
 }
 
-// Go: server.go:826 registerRequestHandler
+// Go: server.go:834 registerRequestHandler
 // PORT: `params` as in `register_notification_handler`.
-pub fn register_request_handler<Req: 'static, Resp: AnyValue>(
+pub fn register_request_handler<
+    Req: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+    Resp: AnyValue,
+>(
     handlers: &mut HandlerMap,
     info: lsproto::RequestInfo<Req, Resp>,
     fn_: fn(
@@ -1811,9 +1807,8 @@ pub fn register_request_handler<Req: 'static, Resp: AnyValue>(
                     return Err(errors::from_value(ErrorCode::SERVER_NOT_INITIALIZED));
                 }
 
-                // Ignore empty params.
-                let params = request_params::<Req>(req);
-                let resp = fn_(s, ctx, params, req)?;
+                let params = lsproto::unmarshal_params::<Req>(req)?;
+                let resp = fn_(s, ctx, Some(&params), req)?;
                 if let Some(err) = ctx.err() {
                     return Err(err);
                 }
@@ -1824,11 +1819,12 @@ pub fn register_request_handler<Req: 'static, Resp: AnyValue>(
     );
 }
 
-// Go: server.go:852 registerLanguageServiceDocumentRequestHandler
+// Go: server.go:859 registerLanguageServiceDocumentRequestHandler
 // PORT: Go calls `params.TextDocumentURI()` in the sync part, which
-// dereferences the params pointer, so `fn` gets `&Req`.
+// dereferences the params pointer, so `fn` gets `&Req`. The async part
+// owns the decoded params (Go captures the pointer).
 pub fn register_language_service_document_request_handler<
-    Req: HasTextDocumentURI + 'static,
+    Req: HasTextDocumentURI + crate::frontend::json::UnmarshalerFrom + Default + 'static,
     Resp: AnyValue,
 >(
     handlers: &mut HandlerMap,
@@ -1842,11 +1838,10 @@ pub fn register_language_service_document_request_handler<
                   ctx: &Context,
                   req: &Rc<lsproto::RequestMessage>|
                   -> Result<Option<AsyncWork>, GoError> {
-                // Ignore empty params.
-                let params = request_params::<Req>(req);
+                let params = lsproto::unmarshal_params::<Req>(req)?;
                 let ls = s
                     .session_ref()
-                    .get_language_service(ctx, &params.expect(NIL_DEREF).text_document_uri())?;
+                    .get_language_service(ctx, &params.text_document_uri())?;
                 let s = s.clone();
                 let ctx = ctx.clone();
                 let req = req.clone();
@@ -1855,8 +1850,7 @@ pub fn register_language_service_document_request_handler<
                         &req,
                         || -> Result<(), GoError> { Ok(()) },
                         || {
-                            let params = request_params::<Req>(&req).expect(NIL_DEREF);
-                            let result = fn_(&s, &ctx, &ls, params);
+                            let result = fn_(&s, &ctx, &ls, &params);
                             // After any language service request, check if new global diagnostics were
                             // discovered during checking and push updated tsconfig diagnostics if so.
                             s.session_ref().enqueue_publish_global_diagnostics();
@@ -1873,9 +1867,10 @@ pub fn register_language_service_document_request_handler<
     );
 }
 
-// Go: server.go:880 registerLanguageServiceWithAutoImportsRequestHandler
+// Go: server.go:886 registerLanguageServiceWithAutoImportsRequestHandler
+// PORT: the async part owns the decoded params (Go captures the pointer).
 pub fn register_language_service_with_auto_imports_request_handler<
-    Req: HasTextDocumentURI + 'static,
+    Req: HasTextDocumentURI + crate::frontend::json::UnmarshalerFrom + Default + 'static,
     Resp: AnyValue,
 >(
     handlers: &mut HandlerMap,
@@ -1890,9 +1885,8 @@ pub fn register_language_service_with_auto_imports_request_handler<
                   ctx: &Context,
                   req: &Rc<lsproto::RequestMessage>|
                   -> Result<Option<AsyncWork>, GoError> {
-            // Ignore empty params.
-            let params = request_params::<Req>(req);
-            let uri = params.expect(NIL_DEREF).text_document_uri();
+            let params = lsproto::unmarshal_params::<Req>(req)?;
+            let uri = params.text_document_uri();
             let s = s.clone();
             let ctx = ctx.clone();
             let req = req.clone();
@@ -1907,9 +1901,8 @@ pub fn register_language_service_with_auto_imports_request_handler<
                             &req,
                             || -> Result<(), GoError> { Ok(()) },
                             || {
-                                let params = request_params::<Req>(&req).expect(NIL_DEREF);
                                 let mut language_service = language_service;
-                                let mut result = fn_(&s, &ctx, &language_service, params);
+                                let mut result = fn_(&s, &ctx, &language_service, &params);
                                 if let Err(ls_err) = &result {
                                     if errors::is(ls_err, &ls::ERR_NEEDS_AUTO_IMPORTS) {
                                         language_service = s
@@ -1920,7 +1913,7 @@ pub fn register_language_service_with_auto_imports_request_handler<
                                         if let Some(err) = ctx.err() {
                                             return Err(err);
                                         }
-                                        result = fn_(&s, &ctx, &language_service, params);
+                                        result = fn_(&s, &ctx, &language_service, &params);
                                         if let Err(ls_err) = &result {
                                             if errors::is(ls_err, &ls::ERR_NEEDS_AUTO_IMPORTS) {
                                                 panic!(
@@ -1945,9 +1938,10 @@ pub fn register_language_service_with_auto_imports_request_handler<
     );
 }
 
-// Go: server.go:916 registerMultiProjectReferenceRequestHandler
+// Go: server.go:921 registerMultiProjectReferenceRequestHandler
+// PORT: the async part owns the decoded params (Go captures the pointer).
 pub fn register_multi_project_reference_request_handler<
-    Req: HasTextDocumentPosition + 'static,
+    Req: HasTextDocumentPosition + crate::frontend::json::UnmarshalerFrom + Default + 'static,
     Resp: AnyValue,
 >(
     handlers: &mut HandlerMap,
@@ -1966,13 +1960,12 @@ pub fn register_multi_project_reference_request_handler<
                   ctx: &Context,
                   req: &Rc<lsproto::RequestMessage>|
                   -> Result<Option<AsyncWork>, GoError> {
-                // Ignore empty params.
-                let params = request_params::<Req>(req);
+                let params = lsproto::unmarshal_params::<Req>(req)?;
                 // !!! sheetal: multiple projects that contain the file through symlinks
                 let (default_ls, orchestrator) = s
                     .get_language_service_and_cross_project_orchestrator(
                         ctx,
-                        &params.expect(NIL_DEREF).text_document_uri(),
+                        &params.text_document_uri(),
                         req,
                     )?;
                 let s = s.clone();
@@ -1983,8 +1976,7 @@ pub fn register_multi_project_reference_request_handler<
                         &req,
                         || -> Result<(), GoError> { Ok(()) },
                         || {
-                            let params = request_params::<Req>(&req).expect(NIL_DEREF);
-                            let resp = fn_(&default_ls, &ctx, params, Some(&orchestrator))?;
+                            let resp = fn_(&default_ls, &ctx, &params, Some(&orchestrator))?;
                             if let Some(err) = ctx.err() {
                                 return Err(err);
                             }

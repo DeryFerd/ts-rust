@@ -446,7 +446,7 @@ impl Checker {
             }
             let mut name = lit.text().to_string();
             let original_name = name.clone();
-            let node_symbol = self.symbol_node_links.get(parent).resolved_symbol;
+            let node_symbol = self.try_get_resolved_symbol_from_type_node(b, parent);
             let mut meaning = SymbolFlags::TYPE;
             if parent.is_type_of() {
                 meaning = SymbolFlags::VALUE;
@@ -892,7 +892,10 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         if is_const_type_reference(node) {
             return Node::NIL;
         }
-        let s = self.ctx.c.symbol_node_links.get(node).resolved_symbol;
+        let s = self
+            .ctx
+            .c
+            .try_get_resolved_symbol_from_type_node(self.ctx.b, node);
         if s.is_nil() {
             return Node::NIL; // ???
         }
@@ -909,7 +912,18 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                 return Node::NIL; // refers to type parameter remapped by context (TODO improvement: just return the remapped param name?)
             }
         }
-        // TODO: further bails in JSdoc - not required anymore due to dropped behavior/reparser?
+        let b = self.ctx.b;
+        let node_type = self.ctx.c.nb_get_type_from_type_node(b, node, false);
+        if !self
+            .ctx
+            .c
+            .can_reuse_existing_js_type_node(b, node, node_type)
+        {
+            // fallback to serialization for jsdoc types that have insufficient or incomplete type args, or are remapped by the checker in only jsdoc contexts
+            // TODO: remappings like `promise` -> `Promise<any>` are static, we *could* statically remap the nodes, too. But that only matters for `isolatedDeclarations`
+            // in JS, should we enable that.
+            return Node::NIL;
+        }
         let (introduces_error, new_name, _) =
             self.track_existing_entity_name(node.type_name(), Node::NIL);
         if !introduces_error {

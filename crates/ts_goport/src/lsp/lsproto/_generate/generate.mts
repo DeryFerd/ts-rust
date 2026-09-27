@@ -3480,47 +3480,10 @@ function generateCode(): Map<string, string> {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Dispatch (unmarshalParams, unmarshalResult)
-    // ------------------------------------------------------------------
-    startFile("dispatch.rs");
-
-    // Generate unmarshalParams function
-    writeLine("// Go: unmarshalParams");
-    writeLine("// PORT: Go switches on the Method consts; each arm here compares with the same const.");
-    writeLine("pub fn unmarshal_params(method: &Method, data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {");
-    writeLine("    match method {");
-
-    // Requests and notifications
-    for (const request of requestsAndNotifications) {
-        const methodName = methodNameIdentifier(request.method);
-
-        if (!request.params) {
-            writeLine(`        m if *m == Method::${rustConstName(methodName)} => unmarshal_empty(data),`);
-            continue;
-        }
-        if (Array.isArray(request.params)) {
-            throw new Error("Unexpected array type for request params: " + JSON.stringify(request.params));
-        }
-
-        const resolvedType = resolveType(request.params);
-
-        if (resolvedType.name === "any") {
-            writeLine(`        m if *m == Method::${rustConstName(methodName)} => unmarshal_any(data),`);
-        }
-        else {
-            const rustType = goTypeToRust(resolvedType.name);
-            writeLine(`        m if *m == Method::${rustConstName(methodName)} => {`);
-            writeLine(`            let v: Box<${rustType}> = unmarshal_ptr_to::<${rustType}>(data)?.into();`);
-            writeLine(`            Ok(Some(v as Box<dyn AnyValue>))`);
-            writeLine(`        }`);
-        }
-    }
-
-    writeLine("        _ => unmarshal_any(data),");
-    writeLine("    }");
-    writeLine("}");
-    writeLine("");
+    // PORT: Go tsgo#4471 stopped generating `unmarshalParams` and
+    // `unmarshalResult`: inbound params stay raw JSON until the handler
+    // decodes them (`lsp.rs` `unmarshal_params`), and `RequestInfo`
+    // decodes a result into its own type. So no dispatch.rs is written.
 
     function responseTypeNameOf(request: Request | Notification): string {
         const methodName = methodNameIdentifier(request.method);
@@ -3530,30 +3493,6 @@ function generateCode(): Map<string, string> {
         return `${methodName}Response`;
     }
 
-    // Generate unmarshalResult function
-    writeLine("// Go: unmarshalResult");
-    writeLine("pub fn unmarshal_result(method: &Method, data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {");
-    writeLine("    match method {");
-
-    // Only requests have results, not notifications
-    for (const request of model.requests) {
-        const methodName = methodNameIdentifier(request.method);
-
-        if (!("result" in request)) {
-            continue;
-        }
-
-        const responseTypeName = responseTypeNameOf(request);
-        writeLine(`        m if *m == Method::${rustConstName(methodName)} => {`);
-        writeLine(`            let v: Box<${responseTypeName}> = unmarshal_value::<${responseTypeName}>(data)?.into();`);
-        writeLine(`            Ok(Some(v as Box<dyn AnyValue>))`);
-        writeLine(`        }`);
-    }
-
-    writeLine("        _ => unmarshal_any(data),");
-    writeLine("    }");
-    writeLine("}");
-    writeLine("");
 
     // ------------------------------------------------------------------
     // Methods, response types, type mapping info, type aliases

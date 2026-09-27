@@ -1340,7 +1340,7 @@ pub fn get_relevant_tokens(position: i32, file: Node) -> (Node, Node) {
 }
 
 // Go: ls/completions.go:2701 CompletionsTriggerCharacter
-// "." | '"' | "'" | "`" | "/" | "@" | "<" | "#" | " "
+// "." | '"' | "'" | "`" | "/" | "@" | "<" | "#" | " " | "*"
 pub type CompletionsTriggerCharacter = String;
 
 // Go: ls/completions.go:2703 isValidTrigger
@@ -1387,6 +1387,7 @@ pub fn is_valid_trigger(
                 && context_token.kind() == SyntaxKind::ImportKeyword
                 && context_token.parent().kind() == SyntaxKind::SourceFile
         }
+        "*" => is_potentially_valid_js_doc_snippet_completion_position(file, position),
         _ => panic!("Unknown trigger character: {trigger_character}"),
     }
 }

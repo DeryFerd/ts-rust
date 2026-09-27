@@ -68,6 +68,14 @@ pub struct SnapshotData {
     // querying the same symbol from two different projects returns the same handle.
     pub symbol_registry: RefCell<FxHashMap<SymbolID, (Rc<RefCell<Checker>>, SymbolId)>>,
 
+    // symbolCanonicalProjects records, for each registered symbol, the project it was
+    // first observed in. Because symbols are shared snapshot-wide (binder symbols are
+    // attached to source files, which can be shared across projects), lookups that need
+    // a project context (e.g. member/export ordering, node handle resolution) but don't
+    // receive one from the caller default to this canonical project. First-writer wins so
+    // the choice is stable. Guarded by symbolRegistryMu.
+    pub symbol_canonical_projects: RefCell<FxHashMap<SymbolID, ProjectID>>,
+
     pub project_registries: RefCell<FxHashMap<ProjectID, Rc<ProjectRegistryData>>>,
 }
 
@@ -158,23 +166,29 @@ impl SnapshotData {
             .clone()
     }
 
-    // Go: api/session.go:75 newSymbolResponse
+    // Go: api/session.go:135 newSymbolResponse
     // newSymbolResponse registers a symbol in the snapshot's registry and returns the response.
+    // canonicalProject is the project the symbol was observed in and must be non-empty; it is recorded
+    // as the symbol's canonical project (first writer wins) and returned to the client so it can default
+    // project-scoped follow-up lookups (members/exports, node resolution) to it.
     // PORT: `checker` owns `symbol`; its arena holds the symbol data.
     pub fn new_symbol_response(
         &self,
         checker: &Rc<RefCell<Checker>>,
         symbol: SymbolId,
+        canonical_project: &ProjectID,
     ) -> Option<SymbolResponse> {
         if symbol.is_nil() {
             return None;
         }
 
+        let (id, project) = self.register_symbol(checker, symbol, canonical_project);
         let c = checker.borrow();
         let sym = c.sym(symbol);
         let mut resp = SymbolResponse {
-            id: self.register_symbol(checker, symbol),
-            name: sym.name.as_str().to_string(),
+            id,
+            project,
+            name: escape_symbol_name(sym.name.as_str()),
             flags: sym.flags.0,
             check_flags: sym.check_flags.0,
             ..Default::default()
@@ -203,10 +217,23 @@ impl SnapshotData {
         Some(resp)
     }
 
-    // Go: api/session.go:111 registerSymbol
-    pub fn register_symbol(&self, checker: &Rc<RefCell<Checker>>, symbol: SymbolId) -> SymbolID {
+    // Go: api/session.go:176 registerSymbol
+    // registerSymbol registers a symbol in the snapshot's registry and returns its handle along with
+    // its canonical project. The canonical project is the project the symbol was first observed in
+    // (first writer wins for stability) and is always non-empty: every symbol handed to a client must
+    // carry a project so that project-scoped follow-up lookups (members/exports, parent, node
+    // resolution) have a default context. Callers must supply a non-empty project.
+    pub fn register_symbol(
+        &self,
+        checker: &Rc<RefCell<Checker>>,
+        symbol: SymbolId,
+        canonical_project: &ProjectID,
+    ) -> (SymbolID, ProjectID) {
         if symbol.is_nil() {
-            return SymbolID(0);
+            return (SymbolID(0), ProjectID::default());
+        }
+        if canonical_project.0.is_empty() {
+            panic!("registerSymbol requires a non-empty canonical project");
         }
         let id = symbol_handle(&checker.borrow().symbols, symbol);
         let mut registry = self.symbol_registry.borrow_mut();
@@ -226,10 +253,16 @@ impl SnapshotData {
             if !same {
                 panic!("duplicate symbol");
             }
-            return id;
+        } else {
+            registry.insert(id, (checker.clone(), symbol));
         }
-        registry.insert(id, (checker.clone(), symbol));
-        id
+        let project = self
+            .symbol_canonical_projects
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| canonical_project.clone())
+            .clone();
+        (id, project)
     }
 
     // Go: api/session.go:129 newTypeResponse
@@ -536,12 +569,22 @@ pub struct Session {
     // This is set to true when using MessagePackProtocol.
     pub use_binary_responses: bool,
 
-    // snapshots maps snapshot handles to their data.
-    // Each snapshot has its own symbol/type registries.
+    // snapshots maps snapshot handles to their data. Each snapshot has its own
+    // symbol/type registries.
+    // PORT: the port is one thread, so the Go `snapshotsMu` and `updateMu`
+    // locks are not ported.
     pub snapshots: RefCell<FxHashMap<SnapshotID, Rc<SnapshotData>>>,
 
-    // latestSnapshot tracks the most recently created snapshot for computing diffs.
+    // latestSnapshot tracks the most recently created snapshot, used as the diff base
+    // for the next update.
     pub latest_snapshot: Cell<SnapshotID>,
+
+    // openProjects and openFiles track the projects and files this session
+    // currently holds open in the project session's API state. The session holds
+    // at most one ref per project/file (opens are idempotent), so it can release
+    // exactly those refs on Close and never send a close for a ref it doesn't hold.
+    pub open_projects: RefCell<FxHashSet<tspath::Path>>,
+    pub open_files: RefCell<FxHashSet<tspath::Path>>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
 }
@@ -571,6 +614,8 @@ pub fn new_session(
         use_binary_responses: false,
         snapshots: RefCell::new(FxHashMap::default()),
         latest_snapshot: Cell::new(SnapshotID(0)),
+        open_projects: RefCell::new(FxHashSet::default()),
+        open_files: RefCell::new(FxHashSet::default()),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
@@ -618,7 +663,8 @@ impl CheckerSetup {
 
     // Go: api/session.go:468 checkerSetup.newSymbolResponse
     pub fn new_symbol_response(&self, sym: SymbolId) -> Option<SymbolResponse> {
-        self.sd.new_symbol_response(&self.checker, sym)
+        self.sd
+            .new_symbol_response(&self.checker, sym, &self.project_id)
     }
 
     // Go: api/session.go:472 checkerSetup.newSignatureResponse
@@ -820,6 +866,9 @@ impl Handler for Session {
             m if m == Method::GET_SOURCE_FILE_NAMES.0 => self
                 .handle_get_source_file_names(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
+                .handle_get_source_file_metadata(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_SYMBOL_AT_POSITION.0 => self
                 .handle_get_symbol_at_position(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -922,6 +971,12 @@ impl Handler for Session {
             m if m == Method::GET_CONSTRAINT_OF_TYPE.0 => self
                 .handle_get_constraint_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_TRUE_TYPE_OF_CONDITIONAL_TYPE.0 => self
+                .handle_get_true_type_of_conditional_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_FALSE_TYPE_OF_CONDITIONAL_TYPE.0 => self
+                .handle_get_false_type_of_conditional_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TYPE_PARAMETERS_OF_SIGNATURE.0 => self
                 .handle_get_type_parameters_of_signature(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -997,20 +1052,53 @@ impl Handler for Session {
             m if m == Method::GET_APPARENT_TYPE.0 => self
                 .handle_get_apparent_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_PROPERTY_OF_TYPE.0 => self
+                .handle_get_property_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_INDEX_INFOS_OF_TYPE.0 => self
                 .handle_get_index_infos_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_CONSTRAINT_OF_TYPE_PARAMETER.0 => self
                 .handle_get_constraint_of_type_parameter(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_BASE_CONSTRAINT_OF_TYPE.0 => self
+                .handle_get_base_constraint_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TYPE_ARGUMENTS.0 => self
                 .handle_get_type_arguments(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_CONSTANT_VALUE.0 => {
+                self.handle_get_constant_value(ctx, assert_params(&parsed))
+            }
+            m if m == Method::GET_SIGNATURE_FROM_DECLARATION.0 => self
+                .handle_get_signature_from_declaration(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_EXPORT_SPECIFIER_LOCAL_TARGET.0 => self
+                .handle_get_export_specifier_local_target_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_ALIASED_SYMBOL.0 => self
+                .handle_get_aliased_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
                 .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_EXPORTS_OF_MODULE.0 => self
+                .handle_get_exports_of_module(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_MEMBER_IN_MODULE_EXPORTS.0 => self
                 .handle_get_member_in_module_exports(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_JS_DOC_TAGS.0 => self
+                .handle_get_js_doc_tags(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_DOCUMENTATION_COMMENT.0 => self
+                .handle_get_documentation_comment(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::IS_ARRAY_TYPE.0 => self
+                .handle_is_array_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::IS_TUPLE_TYPE.0 => self
+                .handle_is_tuple_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_ANY_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_any_type)
@@ -1044,6 +1132,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_ES_SYMBOL_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_es_symbol_type)
+                .map(to_any),
+            m if m == Method::GET_WELL_KNOWN_SYMBOLS.0 => self
+                .handle_get_well_known_symbols(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_SYNTACTIC_DIAGNOSTICS.0 => self
                 .handle_get_syntactic_diagnostics(ctx, assert_params(&parsed))
@@ -1176,46 +1267,137 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:624 handleUpdateSnapshot
-    // handleUpdateSnapshot creates a new snapshot, optionally opening a project.
-    // With no args, it adopts the latest LSP state.
-    // With OpenProject set, it opens the specified project in the new snapshot.
+    // Go: api/session.go:827 handleUpdateSnapshot
+    // handleUpdateSnapshot creates a new snapshot, optionally opening or closing
+    // projects and files. With no args, it adopts the latest LSP state. Opens and
+    // closes are ref-counted per session: the session holds at most one ref per
+    // project/file, so repeated opens are idempotent and a close only releases a ref
+    // the session is actually holding.
+    // PORT: the Go `updateMu` lock is not ported (one thread).
     pub fn handle_update_snapshot(
         &self,
         ctx: &Context,
         params: &UpdateSnapshotParams,
     ) -> Result<UpdateSnapshotResponse, GoError> {
-        let snapshot: Rc<project::Snapshot>;
-
         let file_changes = self.to_file_change_summary(params.file_changes.as_ref());
 
-        if !params.open_project.is_empty() {
-            let config_file_name = self.to_absolute_file_name(&params.open_project);
-            let (_, new_snapshot, err) =
-                self.project_session
-                    .api_open_project(ctx, &config_file_name, &file_changes);
-            if let Some(err) = err {
-                // APIOpenProject returns a ref'd snapshot even on error; release it.
-                project::Snapshot::deref(&new_snapshot, &self.project_session);
-                return Err(errors::errorf(
-                    format!("{}: failed to load project: {}", *ERR_CLIENT_ERROR, err),
-                    vec![ERR_CLIENT_ERROR.clone(), err],
-                ));
+        let mut api_request = project::APISnapshotRequest::default();
+        let cwd = self.project_session.get_current_directory();
+
+        // Open projects: only take a new ref for projects we aren't already holding open.
+        let mut opened_projects: Vec<tspath::Path> = Vec::new();
+        for p in &params.open_projects {
+            let config_file_name = p.to_absolute_file_name(&cwd);
+            let config_path = self.to_path(&config_file_name);
+            if self.open_projects.borrow().contains(&config_path) {
+                continue;
             }
-            snapshot = new_snapshot;
-        } else {
-            // Even when fileChanges is empty, APIUpdateWithFileChanges ensures all projects
-            // opened by the API are up to date. For an API connected to an LSP server, this
-            // brings the API state up to date with the LSP state and ensures projects the
-            // API cares about are ready to be queried.
-            snapshot = self
-                .project_session
-                .api_update_with_file_changes(ctx, &file_changes);
+            api_request
+                .open_projects
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        params.open_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(config_file_name);
+            opened_projects.push(config_path);
         }
 
-        // Create or ref-count snapshot data.
-        // If the same snapshot ID is returned (no changes), we increment the
-        // ref count so each client-side Snapshot can be disposed independently.
+        // Close projects: only release a ref we currently hold.
+        let mut closed_projects: Vec<tspath::Path> = Vec::new();
+        for p in &params.close_projects {
+            let config_path = self.to_path(&p.to_absolute_file_name(&cwd));
+            if !self.open_projects.borrow().contains(&config_path) {
+                continue;
+            }
+            api_request
+                .close_projects
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        params.close_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(config_path.clone());
+            closed_projects.push(config_path);
+        }
+
+        // Open files: only open files we aren't already holding open, so each file is
+        // held by at most one API ref from this session.
+        let mut opened_files: Vec<tspath::Path> = Vec::new();
+        for f in &params.open_files {
+            let uri = f.to_uri(&cwd);
+            let path = self.to_path(&uri.file_name());
+            if self.open_files.borrow().contains(&path) {
+                continue;
+            }
+            api_request
+                .open_files
+                .get_or_insert_with(|| IndexSet::with_capacity(params.open_files.len()))
+                .insert(uri);
+            opened_files.push(path);
+        }
+
+        // Close files: only release a ref we currently hold.
+        let mut closed_files: Vec<tspath::Path> = Vec::new();
+        for f in &params.close_files {
+            let path = self.to_path(&f.to_uri(&cwd).file_name());
+            if !self.open_files.borrow().contains(&path) {
+                continue;
+            }
+            api_request
+                .close_files
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        params.close_files.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(path.clone());
+            closed_files.push(path);
+        }
+
+        // Even when nothing is opened or closed, APIUpdate ensures all projects and
+        // files opened by the API are up to date. For an API connected to an LSP server,
+        // this brings the API state up to date with the LSP state and ensures projects
+        // the API cares about are ready to be queried.
+        let (snapshot, err) = self
+            .project_session
+            .api_update(ctx, &file_changes, api_request);
+        if let Some(err) = err {
+            // APIUpdate returns a ref'd snapshot even on error; release it.
+            project::Snapshot::deref(&snapshot, &self.project_session);
+            return Err(errors::errorf(
+                format!("{}: failed to update snapshot: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+
+        // Commit ref tracking now that the update succeeded.
+        {
+            let mut open_projects = self.open_projects.borrow_mut();
+            for config_path in opened_projects {
+                open_projects.insert(config_path);
+            }
+            for config_path in &closed_projects {
+                open_projects.remove(config_path);
+            }
+        }
+        {
+            let mut open_files = self.open_files.borrow_mut();
+            for path in opened_files {
+                open_files.insert(path);
+            }
+            for path in &closed_files {
+                open_files.remove(path);
+            }
+        }
+
+        // Create or ref-count snapshot data, then atomically read the previous latest
+        // snapshot (the diff base) and advance latestSnapshot to the new handle.
+        // If the same snapshot ID is returned (no changes), we increment the ref count
+        // so each client-side Snapshot can be disposed independently.
         let handle = snapshot_handle(&snapshot);
         let existing = self.snapshots.borrow().get(&handle).cloned();
         if let Some(sd) = existing {
@@ -1228,10 +1410,17 @@ impl Session {
                 snapshot: snapshot.clone(),
                 ref_count: Cell::new(1),
                 symbol_registry: RefCell::new(FxHashMap::default()),
+                symbol_canonical_projects: RefCell::new(FxHashMap::default()),
                 project_registries: RefCell::new(FxHashMap::default()),
             });
             self.snapshots.borrow_mut().insert(handle, sd);
         }
+        let prev_sd = self
+            .snapshots
+            .borrow()
+            .get(&self.latest_snapshot.get())
+            .cloned();
+        self.latest_snapshot.set(handle);
 
         // Build projects list
         let projects = snapshot.project_collection.projects();
@@ -1245,17 +1434,9 @@ impl Session {
 
         // Compute changes from the previous latest snapshot
         let mut changes: Option<SnapshotChanges> = None;
-        let prev_sd = self
-            .snapshots
-            .borrow()
-            .get(&self.latest_snapshot.get())
-            .cloned();
         if let Some(prev_sd) = prev_sd {
             changes = Some(compute_snapshot_changes(&prev_sd.snapshot, &snapshot));
         }
-
-        // Update the latest snapshot
-        self.latest_snapshot.set(handle);
 
         Ok(UpdateSnapshotResponse {
             snapshot: handle,
@@ -1298,29 +1479,25 @@ impl Session {
         Ok(to_any(true))
     }
 
-    // Go: api/session.go:721 handleGetDefaultProjectForFile
-    // handleGetDefaultProjectForFile returns the default project for a given file.
+    // Go: api/session.go:997 handleGetDefaultProjectForFile
+    // handleGetDefaultProjectForFile returns the default project for a given file,
+    // or nil if no project currently contains the file.
     pub fn handle_get_default_project_for_file(
         &self,
         _ctx: &Context,
         params: &GetDefaultProjectForFileParams,
-    ) -> Result<ProjectResponse, GoError> {
+    ) -> Result<Option<ProjectResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let uri = params.file.to_uri();
+        let uri = params
+            .file
+            .to_uri(&self.project_session.get_current_directory());
         let proj = sd.snapshot.get_default_project(&uri);
         let Some(proj) = proj else {
-            return Err(errors::errorf(
-                format!(
-                    "{}: no project found for file {}",
-                    *ERR_CLIENT_ERROR,
-                    params.file.string()
-                ),
-                vec![ERR_CLIENT_ERROR.clone()],
-            ));
+            return Ok(None);
         };
 
-        Ok(new_project_response(&proj.borrow()))
+        Ok(Some(new_project_response(&proj.borrow())))
     }
 
     // Go: api/session.go:737 handleParseConfigFile
@@ -1394,7 +1571,7 @@ impl Session {
             return Ok(None);
         }
 
-        // Encode the full source file
+        // Encode the full source file.
         let data = match encoder::encode_source_file(source_file) {
             Ok((data, _)) => data,
             Err(err) => {
@@ -1431,6 +1608,32 @@ impl Session {
             result.push(source_file.file_name().to_string());
         }
         Ok(result)
+    }
+
+    // Go: api/session.go:1068 handleGetSourceFileMetadata
+    // handleGetSourceFileMetadata returns program-stored metadata for a single source file.
+    // The client fetches this lazily per file and caches it.
+    pub fn handle_get_source_file_metadata(
+        &self,
+        _ctx: &Context,
+        params: &GetSourceFileParams,
+    ) -> Result<Option<SourceFileMetadata>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let Some(source_file) = program.get_source_file(&params.file.to_file_name()) else {
+            return Ok(None);
+        };
+
+        let meta_data = program.get_source_file_meta_data(source_file.path());
+        Ok(Some(SourceFileMetadata {
+            is_default_library: program.is_source_file_default_library(source_file.path()),
+            is_from_external_library: program.is_source_file_from_external_library(&source_file),
+            package_json_type: meta_data.package_json_type,
+            package_json_directory: meta_data.package_json_directory,
+            implied_node_format: meta_data.implied_node_format.0,
+        }))
     }
 
     // Go: api/session.go:804 handleGetSymbolAtPosition
@@ -1904,23 +2107,27 @@ impl Session {
     // Go: api/session.go:1166 handleGetMembersOfSymbol
     pub fn handle_get_members_of_symbol(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetSymbolPropertyParams,
     ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
-        self.resolve_symbol_table_property_of_symbol(params, &|c: &Checker, symbol: SymbolId| {
-            c.sym(symbol).members
-        })
+        self.resolve_symbol_table_property_of_symbol(
+            ctx,
+            params,
+            &|c: &Checker, symbol: SymbolId| c.sym(symbol).members,
+        )
     }
 
     // Go: api/session.go:1172 handleGetExportsOfSymbol
     pub fn handle_get_exports_of_symbol(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetSymbolPropertyParams,
     ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
-        self.resolve_symbol_table_property_of_symbol(params, &|c: &Checker, symbol: SymbolId| {
-            c.sym(symbol).exports
-        })
+        self.resolve_symbol_table_property_of_symbol(
+            ctx,
+            params,
+            &|c: &Checker, symbol: SymbolId| c.sym(symbol).exports,
+        )
     }
 
     // Go: api/session.go:1178 handleGetExportSymbolOfSymbol

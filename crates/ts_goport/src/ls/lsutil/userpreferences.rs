@@ -20,8 +20,8 @@ use std::sync::LazyLock;
 // `IndexMap<String, LspAny>`. Go `nil` is `LspAny::Null`.
 //
 // PORT: Go `[]string` fields tell a nil slice from an empty one. Only
-// `MarshalJSONTo` (nil is skipped) and `WithOverrides` (nil is zero) see the
-// difference. A Rust `Vec` has no nil, so an empty `Vec` counts as nil there.
+// `MarshalJSONTo` (nil is skipped) sees the difference. A Rust `Vec` has no
+// nil, so an empty `Vec` counts as nil there.
 
 // Go: ls/lsutil/userpreferences.go:15 NewDefaultUserPreferences
 pub fn new_default_user_preferences() -> UserPreferences {
@@ -30,9 +30,14 @@ pub fn new_default_user_preferences() -> UserPreferences {
 
         include_completions_for_module_exports: Tristate::True,
         include_completions_for_import_statements: Tristate::True,
+        enable_auto_closing_tags: Tristate::True,
+        enable_js_doc_completions: Tristate::True,
+        generate_return_in_doc_template: Tristate::True,
 
         allow_rename_of_import_path: Tristate::True,
         provide_refactor_not_applicable_reason: Tristate::True,
+        enable_formatting: Tristate::True,
+        enable_validation: Tristate::True,
         display_parts_for_js_doc: Tristate::True,
         disable_line_text_in_references: Tristate::True,
         report_style_checks_as_warnings: Tristate::True,
@@ -87,6 +92,9 @@ pub struct UserPreferences {
     // in addition to `const objectLiteral: T = { foo }`.
     pub include_completions_with_object_literal_method_snippets: Tristate, // !!!
     pub jsx_attribute_completion_style: JsxAttributeCompletionStyle,
+    pub enable_auto_closing_tags: Tristate,
+    pub enable_js_doc_completions: Tristate,
+    pub generate_return_in_doc_template: Tristate,
 
     // ------- AutoImports --------
     pub import_module_specifier_preference: ImportModuleSpecifierPreference, // !!!
@@ -169,10 +177,12 @@ pub struct UserPreferences {
     pub exclude_library_symbols_in_nav_to: Tristate,
 
     // ------- Misc -------
+    pub enable_formatting: Tristate,
+    pub enable_validation: Tristate,
     pub disable_suggestions: Tristate,             // !!!
     pub disable_line_text_in_references: Tristate, // !!!
     pub display_parts_for_js_doc: Tristate,        // !!!
-    pub report_style_checks_as_warnings: Tristate, // !!! If this changes, we need to ask the client to recompute diagnostics
+    pub report_style_checks_as_warnings: Tristate,
 
     // ------- ATA -------
 
@@ -678,7 +688,7 @@ fn type_parsers(t: FieldType) -> Option<fn(&LspAny) -> FieldValue> {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:381 typeSerializers
+// Go: ls/lsutil/userpreferences.go:415 typeSerializers
 // typeSerializers maps reflect.Type to a function that serializes a value of that type.
 // For types which do not serialize as-is (tristate, enums, etc).
 // PORT: the Go map is a match on the field type. The Go type assertion
@@ -747,6 +757,65 @@ fn type_serializers(t: FieldType) -> Option<fn(&FieldValue) -> LspAny> {
                 _ => LspAny::String("auto".to_string()),
             }
         }),
+        // These enums distinguish an unset zero value (e.g. "") from their effective
+        // default (e.g. "auto"): the parser promotes unset/unknown input to the
+        // non-zero default. Plain string serialization would therefore write "" for
+        // an unset field and the parser would read it back as the non-zero default,
+        // breaking round-tripping. Mirror the core.Tristate serializer above and omit
+        // the unset value (return nil) so it decodes back to the zero value. (Enums
+        // whose default already is their zero value, like the OrganizeImports* ones,
+        // round-trip without this.)
+        //
+        // TODO: These three are the only parsers whose fallback is a non-zero value;
+        // every other parser returns its zero value as the fallback. They should be
+        // made consistent: change the parser fallback to return the zero value and
+        // remove this serializer (relying on the default string serialization, which
+        // already omits ""). The consumer must then treat the zero value as the
+        // effective default. The two module-specifier enums are safe to convert (all
+        // read sites already treat the "" zero identically to the promoted default).
+        FieldType::JsxAttributeCompletionStyle => Some(|val: &FieldValue| -> LspAny {
+            // TODO: make consistent with other enums (see note above). Unlike the
+            // module-specifier enums, the consumer in completions.go distinguishes
+            // JsxAttributeCompletionStyleUnknown from ...Auto, so converting this one
+            // requires updating that consumer to treat the zero value as "auto".
+            let FieldValue::JsxAttributeCompletionStyle(v) = val else {
+                panic!(
+                    "interface conversion: interface {{}} is not lsutil.JsxAttributeCompletionStyle"
+                )
+            };
+            if *v != JsxAttributeCompletionStyle::UNKNOWN {
+                return LspAny::String(v.0.to_string());
+            }
+            LspAny::Null
+        }),
+        FieldType::ImportModuleSpecifierPreference => Some(|val: &FieldValue| -> LspAny {
+            // TODO: make consistent with other enums (see note above): have the parser
+            // return the zero value (None) as its fallback and drop this serializer.
+            let FieldValue::ImportModuleSpecifierPreference(_) = val else {
+                panic!(
+                    "interface conversion: interface {{}} is not modulespecifiers.ImportModuleSpecifierPreference"
+                )
+            };
+            let v = val.string();
+            if !v.is_empty() {
+                return LspAny::String(v);
+            }
+            LspAny::Null
+        }),
+        FieldType::ImportModuleSpecifierEndingPreference => Some(|val: &FieldValue| -> LspAny {
+            // TODO: make consistent with other enums (see note above): have the parser
+            // return the zero value (None) as its fallback and drop this serializer.
+            let FieldValue::ImportModuleSpecifierEndingPreference(_) = val else {
+                panic!(
+                    "interface conversion: interface {{}} is not modulespecifiers.ImportModuleSpecifierEndingPreference"
+                )
+            };
+            let v = val.string();
+            if !v.is_empty() {
+                return LspAny::String(v);
+            }
+            LspAny::Null
+        }),
         _ => None,
     }
 }
@@ -780,25 +849,31 @@ fn config_path_parsers(path: &str) -> Option<fn(&LspAny) -> FieldValue> {
 }
 
 // PORT: one Go struct field as `reflect` sees it: the Go field name, the Go
-// `raw` and `config` tags, and accessors that stand for the Go field index
-// path.
+// `raw`, `config` and `fallbackConfig` tags, and accessors that stand for the
+// Go field index path.
 struct StructField {
     name: &'static str,
     raw_tag: &'static str,
     config_tag: &'static str,
+    fallback_config_tag: &'static str,
     get: fn(&UserPreferences) -> FieldValue,
     set: fn(&mut UserPreferences, FieldValue),
 }
 
 // PORT: builds one `StructField`. `$variant` is the Go field type and the
 // path is the field inside `UserPreferences`. `set` panics like Go
-// `reflect.Value.Set` when the value has another type.
+// `reflect.Value.Set` when the value has another type. The form with
+// `fallback:` sets the Go `fallbackConfig` tag.
 macro_rules! pref_field {
     ($name:literal, $raw:literal, $config:literal, $variant:ident, $($path:ident).+) => {
+        pref_field!($name, $raw, $config, fallback: "", $variant, $($path).+)
+    };
+    ($name:literal, $raw:literal, $config:literal, fallback: $fallback:literal, $variant:ident, $($path:ident).+) => {
         StructField {
             name: $name,
             raw_tag: $raw,
             config_tag: $config,
+            fallback_config_tag: $fallback,
             get: |p| FieldValue::$variant(p.$($path).+.clone()),
             set: |p, v| match v {
                 FieldValue::$variant(x) => p.$($path).+ = x,
@@ -1075,6 +1150,29 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
         jsx_attribute_completion_style
     ),
     pref_field!(
+        "EnableAutoClosingTags",
+        "autoClosingTags",
+        "autoClosingTags.enabled",
+        fallback: "autoClosingTags",
+        Tristate,
+        enable_auto_closing_tags
+    ),
+    pref_field!(
+        "EnableJSDocCompletions",
+        "completeJSDocs",
+        "suggest.jsdoc.enabled",
+        fallback: "suggest.completeJSDocs",
+        Tristate,
+        enable_js_doc_completions
+    ),
+    pref_field!(
+        "GenerateReturnInDocTemplate",
+        "generateReturnInDocTemplate",
+        "suggest.jsdoc.generateReturns",
+        Tristate,
+        generate_return_in_doc_template
+    ),
+    pref_field!(
         "ImportModuleSpecifierPreference",
         "importModuleSpecifierPreference",
         "preferences.importModuleSpecifier",
@@ -1309,6 +1407,22 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
         exclude_library_symbols_in_nav_to
     ),
     pref_field!(
+        "EnableFormatting",
+        "formatEnabled",
+        "format.enabled",
+        fallback: "format.enable",
+        Tristate,
+        enable_formatting
+    ),
+    pref_field!(
+        "EnableValidation",
+        "validateEnabled",
+        "validate.enabled",
+        fallback: "validate.enable",
+        Tristate,
+        enable_validation
+    ),
+    pref_field!(
         "DisableSuggestions",
         "disableSuggestions",
         "",
@@ -1332,7 +1446,7 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
     pref_field!(
         "ReportStyleChecksAsWarnings",
         "reportStyleChecksAsWarnings",
-        "",
+        "reportStyleChecksAsWarnings",
         Tristate,
         report_style_checks_as_warnings
     ),
@@ -1359,17 +1473,25 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
     ),
 ];
 
-// Go: ls/lsutil/userpreferences.go:446 fieldInfo
-#[derive(Clone, Copy)]
+// Go: ls/lsutil/userpreferences.go:536 fieldInfo
+#[derive(Clone)]
 struct FieldInfo {
     raw_name: &'static str, // raw name for unstable section lookup (e.g., "quotePreference")
     config_path: &'static str, // dotted path for config (e.g., "preferences.quoteStyle")
+    fallback_config_paths: Vec<ConfigPathInfo>,
     // PORT: Go `fieldPath []int` is the index path to the field in the
     // struct. The field accessors stand for it.
     get: fn(&UserPreferences) -> FieldValue,
     set: fn(&mut UserPreferences, FieldValue),
     raw_invert: bool,    // whether to invert boolean values for raw name
     config_invert: bool, // whether to invert boolean values for config path
+}
+
+// Go: ls/lsutil/userpreferences.go:545 configPathInfo
+#[derive(Clone, Copy)]
+struct ConfigPathInfo {
+    path: &'static str,
+    invert: bool,
 }
 
 // Go: ls/lsutil/userpreferences.go:454 fieldInfoCache
@@ -1403,9 +1525,12 @@ fn collect_field_infos(fields: &'static [StructField]) -> Vec<FieldInfo> {
             panic!("raw or config tag required for field {}", field.name);
         }
 
+        let fallback_config_tag = field.fallback_config_tag;
+
         let mut info = FieldInfo {
             raw_name: "",
             config_path: "",
+            fallback_config_paths: Vec::new(),
             get: field.get,
             set: field.set,
             raw_invert: false,
@@ -1425,18 +1550,34 @@ fn collect_field_infos(fields: &'static [StructField]) -> Vec<FieldInfo> {
 
         // Parse config tag: "path.to.setting" or "path.to.setting,invert"
         if !config_tag.is_empty() {
-            let parts: Vec<&'static str> = config_tag.split(',').collect();
-            info.config_path = parts[0];
-            for part in &parts[1..] {
-                if *part == "invert" {
-                    info.config_invert = true;
-                }
+            let config_path = parse_config_path_tag(config_tag);
+            info.config_path = config_path.path;
+            info.config_invert = config_path.invert;
+        }
+        if !fallback_config_tag.is_empty() {
+            for tag in fallback_config_tag.split(';') {
+                info.fallback_config_paths.push(parse_config_path_tag(tag));
             }
         }
 
         infos.push(info);
     }
     infos
+}
+
+// Go: ls/lsutil/userpreferences.go:617 parseConfigPathTag
+fn parse_config_path_tag(tag: &'static str) -> ConfigPathInfo {
+    let mut parts = tag.split(',');
+    let mut info = ConfigPathInfo {
+        path: parts.next().unwrap_or(""),
+        invert: false,
+    };
+    for part in parts {
+        if part == "invert" {
+            info.invert = true;
+        }
+    }
+    info
 }
 
 // Go: ls/lsutil/userpreferences.go:519 getNestedValue
@@ -1522,17 +1663,30 @@ impl UserPreferences {
             if info.config_path.is_empty() {
                 continue;
             }
-            let (mut val, ok) = get_nested_value(config, info.config_path);
+            let mut config_path = ConfigPathInfo {
+                path: info.config_path,
+                invert: info.config_invert,
+            };
+            let (mut val, mut ok) = get_nested_value(config, config_path.path);
+            if !ok {
+                for fallback_config_path in &info.fallback_config_paths {
+                    (val, ok) = get_nested_value(config, fallback_config_path.path);
+                    if ok {
+                        config_path = *fallback_config_path;
+                        break;
+                    }
+                }
+            }
             if !ok {
                 continue;
             }
 
-            if info.config_invert
+            if config_path.invert
                 && let LspAny::Bool(b) = val
             {
                 val = LspAny::Bool(!b);
             }
-            if let Some(parser) = config_path_parsers(info.config_path) {
+            if let Some(parser) = config_path_parsers(config_path.path) {
                 (info.set)(&mut p, parser(&val));
                 continue;
             }
@@ -1667,7 +1821,7 @@ fn sort_any_keys_deterministic(v: &mut LspAny) {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:689 serializeField
+// Go: ls/lsutil/userpreferences.go:815 serializeField
 // PORT: Go `nil` is `LspAny::Null`. A Go `int` is written as a JSON number;
 // `LspAny::Number` is an `f64`, which holds every `i32` exactly.
 fn serialize_field(field: &FieldValue) -> LspAny {
@@ -1678,8 +1832,24 @@ fn serialize_field(field: &FieldValue) -> LspAny {
 
     match field.type_().kind() {
         FieldKind::Bool => LspAny::Bool(field.bool_()),
-        FieldKind::Int => LspAny::Number(field.int() as f64),
-        FieldKind::String => LspAny::String(field.string()),
+        FieldKind::Int => {
+            // Zero means "unset" for these preference fields. Omit it so a partial
+            // config does not clobber defaults with zeros when round-tripped through
+            // withConfig.
+            let i = field.int();
+            if i == 0 {
+                return LspAny::Null;
+            }
+            LspAny::Number(i as f64)
+        }
+        FieldKind::String => {
+            // Zero ("") means "unset"; omit it for the same reason as int above.
+            let s = field.string();
+            if s.is_empty() {
+                return LspAny::Null;
+            }
+            LspAny::String(s)
+        }
         FieldKind::Slice => {
             let FieldValue::StringSlice(v) = field else {
                 unreachable!("the only slice field type is []string")
@@ -1714,31 +1884,7 @@ impl UnmarshalerFrom for UserPreferences {
 // --- Helper methods ---
 
 impl UserPreferences {
-    // Go: ls/lsutil/userpreferences.go:731 (UserPreferences).WithOverrides
-    // WithOverrides returns a copy of p with non-zero fields from overrides applied on top.
-    // This is safe because all preference fields use types where zero = "not set":
-    // Tristate (TSUnknown=0), int (0), string (""), slice (nil).
-    pub fn with_overrides(&self, overrides: &UserPreferences) -> UserPreferences {
-        let mut p = self.clone();
-        merge_non_zero_fields(&mut p, overrides);
-        p
-    }
-}
-
-// Go: ls/lsutil/userpreferences.go:736 mergeNonZeroFields
-// PORT: Go walks every struct field with `reflect` and recurses into struct
-// fields. The field table lists the same leaf fields in the same order.
-fn merge_non_zero_fields(dst: &mut UserPreferences, src: &UserPreferences) {
-    for info in FIELD_INFO_CACHE.iter() {
-        let src_field = (info.get)(src);
-        if !src_field.is_zero() {
-            (info.set)(dst, src_field);
-        }
-    }
-}
-
-impl UserPreferences {
-    // Go: ls/lsutil/userpreferences.go:750 (UserPreferences).ModuleSpecifierPreferences
+    // Go: ls/lsutil/userpreferences.go:866 (UserPreferences).ModuleSpecifierPreferences
     pub fn module_specifier_preferences(&self) -> crate::modulespecifiers::UserPreferences {
         crate::modulespecifiers::UserPreferences {
             import_module_specifier_preference: self.import_module_specifier_preference,
@@ -1772,11 +1918,7 @@ impl UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:766 ParseUserPreferences
-// PORT: Go `items` is a `map[string]any`, so a section can also hold a Go
-// `UserPreferences` value (`case UserPreferences`, merged with
-// `WithOverrides`). Only Go tests pass one; `LspAny` cannot hold it, so that
-// case has no Rust form. The LSP server passes JSON values only.
+// Go: ls/lsutil/userpreferences.go:882 ParseUserPreferences
 pub fn parse_user_preferences(items: &IndexMap<String, LspAny>) -> UserPreferences {
     let mut prefs = new_default_user_preferences();
     // Apply editor settings first (tabSize, indentSize, etc.) as raw-name defaults,

@@ -5013,7 +5013,7 @@ pub fn source_file_is_bound(file: Node) -> bool {
 // `file.ContainsNonASCII` is in the store before the program is installed
 // (see `source_file_language_variant`) and in `SourceFileInfo` after. A
 // factory SourceFile does not keep the flag (see `SyntheticSourceFileData`),
-// so it reads its text.
+// so it reads its text, as Go `NewSourceFile` does.
 #[must_use]
 pub fn source_file_get_position_map(file: Node) -> &'static PositionMap {
     if let Some(map) = POSITION_MAPS.with(|c| c.borrow().get(&file).copied()) {

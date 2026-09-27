@@ -180,8 +180,9 @@ struct FileStore {
     // drop them.
     lazy_jsdoc_cache: FxHashMap<Node, &'static [Node]>,
     /// Go `file.LanguageVariant`, the parse `file.Diagnostics()` and
-    /// `file.ContainsNonASCII`, set by `finishSourceFile`. Reads of a file
-    /// that is not published use them (`ast::source_file_language_variant`,
+    /// `file.ContainsNonASCII` (Go `NewSourceFile` sets it from the text),
+    /// written by `finishSourceFile`. Reads of a file that is not published
+    /// use them (`ast::source_file_language_variant`,
     /// `ast::source_file_diagnostics`, `ast::source_file_get_position_map`),
     /// for example the format tests, which parse a file with no program.
     language_variant: LanguageVariant,
@@ -1319,8 +1320,9 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
     with_store_mut(file, |s| s.jsdoc_cache = cache);
 }
 
-/// Go `result.LanguageVariant`, `result.diagnostics` and
-/// `result.ContainsNonASCII` in `finishSourceFile`.
+/// Go `result.LanguageVariant` and `result.diagnostics` in
+/// `finishSourceFile`, and `ContainsNonASCII`, which Go `NewSourceFile` sets
+/// from the text (`ParsedSourceFile::new`).
 // PORT: the diagnostics are leaked so reads can return a `&'static` slice,
 // like `GoFile::info.diagnostics` after the publish. A parse without errors
 // leaks nothing.
@@ -1350,9 +1352,8 @@ pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
     with_store(file, |s| s.diagnostics)
 }
 
-/// Go `file.ContainsNonASCII` of a store file: true when the scanner
-/// decoded a non-ASCII rune. False for a store that `finishSourceFile` did
-/// not finish.
+/// Go `file.ContainsNonASCII` of a store file: true when the text has a
+/// byte >= 0x80. False for a store that `finishSourceFile` did not finish.
 #[must_use]
 pub fn file_store_contains_non_ascii(file: usize) -> bool {
     with_store(file, |s| s.contains_non_ascii)

@@ -310,7 +310,7 @@ pub trait EmitResolver {
     fn get_enum_member_value(&self, node: Node) -> EvaluatorResult;
     fn is_late_bound(&self, node: Node) -> bool;
     fn is_optional_parameter(&self, node: Node) -> bool;
-    fn get_base_declarations_for_property_declaration(&self, node: Node) -> Vec<Node>;
+    fn is_this_property_assignment_declaration_redundant(&self, node: Node) -> bool;
 
     // isolatedDeclarations-specific declaration emit
     fn get_properties_of_container_function(&self, node: Node) -> Vec<SymbolId>;
@@ -320,6 +320,7 @@ pub trait EmitResolver {
         symbol: SymbolId,
         enclosing_declaration: Node,
     ) -> bool;
+    fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node;
 
     // Node construction for declaration emit
     fn create_type_of_declaration(

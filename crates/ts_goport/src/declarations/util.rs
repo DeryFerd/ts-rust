@@ -130,6 +130,7 @@ pub(crate) fn is_enclosing_declaration(node: Node) -> bool {
         || is_function_like(node)
         || is_index_signature_declaration(node)
         || is_mapped_type_node(node)
+        || is_variable_declaration(node)
 }
 
 // Go: transformers/declarations/util.go:121 isAlwaysType

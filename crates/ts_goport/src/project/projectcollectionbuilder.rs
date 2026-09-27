@@ -59,12 +59,12 @@ pub struct ProjectCollectionBuilder {
     pub configured_projects: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<Project>>>>,
     pub inferred_project: Rc<dirty::Box<Rc<RefCell<Project>>>>,
 
-    pub api_opened_projects: RefCell<FxHashSet<tspath::Path>>,
+    pub api_state: RefCell<APIState>,
 }
 
-// Go: project/projectcollectionbuilder.go:55 newProjectCollectionBuilder
-// PORT: Go `maps.Clone(oldAPIOpenedProjects)` copies the set, so the caller
-// passes it by reference.
+// Go: project/projectcollectionbuilder.go:56 newProjectCollectionBuilder
+// PORT: Go `oldAPIState.clone()` copies the state, so the caller passes it by
+// reference.
 #[allow(clippy::too_many_arguments)]
 pub fn new_project_collection_builder(
     ctx: &Context,
@@ -72,7 +72,7 @@ pub fn new_project_collection_builder(
     fs: Rc<SnapshotFSBuilder>,
     old_project_collection: Rc<ProjectCollection>,
     old_config_file_registry: Rc<ConfigFileRegistry>,
-    old_api_opened_projects: &FxHashSet<tspath::Path>,
+    old_api_state: &APIState,
     compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
     session_options: Rc<SessionOptions>,
     custom_config_file_name: &str,
@@ -107,7 +107,7 @@ pub fn new_project_collection_builder(
             old_project_collection.configured_projects.clone(),
         ),
         inferred_project: dirty::new_box(old_project_collection.inferred_project.clone()),
-        api_opened_projects: RefCell::new(old_api_opened_projects.clone()),
+        api_state: RefCell::new(old_api_state.clone()),
         client,
         base: old_project_collection,
         program_structure_changed: Cell::new(false),
@@ -135,7 +135,7 @@ fn ensure_cloned<'c>(
 }
 
 impl ProjectCollectionBuilder {
-    // Go: project/projectcollectionbuilder.go:87 Finalize
+    // Go: project/projectcollectionbuilder.go:88 Finalize
     pub fn finalize(
         self: &Rc<Self>,
         _logger: Option<Rc<logging::LogTree>>,
@@ -177,9 +177,9 @@ impl ProjectCollectionBuilder {
                 Some(config_file_registry.clone());
         }
 
-        if *self.api_opened_projects.borrow() != self.base.api_opened_projects {
-            ensure_cloned(&mut new_project_collection, &self.base).api_opened_projects =
-                self.api_opened_projects.borrow().clone();
+        if *self.api_state.borrow() != self.base.api_state {
+            ensure_cloned(&mut new_project_collection, &self.base).api_state =
+                self.api_state.borrow().clone();
         }
 
         let new_project_collection = match new_project_collection {
@@ -207,7 +207,7 @@ impl ProjectCollectionBuilder {
         }
     }
 
-    // Go: project/projectcollectionbuilder.go:145 HandleAPIRequest
+    // Go: project/projectcollectionbuilder.go:146 HandleAPIRequest
     pub fn handle_api_request(
         self: &Rc<Self>,
         api_request: &APISnapshotRequest,
@@ -216,9 +216,19 @@ impl ProjectCollectionBuilder {
         // PORT: a Go nil map is an empty set.
         let mut projects_to_close: FxHashSet<tspath::Path> = FxHashSet::default();
         if let Some(close_projects) = &api_request.close_projects {
-            projects_to_close = close_projects.clone();
+            let mut api_state = self.api_state.borrow_mut();
+            let open_projects = &mut api_state.open_projects;
             for project_path in close_projects {
-                self.api_opened_projects.borrow_mut().remove(project_path);
+                // Ref-counted close: only actually close the project once the last
+                // API client that opened it releases it.
+                // PORT: a missing Go map key reads as 0.
+                let count = open_projects.get(project_path).copied().unwrap_or(0);
+                if count > 1 {
+                    open_projects.insert(project_path.clone(), count - 1);
+                } else if count == 1 {
+                    open_projects.shift_remove(project_path);
+                    projects_to_close.insert(project_path.clone());
+                }
             }
         }
 
@@ -235,7 +245,14 @@ impl ProjectCollectionBuilder {
                     )
                     .is_some()
                 {
-                    self.api_opened_projects.borrow_mut().insert(config_path);
+                    *self
+                        .api_state
+                        .borrow_mut()
+                        .open_projects
+                        .entry(config_path.clone())
+                        .or_insert(0) += 1;
+                    // A project re-opened in the same request shouldn't be closed.
+                    projects_to_close.remove(&config_path);
                 } else {
                     return Err(gostd::errors::errorf(
                         format!("project not found for open: {}", config_file_name),
@@ -245,10 +262,45 @@ impl ProjectCollectionBuilder {
             }
         }
 
+        if let Some(close_files) = &api_request.close_files {
+            let mut api_state = self.api_state.borrow_mut();
+            let open_files = &mut api_state.open_files;
+            for path in close_files {
+                // Ref-counted close mirroring projects above.
+                let Some(entry) = open_files.get_mut(path) else {
+                    continue;
+                };
+                if entry.ref_count > 1 {
+                    entry.ref_count -= 1;
+                } else {
+                    open_files.shift_remove(path);
+                }
+            }
+        }
+
+        if let Some(request_open_files) = &api_request.open_files {
+            let mut api_state = self.api_state.borrow_mut();
+            let open_files = &mut api_state.open_files;
+            for uri in request_open_files {
+                let file_name = uri.file_name();
+                let path = (self.to_path)(&file_name);
+                // PORT: Go reads the zero entry for a missing key and stores
+                // it back.
+                let entry = open_files.entry(path).or_default();
+                entry.file_name = file_name;
+                entry.ref_count += 1;
+            }
+        }
+
         // PORT: Go ranges over the live map; the keys are copied first (the
         // loop body does not change the map).
-        let api_opened_projects: Vec<tspath::Path> =
-            self.api_opened_projects.borrow().iter().cloned().collect();
+        let api_opened_projects: Vec<tspath::Path> = self
+            .api_state
+            .borrow()
+            .open_projects
+            .keys()
+            .cloned()
+            .collect();
         for config_path in api_opened_projects {
             if let (Some(entry), true) = self.configured_projects.load(&config_path) {
                 self.update_program(&*entry, logger.clone());
@@ -281,7 +333,46 @@ impl ProjectCollectionBuilder {
             }
         }
 
+        // Ensure each API-opened file is placed like LSP's textDocument/didOpen: search
+        // up ancestor directories for a configured project that contains it, and only
+        // fall back to the inferred project if none is found. This also keeps already
+        // loaded configured projects up to date. Then run the same cleanup the LSP open
+        // path uses, so configured projects auto-loaded for files that are no longer open
+        // are torn down instead of leaking.
+        if api_request.open_files.is_some() || api_request.close_files.is_some() {
+            let mut retain: FxHashSet<tspath::Path> = FxHashSet::default();
+            for (path, file_name) in self.api_opened_files() {
+                if self.fs.is_open_file(&path) {
+                    // Already an LSP overlay; its project membership is handled by the
+                    // overlay pass in cleanupConfiguredProjects.
+                    continue;
+                }
+                let result = self.ensure_configured_project_and_ancestors_for_file(
+                    &file_name,
+                    &path,
+                    logger.clone(),
+                );
+                retain.extend(result.retain);
+            }
+            self.cleanup_configured_projects(&retain, logger.clone());
+            if self.inferred_project.value().is_some() {
+                self.update_program(&*self.inferred_project, logger.clone());
+            }
+        }
+
         Ok(())
+    }
+
+    /// The API-opened files as (path, file name) pairs, in map order.
+    // PORT: Go ranges over the live `apiState.openFiles`. The loop bodies do
+    // not change it, so the port copies it first and holds no borrow.
+    fn api_opened_files(&self) -> Vec<(tspath::Path, String)> {
+        self.api_state
+            .borrow()
+            .open_files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.file_name.clone()))
+            .collect()
     }
 
     // Go: project/projectcollectionbuilder.go:191 DidChangeFiles
@@ -406,9 +497,6 @@ impl ProjectCollectionBuilder {
 
         // Handle opened file
         if !summary.opened.0.is_empty() || !summary.reopened.0.is_empty() {
-            // PORT: Go `collections.Set` (random order); `IndexSet` keeps the
-            // insertion order so deletions run in a fixed order.
-            let mut to_remove_projects: IndexSet<tspath::Path> = IndexSet::new();
             let file_name =
                 core_ls_ext::first_non_zero([summary.opened.clone(), summary.reopened.clone()])
                     .file_name();
@@ -418,98 +506,137 @@ impl ProjectCollectionBuilder {
                 &path,
                 logger.clone(),
             );
-            self.configured_projects.range(&mut |entry| {
-                to_remove_projects.insert(entry.key());
-                true
-            });
-
-            // Go: retainProjectAndReferences (closure in DidChangeFiles)
-            let retain_project_and_references =
-                |to_remove_projects: &mut IndexSet<tspath::Path>,
-                 project: &Rc<RefCell<Project>>| {
-                    // Retain project
-                    // PORT: Go `project.GetProgram()` is the field read.
-                    let (config_file_path, program) = {
-                        let project = project.borrow();
-                        (project.config_file_path.clone(), project.program)
-                    };
-                    to_remove_projects.shift_remove(&config_file_path);
-                    if let Some(program) = program {
-                        program.range_resolved_project_reference(
-                            |reference_path: &tspath::Path, _, _, _| -> bool {
-                                if let (_, true) = self.configured_projects.load(reference_path) {
-                                    to_remove_projects.shift_remove(reference_path);
-                                }
-                                true
-                            },
-                        );
-                    }
-                };
-
-            // Go: retainDefaultConfiguredProject (closure in DidChangeFiles)
-            let retain_default_configured_project =
-                |to_remove_projects: &mut IndexSet<tspath::Path>,
-                 _open_file: &str,
-                 open_file_path: &tspath::Path,
-                 project: &Rc<RefCell<Project>>| {
-                    // Retain project and its references
-                    retain_project_and_references(&mut *to_remove_projects, project);
-
-                    // Retain all the ancestor projects
-                    self.config_file_registry_builder
-                        .for_each_config_file_name_for(
-                            open_file_path,
-                            &mut |config_file_name: &str| {
-                                if let Some(ancestor) = self.find_or_create_project(
-                                    config_file_name,
-                                    &(self.to_path)(config_file_name),
-                                    ProjectLoadKind::FIND,
-                                    logger.clone(),
-                                ) {
-                                    retain_project_and_references(
-                                        &mut *to_remove_projects,
-                                        &ancestor.value().expect(NIL_DEREF),
-                                    );
-                                }
-                            },
-                        );
-                };
-
-            let mut inferred_project_files: Vec<String> = Vec::new();
-            // PORT: Go map order is random; the overlay map is an IndexMap.
-            for overlay in self.fs.overlays.values() {
-                let open_file = overlay.file_name();
-                let open_file_path = (self.to_path)(&open_file);
-                if let Some(p) = self.find_default_configured_project(&open_file, &open_file_path) {
-                    retain_default_configured_project(
-                        &mut to_remove_projects,
-                        open_file.as_str(),
-                        &open_file_path,
-                        &p.value().expect(NIL_DEREF),
-                    );
-                } else {
-                    inferred_project_files.push(overlay.file_name());
-                }
-            }
-
-            for project_path in &to_remove_projects {
-                if open_file_result.retain.contains(project_path) {
-                    continue;
-                }
-                if self.api_opened_projects.borrow().contains(project_path) {
-                    continue;
-                }
-                if let (Some(p), true) = self.configured_projects.load(project_path) {
-                    self.delete_configured_project(&*p, logger.clone());
-                }
-            }
-            self.update_inferred_project_roots(inferred_project_files, logger.clone());
-            self.config_file_registry_builder.cleanup();
+            self.cleanup_configured_projects(&open_file_result.retain, logger);
         }
     }
 
-    // Go: project/projectcollectionbuilder.go:356 cleanupInferredProject
-    pub fn cleanup_inferred_project(self: &Rc<Self>, logger: Option<Rc<logging::LogTree>>) {
+    // Go: project/projectcollectionbuilder.go:341 cleanupConfiguredProjects
+    // cleanupConfiguredProjects sweeps the loaded configured projects and unloads those
+    // that are no longer needed. Starting from the set of all configured projects, it
+    // retains any project that is the default project (along with its references and
+    // ancestor configs) of an open overlay file or an API-opened file, any project
+    // explicitly opened through the API, and any project in retain (e.g. the ancestor
+    // solution tree built for a freshly opened overlay file). Every other configured
+    // project is deleted, the inferred project roots are recomputed, and the config file
+    // registry is cleaned up. This is the shared mechanism that keeps the set of loaded
+    // projects minimal for both LSP file opens and API file opens/closes.
+    pub fn cleanup_configured_projects(
+        self: &Rc<Self>,
+        retain: &FxHashSet<tspath::Path>,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        // PORT: Go `collections.Set` (random order); `IndexSet` keeps the
+        // insertion order so deletions run in a fixed order.
+        let mut to_remove_projects: IndexSet<tspath::Path> = IndexSet::new();
+        self.configured_projects.range(&mut |entry| {
+            to_remove_projects.insert(entry.key());
+            true
+        });
+
+        // Go: retainProjectAndReferences (closure in cleanupConfiguredProjects)
+        let retain_project_and_references =
+            |to_remove_projects: &mut IndexSet<tspath::Path>, project: &Rc<RefCell<Project>>| {
+                // Retain project
+                // PORT: Go `project.GetProgram()` is the field read.
+                let (config_file_path, program) = {
+                    let project = project.borrow();
+                    (project.config_file_path.clone(), project.program)
+                };
+                to_remove_projects.shift_remove(&config_file_path);
+                if let Some(program) = program {
+                    program.range_resolved_project_reference(
+                        |reference_path: &tspath::Path, _, _, _| -> bool {
+                            if let (_, true) = self.configured_projects.load(reference_path) {
+                                to_remove_projects.shift_remove(reference_path);
+                            }
+                            true
+                        },
+                    );
+                }
+            };
+
+        // Go: retainDefaultConfiguredProject (closure in cleanupConfiguredProjects)
+        let retain_default_configured_project =
+            |to_remove_projects: &mut IndexSet<tspath::Path>,
+             open_file_path: &tspath::Path,
+             project: &Rc<RefCell<Project>>| {
+                // Retain project and its references
+                retain_project_and_references(&mut *to_remove_projects, project);
+
+                // Retain all the ancestor projects
+                self.config_file_registry_builder
+                    .for_each_config_file_name_for(
+                        open_file_path,
+                        &mut |config_file_name: &str| {
+                            if let Some(ancestor) = self.find_or_create_project(
+                                config_file_name,
+                                &(self.to_path)(config_file_name),
+                                ProjectLoadKind::FIND,
+                                logger.clone(),
+                            ) {
+                                retain_project_and_references(
+                                    &mut *to_remove_projects,
+                                    &ancestor.value().expect(NIL_DEREF),
+                                );
+                            }
+                        },
+                    );
+            };
+
+        let mut inferred_project_files: Vec<String> = Vec::new();
+        // PORT: Go map order is random; the overlay map is an IndexMap.
+        for overlay in self.fs.overlays.values() {
+            let open_file = overlay.file_name();
+            let open_file_path = (self.to_path)(&open_file);
+            if let Some(p) = self.find_default_configured_project(&open_file, &open_file_path) {
+                retain_default_configured_project(
+                    &mut to_remove_projects,
+                    &open_file_path,
+                    &p.value().expect(NIL_DEREF),
+                );
+            } else {
+                inferred_project_files.push(open_file);
+            }
+        }
+        // Treat API-opened files like open files: retain their configured project (so
+        // an LSP-driven open doesn't close it), or keep them as inferred project roots.
+        for (path, file_name) in self.api_opened_files() {
+            if self.fs.is_open_file(&path) {
+                continue;
+            }
+            if let Some(p) = self.find_default_configured_project(&file_name, &path) {
+                retain_default_configured_project(
+                    &mut to_remove_projects,
+                    &path,
+                    &p.value().expect(NIL_DEREF),
+                );
+            } else {
+                inferred_project_files.push(file_name);
+            }
+        }
+
+        for project_path in &to_remove_projects {
+            if retain.contains(project_path) {
+                continue;
+            }
+            if self
+                .api_state
+                .borrow()
+                .open_projects
+                .contains_key(project_path)
+            {
+                continue;
+            }
+            if let (Some(p), true) = self.configured_projects.load(project_path) {
+                self.delete_configured_project(&*p, logger.clone());
+            }
+        }
+        self.update_inferred_project_roots(inferred_project_files, logger.clone());
+        self.config_file_registry_builder.cleanup();
+    }
+
+    // Go: project/projectcollectionbuilder.go:420 collectInferredProjectRoots
+    fn collect_inferred_project_roots(self: &Rc<Self>) -> Vec<String> {
         let mut inferred_project_files: Vec<String> = Vec::new();
         for (path, overlay) in &self.fs.overlays {
             if self
@@ -519,10 +646,37 @@ impl ProjectCollectionBuilder {
                 inferred_project_files.push(overlay.file_name());
             }
         }
-        self.update_inferred_project_roots(inferred_project_files, logger);
+        self.append_api_opened_inferred_roots(inferred_project_files)
     }
 
-    // Go: project/projectcollectionbuilder.go:366 ensureInferredProjectIncludesClosedFile
+    // Go: project/projectcollectionbuilder.go:433 appendAPIOpenedInferredRoots
+    // appendAPIOpenedInferredRoots appends API-opened files that aren't open in an
+    // overlay and have no configured project, so they're kept as inferred project
+    // roots and persist across snapshots.
+    fn append_api_opened_inferred_roots(
+        self: &Rc<Self>,
+        mut inferred_project_files: Vec<String>,
+    ) -> Vec<String> {
+        for (path, file_name) in self.api_opened_files() {
+            if self.fs.is_open_file(&path) {
+                continue;
+            }
+            if self
+                .find_default_configured_project(&file_name, &path)
+                .is_none()
+            {
+                inferred_project_files.push(file_name);
+            }
+        }
+        inferred_project_files
+    }
+
+    // Go: project/projectcollectionbuilder.go:445 cleanupInferredProject
+    pub fn cleanup_inferred_project(self: &Rc<Self>, logger: Option<Rc<logging::LogTree>>) {
+        self.update_inferred_project_roots(self.collect_inferred_project_roots(), logger);
+    }
+
+    // Go: project/projectcollectionbuilder.go:449 ensureInferredProjectIncludesClosedFile
     pub fn ensure_inferred_project_includes_closed_file(
         self: &Rc<Self>,
         file_name: &str,
@@ -530,15 +684,7 @@ impl ProjectCollectionBuilder {
     ) {
         // Collect existing inferred project roots (open files not in configured projects)
         // plus this closed file.
-        let mut inferred_project_files: Vec<String> = Vec::new();
-        for (path, overlay) in &self.fs.overlays {
-            if self
-                .find_default_configured_project(&overlay.file_name(), path)
-                .is_none()
-            {
-                inferred_project_files.push(overlay.file_name());
-            }
-        }
+        let mut inferred_project_files = self.collect_inferred_project_roots();
         inferred_project_files.push(file_name.to_string());
         self.update_inferred_project_roots(inferred_project_files, logger.clone());
         if self.inferred_project.value().is_some() {

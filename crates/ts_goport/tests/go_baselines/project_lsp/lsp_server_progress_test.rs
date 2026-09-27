@@ -34,11 +34,7 @@ child_test! {
         let collected = progress_notifications.clone();
         let on_server_notification: lsptestutil::ServerNotificationHandler = Arc::new(move |req| {
             if req.method == lsproto::Method::PROGRESS {
-                if let Some(params) = req
-                    .params
-                    .as_deref()
-                    .and_then(|p| (p as &dyn std::any::Any).downcast_ref::<lsproto::ProgressParams>())
-                {
+                if let Ok(params) = lsproto::unmarshal_params::<lsproto::ProgressParams>(req) {
                     let is_end = params.value.end.is_some();
                     collected
                         .lock()

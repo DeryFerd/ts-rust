@@ -305,7 +305,15 @@ impl Checker {
                 self.sym_mut(target).flags =
                     target_flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
             }
-            self.sym_mut(target).flags |= source_flags;
+            let mut merged_flags = source_flags;
+            if !self
+                .sym(target)
+                .flags
+                .intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+            {
+                merged_flags = merged_flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
+            }
+            self.sym_mut(target).flags |= merged_flags;
             let source_value_declaration = self.sym(source).value_declaration;
             if source_value_declaration.is_some() {
                 set_value_declaration(&mut self.symbols, target, source_value_declaration);

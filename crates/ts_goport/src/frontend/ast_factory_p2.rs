@@ -17,7 +17,11 @@ impl NodeFactory {
     // PORT: Go stores `fileName`, `parseOptions` and `text` on the
     // SourceFile data. Here the file name and text live in the node store
     // (`new_file_store`) and the parse options in `ParsedSourceFile`, so only
-    // the Go check on the file name is kept.
+    // the Go check on the file name is kept. Go `ContainsNonASCII` (from the
+    // text) is set by `ParsedSourceFile::new`, and the parser writes it to the
+    // store. The other callers (an empty tsconfig file, a build worker
+    // diagnostics file) do not make a position map, so their store keeps
+    // false.
     // PORT: named `new_parsed_source_file` because `ast/factory.rs` has the
     // synthetic form of Go NewSourceFile with a different signature.
     pub fn new_parsed_source_file(

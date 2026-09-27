@@ -556,7 +556,8 @@ pub fn get_host_signature_from_js_doc(node: Node) -> Node {
 
 // Finds the declaration that owns the JSDoc for a function-like node.
 // Keep these hosts aligned with JSDoc parameter reparsing so unmatched @param diagnostics use the same attachment rules.
-// Go: ast/utilities.go:4038 GetNextJSDocCommentLocation
+// Keep in sync with getNextJSDocCommentLocation in the API's src/ast/jsdoc.ts
+// Go: ast/utilities.go:4039 GetNextJSDocCommentLocation
 pub fn get_next_js_doc_comment_location(node: Node) -> Node {
     let parent = node.parent();
     if parent.is_some() {

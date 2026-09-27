@@ -29,6 +29,9 @@ impl LanguageService {
         document_uri: &lsproto::DocumentUri,
         options: &lsproto::FormattingOptions,
     ) -> Result<lsproto::DocumentFormattingResponse, GoError> {
+        if self.user_preferences().enable_formatting.is_false() {
+            return Ok(lsproto::TextEditsOrNull::default());
+        }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
         let edits = self.to_ls_proto_text_edits(
@@ -48,6 +51,9 @@ impl LanguageService {
         options: &lsproto::FormattingOptions,
         r: lsproto::Range,
     ) -> Result<lsproto::DocumentRangeFormattingResponse, GoError> {
+        if self.user_preferences().enable_formatting.is_false() {
+            return Ok(lsproto::TextEditsOrNull::default());
+        }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
         let edits = self.to_ls_proto_text_edits(
@@ -73,6 +79,9 @@ impl LanguageService {
         position: lsproto::Position,
         character: &str,
     ) -> Result<lsproto::DocumentOnTypeFormattingResponse, GoError> {
+        if self.user_preferences().enable_formatting.is_false() {
+            return Ok(lsproto::TextEditsOrNull::default());
+        }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
         let edits = self.to_ls_proto_text_edits(

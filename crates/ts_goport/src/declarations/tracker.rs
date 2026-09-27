@@ -58,7 +58,49 @@ impl SymbolTrackerImpl {
                     .collect()
             });
         }
-        self.add_diagnostic((self.get_isolated_declaration_error)(None, node));
+        if !self.is_child_of_bound_expando(None, node) {
+            // expando props get an error when their host is visited by the above, this prevents a follow-on error on a non-inferrable expression
+            self.add_diagnostic((self.get_isolated_declaration_error)(None, node));
+        }
+    }
+
+    // Go: transformers/declarations/tracker.go:60 SymbolTrackerImpl.isBoundExpando
+    // PORT: `c` is the checker in hand on the node builder path, where Go
+    // calls the unsafe resolver methods with the lock already held. With no
+    // checker, the resolver trait methods borrow it.
+    fn is_bound_expando(&self, c: Option<&mut Checker>, node: Node) -> bool {
+        if !(is_expando_property_declaration(node) && is_property_access_expression(node.left())) {
+            return false;
+        }
+        let left = get_leftmost_expression(node.left(), true);
+        match c {
+            Some(c) => {
+                let resolver = c.get_emit_resolver();
+                let r#ref = resolver.get_referenced_value_declaration_unsafe_worker(c, left);
+                if r#ref.is_nil() {
+                    return false;
+                }
+                resolver.is_expando_function_declaration_unsafe_worker(c, r#ref)
+            }
+            None => {
+                let r#ref = self.resolver.get_referenced_value_declaration_unsafe(left);
+                if r#ref.is_nil() {
+                    return false;
+                }
+                self.resolver.is_expando_function_declaration_unsafe(r#ref)
+            }
+        }
+    }
+
+    // Go: transformers/declarations/tracker.go:71 SymbolTrackerImpl.isChildOfBoundExpando
+    fn is_child_of_bound_expando(&self, mut c: Option<&mut Checker>, node: Node) -> bool {
+        find_ancestor_or_quit(node, |n| {
+            if is_source_file(n) || is_block(n) {
+                return FindAncestorResult::FIND_ANCESTOR_QUIT;
+            }
+            to_find_ancestor_result(self.is_bound_expando(c.as_deref_mut(), n))
+        })
+        .is_some()
     }
 
     // Go: transformers/declarations/tracker.go:27 SymbolTrackerImpl.PopErrorFallbackNode
@@ -256,7 +298,10 @@ impl SymbolTracker for SymbolTrackerImpl {
                     .collect()
             });
         }
-        self.add_diagnostic((self.get_isolated_declaration_error)(Some(c), node));
+        if !self.is_child_of_bound_expando(Some(&mut *c), node) {
+            // expando props get an error when their host is visited by the above, this prevents a follow-on error on a non-inferrable expression
+            self.add_diagnostic((self.get_isolated_declaration_error)(Some(c), node));
+        }
     }
 
     // Go: transformers/declarations/tracker.go:75 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError

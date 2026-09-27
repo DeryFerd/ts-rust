@@ -768,6 +768,9 @@ fn fill_non_zero_values() -> UserPreferences {
         include_completions_with_class_member_snippets: f,
         include_completions_with_object_literal_method_snippets: f,
         jsx_attribute_completion_style: JsxAttributeCompletionStyle::BRACES,
+        enable_auto_closing_tags: f,
+        enable_js_doc_completions: f,
+        generate_return_in_doc_template: f,
         import_module_specifier_preference: ImportModuleSpecifierPreference::Relative,
         import_module_specifier_ending: ImportModuleSpecifierEndingPreference::Js,
         auto_import_specifier_exclude_regexes: test(),
@@ -805,6 +808,8 @@ fn fill_non_zero_values() -> UserPreferences {
         },
         prefer_go_to_source_definition: true,
         exclude_library_symbols_in_nav_to: f,
+        enable_formatting: f,
+        enable_validation: f,
         disable_suggestions: f,
         disable_line_text_in_references: f,
         display_parts_for_js_doc: f,
@@ -966,6 +971,50 @@ fn items(entries: &[(&str, LspAny)]) -> IndexMap<String, LspAny> {
         LspAny::Object(m) => m,
         _ => unreachable!(),
     }
+}
+
+// Go: ls/lsutil/userpreferences_test.go:427 TestUserPreferencesReportStyleChecksAsWarnings
+#[test]
+fn test_user_preferences_report_style_checks_as_warnings() {
+    let mut t = Subtests::new("TestUserPreferencesReportStyleChecksAsWarnings");
+
+    t.run("reportStyleChecksAsWarnings via config path", || {
+        let prefs = parse_user_preferences(&items(&[(
+            "js/ts",
+            obj(&[("reportStyleChecksAsWarnings", LspAny::Bool(false))]),
+        )]));
+        assert_equal(
+            prefs.report_style_checks_as_warnings,
+            Tristate::False,
+            "ReportStyleChecksAsWarnings",
+        )
+    });
+
+    t.run("reportStyleChecksAsWarnings defaults to true", || {
+        let prefs = new_default_user_preferences();
+        assert_equal(
+            prefs.report_style_checks_as_warnings,
+            Tristate::True,
+            "ReportStyleChecksAsWarnings",
+        )
+    });
+
+    t.run("reportStyleChecksAsWarnings via unstable section", || {
+        let prefs = parse_user_preferences(&items(&[(
+            "js/ts",
+            obj(&[(
+                "unstable",
+                obj(&[("reportStyleChecksAsWarnings", LspAny::Bool(false))]),
+            )]),
+        )]));
+        assert_equal(
+            prefs.report_style_checks_as_warnings,
+            Tristate::False,
+            "ReportStyleChecksAsWarnings",
+        )
+    });
+
+    t.finish();
 }
 
 // Go: ls/lsutil/userpreferences_test.go:328 TestUserPreferencesParseATA

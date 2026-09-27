@@ -257,72 +257,11 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
     }
 }
 
-// Go: lsp.go:87 unmarshalPtrTo
-// `unmarshal_root` is Go `json.Unmarshal` with the v2 error text, and
-// `go_type_name` gives Go `%T` without the `*`.
-pub fn unmarshal_ptr_to<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<Box<T>, GoError> {
-    let mut v = T::default();
-    if let Err(err) = unmarshal_root(data, &mut v) {
-        let err = gostd::errors::from_value(err);
-        return Err(gostd::errors::errorf(
-            format!(
-                "failed to unmarshal *{}: {}",
-                go_type_name::<T>(),
-                err.error()
-            ),
-            vec![err],
-        ));
-    }
-    Ok(Box::new(v))
-}
-
-// Go: lsp.go:95 unmarshalValue
-pub fn unmarshal_value<T: UnmarshalerFrom + Default>(data: &[u8]) -> Result<T, GoError> {
-    let mut v = T::default();
-    if let Err(err) = unmarshal_root(data, &mut v) {
-        let err = gostd::errors::from_value(err);
-        return Err(gostd::errors::errorf(
-            format!(
-                "failed to unmarshal *{}: {}",
-                go_type_name::<T>(),
-                err.error()
-            ),
-            vec![err],
-        ));
-    }
-    Ok(v)
-}
-
-// Go: lsp.go:103 unmarshalAny
-// PORT: Go `any` is `Option<Box<dyn AnyValue>>`; a JSON null leaves it nil
-// (`None`), any other value is a boxed `LspAny`.
-pub fn unmarshal_any(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-    let mut v = LspAny::Null;
-    if let Err(err) = unmarshal_root(data, &mut v) {
-        let err = gostd::errors::from_value(err);
-        return Err(gostd::errors::errorf(
-            format!("failed to unmarshal any: {}", err.error()),
-            vec![err],
-        ));
-    }
-    if v == LspAny::Null {
-        return Ok(None);
-    }
-    Ok(Some(Box::new(v)))
-}
-
-// Go: lsp.go:111 unmarshalEmpty
-pub fn unmarshal_empty(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-    if !data.is_empty() {
-        return Err(gostd::errors::new(format!(
-            "expected empty, got: {}",
-            String::from_utf8_lossy(data)
-        )));
-    }
-    Ok(None)
-}
-
-// Go: lsp.go:118 boolToInt
+// Go: boolToInt (removed in tsgo#4471)
+// PORT: Go tsgo#4471 replaced the generated union and `Registration`
+// marshal checks with the reflective `marshalUnion` and `countNonNil`
+// (structcodec.go:129, :155). Rust has no reflection, so the generated code
+// keeps its per-field checks and this helper; the behavior is the same.
 pub fn bool_to_int(b: bool) -> i32 {
     if b {
         return 1;
@@ -520,40 +459,25 @@ impl<P, R> RequestInfo<P, R> {
     }
 }
 
-impl<P, R: 'static> RequestInfo<P, R> {
-    // Go: lsp.go:232 UnmarshalResult
-    // PORT: Go type assertions on `any`. `None` is a nil `any`. `%T` in the
+impl<P, R: UnmarshalerFrom + Default> RequestInfo<P, R> {
+    // Go: lsp.go:194 UnmarshalResult
+    // PORT: Go type assertion on `any`. `None` is a nil `any`. `%T` in the
     // error prints the Rust debug value.
     pub fn unmarshal_result(&self, result: Option<Box<dyn AnyValue>>) -> Result<R, GoError> {
         let Some(result) = result else {
             return Err(gostd::errors::new("expected json.Value, got <nil>"));
         };
-        if result.downcast_ref::<R>().is_some() {
-            let result: Box<dyn std::any::Any> = result;
-            return Ok(*result.downcast::<R>().expect("checked by downcast_ref"));
-        }
-
         let Some(raw) = result.downcast_ref::<JsonValue>() else {
             return Err(gostd::errors::new(format!(
                 "expected json.Value, got {result:?}"
             )));
         };
 
-        let r = unmarshal_result(&self.method, &raw.0)?;
-        let Some(r) = r else {
-            panic!(
-                "interface conversion: interface {{}} is nil, not {}",
-                std::any::type_name::<R>()
-            );
-        };
-        let r: Box<dyn std::any::Any> = r;
-        match r.downcast::<R>() {
-            Ok(r) => Ok(*r),
-            Err(_) => panic!(
-                "interface conversion: interface {{}} is not {}",
-                std::any::type_name::<R>()
-            ),
+        let mut r = R::default();
+        if let Err(err) = unmarshal_root(&raw.0, &mut r) {
+            return Err(gostd::errors::from_value(err));
         }
+        Ok(r)
     }
 }
 
@@ -656,6 +580,70 @@ impl IsZero for Null {
     }
 }
 
+// Go: lsp.go:235 UnmarshalParams
+// UnmarshalParams decodes the params of an inbound request or notification
+// message into the requested type. Inbound messages store their params as a
+// raw [json.Value] (see [Message.UnmarshalJSON]); decoding is deferred to the
+// point of dispatch so that param types for methods the server never handles
+// are not forced into the binary.
+//
+// A [NoParams] method must be given no params; every other method must be given
+// params as an object or array. A violation returns [ErrorCodeInvalidParams].
+// PORT: Go `T` is a pointer type (or `NoParams`); a successful decode never
+// gives a nil pointer, so the port returns the value. `%T` in the error prints
+// the Rust debug value.
+pub fn unmarshal_params<T: UnmarshalerFrom + Default + 'static>(
+    req: &RequestMessage,
+) -> Result<T, GoError> {
+    let mut params = T::default();
+    let mut raw: &[u8] = &[];
+    if let Some(p) = req.params.as_deref() {
+        let Some(v) = p.downcast_ref::<JsonValue>() else {
+            return Err(super::jsonrpc::wrap_error_code(
+                ErrorCode::INVALID_PARAMS,
+                gostd::errors::new(format!("unexpected params type {p:?}")),
+            ));
+        };
+        raw = &v.0;
+    }
+
+    // params is the zero value of T; this asserts on its type, i.e. whether the
+    // method was declared with NoParams.
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<NoParams>() {
+        if !raw.is_empty() {
+            return Err(super::jsonrpc::wrap_error_code(
+                ErrorCode::INVALID_PARAMS,
+                gostd::errors::new(format!(
+                    "expected no params, got {}",
+                    String::from_utf8_lossy(raw)
+                )),
+            ));
+        }
+        return Ok(params);
+    }
+
+    // The base protocol defines params as `array | object`; reject anything else
+    // (absent, null, or a scalar).
+    // PORT: Go `raw.Kind()` is the first byte after JSON whitespace.
+    let kind = raw
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    if kind != Some(b'{') && kind != Some(b'[') {
+        return Err(super::jsonrpc::wrap_error_code(
+            ErrorCode::INVALID_PARAMS,
+            gostd::errors::new("params must be an object or array"),
+        ));
+    }
+    if let Err(err) = unmarshal_root(raw, &mut params) {
+        return Err(super::jsonrpc::wrap_error_code(
+            ErrorCode::INVALID_PARAMS,
+            gostd::errors::from_value(err),
+        ));
+    }
+    Ok(params)
+}
+
 // Go: lsp.go:286 NoParams
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NoParams;
@@ -726,52 +714,76 @@ impl CodeActionKind {
 mod unmarshal_error_tests {
     use super::*;
 
-    fn params_err_text<T: UnmarshalerFrom + Default + std::fmt::Debug>(data: &str) -> String {
-        unmarshal_ptr_to::<T>(data.as_bytes())
+    /// The error of `unmarshal_params::<T>` for a request whose raw params
+    /// are `data`.
+    fn params_err_text<T: UnmarshalerFrom + Default + std::fmt::Debug + 'static>(
+        data: &str,
+    ) -> String {
+        let req = RequestMessage {
+            params: Some(Box::new(JsonValue(data.as_bytes().to_vec()))),
+            ..RequestMessage::default()
+        };
+        unmarshal_params::<T>(&req)
             .expect_err("want an error")
             .error()
     }
 
-    // Expected texts come from the pinned Go LSP server (tsgo-oracle, and
-    // the tests2 S6-002 goldens); Go writes "cannot" or "unable to".
+    // Expected texts come from Go at the pin (tsgo-oracle-52168999f3dc; the
+    // probe is in continuation-r97-goport/upstream/bumpA2/evidence/
+    // lsp-invalid-params-N.txt). Since tsgo#4471 Go decodes params at
+    // dispatch; the text is the old inner JSON error after "InvalidParams: ".
+    // Go writes "cannot" or "unable to".
     #[test]
     fn params_errors_match_go() {
         assert_eq!(
             params_err_text::<HoverParams>(r#"{"textDocument":{"uri":"file:///a.ts"}}"#),
-            "failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal into Go lsproto.HoverParams after offset 38: missing required properties: position"
+            "InvalidParams: json: cannot unmarshal into Go lsproto.HoverParams after offset 38: missing required properties: position"
         );
         assert_eq!(
             params_err_text::<SignatureHelpParams>(
                 r#"{"textDocument":{"uri":"file:///a.ts"},"position":{"line":0,"character":0},"context":5}"#
             ),
-            r#"failed to unmarshal *lsproto.SignatureHelpParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context": expected object start, but encountered number"#
+            r#"InvalidParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context": expected object start, but encountered number"#
         );
         assert_eq!(
             params_err_text::<HoverParams>(
                 r#"{"textDocument":{"uri":5},"position":{"line":0,"character":0}}"#
             ),
-            r#"failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal JSON number into Go lsproto.DocumentUri within "/textDocument/uri""#
+            r#"InvalidParams: json: cannot unmarshal JSON number into Go lsproto.DocumentUri within "/textDocument/uri""#
         );
         assert_eq!(
             params_err_text::<HoverParams>(
                 r#"{"textDocument":{"uri":"file:///a.ts"},"position":{"line":"x","character":0}}"#
             ),
-            r#"failed to unmarshal *lsproto.HoverParams: json: cannot unmarshal JSON string into Go uint32 within "/position/line""#
+            r#"InvalidParams: json: cannot unmarshal JSON string into Go uint32 within "/position/line""#
+        );
+        assert_eq!(
+            params_err_text::<HoverParams>("null"),
+            "InvalidParams: params must be an object or array"
+        );
+        assert_eq!(
+            params_err_text::<HoverParams>("5"),
+            "InvalidParams: params must be an object or array"
+        );
+        assert_eq!(
+            params_err_text::<NoParams>("{}"),
+            "InvalidParams: expected no params, got {}"
         );
     }
 
-    // S6-002: both wrappers of a signatureHelp retrigger whose
-    // `activeSignatureHelp` is null (lsp server.go:121 reads the message with
-    // `json.Unmarshal(data, req)`).
+    // S6-002: a signatureHelp retrigger whose `activeSignatureHelp` is null.
+    // Since tsgo#4471 the message reads without error and the handler's
+    // `UnmarshalParams` fails (Go at the pin, same evidence file).
     #[test]
     fn null_active_signature_help_matches_go() {
         let data = br#"{"jsonrpc":"2.0","id":4,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":"file:///a.ts"},"position":{"line":0,"character":0},"context":{"triggerKind":3,"isRetrigger":true,"activeSignatureHelp":null}}}"#;
-        let mut req = Message::default();
-        let err = unmarshal_json_method::<Message>(data, |d| req.unmarshal_json(d))
-            .expect_err("want an error");
+        let mut msg = Message::default();
+        msg.unmarshal_json(data).expect("the message reads");
+        let err =
+            unmarshal_params::<SignatureHelpParams>(msg.as_request()).expect_err("want an error");
         assert_eq!(
             err.error(),
-            r#"json: cannot unmarshal JSON object into Go lsproto.Message: InvalidParams: failed to unmarshal *lsproto.SignatureHelpParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context/activeSignatureHelp": null value is not allowed for field "activeSignatureHelp""#
+            r#"InvalidParams: json: cannot unmarshal into Go lsproto.SignatureHelpContext within "/context/activeSignatureHelp": null value is not allowed for field "activeSignatureHelp""#
         );
     }
 }

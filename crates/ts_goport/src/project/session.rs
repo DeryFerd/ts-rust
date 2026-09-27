@@ -2540,6 +2540,7 @@ impl Session {
         if old_prefs.custom_config_file_name != new_prefs.custom_config_file_name
             || old_prefs.report_style_checks_as_warnings
                 != new_prefs.report_style_checks_as_warnings
+            || old_prefs.enable_validation != new_prefs.enable_validation
         {
             self.schedule_diagnostics_refresh();
         }
@@ -2565,6 +2566,29 @@ impl Session {
         new_snapshot: &Rc<Snapshot>,
     ) {
         if !self.options.push_diagnostics_enabled {
+            return;
+        }
+        if new_snapshot.user_preferences().enable_validation.is_false() {
+            if old_snapshot.user_preferences().enable_validation.is_false() {
+                return;
+            }
+            let old_open_projects = old_snapshot
+                .project_collection
+                .get_open_configured_projects();
+            for (config_file_path, old_project) in
+                &old_snapshot.project_collection.projects_by_path()
+            {
+                if old_project.borrow().kind == Kind::CONFIGURED
+                    && old_open_projects.contains(config_file_path)
+                {
+                    self.publish_project_diagnostics(
+                        &self.background_ctx,
+                        config_file_path,
+                        &[],
+                        &old_snapshot.converters,
+                    );
+                }
+            }
             return;
         }
 
@@ -2678,6 +2702,11 @@ impl Session {
         diagnostics: &[Diagnostic],
         converters: &lsconv::Converters,
     ) {
+        let diagnostics: &[Diagnostic] = if self.config().enable_validation.is_false() {
+            &[]
+        } else {
+            diagnostics
+        };
         let mut lsp_diagnostics: Vec<lsproto::Diagnostic> = Vec::with_capacity(diagnostics.len());
         for diag in diagnostics {
             lsp_diagnostics.push(lsconv::diagnostic_to_lsp_push(ctx, converters, diag));
@@ -2703,7 +2732,7 @@ impl Session {
     // global diagnostics from checker pools, re-publishing tsconfig diagnostics if changed.
     // Multiple calls are coalesced into a single background task.
     pub fn enqueue_publish_global_diagnostics(self: &Rc<Self>) {
-        if !self.options.push_diagnostics_enabled {
+        if !self.options.push_diagnostics_enabled || self.config().enable_validation.is_false() {
             return;
         }
         // Go: s.globalDiagPublishPending.CompareAndSwap(false, true)
