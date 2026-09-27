@@ -13,13 +13,18 @@
 //! (`IndexMap<String, V>` unmarshal, Go `collections.OrderedMap` rules).
 //! `IndexMap<DocumentUri, V>` lives in `lsp/lsproto/lsp.rs`.
 //!
-//! PORT: error texts follow `json.rs` (no `json: ` prefix, no JSON pointer),
-//! not the exact v2 texts. Integer arshalers do not port the stringified
-//! form that v2 uses for integer map keys (no LSP type has integer keys).
+//! Unmarshal errors of the arshalers here are Go v2 `SemanticError` texts
+//! (see `SemanticError`). The JSON pointer is added by `unmarshal_root`; an
+//! error that reaches the caller through `json.rs` `json_unmarshal` has no
+//! pointer. The `json.rs` impls keep their own texts.
+//!
+//! PORT: integer arshalers do not port the stringified form that v2 uses
+//! for integer map keys (no LSP type has integer keys).
 
 use crate::frontend::prelude::*;
 
 use std::any::Any;
+use std::cell::RefCell;
 
 /// Go `any` holding a value that the LSP layer can marshal
 /// (`RequestMessage.Params`, `ResponseMessage.Result`, `Message.msg`).
@@ -157,37 +162,537 @@ fn normalize_kind(c: u8) -> u8 {
     }
 }
 
-// The JSON kind word of a v2 `SemanticError`.
-fn kind_name(k: u8) -> &'static str {
-    match k {
-        b'n' => "null",
-        b'f' | b't' => "boolean",
-        b'"' => "string",
-        b'0' => "number",
-        b'{' | b'}' => "object",
-        b'[' | b']' => "array",
-        _ => "value",
-    }
+fn is_ws(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-// Go `newUnmarshalErrorAfter(dec, t, nil)`.
-fn unmarshal_kind_error(k: u8, go_type: &str) -> JsonError {
-    JsonError {
-        message: format!("cannot unmarshal JSON {} into Go {go_type}", kind_name(k)),
+fn skip_ws(data: &[u8], mut p: usize) -> usize {
+    while p < data.len() && is_ws(data[p]) {
+        p += 1;
     }
+    p
 }
 
-// Go `newUnmarshalErrorAfterWithValue(dec, t, err)`: the JSON value is part
-// of the text when it is shorter than 100 bytes.
+fn skip_ws_back(data: &[u8], mut p: usize) -> usize {
+    while p > 0 && is_ws(data[p - 1]) {
+        p -= 1;
+    }
+    p
+}
+
+/// Go `newUnmarshalErrorAfter(dec, t, nil)`: a default arshaler error for a
+/// JSON value of kind `k` ("json: cannot unmarshal JSON string into Go
+/// uint32").
+#[must_use]
+pub fn unmarshal_kind_error(k: u8, go_type: &str) -> JsonError {
+    SemanticError::after(k, "", go_type, "").into_json_error()
+}
+
+// Go `newUnmarshalErrorAfterWithValue(dec, t, err)`: Go keeps the value of a
+// string or a number, and the text shows it when it is shorter than 100 bytes.
 fn unmarshal_value_error(val: &[u8], go_type: &str, detail: &str) -> JsonError {
     let k = val.first().map_or(0, |&c| normalize_kind(c));
-    let mut message = format!("cannot unmarshal JSON {}", kind_name(k));
-    if !val.is_empty() && val.len() < 100 {
-        message.push(' ');
-        message.push_str(&String::from_utf8_lossy(val));
+    let val = if k == b'"' || k == b'0' {
+        String::from_utf8_lossy(val).into_owned()
+    } else {
+        String::new()
+    };
+    SemanticError::after(k, &val, go_type, detail).into_json_error()
+}
+
+// ---------------------------------------------------------------------------
+// Go v2 unmarshal errors
+// ---------------------------------------------------------------------------
+
+/// Where the decoder stands when an unmarshal error is made. It gives the Go
+/// `where` argument of `appendStackPointer` (the JSON pointer) and the byte
+/// offset of the error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorPos {
+    /// Before the value (Go `newUnmarshalErrorBefore`, where = +1).
+    Before,
+    /// Just after the value, or after the name of an object member (Go
+    /// `newUnmarshalErrorAfter`, where = -1).
+    After,
+    /// Just after the closing token of an object or array that was read token
+    /// by token (where = -1; the offset is that of the closing token).
+    AfterEnd,
+}
+
+/// Go v2 `*json.SemanticError` of an unmarshal (errors.go:73).
+///
+/// PORT: `JsonError` holds only text. The `SemanticError` of the last error
+/// made on this thread is kept beside it, so that a caller up the stack can
+/// fill in the Go type or the JSON pointer and write the text again, as Go
+/// fills in the fields of the same error value.
+#[derive(Clone, Debug)]
+pub struct SemanticError {
+    /// `false` while this is a plain error that an `UnmarshalJSONFrom` method
+    /// returned: its text is `err` alone. The caller of the method wraps it
+    /// (`wrap_method_error`).
+    pub wrapped: bool,
+    /// Go `JSONKind` (0 when unknown).
+    pub json_kind: u8,
+    /// Go `JSONValue`: the raw string or number that failed, or empty.
+    pub json_value: String,
+    /// Go `GoType.String()`.
+    pub go_type: String,
+    /// Go `JSONPointer`. `None` until `unmarshal_root` finds it.
+    pub pointer: Option<String>,
+    /// Go `ByteOffset`. The text shows it only when the pointer is empty.
+    pub byte_offset: usize,
+    pub pos: ErrorPos,
+    /// The text of Go `Err` (empty for nil).
+    pub err: String,
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<Option<SemanticError>> = const { RefCell::new(None) };
+}
+
+impl SemanticError {
+    // Go `newUnmarshalErrorAfter` for a default arshaler.
+    fn after(json_kind: u8, json_value: &str, go_type: &str, err: &str) -> SemanticError {
+        SemanticError {
+            wrapped: true,
+            json_kind,
+            json_value: json_value.to_string(),
+            go_type: go_type.to_string(),
+            pointer: None,
+            byte_offset: 0,
+            pos: ErrorPos::After,
+            err: err.to_string(),
+        }
     }
-    message.push_str(&format!(" into Go {go_type}: {detail}"));
-    JsonError { message }
+
+    /// A plain error that an `UnmarshalJSONFrom` method returns (Go
+    /// `fmt.Errorf` in the method). `pos` is where the method left the
+    /// decoder.
+    #[must_use]
+    pub fn method(pos: ErrorPos, err: impl Into<String>) -> JsonError {
+        SemanticError {
+            wrapped: false,
+            json_kind: 0,
+            json_value: String::new(),
+            go_type: String::new(),
+            pointer: None,
+            byte_offset: 0,
+            pos,
+            err: err.into(),
+        }
+        .into_json_error()
+    }
+
+    /// The `JsonError` with the text of this error. The error is kept for
+    /// `SemanticError::of`.
+    #[must_use]
+    pub fn into_json_error(self) -> JsonError {
+        let message = self.to_string();
+        LAST_ERROR.with(|last| *last.borrow_mut() = Some(self));
+        JsonError { message }
+    }
+
+    /// The `SemanticError` that made `err`, if `err` is the last one made on
+    /// this thread. Other errors (syntax errors, `json.rs` texts) give `None`.
+    #[must_use]
+    pub fn of(err: &JsonError) -> Option<SemanticError> {
+        LAST_ERROR.with(|last| {
+            last.borrow()
+                .as_ref()
+                .filter(|s| s.to_string() == err.message)
+                .cloned()
+        })
+    }
+}
+
+// Go: errors.go:356 (*SemanticError).Error
+// PORT: Go picks "cannot" or "unable to" at random once per process; the
+// port always writes "cannot". Go prints only the kind of a type whose name
+// is longer than 100 bytes; no port type has such a name.
+impl std::fmt::Display for SemanticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.wrapped {
+            return f.write_str(&self.err);
+        }
+        let mut sb = String::from("json: cannot unmarshal");
+        match self.json_kind {
+            b'n' => sb.push_str(" JSON null"),
+            b'f' | b't' => sb.push_str(" JSON boolean"),
+            b'"' => sb.push_str(" JSON string"),
+            b'0' => sb.push_str(" JSON number"),
+            b'{' | b'}' => sb.push_str(" JSON object"),
+            b'[' | b']' => sb.push_str(" JSON array"),
+            _ => {}
+        }
+        if !self.json_value.is_empty() && self.json_value.len() < 100 {
+            sb.push(' ');
+            sb.push_str(&self.json_value);
+        }
+        if !self.go_type.is_empty() {
+            sb.push_str(" into Go ");
+            sb.push_str(&self.go_type);
+        }
+        match self.pointer.as_deref() {
+            Some(ptr) if !ptr.is_empty() => {
+                sb.push_str(" within ");
+                sb.push_str(&crate::gostd::strconv::quote(&truncate_pointer(ptr, 100)));
+            }
+            _ if self.byte_offset > 0 => {
+                sb.push_str(" after offset ");
+                sb.push_str(&self.byte_offset.to_string());
+            }
+            _ => {}
+        }
+        if !self.err.is_empty() {
+            sb.push_str(": ");
+            sb.push_str(&self.err);
+        }
+        f.write_str(&sb)
+    }
+}
+
+// Go: internal/jsonwire/wire.go:165 TruncatePointer
+fn truncate_pointer(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut i = n / 2;
+    let mut j = s.len() - n / 2;
+
+    // Avoid truncating a name if there are multiple names present.
+    if let Some(k) = s.as_bytes()[..i].iter().rposition(|&c| c == b'/')
+        && k > 0
+    {
+        i = k;
+    }
+    if let Some(k) = s.as_bytes()[j..].iter().position(|&c| c == b'/') {
+        j += k + 1;
+    }
+
+    // Avoid truncation in the middle of a UTF-8 rune.
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+
+    // Determine the right middle fragment to use.
+    let mid = &s[i..j];
+    let mut middle = match mid.matches('/').count() {
+        0 => "…",
+        1 => "…/…",
+        _ => "…/…/…",
+    };
+    if mid.starts_with('/') && middle != "…" {
+        middle = middle.strip_prefix('…').unwrap_or(middle);
+    }
+    if mid.ends_with('/') && middle != "…" {
+        middle = middle.strip_suffix('…').unwrap_or(middle);
+    }
+    format!("{}{middle}{}", &s[..i], &s[j..])
+}
+
+/// Go `newSemanticErrorWithPosition` for the type `T` of an
+/// `UnmarshalJSONFrom` method (arshal_methods.go:343): a plain error from
+/// the method gets the Go type of `T`. A `SemanticError` keeps its type, and
+/// other errors pass through.
+///
+/// PORT: Go wraps at every type that has a method. The port wraps where the
+/// caller knows the type: `Option<T>`, `Vec<T>` and map values, the root
+/// value (`unmarshal_root`) and hand-written methods. A plain error from a
+/// struct-typed required field of a generated LSP type gets the type of the
+/// next such caller.
+#[must_use]
+pub fn wrap_method_error<T: ?Sized>(err: JsonError) -> JsonError {
+    match SemanticError::of(&err) {
+        Some(mut s) if !s.wrapped => {
+            s.wrapped = true;
+            s.go_type = go_type_name::<T>();
+            s.into_json_error()
+        }
+        _ => err,
+    }
+}
+
+/// Go `json.Unmarshal(data, v)` (`json.rs` `json_unmarshal`) with the Go v2
+/// error text: a plain error of the method of `T` is wrapped, and a
+/// `SemanticError` gets its JSON pointer in `data` (or, for the root value,
+/// its byte offset).
+///
+/// PORT: the Rust decoder keeps no object names, so the pointer is found
+/// again from `data` and the input offset where decoding stopped. A
+/// `json_unmarshal` of a raw sub-value inside a method (LSP unions) does not
+/// find pointers, so its errors get the pointer in `data`, where Go keeps
+/// the one in the sub-value.
+pub fn unmarshal_root<T: UnmarshalerFrom + ?Sized>(
+    data: &[u8],
+    v: &mut T,
+) -> Result<(), JsonError> {
+    let mut dec = JsonDecoder::new(data, JsonOptions::default());
+    let err = match json_unmarshal_decode(&mut dec, v) {
+        Ok(()) => return dec.check_eof(),
+        Err(err) => wrap_method_error::<T>(err),
+    };
+    let Some(mut s) = SemanticError::of(&err) else {
+        return Err(err);
+    };
+    if !s.wrapped || s.pointer.is_some() {
+        return Err(err);
+    }
+    let end = error_end(&mut dec, data);
+    s.pointer = Some(stack_pointer(&stack_at(data, end), s.pos));
+    s.byte_offset = match s.pos {
+        // Go `CountNextDelimWhitespace`: the next token.
+        ErrorPos::Before => {
+            let p = skip_ws(data, end);
+            if p < data.len() && matches!(data[p], b',' | b':') {
+                skip_ws(data, p + 1)
+            } else {
+                p
+            }
+        }
+        // The text shows the offset only for the root value itself.
+        ErrorPos::After => skip_ws(data, 0),
+        ErrorPos::AfterEnd => end.saturating_sub(1),
+    };
+    Err(s.into_json_error())
+}
+
+/// Go v2 `json.Unmarshal(data, &v)` for a type `T` with a v1 `UnmarshalJSON`
+/// method (arshal_methods.go:282); `unmarshal_json` is the method. The raw
+/// value is read first, so a syntax error comes back as it is. An error of
+/// the method is wrapped in a `SemanticError` for the JSON kind of the value
+/// and the Go type of `T`, and stays in the error chain.
+///
+/// Used for `lsproto.Message` (lsp server.go:121 `json.Unmarshal(data, req)`).
+///
+/// PORT: Go collapses a `SemanticError` that the method returns into the
+/// outer one; no port method returns one.
+pub fn unmarshal_json_method<T: ?Sized>(
+    data: &[u8],
+    unmarshal_json: impl FnOnce(&[u8]) -> Result<(), crate::gostd::GoError>,
+) -> Result<(), crate::gostd::GoError> {
+    let mut dec = JsonDecoder::new(data, JsonOptions::default());
+    let val = dec.read_value().map_err(crate::gostd::errors::from_value)?;
+    if let Err(err) = unmarshal_json(val) {
+        let s = SemanticError {
+            pointer: Some(String::new()),
+            byte_offset: skip_ws(data, 0),
+            ..SemanticError::after(
+                val.first().map_or(0, |&c| normalize_kind(c)),
+                "",
+                &go_type_name::<T>(),
+                &err.error(),
+            )
+        };
+        return Err(crate::gostd::errors::errorf(s.to_string(), vec![err]));
+    }
+    dec.check_eof().map_err(crate::gostd::errors::from_value)
+}
+
+// The input offset where decoding stopped at an error (Go `prevEnd`, the
+// end of the last token read). The decoder does not show it, so read on to
+// the next value, whose offset `read_value` gives, and walk back over the
+// delimiter and the closing tokens before it. The input up to the error was
+// valid; the rest of a request is valid JSON too.
+fn error_end(dec: &mut JsonDecoder<'_>, data: &[u8]) -> usize {
+    let mut closes = 0;
+    let mut next = data.len();
+    loop {
+        match dec.peek_kind() {
+            b'}' | b']' => {
+                if dec.read_token().is_err() {
+                    break;
+                }
+                closes += 1;
+            }
+            0 => break,
+            _ => {
+                if let Ok(v) = dec.read_value() {
+                    next = v.as_ptr().addr() - data.as_ptr().addr();
+                }
+                break;
+            }
+        }
+    }
+    let mut p = skip_ws_back(data, next);
+    if p > 0 && (data[p - 1] == b',' || (closes == 0 && data[p - 1] == b':')) {
+        p = skip_ws_back(data, p - 1);
+    }
+    for _ in 0..closes {
+        if p > 0 && matches!(data[p - 1], b'}' | b']') {
+            p = skip_ws_back(data, p - 1);
+        }
+    }
+    p
+}
+
+// One open object or array of the Go decoder state (jsontext `stateEntry`,
+// with the last object name read in it).
+struct StackEntry {
+    is_object: bool,
+    // Names and values read so far.
+    len: usize,
+    name: String,
+}
+
+// The open objects and arrays below the top level after the tokens in
+// `data[..end]`.
+fn stack_at(data: &[u8], end: usize) -> Vec<StackEntry> {
+    let mut stack: Vec<StackEntry> = Vec::new();
+    let mut i = 0;
+    while i < end {
+        let c = data[i];
+        match c {
+            b'{' | b'[' => {
+                if let Some(e) = stack.last_mut() {
+                    e.len += 1;
+                }
+                stack.push(StackEntry {
+                    is_object: c == b'{',
+                    len: 0,
+                    name: String::new(),
+                });
+                i += 1;
+            }
+            b'}' | b']' => {
+                stack.pop();
+                i += 1;
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < data.len() && data[i] != b'"' {
+                    i += if data[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(data.len());
+                if let Some(e) = stack.last_mut() {
+                    if e.is_object && e.len.is_multiple_of(2) {
+                        let mut name = JsonDecoder::new(&data[start..i], JsonOptions::default());
+                        e.name = match name.read_token() {
+                            Ok(JsonToken::String(s)) => s,
+                            _ => String::new(),
+                        };
+                    }
+                    e.len += 1;
+                }
+            }
+            b',' | b':' => i += 1,
+            c if is_ws(c) => i += 1,
+            _ => {
+                // A number or a literal.
+                if let Some(e) = stack.last_mut() {
+                    e.len += 1;
+                }
+                while i < data.len()
+                    && !is_ws(data[i])
+                    && !matches!(data[i], b',' | b':' | b'}' | b']')
+                {
+                    i += 1;
+                }
+            }
+        }
+    }
+    stack
+}
+
+// Go: jsontext/state.go:180 appendStackPointer, with where = +1 for
+// `Before` and -1 otherwise.
+fn stack_pointer(stack: &[StackEntry], pos: ErrorPos) -> String {
+    let before = pos == ErrorPos::Before;
+    let mut b = String::new();
+    for (i, e) in stack.iter().enumerate() {
+        // By default point to the previous array element.
+        let mut index = e.len.wrapping_sub(1);
+        if i == stack.len() - 1 {
+            if (!before && e.len == 0) || (before && e.is_object && e.len.is_multiple_of(2)) {
+                return b;
+            }
+            if before && !e.is_object {
+                // Point to the next array element.
+                index = e.len;
+            }
+        }
+        b.push('/');
+        if e.is_object {
+            // Per RFC 6901, section 3, escape '~' and '/' characters.
+            for c in e.name.chars() {
+                match c {
+                    '~' => b.push_str("~0"),
+                    '/' => b.push_str("~1"),
+                    c => b.push(c),
+                }
+            }
+        } else {
+            b.push_str(&index.to_string());
+        }
+    }
+    b
+}
+
+/// Go `reflect.Type.String()` of the Go type that the Rust type `T` stands
+/// for: api and lsproto types get their package name, `Vec<T>` is `[]T`,
+/// `Option<T>` is `*T`, `Box<T>` is `T`, a map is `map[K]V`, and the Rust
+/// number types are the Go ones of the same size.
+///
+/// PORT: built from `std::any::type_name`. A Go slice of pointers (`[]*T`)
+/// prints as `[]T`.
+#[must_use]
+pub fn go_type_name<T: ?Sized>() -> String {
+    go_type_string(std::any::type_name::<T>())
+}
+
+fn go_type_string(rust: &str) -> String {
+    let (path, args) = match rust.find('<') {
+        Some(i) if rust.ends_with('>') => {
+            (&rust[..i], split_type_args(&rust[i + 1..rust.len() - 1]))
+        }
+        _ => (rust, Vec::new()),
+    };
+    let name = path.rsplit("::").next().unwrap_or(path);
+    match (name, args.as_slice()) {
+        ("Vec", [t]) => format!("[]{}", go_type_string(t)),
+        ("Option", [t]) => format!("*{}", go_type_string(t)),
+        ("Box", [t]) => go_type_string(t),
+        ("IndexMap" | "HashMap", [k, v, ..]) => {
+            format!("map[{}]{}", go_type_string(k), go_type_string(v))
+        }
+        ("bool", []) => "bool".to_string(),
+        ("u8", []) => "uint8".to_string(),
+        ("u32", []) => "uint32".to_string(),
+        ("u64", []) => "uint64".to_string(),
+        ("usize", []) => "uint".to_string(),
+        ("i32", []) => "int32".to_string(),
+        ("i64", []) => "int64".to_string(),
+        ("isize", []) => "int".to_string(),
+        ("f64", []) => "float64".to_string(),
+        ("String" | "str", []) => "string".to_string(),
+        ("LspAny", []) => "interface {}".to_string(),
+        _ if path.contains("::lsproto::") => format!("lsproto.{name}"),
+        _ if path.contains("::api::") => format!("api.{name}"),
+        _ => name.to_string(),
+    }
+}
+
+// The top-level arguments of a generic Rust type name ("A, B<C, D>").
+fn split_type_args(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
 }
 
 // Go `newUnmarshalErrorAfterWithSkipping`: after the first token of a value
@@ -283,6 +788,36 @@ fn unmarshal_uint(dec: &mut JsonDecoder<'_>, bits: u32, go_type: &str) -> Result
             Ok(n)
         }
         _ => Err(unmarshal_kind_error(k, go_type)),
+    }
+}
+
+/// Go v2 uint arshaler for a Go named uint type such as `api.SnapshotID`:
+/// errors name `go_type`. The Go size is the size of `U`.
+pub fn unmarshal_uint_as<U: TryFrom<u64>>(
+    dec: &mut JsonDecoder<'_>,
+    go_type: &str,
+) -> Result<U, JsonError> {
+    let bits = u32::try_from(std::mem::size_of::<U>() * 8).unwrap_or(64);
+    let n = unmarshal_uint(dec, bits, go_type)?;
+    // `unmarshal_uint` checked the range.
+    U::try_from(n).map_err(|_| unmarshal_kind_error(b'0', go_type))
+}
+
+/// Go v2 string arshaler (arshal_default.go:257) for a Go named string type
+/// such as `lsproto.DocumentUri`: null sets "", a string sets the value, and
+/// any other kind is an error that names `go_type`.
+pub fn unmarshal_string_as(
+    dec: &mut JsonDecoder<'_>,
+    s: &mut String,
+    go_type: &str,
+) -> Result<(), JsonError> {
+    match dec.peek_kind() {
+        b'n' | b'"' => s.unmarshal_json_from(dec),
+        _ => {
+            let val = dec.read_value()?;
+            let k = val.first().map_or(0, |&c| normalize_kind(c));
+            Err(unmarshal_kind_error(k, go_type))
+        }
     }
 }
 
@@ -411,7 +946,8 @@ impl<T: MarshalerTo> MarshalerTo for Option<T> {
 
 // Go: arshal_default.go:1742 makePointerArshaler (unmarshal): null sets nil;
 // otherwise a nil pointer gets a new zero value and the value decodes into
-// the pointee (merging into an existing one).
+// the pointee (merging into an existing one). A plain error of the method of
+// `T` gets the Go type `T`.
 impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Option<T> {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         if dec.peek_kind() == b'n' {
@@ -420,7 +956,7 @@ impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Option<T> {
             return Ok(());
         }
         let v = self.get_or_insert_with(T::default);
-        json_unmarshal_decode(dec, v)
+        json_unmarshal_decode(dec, v).map_err(wrap_method_error::<T>)
     }
 }
 
@@ -439,7 +975,8 @@ impl<T: UnmarshalerFrom + ?Sized> UnmarshalerFrom for Box<T> {
 }
 
 // Go: arshal_default.go:1528 makeSliceArshaler (unmarshal): null sets nil,
-// each element starts from its zero value, `[]` sets an empty slice.
+// each element starts from its zero value, `[]` sets an empty slice. A plain
+// error of the method of `T` gets the Go type `T`.
 // PORT: nil and empty are both an empty `Vec`.
 impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Vec<T> {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
@@ -454,14 +991,14 @@ impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Vec<T> {
                 while dec.peek_kind() != b']' {
                     self.push(T::default());
                     let v = self.last_mut().expect("element was just pushed");
-                    json_unmarshal_decode(dec, v)?;
+                    json_unmarshal_decode(dec, v).map_err(wrap_method_error::<T>)?;
                 }
                 dec.read_token()?;
                 Ok(())
             }
             _ => {
                 skip_rest_of_value(dec, &tok)?;
-                Err(unmarshal_kind_error(tok.kind(), "slice"))
+                Err(unmarshal_kind_error(tok.kind(), &go_type_name::<Self>()))
             }
         }
     }
@@ -505,9 +1042,12 @@ impl UnmarshalerFrom for [u32; 2] {
                 }
                 dec.read_token()?;
                 if let Some(err) = err {
-                    return Err(JsonError {
-                        message: format!("cannot unmarshal JSON array into Go [2]uint32: {err}"),
-                    });
+                    // Go `newUnmarshalErrorAfter` after the closing `]`.
+                    let s = SemanticError {
+                        pos: ErrorPos::AfterEnd,
+                        ..SemanticError::after(b']', "", "[2]uint32", err)
+                    };
+                    return Err(s.into_json_error());
                 }
                 Ok(())
             }
@@ -603,11 +1143,11 @@ pub fn unmarshal_value_any(dec: &mut JsonDecoder<'_>) -> Result<LspAny, JsonErro
                     message: "invalid number".to_string(),
                 })?;
                 if fv.is_infinite() {
-                    return Err(JsonError {
-                        message: format!(
-                            "cannot unmarshal JSON number {raw} into Go float64: value out of range"
-                        ),
-                    });
+                    return Err(unmarshal_value_error(
+                        raw.as_bytes(),
+                        "float64",
+                        "value out of range",
+                    ));
                 }
                 Ok(LspAny::Number(fv))
             }
@@ -1015,4 +1555,43 @@ pub fn marshal_indent<T: MarshalerTo + ?Sized>(
     w.write_value_from(&mut out, &mut dec)?;
     dec.check_eof()?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod unmarshal_error_tests {
+    use super::*;
+
+    fn err_text<T: UnmarshalerFrom + Default>(data: &str) -> String {
+        let mut v = T::default();
+        unmarshal_root(data.as_bytes(), &mut v)
+            .expect_err("want an error")
+            .to_string()
+    }
+
+    // Expected texts come from Go JSON v2 `json.Unmarshal`
+    // (go-json-experiment v0.0.0-20260601182631-00ed12fed2a6). Go writes
+    // "cannot" or "unable to"; the port writes "cannot".
+    #[test]
+    fn unmarshal_root_errors_match_go() {
+        assert_eq!(
+            err_text::<Vec<u32>>(r#"[1,"x"]"#),
+            r#"json: cannot unmarshal JSON string into Go uint32 within "/1""#
+        );
+        assert_eq!(
+            err_text::<Vec<u32>>(" {}"),
+            "json: cannot unmarshal JSON object into Go []uint32 after offset 1"
+        );
+        assert_eq!(
+            err_text::<[u32; 2]>("[1]"),
+            "json: cannot unmarshal JSON array into Go [2]uint32 after offset 2: too few array elements"
+        );
+        assert_eq!(
+            err_text::<LspAny>(r#"{"a":[1,1e999]}"#),
+            r#"json: cannot unmarshal JSON number 1e999 into Go float64 within "/a/1": value out of range"#
+        );
+        assert_eq!(
+            err_text::<FxHashMap<String, Vec<u32>>>(r#"{"a/b":[0,-1]}"#),
+            r#"json: cannot unmarshal JSON number -1 into Go uint32 within "/a~1b/1": invalid syntax"#
+        );
+    }
 }

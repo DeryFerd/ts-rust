@@ -1,0 +1,55 @@
+//! Rust port of the pinned typescript-go compiler runner
+//! (`internal/testrunner`): `TestLocal` and `TestSubmodule` compare the
+//! `.errors.txt`, `.js`, `.js.map`, `.sourcemap.txt`, `.types`, `.symbols`
+//! and `.trace.json` baselines of every compiler and conformance case with
+//! `testdata/baselines/reference` of the Go checkout, byte for byte.
+//!
+//! Files:
+//! - `runner.rs`: compiler_runner.go (the runner, the test cases, the
+//!   subtests).
+//! - `test_case_parser.rs`: test_case_parser.go and its test.
+//! - `harness.rs`: the harnessutil parts that `support::harnessutil` does
+//!   not have (`CompileFiles`, options, configurations) and recorderfs.go.
+//! - `sourcemap_recorder.rs`: sourcemap_recorder.go and
+//!   `GetSourceMapRecord`.
+//! - `tsbaseline.rs`: testutil/tsbaseline (error, js emit, source map,
+//!   source map record, module resolution, the type and symbol wrappers).
+//! - `go_regex.rs`: the Go regular expressions as plain matchers.
+//! - `child.rs`: each test configuration runs in a child process; the
+//!   environment variables and `known_failures.txt` are described there.
+//!
+//! Run: `scripts/run-cargo-capped.sh test --release -p ts_goport --test
+//! go_baselines -- compiler_runner` (TestLocal). TestSubmodule is ignored
+//! (long): run it with `--include-ignored compiler_runner::test_submodule`
+//! and `COMPILER_RUNNER_SHARD=<i>/<n>`.
+
+mod child;
+mod go_regex;
+mod harness;
+mod runner;
+mod sourcemap_recorder;
+mod test_case_parser;
+mod tsbaseline;
+
+// Go: compiler_runner_test.go:14 TestLocal
+// Runs the new compiler tests and produces baselines (e.g. `test1.symbols`).
+#[test]
+fn test_local() {
+    child::run_compiler_tests(false);
+}
+
+// Go: compiler_runner_test.go:18 TestSubmodule
+// Runs the old compiler tests, and produces new baselines (e.g. `test1.symbols`)
+// and a diff between the new and old baselines (e.g. `test1.symbols.diff`).
+#[test]
+#[ignore = "long: about 15,000 child processes; run in shards (COMPILER_RUNNER_SHARD)"]
+fn test_submodule() {
+    child::run_compiler_tests(true);
+}
+
+/// Child process entry of the compiler runner. Returns at once unless the
+/// runner started it.
+#[test]
+fn __compiler_runner_child() {
+    child::child_entry();
+}
