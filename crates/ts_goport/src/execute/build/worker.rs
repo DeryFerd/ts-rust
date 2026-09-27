@@ -17,9 +17,10 @@
 //!
 //! Protocol (stdout, one line, compact JSON):
 //! `{"exitStatus":0,"output":"...","diagnostics":[[code,category,
-//!   fileName | null,pos,end,[args...]]...],"diagnosticFileTexts":
-//!   [[fileName,text]...],"emittedFiles":[...],
-//!   "hasChangedDtsFile":false,"buildInfoFileName":"..." | null,
+//!   fileName | null,pos,end,[args...],[chain...],[related...]]...],
+//!   "diagnosticFileTexts":[[fileName,text]...],"emittedFiles":[...],
+//!   "hasChangedDtsFile":false,
+//!   "buildInfoEmit":["<file>",<unix seconds>,<nanoseconds>] | null,
 //!   "statistics":{...} | null,
 //!   "outputTimeStamps":[["<file>",<unix seconds>,<nanoseconds>],...],
 //!   "fsCache":{...}}`
@@ -51,6 +52,8 @@ use crate::execute::tsc::emit::{
 };
 use crate::execute::tsc::statistics::decode_statistics;
 use crate::frontend::prelude::*;
+// PORT: testing
+use crate::execute::tsc::compile::{BuildWorkerRunner, CommandLineTesting};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,9 +61,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const BUILD_WORKER_FLAG: &str = "--build-worker";
 
 /// The orchestrator's `WriteOutputIsTTY` for a worker: "1" or "0".
-const WORKER_TTY_ENV: &str = "GOPORT_BUILD_WORKER_TTY";
+// PORT: testing. `pub` so a test worker runner can give it (see `WorkerSystem`).
+pub const WORKER_TTY_ENV: &str = "GOPORT_BUILD_WORKER_TTY";
 /// The orchestrator's `SinceStart` when it started a worker, in nanoseconds.
-const WORKER_SINCE_START_ENV: &str = "GOPORT_BUILD_WORKER_SINCE_START_NS";
+pub const WORKER_SINCE_START_ENV: &str = "GOPORT_BUILD_WORKER_SINCE_START_NS";
 
 // PORT: Go tasks use the orchestrator's `Sys`. A worker process differs in
 // two answers. Its stdout is a pipe to the orchestrator, so its own
@@ -162,12 +166,20 @@ pub fn compare_paths_options_of_sys(sys: &dyn System) -> ComparePathsOptions {
 // (`worker_diagnostics`) and the orchestrator appends them (build_task.rs
 // `compile_and_emit_finish`). `sys` is the worker's own system; it is
 // wrapped in `WorkerSystem`.
+//
+// PORT: testing. `testing` is Go `o.opts.Testing` (`None` outside tests).
+// Go `TestingMTimesCache` is the worker host's `m_times`; the orchestrator
+// side is `CommandLineTesting::on_worker_emitted_files`. Go calls
+// `Testing.OnProgram` when the task reports (buildtask.go:109); the worker
+// calls it after emit, and the test delivers it at report time
+// (`CommandLineTesting::on_build_task_program`).
 pub fn compile_and_emit_worker(
     sys: Rc<dyn System>,
     config: &str,
     build_command_line: &[String],
     fs_cache: &CachedFsState,
     report_program_fs_cache: &mut dyn FnMut(&CachedFsState),
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> WorkerCompileResult {
     let sys: Rc<dyn System> = Rc::new(WorkerSystem::new(sys));
     let command = Rc::new(parse_build_command_line(
@@ -219,7 +231,7 @@ pub fn compile_and_emit_worker(
     let parse_start = sys.now();
     let compiler_host: Rc<dyn CompilerHost> = Rc::new(BuildCompilerHost {
         host: host.clone(),
-        trace: get_trace_with_writer_from_sys(writer.clone(), command.locale()),
+        trace: get_trace_with_writer_from_sys(writer.clone(), command.locale(), testing.clone()),
     });
     // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
     // PORT: the process has one program, so the new program is installed
@@ -244,14 +256,14 @@ pub fn compile_and_emit_worker(
     let program = new_incremental_program(
         old_program.as_ref(),
         host.clone() as Rc<dyn IncrementalHost>,
-        false,
+        testing.is_some(),
     );
     compile_times.borrow_mut().changes_compute_time = sys
         .now()
         .duration_since(changes_compute_start)
         .unwrap_or_default();
 
-    let written_build_info: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let written_build_info: Arc<Mutex<Option<(String, SystemTime)>>> = Arc::new(Mutex::new(None));
     // Go: build/buildtask.go:779 (*BuildTask).storeOutputTimeStamp
     let store_output_time_stamp =
         command.compiler_options.watch.is_true() && !resolved.compiler_options().is_incremental();
@@ -263,6 +275,8 @@ pub fn compile_and_emit_worker(
         store_output_time_stamp,
         output_time_stamps.clone(),
     );
+    // The `Sys.Now()` of `writeFile` (see `task_write_file_now`).
+    WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
     // Go keeps the statistics in the task result for the build aggregate
     // (buildtask.go:233); they go back in the worker result.
     let (result, statistics) = emit_and_report_statistics(&EmitInput {
@@ -274,10 +288,17 @@ pub fn compile_and_emit_worker(
         writer: writer.clone(),
         write_file: Some(write_file),
         compile_times,
+        testing: testing.clone(),
+        testing_m_times_cache: Some(&host.m_times),
     });
+    WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
+    // PORT: testing (see above)
+    if let Some(testing) = &testing {
+        testing.on_program(&program);
+    }
 
     let output = String::from_utf8_lossy(&builder.borrow()).into_owned();
-    let build_info_file_name = written_build_info
+    let build_info_emit = written_build_info
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
@@ -294,7 +315,7 @@ pub fn compile_and_emit_worker(
         diagnostic_file_texts,
         emitted_files: result.emit_result.emitted_files.clone(),
         has_changed_dts_file: program.has_changed_dts_file(),
-        build_info_file_name,
+        build_info_emit,
         statistics,
         output_time_stamps,
         fs_cache: host
@@ -312,30 +333,67 @@ fn worker_diagnostics(
     let mut seen: FxHashSet<&'static str> = FxHashSet::default();
     let diagnostics = diagnostics
         .iter()
-        .map(|diagnostic| {
-            let file_name = if diagnostic.file.is_nil() {
-                None
-            } else {
-                let file_name = source_file_file_name(diagnostic.file);
-                if seen.insert(file_name) {
-                    file_texts.push((
-                        file_name.to_string(),
-                        source_file_text(diagnostic.file).to_string(),
-                    ));
-                }
-                Some(file_name.to_string())
-            };
-            WorkerDiagnostic {
-                file_name,
-                pos: diagnostic.pos,
-                end: diagnostic.end,
-                code: diagnostic.code,
-                category: diagnostic.category,
-                message_args: diagnostic.message_args.clone(),
-            }
-        })
+        .map(|diagnostic| worker_diagnostic(diagnostic, &mut file_texts, &mut seen))
         .collect();
     (diagnostics, file_texts)
+}
+
+// One entry of `worker_diagnostics`, with its message chain and related
+// information. `file_texts` and `seen` collect the files that it names.
+fn worker_diagnostic(
+    diagnostic: &Diagnostic,
+    file_texts: &mut Vec<(String, String)>,
+    seen: &mut FxHashSet<&'static str>,
+) -> WorkerDiagnostic {
+    let file_name = if diagnostic.file.is_nil() {
+        None
+    } else {
+        let file_name = source_file_file_name(diagnostic.file);
+        if seen.insert(file_name) {
+            file_texts.push((
+                file_name.to_string(),
+                source_file_text(diagnostic.file).to_string(),
+            ));
+        }
+        Some(file_name.to_string())
+    };
+    let mut to_worker = |diagnostics: &[Diagnostic]| -> Vec<WorkerDiagnostic> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| worker_diagnostic(diagnostic, file_texts, seen))
+            .collect()
+    };
+    let message_chain = to_worker(&diagnostic.message_chain);
+    let related_information = to_worker(&diagnostic.related_information);
+    WorkerDiagnostic {
+        file_name,
+        pos: diagnostic.pos,
+        end: diagnostic.end,
+        code: diagnostic.code,
+        category: diagnostic.category,
+        message_args: diagnostic.message_args.clone(),
+        message_chain,
+        related_information,
+    }
+}
+
+thread_local! {
+    // Go `orchestrator.opts.Sys` of the task `writeFile`: the worker
+    // system, on the thread that runs `compile_and_emit_worker`, while it
+    // emits (see `task_write_file_now`).
+    static WRITE_FILE_SYS: RefCell<Option<Rc<dyn System>>> = const { RefCell::new(None) };
+}
+
+// Go `orchestrator.opts.Sys.Now()` in the task `writeFile`.
+// PORT: emit writes the source files' outputs on the checker threads,
+// which cannot hold the `Rc` system; there it is the OS system's `Now`
+// (`SystemTime::now`). The build info write runs on the worker thread
+// (incremental `emitBuildInfo`), so its time comes from the worker system,
+// in the same order as Go with the test `OnEmittedFiles` times.
+fn task_write_file_now() -> SystemTime {
+    WRITE_FILE_SYS
+        .with(|sys| sys.borrow().as_ref().map(|sys| sys.now()))
+        .unwrap_or_else(SystemTime::now)
 }
 
 // Go: build/buildtask.go:785 (*BuildTask).writeFile
@@ -348,13 +406,14 @@ fn worker_diagnostics(
 // build info field. Go sets it only for the write of
 // `config.GetBuildInfoFileName()` (incremental/program.go emitBuildInfo),
 // so the file name is compared instead. The worker has no task, so the
-// `onBuildInfoEmit` call is recorded as the written file name and runs in
-// the orchestrator. The `storeOutputTimeStamp` branch (watch mode) is
-// recorded in `output_time_stamps`, and the orchestrator stores the times
+// `onBuildInfoEmit` call is recorded as the written file name with its
+// `Sys.Now()` time, and runs in the orchestrator. The
+// `storeOutputTimeStamp` branch (watch mode) is recorded in
+// `output_time_stamps`, and the orchestrator stores the times
 // (`BuildTask::compile_and_emit_finish`).
 fn new_task_write_file(
     build_info_file_name: String,
-    written_build_info: Arc<Mutex<Option<String>>>,
+    written_build_info: Arc<Mutex<Option<(String, SystemTime)>>>,
     store_output_time_stamp: bool,
     output_time_stamps: Arc<Mutex<Vec<(String, SystemTime)>>>,
 ) -> WriteFile {
@@ -363,20 +422,17 @@ fn new_task_write_file(
             match osvfs_fs().write_file(file_name, text) {
                 Ok(()) => {
                     if !build_info_file_name.is_empty() && file_name == build_info_file_name {
+                        // Go: build/buildtask.go:741 onBuildInfoEmit, `mTime`
                         *written_build_info
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(file_name.to_string());
+                            Some((file_name.to_string(), task_write_file_now()));
                     } else if store_output_time_stamp {
                         // Store time stamps
-                        // PORT: Go `orchestrator.opts.Sys.Now()`. The
-                        // callback runs on a checker thread and cannot hold
-                        // the `Rc` system; the OS system's `Now` is
-                        // `SystemTime::now`.
                         output_time_stamps
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((file_name.to_string(), SystemTime::now()));
+                            .push((file_name.to_string(), task_write_file_now()));
                     }
                     Ok(())
                 }
@@ -426,9 +482,9 @@ impl MarshalerTo for WorkerCompileResult {
         append_json_quote_port_form_list(enc, &self.emitted_files);
         enc.push_str(",\"hasChangedDtsFile\":");
         self.has_changed_dts_file.marshal_json_to(enc)?;
-        enc.push_str(",\"buildInfoFileName\":");
-        match &self.build_info_file_name {
-            Some(name) => append_json_quote_port_form(enc, name),
+        enc.push_str(",\"buildInfoEmit\":");
+        match &self.build_info_emit {
+            Some((file_name, m_time)) => marshal_file_time(enc, file_name, *m_time),
             None => enc.push_str("null"),
         }
         enc.push_str(",\"statistics\":");
@@ -441,14 +497,7 @@ impl MarshalerTo for WorkerCompileResult {
             if i > 0 {
                 enc.push(',');
             }
-            let since_epoch = m_time.duration_since(UNIX_EPOCH).unwrap_or_default();
-            enc.push('[');
-            file_name.marshal_json_to(enc)?;
-            enc.push(',');
-            enc.push_str(&since_epoch.as_secs().to_string());
-            enc.push(',');
-            enc.push_str(&since_epoch.subsec_nanos().to_string());
-            enc.push(']');
+            marshal_file_time(enc, file_name, *m_time);
         }
         enc.push(']');
         enc.push_str(",\"fsCache\":");
@@ -458,9 +507,42 @@ impl MarshalerTo for WorkerCompileResult {
     }
 }
 
-// `[code,category,fileName|null,pos,end,[args...]]`. The category is the Go
-// value (0 warning, 1 error, 2 suggestion, 3 message). The strings keep the
-// port form (see `WorkerCompileResult`).
+// `["<file>",<unix seconds>,<nanoseconds>]`, a file with its time.
+fn marshal_file_time(enc: &mut String, file_name: &str, m_time: SystemTime) {
+    let since_epoch = m_time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    enc.push('[');
+    append_json_quote_port_form(enc, file_name);
+    enc.push(',');
+    enc.push_str(&since_epoch.as_secs().to_string());
+    enc.push(',');
+    enc.push_str(&since_epoch.subsec_nanos().to_string());
+    enc.push(']');
+}
+
+fn decode_file_time(dec: &mut JsonDecoder<'_>) -> Result<(String, SystemTime), JsonError> {
+    let invalid = || JsonError {
+        message: "invalid build worker file time".to_string(),
+    };
+    if dec.read_token()? != JsonToken::BeginArray {
+        return Err(invalid());
+    }
+    let mut file_name = String::new();
+    json_unmarshal_decode(dec, &mut file_name)?;
+    let mut seconds = 0.0f64;
+    json_unmarshal_decode(dec, &mut seconds)?;
+    let mut nanoseconds = 0.0f64;
+    json_unmarshal_decode(dec, &mut nanoseconds)?;
+    if dec.read_token()? != JsonToken::EndArray {
+        return Err(invalid());
+    }
+    let m_time = UNIX_EPOCH + Duration::new(seconds as u64, nanoseconds as u32);
+    Ok((file_name, m_time))
+}
+
+// `[code,category,fileName|null,pos,end,[args...],[chain...],[related...]]`.
+// The category is the Go value (0 warning, 1 error, 2 suggestion, 3
+// message). The chain and related entries have the same form. The strings
+// keep the port form (see `WorkerCompileResult`).
 impl MarshalerTo for WorkerDiagnostic {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
         enc.push('[');
@@ -478,6 +560,10 @@ impl MarshalerTo for WorkerDiagnostic {
         enc.push_str(&self.end.to_string());
         enc.push(',');
         append_json_quote_port_form_list(enc, &self.message_args);
+        enc.push(',');
+        self.message_chain.marshal_json_to(enc)?;
+        enc.push(',');
+        self.related_information.marshal_json_to(enc)?;
         enc.push(']');
         Ok(())
     }
@@ -523,6 +609,8 @@ fn decode_worker_diagnostic(dec: &mut JsonDecoder<'_>) -> Result<WorkerDiagnosti
         message_args.push(arg);
     }
     dec.read_token()?;
+    let message_chain = decode_worker_diagnostics(dec)?;
+    let related_information = decode_worker_diagnostics(dec)?;
     if dec.read_token()? != JsonToken::EndArray {
         return Err(invalid());
     }
@@ -533,7 +621,26 @@ fn decode_worker_diagnostic(dec: &mut JsonDecoder<'_>) -> Result<WorkerDiagnosti
         code,
         category,
         message_args,
+        message_chain,
+        related_information,
     })
+}
+
+// `[diagnostic...]` (see `decode_worker_diagnostic`).
+fn decode_worker_diagnostics(
+    dec: &mut JsonDecoder<'_>,
+) -> Result<Vec<WorkerDiagnostic>, JsonError> {
+    if dec.read_token()? != JsonToken::BeginArray {
+        return Err(JsonError {
+            message: "invalid build worker diagnostics".to_string(),
+        });
+    }
+    let mut diagnostics = Vec::new();
+    while dec.peek_kind() != b']' {
+        diagnostics.push(decode_worker_diagnostic(dec)?);
+    }
+    dec.read_token()?;
+    Ok(diagnostics)
 }
 
 /// The protocol line for `result` (no trailing newline).
@@ -562,7 +669,7 @@ fn decode_worker_compile_result(
         diagnostic_file_texts: Vec::new(),
         emitted_files: Vec::new(),
         has_changed_dts_file: false,
-        build_info_file_name: None,
+        build_info_emit: None,
         statistics: None,
         output_time_stamps: Vec::new(),
         fs_cache: CachedFsState::default(),
@@ -580,15 +687,7 @@ fn decode_worker_compile_result(
                 result.exit_status = ExitStatus::from_code(code as i32).ok_or_else(invalid)?;
             }
             "output" => json_unmarshal_decode(dec, &mut result.output)?,
-            "diagnostics" => {
-                if dec.read_token()? != JsonToken::BeginArray {
-                    return Err(invalid());
-                }
-                while dec.peek_kind() != b']' {
-                    result.diagnostics.push(decode_worker_diagnostic(dec)?);
-                }
-                dec.read_token()?;
-            }
+            "diagnostics" => result.diagnostics = decode_worker_diagnostics(dec)?,
             "diagnosticFileTexts" => {
                 if dec.read_token()? != JsonToken::BeginArray {
                     return Err(invalid());
@@ -620,14 +719,12 @@ fn decode_worker_compile_result(
                 dec.read_token()?;
             }
             "hasChangedDtsFile" => json_unmarshal_decode(dec, &mut result.has_changed_dts_file)?,
-            "buildInfoFileName" => {
+            "buildInfoEmit" => {
                 if dec.peek_kind() == b'n' {
                     dec.read_token()?;
-                    result.build_info_file_name = None;
+                    result.build_info_emit = None;
                 } else {
-                    let mut name = String::new();
-                    json_unmarshal_decode(dec, &mut name)?;
-                    result.build_info_file_name = Some(name);
+                    result.build_info_emit = Some(decode_file_time(dec)?);
                 }
             }
             "statistics" => {
@@ -643,20 +740,7 @@ fn decode_worker_compile_result(
                     return Err(invalid());
                 }
                 while dec.peek_kind() != b']' {
-                    if dec.read_token()? != JsonToken::BeginArray {
-                        return Err(invalid());
-                    }
-                    let mut file_name = String::new();
-                    json_unmarshal_decode(dec, &mut file_name)?;
-                    let mut seconds = 0.0f64;
-                    json_unmarshal_decode(dec, &mut seconds)?;
-                    let mut nanoseconds = 0.0f64;
-                    json_unmarshal_decode(dec, &mut nanoseconds)?;
-                    if dec.read_token()? != JsonToken::EndArray {
-                        return Err(invalid());
-                    }
-                    let m_time = UNIX_EPOCH + Duration::new(seconds as u64, nanoseconds as u32);
-                    result.output_time_stamps.push((file_name, m_time));
+                    result.output_time_stamps.push(decode_file_time(dec)?);
                 }
                 dec.read_token()?;
             }
@@ -674,7 +758,9 @@ fn decode_worker_compile_result(
 
 /// Starts build workers. It is `Send`, so the orchestrator can wait for
 /// several workers on helper threads (Go runs tasks on goroutines).
-#[derive(Clone, Debug)]
+// PORT: testing. `Debug` is written out below, because `runner` is a
+// closure.
+#[derive(Clone)]
 pub struct WorkerLauncher {
     /// The build binary.
     pub exe: std::path::PathBuf,
@@ -684,6 +770,22 @@ pub struct WorkerLauncher {
     pub write_output_is_tty: bool,
     /// The orchestrator's start, for its `SinceStart` (see `WorkerSystem`).
     pub start: std::time::Instant,
+    /// PORT: testing. A test's runner in place of the worker process
+    /// (`CommandLineTesting::build_worker_runner`). `None` outside tests.
+    pub runner: Option<BuildWorkerRunner>,
+}
+
+// PORT: testing (see `WorkerLauncher`)
+impl std::fmt::Debug for WorkerLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerLauncher")
+            .field("exe", &self.exe)
+            .field("build_command_line", &self.build_command_line)
+            .field("write_output_is_tty", &self.write_output_is_tty)
+            .field("start", &self.start)
+            .field("runner", &self.runner.is_some())
+            .finish()
+    }
 }
 
 impl WorkerLauncher {
@@ -700,6 +802,7 @@ impl WorkerLauncher {
             build_command_line,
             write_output_is_tty: std::io::stdout().is_terminal(),
             start: std::time::Instant::now(),
+            runner: None,
         }
     }
 
@@ -723,6 +826,10 @@ impl WorkerLauncher {
         fs_cache: &str,
         on_program_fs_cache: &mut dyn FnMut(CachedFsState),
     ) -> WorkerCompileResult {
+        // PORT: testing
+        if let Some(runner) = &self.runner {
+            return runner(config, fs_cache, on_program_fs_cache);
+        }
         let output = std::process::Command::new(&self.exe)
             .arg(BUILD_WORKER_FLAG)
             // The worker reads its arguments into the port form again.
@@ -794,7 +901,7 @@ impl WorkerLauncher {
                 diagnostic_file_texts: Vec::new(),
                 emitted_files: Vec::new(),
                 has_changed_dts_file: false,
-                build_info_file_name: None,
+                build_info_emit: None,
                 statistics: None,
                 output_time_stamps: Vec::new(),
                 fs_cache: CachedFsState::default(),
@@ -865,7 +972,8 @@ pub fn marshal_worker_program_fs_cache(state: &CachedFsState) -> String {
 }
 
 /// Reads a `fsCacheProgram` line back. `None` for any other line.
-fn parse_worker_program_fs_cache(line: &[u8]) -> Option<CachedFsState> {
+// PORT: testing. `pub` so a test worker runner can read the line.
+pub fn parse_worker_program_fs_cache(line: &[u8]) -> Option<CachedFsState> {
     if !line.starts_with(PROGRAM_FS_CACHE_PREFIX.as_bytes()) {
         return None;
     }
@@ -917,6 +1025,26 @@ mod tests {
                         "\u{FDD0}\u{10F7FE}x".to_string(),
                         "\u{FDD0}\u{FDD0}".to_string(),
                     ],
+                    message_chain: vec![WorkerDiagnostic {
+                        file_name: None,
+                        pos: 0,
+                        end: 0,
+                        code: 2322,
+                        category: ts_diagnostics::Category::Error,
+                        message_args: vec!["string".to_string(), "number".to_string()],
+                        message_chain: Vec::new(),
+                        related_information: Vec::new(),
+                    }],
+                    related_information: vec![WorkerDiagnostic {
+                        file_name: Some("/p/b.ts".to_string()),
+                        pos: 1,
+                        end: 2,
+                        code: 2728,
+                        category: ts_diagnostics::Category::Message,
+                        message_args: vec!["x".to_string()],
+                        message_chain: Vec::new(),
+                        related_information: Vec::new(),
+                    }],
                 },
                 WorkerDiagnostic {
                     file_name: None,
@@ -925,6 +1053,8 @@ mod tests {
                     code: 18003,
                     category: ts_diagnostics::Category::Error,
                     message_args: Vec::new(),
+                    message_chain: Vec::new(),
+                    related_information: Vec::new(),
                 },
             ],
             diagnostic_file_texts: vec![(
@@ -933,7 +1063,10 @@ mod tests {
             )],
             emitted_files: Vec::new(),
             has_changed_dts_file: false,
-            build_info_file_name: None,
+            build_info_emit: Some((
+                "/p/tsconfig.tsbuildinfo".to_string(),
+                UNIX_EPOCH + Duration::new(1_700_000_000, 5),
+            )),
             statistics: None,
             output_time_stamps: Vec::new(),
             fs_cache: CachedFsState::default(),
@@ -946,6 +1079,13 @@ mod tests {
             back.diagnostics[0].message_args,
             result.diagnostics[0].message_args
         );
+        let chain = &back.diagnostics[0].message_chain;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].message_args, ["string", "number"]);
+        let related = &back.diagnostics[0].related_information;
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].file_name.as_deref(), Some("/p/b.ts"));
+        assert_eq!(back.build_info_emit, result.build_info_emit);
         assert_eq!(back.diagnostic_file_texts, result.diagnostic_file_texts);
         assert_eq!(marshal_worker_compile_result(&back), line);
     }

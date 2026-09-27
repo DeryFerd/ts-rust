@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::ast::store::{
-    file_store_file_name, file_store_parser_flags, publish_file_stores, unpublished_file_ids,
+    file_store_contains_non_ascii, file_store_file_name, file_store_parser_flags,
+    publish_file_stores, unpublished_file_ids,
 };
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
@@ -279,6 +280,12 @@ pub(super) fn note_parsed_source_file(file: &Rc<ParsedSourceFile>) {
     if !crate::ast::is_published(file.store) {
         PARSED_UNPUBLISHED.with(|parsed| parsed.borrow_mut().insert(file.store, file.clone()));
     }
+}
+
+/// The parse that `note_parsed_source_file` recorded for store `store` on
+/// this thread, while the store is not published.
+pub(super) fn unpublished_parsed_source_file(store: usize) -> Option<Rc<ParsedSourceFile>> {
+    PARSED_UNPUBLISHED.with(|parsed| parsed.borrow().get(&store).cloned())
 }
 
 /// `publish_parsed_files` (program.rs).
@@ -614,6 +621,7 @@ fn program_file_info(store: usize, file: &ParsedSourceFile) -> SourceFileInfo {
         js_diagnostics: file.js_diagnostics.clone(),
         jsdoc_diagnostics: file.jsdoc_diagnostics.clone(),
         has_lazy_js_doc: file.has_lazy_js_doc,
+        contains_non_ascii: file.contains_non_ascii,
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
@@ -653,6 +661,8 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         js_diagnostics: Vec::new(),
         jsdoc_diagnostics: Vec::new(),
         has_lazy_js_doc: false,
+        // The parser flag of the config file, when the store was parsed.
+        contains_non_ascii: file_store_contains_non_ascii(store),
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };

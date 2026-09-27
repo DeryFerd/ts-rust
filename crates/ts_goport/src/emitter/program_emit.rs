@@ -86,9 +86,20 @@ pub fn emit_with(
     );
     let emit_only = options.emit_only;
     let write_file = options.write_file.clone();
-    let results = run_on_checker_threads_for_files(&source_files, move |source_file| {
+    // Go `core.singleThreadedWorkGroup` runs the queued emits
+    // last-queued-first (core/workgroup.go:67). With one checker thread the
+    // jobs run in the order they are sent, so send them reversed.
+    let last_queued_first = single_threaded();
+    let mut queued = source_files;
+    if last_queued_first {
+        queued.reverse();
+    }
+    let mut results = run_on_checker_threads_for_files(&queued, move |source_file| {
         wrap(&|| emit_source_file(source_file, emit_only, write_file.clone()))
     });
+    if last_queued_first {
+        results.reverse();
+    }
 
     // collect results from emit, preserving input order
     combine_emit_results(results)

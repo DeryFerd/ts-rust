@@ -331,6 +331,9 @@ pub fn adopt_detached_parse(
     let remap = adopt_detached_store(store);
     file.remap_store(remap);
     file.parse_options = opts.clone();
+    if file.has_lazy_js_doc {
+        set_file_store_lazy_js_doc(file.store, &file.parse_options, file.script_kind);
+    }
     set_source_file_diagnostics(file.root, file.diagnostics.clone());
     file
 }
@@ -779,10 +782,18 @@ impl Parser {
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
         set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
-        set_file_store_parse_fields(result.store, result.language_variant, &result.diagnostics);
+        set_file_store_parse_fields(
+            result.store,
+            result.language_variant,
+            &result.diagnostics,
+            result.contains_non_ascii,
+        );
         // For non-JS files, enable lazy JSDoc parsing on demand
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;
+            // PORT: node reads before a program use the store (see
+            // `resolve_file_store_js_doc`).
+            set_file_store_lazy_js_doc(result.store, &result.parse_options, result.script_kind);
         }
         self.reparsed_clones
             .sort_by(|a, b| compare_node_positions(*a, *b).cmp(&0));

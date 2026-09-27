@@ -98,7 +98,7 @@ fn run(args: &[String]) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         // Go: cmd/tsgo/main.go:31 `signal.NotifyContext(context.Background(), ...)`.
         // PORT: no signal handling (plan D-W3), so the context never ends.
-        tsc_build_compilation(&context::background(), sys.clone(), args)
+        tsc_build_compilation(&context::background(), sys.clone(), args, None)
     }));
     let _ = sys.writer().borrow_mut().flush();
     let code = match result {
@@ -167,6 +167,7 @@ fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
             build_command_line,
             &fs_cache,
             &mut report_program_fs_cache,
+            None,
         )
     }));
     match result {

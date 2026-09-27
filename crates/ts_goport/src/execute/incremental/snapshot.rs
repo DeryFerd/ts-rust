@@ -85,10 +85,34 @@ pub fn port_text_range(file: Node, pos: i32, end: i32) -> TextRange {
 
 // Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName
 // PORT: Go nil `diagnostics` is `None`; it marks "not converted yet".
-#[derive(Clone, Debug, Default)]
+// PORT: testing. Go maps hold pointers to these, and the Go test harness
+// compares the old and new program's pointers (tsctests/sys.go OnProgram).
+// `id` is that identity: each new entry (Go
+// `&DiagnosticsOrBuildInfoDiagnosticsWithFileName{...}`, here `default()`
+// or `..Default::default()`) gets a new id, and a clone (Go keeps the
+// pointer) keeps it. No output reads it.
+#[derive(Clone, Debug)]
 pub struct DiagnosticsOrBuildInfoDiagnosticsWithFileName {
     pub diagnostics: Option<Vec<Diagnostic>>,
     pub build_info_diagnostics: Vec<BuildInfoDiagnosticWithFileName>,
+    pub id: u64,
+}
+
+// PORT: testing (see `DiagnosticsOrBuildInfoDiagnosticsWithFileName`)
+impl Default for DiagnosticsOrBuildInfoDiagnosticsWithFileName {
+    fn default() -> Self {
+        DiagnosticsOrBuildInfoDiagnosticsWithFileName {
+            diagnostics: None,
+            build_info_diagnostics: Vec::new(),
+            id: new_diagnostics_id(),
+        }
+    }
+}
+
+/// PORT: testing. A new `DiagnosticsOrBuildInfoDiagnosticsWithFileName` id.
+pub fn new_diagnostics_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl BuildInfoDiagnosticWithFileName {

@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use super::compile::{System, Writer, write_str};
+// PORT: testing (the status reporters)
+use super::compile::CommandLineTesting;
 use crate::diagnostics_loc::{localize, message_localize};
 use crate::frontend::tspath::{ComparePathsOptions, convert_to_relative_path, path_is_absolute};
 use crate::locale::Locale;
@@ -201,6 +203,7 @@ pub fn create_builder_status_reporter(
     w: Writer,
     locale: &Locale,
     options: &CompilerOptions,
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> DiagnosticReporter {
     if options.quiet.is_true() {
         return quiet_diagnostic_reporter();
@@ -214,11 +217,18 @@ pub fn create_builder_status_reporter(
             format_diagnostics_status_and_time
         };
     Rc::new(move |diagnostic: &Diagnostic| {
+        // PORT: testing. Go `defer testing.OnBuildStatusReportEnd(w)`.
+        if let Some(testing) = &testing {
+            testing.on_build_status_report_start(&w);
+        }
         write_status(&w, &format_status_time(sys.now()), diagnostic, &format_opts);
         write_str(
             &w,
             &format!("{}{}", format_opts.new_line, format_opts.new_line),
         );
+        if let Some(testing) = &testing {
+            testing.on_build_status_report_end(&w);
+        }
     })
 }
 
@@ -227,6 +237,7 @@ pub fn create_watch_status_reporter(
     sys: Rc<dyn System>,
     locale: &Locale,
     options: Rc<CompilerOptions>,
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> DiagnosticReporter {
     let format_opts = get_format_opts_of_sys(sys.as_ref(), locale);
     let write_status: fn(&Writer, &str, &Diagnostic, &FormattingOptions) =
@@ -237,6 +248,10 @@ pub fn create_watch_status_reporter(
         };
     Rc::new(move |diagnostic: &Diagnostic| {
         let writer = sys.writer();
+        // PORT: testing. Go `defer testing.OnWatchStatusReportEnd()`.
+        if let Some(testing) = &testing {
+            testing.on_watch_status_report_start();
+        }
         try_clear_screen(&writer, diagnostic, &options);
         write_status(
             &writer,
@@ -248,6 +263,9 @@ pub fn create_watch_status_reporter(
             &writer,
             &format!("{}{}", format_opts.new_line, format_opts.new_line),
         );
+        if let Some(testing) = &testing {
+            testing.on_watch_status_report_end();
+        }
     })
 }
 

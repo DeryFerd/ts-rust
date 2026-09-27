@@ -6,13 +6,14 @@
 
 use crate::frontend::prelude::*;
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path as OsPath, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 // PORT: a Go path is a Go string, so it can hold any bytes, and Go passes
@@ -46,8 +47,50 @@ pub fn os_args() -> Vec<String> {
 }
 
 /// The current directory in the port form (Go `os.Getwd`, see `os_path`).
+/// With an OS override installed, the override's directory.
 pub fn os_current_dir() -> io::Result<String> {
+    if let Some(o) = OS_OVERRIDE.get() {
+        return Ok(o.current_directory.clone());
+    }
     std::env::current_dir().map(go_string_from_os)
+}
+
+// PORT: Go reads files and the current directory through `sys.FS()` and
+// `sys.GetCurrentDirectory()`, so a Go test swaps the whole OS for its
+// `TestSys`. The port's file system is `Rc`, so the parse, checker and emit
+// threads cannot share `sys.FS()`: they call `osvfs_fs()` and
+// `os_current_dir()` directly. A test process installs an `OsOverride` once
+// at start, and those calls then reach the test file system and directory.
+// Only test processes install it; a real run never does and keeps the OS
+// behavior below unchanged.
+
+/// The file system and current directory that replace the OS in a test
+/// process (see `install_os_override`).
+pub struct OsOverride {
+    /// Makes the file system for one thread. `osvfs_fs` calls it once per
+    /// thread. Each value must share one state (for example a map behind
+    /// an `Arc<Mutex>`), so that all threads see the same files. It must
+    /// not call `osvfs_fs` itself.
+    pub fs: Arc<dyn Fn() -> Rc<dyn Fs> + Send + Sync>,
+    /// The value of `os_current_dir`.
+    pub current_directory: String,
+}
+
+static OS_OVERRIDE: OnceLock<OsOverride> = OnceLock::new();
+
+/// Replaces the OS file system and current directory for the rest of the
+/// process. Install it before the first `osvfs_fs` or `os_current_dir`
+/// call. Panics when an override is already installed.
+pub fn install_os_override(o: OsOverride) {
+    assert!(
+        OS_OVERRIDE.set(o).is_ok(),
+        "osvfs: an OS override is already installed"
+    );
+}
+
+/// True when `install_os_override` has run in this process.
+pub fn os_override_installed() -> bool {
+    OS_OVERRIDE.get().is_some()
 }
 
 // PORT: the Go semaphores `blockingOpSema`, `readSema` and `writeSema`
@@ -57,7 +100,9 @@ pub fn os_current_dir() -> io::Result<String> {
 // Go: os.go:30 FS
 // FS creates a new FS from the OS file system.
 // PORT: the Go package function `osvfs.FS` is `osvfs_fs`. Go returns one
-// package-level value; this returns a clone of one per-thread value.
+// package-level value; this returns a clone of one per-thread value. With
+// an OS override installed (a test process), the per-thread value is the
+// one that the override's `fs` makes on the first call on that thread.
 pub fn osvfs_fs() -> Rc<dyn Fs> {
     thread_local! {
         // Go: os.go:34 osVFS
@@ -67,6 +112,10 @@ pub fn osvfs_fs() -> Rc<dyn Fs> {
                 is_reparse_point: IS_REPARSE_POINT,
             },
         });
+        static OVERRIDE_FS: OnceCell<Rc<dyn Fs>> = const { OnceCell::new() };
+    }
+    if let Some(o) = OS_OVERRIDE.get() {
+        return OVERRIDE_FS.with(|cell| Rc::clone(cell.get_or_init(|| (o.fs)())));
     }
     OS_VFS.with(Rc::clone)
 }

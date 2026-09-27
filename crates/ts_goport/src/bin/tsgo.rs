@@ -203,6 +203,7 @@ fn run_worker(start: Instant, config: &str, build_command_line: &[String]) -> i3
             build_command_line,
             &fs_cache,
             &mut report_program_fs_cache,
+            None,
         )
     }));
     match result {

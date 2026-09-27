@@ -9,8 +9,8 @@
 //! `goport_build` runs `tsc_build_compilation`.
 //!
 //! PORT: Go `ctx` reaches watch mode (execute/watcher.rs) and the build
-//! orchestrator. Go `testing` is nil outside Go tests, so it is dropped
-//! (see compile.rs).
+//! orchestrator. Go `testing` is `TscCompilationHooks::testing` (`None`
+//! outside tests, see compile.rs).
 //!
 //! PORT: the program state is process-wide, so Go `compiler.NewProgram` is
 //! `crate::program::install_new_program`, as in build/worker.rs (see
@@ -43,6 +43,8 @@ use crate::execute::watcher::create_watcher;
 use crate::frontend::json::json_marshal_indent_write;
 use crate::frontend::tsoptions::convert_to_ts_config;
 use crate::gostd::Context;
+// PORT: testing
+use crate::execute::tsc::CommandLineTesting;
 
 /// The bin part of the compile step of `tscCompilation`.
 // PORT: no Go equivalent. Go has one `tsc`. `tsgo` uses the defaults
@@ -95,6 +97,14 @@ pub trait TscCompilationHooks {
     /// default, which refuses every write (program.rs emitHost
     /// `write_file`).
     fn write_file(&self) -> Option<WriteFile>;
+
+    /// Go `testing tsc.CommandLineTesting` of `CommandLine`. `None` is the
+    /// Go nil that every bin passes; a test passes its test system.
+    // PORT: testing. Go passes it as a parameter; a hook keeps the bins
+    // unchanged.
+    fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
+        None
+    }
 }
 
 /// Go `tsc`: no bin step, the Go program, and emit writes through the OS
@@ -122,8 +132,9 @@ fn result(status: ExitStatus) -> CommandLineResult {
 
 // Go: execute/tsc.go:27 startTracingIfNeeded, the warning part. The session
 // is the process session in `crate::tracing`.
-fn start_tracing_if_needed(sys: &dyn System, config: &ParsedCommandLine) {
-    if let Some(warning) = crate::tracing::start_tracing_if_needed(config, false) {
+// PORT: testing. `testing` is Go `testing != nil`.
+fn start_tracing_if_needed(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
+    if let Some(warning) = crate::tracing::start_tracing_if_needed(config, testing) {
         write_str(&sys.writer(), &warning);
     }
 }
@@ -152,7 +163,7 @@ pub fn command_line(
                 if !hooks.build_mode() {
                     unported!("tscBuildCompilation");
                 }
-                return tsc_build_compilation(ctx, sys, command_line_args);
+                return tsc_build_compilation(ctx, sys, command_line_args, hooks.testing());
             }
             // case "-f":
             // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
@@ -174,10 +185,13 @@ pub fn command_line(
 // here it is the first step, which runs in the same order.
 // `command_line_args` is the full command line (Go `commandLineArgs`),
 // which the build workers get too (build/worker.rs).
+// PORT: testing. A test's `build_worker_runner` replaces the build worker
+// process (see `BuildWorkerRunner`).
 pub fn tsc_build_compilation(
     ctx: &Context,
     sys: Rc<dyn System>,
     command_line_args: &[String],
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> CommandLineResult {
     let build_command = parse_build_command_line(command_line_args, &SystemParseConfigHost(&*sys));
     let locale = build_command.locale();
@@ -213,10 +227,16 @@ pub fn tsc_build_compilation(
         return result(ExitStatus::Success);
     }
 
+    let mut worker = WorkerLauncher::current(command_line_args.to_vec());
+    // PORT: testing
+    worker.runner = testing
+        .as_ref()
+        .and_then(|testing| testing.build_worker_runner());
     let orchestrator = Box::new(new_orchestrator(OrchestratorOptions {
         sys,
         command: Rc::new(build_command),
-        worker: WorkerLauncher::current(command_line_args.to_vec()),
+        worker,
+        testing,
     }));
     orchestrator.start(ctx)
 }
@@ -229,6 +249,8 @@ pub fn tsc_compilation(
     command_line: ParsedCommandLine,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    // PORT: testing. Go `testing` parameter.
+    let testing = hooks.testing();
     let mut config_file_name = String::new();
     let locale = command_line.locale();
     let mut report_diagnostic: DiagnosticReporter = create_diagnostic_reporter(
@@ -427,6 +449,7 @@ pub fn tsc_compilation(
             command_line_raw,
             report_diagnostic,
             report_error_summary,
+            testing,
         );
         watcher.start(ctx);
         return CommandLineResult {
@@ -441,6 +464,7 @@ pub fn tsc_compilation(
             report_error_summary,
             extended_config_cache,
             compile_times,
+            testing,
             hooks,
         );
     }
@@ -451,6 +475,7 @@ pub fn tsc_compilation(
         report_error_summary,
         extended_config_cache,
         compile_times,
+        testing,
         hooks,
     )
 }
@@ -475,8 +500,12 @@ fn find_config_file(
 }
 
 // Go: execute/tsc.go:280 getTraceFromSys
-pub(crate) fn get_trace_from_sys(sys: &dyn System, locale: crate::locale::Locale) -> TraceFn {
-    get_trace_with_writer_from_sys(sys.writer(), locale)
+pub(crate) fn get_trace_from_sys(
+    sys: &dyn System,
+    locale: crate::locale::Locale,
+    testing: Option<Rc<dyn CommandLineTesting>>,
+) -> TraceFn {
+    get_trace_with_writer_from_sys(sys.writer(), locale, testing)
 }
 
 /// Go `compiler.NewProgram(compiler.ProgramOptions{Config, Host, Tracing})`.
@@ -526,7 +555,8 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // and `goport_emit` run on read-only Query inputs, which are composite and
 // incremental, and the Go incremental program would write build info next
 // to them. Their steps are still timed (empty), so the statistics table
-// has the same rows as Go. `testing.OnProgram` is a test hook.
+// has the same rows as Go. Without the incremental program there is no
+// `testing.OnProgram` (only a bin replaces it, and bins pass no testing).
 fn perform_incremental_compilation(
     sys: &dyn System,
     config: ParsedCommandLine,
@@ -534,6 +564,7 @@ fn perform_incremental_compilation(
     report_error_summary: DiagnosticsReporter,
     extended_config_cache: Rc<TscExtendedConfigCache>,
     compile_times: Rc<RefCell<CompileTimes>>,
+    testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let host = new_cached_fs_compiler_host(
@@ -541,7 +572,7 @@ fn perform_incremental_compilation(
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
-        Some(get_trace_from_sys(sys, config.locale())),
+        Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
     );
     let config = Rc::new(config);
     let replacement = hooks.program_like();
@@ -552,7 +583,7 @@ fn perform_incremental_compilation(
     };
     compile_times.borrow_mut().build_info_read_time = since(sys, build_info_read_start);
 
-    start_tracing_if_needed(sys, &config);
+    start_tracing_if_needed(sys, &config, testing.is_some());
 
     let parse_start = sys.now();
     install_program(host.clone(), config.clone());
@@ -563,7 +594,7 @@ fn perform_incremental_compilation(
         None => Some(new_incremental_program(
             old_program.as_ref(),
             create_host(host),
-            false,
+            testing.is_some(),
         )),
     };
     compile_times.borrow_mut().changes_compute_time = since(sys, changes_compute_start);
@@ -585,10 +616,16 @@ fn perform_incremental_compilation(
         writer: sys.writer(),
         write_file: hooks.write_file(),
         compile_times,
+        testing: testing.clone(),
+        testing_m_times_cache: None,
     });
 
     stop_tracing(sys);
 
+    // PORT: testing
+    if let (Some(testing), Some(incremental_program)) = (&testing, &incremental_program) {
+        testing.on_program(incremental_program);
+    }
     result(emit_result.status)
 }
 
@@ -600,6 +637,7 @@ fn perform_compilation(
     report_error_summary: DiagnosticsReporter,
     extended_config_cache: Rc<TscExtendedConfigCache>,
     compile_times: Rc<RefCell<CompileTimes>>,
+    testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let host = new_cached_fs_compiler_host(
@@ -607,11 +645,11 @@ fn perform_compilation(
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
-        Some(get_trace_from_sys(sys, config.locale())),
+        Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
     );
     let config = Rc::new(config);
 
-    start_tracing_if_needed(sys, &config);
+    start_tracing_if_needed(sys, &config, testing.is_some());
 
     let parse_start = sys.now();
     install_program(host, config.clone());
@@ -630,6 +668,8 @@ fn perform_compilation(
         writer: sys.writer(),
         write_file: hooks.write_file(),
         compile_times,
+        testing,
+        testing_m_times_cache: None,
     });
 
     stop_tracing(sys);

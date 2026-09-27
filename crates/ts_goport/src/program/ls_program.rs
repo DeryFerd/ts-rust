@@ -159,13 +159,15 @@ pub fn program_version(p: &'static NewProgram) -> &'static GoProgram {
 /// The parsed file whose root is `file`, from any program made here that
 /// is not released, or None. Go `*ast.SourceFile` is one object in every
 /// program that has it; here the programs hold the `ParsedSourceFile`.
+/// A file that is not published yet (Go `parser.ParseSourceFile` outside a
+/// program) has the parse that `program::note_parsed_source_file` recorded
+/// on this thread.
 pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
-    let path = tspath::Path(
-        crate::ast::try_go_file(file.file_index())?
-            .info
-            .path
-            .clone(),
-    );
+    let Some(go_file) = crate::ast::try_go_file(file.file_index()) else {
+        return super::go_frontend::unpublished_parsed_source_file(file.file_index())
+            .filter(|parsed| parsed.root == file);
+    };
+    let path = tspath::Path(go_file.info.path.clone());
     let programs: Vec<&'static NewProgram> = PROGRAM_CHECKERS.with(|programs| {
         programs
             .borrow()

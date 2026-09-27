@@ -10,6 +10,8 @@ use crate::frontend::json::{
 use crate::prelude::*;
 
 use super::compile::CompileTimes;
+// PORT: testing (`report_to`)
+use super::compile::{CommandLineTesting, Writer, write_str};
 
 struct TableRow {
     name: String,
@@ -132,8 +134,9 @@ pub fn statistics_from_program(compile_times: &CompileTimes, mem_stats: &MemStat
 }
 
 impl Statistics {
-    // Go: execute/tsc/statistics.go:84 Report
-    // PORT: the `CommandLineTesting` hooks are test-only and not ported.
+    // Go: execute/tsc/statistics.go:84 Report, the table part.
+    // PORT: this writes the table to a string. `report_to` is Go `Report`
+    // with the writer and the `CommandLineTesting` hooks.
     pub fn report(&self, w: &mut String) {
         let mut table = Table::default();
         let mut prefix = "";
@@ -186,6 +189,21 @@ impl Statistics {
         }
         table.add_duration(&format!("{prefix}Total time"), compile_times.total_time);
         table.print(w);
+    }
+
+    // Go: execute/tsc/statistics.go:84 Report
+    // PORT: testing. Go `defer testing.OnStatisticsEnd(w)` runs after the
+    // table is written.
+    pub fn report_to(&self, w: &Writer, testing: Option<Rc<dyn CommandLineTesting>>) {
+        if let Some(testing) = &testing {
+            testing.on_statistics_start(w);
+        }
+        let mut text = String::new();
+        self.report(&mut text);
+        write_str(w, &text);
+        if let Some(testing) = &testing {
+            testing.on_statistics_end(w);
+        }
     }
 
     // Go: execute/tsc/statistics.go:130 Aggregate

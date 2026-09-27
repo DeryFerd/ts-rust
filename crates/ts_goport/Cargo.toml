@@ -36,3 +36,10 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 [lints]
 workspace = true
+
+# Rust port of the pinned typescript-go baseline tests. `test = false` keeps
+# it out of `cargo test --workspace`; run it with `--test go_baselines`.
+[[test]]
+name = "go_baselines"
+path = "tests/go_baselines/main.rs"
+test = false

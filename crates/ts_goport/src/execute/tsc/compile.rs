@@ -12,6 +12,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::emitter::program_emit::EmitResult;
 use crate::frontend::vfs::Fs;
+// PORT: testing (`CommandLineTesting`)
+use crate::execute::build::build_task::WorkerCompileResult;
+use crate::frontend::compiler::TraceFn;
+use crate::frontend::tspath::Path;
+use crate::frontend::vfs::CachedFsState;
+use crate::locale::Locale;
+use std::sync::Arc;
 
 /// Go `io.Writer`. A caller that wants the text back (Go `bytes.Buffer`)
 /// keeps its own `Rc<RefCell<Vec<u8>>>` and passes a clone as a `Writer`.
@@ -121,9 +128,63 @@ pub struct CommandLineResult {
     pub watcher: Option<Box<dyn Watcher>>,
 }
 
-// PORT: Go execute/tsc/compile.go:50 CommandLineTesting is the Go test
-// harness hook. It is not ported: every Go caller outside tests passes nil,
-// so the port always takes the nil paths.
+// Go: execute/tsc/compile.go:50 CommandLineTesting
+// PORT: testing. The Go test harness hook (tsctests/sys.go `TestSys`).
+// Every real run passes `None` (Go nil), so it takes the Go nil paths. Go
+// `io.Writer` is `Writer`. Go `*collections.SyncMap[tspath.Path,
+// time.Time]` is the build host `m_times` (`None` is the Go zero time).
+// The last three methods have no Go equivalent and do nothing by default:
+// the port compiles each build project in a worker process
+// (build/worker.rs), so a test can run the worker itself and gets the
+// task's program and emitted files back on the orchestrator side.
+pub trait CommandLineTesting {
+    // Ensure that all emitted files are timestamped in order to ensure they are deterministic for test baseline
+    fn on_emitted_files(
+        &self,
+        result: &EmitResult,
+        m_times_cache: Option<&RefCell<FxHashMap<Path, Option<SystemTime>>>>,
+    );
+    fn on_list_files_start(&self, w: &Writer);
+    fn on_list_files_end(&self, w: &Writer);
+    fn on_statistics_start(&self, w: &Writer);
+    fn on_statistics_end(&self, w: &Writer);
+    fn on_build_status_report_start(&self, w: &Writer);
+    fn on_build_status_report_end(&self, w: &Writer);
+    fn on_watch_status_report_start(&self);
+    fn on_watch_status_report_end(&self);
+    fn get_trace(&self, w: Writer, locale: Locale) -> TraceFn;
+    fn on_program(&self, program: &crate::execute::incremental::program::Program);
+
+    /// PORT: testing, no Go equivalent. The runner that replaces the build
+    /// worker process (see `BuildWorkerRunner`). `None` keeps the process.
+    fn build_worker_runner(&self) -> Option<BuildWorkerRunner> {
+        None
+    }
+
+    /// PORT: testing. Go `Testing.OnProgram(t.result.program)` when the
+    /// build task of `config` reports (build/buildtask.go:109). The program
+    /// is in the worker, so the test keeps what its worker saw.
+    fn on_build_task_program(&self, _config: &str) {}
+
+    /// PORT: testing. The orchestrator part of Go `OnEmittedFiles` for a
+    /// build worker's `emitted_files`: Go updates the orchestrator host
+    /// `mTimes` (`TestingMTimesCache`, build/buildtask.go:230).
+    fn on_worker_emitted_files(
+        &self,
+        _emitted_files: &[String],
+        _m_times: &RefCell<FxHashMap<Path, Option<SystemTime>>>,
+    ) {
+    }
+}
+
+/// PORT: testing, no Go equivalent. Runs one build worker in place of the
+/// worker process (`WorkerLauncher::run`): it gets the task config, the
+/// orchestrator's cached file system as JSON (shared_fs.rs) and the
+/// callback for the program's cache entries, and returns the worker result.
+/// The orchestrator calls it on its own thread, one task at a time, so a
+/// test file system and clock see one ordered sequence.
+pub type BuildWorkerRunner =
+    Arc<dyn Fn(&str, &str, &mut dyn FnMut(CachedFsState)) -> WorkerCompileResult + Send + Sync>;
 
 // Go: execute/tsc/compile.go:66 CompileTimes
 // PORT: Go keeps `bindTime`, `checkTime`, `totalTime` and `emitTime`

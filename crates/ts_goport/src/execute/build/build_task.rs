@@ -3,6 +3,8 @@ use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::{BuildInfo, compute_hash};
 use crate::execute::tsc::{ExitStatus, Statistics};
 use crate::frontend::prelude::*;
+// PORT: testing
+use crate::execute::tsc::CommandLineTesting;
 use std::time::SystemTime;
 
 // This file ports execute/build/buildtask.go.
@@ -28,8 +30,8 @@ use std::time::SystemTime;
 //
 // PORT: each worker reports its own project statistics
 // (`tsc.EmitAndReportStatistics`) and sends them back in its result, so
-// the task keeps them for the build aggregate. `opts.Testing` is always
-// nil.
+// the task keeps them for the build aggregate. `opts.Testing` is
+// `BuildTaskOrchestrator::testing` (`None` outside tests).
 //
 // PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero), as in
 // up_to_date_status.rs.
@@ -72,7 +74,8 @@ pub type TaskDiagnosticReporter = Box<dyn Fn(&mut String, &Diagnostic)>;
 
 // Go: build/buildtask.go:39 taskResult
 // PORT: Go `program *incremental.Program` is only read for
-// `HasChangedDtsFile()` (and `Testing.OnProgram`), so only that bool is
+// `HasChangedDtsFile()` (and `Testing.OnProgram`, which is
+// `CommandLineTesting::on_build_task_program`), so only that bool is
 // kept; the program lives in the worker. Go `*tsc.Statistics` is an
 // `Option` (nil = `None`).
 pub struct TaskResult {
@@ -114,11 +117,13 @@ impl TaskResult {
 // - `diagnostics`: `result.Diagnostics`, the diagnostics that went through
 //   Go `t.reportDiagnostic` (see `WorkerDiagnostic`).
 // - `diagnostic_file_texts`: the file name and text of each file that
-//   `diagnostics` names, in first use order.
+//   `diagnostics` names (with their message chains and related
+//   information), in first use order.
 // - `emitted_files`: `result.EmitResult.EmittedFiles`.
 // - `has_changed_dts_file`: `incremental.Program.HasChangedDtsFile()`.
-// - `build_info_file_name`: the file name that `writeFile` wrote with
-//   `data.BuildInfo != nil`, or `None` when no build info was written.
+// - `build_info_emit`: the file name that `writeFile` wrote with
+//   `data.BuildInfo != nil` and the Go `Sys.Now()` of `onBuildInfoEmit`,
+//   taken at that write, or `None` when no build info was written.
 // - `statistics`: the statistics of `tsc.EmitAndReportStatistics` (`None`
 //   when Go returns nil).
 // - `output_time_stamps`: the files that `writeFile` wrote with
@@ -134,7 +139,7 @@ pub struct WorkerCompileResult {
     pub diagnostic_file_texts: Vec<(String, String)>,
     pub emitted_files: Vec<String>,
     pub has_changed_dts_file: bool,
-    pub build_info_file_name: Option<String>,
+    pub build_info_emit: Option<(String, SystemTime)>,
     pub statistics: Option<Statistics>,
     pub output_time_stamps: Vec<(String, SystemTime)>,
     pub fs_cache: CachedFsState,
@@ -145,10 +150,13 @@ pub struct WorkerCompileResult {
 // - `file_name`: the file name of Go `File()`, or `None` when it is nil.
 // - `pos`, `end`, `code`, `category`, `message_args`: Go `Pos()`, `End()`,
 //   `Code()`, `Category()` and the message arguments.
-// PORT: the message chain and the related information are not sent. Go
-// reads `t.errors` only for the error summary (`WriteErrorSummaryText`
-// reads the category, the file and the line of `Pos()`) and in watch mode
-// (see `compile_and_emit_finish`).
+// - `message_chain`, `related_information`: Go `MessageChain()` and
+//   `RelatedInformation()`, in the same form.
+// PORT: `skippedOnNoEmit` and the repopulate information are not sent.
+// Go reads `t.errors` only for the error summary (`WriteErrorSummaryText`)
+// and in watch mode, where the diagnostic reporter prints `t.errors` again
+// for a task that it does not rebuild (`build_project_start`). Neither
+// reads them.
 #[derive(Clone, Debug)]
 pub struct WorkerDiagnostic {
     pub file_name: Option<String>,
@@ -157,16 +165,20 @@ pub struct WorkerDiagnostic {
     pub code: i32,
     pub category: ts_diagnostics::Category,
     pub message_args: Vec<String>,
+    pub message_chain: Vec<WorkerDiagnostic>,
+    pub related_information: Vec<WorkerDiagnostic>,
 }
 
 thread_local! {
-    // The file node of each file name in the orchestrator's `t.errors` (see
-    // `error_file`).
-    static ERROR_FILES: RefCell<FxHashMap<String, Node>> = RefCell::new(FxHashMap::default());
+    // The file node of each file name and text in the orchestrator's
+    // `t.errors` (see `error_file`).
+    static ERROR_FILES: RefCell<FxHashMap<(String, String), Node>> =
+        RefCell::new(FxHashMap::default());
 }
 
-// The one file node of `file_name` in the orchestrator's `t.errors`: the
-// first node that was seen for that name, else `make()`.
+// The one file node of `file_name` with `text` in the orchestrator's
+// `t.errors`: the first node that was seen for that name and text, else
+// `make()`.
 // PORT: Go keys the error summary by the file object, and a build shares
 // one object per file: the programs get their files from the build host's
 // parse cache, and a program's config diagnostics are those of `t.resolved`
@@ -175,15 +187,17 @@ thread_local! {
 // the reference error in `lib/tsconfig.json` that the programs of `lib`
 // and `app` both report). The port's worker diagnostics come from another
 // process (`worker_errors`), so the orchestrator shares one node per file
-// name instead, for the worker diagnostics and its own
+// name and text instead, for the worker diagnostics and its own
 // (`report_diagnostic`). Go parses a file again for a program with other
 // parse options, which then counts as another file; the port counts it as
-// the same file.
-fn error_file(file_name: &str, make: impl FnOnce() -> Node) -> Node {
+// the same file. In watch mode a changed file is a new Go object with the
+// new text, so the text is part of the key: watch mode prints `t.errors`
+// again, with the code of the file.
+fn error_file(file_name: &str, text: &str, make: impl FnOnce() -> Node) -> Node {
     ERROR_FILES.with(|files| {
         *files
             .borrow_mut()
-            .entry(file_name.to_string())
+            .entry((file_name.to_string(), text.to_string()))
             .or_insert_with(make)
     })
 }
@@ -192,48 +206,60 @@ fn error_file(file_name: &str, make: impl FnOnce() -> Node) -> Node {
 // through `t.reportDiagnostic` (buildtask.go:86), in the same order.
 // PORT: the worker's source files are in the worker process. A file that
 // the orchestrator has no node for gets a node with the text that the
-// worker sent and no statements: the error summary reads only the file
-// name and the line of a position (see `error_file`).
+// worker sent and no statements: the diagnostic writers read only the file
+// name, the text and the lines of the text (see `error_file`).
 fn worker_errors(
     orchestrator: &dyn BuildTaskOrchestrator,
     result: &WorkerCompileResult,
 ) -> Vec<Diagnostic> {
+    // The node of each file that the diagnostics name, in first use order.
+    let files: FxHashMap<&str, Node> = result
+        .diagnostic_file_texts
+        .iter()
+        .map(|(file_name, text)| {
+            let file = error_file(file_name, text, || {
+                new_worker_diagnostic_file(orchestrator, file_name, text)
+            });
+            (file_name.as_str(), file)
+        })
+        .collect();
     result
         .diagnostics
         .iter()
-        .map(|diagnostic| {
-            let file = match &diagnostic.file_name {
-                None => Node::NIL,
-                Some(file_name) => error_file(file_name, || {
-                    let text = result
-                        .diagnostic_file_texts
-                        .iter()
-                        .find(|(name, _)| name == file_name)
-                        .map_or("", |(_, text)| text.as_str());
-                    new_worker_diagnostic_file(orchestrator, file_name, text)
-                }),
-            };
-            let message =
-                ts_diagnostics::message_by_code(diagnostic.code as u32).unwrap_or_else(|| {
-                    panic!("build worker: unknown diagnostic code {}", diagnostic.code)
-                });
-            Diagnostic {
-                file,
-                pos: diagnostic.pos,
-                end: diagnostic.end,
-                code: diagnostic.code,
-                category: diagnostic.category,
-                message,
-                message_args: diagnostic.message_args.clone(),
-                message_chain: Vec::new(),
-                related_information: Vec::new(),
-                reports_unnecessary: message.reports_unnecessary(),
-                reports_deprecated: message.reports_deprecated(),
-                skipped_on_no_emit: false,
-                repopulate_info: None,
-            }
-        })
+        .map(|diagnostic| worker_error(&files, diagnostic))
         .collect()
+}
+
+// One entry of `worker_errors`, with its message chain and related
+// information. `files` has the node of each file name.
+fn worker_error(files: &FxHashMap<&str, Node>, diagnostic: &WorkerDiagnostic) -> Diagnostic {
+    let file = match &diagnostic.file_name {
+        None => Node::NIL,
+        Some(file_name) => files[file_name.as_str()],
+    };
+    let message = ts_diagnostics::message_by_code(diagnostic.code as u32)
+        .unwrap_or_else(|| panic!("build worker: unknown diagnostic code {}", diagnostic.code));
+    let to_diagnostics = |diagnostics: &[WorkerDiagnostic]| -> Vec<Diagnostic> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| worker_error(files, diagnostic))
+            .collect()
+    };
+    Diagnostic {
+        file,
+        pos: diagnostic.pos,
+        end: diagnostic.end,
+        code: diagnostic.code,
+        category: diagnostic.category,
+        message,
+        message_args: diagnostic.message_args.clone(),
+        message_chain: to_diagnostics(&diagnostic.message_chain),
+        related_information: to_diagnostics(&diagnostic.related_information),
+        reports_unnecessary: message.reports_unnecessary(),
+        reports_deprecated: message.reports_deprecated(),
+        skipped_on_no_emit: false,
+        repopulate_info: None,
+    }
 }
 
 // A source file node named `file_name` with `text` and no statements (see
@@ -286,6 +312,11 @@ pub trait BuildTaskOrchestrator {
     // Runs the program part of Go `compileAndEmit` for `config` in a worker
     // process and returns its result (plan D1).
     fn compile_and_emit_in_worker(&self, config: &str, config_path: &Path) -> WorkerCompileResult;
+    // Go: `o.opts.Testing`
+    // PORT: testing. `None` outside tests.
+    fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
+        None
+    }
 }
 
 // Go: build/buildtask.go:50 BuildTask
@@ -365,7 +396,7 @@ impl BuildTask {
         let mut error = err.clone();
         if error.file.is_some() {
             let file = error.file;
-            error.file = error_file(source_file_file_name(file), || file);
+            error.file = error_file(source_file_file_name(file), source_file_text(file), || file);
         }
         self.errors.push(error);
         let result = self.result_mut();
@@ -556,25 +587,16 @@ impl BuildTask {
         // Go: build/buildtask.go:785 (*BuildTask).writeFile, build info part.
         // PORT: Go passes the in-memory BuildInfo that was just written; it
         // is read back from the written file here, which has the same
-        // content.
-        if let Some(build_info_file_name) = &worker_result.build_info_file_name {
+        // content. The worker took the `mTime` at the write.
+        if let Some((build_info_file_name, m_time)) = &worker_result.build_info_emit {
             let build_info = orchestrator.read_build_info_file(self.resolved());
             self.on_build_info_emit(
                 orchestrator,
                 build_info_file_name,
                 build_info,
                 worker_result.has_changed_dts_file,
+                *m_time,
             );
-        }
-
-        // PORT: the worker diagnostics in `t.errors` (`worker_errors`) have
-        // no message chain and no related information. Watch mode prints
-        // `t.errors` again for a task that it does not rebuild, so a watch
-        // build with worker diagnostics stops here.
-        if orchestrator.command().compiler_options.watch.is_true()
-            && !worker_result.diagnostics.is_empty()
-        {
-            unported!("BuildTask.reportDiagnostic (build worker diagnostics in watch mode)");
         }
 
         self.result_mut().exit_status = worker_result.exit_status;
@@ -717,9 +739,7 @@ impl BuildTask {
         };
 
         // Solution - nothing to build
-        // PORT: Go checks `ProjectReferences() != nil`. The Rust field is a
-        // `Vec`, which has no nil state, so an empty list counts as nil.
-        if resolved.file_names().is_empty() && !resolved.project_references().is_empty() {
+        if resolved.file_names().is_empty() && resolved.has_project_references() {
             return UpToDateStatus::new(UpToDateStatusType::Solution);
         }
 
@@ -859,7 +879,7 @@ impl BuildTask {
                                 orchestrator.fs().read_file(resolved_input_path.as_str());
                             if ok {
                                 current_version =
-                                    compute_hash(&text, false /*opts.Testing != nil*/);
+                                    compute_hash(&text, orchestrator.testing().is_some());
                                 if version == current_version {
                                     input_text_unchanged = true;
                                 }
@@ -1303,14 +1323,19 @@ impl BuildTask {
     }
 
     // Go: build/buildtask.go:741 (*BuildTask).onBuildInfoEmit
+    // PORT: Go takes `mTime := orchestrator.opts.Sys.Now()` here, in the
+    // `writeFile` call of the build info. That write runs in the worker,
+    // which takes the time there (worker.rs `new_task_write_file`), before
+    // the test `OnEmittedFiles` stamps the emitted files. So the caller
+    // passes it as `m_time`.
     pub fn on_build_info_emit(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         build_info_file_name: &str,
         build_info: Option<Rc<BuildInfo>>,
         has_changed_dts_file: bool,
+        m_time: SystemTime,
     ) {
-        let m_time = orchestrator.now();
         let dts_time = if has_changed_dts_file {
             Some(Some(m_time))
         } else if let Some(entry) = &self.build_info_entry {
@@ -1371,7 +1396,8 @@ impl BuildTask {
 
     // Go: build/buildtask.go:785 (*BuildTask).writeFile
     // PORT: runs in the worker (plan D1). Its build info branch is
-    // `on_build_info_emit` in `compile_and_emit_finish`; the worker records
+    // `on_build_info_emit` in `compile_and_emit_finish`, with the time that
+    // the worker took at the write (`build_info_emit`); the worker records
     // the watch-only `storeMTime` branch in `output_time_stamps`, which
     // `compile_and_emit_finish` stores.
 }
