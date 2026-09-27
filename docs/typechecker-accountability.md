@@ -144,8 +144,9 @@ Under that delegation, root extended both rules to batch
 `recovery-continuation-go-checker-port-5`, and then to batch
 `recovery-continuation-go-checker-port-6`, and then to batch
 `recovery-continuation-go-checker-port-7`, and then to batch
-`recovery-continuation-go-checker-port-8`, and then to batch
-`recovery-continuation-go-checker-port-9`, each time with the same pins and
+`recovery-continuation-go-checker-port-8`, then to batch
+`recovery-continuation-go-checker-port-9`, and then to batch
+`recovery-continuation-go-checker-port-10`, each time with the same pins and
 scope. Each extension is a separate entry in `acceptanceRuleChanges`. The
 records name root as the extender. This is not a new direct approval by Theo,
 and it does not widen the rules.
