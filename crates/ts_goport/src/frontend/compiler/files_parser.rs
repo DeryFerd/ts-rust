@@ -341,6 +341,11 @@ impl FilesParser {
             .shared
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
+        // PERF: a later `tsc -b` program gets its shared `.d.ts` and `.json`
+        // files from the build host's cache. A worker parse of such a file
+        // is not used: it takes CPU from the checks of the earlier
+        // projects, and the loader waits for running parses at the end.
+        lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_names();
         let prefetch = PrefetchGuard::install(pool.shared.clone());
         self.start(loader, tasks, 0);
         pool.shared
@@ -1225,6 +1230,9 @@ struct PrefetchQueue {
     rank: Option<(Vec<Arc<PrefetchJob>>, usize)>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
+    /// The files that the loader's host gives from its cache
+    /// (`CompilerHost::cached_source_file_names`). They get no job.
+    cached: FxHashSet<String>,
     next_job: usize,
     closed: bool,
 }
@@ -1232,13 +1240,16 @@ struct PrefetchQueue {
 impl PrefetchQueue {
     /// Makes the job of a file that has none and records it by name. A
     /// `lib.dom.d.ts` job goes to `first`; the caller pushes other jobs.
-    /// `None` when the queue is closed or full.
+    /// `None` when the queue is closed or full, or the file is `cached`.
     fn add(
         &mut self,
         opts: SourceFileParseOptions,
         script_kind: ScriptKind,
     ) -> Option<Arc<PrefetchJob>> {
-        if self.closed || self.next_job >= DETACHED_STORE_LIMIT {
+        if self.closed
+            || self.next_job >= DETACHED_STORE_LIMIT
+            || self.cached.contains(&opts.file_name)
+        {
             return None;
         }
         let job = Arc::new(PrefetchJob {

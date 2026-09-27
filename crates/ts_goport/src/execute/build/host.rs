@@ -280,6 +280,16 @@ impl CompilerHost for BuildHost {
         self.host.get_source_file(opts)
     }
 
+    // PORT: not in Go (see `CompilerHost::cached_source_file_names`). The
+    // `.d.ts` and `.json` files that `get_source_file` keeps.
+    fn cached_source_file_names(&self) -> FxHashSet<String> {
+        let mut names = FxHashSet::default();
+        self.source_files.for_each_stored(|key| {
+            names.insert(key.0.file_name.clone());
+        });
+        names
+    }
+
     // Go: build/host.go:60 (*host).GetResolvedProjectReference
     fn get_resolved_project_reference(
         &self,
@@ -389,5 +399,10 @@ impl CompilerHost for BuildCompilerHost {
         path: &Path,
     ) -> Option<Rc<ParsedCommandLine>> {
         self.host.get_resolved_project_reference(file_name, path)
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_names`).
+    fn cached_source_file_names(&self) -> FxHashSet<String> {
+        self.host.cached_source_file_names()
     }
 }

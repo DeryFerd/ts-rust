@@ -223,8 +223,10 @@ The batch that adds it is not accepted until Theo approves.
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
   reports. The build host shares its parsed `.d.ts` and `.json` files
-  between the programs. A file that one program parsed and left out (a
-  deduplicated package) can be a program file of a later one, so the build
+  between the programs, and the parse workers of a later program do not
+  parse them again (`CompilerHost::cached_source_file_names`, not in Go).
+  A file that one program parsed and left out (a deduplicated package)
+  can be a program file of a later one, so the build
   host notes each parse that it keeps (`program::note_parsed_source_file`)
   and a publish gives it its complete `GoFile`. The publish asserts that
   every program file is a source file. The programs are made on one
