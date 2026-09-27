@@ -1,11 +1,13 @@
 //! Port of execute/incremental/emitfileshandler.go.
 //!
-//! PORT: Go emits the affected files on a work group; here they emit one
-//! after another in the order Go queues them (each emit runs on the file's
-//! checker thread). The `WriteFile` callback runs on the checker threads,
-//! so what it reads from the snapshot is copied into it, and what it
-//! records (Go `signatures`, `emitSignatures`, `latestChangedDtsFiles`
-//! SyncMaps) goes to `EmitFilesShared` behind a mutex. Go `ctx` is dropped.
+//! PORT: Go emits the affected files on a work group; here
+//! `emit_files_incremental` sends them as one `emit_batch`, in the order Go
+//! queues them. Each emit runs on the file's checker thread, and each
+//! checker thread runs its files in that order. The `WriteFile` callback
+//! runs on the checker threads, so what it reads from the snapshot is
+//! copied into it, and what it records (Go `signatures`, `emitSignatures`,
+//! `latestChangedDtsFiles` SyncMaps) goes to `EmitFilesShared` behind a
+//! mutex. Go `ctx` is dropped.
 
 use super::affected_files::collect_all_affected_files;
 use super::hash::FileInfo;
@@ -14,7 +16,7 @@ use super::program::{Program, SignatureUpdateKind};
 use super::snapshot::*;
 use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{
-    EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit,
+    EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit, emit_batch,
 };
 use crate::frontend::prelude::*;
 use crate::program::source_file_may_be_emitted;
@@ -178,27 +180,14 @@ impl<'a> EmitFilesHandler<'a> {
             .iter()
             .map(|(path, kind)| (path.clone(), *kind))
             .collect();
-        // PORT: perf. Go runs this loop in a WorkGroup. For declaration
-        // diagnostics (`is_for_dts_errors`) the job of every file that the
-        // loop will ask is sent to its checker thread first, and the loop
-        // takes each result in order. Each checker gets its files in the same
-        // order as before. The real emit below stays one file at a time.
-        let mut dts_jobs: std::collections::VecDeque<_> = if self.is_for_dts_errors {
-            pending
-                .iter()
-                .filter_map(|(path, emit_kind)| {
-                    let affected_file = get_source_file_by_path(path);
-                    (affected_file.is_some()
-                        && source_file_may_be_emitted(affected_file, false)
-                        && !self
-                            .get_pending_emit_kind_for_emit_options(*emit_kind, options)
-                            .is_empty())
-                    .then(|| send_declaration_diagnostics_job(affected_file))
-                })
-                .collect()
-        } else {
-            std::collections::VecDeque::new()
-        };
+
+        // PORT: perf. Go queues one job per file on a WorkGroup. Pass 1 is
+        // the loop body before `wg.Queue`, in the order Go queues. Pass 2
+        // runs all jobs at once (`emit_batch`, or one declaration diagnostics
+        // job per file); each checker thread runs its files in pass 1 order,
+        // as the old one-file-at-a-time loop did. Pass 3 is the job tail, in
+        // the same order.
+        let mut queued: Vec<(Path, FileEmitKind, FileEmitKind, Node)> = Vec::new();
         for (path, emit_kind) in pending {
             let affected_file = get_source_file_by_path(&path);
             if affected_file.is_nil() || !source_file_may_be_emitted(affected_file, false) {
@@ -207,48 +196,63 @@ impl<'a> EmitFilesHandler<'a> {
             }
             let pending_kind = self.get_pending_emit_kind_for_emit_options(emit_kind, options);
             if !pending_kind.is_empty() {
-                // Determine if we can do partial emit
-                let mut emit_only = EmitOnly::All;
-                if pending_kind.intersects(FileEmitKind::ALL_JS) {
-                    emit_only = EmitOnly::Js;
-                }
-                if pending_kind.intersects(FileEmitKind::ALL_DTS) {
-                    if emit_only == EmitOnly::Js {
-                        emit_only = EmitOnly::All;
-                    } else {
-                        emit_only = EmitOnly::Dts;
+                queued.push((path, emit_kind, pending_kind, affected_file));
+            }
+        }
+
+        let results: Vec<EmitResult> = if !self.is_for_dts_errors {
+            let targets = queued
+                .iter()
+                .map(|&(_, _, pending_kind, affected_file)| {
+                    // Determine if we can do partial emit
+                    let mut emit_only = EmitOnly::All;
+                    if pending_kind.intersects(FileEmitKind::ALL_JS) {
+                        emit_only = EmitOnly::Js;
                     }
-                }
-                let result = if !self.is_for_dts_errors {
-                    let emit_options = self.get_emit_options(EmitOptions {
+                    if pending_kind.intersects(FileEmitKind::ALL_DTS) {
+                        if emit_only == EmitOnly::Js {
+                            emit_only = EmitOnly::All;
+                        } else {
+                            emit_only = EmitOnly::Dts;
+                        }
+                    }
+                    self.get_emit_options(EmitOptions {
                         target_source_file: affected_file,
                         emit_only,
                         write_file: options.write_file.clone(),
-                    });
-                    emit(emit_options)
-                } else {
-                    // Go `GetDeclarationDiagnostics(ctx, affectedFile)`.
-                    let job = dts_jobs
-                        .pop_front()
-                        .expect("one declaration diagnostics job per emitted file");
-                    EmitResult {
-                        emit_skipped: true,
-                        diagnostics: sort_and_deduplicate_diagnostics(job.wait()),
-                        ..EmitResult::default()
-                    }
-                };
-                self.update_has_emit_diagnostics(Some(&result));
+                    })
+                })
+                .collect();
+            emit_batch(targets)
+        } else {
+            // Go `GetDeclarationDiagnostics(ctx, affectedFile)`. Send every
+            // job first, then wait for each in order.
+            let jobs: Vec<_> = queued
+                .iter()
+                .map(|&(.., affected_file)| send_declaration_diagnostics_job(affected_file))
+                .collect();
+            jobs.into_iter()
+                .map(|job| EmitResult {
+                    emit_skipped: true,
+                    diagnostics: sort_and_deduplicate_diagnostics(job.wait()),
+                    ..EmitResult::default()
+                })
+                .collect()
+        };
 
-                // Update the pendingEmit for the file
-                self.emit_updates.insert(
-                    path,
-                    EmitUpdate {
-                        pending_kind: get_pending_emit_kind(emit_kind, pending_kind),
-                        result: Some(result),
-                        dts_errors_from_cache: false,
-                    },
-                );
-            }
+        debug_assert_eq!(results.len(), queued.len(), "one result per queued file");
+        for ((path, emit_kind, pending_kind, _), result) in queued.into_iter().zip(results) {
+            self.update_has_emit_diagnostics(Some(&result));
+
+            // Update the pendingEmit for the file
+            self.emit_updates.insert(
+                path,
+                EmitUpdate {
+                    pending_kind: get_pending_emit_kind(emit_kind, pending_kind),
+                    result: Some(result),
+                    dts_errors_from_cache: false,
+                },
+            );
         }
 
         // Get updated errors that were not included in affected files emit

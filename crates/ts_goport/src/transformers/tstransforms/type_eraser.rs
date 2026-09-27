@@ -2,7 +2,6 @@
 
 use super::TxVisit;
 use super::runtime_syntax::get_innermost_module_declaration_from_dotted_module;
-use crate::ast::visitor::NodeVisitor;
 use crate::prelude::*;
 use crate::transformers::modifier_visitor::extract_modifiers;
 use crate::transformers::transformer::{
@@ -49,13 +48,6 @@ impl TransformerVisit for TypeEraserTransformer {
 
     // Go: transformers/tstransforms/typeeraser.go:44 TypeEraserTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
-        self.with_visitor(|v| Self::root_callback(node, v))
-    }
-
-    // Go: transformers/tstransforms/typeeraser.go:44 TypeEraserTransformer.visit
-    /// Go `tx.visit` as the callback of the root visitor `v`. Where Go calls
-    /// `tx.Visitor().VisitEachChild(node)`, this descends on `v`.
-    fn root_callback(node: Node, v: &mut NodeVisitor<'_, &mut Self>) -> Node {
         if !node
             .subtree_facts()
             .intersects(SubtreeFacts::SUBTREE_CONTAINS_TYPE_SCRIPT)
@@ -64,15 +56,12 @@ impl TransformerVisit for TypeEraserTransformer {
         }
 
         if is_statement(node) && has_syntactic_modifier(node, ModifierFlags::AMBIENT) {
-            return v.ctx.elide(node);
+            return self.elide(node);
         }
 
-        let grandparent_node = v.ctx.push_node(node);
-        let result = match v.ctx.visit_worker(node) {
-            Some(result) => result,
-            None => v.visit_each_child(node),
-        };
-        v.ctx.pop_node(grandparent_node);
+        let grandparent_node = self.push_node(node);
+        let result = self.visit_worker(node);
+        self.pop_node(grandparent_node);
         result
     }
 }
@@ -100,12 +89,10 @@ impl TypeEraserTransformer {
     }
 
     /// The body of Go `visit` after `pushNode` (Go pops with `defer`).
-    /// `None` is Go `tx.Visitor().VisitEachChild(node)`: the caller descends
-    /// on the running root visitor (see `root_callback`).
-    fn visit_worker(&mut self, node: Node) -> Option<Node> {
+    fn visit_worker(&mut self, node: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
-        let result = match node.kind() {
+        match node.kind() {
             // TypeScript accessibility and readonly modifiers are elided
             SyntaxKind::PublicKeyword
             | SyntaxKind::PrivateKeyword
@@ -153,9 +140,9 @@ impl TypeEraserTransformer {
                 // appear as a grammar error on other declarations and must not leak into the emitted JS.
                 // The `in` binary operator shares this token kind, so only elide when used as a modifier.
                 if self.parent_node.is_nil() || !is_binary_expression(self.parent_node) {
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
-                return None;
+                self.visit_each_child(node)
             }
 
             // reparsed commonjs are elided
@@ -182,9 +169,9 @@ impl TypeEraserTransformer {
                         .is_nil()
                 {
                     // TypeScript module declarations are elided if they are not instantiated or have no body
-                    return Some(self.elide(node));
+                    return self.elide(node);
                 }
-                return None;
+                self.visit_each_child(node)
             }
 
             SyntaxKind::ExpressionWithTypeArguments => {
@@ -204,18 +191,18 @@ impl TypeEraserTransformer {
                     let modifiers = self.visit_modifiers(node.modifiers());
                     let name = self.visit_node(node.name());
                     let initializer = self.visit_node(node.initializer());
-                    return Some(f.update_property_declaration(
+                    return f.update_property_declaration(
                         node,
                         modifiers,
                         name,
                         Node::NIL,
                         Node::NIL,
                         initializer,
-                    ));
+                    );
                 }
                 if has_syntactic_modifier(node, ModifierFlags::AMBIENT | ModifierFlags::ABSTRACT) {
                     // TypeScript `declare` fields are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let modifiers = self.visit_modifiers(node.modifiers());
                 let name = self.visit_node(node.name());
@@ -233,7 +220,7 @@ impl TypeEraserTransformer {
             SyntaxKind::Constructor => {
                 if node_is_missing(node.body()) {
                     // TypeScript overloads are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let parameters = self.visit_nodes(node.parameter_list());
                 let body = self.visit_node(node.body());
@@ -251,7 +238,7 @@ impl TypeEraserTransformer {
             SyntaxKind::MethodDeclaration => {
                 if node_is_missing(node.body()) {
                     // TypeScript overloads are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let modifiers = self.visit_modifiers(node.modifiers());
                 let name = self.visit_node(node.name());
@@ -276,7 +263,7 @@ impl TypeEraserTransformer {
                     && has_syntactic_modifier(node, ModifierFlags::ABSTRACT)
                 {
                     // Abstract accessors are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let mut body = self.visit_node(node.body());
                 if body.is_nil() {
@@ -302,7 +289,7 @@ impl TypeEraserTransformer {
                     && has_syntactic_modifier(node, ModifierFlags::ABSTRACT)
                 {
                     // Abstract accessors are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let mut body = self.visit_node(node.body());
                 if body.is_nil() {
@@ -337,7 +324,7 @@ impl TypeEraserTransformer {
             SyntaxKind::HeritageClause => {
                 if node.token() == SyntaxKind::ImplementsKeyword {
                     // TypeScript `implements` clauses are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let types = self.visit_nodes(node.types());
                 f.update_heritage_clause(node, node.token(), types)
@@ -376,7 +363,7 @@ impl TypeEraserTransformer {
             SyntaxKind::FunctionDeclaration => {
                 if node_is_missing(node.body()) {
                     // TypeScript overloads are elided
-                    return Some(self.elide(node));
+                    return self.elide(node);
                 }
                 let modifiers = self.visit_modifiers(node.modifiers());
                 let name = self.visit_node(node.name());
@@ -432,7 +419,7 @@ impl TypeEraserTransformer {
             SyntaxKind::Parameter => {
                 if is_this_parameter(node) {
                     // TypeScript `this` parameters are elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 // preserve parameter property modifiers to be handled by the runtime transformer
                 let mut modifiers = ModifierList::NIL;
@@ -522,10 +509,10 @@ impl TypeEraserTransformer {
                         let partial = f.new_partially_emitted_expression(visited);
                         ec.set_original(partial, node);
                         set_node_loc(partial, node.loc());
-                        return Some(partial);
+                        return partial;
                     }
                 }
-                return None;
+                self.visit_each_child(node)
             }
 
             SyntaxKind::JsxSelfClosingElement => {
@@ -543,20 +530,20 @@ impl TypeEraserTransformer {
             SyntaxKind::ImportEqualsDeclaration => {
                 if node.is_type_only() {
                     // elide type-only imports
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
-                return None;
+                self.visit_each_child(node)
             }
 
             SyntaxKind::ImportDeclaration => {
                 if node.import_clause().is_nil() {
                     // Do not elide a side-effect only import declaration.
                     //  import "foo";
-                    return Some(node);
+                    return node;
                 }
                 let import_clause = self.visit_node(node.import_clause());
                 if import_clause.is_nil() {
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 f.update_import_declaration(
                     node,
@@ -570,13 +557,13 @@ impl TypeEraserTransformer {
             SyntaxKind::ImportClause => {
                 if node.is_type_only() {
                     // Always elide type-only imports
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let name = node.name();
                 let named_bindings = self.visit_node(node.named_bindings());
                 if name.is_nil() && named_bindings.is_nil() {
                     // all import bindings were elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 f.update_import_clause(node, node.phase_modifier(), name, named_bindings)
             }
@@ -584,14 +571,14 @@ impl TypeEraserTransformer {
             SyntaxKind::NamedImports => {
                 if node.element_list().nodes().is_empty() {
                     // Do not elide a side-effect only import declaration.
-                    return Some(node);
+                    return node;
                 }
                 let elements = self.visit_nodes(node.element_list());
                 if !self.compiler_options.verbatim_module_syntax.is_true()
                     && elements.nodes().is_empty()
                 {
                     // all import specifiers were elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 f.update_named_imports(node, elements)
             }
@@ -599,7 +586,7 @@ impl TypeEraserTransformer {
             SyntaxKind::ImportSpecifier => {
                 if node.is_type_only() {
                     // elide type-only or unused imports
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 node
             }
@@ -607,14 +594,14 @@ impl TypeEraserTransformer {
             SyntaxKind::ExportDeclaration => {
                 if node.is_type_only() {
                     // elide type-only exports
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 let mut export_clause = Node::NIL;
                 if node.export_clause().is_some() {
                     export_clause = self.visit_node(node.export_clause());
                     if export_clause.is_nil() {
                         // all export bindings were elided
-                        return Some(Node::NIL);
+                        return Node::NIL;
                     }
                 }
                 let module_specifier = self.visit_node(node.module_specifier());
@@ -632,7 +619,7 @@ impl TypeEraserTransformer {
             SyntaxKind::NamedExports => {
                 if node.element_list().nodes().is_empty() {
                     // Do not elide an empty export declaration.
-                    return Some(node);
+                    return node;
                 }
 
                 let elements = self.visit_nodes(node.element_list());
@@ -640,7 +627,7 @@ impl TypeEraserTransformer {
                     && elements.nodes().is_empty()
                 {
                     // all export specifiers were elided
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 f.update_named_exports(node, elements)
             }
@@ -648,20 +635,19 @@ impl TypeEraserTransformer {
             SyntaxKind::ExportSpecifier => {
                 if node.is_type_only() {
                     // elide unused export
-                    return Some(Node::NIL);
+                    return Node::NIL;
                 }
                 node
             }
 
             SyntaxKind::EnumDeclaration => {
                 if is_enum_const(node) {
-                    return Some(node);
+                    return node;
                 }
-                return None;
+                self.visit_each_child(node)
             }
 
-            _ => return None,
-        };
-        Some(result)
+            _ => self.visit_each_child(node),
+        }
     }
 }

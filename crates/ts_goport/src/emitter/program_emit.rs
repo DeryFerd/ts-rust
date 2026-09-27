@@ -103,8 +103,10 @@ pub fn emit_batch(targets: Vec<EmitOptions>) -> Vec<EmitResult> {
 ///
 /// Go `emitFilesIncremental` calls `Program.Emit` for each pending file
 /// inside a work group, so the files emit in parallel. `emit_files_incremental`
-/// can build one `EmitOptions` per pending file (one target file each, from
-/// `get_emit_options`) and call this once instead of `emit` per file.
+/// builds one `EmitOptions` per pending file (one target file each, from
+/// `get_emit_options`) and calls this once instead of `emit` per file.
+/// Each checker thread runs its files in `targets` order, also with
+/// `--singleThreaded`.
 ///
 /// Each target must name one source file, and no file can be in the batch
 /// twice. With `noEmitOnError` each target runs through `emit_with`, one at
@@ -148,7 +150,12 @@ pub fn emit_batch_with(
 
     // The closure gets only the file, so it finds the file's target here.
     let file_targets = Arc::new(file_targets);
-    let mut results = run_emit_jobs(files, move |source_file| {
+    // PORT: the batch runs in `targets` order on each checker thread, also with
+    // `--singleThreaded`. Go `emitFilesIncremental` queues the files in SyncMap
+    // Range order, which is random, and its single-threaded work group runs them
+    // last-queued-first. The port keeps the order of the one-file loop that the
+    // batch replaces, so each checker does the same work in the same order.
+    let mut results = run_on_checker_threads_for_files(&files, move |source_file| {
         // One Go `Program.Emit` trace event per target, on the emit thread.
         let _trace = trace_emit();
         let (emit_only, write_file) = &file_targets[&source_file];
