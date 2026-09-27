@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
+[[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
 
 # Runs the pinned tsgo oracle on a project without writing into it. Always adds
 # --noEmit and puts .tsbuildinfo outside the project. Fails if any file under

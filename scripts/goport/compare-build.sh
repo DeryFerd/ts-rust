@@ -24,6 +24,8 @@
 # masked), the set of output files written or touched (mtime changes), and
 # the full output tree (diff -r). Results: /tmp/goport-build/<repo>/seq/log.
 set -uo pipefail
+# GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
+[[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
 
 REPO_ROOT=/home/theo/Code/sandbox/ts-rust
 ORACLE=${ORACLE:-$HOME/.local/bin/tsgo-oracle}
