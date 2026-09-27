@@ -109,6 +109,16 @@ impl CompilerHost for WatchCompilerHost {
         self.compiler_host
             .get_resolved_project_reference(file_name, path)
     }
+
+    // PORT: not in Go (see `CompilerHost::prefetch_parses`). A rebuild
+    // gets the files that did not change from `cache`, so parse workers
+    // would parse them again for nothing, and those parses stay in the
+    // workers' AST arenas (about 38 MiB for each query-core rebuild). The
+    // first build, and a build after an overflow or a config change (both
+    // empty the cache), still parse ahead.
+    fn prefetch_parses(&self) -> bool {
+        self.cache.borrow().is_empty() && self.compiler_host.prefetch_parses()
+    }
 }
 
 // Go: execute/watcher.go:57 Watcher

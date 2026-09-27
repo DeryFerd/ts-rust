@@ -48,15 +48,22 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// large projects.
 const STACK_SIZE: usize = 1 << 30;
 
-/// The opt-in `jemalloc` feature makes jemalloc the global allocator
-/// (see `goport.rs` `set_malloc_tunables`).
+/// jemalloc is the global allocator (default feature `jemalloc`). A build
+/// without the feature uses glibc malloc. See `goport.rs`
+/// `set_malloc_tunables`.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Same as `goport.rs` `JEMALLOC_CONF`, so a build here uses the jemalloc
+/// settings of `tsgo -b` (its build workers inherit the tsgo value).
+/// `scripts/build-release.sh` reads it from this line for its BOLT runs.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+
 fn main() {
     // A build keeps the wide budget (`ThreadBudget::WIDE`): parse and bind
-    // threads up to 8 and 16 malloc arenas.
+    // threads up to 8, and 16 arenas with glibc malloc.
     let budget = ThreadBudget::WIDE;
     set_malloc_tunables(&budget);
     budget.install();
@@ -76,17 +83,21 @@ fn main() {
 }
 
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
-/// values. A build runs about 20 threads per program, so `arena_max` is 16
-/// here (`ThreadBudget::WIDE`). Build workers inherit the variable, so they
-/// do not exec again. The `jemalloc` build keeps the jemalloc defaults.
+/// values. jemalloc gets `JEMALLOC_CONF`. With glibc malloc, a build runs
+/// about 20 threads per program, so `arena_max` is 16 here
+/// (`ThreadBudget::WIDE`). Build workers inherit the variable, so they do
+/// not exec again.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
-    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
-        const NAME: &str = "GLIBC_TUNABLES";
-        if std::env::var_os(NAME).is_some() {
+        #[cfg(not(feature = "jemalloc"))]
+        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
+        #[cfg(feature = "jemalloc")]
+        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
+        if std::env::var_os(name).is_some() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -98,7 +109,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(NAME, budget.glibc_tunables()).exec();
+        let _ = command.args(args).env(name, value).exec();
     }
 }
 
