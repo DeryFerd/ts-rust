@@ -24,22 +24,36 @@ pub trait WatchBackend {
         recursive: bool,
         ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ) -> Result<Box<dyn fswatch::Watch>, GoError>;
+    /// PORT: Go takes a `[]WatchDirectoryRequest` slice; the port takes the
+    /// requests by value, because a backend keeps their callbacks.
+    fn watch_directories(
+        &self,
+        requests: Vec<WatchDirectoryRequest>,
+    ) -> Result<Vec<Box<dyn fswatch::Watch>>, GoError>;
 }
 
-// Go: watchbackend.go:18 CommandLineTestingWithWatchBackend
+// Go: watchbackend.go:17 WatchDirectoryRequest
+pub struct WatchDirectoryRequest {
+    pub dir: String,
+    pub callback: fswatch::WatchCallback,
+    pub recursive: bool,
+    pub ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+}
+
+// Go: watchbackend.go:26 CommandLineTestingWithWatchBackend
 /// CommandLineTestingWithWatchBackend is an optional extension of
 /// [CommandLineTesting] that supplies a [WatchBackend] for test mode
 pub trait CommandLineTestingWithWatchBackend {
     fn watch_backend(&self) -> Rc<dyn WatchBackend>;
 }
 
-// Go: watchbackend.go:22 FSWatchBackend
+// Go: watchbackend.go:30 FSWatchBackend
 pub struct FsWatchBackend {
     pub inner: Arc<dyn fswatch::Watcher>,
 }
 
 impl WatchBackend for FsWatchBackend {
-    // Go: watchbackend.go:24 FSWatchBackend.WatchDirectory
+    // Go: watchbackend.go:32 FSWatchBackend.WatchDirectory
     fn watch_directory(
         &self,
         dir: &str,
@@ -47,18 +61,53 @@ impl WatchBackend for FsWatchBackend {
         recursive: bool,
         ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ) -> Result<Box<dyn fswatch::Watch>, GoError> {
-        let mut opts: Vec<Box<dyn fswatch::WatchOption>> = Vec::new();
-        if recursive {
-            opts.push(fswatch::with_recursive());
-        }
-        if let Some(ignore) = ignore {
-            opts.push(fswatch::with_ignore(ignore));
-        }
-        self.inner.watch_directory(dir, fn_, &opts)
+        let closers = self.watch_directories(vec![WatchDirectoryRequest {
+            dir: dir.to_string(),
+            callback: fn_,
+            recursive,
+            ignore,
+        }])?;
+        Ok(closers
+            .into_iter()
+            .next()
+            .expect("WatchDirectories returns one closer per request"))
+    }
+
+    // Go: watchbackend.go:45 FSWatchBackend.WatchDirectories
+    /// PORT: an fswatch request borrows its options, so all option lists are
+    /// made before the requests. Go converts each `fswatch.Watch` to an
+    /// `io.Closer`; the port returns the watches.
+    fn watch_directories(
+        &self,
+        requests: Vec<WatchDirectoryRequest>,
+    ) -> Result<Vec<Box<dyn fswatch::Watch>>, GoError> {
+        let opts: Vec<Vec<Box<dyn fswatch::WatchOption>>> = requests
+            .iter()
+            .map(|request| {
+                let mut opts: Vec<Box<dyn fswatch::WatchOption>> = Vec::new();
+                if request.recursive {
+                    opts.push(fswatch::with_recursive());
+                }
+                if let Some(ignore) = &request.ignore {
+                    opts.push(fswatch::with_ignore(ignore.clone()));
+                }
+                opts
+            })
+            .collect();
+        let fswatch_requests: Vec<fswatch::WatchDirectoryRequest<'_>> = requests
+            .into_iter()
+            .zip(&opts)
+            .map(|(request, options)| fswatch::WatchDirectoryRequest {
+                dir: request.dir,
+                callback: request.callback,
+                options,
+            })
+            .collect();
+        self.inner.watch_directories(&fswatch_requests)
     }
 }
 
-// Go: watchbackend.go:35 ShouldIgnoreWatchPath
+// Go: watchbackend.go:72 ShouldIgnoreWatchPath
 pub fn should_ignore_watch_path(path: &str) -> bool {
     let p = tspath::normalize_slashes(path);
     p.ends_with("/.git")
@@ -67,7 +116,7 @@ pub fn should_ignore_watch_path(path: &str) -> bool {
         || p.contains("/.#")
 }
 
-// Go: watchbackend.go:43 CanWatchDirectory
+// Go: watchbackend.go:80 CanWatchDirectory
 pub fn can_watch_directory(dir: &str) -> bool {
     let components = tspath::get_path_components(dir, "");
     let length = components.len() as i32;
@@ -78,7 +127,7 @@ pub fn can_watch_directory(dir: &str) -> bool {
     length > root_length + 1
 }
 
-// Go: watchbackend.go:53 PerceivedOsRootLengthForWatching
+// Go: watchbackend.go:90 PerceivedOsRootLengthForWatching
 // PORT: Go `strings.EqualFold` is `stringutil_ls::equate_string_case_insensitive`
 // (Go `stringutil.EquateStringCaseInsensitive` is `strings.EqualFold`).
 pub fn perceived_os_root_length_for_watching(components: &[String]) -> i32 {

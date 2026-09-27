@@ -30,7 +30,7 @@ use ts_goport::execute::build::worker::BUILD_WORKER_FLAG;
 use ts_goport::execute::execute_tsc::{GoTsc, command_line};
 use ts_goport::execute::tsc::{EXIT_UNPORTED, System, Writer, new_os_system};
 use ts_goport::execute::watcher::set_test_watch_backend;
-use ts_goport::execute::watchmanager::WatchBackend;
+use ts_goport::execute::watchmanager::{WatchBackend, WatchDirectoryRequest};
 use ts_goport::fswatch::{Event, EventKind, Watch, WatchCallback};
 use ts_goport::gostd::context;
 use ts_goport::gostd::errors::GoError;
@@ -252,6 +252,25 @@ impl WatchBackend for TestBackend {
             id,
             watches: self.watches.clone(),
         }))
+    }
+
+    /// One `watch_directory` call per request, in request order. A test
+    /// watch never fails, so the batch never fails either.
+    fn watch_directories(
+        &self,
+        requests: Vec<WatchDirectoryRequest>,
+    ) -> Result<Vec<Box<dyn Watch>>, GoError> {
+        requests
+            .into_iter()
+            .map(|request| {
+                self.watch_directory(
+                    &request.dir,
+                    request.callback,
+                    request.recursive,
+                    request.ignore,
+                )
+            })
+            .collect()
     }
 }
 

@@ -44,7 +44,13 @@ impl WatchedDir {
     }
 }
 
-// Go: watchmanager.go:28 WatchManager
+// Go: watchmanager.go:20 dirWatchUpdate
+struct DirWatchUpdate {
+    dir: String,
+    recursive: bool,
+}
+
+// Go: watchmanager.go:33 WatchManager
 /// WatchManager manages fswatch directory watches, event accumulation,
 /// and DoCycle signaling. It is shared by the CLI watcher and the build
 /// mode orchestrator.
@@ -123,7 +129,7 @@ impl GoMutex {
     }
 }
 
-// Go: watchmanager.go:45 NewWatchManager
+// Go: watchmanager.go:50 NewWatchManager
 pub fn new_watch_manager(
     warn_writer: Writer,
     dir_exists: Box<dyn Fn(&str) -> bool>,
@@ -145,17 +151,17 @@ pub fn new_watch_manager(
 }
 
 impl WatchManager {
-    // Go: watchmanager.go:54 WatchManager.SetBackend
+    // Go: watchmanager.go:59 WatchManager.SetBackend
     pub fn set_backend(&mut self, b: Rc<dyn WatchBackend>) {
         self.backend = Some(b);
     }
 
-    // Go: watchmanager.go:56 WatchManager.Backend
+    // Go: watchmanager.go:61 WatchManager.Backend
     pub fn backend(&self) -> Option<Rc<dyn WatchBackend>> {
         self.backend.clone()
     }
 
-    // Go: watchmanager.go:58 WatchManager.EnsureDefaultBackend
+    // Go: watchmanager.go:63 WatchManager.EnsureDefaultBackend
     pub fn ensure_default_backend(&mut self) {
         if self.backend.is_none() {
             let fsw = fswatch::default();
@@ -169,22 +175,22 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:68 WatchManager.Lock
+    // Go: watchmanager.go:73 WatchManager.Lock
     pub fn lock(&self) {
         self.shared.mu.lock();
     }
 
-    // Go: watchmanager.go:70 WatchManager.Unlock
+    // Go: watchmanager.go:75 WatchManager.Unlock
     pub fn unlock(&self) {
         self.shared.mu.unlock();
     }
 
-    // Go: watchmanager.go:72 WatchManager.DoCycleCh
+    // Go: watchmanager.go:77 WatchManager.DoCycleCh
     pub fn do_cycle_ch(&self) -> &Receiver<()> {
         &self.do_cycle_ch
     }
 
-    // Go: watchmanager.go:74 WatchManager.DrainEvents
+    // Go: watchmanager.go:79 WatchManager.DrainEvents
     /// PORT: Go returns a nil map when nothing changed; the port returns an
     /// empty map.
     pub fn drain_events(&self) -> (FxHashMap<String, fswatch::EventKind>, bool) {
@@ -196,13 +202,13 @@ impl WatchManager {
         (changed_paths, overflow)
     }
 
-    // Go: watchmanager.go:84 WatchManager.ForceOverflow
+    // Go: watchmanager.go:89 WatchManager.ForceOverflow
     pub fn force_overflow(&self) {
         let mut changed = self.shared.changed_mu.lock().unwrap();
         changed.changed_overflow = true;
     }
 
-    // Go: watchmanager.go:162 WatchManager.CloseAllWatches
+    // Go: watchmanager.go:167 WatchManager.CloseAllWatches
     pub fn close_all_watches(&self) {
         self.shared.mu.lock();
         let closers: Vec<Arc<WatchedDir>> = {
@@ -219,32 +225,20 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:175 WatchManager.createDirWatch
+    // Go: watchmanager.go:180 WatchManager.createDirWatch
     pub fn create_dir_watch(&self, dir: &str, recursive: bool) -> Result<(), GoError> {
         let entry = Arc::new(WatchedDir {
             closer: Mutex::new(None),
             recursive,
         });
-        let shared = self.shared.clone();
-        let identity = entry.clone();
-        let cb_dir = dir.to_string();
-        // PORT: the callback runs on the fswatch debouncer thread; it logs
-        // to stdout when DebugLog was set when the watch was made (Go reads
-        // DebugLog at event time; callers set it before the first watch).
-        let debug_log = self.debug_log.is_some();
-        let cb: fswatch::WatchCallback =
-            Arc::new(move |events: Vec<fswatch::Event>, err: Option<GoError>| {
-                if let Some(e) = &err {
-                    if errors::is(e, &fswatch::ERR_WATCH_TERMINATED) {
-                        shared.handle_watch_terminated(debug_log, &cb_dir, &identity);
-                        return;
-                    }
-                }
-                shared.on_watch_events(debug_log, events, err);
-            });
-        let ignore: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(should_ignore_watch_path);
+        let request = self.create_dir_watch_request(dir, &entry);
         let backend = self.backend.as_ref().expect("watchmanager: backend is set");
-        let watch = match backend.watch_directory(dir, cb, recursive, Some(ignore)) {
+        let watch = match backend.watch_directory(
+            &request.dir,
+            request.callback,
+            request.recursive,
+            request.ignore,
+        ) {
             Ok(watch) => watch,
             Err(err) => {
                 if let Some(debug_log) = &self.debug_log {
@@ -272,7 +266,36 @@ impl WatchManager {
         Ok(())
     }
 
-    // Go: watchmanager.go:196 WatchManager.ResolveDesiredDirs
+    // Go: watchmanager.go:195 WatchManager.createDirWatchRequest
+    fn create_dir_watch_request(
+        &self,
+        dir: &str,
+        entry: &Arc<WatchedDir>,
+    ) -> WatchDirectoryRequest {
+        let shared = self.shared.clone();
+        let identity = entry.clone();
+        let cb_dir = dir.to_string();
+        // PORT: the callback runs on the fswatch debouncer thread; it logs
+        // to stdout when DebugLog was set when the watch was made (Go reads
+        // DebugLog at event time; callers set it before the first watch).
+        let debug_log = self.debug_log.is_some();
+        WatchDirectoryRequest {
+            dir: dir.to_string(),
+            recursive: entry.recursive,
+            ignore: Some(Arc::new(should_ignore_watch_path)),
+            callback: Arc::new(move |events: Vec<fswatch::Event>, err: Option<GoError>| {
+                if let Some(e) = &err {
+                    if errors::is(e, &fswatch::ERR_WATCH_TERMINATED) {
+                        shared.handle_watch_terminated(debug_log, &cb_dir, &identity);
+                        return;
+                    }
+                }
+                shared.on_watch_events(debug_log, events, err);
+            }),
+        }
+    }
+
+    // Go: watchmanager.go:210 WatchManager.ResolveDesiredDirs
     pub fn resolve_desired_dirs(
         &self,
         desired_dirs: &FxHashMap<String, bool>,
@@ -316,17 +339,18 @@ impl WatchManager {
         resolved
     }
 
-    // Go: watchmanager.go:227 WatchManager.ReconcileWatches
-    // PORT: Go ranges over `wm.watchedDirs` while the callbacks delete and
-    // add entries (Go allows that). The port passes a copy of the map and
-    // the callbacks change the live map; the entries a callback adds match
-    // `desiredDirs`, so Go makes no further call for them either.
+    // Go: watchmanager.go:241 WatchManager.ReconcileWatches
+    // PORT: Go ranges over `wm.watchedDirs` while the callbacks delete
+    // entries (Go allows that). The port passes a copy of the map and the
+    // callbacks change the live map.
     pub fn reconcile_watches(&self, desired_dirs: &FxHashMap<String, bool>) -> Result<(), GoError> {
         if self.backend.is_none() {
             return Ok(());
         }
 
-        let watch_err: RefCell<Option<GoError>> = RefCell::new(None);
+        let mut additions: Vec<DirWatchUpdate> = Vec::new();
+        let mut changes: Vec<DirWatchUpdate> = Vec::new();
+
         let watched_dirs: FxHashMap<String, Arc<WatchedDir>> =
             self.shared.watched_dirs.lock().unwrap().clone();
         let mut on_added = |dir: &String, recursive: &bool| {
@@ -337,12 +361,10 @@ impl WatchManager {
                     &format!("[watch] watching directory {dir} (recursive={recursive})\n"),
                 );
             }
-            if let Err(err) = self.create_dir_watch(dir, recursive) {
-                let mut watch_err = watch_err.borrow_mut();
-                if watch_err.is_none() {
-                    *watch_err = Some(err);
-                }
-            }
+            additions.push(DirWatchUpdate {
+                dir: dir.clone(),
+                recursive,
+            });
         };
         let mut on_removed = |dir: &String, wd: &Arc<WatchedDir>| {
             if let Some(debug_log) = &self.debug_log {
@@ -367,12 +389,10 @@ impl WatchManager {
             }
             wd.close_closer();
             self.shared.watched_dirs.lock().unwrap().remove(dir);
-            if let Err(err) = self.create_dir_watch(dir, recursive) {
-                let mut watch_err = watch_err.borrow_mut();
-                if watch_err.is_none() {
-                    *watch_err = Some(err);
-                }
-            }
+            changes.push(DirWatchUpdate {
+                dir: dir.clone(),
+                recursive,
+            });
         };
         core_ls_ext::diff_maps_func::<String, Arc<WatchedDir>, bool>(
             &watched_dirs,
@@ -382,13 +402,64 @@ impl WatchManager {
             Some(&mut on_removed),
             Some(&mut on_changed),
         );
-        match watch_err.into_inner() {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        additions.append(&mut changes);
+        self.create_dir_watches(additions)
     }
 
-    // Go: watchmanager.go:279 WatchManager.IsPathUnderWatch
+    // Go: watchmanager.go:279 WatchManager.createDirWatches
+    /// PORT: on an error Go also closes each non-nil `closers[i]`. Every Go
+    /// backend returns nil closers with an error, and a Rust `Err` carries
+    /// no watches, so there is nothing to close.
+    fn create_dir_watches(&self, updates: Vec<DirWatchUpdate>) -> Result<(), GoError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut requests: Vec<WatchDirectoryRequest> = Vec::with_capacity(updates.len());
+        let mut entries: Vec<Arc<WatchedDir>> = Vec::with_capacity(updates.len());
+        for update in &updates {
+            let entry = Arc::new(WatchedDir {
+                closer: Mutex::new(None),
+                recursive: update.recursive,
+            });
+            requests.push(self.create_dir_watch_request(&update.dir, &entry));
+            entries.push(entry);
+        }
+        let backend = self.backend.as_ref().expect("watchmanager: backend is set");
+        let closers = match backend.watch_directories(requests) {
+            Ok(closers) => closers,
+            Err(err) => {
+                if let Some(debug_log) = &self.debug_log {
+                    for update in &updates {
+                        write_str(
+                            debug_log,
+                            &format!(
+                                "[watch] failed to watch directory {}: {}\n",
+                                update.dir,
+                                err.error()
+                            ),
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
+        // PORT: the closers are set before `watched_dirs` is locked, as in
+        // `create_dir_watch`, so no closer lock is taken under that lock.
+        let mut closers = closers.into_iter();
+        for entry in &entries {
+            let closer = closers
+                .next()
+                .expect("index out of range: WatchDirectories returns one closer per request");
+            *entry.closer.lock().unwrap() = Some(closer);
+        }
+        let mut watched_dirs = self.shared.watched_dirs.lock().unwrap();
+        for (update, entry) in updates.into_iter().zip(entries) {
+            watched_dirs.insert(update.dir, entry);
+        }
+        Ok(())
+    }
+
+    // Go: watchmanager.go:322 WatchManager.IsPathUnderWatch
     pub fn is_path_under_watch(&self, path: &str, opts: &tspath::ComparePathsOptions) -> bool {
         let watched_dirs = self.shared.watched_dirs.lock().unwrap();
         for dir in watched_dirs.keys() {
@@ -399,7 +470,7 @@ impl WatchManager {
         false
     }
 
-    // Go: watchmanager.go:288 WatchManager.RunLoop
+    // Go: watchmanager.go:331 WatchManager.RunLoop
     // PORT: Go selects on `ctx.Done()` and `doCycleCh`. The port waits on
     // the channel with a timeout and checks `ctx.err()` (PORTING "Go
     // runtime"). `doCycle` is the caller's DoCycle method value.
@@ -422,7 +493,7 @@ impl WatchManager {
 }
 
 impl WatchManagerShared {
-    // Go: watchmanager.go:90 WatchManager.signalDoCycle
+    // Go: watchmanager.go:95 WatchManager.signalDoCycle
     pub fn signal_do_cycle(&self) {
         match self.do_cycle_ch.try_send(()) {
             Ok(()) => {
@@ -434,7 +505,7 @@ impl WatchManagerShared {
         }
     }
 
-    // Go: watchmanager.go:99 WatchManager.onWatchEvents
+    // Go: watchmanager.go:104 WatchManager.onWatchEvents
     // PORT: runs on the fswatch callback thread. `debug_log` is whether Go
     // `wm.DebugLog` is non-nil; the text goes to the process stdout, as does
     // the `warnWriter` warning (see the file comment).
@@ -489,7 +560,7 @@ impl WatchManagerShared {
         }
     }
 
-    // Go: watchmanager.go:142 WatchManager.handleWatchTerminated
+    // Go: watchmanager.go:147 WatchManager.handleWatchTerminated
     // PORT: runs on the fswatch callback thread (see onWatchEvents).
     pub fn handle_watch_terminated(&self, debug_log: bool, dir: &str, identity: &Arc<WatchedDir>) {
         if debug_log {
@@ -518,7 +589,7 @@ impl WatchManagerShared {
     }
 }
 
-// Go: watchmanager.go:266 IsDirCoveredByWatch
+// Go: watchmanager.go:309 IsDirCoveredByWatch
 pub fn is_dir_covered_by_watch(
     dirs: &FxHashMap<String, bool>,
     dir: &str,
