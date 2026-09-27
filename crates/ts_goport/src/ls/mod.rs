@@ -35,7 +35,9 @@ pub mod linkedediting;
 pub mod lsconv;
 pub mod lsutil;
 pub mod organizeimports;
+pub mod program_view;
 pub mod rename;
+pub mod search_thread;
 pub mod selectionranges;
 pub mod semantictokens;
 pub mod signaturehelp;
@@ -76,7 +78,9 @@ pub use inlay_hints::*;
 pub use languageservice::*;
 pub use linkedediting::*;
 pub use organizeimports::*;
+pub use program_view::*;
 pub use rename::*;
+pub use search_thread::*;
 pub use selectionranges::*;
 pub use semantictokens::*;
 pub use signaturehelp::*;
@@ -97,8 +101,9 @@ pub mod prelude {
         diagnostics::*, displaypartswriter::*, documenthighlights::*, file_rename::*,
         findallreferences_p1::*, findallreferences_p2::*, folding::*, format::*, host::*, hover::*,
         import_tracker::*, inlay_hints::*, languageservice::*, linkedediting::*,
-        organizeimports::*, rename::*, selectionranges::*, semantictokens::*, signaturehelp::*,
-        source_map::*, sourcedefinition::*, string_completions::*, symbols::*, utilities::*,
+        organizeimports::*, program_view::*, rename::*, search_thread::*, selectionranges::*,
+        semantictokens::*, signaturehelp::*, source_map::*, sourcedefinition::*,
+        string_completions::*, symbols::*, utilities::*,
     };
     pub use crate::astnav;
     pub use crate::format;

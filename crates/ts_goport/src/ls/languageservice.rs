@@ -8,11 +8,15 @@ use crate::ls::prelude::*;
 // `*lsconv.Converters` is shared (`Rc`). All methods take `&self`, so the
 // mapper cache is a `RefCell`. The fields are `pub` because other files of
 // package `ls` read them (Go same-package access).
-pub struct LanguageService {
+// PORT: `P` is the program. It is `&'static NewProgram` except on a search
+// thread of a cross-project request (`program_view.rs`). The methods that
+// the search runs are in `impl<P: ProgramView> LanguageService<P>` blocks;
+// all other methods are for the default `P` only.
+pub struct LanguageService<P = &'static compiler::NewProgram> {
     pub project_path: tspath::Path,
     pub host: Rc<dyn Host>,
     pub active_config: lsutil::UserPreferences,
-    pub program: &'static compiler::NewProgram,
+    pub program: P,
     pub converters: Rc<lsconv::Converters>,
     // PORT: Go caches `*DocumentPositionMapper` values, including nil. The
     // contract type holds only non-nil mappers, so a nil result is not cached
@@ -52,7 +56,37 @@ pub fn new_language_service(
     }
 }
 
+/// A language service for a program view that is not a `NewProgram` (a
+/// search thread, see `search_thread.rs`). `program_guard` makes the
+/// view's program version current (`ls_program::enter_version`).
+pub fn new_language_service_for_view<P: ProgramView>(
+    project_path: tspath::Path,
+    program: P,
+    host: Rc<dyn Host>,
+    active_config: lsutil::UserPreferences,
+    program_guard: ls_program::ProgramGuard,
+) -> LanguageService<P> {
+    let converters = host.converters();
+    LanguageService {
+        project_path,
+        host,
+        program,
+        converters,
+        active_config,
+        document_position_mappers: RefCell::new(FxHashMap::default()),
+        _program_guard: program_guard,
+    }
+}
+
 impl LanguageService {
+    /// Makes this language service's program current again while the guard
+    /// lives (see the `_program_guard` field).
+    pub fn enter_program(&self) -> ls_program::ProgramGuard {
+        ls_program::enter(self.program)
+    }
+}
+
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/languageservice.go:40 toPath
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         tspath::to_path(
@@ -63,14 +97,8 @@ impl LanguageService {
     }
 
     // Go: ls/languageservice.go:44 GetProgram
-    pub fn get_program(&self) -> &'static compiler::NewProgram {
+    pub fn get_program(&self) -> P {
         self.program
-    }
-
-    /// Makes this language service's program current again while the guard
-    /// lives (see the `_program_guard` field).
-    pub fn enter_program(&self) -> ls_program::ProgramGuard {
-        ls_program::enter(self.program)
     }
 
     // Go: ls/languageservice.go:48 UserPreferences
@@ -88,23 +116,15 @@ impl LanguageService {
     // Go: ls/languageservice.go:56 tryGetProgramAndFile
     // PORT: Go `*ast.SourceFile` is the file root `Node` (`Node::NIL` when the
     // program has no such file).
-    pub fn try_get_program_and_file(
-        &self,
-        file_name: &str,
-    ) -> (&'static compiler::NewProgram, Node) {
+    pub fn try_get_program_and_file(&self, file_name: &str) -> (P, Node) {
         let program = self.get_program();
-        let file = program
-            .get_source_file(file_name)
-            .map_or(Node::NIL, |file| file.root);
+        let file = program.source_file_root(file_name);
         (program, file)
     }
 
     // Go: ls/languageservice.go:62 getProgramAndFile
     // PORT: Go passes the URI by value; here by reference.
-    pub fn get_program_and_file(
-        &self,
-        document_uri: &lsproto::DocumentUri,
-    ) -> (&'static compiler::NewProgram, Node) {
+    pub fn get_program_and_file(&self, document_uri: &lsproto::DocumentUri) -> (P, Node) {
         let file_name = document_uri.file_name();
         let (program, file) = self.try_get_program_and_file(&file_name);
         if file.is_nil() {
@@ -154,7 +174,9 @@ impl LanguageService {
     ) -> Option<Rc<sourcemap::lineinfo::ECMALineInfo>> {
         self.host.get_ecma_line_info(file_name)
     }
+}
 
+impl LanguageService {
     // Go: ls/languageservice.go:95 getPreparedAutoImportView
     // getPreparedAutoImportView returns an auto-import view for the given file if the registry is prepared
     // to provide up-to-date auto-imports for it. If not, it returns ErrNeedsAutoImports.
@@ -248,7 +270,7 @@ impl LanguageService {
 // `UseCaseSensitiveFileNames`, `GetECMALineInfo` and `ReadFile` methods
 // (`GetDocumentPositionMapper` passes `l`). The inherent methods above win in
 // method syntax, so these calls do not recurse.
-impl sourcemap::Host for LanguageService {
+impl<P: ProgramView> sourcemap::Host for LanguageService<P> {
     fn use_case_sensitive_file_names(&self) -> bool {
         LanguageService::use_case_sensitive_file_names(self)
     }

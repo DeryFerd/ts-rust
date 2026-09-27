@@ -462,6 +462,25 @@ fswatch backends and debouncers, timer wake-ups) touch only `Send` data.
 Factory nodes and cached tokens are thread-local, which is correct
 because every request runs on the dispatch thread.
 
+One exception: the cross-project search (`ls/crossproject.rs`,
+`ls/search_thread.rs`). Go searches each project of a references,
+implementations or rename request on its own goroutine. Here the search of
+each project other than the default one runs on the search thread of its
+program version:
+- One long-lived thread per program version. It starts from a
+  `program::WorkerSeed` taken after the program is bound, makes its own
+  checker, drops it after 30 s with no job, and ends when the program is
+  released (`ls::release_search_thread`).
+- A job gets and returns only `Send` data. The thread reads the program
+  through `ls::ProgramView` (a copy of the data the search reads) and
+  program files from the AST store. Other reads go to the dispatch thread.
+- Session calls, the default project's search and the merge stay on the
+  dispatch thread. Items commit in queue order, so the results are those
+  of a serial run in Go start order.
+- The search code is generic over `ProgramView`
+  (`LanguageService<P = &'static NewProgram>`). Keep new code on that path
+  generic, and keep `Rc` values and checkers on their thread.
+
 ### Go runtime (`crate::gostd`)
 
 | Go | Rust |
@@ -480,7 +499,7 @@ because every request runs on the dispatch thread.
 | `err.Error()` | `err.error()` |
 | `go f()` that touches dispatch-thread state | `gostd::local::go(Box::new(f))`: FIFO on the dispatch thread, run by `local::run_pending()` |
 | `go f()` over `Send` data only | `std::thread::spawn` |
-| `sync.WaitGroup`, `wg.Go`, `core.WorkGroup`, `errgroup` over dispatch-thread state | serial, in Go start order, like Go's single-threaded `WorkGroup`; keep the `ctx.err()` checks |
+| `sync.WaitGroup`, `wg.Go`, `core.WorkGroup`, `errgroup` over dispatch-thread state | serial, in Go start order, like Go's single-threaded `WorkGroup`; keep the `ctx.err()` checks (the cross-project search is the one exception, see "Threads") |
 | `errgroup.WithContext` over `Send` loops | `gostd::errgroup` (real threads) |
 | `chan T` with capacity n / unbuffered | `std::sync::mpsc::sync_channel(n)` / `sync_channel(0)`; `select` with `default` is `try_send` / `try_recv`; `select` on `ctx.Done()` is a `recv_timeout` loop that checks `ctx.err()` (PORT note) |
 | `sync.Mutex`, `RWMutex`, `atomic.*` on dispatch-thread data | a plain field, `Cell` or `RefCell` (drop the lock) |
@@ -532,7 +551,8 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   `ls_program::update_program` is a program version of the process
   (`program::new_program_version`), as Go makes a new `Program` for each
   snapshot change. Versions share the file versions they have in common.
-  The checkers of every version are made on the dispatch thread.
+  The checkers of every version are made on the dispatch thread, except
+  the checkers of the cross-project search threads (see "Threads").
 - Current program: checker code reads `prog()`. `ls_program::enter(p)`
   makes `p` current while its `ProgramGuard` lives; the last guard that is
   still alive wins, so guards can drop in any order. A language service

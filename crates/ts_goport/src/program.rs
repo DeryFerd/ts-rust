@@ -3482,8 +3482,9 @@ thread_local! {
 
 /// The thread-local state that a checker worker starts from: the current
 /// program, and the synthetic nodes, ids and lazy JSDoc of the loading
-/// thread when the pool is made.
-struct WorkerSeed {
+/// thread when the pool is made. The language server's cross-project search
+/// threads start from it too (`ls/search_thread.rs`).
+pub(crate) struct WorkerSeed {
     program: &'static GoProgram,
     synthetic: SyntheticSeed,
     ids: IdSeed,
@@ -3491,7 +3492,7 @@ struct WorkerSeed {
 }
 
 impl WorkerSeed {
-    fn take() -> Self {
+    pub(crate) fn take() -> Self {
         Self {
             program: prog(),
             synthetic: synthetic_seed(),
@@ -3500,7 +3501,7 @@ impl WorkerSeed {
         }
     }
 
-    fn install(self) {
+    pub(crate) fn install(self) {
         crate::core::set_thread_program(Some(self.program));
         install_synthetic_seed(self.synthetic);
         install_id_seed(self.ids);

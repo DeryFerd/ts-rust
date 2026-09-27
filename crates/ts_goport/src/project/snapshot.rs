@@ -910,8 +910,10 @@ impl Snapshot {
                     }
                     // PORT: Go frees the program when nothing references it.
                     // The port frees its checkers and its program version
-                    // now, or when the last request on it ends.
+                    // now, or when the last request on it ends. Its
+                    // cross-project search thread ends after its queued jobs.
                     crate::program::ls_program::release_program(program);
+                    crate::ls::release_search_thread(program);
                 }
             }
         }

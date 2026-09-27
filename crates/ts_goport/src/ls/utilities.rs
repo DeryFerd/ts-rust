@@ -397,7 +397,7 @@ pub fn is_in_right_side_of_internal_import_equals_declaration(node: Node) -> boo
         && node.parent().module_reference() == node
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/utilities.go:287 createLspRangeFromNode
     pub fn create_lsp_range_from_node(&self, node: Node, file: Node) -> lsproto::Range {
         self.create_lsp_range_from_bounds(
@@ -416,7 +416,7 @@ pub fn create_range_from_node(node: Node, file: Node) -> TextRange {
     )
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/utilities.go:295 createLspRangeFromBounds
     // PORT: Go passes the `*ast.SourceFile` as an `lsconv.Script`.
     pub fn create_lsp_range_from_bounds(&self, start: i32, end: i32, file: Node) -> lsproto::Range {
