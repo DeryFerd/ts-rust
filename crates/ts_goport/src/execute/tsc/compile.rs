@@ -3,8 +3,8 @@
 //!
 //! PORT: Go `io.Writer` is `Writer` (a shared `std::io::Write`). The
 //! frontend file system is `Rc`, so the system and the writers are `Rc`
-//! too and stay on one thread. A build runs each project in its own worker
-//! process, so no writer is shared across threads.
+//! too and stay on one thread. A build compiles every project on the
+//! orchestrator thread, so no writer is shared across threads.
 
 use crate::prelude::*;
 
@@ -134,10 +134,11 @@ pub struct CommandLineResult {
 // `io.Writer` is `Writer`. Go `*collections.SyncMap[tspath.Path,
 // time.Time]` is the build host `m_times`, a `Mutex` (`None` is the Go zero
 // time).
-// The last three methods have no Go equivalent and do nothing by default:
-// the port compiles each build project in a worker process
-// (build/worker.rs), so a test can run the worker itself and gets the
-// task's program and emitted files back on the orchestrator side.
+// The last three methods have no Go equivalent and do nothing by default.
+// They served the build worker process (build/worker.rs). The build now
+// compiles in the process and calls `on_program` and `on_emitted_files` as
+// Go does, so the orchestrator no longer calls them. M2b removes them with
+// the worker.
 pub trait CommandLineTesting {
     // Ensure that all emitted files are timestamped in order to ensure they are deterministic for test baseline
     fn on_emitted_files(

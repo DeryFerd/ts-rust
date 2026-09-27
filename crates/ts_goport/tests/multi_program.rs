@@ -15,6 +15,9 @@
 //! The watch test runs `tsc --watch` through `goport_watch` and edits
 //! `src/a.ts` between builds.
 //!
+//! The build test runs `goport_build -b` on `fixtures/multiprog/build-dedup`,
+//! whose projects share parsed files in one process, as Go `tsc -b` does.
+//!
 //! `pair` writes these files to its out dir: `a.txt`, `a.status`, `b.txt`,
 //! `b.status`, `b.reused` and, with `--first`, `first.txt`. A status file
 //! holds the decimal exit code. `b.reused` holds `true` or `false`.
@@ -38,6 +41,11 @@ const FIXTURE: &str = concat!(
 );
 
 const EMIT_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/multiprog/emit");
+
+const BUILD_DEDUP_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/multiprog/build-dedup"
+);
 
 /// The file that each test edits, relative to the project.
 const CHANGED: &str = "src/a.ts";
@@ -338,6 +346,43 @@ fn watch_builds_report_like_fresh_runs() {
             i == 1 || i == 2,
             "build {i}: c.ts error:\n{build}"
         );
+    }
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// `goport_build -b` makes the program of each project in one process, and
+/// the build host shares parsed `.d.ts` files between them. `p1` imports
+/// `a` and `b`, so the copy of `a` under `b/node_modules` is a duplicate
+/// package: `p1` parses it and its `dep.d.ts` and leaves both out. `p2`
+/// imports only `b`, so both are program files of `p2`. `expected.txt` is
+/// the pinned tsgo output of the same command.
+#[test]
+fn build_includes_files_that_an_earlier_project_left_out() {
+    let root = scratch_dir("build-dedup");
+    copy_dir(Path::new(BUILD_DEDUP_FIXTURE), &root);
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_build"))
+        .args(["-b", "tsconfig.json", "--explainFiles", "--pretty", "false"])
+        .current_dir(&root)
+        .output()
+        .expect("run goport_build");
+    let report = Report {
+        stdout: String::from_utf8(run.stdout).expect("goport_build stdout is UTF-8"),
+        status: run.status.code().expect("goport_build exited with a code"),
+    };
+    let expected = Report {
+        stdout: read(&root.join("expected.txt")),
+        status: 0,
+    };
+    assert_eq!(
+        report,
+        expected,
+        "goport_build against tsgo ({}):\n{}",
+        root.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    for project in ["p1", "p2"] {
+        let build_info = root.join(project).join("tsconfig.tsbuildinfo");
+        assert!(build_info.is_file(), "no {}", build_info.display());
     }
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }

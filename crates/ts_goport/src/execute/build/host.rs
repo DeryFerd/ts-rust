@@ -264,9 +264,21 @@ impl CompilerHost for BuildHost {
             || file_extension_is(&opts.file_name, EXTENSION_JSON)
         {
             // Cache dts and json files as they will be reused
+            // PORT: a parse that the cache keeps can be left out of one
+            // program (a deduplicated package, or a file that only such a
+            // package imports) and be a program file of a later one. Go
+            // keeps the whole `*ast.SourceFile`. The note makes the publish
+            // of the first program give the store its complete Go file, so
+            // the later program can use it.
             return self.source_files.load_or_store(
                 SourceFileCacheKey(opts.clone()),
-                |key| self.host.get_source_file(&key.0),
+                |key| {
+                    let file = self.host.get_source_file(&key.0);
+                    if let Some(file) = &file {
+                        crate::program::note_parsed_source_file(file);
+                    }
+                    file
+                },
                 false, /* allowZero */
             );
         }

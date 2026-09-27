@@ -183,10 +183,10 @@ pub fn command_line(
 // Go: execute/tsc.go:90 tscBuildCompilation
 // PORT: Go `CommandLine` parses the build command line and passes it in;
 // here it is the first step, which runs in the same order.
-// `command_line_args` is the full command line (Go `commandLineArgs`),
-// which the build workers get too (build/worker.rs).
-// PORT: testing. A test's `build_worker_runner` replaces the build worker
-// process (see `BuildWorkerRunner`).
+// `command_line_args` is the full command line (Go `commandLineArgs`).
+// PORT: the orchestrator compiles every project in this process, on this
+// thread (build/build_task.rs). The worker launcher below is not used any
+// more; M2b removes it with the build worker.
 pub fn tsc_build_compilation(
     ctx: &Context,
     sys: Rc<dyn System>,
