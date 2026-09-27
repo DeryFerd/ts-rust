@@ -22,6 +22,25 @@ corpus-diag/10569 | single-threaded-equal | traceResolution case nodeModulesPack
 corpus-diag/11458 | single-threaded-equal | traceResolution case library-reference-15: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
 corpus-diag/11466 | single-threaded-equal | traceResolution case library-reference-scoped-packages: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
 
+# The same 14 cases at upstream pin 52168999f3dc (bump A, GOPORT_PIN). Corpus ids are ids of the pin's
+# corpus-full list; at this pin each of these ids is 10 higher. The entries above keep the
+# ids of pin dc37b5249ab6. At the other pin an id names another case; there the entry still allows only
+# a FAIL whose goport output equals `tsgo-oracle --singleThreaded` byte for byte.
+corpus-diag/00228 | single-threaded-equal | traceResolution case pathsAliasTrailingSlashConflictWithAtTypes (pin 52168999f3dc; id 00218 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/03535 | single-threaded-equal | traceResolution case importWithTrailingSlash (pin 52168999f3dc; id 03525 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04601 | single-threaded-equal | traceResolution case moduleResolutionWithExtensions_notSupported3 (pin 52168999f3dc; id 04591 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04602 | single-threaded-equal | traceResolution case moduleResolutionWithExtensions_unexpected (pin 52168999f3dc; id 04592 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04640 | single-threaded-equal | traceResolution case moduleResolution_packageJson_yesAtPackageRoot_mainFieldInSubDirectory (pin 52168999f3dc; id 04630 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04941 | single-threaded-equal | traceResolution case nodeColonModuleResolution2 (pin 52168999f3dc; id 04931 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/05488 | single-threaded-equal | traceResolution case reactJsxReactResolvedNodeNextEsm (pin 52168999f3dc; id 05478 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/07625 | single-threaded-equal | traceResolution case typesVersionsDeclarationEmit.multiFileBackReferenceToSelf (pin 52168999f3dc; id 07615 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/07626 | single-threaded-equal | traceResolution case typesVersionsDeclarationEmit.multiFileBackReferenceToUnmapped (pin 52168999f3dc; id 07616 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10466 | single-threaded-equal | traceResolution case bundlerImportTsExtensions (pin 52168999f3dc; id 10456 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10473 | single-threaded-equal | traceResolution case customConditions (pin 52168999f3dc; id 10463 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10579 | single-threaded-equal | traceResolution case nodeModulesPackageImports (pin 52168999f3dc; id 10569 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/11468 | single-threaded-equal | traceResolution case library-reference-15 (pin 52168999f3dc; id 11458 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/11476 | single-threaded-equal | traceResolution case library-reference-scoped-packages (pin 52168999f3dc; id 11466 at dc37b5249ab6): oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+
 # Effect McpProtocol (typesyms/strord-verify): the Go dumper prints the Rpc union members of
 # ProtocolAdapter in a check-order dependent order.
 # Effect unstable/ai (McpProtocol, McpSchema, mcpProtocol/*): the Go dumper prints Rpc union
