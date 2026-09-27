@@ -154,6 +154,19 @@ pub trait EmitTextWriter {
     fn is_at_start_of_line(&self) -> bool;
     fn has_trailing_comment(&self) -> bool;
     fn has_trailing_whitespace(&self) -> bool;
+
+    /// PORT: not in the Go interface. Go `textWriter.Grow`, here on the trait
+    /// so the emitter can size the output buffer before it prints. Other
+    /// writers ignore it.
+    fn grow(&mut self, _n: i32) {}
+
+    /// PORT: not in Go. `string()` then `clear()`. A writer can override it
+    /// to move its text out instead of copying it.
+    fn take_string(&mut self) -> String {
+        let text = self.string();
+        self.clear();
+        text
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

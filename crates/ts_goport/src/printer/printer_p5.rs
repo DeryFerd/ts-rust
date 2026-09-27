@@ -499,6 +499,9 @@ impl Printer {
     // Go: printer/printer.go:5030 setSourceFile
     pub(crate) fn set_source_file(&mut self, source_file: Node) {
         self.current_source_file = source_file;
+        // PERF: clear the one-entry caches of the current file (printer_p1).
+        self.current_original_cache.take();
+        self.current_line_map_cache.take();
         self.unique_helper_names = None;
         self.external_helpers_module_name = Node::NIL;
         if source_file.is_some() {
@@ -1109,13 +1112,11 @@ impl Printer {
         comment_pos: i32,
     ) -> bool {
         // If the leading comments start on different line than the start of node, write new line
-        self.current_source_file.is_some()
-            && pos != comment_pos
-            && compute_line_of_position(source_file_ecma_line_map(self.current_source_file), pos)
-                != compute_line_of_position(
-                    source_file_ecma_line_map(self.current_source_file),
-                    comment_pos,
-                )
+        if self.current_source_file.is_nil() || pos == comment_pos {
+            return false;
+        }
+        let line_map = self.current_line_map();
+        compute_line_of_position(line_map, pos) != compute_line_of_position(line_map, comment_pos)
     }
 
     // Go: printer/printer.go:5562 emitLeadingCommentsOfPosition
@@ -1228,7 +1229,7 @@ impl Printer {
         }
 
         let text = source_file_text(self.current_source_file);
-        let line_map = source_file_ecma_line_map(self.current_source_file);
+        let line_map = self.current_line_map();
 
         let mut leading_comments: Vec<CommentRange> = Vec::new();
         if self.comments_disabled {
@@ -1439,9 +1440,10 @@ impl Printer {
             let writer = self.writer_p5();
             (writer.get_line(), writer.get_column())
         };
+        // PERF: borrow the generator; no `Rc` clone for each position.
         let generator = self
             .source_map_generator
-            .clone()
+            .as_ref()
             .expect("source map generator");
         if let Err(err) = generator.borrow_mut().add_source_mapping(
             line,
@@ -1486,7 +1488,10 @@ impl Printer {
             && self.current_source_file.is_some()
             && !position_is_synthesized(loc.pos())
         {
-            let pos = skip_trivia(source_file_text(self.current_source_file), loc.pos());
+            // PERF: nested nodes often start at the same pos (see `SkipTriviaMemo`).
+            let pos = self
+                .skip_trivia_memo
+                .skip_trivia(self.current_source_file, loc.pos());
             self.emit_source_pos(self.source_map_source, pos);
         }
 

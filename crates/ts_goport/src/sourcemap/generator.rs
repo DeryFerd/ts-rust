@@ -70,20 +70,58 @@ impl RawSourceMap {
     // PORT: not a Go function. The struct tags give the key order.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(self.mappings.len() + 128);
+        // A decoded map can hold any mappings text, so check it before the
+        // fast quote. The generator skips this check.
+        let quote_mappings: fn(&mut String, &str) = if self.mappings.bytes().all(is_vlq_byte) {
+            append_vlq_quote
+        } else {
+            append_json_quote
+        };
+        RawSourceMapJson {
+            version: self.version,
+            file: &self.file,
+            source_root: &self.source_root,
+            sources: &self.sources,
+            names: &self.names,
+            mappings: &self.mappings,
+            sources_content: self.sources_content.as_deref(),
+        }
+        .write(quote_mappings)
+    }
+}
+
+/// Borrowed `RawSourceMap` fields. `RawSourceMap::to_json` and
+/// `Generator::bytes` both write JSON through it, so the key order and the
+/// omit rules are in one place and the generator clones nothing.
+struct RawSourceMapJson<'a> {
+    version: i32,
+    file: &'a str,
+    source_root: &'a str,
+    sources: &'a [String],
+    names: &'a [String],
+    mappings: &'a str,
+    /// `None` omits the key (Go `omitzero` on a nil slice).
+    sources_content: Option<&'a [Option<String>]>,
+}
+
+impl RawSourceMapJson<'_> {
+    /// Writes the JSON. `quote_mappings` is `append_vlq_quote` when the
+    /// mappings are known VLQ text, else `append_json_quote`.
+    fn write(&self, quote_mappings: fn(&mut String, &str)) -> String {
+        let mut out = String::with_capacity(self.len_hint());
         out.push_str("{\"version\":");
         out.push_str(&self.version.to_string());
         out.push_str(",\"file\":");
-        append_json_quote(&mut out, &self.file);
+        append_json_quote(&mut out, self.file);
         out.push_str(",\"sourceRoot\":");
-        append_json_quote(&mut out, &self.source_root);
+        append_json_quote(&mut out, self.source_root);
         out.push_str(",\"sources\":");
-        append_json_string_array(&mut out, &self.sources);
+        append_json_string_array(&mut out, self.sources);
         out.push_str(",\"names\":");
-        append_json_string_array(&mut out, &self.names);
+        append_json_string_array(&mut out, self.names);
         out.push_str(",\"mappings\":");
-        append_json_quote(&mut out, &self.mappings);
-        if let Some(sources_content) = &self.sources_content {
+        quote_mappings(&mut out, self.mappings);
+        if let Some(sources_content) = self.sources_content {
             out.push_str(",\"sourcesContent\":[");
             for (i, content) in sources_content.iter().enumerate() {
                 if i > 0 {
@@ -99,6 +137,41 @@ impl RawSourceMap {
         out.push('}');
         out
     }
+
+    /// The output size without escapes, so the common case never grows the
+    /// buffer. Each list item adds two quotes and a comma.
+    fn len_hint(&self) -> usize {
+        let list = |values: &[String]| values.iter().map(|v| v.len() + 3).sum::<usize>();
+        let content = self.sources_content.map_or(0, |contents| {
+            contents
+                .iter()
+                .map(|c| c.as_ref().map_or(5, |c| c.len() + 3))
+                .sum::<usize>()
+        });
+        128 + self.file.len()
+            + self.source_root.len()
+            + self.mappings.len()
+            + list(self.sources)
+            + list(self.names)
+            + content
+    }
+}
+
+/// A byte that VLQ mappings can hold: a base64 digit, ',' or ';'.
+fn is_vlq_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b',' | b';')
+}
+
+/// Quotes VLQ mappings with one `push_str`. JSON escapes none of the VLQ
+/// bytes, so the output is the same as `append_json_quote`.
+fn append_vlq_quote(out: &mut String, mappings: &str) {
+    debug_assert!(
+        mappings.bytes().all(is_vlq_byte),
+        "mappings must hold only base64 digits, ',' and ';'"
+    );
+    out.push('"');
+    out.push_str(mappings);
+    out.push('"');
 }
 
 fn append_json_string_array(out: &mut String, values: &[String]) {
@@ -125,9 +198,14 @@ pub fn new_generator(
         source_root: source_root.to_string(),
         sources_directory_path: sources_directory_path.to_string(),
         path_options: options,
+        // PORT: skips the first small regrowths of the mappings buffer.
+        mappings: String::with_capacity(MAPPINGS_INITIAL_CAPACITY),
         ..Generator::default()
     }
 }
+
+/// Start size of the mappings buffer, so small files never regrow it.
+const MAPPINGS_INITIAL_CAPACITY: usize = 1024;
 
 impl Generator {
     // Go: sourcemap/generator.go:74 Sources
@@ -222,8 +300,11 @@ impl Generator {
     }
 
     // Go: sourcemap/generator.go:149 appendMappingCharCode
-    fn append_mapping_char_code(&mut self, char_code: char) {
-        self.mappings.push(char_code);
+    // PORT: takes an ASCII byte. The `& 0x7F` changes no caller's value; it
+    // tells the compiler the char is ASCII, so `push` writes one byte.
+    fn append_mapping_char_code(&mut self, char_code: u8) {
+        debug_assert!(char_code.is_ascii());
+        self.mappings.push(char::from(char_code & 0x7F));
     }
 
     // Go: sourcemap/generator.go:153 appendBase64VLQ
@@ -249,7 +330,7 @@ impl Generator {
                 // There are still more digits to decode, set the msb (6th bit)
                 current_digit |= 32;
             }
-            self.append_mapping_char_code(base64_format_encode(current_digit as i32));
+            self.append_mapping_char_code(base64_format_encode(current_digit as usize));
             if in_value <= 0 {
                 break;
             }
@@ -266,7 +347,7 @@ impl Generator {
         if self.last_generated_line < self.pending_generated_line {
             // Emit line delimiters
             loop {
-                self.append_mapping_char_code(';');
+                self.append_mapping_char_code(b';');
                 self.last_generated_line += 1;
                 if self.last_generated_line >= self.pending_generated_line {
                     break;
@@ -281,7 +362,7 @@ impl Generator {
             }
             // Emit comma to separate the entry
             if self.has_last {
-                self.append_mapping_char_code(',');
+                self.append_mapping_char_code(b',');
             }
         }
 
@@ -469,8 +550,25 @@ impl Generator {
     }
 
     // Go: sourcemap/generator.go:337 bytes
+    // PORT: Go marshals the cloned `RawSourceMap()`. This writes the same
+    // JSON from the fields in place, after the same commit.
     fn bytes(&mut self) -> String {
-        self.raw_source_map().to_json()
+        self.commit_pending_mapping();
+        RawSourceMapJson {
+            version: 3,
+            file: &self.file,
+            source_root: &self.source_root,
+            sources: &self.sources,
+            names: &self.names,
+            mappings: &self.mappings,
+            // Same omit rule as `raw_source_map`.
+            sources_content: if self.sources_content.is_empty() {
+                None
+            } else {
+                Some(self.sources_content.as_slice())
+            },
+        }
+        .write(append_vlq_quote)
     }
 
     // Go: sourcemap/generator.go:346 String
@@ -492,24 +590,28 @@ impl Generator {
     }
 }
 
+/// The standard base64 digits. Both `base64FormatEncode` and
+/// `base64.StdEncoding` use this order.
+const BASE64_DIGITS: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 /// Go `base64.StdEncoding` (with `=` padding).
 // PORT: Go uses `encoding/base64`; the crate adds no dependency for it.
 fn base64_std_encode(out: &mut String, data: &[u8]) {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for chunk in data.chunks(3) {
         let b0 = u32::from(chunk[0]);
         let b1 = chunk.get(1).map_or(0, |&b| u32::from(b));
         let b2 = chunk.get(2).map_or(0, |&b| u32::from(b));
         let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 63) as usize] as char);
+        out.push(BASE64_DIGITS[((triple >> 18) & 63) as usize] as char);
+        out.push(BASE64_DIGITS[((triple >> 12) & 63) as usize] as char);
         if chunk.len() > 1 {
-            out.push(ALPHABET[((triple >> 6) & 63) as usize] as char);
+            out.push(BASE64_DIGITS[((triple >> 6) & 63) as usize] as char);
         } else {
             out.push('=');
         }
         if chunk.len() > 2 {
-            out.push(ALPHABET[(triple & 63) as usize] as char);
+            out.push(BASE64_DIGITS[(triple & 63) as usize] as char);
         } else {
             out.push('=');
         }
@@ -517,15 +619,10 @@ fn base64_std_encode(out: &mut String, data: &[u8]) {
 }
 
 // Go: sourcemap/generator.go:363 base64FormatEncode
-fn base64_format_encode(value: i32) -> char {
-    match value {
-        0..=25 => (b'A' + value as u8) as char,
-        26..=51 => (b'a' + (value - 26) as u8) as char,
-        52..=61 => (b'0' + (value - 52) as u8) as char,
-        62 => '+',
-        63 => '/',
-        _ => panic!("not a base64 value"),
-    }
+// PORT: a table lookup that returns the ASCII byte. A value past 63 panics
+// on the index, as Go panics.
+fn base64_format_encode(value: usize) -> u8 {
+    BASE64_DIGITS[value]
 }
 
 #[cfg(test)]
@@ -542,6 +639,37 @@ mod tests {
         assert_eq!(
             generator.string(),
             r#"{"version":3,"file":"a.js","sourceRoot":"","sources":["a.ts"],"names":[],"mappings":"AAAA,IAAM;AACN"}"#
+        );
+    }
+
+    #[test]
+    fn generator_json_matches_raw_source_map_json() {
+        let mut generator = new_generator("a.js", "r/", "/p", ComparePathsOptions::default());
+        let source = generator.add_source("/p/a.ts");
+        generator
+            .set_source_content(source, "let x = \"\\\n")
+            .unwrap();
+        let name = generator.add_name("x");
+        generator
+            .add_named_source_mapping(0, 4, source, 0, 4, name)
+            .unwrap();
+        generator.add_source_mapping(2, 0, source, 1, 0).unwrap();
+        let raw = generator.raw_source_map().to_json();
+        assert_eq!(generator.string(), raw);
+        assert_eq!(
+            raw,
+            r#"{"version":3,"file":"a.js","sourceRoot":"r/","sources":["a.ts"],"names":["x"],"mappings":"IAAIA;;AACJ","sourcesContent":["let x = \"\\\n"]}"#
+        );
+
+        // A decoded map can hold mappings that need escapes.
+        let decoded = RawSourceMap {
+            version: 3,
+            mappings: "A\"".to_string(),
+            ..RawSourceMap::default()
+        };
+        assert_eq!(
+            decoded.to_json(),
+            r#"{"version":3,"file":"","sourceRoot":"","sources":[],"names":[],"mappings":"A\""}"#
         );
     }
 
