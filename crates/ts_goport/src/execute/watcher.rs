@@ -1,9 +1,9 @@
 //! Go: execute/watcher.go (package `execute`): `tsc --watch` without
 //! `--build`.
 //!
-//! PORT: `testing tsc.CommandLineTesting` is always nil (see
-//! tsc/compile.rs); it is dropped with the branches that read it
-//! (`testing.OnProgram`, the test watch backend).
+//! PORT: testing. Go `testing tsc.CommandLineTesting` is `None` outside
+//! tests (see tsc/compile.rs). The test watch backend comes from
+//! `set_test_watch_backend`, not from `testing`.
 //!
 //! PORT: Go runs `DoCycle` from `WatchManager.RunLoop` on the goroutine
 //! that called `start`. The port does the same on the calling thread. The
@@ -21,7 +21,9 @@ use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::build::worker::SystemParseConfigHost;
 use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_write_file};
 use crate::execute::incremental;
-use crate::execute::tsc::compile::{CompileAndEmitResult, CompileTimes, System, write_str};
+use crate::execute::tsc::compile::{
+    CommandLineTesting, CompileAndEmitResult, CompileTimes, System, write_str,
+};
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_watch_status_reporter,
 };
@@ -126,6 +128,7 @@ pub struct Watcher {
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
     report_watch_status: DiagnosticReporter,
+    testing: Option<Rc<dyn CommandLineTesting>>,
 
     program: Option<incremental::program::Program>,
     extended_config_cache: Option<Rc<TscExtendedConfigCache>>,
@@ -155,10 +158,10 @@ thread_local! {
 /// Go `tsc.CommandLineTesting` with `WatchBackend()`
 /// (watchmanager.CommandLineTestingWithWatchBackend): a watcher that this
 /// thread makes later uses `backend` in place of the OS file watcher.
-// PORT: Go passes `testing` down from `CommandLine`; the port drops that
-// parameter (`testing` is nil for the bins), so a test harness sets the
-// backend here. Only the backend part of Go's test mode is kept: the
-// watcher still runs its own loop (Go's test mode calls `DoCycle` itself).
+// PORT: a test harness sets the backend here, not through `testing`. With
+// `testing` set too, the watcher is in Go's test mode: `start` returns
+// after the first build and the test calls `DoCycle`. Without it (the
+// `goport_watch` bin), the watcher still runs its own loop.
 pub fn set_test_watch_backend(backend: Rc<dyn WatchBackend>) {
     TEST_WATCH_BACKEND.with(|slot| *slot.borrow_mut() = Some(backend));
 }
@@ -176,6 +179,7 @@ pub fn create_watcher(
     command_line_raw: Option<IndexMap<String, CompilerOptionsValue>>,
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> Watcher {
     // PORT: Go passes the method value `sys.FS().DirectoryExists`.
     let fs = sys.fs();
@@ -199,7 +203,9 @@ pub fn create_watcher(
             sys,
             &config_parse_result.locale(),
             config_parse_result.compiler_options().clone(),
+            testing.clone(),
         ),
+        testing,
         program: None,
         extended_config_cache: None,
         config_modified: false,
@@ -227,7 +233,11 @@ impl Watcher {
             self.sys.fs(),
             &self.sys.default_library_path(),
             Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
-            Some(get_trace_from_sys(&*self.sys, self.config.locale())),
+            Some(get_trace_from_sys(
+                &*self.sys,
+                self.config.locale(),
+                self.testing.clone(),
+            )),
         );
         self.program = incremental::program::read_build_info_program(
             &self.config,
@@ -249,8 +259,9 @@ impl Watcher {
             self.wm.borrow_mut().debug_log = Some(self.sys.writer());
         }
 
-        // PORT: `w.testing` is always nil.
-        self.wm.borrow_mut().ensure_default_backend();
+        if self.testing.is_none() {
+            self.wm.borrow_mut().ensure_default_backend();
+        }
 
         (self.report_watch_status)(&new_compiler_diagnostic(
             diag::Starting_compilation_in_watch_mode,
@@ -261,10 +272,11 @@ impl Watcher {
         }
         self.wm.borrow().unlock();
 
-        // PORT: `w.testing` is always nil. Go passes the method value
-        // `w.DoCycle`.
-        let wm = Rc::clone(&self.wm);
-        wm.borrow().run_loop(ctx, &mut || self.do_cycle());
+        if self.testing.is_none() {
+            // PORT: Go passes the method value `w.DoCycle`.
+            let wm = Rc::clone(&self.wm);
+            wm.borrow().run_loop(ctx, &mut || self.do_cycle());
+        }
     }
 
     // Go: execute/watcher.go:143 (*Watcher).computeDesiredWatches
@@ -366,7 +378,7 @@ impl Watcher {
                         ),
                     );
                 }
-                // PORT: `w.testing` is always nil.
+                self.on_program();
                 self.wm.borrow().unlock();
                 return;
             }
@@ -378,7 +390,7 @@ impl Watcher {
             if let Some(debug_log) = &self.wm.borrow().debug_log {
                 write_str(debug_log, "[watch] DoCycle: no events, skipping\n");
             }
-            // PORT: `w.testing` is always nil.
+            self.on_program();
             self.wm.borrow().unlock();
             return;
         }
@@ -445,7 +457,11 @@ impl Watcher {
             self.extended_config_cache
                 .clone()
                 .map(|cache| cache as Rc<dyn ExtendedConfigCache>),
-            Some(get_trace_from_sys(&*self.sys, self.config.locale())),
+            Some(get_trace_from_sys(
+                &*self.sys,
+                self.config.locale(),
+                self.testing.clone(),
+            )),
         );
         let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
@@ -475,7 +491,7 @@ impl Watcher {
         let mut program = incremental::program::new_program(
             self.program.as_ref(),
             incremental::incremental::create_host(host),
-            false, /* w.testing != nil */
+            self.testing.is_some(),
         );
         // PORT: Go passes a nil incremental host. The Rust `new_program`
         // takes a host, so the field is cleared after.
@@ -533,8 +549,19 @@ impl Watcher {
             ));
         }
 
-        // PORT: `w.testing` is always nil.
+        self.on_program();
         Ok(())
+    }
+
+    /// Go `if w.testing != nil { w.testing.OnProgram(w.program) }`.
+    // PORT: the test reads the program's files, so its version is current
+    // for the call.
+    fn on_program(&self) {
+        let (Some(testing), Some(program)) = (&self.testing, &self.program) else {
+            return;
+        };
+        let _program = crate::core::enter_program(program.program);
+        testing.on_program(program);
     }
 
     // Go: execute/watcher.go:356 (*Watcher).evictChangedSourceFiles
@@ -573,6 +600,8 @@ impl Watcher {
             writer: self.sys.writer(),
             write_file: Some(os_write_file()),
             compile_times: Rc::new(RefCell::new(CompileTimes::default())),
+            testing: self.testing.clone(),
+            testing_m_times_cache: None,
         })
     }
 

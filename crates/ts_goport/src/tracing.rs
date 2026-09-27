@@ -22,8 +22,11 @@
 //! PORT: Go writes through the program `vfs.FS`. The session is shared by
 //! the checker threads, so it writes with `std::fs`, with the same
 //! create-directory-and-retry step as Go `osvfs` `WriteFile`/`AppendFile`.
-//! OS error texts are the Rust `io::Error` texts, not the Go ones.
+//! OS error texts are the Rust `io::Error` texts, not the Go ones. A test
+//! process that installs an OS override writes through `osvfs_fs()`
+//! instead (see `write_file`).
 
+use crate::execute::incremental::emit_files::fs_error_text;
 use crate::prelude::*;
 
 use std::borrow::Cow;
@@ -100,8 +103,9 @@ const FLUSH_THRESHOLD: usize = 256 * 1024;
 // Go: tracing/tracing.go:111 Tracing
 // Tracing manages the overall tracing session including all checkers.
 // PORT: the Go fields that `mu` guards are in `TracingState`. Go `fs` is
-// `std::fs` (see the module comment). Go `tracers` is not kept: each
-// checker holds its own `TypeTracer` (see `stop_tracing`).
+// `std::fs`, or `osvfs_fs()` in a test process (see the module comment).
+// Go `tracers` is not kept: each checker holds its own `TypeTracer` (see
+// `stop_tracing`).
 pub struct Tracing {
     trace_dir: String,
     trace_path: String,
@@ -1579,11 +1583,27 @@ fn write_file_ensuring_dir(path: &str, content: &str, append: bool) -> std::io::
 }
 
 // Go: vfs/osvfs/os.go:205 WriteFile
+// PORT: Go `tr.fs.WriteFile`, where `tr.fs` is `sys.FS()`. A test process
+// installs an OS override (`osvfs::install_os_override`), and then the
+// session writes through that thread's `osvfs_fs()`, which is the test
+// file system. The error text is Go `err.Error()`. A real run never
+// installs the override and writes with `std::fs` as before.
 fn write_file(path: &str, content: &str) -> std::io::Result<()> {
+    if crate::frontend::vfs::os_override_installed() {
+        return crate::frontend::vfs::osvfs_fs()
+            .write_file(path, content)
+            .map_err(|err| std::io::Error::other(fs_error_text(&err)));
+    }
     write_file_ensuring_dir(path, content, false)
 }
 
 // Go: vfs/osvfs/os.go:209 AppendFile
+// PORT: Go `tr.fs.AppendFile`; see `write_file` for the OS override.
 fn append_file(path: &str, content: &str) -> std::io::Result<()> {
+    if crate::frontend::vfs::os_override_installed() {
+        return crate::frontend::vfs::osvfs_fs()
+            .append_file(path, content)
+            .map_err(|err| std::io::Error::other(fs_error_text(&err)));
+    }
     write_file_ensuring_dir(path, content, true)
 }

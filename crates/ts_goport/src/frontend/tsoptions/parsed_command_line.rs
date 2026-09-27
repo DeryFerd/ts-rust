@@ -391,20 +391,22 @@ fn glob_split(input: &[u8]) -> (&[u8], &[u8]) {
 // Go: core/parsedoptions.go:3 ParsedOptions
 // PORT: Go `*CompilerOptions` is `Rc<CompilerOptions>`, so copies of the
 // struct share it like Go pointers do. Go `*TypeAcquisition` is an
-// `Option`. Go `[]*ProjectReference` is `Vec<ProjectReference>`, the type
-// that `parse_project_reference` returns.
+// `Option`. Go `[]*ProjectReference` is `Option<Vec<ProjectReference>>`:
+// `None` is Go nil (no `references` in the config) and `Some(vec![])` is
+// Go `"references": []`. The build checks that difference.
 // PORT: the Go `WatchOptions` field is left out. The crate has no
 // `WatchOptions` type, and Go `ParseJsonConfigFileContent` never sets it.
 // PORT: `PartialEq` is Go `reflect.DeepEqual` (execute/watcher.go
-// recheckTsConfig). Go DeepEqual also tells a nil slice from an empty one;
-// a `Vec` has no nil, so those two compare equal here.
+// recheckTsConfig). The `Option` keeps the Go nil and empty slice apart for
+// `project_references`; other `Vec` fields have no nil, so those two compare
+// equal there.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParsedOptions {
     pub compiler_options: Rc<CompilerOptions>,
     pub type_acquisition: Option<TypeAcquisition>,
 
     pub file_names: Vec<String>,
-    pub project_references: Vec<ProjectReference>,
+    pub project_references: Option<Vec<ProjectReference>>,
 }
 
 // PORT: the two Go maps that `ParseInputOutputNames` fills in one `Once`.
@@ -792,15 +794,25 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:309 (*ParsedCommandLine).ProjectReferences
+    /// PORT: a nil Go slice is an empty slice here. Use
+    /// `has_project_references` for Go `ProjectReferences() != nil`.
     pub fn project_references(&self) -> &[ProjectReference] {
-        &self.parsed_config.project_references
+        self.parsed_config
+            .project_references
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Go `ProjectReferences() != nil`: the config has a `references` list,
+    /// which can be empty.
+    pub fn has_project_references(&self) -> bool {
+        self.parsed_config.project_references.is_some()
     }
 
     // Go: tsoptions/parsedcommandline.go:313 (*ParsedCommandLine).ResolvedProjectReferencePaths
     pub fn resolved_project_reference_paths(&self) -> &[String] {
         self.resolved_project_reference_paths.get_or_init(|| {
-            self.parsed_config
-                .project_references
+            self.project_references()
                 .iter()
                 .map(resolve_project_reference_path)
                 .collect()

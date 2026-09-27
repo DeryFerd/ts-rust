@@ -65,6 +65,7 @@
 //! publish has only `GoFile`s. It must be the only publish: file ids are
 //! store ids, so no store can be made or published after it.
 
+use crate::frontend::parser::SourceFileParseOptions;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -157,12 +158,27 @@ struct FileStore {
     /// until the file is published (its `GoFile` holds it then), so
     /// `publish_file_stores` empties it.
     jsdoc_cache: FxHashMap<Node, &'static [Node]>,
-    /// Go `file.LanguageVariant` and the parse `file.Diagnostics()`, set by
-    /// `finishSourceFile`. Reads of a file that is not published use them
-    /// (`ast::source_file_language_variant`, `ast::source_file_diagnostics`),
+    /// Go `file.hasLazyJSDoc`, set by `finishSourceFile` for a non-JS file,
+    /// with the inputs that Go `parseJSDocForNode` reads from the file
+    /// (`ParseOptions()` and `ScriptKind`; the text is `text`). Node reads
+    /// use it until the file is published (the program then keeps the
+    /// inputs), so `publish_file_stores` drops it.
+    lazy_js_doc: Option<(SourceFileParseOptions, ScriptKind)>,
+    /// Go `file.jsdocCache` entries that `resolveJSDoc` adds before the file
+    /// is published.
+    // PORT: the parsed JSDoc nodes are synthetic nodes of the thread that
+    // parsed them, so they are kept apart from `jsdoc_cache`.
+    // `adopt_detached_store` (another thread) and `publish_file_stores`
+    // drop them.
+    lazy_jsdoc_cache: FxHashMap<Node, &'static [Node]>,
+    /// Go `file.LanguageVariant`, the parse `file.Diagnostics()` and
+    /// `file.ContainsNonASCII`, set by `finishSourceFile`. Reads of a file
+    /// that is not published use them (`ast::source_file_language_variant`,
+    /// `ast::source_file_diagnostics`, `ast::source_file_get_position_map`),
     /// for example the format tests, which parse a file with no program.
     language_variant: LanguageVariant,
     diagnostics: &'static [Diagnostic],
+    contains_non_ascii: bool,
     /// The SourceFile node of this store, set by `publish_file_stores`.
     root: Node,
     /// Go `SourceFile.ECMALineMap()`, computed on first use after publish
@@ -599,6 +615,8 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
                 (remap.node(node), jsdocs)
             })
             .collect();
+        // The lazy JSDoc nodes are synthetic nodes of the parse worker.
+        store.lazy_jsdoc_cache = FxHashMap::default();
         // The resolved table holds handles of the store id, which changes
         // here. `publish_file_stores` makes it for the real id.
         store.resolved = Box::default();
@@ -713,8 +731,8 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
     with_store_mut(file, |s| s.jsdoc_cache = cache);
 }
 
-/// Go `result.LanguageVariant` and `result.diagnostics` in
-/// `finishSourceFile`.
+/// Go `result.LanguageVariant`, `result.diagnostics` and
+/// `result.ContainsNonASCII` in `finishSourceFile`.
 // PORT: the diagnostics are leaked so reads can return a `&'static` slice,
 // like `GoFile::info.diagnostics` after the publish. A parse without errors
 // leaks nothing.
@@ -722,11 +740,13 @@ pub fn set_file_store_parse_fields(
     file: usize,
     language_variant: LanguageVariant,
     diagnostics: &[Diagnostic],
+    contains_non_ascii: bool,
 ) {
     let diagnostics: &'static [Diagnostic] = Box::leak(diagnostics.to_vec().into_boxed_slice());
     with_store_mut(file, |s| {
         s.language_variant = language_variant;
         s.diagnostics = diagnostics;
+        s.contains_non_ascii = contains_non_ascii;
     });
 }
 
@@ -742,11 +762,61 @@ pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
     with_store(file, |s| s.diagnostics)
 }
 
+/// Go `file.ContainsNonASCII` of a store file: true when the scanner
+/// decoded a non-ASCII rune. False for a store that `finishSourceFile` did
+/// not finish.
+#[must_use]
+pub fn file_store_contains_non_ascii(file: usize) -> bool {
+    with_store(file, |s| s.contains_non_ascii)
+}
+
 /// Go `file.jsdocCache[node]` of a store file whose program is not
-/// installed yet.
+/// installed yet. It never parses (Go `EagerJSDoc`).
 #[must_use]
 pub fn file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
-    with_store(file, |s| s.jsdoc_cache.get(&node).copied())
+    with_store(file, |s| {
+        s.jsdoc_cache
+            .get(&node)
+            .or_else(|| s.lazy_jsdoc_cache.get(&node))
+            .copied()
+    })
+}
+
+/// Go `result.SetHasLazyJSDoc(true)` in `finishSourceFile`. The store keeps
+/// the parse options and script kind of the file for
+/// `resolve_file_store_js_doc`.
+pub fn set_file_store_lazy_js_doc(
+    file: usize,
+    parse_options: &SourceFileParseOptions,
+    script_kind: ScriptKind,
+) {
+    let lazy = Some((parse_options.clone(), script_kind));
+    with_store_mut(file, |s| s.lazy_js_doc = lazy);
+}
+
+// Go: ast/ast.go:2614 (*SourceFile).resolveJSDoc
+/// Go `node.JSDoc(file)` of a store file whose program is not installed
+/// yet: the cache, then, in a lazy file (`set_file_store_lazy_js_doc`), Go
+/// `parseJSDocForNode`, whose result the cache keeps. None on a cache miss
+/// in a file that is not lazy.
+// PORT: Go takes `jsdocMu`. A store that is not published has one thread.
+// The lists are leaked so reads can return `&'static` slices.
+#[must_use]
+pub fn resolve_file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
+    if let Some(jsdocs) = file_store_js_doc(file, node) {
+        return Some(jsdocs);
+    }
+    let (parse_options, script_kind, text) = with_store(file, |s| {
+        s.lazy_js_doc
+            .clone()
+            .map(|(parse_options, script_kind)| (parse_options, script_kind, s.text))
+    })?;
+    let jsdocs: &'static [Node] = Box::leak(
+        crate::frontend::parser::parse_js_doc_for_node(&parse_options, text, script_kind, node)
+            .into_boxed_slice(),
+    );
+    with_store_mut(file, |s| s.lazy_jsdoc_cache.insert(node, jsdocs));
+    Some(jsdocs)
 }
 
 /// True when node reads of store file `file` must use the store, because
@@ -813,6 +883,8 @@ impl FileStore {
         }
         self.aliases = FxHashMap::default();
         self.jsdoc_cache = FxHashMap::default();
+        self.lazy_js_doc = None;
+        self.lazy_jsdoc_cache = FxHashMap::default();
         self.parser_flags = None;
         if self.root_slot != NIL_SLOT {
             self.root = handle(file, self.root_slot);

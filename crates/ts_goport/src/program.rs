@@ -177,6 +177,9 @@ pub struct SourceFileInfo {
     pub jsdoc_diagnostics: Vec<Diagnostic>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
+    /// Go `SourceFile.ContainsNonASCII`: the scanner decoded a non-ASCII
+    /// rune. `ast::source_file_get_position_map` reads it.
+    pub contains_non_ascii: bool,
     /// Trivia runs of the text. They map the Rust token-start ranges to Go
     /// full-start ranges (see `ast::go_view`).
     pub trivia: crate::ast::go_view::TriviaRuns,
@@ -719,15 +722,21 @@ static LINEAGE: Mutex<Option<SymbolArena>> = Mutex::new(None);
 // a copy of it after the program files are bound. `Checker::new` uses the
 // same initializer, so the first of the two to run binds. Files bind in
 // parallel, each into its own arena (`bind_files_parallel`), and join the
-// lineage in file order with the ids a serial bind gives. A file that an
-// earlier program version bound is not bound again.
+// lineage in file order with the ids a serial bind gives. With
+// `--singleThreaded` they bind last-queued-first
+// (`bind_files_last_queued_first`). A file that an earlier program version
+// bound is not bound again.
 pub fn bind_all() {
     let program = prog();
     program.bound_symbols.get_or_init(|| {
         let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
         let symbols = lineage.get_or_insert_with(SymbolArena::new);
         let mark = symbols.mark();
-        bind_files_parallel(symbols);
+        if single_threaded() {
+            bind_files_last_queued_first(symbols);
+        } else {
+            bind_files_parallel(symbols);
+        }
         for file in program.source_files() {
             // Go: program.go:450 traces the files that are not bound yet.
             let _trace = if file.file_bind.get().is_none() {
@@ -741,6 +750,35 @@ pub fn bind_all() {
         symbols.share_since(mark);
         symbols.clone()
     });
+}
+
+/// Go program.go:445 with `--singleThreaded`: `core.singleThreadedWorkGroup`
+/// runs the queued binds last-queued-first (core/workgroup.go:67), so the
+/// files that are not bound yet bind, and trace, in reverse file order. Each
+/// file binds into its own arena, and the arenas join the lineage arena in
+/// file order, so the ids are those of a serial bind in file order (see
+/// `bind_files_parallel`). This thread keeps the state that binding makes.
+fn bind_files_last_queued_first(symbols: &mut SymbolArena) {
+    let queued: Vec<Node> = prog()
+        .source_files()
+        .filter(|file| file.file_bind.get().is_none())
+        .map(|file| file.root)
+        .collect();
+    let mut bound: Vec<(BoundFile, SymbolArena)> = queued
+        .into_iter()
+        .rev()
+        .map(|file| {
+            let _trace = trace_bind_source_file(file);
+            let mut file_symbols = SymbolArena::new();
+            let bound = bind_source_file_detached(file, &mut file_symbols);
+            (bound, file_symbols)
+        })
+        .collect();
+    bound.reverse();
+    for (mut file, file_symbols) in bound {
+        file.remap(symbols.append_file_arena(file_symbols));
+        file.install();
+    }
 }
 
 /// Go program.go:450: the "bindSourceFile" event of one file, when tracing.
@@ -1087,6 +1125,10 @@ fn build_early_info(
         js_diagnostics: Vec::new(),
         jsdoc_diagnostics: Vec::new(),
         has_lazy_js_doc: script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX,
+        // PORT: the legacy parser has no Go scanner flag. A string literal
+        // with no escape or newline does not set the Go flag, so this can be
+        // true where Go is false.
+        contains_non_ascii: !text.is_ascii(),
         trivia: crate::ast::go_view::TriviaRuns::compute(&source.parse.arena, text),
         late: OnceLock::new(),
     };

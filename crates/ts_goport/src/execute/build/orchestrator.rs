@@ -24,7 +24,10 @@
 //! build_task.rs), so the aggregate `--diagnostics` and
 //! `--extendedDiagnostics` statistics cannot add them. `report_task` calls
 //! `unported!` for a task that built a program when they are asked for.
-//! `opts.Testing` is always nil.
+//!
+//! PORT: testing. `opts.testing` is `None` outside tests. A test that runs
+//! the build workers itself (`CommandLineTesting::build_worker_runner`)
+//! gets them one at a time on this thread (see `build_all_tasks`).
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
@@ -45,16 +48,19 @@ use crate::execute::tsc::statistics::Statistics;
 use crate::execute::watchmanager::{WatchManager, new_watch_manager};
 use crate::frontend::prelude::*;
 use crate::gostd::Context;
+// PORT: testing
+use crate::execute::tsc::compile::CommandLineTesting;
 use std::sync::mpsc;
 use std::time::SystemTime;
 
 // Go: build/orchestrator.go:25 Options
-// PORT: `Testing` is dropped (always nil). `worker` starts the build
-// worker processes (plan D1).
+// PORT: `worker` starts the build worker processes (plan D1).
 pub struct Options {
     pub sys: Rc<dyn System>,
     pub command: Rc<ParsedBuildCommandLine>,
     pub worker: WorkerLauncher,
+    // PORT: testing. `None` outside tests.
+    pub testing: Option<Rc<dyn CommandLineTesting>>,
 }
 
 // Go: build/orchestrator.go:31 orchestratorResult
@@ -110,11 +116,8 @@ impl OrchestratorResult {
             return;
         }
         self.statistics.set_total_time(o.opts.sys.since_start());
-        // PORT: `Statistics::report` writes to a string; Go writes to
-        // `o.opts.Sys.Writer()`.
-        let mut w = String::new();
-        self.statistics.report(&mut w);
-        write_str(&o.opts.sys.writer(), &w);
+        self.statistics
+            .report_to(&o.opts.sys.writer(), o.opts.testing.clone());
     }
 }
 
@@ -474,6 +477,23 @@ impl Orchestrator {
                     task.clean_project(self, &paths[index]);
                     states[index] = State::Done;
                 } else if task.build_project_start(self, &paths[index]) {
+                    // PORT: testing. The test's worker runner runs here, on
+                    // this thread, one task at a time. Its messages apply in
+                    // the order of the channel path below: each program
+                    // cache, then the result.
+                    if self.opts.worker.runner.is_some() {
+                        let config = task.config.clone();
+                        let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
+                        let result = self.opts.worker.run(&config, &fs_cache, &mut |state| {
+                            self.host.cached_fs.load_state(&state);
+                        });
+                        self.host.cached_fs.load_state(&result.fs_cache);
+                        let emitted_files = result.emitted_files.clone();
+                        task.build_project_finish(self, &paths[index], result);
+                        self.on_worker_emitted_files(&emitted_files);
+                        states[index] = State::Done;
+                        continue;
+                    }
                     let worker = self.opts.worker.clone();
                     let config = task.config.clone();
                     let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
@@ -508,10 +528,28 @@ impl Orchestrator {
                 };
                 self.host.cached_fs.load_state(&result.fs_cache);
                 let task = self.get_task(&paths[index]);
+                // PORT: testing
+                let emitted_files = self
+                    .opts
+                    .testing
+                    .as_ref()
+                    .map(|_| result.emitted_files.clone());
                 task.borrow_mut()
                     .build_project_finish(self, &paths[index], result);
+                if let Some(emitted_files) = emitted_files {
+                    self.on_worker_emitted_files(&emitted_files);
+                }
                 states[index] = State::Done;
             }
+        }
+    }
+
+    // PORT: testing. The orchestrator part of Go `OnEmittedFiles` for a
+    // worker's result: Go passes `TestingMTimesCache: orchestrator.host.mTimes`
+    // (buildtask.go:229-230). It runs after the result is applied.
+    fn on_worker_emitted_files(&self, emitted_files: &[String]) {
+        if let Some(testing) = &self.opts.testing {
+            testing.on_worker_emitted_files(emitted_files, &self.host.m_times);
         }
     }
 
@@ -532,7 +570,14 @@ impl Orchestrator {
         // If we built the program, or updated timestamps, or had errors, we need to
         // delete files that are no longer needed
         match result.build_kind {
-            BuildKind::Program => build_result.statistics.projects_built += 1,
+            BuildKind::Program => {
+                // PORT: testing. Go `Testing.OnProgram(t.result.program)`
+                // (buildtask.go:109); the program is in the worker.
+                if let Some(testing) = &self.opts.testing {
+                    testing.on_build_task_program(&task.config);
+                }
+                build_result.statistics.projects_built += 1
+            }
             BuildKind::Pseudo => build_result.statistics.timestamp_updates += 1,
             BuildKind::None => {}
         }
@@ -551,6 +596,7 @@ impl Orchestrator {
             self.writer(),
             &self.opts.command.locale(),
             &self.opts.command.compiler_options,
+            self.opts.testing.clone(),
         )
     }
 
@@ -572,6 +618,7 @@ impl Orchestrator {
                 w,
                 &self.opts.command.locale(),
                 &self.opts.command.compiler_options,
+                self.opts.testing.clone(),
             )
         })
     }
@@ -652,7 +699,14 @@ impl BuildTaskOrchestrator for Orchestrator {
             self.host.cached_fs.load_state(&state);
         });
         self.host.cached_fs.load_state(&result.fs_cache);
+        // PORT: testing. The task applies the result after this returns.
+        self.on_worker_emitted_files(&result.emitted_files);
         result
+    }
+
+    // PORT: testing
+    fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
+        self.opts.testing.clone()
     }
 }
 
@@ -686,6 +740,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
             orchestrator.opts.sys.clone(),
             &orchestrator.opts.command.locale(),
             orchestrator.opts.command.compiler_options.clone(),
+            orchestrator.opts.testing.clone(),
         ));
         // Go: if t, ok := opts.Testing.(CommandLineTestingWithWatchBackend); ok { wm.SetBackend(t.WatchBackend()) }
         // PORT: the test backend comes from `watcher::set_test_watch_backend`.

@@ -3674,9 +3674,11 @@ impl Node {
     /// The JSDoc nodes of this node. Pass `Node::NIL` for `file` to walk up
     /// to the source file.
     // PORT: Go resolves a lazy cache miss with the parser hook
-    // `parseJSDocForNode`. The Go frontend path (`GOPORT_FRONTEND=go`) runs
-    // it through `program::resolve_lazy_js_doc`. The legacy path has no
-    // hook, so a miss on a lazy file stops at `unported!`.
+    // `parseJSDocForNode`. A file that is not published yet runs it through
+    // `resolve_file_store_js_doc`. The Go frontend path
+    // (`GOPORT_FRONTEND=go`) runs it through `program::resolve_lazy_js_doc`.
+    // The legacy path has no hook, so a miss on a lazy file stops at
+    // `unported!`.
     #[must_use]
     pub fn js_doc(self, file: Node) -> NodeSlice {
         if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
@@ -3697,10 +3699,12 @@ impl Node {
         if is_synthetic_node(file) {
             return NodeSlice::NIL;
         }
-        // PORT: during the parse (Go `collectExternalModuleReferences`) the
-        // store file is not in a program yet; its cache is in the store.
+        // PORT: during the parse (Go `collectExternalModuleReferences`) or
+        // after a parse outside a program (Go `parser.ParseSourceFile`, as
+        // the astnav tests do) the store file is not in a program; its cache
+        // and lazy JSDoc inputs are in the store.
         if is_file_store_before_program(file.file_index()) {
-            return file_store_js_doc(file.file_index(), self)
+            return resolve_file_store_js_doc(file.file_index(), self)
                 .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
         }
         let info = source_file_info(file);
@@ -3939,21 +3943,30 @@ pub fn source_file_is_bound(file: Node) -> bool {
 }
 
 // Go: ast.go:2756 (*SourceFile).GetPositionMap
-// PORT: Go reads the scanner's `ContainsNonASCII` flag. The text is the
-// same input, so `str::is_ascii` gives the same answer.
+// PORT: Go `positionMapOnce` is a per-thread cache (`POSITION_MAPS`).
+// `file.ContainsNonASCII` is in the store before the program is installed
+// (see `source_file_language_variant`) and in `SourceFileInfo` after. A
+// factory SourceFile does not keep the flag (see `SyntheticSourceFileData`),
+// so it reads its text.
 #[must_use]
 pub fn source_file_get_position_map(file: Node) -> &'static PositionMap {
     if let Some(map) = POSITION_MAPS.with(|c| c.borrow().get(&file).copied()) {
         return map;
     }
-    let text = source_file_text(file);
-    let map = if text.is_ascii() {
+    let contains_non_ascii = if is_synthetic_node(file) {
+        !source_file_text(file).is_ascii()
+    } else if is_file_store_before_program(file.file_index()) {
+        file_store_contains_non_ascii(file.file_index())
+    } else {
+        source_file_info(file).contains_non_ascii
+    };
+    let map = if contains_non_ascii {
+        compute_position_map(source_file_text(file))
+    } else {
         PositionMap {
             ascii_only: true,
             ..PositionMap::default()
         }
-    } else {
-        compute_position_map(text)
     };
     let map: &'static PositionMap = Box::leak(Box::new(map));
     POSITION_MAPS.with(|c| c.borrow_mut().insert(file, map));

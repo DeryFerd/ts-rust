@@ -468,6 +468,9 @@ pub fn finish_referenced_files(file: Node, job: ReferencedFilesJob) -> Option<In
 // When diagnostics are copied from a previous build, their message chains may reference
 // stale program state (e.g., resolved module alternate results, package.json scope).
 // This function recomputes those chains using the current program's state.
+// PORT: testing. `diags.clone()` keeps the entry id (Go returns the same
+// pointer), and the new entry gets a new id (see
+// `DiagnosticsOrBuildInfoDiagnosticsWithFileName`).
 #[must_use]
 pub fn repopulate_diagnostics_of_file(
     diags: &DiagnosticsOrBuildInfoDiagnosticsWithFileName,

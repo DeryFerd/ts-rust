@@ -483,6 +483,8 @@ fn report(live: &Live) -> Report {
         writer,
         write_file,
         compile_times: Rc::new(RefCell::new(CompileTimes::default())),
+        testing: None,
+        testing_m_times_cache: None,
     });
     assert_no_unported();
     let outputs = std::mem::take(&mut *outputs.lock().expect("outputs"));

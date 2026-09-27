@@ -9,6 +9,10 @@
 //! - Go `sourceFile.Hash`, `ParseOptions()`, `NodeCount` and `TextCount` are
 //!   not on the ts_goport SourceFile node. See `source_file_content_hash` and
 //!   `parsed_source_file_of`.
+//! - The other Go `SourceFile` fields that the parser sets (`Path()`,
+//!   `Imports()`, `ModuleAugmentations`, ...) are read through
+//!   `source_file_fields`, which also works for a file that is parsed
+//!   outside a program.
 
 use crate::api::encoder::prelude::*;
 
@@ -308,8 +312,10 @@ fn source_file_content_hash(source_file: Node) -> Uint128 {
 /// The parsed-file record that holds the Go `SourceFile` fields
 /// `ParseOptions()`, `NodeCount` and `TextCount`, or None.
 // PORT: Go keeps these fields on the SourceFile node. ts_goport keeps them in
-// `ParsedSourceFile`, which the language server programs hold. A factory
-// SourceFile has none.
+// `ParsedSourceFile`, which the language server programs hold. A file that
+// is parsed outside a program (Go `parser.ParseSourceFile`) has the parse
+// that `program::note_parsed_source_file` recorded. A factory SourceFile has
+// none.
 fn parsed_source_file_of(source_file: Node) -> Option<Rc<ParsedSourceFile>> {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return None;
@@ -328,6 +334,85 @@ fn source_file_node_count(source_file: Node) -> usize {
 // PORT: Go uses it only as a slice capacity (see `source_file_node_count`).
 fn source_file_text_count(source_file: Node) -> usize {
     parsed_source_file_of(source_file).map_or(0, |file| file.text_count)
+}
+
+/// The Go `SourceFile` fields that the parser sets and the encoder reads:
+/// `Path()`, `Imports()`, `ModuleAugmentations`, `AmbientModuleNames`,
+/// `ExternalModuleIndicator`, the file references, `LanguageVariant` and
+/// `ScriptKind`.
+// PORT: Go reads them from the `*ast.SourceFile`. A published file has them
+// in its `GoFile` (`source_file_info`). A file that is parsed outside a
+// program (Go `parser.ParseSourceFile`, as the encoder tests do) is not
+// published and has no `GoFile`; its `ParsedSourceFile` has them.
+enum SourceFileFields {
+    Published(&'static SourceFileInfo),
+    Parsed(Rc<ParsedSourceFile>),
+}
+
+/// The same field of either `SourceFileFields` variant.
+macro_rules! source_file_field {
+    ($fields:expr, $field:ident) => {
+        match $fields {
+            SourceFileFields::Published(info) => &info.$field,
+            SourceFileFields::Parsed(file) => &file.$field,
+        }
+    };
+}
+
+impl SourceFileFields {
+    fn path(&self) -> &str {
+        match self {
+            SourceFileFields::Published(info) => &info.path,
+            SourceFileFields::Parsed(file) => &file.path().0,
+        }
+    }
+
+    fn imports(&self) -> &[Node] {
+        source_file_field!(self, imports)
+    }
+
+    fn module_augmentations(&self) -> &[Node] {
+        source_file_field!(self, module_augmentations)
+    }
+
+    fn ambient_module_names(&self) -> &[String] {
+        source_file_field!(self, ambient_module_names)
+    }
+
+    fn external_module_indicator(&self) -> Node {
+        *source_file_field!(self, external_module_indicator)
+    }
+
+    fn referenced_files(&self) -> &[FileReference] {
+        source_file_field!(self, referenced_files)
+    }
+
+    fn type_reference_directives(&self) -> &[FileReference] {
+        source_file_field!(self, type_reference_directives)
+    }
+
+    fn lib_reference_directives(&self) -> &[FileReference] {
+        source_file_field!(self, lib_reference_directives)
+    }
+
+    fn language_variant(&self) -> LanguageVariant {
+        *source_file_field!(self, language_variant)
+    }
+
+    fn script_kind(&self) -> ScriptKind {
+        *source_file_field!(self, script_kind)
+    }
+}
+
+/// `SourceFileFields` of `sf`.
+fn source_file_fields(sf: Node) -> SourceFileFields {
+    if !is_synthetic_node(sf)
+        && is_file_store_before_program(sf.file_index())
+        && let Some(parsed) = parsed_source_file_of(sf)
+    {
+        return SourceFileFields::Parsed(parsed);
+    }
+    SourceFileFields::Published(source_file_info(sf))
 }
 
 /// Go `%v` of an `ast.Kind` (the generated stringer): "KindX", or "Kind(N)"
@@ -592,24 +677,26 @@ fn encode_tree(
     let sf_extended_data_offset: usize; // byte offset in extendedData where SourceFile fields start
     if root_node.kind() == SyntaxKind::SourceFile {
         let sf = root_node;
-        let info = source_file_info(sf);
-        let mut total = source_file_imports(sf).len() + info.module_augmentations.len();
-        if info.external_module_indicator.is_some() && info.external_module_indicator != root_node {
+        let fields = source_file_fields(sf);
+        let mut total = fields.imports().len() + fields.module_augmentations().len();
+        if fields.external_module_indicator().is_some()
+            && fields.external_module_indicator() != root_node
+        {
             total += 1;
         }
         if total > 0 {
             let mut map: FxHashMap<Node, u32> =
                 FxHashMap::with_capacity_and_hasher(total, Default::default());
-            for imp in source_file_imports(sf) {
+            for &imp in fields.imports() {
                 map.insert(imp, 0);
             }
-            for &aug in &info.module_augmentations {
+            for &aug in fields.module_augmentations() {
                 map.insert(aug, 0);
             }
-            if info.external_module_indicator.is_some()
-                && info.external_module_indicator != root_node
+            if fields.external_module_indicator().is_some()
+                && fields.external_module_indicator() != root_node
             {
-                map.insert(info.external_module_indicator, 0);
+                map.insert(fields.external_module_indicator(), 0);
             }
             node_index_map = Some(map);
         }
@@ -812,19 +899,19 @@ fn encode_tree(
         // Encode imports, moduleAugmentations, and ambientModuleNames into structured data,
         // and patch the placeholder offsets in the SourceFile extended data.
         let sf = root_node;
-        let info = source_file_info(sf);
+        let fields = source_file_fields(sf);
         let imports_offset = encode_node_index_array(
-            &source_file_imports(sf).to_vec(),
+            fields.imports(),
             node_index_map.as_ref(),
             &mut structured_data,
         );
         let module_augmentations_offset = encode_module_augmentations(
-            &info.module_augmentations,
+            fields.module_augmentations(),
             node_index_map.as_ref(),
             &mut structured_data,
         );
         let ambient_module_names_offset =
-            encode_string_array(&info.ambient_module_names, &mut structured_data);
+            encode_string_array(fields.ambient_module_names(), &mut structured_data);
         // Patch the 3 placeholder uint32s at sfExtendedDataOffset + 32, 36, 40
         put_uint32(
             &mut extended_data,
@@ -843,13 +930,13 @@ fn encode_tree(
         );
         // Patch externalModuleIndicator node index at offset 44
         let mut external_module_indicator_index: u32 = 0;
-        if info.external_module_indicator.is_some() {
-            if info.external_module_indicator == root_node {
+        if fields.external_module_indicator().is_some() {
+            if fields.external_module_indicator() == root_node {
                 external_module_indicator_index = 1; // root node index
             } else {
                 external_module_indicator_index = node_index_map
                     .as_ref()
-                    .and_then(|map| map.get(&info.external_module_indicator).copied())
+                    .and_then(|map| map.get(&fields.external_module_indicator()).copied())
                     .unwrap_or(0);
             }
         }
@@ -947,19 +1034,19 @@ pub fn record_extended_data_source_file(
     structured_data: &mut Vec<u8>,
 ) {
     let sf = node;
-    let info = source_file_info(sf);
+    let fields = source_file_fields(sf);
     let text_index = strs.add(source_file_text(sf), sf.kind(), sf.pos(), sf.end());
     let file_name_index = strs.add(source_file_file_name(sf), SyntaxKind::Unknown, 0, 0);
-    let path_index = strs.add(&info.path, SyntaxKind::Unknown, 0, 0);
+    let path_index = strs.add(fields.path(), SyntaxKind::Unknown, 0, 0);
     let referenced_files_offset =
-        encode_file_references(&info.referenced_files, position_map, structured_data);
+        encode_file_references(fields.referenced_files(), position_map, structured_data);
     let type_ref_directives_offset = encode_file_references(
-        &info.type_reference_directives,
+        fields.type_reference_directives(),
         position_map,
         structured_data,
     );
     let lib_ref_directives_offset = encode_file_references(
-        &info.lib_reference_directives,
+        fields.lib_reference_directives(),
         position_map,
         structured_data,
     );
@@ -971,8 +1058,8 @@ pub fn record_extended_data_source_file(
             text_index,
             file_name_index,
             path_index,
-            info.language_variant.0 as u32,
-            info.script_kind.0 as u32,
+            fields.language_variant().0 as u32,
+            fields.script_kind().0 as u32,
             referenced_files_offset,
             type_ref_directives_offset,
             lib_ref_directives_offset,

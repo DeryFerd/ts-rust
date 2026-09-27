@@ -34,16 +34,17 @@ impl Orchestrator {
     pub fn watch(&mut self, ctx: &Context) {
         self.wm.borrow().lock();
 
-        // PORT: `o.opts.Testing` is always nil.
-        if !self
-            .opts
-            .sys
-            .get_environment_variable("TS_WATCH_DEBUG")
-            .is_empty()
-        {
-            self.wm.borrow_mut().debug_log = Some(self.opts.sys.writer());
+        if self.opts.testing.is_none() {
+            if !self
+                .opts
+                .sys
+                .get_environment_variable("TS_WATCH_DEBUG")
+                .is_empty()
+            {
+                self.wm.borrow_mut().debug_log = Some(self.opts.sys.writer());
+            }
+            self.wm.borrow_mut().ensure_default_backend();
         }
-        self.wm.borrow_mut().ensure_default_backend();
 
         self.update_watch();
         let desired_dirs = self.compute_desired_watches();
@@ -56,10 +57,11 @@ impl Orchestrator {
 
         self.wm.borrow().unlock();
 
-        // PORT: `o.opts.Testing` is always nil. Go passes the method value
-        // `o.DoCycle`.
-        let wm = Rc::clone(&self.wm);
-        wm.borrow().run_loop(ctx, &mut || self.do_cycle());
+        if self.opts.testing.is_none() {
+            // PORT: Go passes the method value `o.DoCycle`.
+            let wm = Rc::clone(&self.wm);
+            wm.borrow().run_loop(ctx, &mut || self.do_cycle());
+        }
     }
 
     // Go: build/orchestrator.go:264 (*Orchestrator).updateWatch

@@ -18,6 +18,11 @@ use super::compile::{CompileAndEmitResult, CompileTimes, ExitStatus, System, Wri
 use super::diagnostics::{DiagnosticReporter, DiagnosticsReporter};
 use super::statistics::{Statistics, read_mem_stats, statistics_from_program};
 
+// PORT: testing (`CommandLineTesting`)
+use super::compile::CommandLineTesting;
+use crate::frontend::tspath::Path;
+use std::time::SystemTime;
+
 // Go: compiler/program.go:1710 ProgramLike
 // PORT: only the methods that `EmitFilesAndReportErrors` and
 // `GetDiagnosticsOfAnyProgram` call. Config, syntactic and program
@@ -67,11 +72,15 @@ impl ProgramLike for CompilerProgram {
 }
 
 // Go: execute/tsc/emit.go:20 GetTraceWithWriterFromSys
-// PORT: the testing hook is dropped (see compile.rs).
 pub fn get_trace_with_writer_from_sys(
     w: Writer,
     locale: Locale,
+    testing: Option<Rc<dyn CommandLineTesting>>,
 ) -> Rc<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)> {
+    // PORT: testing
+    if let Some(testing) = testing {
+        return testing.get_trace(w, locale);
+    }
     Rc::new(
         move |msg: &'static ts_diagnostics::Message, args: Vec<String>| {
             write_str(&w, &format!("{}\n", message_localize(msg, &locale, &args)));
@@ -81,9 +90,9 @@ pub fn get_trace_with_writer_from_sys(
 
 // Go: execute/tsc/emit.go:30 EmitInput
 // PORT: `Program` is the installed program (see the module comment).
-// `Testing` and `TestingMTimesCache` are dropped: they are nil outside Go
-// tests. `Tracing` is the process session (`crate::tracing::get`). Go
-// `Config` is optional here: without
+// `Testing` and `TestingMTimesCache` are `None` outside Go tests; the cache
+// is the build host `m_times`. `Tracing` is the process session
+// (`crate::tracing::get`). Go `Config` is optional here: without
 // it, the program options are used, which are the config options with the
 // command line applied.
 pub struct EmitInput<'a> {
@@ -95,6 +104,9 @@ pub struct EmitInput<'a> {
     pub writer: Writer,
     pub write_file: Option<WriteFile>,
     pub compile_times: Rc<RefCell<CompileTimes>>,
+    // PORT: testing
+    pub testing: Option<Rc<dyn CommandLineTesting>>,
+    pub testing_m_times_cache: Option<&'a RefCell<FxHashMap<Path, Option<SystemTime>>>>,
 }
 
 impl EmitInput<'_> {
@@ -133,9 +145,7 @@ pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, O
         // `read_mem_stats`.
         let mem_stats = read_mem_stats();
         let program_statistics = statistics_from_program(&result.times.borrow(), &mem_stats);
-        let mut text = String::new();
-        program_statistics.report(&mut text);
-        write_str(&input.writer, &text);
+        program_statistics.report_to(&input.writer, input.testing.clone());
         statistics = Some(program_statistics);
     }
 
@@ -208,6 +218,10 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
         result.times.borrow_mut().emit_time = emit_start.elapsed();
     }
     all_diagnostics.extend(emit_result.diagnostics.iter().cloned());
+    // PORT: testing
+    if let Some(testing) = &input.testing {
+        testing.on_emitted_files(&emit_result, input.testing_m_times_cache);
+    }
 
     let all_diagnostics = sort_and_deduplicate_diagnostics(all_diagnostics);
     for diagnostic in &all_diagnostics {
@@ -226,6 +240,11 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
 // Go: execute/tsc/emit.go:136 listFiles
 // PORT: Go `fmt.Fprintln(w, "TSFILE: ", x)` puts a space between operands.
 fn list_files(input: &EmitInput, emit_result: &EmitResult) {
+    // PORT: testing. Go `defer input.Testing.OnListFilesEnd(input.Writer)`
+    // is at the end (this function has no early return).
+    if let Some(testing) = &input.testing {
+        testing.on_list_files_start(&input.writer);
+    }
     let options = options();
     if options.list_emitted_files.is_true() {
         for file in &emit_result.emitted_files {
@@ -249,5 +268,9 @@ fn list_files(input: &EmitInput, emit_result: &EmitResult) {
         for file in source_files() {
             write_str(&input.writer, &format!("{}\n", source_file_file_name(file)));
         }
+    }
+    // PORT: testing
+    if let Some(testing) = &input.testing {
+        testing.on_list_files_end(&input.writer);
     }
 }

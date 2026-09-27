@@ -54,7 +54,22 @@ pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: b
     };
 
     if testing {
-        incremental_program.testing_data = Some(RefCell::new(TestingData::default()));
+        // PORT: testing. Go keeps pointers to the new snapshot's and the old
+        // program's `semanticDiagnosticsPerFile` (see `TestingData`).
+        let old_semantic_diagnostics_ids = match old_program {
+            Some(old_program) => old_program
+                .snapshot
+                .borrow()
+                .semantic_diagnostics_per_file
+                .iter()
+                .map(|(path, diagnostics)| (path.clone(), diagnostics.id))
+                .collect(),
+            None => FxHashMap::default(),
+        };
+        incremental_program.testing_data = Some(RefCell::new(TestingData {
+            old_semantic_diagnostics_ids,
+            ..TestingData::default()
+        }));
     }
     incremental_program
 }
@@ -86,12 +101,22 @@ pub fn read_build_info_program(
 }
 
 // Go: incremental/program.go:58 TestingData
-// PORT: Go also keeps pointers to the new and old semantic diagnostics
-// maps. The Go test harness reads them; nothing in the port does, so only
-// the signature kinds are kept.
+// PORT: testing. Go keeps pointers to the new snapshot's and the old
+// program's `semanticDiagnosticsPerFile`, and the Go test harness compares
+// the entry pointers. The entry identity is its `id` (see
+// `DiagnosticsOrBuildInfoDiagnosticsWithFileName`). Go
+// `SemanticDiagnosticsPerFile` is `Program::semantic_diagnostics_id`,
+// which reads the current snapshot as the Go pointer does. Go
+// `OldProgramSemanticDiagnosticsPerFile` is `old_semantic_diagnostics_ids`,
+// the old map's ids when `new_program` ran (empty without an old program).
+// Nothing changes the old map after that, except when Go
+// `programToSnapshot` reuses the old snapshot (same program). Then Go
+// compares one map with itself; only watch mode (not on this branch) makes
+// that case, and it must read the ids live.
 #[derive(Clone, Debug, Default)]
 pub struct TestingData {
     pub updated_signature_kinds: FxHashMap<Path, SignatureUpdateKind>,
+    pub old_semantic_diagnostics_ids: FxHashMap<Path, u64>,
 }
 
 impl Program {
@@ -99,6 +124,17 @@ impl Program {
     #[must_use]
     pub fn get_testing_data(&self) -> Option<std::cell::Ref<'_, TestingData>> {
         self.testing_data.as_ref().map(RefCell::borrow)
+    }
+
+    // PORT: testing. Go `testingData.SemanticDiagnosticsPerFile.Load(path)`,
+    // as the entry identity (see `TestingData`).
+    #[must_use]
+    pub fn semantic_diagnostics_id(&self, path: &Path) -> Option<u64> {
+        self.snapshot
+            .borrow()
+            .semantic_diagnostics_per_file
+            .get(path)
+            .map(|diagnostics| diagnostics.id)
     }
 
     // Go: incremental/program.go:68 panicIfNoProgram

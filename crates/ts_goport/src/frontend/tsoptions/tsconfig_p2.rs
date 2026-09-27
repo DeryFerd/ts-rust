@@ -892,7 +892,8 @@ pub fn parse_json_config_file_content_worker(
     };
 
     // Go: getProjectReferences(basePathForFileNames)
-    let mut project_references: Vec<ProjectReference> = Vec::new();
+    // PORT: Go nil is `None`. A `references` list, even `[]`, is `Some`.
+    let mut project_references: Option<Vec<ProjectReference>> = None;
     let new_references_of_raw = get_prop_from_raw(
         &raw_config,
         is_json,
@@ -902,6 +903,7 @@ pub fn parse_json_config_file_content_worker(
         "object",
     );
     if let Some(references) = &new_references_of_raw.slice_value {
+        let project_references = project_references.insert(Vec::new());
         for reference in references {
             for r in parse_project_reference(reference) {
                 if r.path.is_empty() {

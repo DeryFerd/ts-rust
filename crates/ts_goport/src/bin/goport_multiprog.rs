@@ -263,6 +263,8 @@ fn report(p: &'static GoProgram) -> (Vec<u8>, i32) {
         writer,
         write_file: None,
         compile_times: Rc::new(RefCell::new(CompileTimes::default())),
+        testing: None,
+        testing_m_times_cache: None,
     });
     let hits = unported_report();
     assert!(

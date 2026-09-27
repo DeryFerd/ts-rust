@@ -152,6 +152,8 @@ impl ToSnapshot<'_> {
             diagnostics: None,
             build_info_diagnostics: self
                 .to_build_info_diagnostics_with_file_name(Some(&dig.diagnostics)),
+            // PORT: testing (see `DiagnosticsOrBuildInfoDiagnosticsWithFileName`)
+            id: new_diagnostics_id(),
         }
     }
 
