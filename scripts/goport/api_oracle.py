@@ -1274,6 +1274,8 @@ def classify(g, r, flaky_ev):
     if gs == "error":
         if rs == "error" and canon(g_resp) == canon(r_resp):
             return "oracle_error_same", None, None
+        if rs == "error" and flaky_ev and flaky_ev.get("unstable") == "error":
+            return "flaky_oracle", "error", None
         sub = (r_resp.get("error") or {}).get("message") if rs == "error" else None
         return "oracle_error_diff", sub, None
     if rs == "error":
@@ -1620,7 +1622,13 @@ def build_summary(out_root, label, baseline):
     skipped = 0
     for (battery, trace), r in res.items():
         seen_id_only = False
+        # Symbols are named over the whole session, so a later goport error (a symbol never
+        # answered in full) can also change earlier answers. Such id_only is not a root.
+        other = any(e["class"] not in ("same", "skipped", "fs", "oracle_error_same", "id_only", "flaky_oracle")
+                    for e in r["events"])
         for e in r["events"]:
+            if e["class"] == "id_only" and not e.get("sub") and other:
+                e = dict(e, sub="trace has another difference")
             cls = e["class"]
             if cls in ("skipped", "fs"):
                 skipped += cls == "skipped"
@@ -1638,7 +1646,7 @@ def build_summary(out_root, label, baseline):
                       (f" @ {e['pointer']}" if e.get("pointer") is not None and cls != "id_only" else "")
                 subs[key] += 1
                 examples.setdefault(key, f"{battery}/{trace}#{e['event']}")
-            if cls == "id_only" and not seen_id_only:
+            if cls == "id_only" and not seen_id_only and not e.get("sub"):
                 seen_id_only = True
                 first_id_only[e["method"]] += 1
     s = {"format": SUMMARY_FORMAT, "label": label, "traces": len(res), "total": dict(total), "skipped": skipped,
@@ -1690,7 +1698,7 @@ def summary_markdown(s):
             key = key[:157] + "..."
         lines.append(f"| {g['count']} | {key} | {g['example']} |")
     if s.get("firstIdOnlyMethod"):
-        lines += ["", "First id_only request per trace, by method: " +
+        lines += ["", "First root id_only request (no other difference in the trace), by method: " +
                   ", ".join(f"{m} {n}" for m, n in sorted(s["firstIdOnlyMethod"].items(), key=lambda x: -x[1]))]
     slow = [(m, v) for m, v in (s.get("ms") or {}).items() if v["goport"] >= 200 and v["goport"] > 2 * max(1, v["oracle"])]
     if slow:
