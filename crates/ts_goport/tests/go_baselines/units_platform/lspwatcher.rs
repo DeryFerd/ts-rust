@@ -11,9 +11,9 @@
 //! the log.
 //!
 //! The two tests on the real backend (`New`) run in a child process of
-//! this test binary: the Rust `DefaultWatcherBackend` delivery is
-//! `unported!` (bug S2-001), and a panic there would stop the shared fswatch
-//! debounce thread that the fswatch tests of this process use.
+//! this test binary, so that a fault in the `DefaultWatcherBackend`
+//! delivery (bug S2-001, fixed) cannot stop the shared fswatch debounce
+//! thread that the fswatch tests of this process use.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -276,7 +276,6 @@ fn create_change_delete_body() {
 
 // Go: lspwatcher_test.go:33 TestWatcher_CreateChangeDelete
 #[test]
-#[ignore = "bug: S2-001 lspwatcher DefaultWatcherBackend event delivery is unported!"]
 fn test_watcher_create_change_delete() {
     run_child("CreateChangeDelete");
 }
@@ -421,7 +420,6 @@ fn missing_then_create_body() {
 
 // Go: lspwatcher_test.go:336 TestWatcher_RealBackend_MissingThenCreate
 #[test]
-#[ignore = "bug: S2-001 lspwatcher DefaultWatcherBackend event delivery is unported!"]
 fn test_watcher_real_backend_missing_then_create() {
     run_child("MissingThenCreate");
 }

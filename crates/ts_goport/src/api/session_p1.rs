@@ -21,6 +21,13 @@ use crate::api::prelude::*;
 //   case calls `unported!`.
 // - Go `defer setup.done()`: `CheckerSetup::done` is a `Release` guard. It
 //   releases the checker when `setup` drops at the end of the handler.
+// - Current program: node handles (`node_handle_from`, `resolve_node_handle`)
+//   and the source file encoder read lazy JSDoc through `prog()`. So every
+//   handler that reads a program keeps it current for its whole body.
+//   `setup_checker` does it through `done`. The handlers with no checker
+//   call `ls_program::enter` after `get_program`. The `resolve*PropertyOf*`
+//   helpers have no project, so they enter the program of the checker that
+//   owns the handle.
 // - Go mutexes (`snapshotsMu`, the registry mutexes) are dropped: the
 //   session runs on the dispatch thread (PORTING "Threads").
 // - The profile handlers run `crate::pprof`, which writes profiles with no
@@ -1203,6 +1210,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // The encoder reads lazy JSDoc (file header, "Current program").
+        let _program = ls_program::enter(program);
 
         let source_file = program
             .get_source_file(&params.file.to_file_name())

@@ -33,6 +33,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let result = getter(&checker.borrow(), t);
         if result.is_nil() {
@@ -52,6 +54,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let types = getter(&checker.borrow(), t);
         if types.is_empty() {
@@ -75,6 +79,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let result = getter(&checker.borrow(), t);
         if result.is_nil() {
@@ -93,6 +99,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, symbol) = sd.resolve_symbol_handle(params.symbol)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let result = getter(&checker.borrow(), symbol);
         if result.is_nil() {
@@ -111,6 +119,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, symbol) = sd.resolve_symbol_handle(params.symbol)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let symbol_table = getter(&checker.borrow(), symbol);
         let table_len = checker.borrow().symbols.len(symbol_table);
@@ -137,6 +147,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let symbols = getter(&checker.borrow(), sig);
         if symbols.is_empty() {
@@ -160,6 +172,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let result = getter(&checker.borrow(), sig);
         if result.is_nil() {
@@ -177,6 +191,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let types = getter(&checker.borrow(), sig);
         if types.is_empty() {
@@ -199,6 +215,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
+        let _program = ls_program::enter_version(checker.borrow().program);
 
         let result = getter(&checker.borrow(), sig);
         if result.is_nil() {
@@ -1158,6 +1176,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
 
@@ -1176,6 +1196,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
 
@@ -1194,6 +1216,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
 
@@ -1212,6 +1236,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
 
@@ -1229,6 +1255,8 @@ impl Session {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let diags = program.get_config_file_parsing_diagnostics();
         Ok(new_diagnostic_responses(&diags))
@@ -1310,6 +1338,8 @@ impl Session {
     ) -> Result<Vec<SignatureUsageResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let signature_decl = sd.resolve_node_handle(program, &params.signature_decl)?;
         if signature_decl.is_nil() {
@@ -1348,6 +1378,8 @@ impl Session {
     ) -> Result<Option<CompletionInfoResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
         let source_file = program
             .get_source_file(&params.file.to_file_name())
             .map_or(Node::NIL, |f| f.root);
@@ -1416,6 +1448,8 @@ impl Session {
     ) -> Result<Vec<ReferencedSymbolEntry>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
 
         let node = sd.resolve_node_handle(program, &params.node)?;
         if node.is_nil() {
