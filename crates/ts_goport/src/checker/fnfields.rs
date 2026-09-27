@@ -15,6 +15,8 @@ impl Checker {
         f(self, a, b)
     }
 
+    // PORT: takes the plain Go message. A caller that defers the "cannot
+    // find name" message calls the `resolve_name` field with a `NameNotFound`.
     pub fn resolve_name(
         &mut self,
         location: Node,
@@ -30,7 +32,7 @@ impl Checker {
             location,
             name,
             meaning,
-            name_not_found_message,
+            name_not_found_message.map(NameNotFound::Message),
             is_use,
             exclude_globals,
         )
@@ -51,7 +53,7 @@ impl Checker {
             location,
             name,
             meaning,
-            name_not_found_message,
+            name_not_found_message.map(NameNotFound::Message),
             is_use,
             exclude_globals,
         )

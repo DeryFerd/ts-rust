@@ -304,10 +304,12 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   fewer parse or bind threads). Then retest query RSS with `narenas:4`.
 - PGO: `scripts/build-pgo.sh [out-dir]` does an instrumented build
   (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
-  about 200 corpus cases (plus `goport_emit` on query and hono), merges with
-  `llvm-profdata` and builds with `-Cprofile-use`. Output must stay
-  byte-identical to the plain `goport` build; verify the PGO binary like
-  any other. The binaries land in `<out-dir>/target-use/goport/`.
+  about 200 corpus cases (plus `tsgo --noEmit` on the five projects and
+  `goport_emit` on query and hono), merges with `llvm-profdata` and builds
+  with `-Cprofile-use`. Output must stay byte-identical to the plain
+  `goport` build; verify the PGO binary like any other. The gate does not
+  run `tsgo`, so check it separately. The binaries (with `tsgo`) land in
+  `<out-dir>/target-use/goport/`.
   Round 5 (1.95): 9% faster on query and 12 to 15% on hono, zod, effect and
   elysia, with the same peak RSS.
   Retrain when the allocator or hot code changes.
@@ -450,7 +452,11 @@ because every request runs on the dispatch thread.
 | `slices.SortStableFunc`, `sort.SliceStable` | `v.sort_by(..)` (all stable sorts agree) |
 | `slices.BinarySearchFunc` | `gostd::slices::binary_search_func(&v, target, cmp) -> (usize, bool)` |
 | `strconv.Quote`, `%q` | `gostd::strconv::quote(s)` |
-| `net/url` (`Parse`, `PathEscape`, `QueryEscape`, `PathUnescape`) | `gostd::url::{parse, path_escape, query_escape, path_unescape}` |
+| `net/url` (`Parse`, `PathEscape`, `QueryEscape`, `PathUnescape`), `net/netip.ParseAddr` | `gostd::url::{parse, path_escape, query_escape, path_unescape}`, `gostd::netip` |
+| `regexp` with `\p{..}` classes, `unicode` range tables | `gostd::regexp`, `gostd::unicode_tables` (go1.26.8, Unicode 15.0.0, generated) |
+| x/text `collate`, `unicode/norm` (organize imports) | `gostd::collate`, `gostd::norm` (tables in `gostd/data/`, generated); `language.Compose`, `Parent`, `TypeForKey`, compact tags in `locale.rs` |
+| `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)` | `cmd::tsgo::main::notify_context` (`signal-hook`) |
+| `panic(x)` that the pinned Go reaches on the same input and nothing recovers | `core::go_panic(text)`: the bins print `panic: <text>` and exit 2 |
 | `%v`, `%+v`, `%T` in log text | `format!("{:?}", x)` with a PORT note (log text is not compared) |
 | Go map iteration that reaches output | `IndexMap` in insertion order and `// PORT: Go map order is random`; the oracle compares that output without order |
 | `collections.OrderedMap` | `IndexMap` (`Delete` is `shift_remove`) |
@@ -529,9 +535,13 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   with `program::publish_parsed_files` and bind it with
   `program::bind_file_outside_program` (Go `BindSourceFile`).
 - The autoimport `aliasResolver` (a checker over node_modules files that no
-  program holds) is not ported: a checker reads its program state from a
-  program version, which only a `NewProgram` makes. It calls
-  `unported!("NewChecker (aliasResolver)")`.
+  program holds) makes its own program version
+  (`program::new_alias_resolver_program`). Before it makes the checker, it
+  reads every file that a string module name in its files can resolve to
+  (imports, exports, `require`, import types, JSDoc imports, relative names
+  inside `declare module "x" {}`), so the checker arena holds them. It can
+  read more files than Go; it never reads fewer. A file that this walk
+  misses reaches `unported!("aliasResolver.GetSourceFile after NewChecker")`.
 
 ### Scanning
 
@@ -605,16 +615,23 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Not ported (plan level)
 
-- The autoimport `aliasResolver` checker (see "Programs and checkers").
-- fanotify (D-W1): `src/fswatch/unix.rs` keeps Go names. The inotify,
-  pipe, poll, read, write, close, open, getdents and lstat calls go through
-  the safe API of `rustix` (already a dependency) or `std`, so `tsc --watch`
-  and `-b --watch` watch files with the inotify backend. rustix has no
-  `fanotify_init`, `fanotify_mark`, `name_to_handle_at` or usable `statfs`,
-  so those bodies call `unported!("unix.Name")` and fanotify is never
-  available (Go's result when `fanotify_init` fails). No `libc`, no
-  `unsafe`.
-- SIGINT/SIGTERM handling (a `--watch` or `--lsp` process that gets SIGTERM
-  dies with the signal; Go exits 0), pprof, Go runtime metrics and
-  `runtime.GC`, Unicode collation (`collate.New`), and the kqueue, FSEvents
-  and Windows watchers.
+- The kqueue, FSEvents and Windows file watchers. The in-process LSP
+  watcher (`lsp/lspwatcher`) needs one of them, so on Linux it is never
+  made (as in Go) and its callback delivery stays `unported!`. The Linux
+  watchers (fanotify, inotify) are ported in `src/fswatch/unix.rs` with
+  safe crates (`nix::sys::fanotify`, `name-to-handle-at`, `rustix`, `std`;
+  D-W1). No `libc`, no `unsafe`.
+- One dispatch thread (see "Threads"): the server answers requests in
+  arrival order, where Go runs the async part of a request on a goroutine
+  and answers in finish order. Timers and background tasks run at message
+  boundaries. The checker is never canceled, so a canceled diagnostic
+  request answers `-32800` after the full check. The results are Go's; only
+  order and timing differ.
+- Go runtime profiles (pprof) have no samples: the port writes Go's file
+  names, errors and log lines and valid empty profiles. `runtime.GC` is a
+  no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of
+  performance telemetry are 0.
+- API handles across checkers: a type, signature or checker-made symbol of
+  one project sent with another project of the same snapshot stays
+  `unported!` (a Rust id indexes one checker's arena).
+- Windows named pipes (`--api --pipe` on Windows) return an error.

@@ -20,10 +20,9 @@
 //! are merged back when its program is made and when its result arrives
 //! (see shared_fs.rs, which also says what stays timing dependent).
 //!
-//! PORT: a build worker does not send its project statistics back (see
-//! build_task.rs), so the aggregate `--diagnostics` and
-//! `--extendedDiagnostics` statistics cannot add them. `report_task` calls
-//! `unported!` for a task that built a program when they are asked for.
+//! PORT: a build worker sends its project statistics back in its result
+//! (see build_task.rs), and `report_task` adds them to the aggregate
+//! `--diagnostics` and `--extendedDiagnostics` statistics.
 //!
 //! PORT: testing. `opts.testing` is `None` outside tests. A test that runs
 //! the build workers itself (`CommandLineTesting::build_worker_runner`)

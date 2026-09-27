@@ -20,6 +20,7 @@
 
 use crate::execute::tsc::compile::CompileTimes;
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use ts_path::CaseSensitivity;
@@ -172,9 +173,11 @@ pub struct SourceFileInfo {
     pub type_reference_directives: Vec<FileReference>,
     pub lib_reference_directives: Vec<FileReference>,
     pub comment_directives: Vec<CommentDirective>,
-    pub diagnostics: Vec<Diagnostic>,
-    pub js_diagnostics: Vec<Diagnostic>,
-    pub jsdoc_diagnostics: Vec<Diagnostic>,
+    // PERF: the diagnostic lists borrow the leaked parsed file of the Go
+    // frontend instead of copying it. The legacy path leaks its own lists.
+    pub diagnostics: &'static [Diagnostic],
+    pub js_diagnostics: &'static [Diagnostic],
+    pub jsdoc_diagnostics: &'static [Diagnostic],
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
     /// Go `SourceFile.ContainsNonASCII`: the scanner decoded a non-ASCII
@@ -200,15 +203,22 @@ impl Deref for SourceFileInfo {
 pub struct LateSourceFileInfo {
     pub file_index: usize,
     pub external_module_indicator: Node,
-    pub reparsed_clones: Vec<Node>,
+    // PERF: like the diagnostic lists, `reparsed_clones` and `jsdoc_cache`
+    // borrow leaked data. The JSDoc cache has one list per host node, so a
+    // copy costs one allocation per entry.
+    pub reparsed_clones: &'static [Node],
     pub imports: Vec<Node>,
     pub module_augmentations: Vec<Node>,
     pub ambient_module_names: Vec<String>,
     pub uses_uri_style_node_core_modules: Tristate,
     /// Go `SourceFile.jsdocCache`: parsed JSDoc nodes by host node.
-    pub jsdoc_cache: FxHashMap<Node, Vec<Node>>,
+    pub jsdoc_cache: &'static FxHashMap<Node, Vec<Node>>,
     post_bind: OnceLock<PostBindInfo>,
 }
+
+/// The JSDoc cache of a file with no eager entries.
+static EMPTY_JSDOC_CACHE: FxHashMap<Node, Vec<Node>> =
+    FxHashMap::with_hasher(rustc_hash::FxBuildHasher);
 
 /// Go `ast.SourceFile` fields that the binder sets but that live on the
 /// SourceFile in Go.
@@ -1119,11 +1129,11 @@ fn build_early_info(
         type_reference_directives: fields.type_reference_directives,
         lib_reference_directives: fields.lib_reference_directives,
         comment_directives,
-        diagnostics,
+        diagnostics: diagnostics.leak(),
         // PORT: the Rust parser does not report Go `JSDiagnostics` or
         // `JSDocDiagnostics` separately; they stay empty.
-        js_diagnostics: Vec::new(),
-        jsdoc_diagnostics: Vec::new(),
+        js_diagnostics: &[],
+        jsdoc_diagnostics: &[],
         has_lazy_js_doc: script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX,
         // PORT: the legacy parser has no Go scanner flag. A string literal
         // with no escape or newline does not set the Go flag, so this can be
@@ -1172,7 +1182,7 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
     LateSourceFileInfo {
         file_index: index,
         external_module_indicator,
-        reparsed_clones,
+        reparsed_clones: reparsed_clones.leak(),
         imports: refs.imports,
         module_augmentations: refs.module_augmentations,
         ambient_module_names: refs.ambient_module_names,
@@ -1180,9 +1190,9 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
         // PORT: JS files treat a cache miss as an unported lazy parse; TS
         // files get the eager Go entries.
         jsdoc_cache: if info.has_lazy_js_doc {
-            FxHashMap::default()
+            &EMPTY_JSDOC_CACHE
         } else {
-            crate::ast::build_jsdoc_cache(root)
+            &*Box::leak(Box::new(crate::ast::build_jsdoc_cache(root)))
         },
         post_bind: OnceLock::new(),
     }
@@ -2520,17 +2530,25 @@ pub fn single_threaded() -> bool {
 // entry, the other modes are tried, because the Rust loader may key an
 // import by a different mode than the Go mode computation. A miss (Go: a
 // failed resolution) returns None.
+// PERF: the Go frontend path borrows the stored resolution. Only the legacy
+// path, which builds a new one, returns it owned.
 pub fn get_resolved_module(
     file: Node,
     module_reference: &str,
     mode: ResolutionMode,
-) -> Option<ResolvedModule> {
+) -> Option<Cow<'static, ResolvedModule>> {
     // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule (never nil)
     if let Some(resolver) = alias_resolver() {
-        return Some(resolver.resolved_module(file, module_reference, mode));
+        return Some(Cow::Owned(resolver.resolved_module(
+            file,
+            module_reference,
+            mode,
+        )));
     }
     if let Some(go) = &state().go {
-        return go.get_resolved_module(file, module_reference, mode);
+        return go
+            .get_resolved_module(file, module_reference, mode)
+            .map(Cow::Borrowed);
     }
     let program = prog();
     let go_file = crate::ast::go_file(file.file_index());
@@ -2554,7 +2572,10 @@ pub fn get_resolved_module(
                 .expect("legacy program")
                 .resolved_module_file(go_file.legacy_source().id, module_reference, format)
         })?;
-    Some(build_resolved_module(module_reference, &target.file_name))
+    Some(Cow::Owned(build_resolved_module(
+        module_reference,
+        &target.file_name,
+    )))
 }
 
 fn build_resolved_module(module_reference: &str, resolved_file_name: &str) -> ResolvedModule {
@@ -2604,7 +2625,7 @@ pub fn get_resolved_module_from_module_specifier(
         panic!("moduleSpecifier must be a StringLiteralLike");
     }
     let mode = get_mode_for_usage_location(file, module_specifier);
-    get_resolved_module(file, module_specifier.text(), mode)
+    get_resolved_module(file, module_specifier.text(), mode).map(Cow::into_owned)
 }
 
 // Go: compiler/program.go:511 GetResolvedModules
@@ -2647,7 +2668,7 @@ pub fn get_resolved_modules()
                     continue;
                 }
                 if let Some(resolved) = get_resolved_module(file.root, &name, mode) {
-                    in_file.insert((name, mode), resolved);
+                    in_file.insert((name, mode), resolved.into_owned());
                 }
             }
             result.insert(file.info.path.clone(), in_file);
@@ -2665,6 +2686,18 @@ pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
         .unwrap_or_default()
 }
 
+// Borrowed form of `get_source_file_meta_data` for the mode functions
+// below, which run for each import and so do not clone the metadata
+// strings. A path with no file gets the default metadata, as there.
+fn source_file_meta_data_ref(path: &str) -> &'static SourceFileMetaData {
+    static MISSING: std::sync::LazyLock<SourceFileMetaData> =
+        std::sync::LazyLock::new(SourceFileMetaData::default);
+    match file_meta_by_path(path) {
+        Some(meta) => &meta.meta_data,
+        None => &MISSING,
+    }
+}
+
 // Go: compiler/program.go:1523 GetEmitModuleFormatOfFile
 pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     // Go: ls/autoimport/aliasresolver.go:96 GetEmitModuleFormatOfFile
@@ -2672,13 +2705,10 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
         return ModuleKind::ES_NEXT;
     }
     let info = source_file_info(source_file);
-    // Borrow the metadata instead of cloning its strings for each call.
-    let missing = SourceFileMetaData::default();
-    let meta_data = file_meta_by_path(&info.path).map_or(&missing, |meta| &meta.meta_data);
     get_emit_module_format_of_file_worker(
         &info.file_name,
         compiler_options_for_file(source_file),
-        meta_data,
+        source_file_meta_data_ref(&info.path),
     )
 }
 
@@ -2691,7 +2721,7 @@ pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> 
     let info = source_file_info(source_file);
     get_emit_syntax_for_usage_location_worker(
         &info.file_name,
-        &get_source_file_meta_data(&info.path),
+        source_file_meta_data_ref(&info.path),
         location,
         compiler_options_for_file(source_file),
     )
@@ -2707,7 +2737,7 @@ pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
     get_implied_node_format_for_emit_worker(
         &info.file_name,
         compiler_options_for_file(source_file).get_emit_module_kind(),
-        &get_source_file_meta_data(&info.path),
+        source_file_meta_data_ref(&info.path),
     )
 }
 
@@ -2720,7 +2750,7 @@ pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> Resolut
     let info = source_file_info(source_file);
     get_mode_for_usage_location_worker(
         &info.file_name,
-        &get_source_file_meta_data(&info.path),
+        source_file_meta_data_ref(&info.path),
         location,
         compiler_options_for_file(source_file),
     )
@@ -2735,7 +2765,7 @@ pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode
     let info = source_file_info(source_file);
     get_default_resolution_mode_for_file_worker(
         &info.file_name,
-        &get_source_file_meta_data(&info.path),
+        source_file_meta_data_ref(&info.path),
         compiler_options_for_file(source_file),
     )
 }
@@ -3650,7 +3680,7 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
         let mut diags: Vec<Diagnostic> = info
             .diagnostics
             .iter()
-            .chain(&info.js_diagnostics)
+            .chain(info.js_diagnostics)
             .cloned()
             .collect();
         // For JS files that won't be checked by the checker (no checkJs/ts-check), we need

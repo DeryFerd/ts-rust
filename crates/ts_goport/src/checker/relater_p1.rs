@@ -125,10 +125,23 @@ pub type CacheKeyMap<V> =
 pub type CacheKeySet =
     std::collections::HashSet<CacheHashKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
 
+// PORT: perf. `CacheHashKey` is already an xxh3 hash, so `FlatMap` uses its
+// low half as is (the same bits `CacheKeyHasher` uses).
+impl FlatKey for CacheHashKey {
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        self.lo
+    }
+}
+
+/// The map type of `Relation::results`. For an A/B run against hashbrown,
+/// change it to `CacheKeyMap<RelationComparisonResult>`.
+pub type RelationResultsMap = FlatMap<CacheHashKey, RelationComparisonResult>;
+
 // Go: checker/relater.go:99 Relation
 #[derive(Clone, Debug, Default)]
 pub struct Relation {
-    pub results: CacheKeyMap<RelationComparisonResult>,
+    pub results: RelationResultsMap,
 }
 
 impl Relation {
@@ -1698,8 +1711,9 @@ impl Checker {
         false
     }
 
-    // PORT: perf. The recursion id that `invoke_once` keeps for each entry of
-    // the inference stacks. `None` marks an entry that still needs
+    // PORT: perf. The recursion id kept for each entry of the inference
+    // stacks (`invoke_once`) and the relater stacks
+    // (`is_deeply_nested_relater_type`). `None` marks an entry that still needs
     // `has_matching_recursion_identity`: an instantiated mapped type (its
     // mapped target can make types) or an intersection (its parts can be
     // mapped types). For any other type that function is
@@ -1715,22 +1729,24 @@ impl Checker {
         Some(self.get_recursion_identity(t))
     }
 
-    // PORT: perf. `is_deeply_nested_type` for the inference stacks. `ids[i]`
-    // is `stack_recursion_id(stack[i])`. An entry with an id is compared
-    // directly. `probe_id` is `stack_recursion_id(t)` when the caller has it
-    // (`invoke_once` probes with the entry it just pushed), else `None`. A
-    // probe with an id is not an instantiated mapped type or an
-    // intersection, so the Go code would only compute that same id. The
+    // PORT: perf. `is_deeply_nested_type` for stacks that keep recursion
+    // ids (the inference stacks and, through
+    // `is_deeply_nested_relater_type`, the relater stacks). `ids[i]` is
+    // `stack_recursion_id(stack[i])`. An entry with an id is compared
+    // directly. `probe_id` is `stack_recursion_id(t)` when the caller has it,
+    // else `None`. A probe with an id is not an instantiated mapped type or
+    // an intersection, so the Go code would only compute that same id. The
     // other probes and the `None` entries run the Go code, so
     // `get_mapped_target_with_symbol` runs for the same types in Go order.
-    // The relater stacks keep `is_deeply_nested_type`.
+    // `ids` holds `Option<RecursionId>` (relater stacks) or `RecursionKey`
+    // (inference stacks, which convert to the same `Option<RecursionId>`).
     // Go: checker/relater.go:773 isDeeplyNestedType
-    pub fn is_deeply_nested_type_with_ids(
+    pub fn is_deeply_nested_type_with_ids<I: Copy + Into<Option<RecursionId>>>(
         &mut self,
         t: TypeId,
         probe_id: Option<RecursionId>,
         stack: &[TypeId],
-        ids: &[Option<RecursionId>],
+        ids: &[I],
         max_depth: i32,
     ) -> bool {
         debug_assert_eq!(stack.len(), ids.len());
@@ -1766,6 +1782,7 @@ impl Checker {
             let mut count: i32 = 0;
             let mut last_type_id = TypeId(0);
             for (&t, &id) in stack.iter().zip(ids) {
+                let id: Option<RecursionId> = id.into();
                 let matching = match id {
                     Some(id) => id == identity,
                     None => self.has_matching_recursion_identity(t, identity),
@@ -1785,6 +1802,34 @@ impl Checker {
             }
         }
         false
+    }
+
+    // PORT: perf. `is_deeply_nested_type` for the relater stacks. `ids`
+    // holds `stack_recursion_id` for a prefix of `stack`. It is filled up to
+    // the full stack only when the check reaches the scan, and the caller
+    // truncates it when the stack pops. The ids read only type data fixed
+    // at type creation, so a late fill gives the same ids.
+    // Go: checker/relater.go:773 isDeeplyNestedType
+    pub fn is_deeply_nested_relater_type(
+        &mut self,
+        t: TypeId,
+        stack: &[TypeId],
+        ids: &mut Vec<Option<RecursionId>>,
+        max_depth: i32,
+    ) -> bool {
+        if (stack.len() as i32) < max_depth {
+            return false;
+        }
+        debug_assert!(ids.len() <= stack.len());
+        for &s in &stack[ids.len()..] {
+            ids.push(self.stack_recursion_id(s));
+        }
+        // The probe is usually the entry just pushed, whose id is known.
+        let probe_id = match (stack.last(), ids.last()) {
+            (Some(&top), Some(&id)) if top == t => id,
+            _ => self.stack_recursion_id(t),
+        };
+        self.is_deeply_nested_type_with_ids(t, probe_id, stack, ids, max_depth)
     }
 
     // Go: checker/relater.go:807 getMappedTargetWithSymbol

@@ -1171,7 +1171,9 @@ impl Checker {
             let t = self.check_computed_property_name(name);
             return self.get_regular_type_of_literal_type(t);
         }
-        let property_name = get_property_name_for_property_name_node(name);
+        // Borrowed text: get_string_literal_type makes the String key only
+        // when the literal type is new.
+        let property_name = property_name_text(name);
         if property_name != INTERNAL_SYMBOL_NAME_MISSING {
             return self.get_string_literal_type(&property_name);
         }

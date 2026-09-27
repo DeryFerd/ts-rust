@@ -751,6 +751,20 @@ impl crate::printer::EmitResolver for EmitResolver {
                 .borrow_mut()
                 .get(file)
                 .aliases_marked = true;
+            // PERF: hono P7-C2, query Q7-1. The walk acts only on an
+            // ExportAssignment, an ExportSpecifier or a BinaryExpression
+            // that `is_common_js_module_exports` accepts, which needs the
+            // file's `common_js_module_indicator`. In an alias-free store the
+            // walk visits only nodes of this store, and with local parents
+            // the source file that test reads is this file. So when the
+            // store has neither kind and the file has no indicator, the walk
+            // does nothing. Synthetic files have no store facts and walk.
+            if frozen_node_store_facts(file).is_some_and(|facts| {
+                facts.alias_free && facts.parents_local && !facts.has_export_alias_kind
+            }) && source_file_info(file).common_js_module_indicator.is_nil()
+            {
+                return;
+            }
             // TODO: Does this even *have* to be an upfront walk? If it's not possible for a
             // import a = a.b.c statement to chain into exposing a statement in a sibling scope,
             // it could at least be pushed into scope entry -  then it wouldn't need to be recursive.

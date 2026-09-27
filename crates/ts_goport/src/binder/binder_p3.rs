@@ -3,6 +3,7 @@
 //! diagnostics.
 
 use crate::prelude::*;
+use ts_ast::NodeData;
 
 // PORT: Binder storage used by this file. Go stores binder output on the AST
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
@@ -931,12 +932,15 @@ impl Binder {
 
     // Go: binder/binder.go:2463 bindParameterFlow
     pub fn bind_parameter_flow(&mut self, node: Node) {
-        self.bind_modifiers(node.modifiers());
+        // PERF: query Q7-3. The node data is looked up once for the
+        // `_in` field reads. Binding never changes node data.
+        let d = ast_data_of(node);
+        self.bind_modifiers(node.modifiers_in(d));
         self.bind(node.dot_dot_dot_token());
-        self.bind(node.question_token());
+        self.bind(node.question_token_in(d));
         self.bind(node.type_());
-        self.bind_initializer(node.initializer());
-        self.bind(node.name());
+        self.bind_initializer(node.initializer_in(d));
+        self.bind(node.name_in(d));
     }
 
     // Go: binder/binder.go:2474 bindInitializer
@@ -1374,8 +1378,10 @@ impl Binder {
 }
 
 // Go: binder/binder.go:2749 getOptionalSymbolFlagForNode
-pub fn get_optional_symbol_flag_for_node(node: Node) -> SymbolFlags {
-    let postfix_token = node.postfix_token();
+// PERF: query Q7-3. `d` is the data of `node`, which the caller already
+// loaded with `ast_data_of`.
+pub fn get_optional_symbol_flag_for_node(node: Node, d: &'static NodeData) -> SymbolFlags {
+    let postfix_token = node.postfix_token_in(d);
     if postfix_token.is_some() && postfix_token.kind() == SyntaxKind::QuestionToken {
         SymbolFlags::OPTIONAL
     } else {

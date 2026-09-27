@@ -54,26 +54,17 @@ fn req(file: usize, id: ts_ast::NodeId) -> Node {
 
 /// A required list.
 fn list(file: usize, l: &'static ts_ast::NodeList) -> NodeList {
-    NodeList {
-        file: file as u32,
-        list: Some(l),
-    }
+    NodeList::from_ts(file, Some(l))
 }
 
 /// An optional list. `None` is Go `nil`.
 fn opt_list(file: usize, l: &'static Option<ts_ast::NodeList>) -> NodeList {
-    NodeList {
-        file: file as u32,
-        list: l.as_ref(),
-    }
+    NodeList::from_ts(file, l.as_ref())
 }
 
 /// An optional modifier list. `None` is Go `nil`.
 fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
-    ModifierList {
-        file: file as u32,
-        list: m.as_ref(),
-    }
+    ModifierList::from_ts(file, m.as_ref())
 }
 
 /// True when data variant `$v` fits a node of kind `$k`. This mirrors
@@ -243,6 +234,21 @@ macro_rules! kind_lacks_data {
     };
 }
 
+/// The data match of `by_data!`: `$data` is the loaded data of a node of
+/// file `$file_in`. The arms are those of `by_data!`.
+macro_rules! match_data {
+    ($file_in:expr, $data:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let file: usize = $file_in;
+        match $data {
+            $($(NodeData::$v($d) => {
+                let $file = file;
+                $e
+            })+)+
+            _ => $def,
+        }
+    }};
+}
+
 /// Go field read by node data variant. Each arm lists `NodeData` variants,
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
@@ -257,16 +263,176 @@ macro_rules! by_data {
             debug_assert!(!matches!(data(node), $($(NodeData::$v(_))|+)|+));
             $def
         } else {
-            let file = node.file_index();
-            match data(node) {
-                $($(NodeData::$v($d) => {
-                    let $file = file;
-                    $e
-                })+)+
-                _ => $def,
-            }
+            match_data!(node.file_index(), data(node), $def, $([$($v),+] => |$file, $d| $e),+)
         }
     }};
+}
+
+/// Defines one Go field accessor as two `Node` methods from one arm list:
+/// `$name(self)` reads the node like `by_data!`, and `$name_in(self, d)`
+/// reads `d`, the data of the same node, which the caller already loaded
+/// with `ast_data_of`. `$n` names the node in the arms. The arms are those
+/// of `by_data!`.
+///
+/// PERF: query Q7-3. Each `$name` call repeats the `FROZEN` lookup, the
+/// kind-table test and the data load. A caller that reads several fields of
+/// one node (the binder) loads the data once and calls the `_in` methods.
+/// Both methods give the same result.
+macro_rules! data_accessor {
+    (
+        $(#[$attr:meta])*
+        $vis:vis fn $name:ident, $name_in:ident($n:ident) -> $ty:ty {
+            $def:expr,
+            $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?
+        }
+    ) => {
+        $(#[$attr])*
+        #[must_use]
+        $vis fn $name(self) -> $ty {
+            let $n: Node = self;
+            by_data!($n, $def, $([$($v),+] => |$file, $d| $e),+)
+        }
+
+        #[doc = concat!("`Node::", stringify!($name), "` on `d`, the data of this node that the caller already loaded with `ast_data_of` (see `data_accessor!`).")]
+        #[must_use]
+        $vis fn $name_in(self, d: &'static NodeData) -> $ty {
+            let $n: Node = self;
+            debug_assert!(std::ptr::eq(d, data($n)), "data of another node");
+            match_data!($n.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
+        }
+    };
+}
+
+/// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants
+/// that hold a Go `Modifiers()` list. `Node::modifiers` and the U1 (b) store
+/// column (`store_node_modifier_bits`) both take the list from here, so they
+/// agree by construction.
+macro_rules! modifiers_variants {
+    ($mac:ident! { $($args:tt)* }) => {
+        $mac! {
+            $($args)*
+            [
+                ArrowFunction,
+                BinaryExpression,
+                ClassDeclaration,
+                ClassExpression,
+                ClassStaticBlockDeclaration,
+                ConstructorDeclaration,
+                ConstructorTypeNode,
+                EnumDeclaration,
+                EnumMember,
+                ExportAssignment,
+                ExportDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                FunctionTypeNode,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                ImportDeclaration,
+                ImportEqualsDeclaration,
+                IndexSignatureDeclaration,
+                InterfaceDeclaration,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                MissingDeclaration,
+                ModuleDeclaration,
+                NamespaceExportDeclaration,
+                ParameterDeclaration,
+                PropertyAssignment,
+                PropertyDeclaration,
+                PropertySignatureDeclaration,
+                ShorthandPropertyAssignment,
+                TypeAliasDeclaration,
+                TypeParameterDeclaration,
+                VariableStatement
+            ]
+        }
+    };
+}
+
+/// `Node::modifiers` and `Node::modifiers_in` over the `modifiers_variants!`
+/// list.
+macro_rules! modifiers_accessor {
+    ([$($v:ident),+ $(,)?]) => {
+        data_accessor! {
+            pub fn modifiers, modifiers_in(n) -> ModifierList {
+                ModifierList::NIL,
+                [$($v),+] => |f, d| mods(f, &d.modifiers),
+            }
+        }
+    };
+}
+
+/// `store_node_modifier_bits` over the `modifiers_variants!` list.
+macro_rules! store_node_modifier_bits_fn {
+    ([$($v:ident),+ $(,)?]) => {
+        /// U1 (b): `ModifierList::modifier_flags` of the own modifier list of
+        /// `node`, a store node of kind `kind`, as bits: the value
+        /// `Node::modifiers().modifier_flags()` gives for it (store lists hold
+        /// their Go flags). 0 when the node has no list. The kind test comes
+        /// first, so most nodes are not loaded (`FileStore::modifier_bits`).
+        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, node: &ts_ast::Node) -> u32 {
+            let mut has_list = false;
+            $(has_list |= variant_has_kind!($v, kind);)+
+            if !has_list {
+                return 0;
+            }
+            match &node.data {
+                $(NodeData::$v(d) => d.modifiers.as_ref().map_or(0, |m| m.flags.0),)+
+                _ => 0,
+            }
+        }
+    };
+}
+
+modifiers_variants!(store_node_modifier_bits_fn! {});
+
+/// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants of
+/// the Go node types that embed `LocalsContainerBase`. `is_locals_container`
+/// and the U1 (d) kind test of `Node::locals` both take the list from here,
+/// so they agree by construction.
+macro_rules! locals_container_variants {
+    ($mac:ident! { $($args:tt)* }) => {
+        $mac! {
+            $($args)*
+            [
+                ArrowFunction,
+                Block,
+                CallSignatureDeclaration,
+                CaseBlock,
+                CatchClause,
+                ClassDeclaration,
+                ClassExpression,
+                ClassStaticBlockDeclaration,
+                ConditionalTypeNode,
+                ConstructSignatureDeclaration,
+                ConstructorDeclaration,
+                ConstructorTypeNode,
+                ForInOrOfStatement,
+                ForStatement,
+                FunctionDeclaration,
+                FunctionExpression,
+                FunctionTypeNode,
+                GetAccessorDeclaration,
+                IndexSignatureDeclaration,
+                JsDocSignature,
+                MappedTypeNode,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                ModuleDeclaration,
+                SetAccessorDeclaration,
+                SourceFile,
+                TypeAliasDeclaration
+            ]
+        }
+    };
+}
+
+/// True when `$d` (a `&NodeData`) is one of the listed variants.
+macro_rules! data_is_variant {
+    ($d:expr, [$($v:ident),+ $(,)?]) => {
+        matches!($d, $(NodeData::$v(_))|+)
+    };
 }
 
 /// Binder data for nodes of a file that is not bound yet.
@@ -396,6 +562,28 @@ pub fn compare_text_ranges(r1: TextRange, r2: TextRange) -> i32 {
 /// A ts_ast range as a Go `core.TextRange`.
 fn text_range_of(r: &ts_core::TextRange) -> TextRange {
     TextRange::new(r.start.get() as i32, r.end.get() as i32)
+}
+
+/// Go `node.Text()` of Identifier or PrivateIdentifier `n`, whose data text
+/// is `text`.
+// PERF: U1 (d). A store node made by `alloc_store_name_node` has an empty
+// data text; its text is the name of its slot (`store_identifier_name`). A
+// data text that is not empty is the text: synthetic, cloned and legacy
+// nodes keep it, and a store slot whose data has one has that name.
+#[inline]
+fn name_node_text(n: Node, text: &'static str) -> &'static str {
+    if !text.is_empty() {
+        return text;
+    }
+    store_identifier_name(n).map_or("", |name| name.as_str())
+}
+
+/// The last step of Go `QuestionToken`: the postfix token when it is `?`.
+fn question_of_postfix(postfix: Node) -> Node {
+    if postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken {
+        return postfix;
+    }
+    Node::NIL
 }
 
 /// Go `MappedTypeNode.Members`.
@@ -531,6 +719,7 @@ impl NodeSlice {
     }
 
     /// Go `nodes[i]`. Panics when `i` is out of range, like Go.
+    #[inline]
     #[must_use]
     pub fn get(self, i: usize) -> Node {
         if self.ids.is_empty() {
@@ -560,13 +749,17 @@ impl NodeSlice {
 
     #[must_use]
     pub fn iter(self) -> NodeSliceIter {
+        let ids = if self.ids.is_empty() {
+            SliceIds::Nodes
+        } else {
+            match frozen_store_ids(self.file as usize) {
+                Some(ids) => SliceIds::Frozen(ids),
+                None => SliceIds::Slow,
+            }
+        };
         NodeSliceIter {
             slice: self,
-            resolved: if self.ids.is_empty() {
-                None
-            } else {
-                frozen_resolved(self.file as usize)
-            },
+            ids,
             front: 0,
             back: self.len(),
         }
@@ -578,23 +771,43 @@ impl NodeSlice {
     }
 }
 
+/// How a `NodeSliceIter` turns position `i` into a node, read once for the
+/// whole loop.
+#[derive(Clone, Copy, Debug)]
+enum SliceIds {
+    /// The slice holds nodes (`NodeSlice::from_nodes`), not ids.
+    Nodes,
+    /// Ids of a frozen store (`frozen_store_ids`).
+    Frozen(FrozenIds),
+    /// `Node::new` per id: before freeze, and for synthetic and legacy files.
+    Slow,
+}
+
 /// Iterator over a `NodeSlice`. Yields `Node` by value.
 #[derive(Clone, Debug)]
 pub struct NodeSliceIter {
     slice: NodeSlice,
-    /// `frozen_resolved(slice.file)`, read once for the whole loop.
-    resolved: Option<&'static [Node]>,
+    ids: SliceIds,
     front: usize,
     back: usize,
 }
 
 impl NodeSliceIter {
     /// `self.slice.get(i)`, without the per-node store lookup in tier 0.
+    // PERF: U1 (c). The store facts are read once in `NodeSlice::iter`. For
+    // an alias-free store (most stores) each id then becomes its handle with
+    // no table load (`FrozenIds::Direct`).
     #[inline]
     fn at(&self, i: usize) -> Node {
-        match self.resolved {
-            Some(resolved) => resolved[self.slice.ids[i].index()],
-            None => self.slice.get(i),
+        match self.ids {
+            SliceIds::Nodes => self.slice.nodes[i],
+            SliceIds::Frozen(ids) => {
+                let id = self.slice.ids[i];
+                let n = ids.node(id);
+                debug_assert_eq!(n, Node::new(self.slice.file as usize, id));
+                n
+            }
+            SliceIds::Slow => self.slice.get(i),
         }
     }
 }
@@ -651,19 +864,50 @@ impl IntoIterator for &NodeSlice {
 // NodeList
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `*ast.NodeList`. `list == None` is Go `nil`. Equality is pointer
+/// Go `*ast.NodeList`. `NodeList::NIL` is Go `nil`. Equality is pointer
 /// equality, like Go.
+// PERF: U1 (e). A list that the parser made in a store and that no node
+// data holds yet is a pending handle (`PendingList`): its ids live in the
+// AST bump arena, and `store_list_value` builds the ts_ast list once, in the
+// node data. The handle stays 16 bytes (tag, file, pointer). The checker
+// reads `Ts` handles only; the `Pending` arms are for the parse.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NodeList {
-    pub file: u32,
-    pub list: Option<&'static ts_ast::NodeList>,
+pub struct NodeList(ListRef);
+
+/// The list that a `NodeList` names.
+#[derive(Clone, Copy, Debug, Default)]
+enum ListRef {
+    /// Go `nil`.
+    #[default]
+    Nil,
+    /// A ts_ast list of file `file`: a list field of node data, or a leaked
+    /// list (synthetic lists, lists of the legacy frontend).
+    Ts {
+        file: u32,
+        list: &'static ts_ast::NodeList,
+    },
+    /// A store list of store `file` that no node data holds yet.
+    Pending {
+        file: u32,
+        list: &'static PendingList,
+    },
 }
+
+const _: () = assert!(std::mem::size_of::<NodeList>() == 16);
 
 impl PartialEq for NodeList {
     fn eq(&self, other: &Self) -> bool {
-        match (self.is_nil(), other.is_nil(), self.list, other.list) {
-            (true, true, _, _) => true,
-            (false, false, Some(a), Some(b)) => std::ptr::eq(a, b),
+        match (self.is_nil(), other.is_nil()) {
+            (true, true) => true,
+            (false, false) => match (self.0, other.0) {
+                (ListRef::Ts { list: a, .. }, ListRef::Ts { list: b, .. }) => std::ptr::eq(a, b),
+                // A pending handle equals only itself (the ts_ast copies in
+                // node data are other lists, plan risk 2).
+                (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
+                    std::ptr::eq(a, b)
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -673,18 +917,124 @@ impl Eq for NodeList {}
 
 impl NodeList {
     /// Go `nil`.
-    pub const NIL: Self = Self {
-        file: 0,
-        list: None,
-    };
+    pub const NIL: Self = Self(ListRef::Nil);
+
+    /// The handle of ts_ast list `list` of file `file`: a list field of node
+    /// data, or a leaked list. `None` is Go `nil`.
+    #[inline]
+    #[must_use]
+    pub fn from_ts(file: usize, list: Option<&'static ts_ast::NodeList>) -> Self {
+        match list {
+            Some(list) => Self(ListRef::Ts {
+                file: file as u32,
+                list,
+            }),
+            None => Self::NIL,
+        }
+    }
+
+    /// The handle of pending list `list` of store `file` (U1 (e)).
+    #[inline]
+    #[must_use]
+    pub(crate) fn pending(file: usize, list: &'static PendingList) -> Self {
+        Self(ListRef::Pending {
+            file: file as u32,
+            list,
+        })
+    }
+
+    /// The file of the list: a store id, a legacy file index or
+    /// `SYNTHETIC_NODE_FILE`. 0 for `NodeList::NIL`.
+    #[inline]
+    #[must_use]
+    pub fn file(self) -> usize {
+        match self.0 {
+            ListRef::Nil => 0,
+            ListRef::Ts { file, .. } | ListRef::Pending { file, .. } => file as usize,
+        }
+    }
+
+    /// The ts_ast list of the handle. `None` for `NodeList::NIL` and for a
+    /// pending list.
+    #[inline]
+    #[must_use]
+    pub fn ts_list(self) -> Option<&'static ts_ast::NodeList> {
+        match self.0 {
+            ListRef::Ts { list, .. } => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The pending store list of the handle (U1 (e)), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn pending_list(self) -> Option<&'static PendingList> {
+        match self.0 {
+            ListRef::Pending { list, .. } => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The address of the list, for Go pointer compares. `None` for
+    /// `NodeList::NIL`. A Go `nil` marker list (`store::NIL_LIST_POS`) has an
+    /// address.
+    #[must_use]
+    pub fn list_ptr(self) -> Option<*const ()> {
+        match self.0 {
+            ListRef::Nil => None,
+            ListRef::Ts { list, .. } => Some(std::ptr::from_ref(list).cast()),
+            ListRef::Pending { list, .. } => Some(std::ptr::from_ref(list).cast()),
+        }
+    }
+
+    /// The ts_ast `has_trailing_comma` bit of the list, false for
+    /// `NodeList::NIL`. Go computes `HasTrailingComma` from the list ends
+    /// (`has_trailing_comma`). The parser sets this bit on an empty list as
+    /// the missing-list marker (`with_missing_marker`), and synthetic copies
+    /// keep it.
+    #[must_use]
+    pub fn stored_trailing_comma(self) -> bool {
+        match self.0 {
+            ListRef::Nil => false,
+            ListRef::Ts { list, .. } => list.has_trailing_comma,
+            ListRef::Pending { list, .. } => list.has_trailing_comma,
+        }
+    }
+
+    /// Parser `createMissingList`: a new empty list at the `Loc` of this
+    /// (empty) list, with the ts_ast `has_trailing_comma` bit set, the marker
+    /// that parser.rs `is_missing_node_list` reads. Go `nil` stays nil.
+    #[must_use]
+    pub fn with_missing_marker(self) -> NodeList {
+        match self.0 {
+            ListRef::Nil => self,
+            ListRef::Ts { file, list } => Self(ListRef::Ts {
+                file,
+                list: Box::leak(Box::new(ts_ast::NodeList {
+                    range: list.range,
+                    nodes: Vec::new(),
+                    has_trailing_comma: true,
+                })),
+            }),
+            ListRef::Pending { file, list } => Self(ListRef::Pending {
+                file,
+                list: crate::ast::store::leak_in_ast_arena(PendingList {
+                    range: list.range,
+                    nodes: &[],
+                    has_trailing_comma: true,
+                }),
+            }),
+        }
+    }
 
     /// Go `list == nil`. A required ts_ast list field of a store node holds
     /// Go `nil` as a marker list (`store::NIL_LIST_POS`).
     #[must_use]
     pub fn is_nil(self) -> bool {
-        match self.list {
-            None => true,
-            Some(l) => is_nil_list_marker(l),
+        match self.0 {
+            ListRef::Nil => true,
+            ListRef::Ts { list, .. } => is_nil_list_marker(list),
+            ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
         }
     }
 
@@ -696,9 +1046,10 @@ impl NodeList {
     /// Go `list.Nodes`. Empty when nil.
     #[must_use]
     pub fn nodes(self) -> NodeSlice {
-        match self.list {
-            Some(l) => NodeSlice::from_ids(self.file as usize, &l.nodes),
-            None => NodeSlice::NIL,
+        match self.0 {
+            ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, &list.nodes),
+            ListRef::Nil => NodeSlice::NIL,
+            ListRef::Pending { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
         }
     }
 
@@ -708,13 +1059,21 @@ impl NodeList {
     // first token. Go ranges start after the opener (or at the full start)
     // and end after the last element or its trailing comma.
     pub fn loc(self) -> TextRange {
-        let l = self.list.expect("nil NodeList dereference");
+        let (file, l) = match self.0 {
+            ListRef::Nil => panic!("nil NodeList dereference"),
+            ListRef::Ts { file, list } => (file as usize, list),
+            // A store list: it holds the Go `Loc`.
+            ListRef::Pending { list, .. } => {
+                assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
+                return text_range_of(&list.range);
+            }
+        };
         assert!(!is_nil_list_marker(l), "nil NodeList dereference");
         // Synthetic and store lists hold the Go `Loc`.
-        if self.file as usize == SYNTHETIC_NODE_FILE || has_file_store(self.file as usize) {
+        if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
             return text_range_of(&l.range);
         }
-        let Some(file) = try_go_file(self.file as usize) else {
+        let Some(file) = try_go_file(file) else {
             return text_range_of(&l.range);
         };
         let arena = &file.legacy_source().parse.arena;
@@ -767,18 +1126,42 @@ impl NodeList {
 // ModifierList
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `*ast.ModifierList`. `list == None` is Go `nil`.
+/// Go `*ast.ModifierList`. `ModifierList::NIL` is Go `nil`.
+// PERF: U1 (e). A parser list that no node data holds yet is a pending
+// handle (`PendingModifierList`), as for `NodeList`. 16 bytes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ModifierList {
-    pub file: u32,
-    pub list: Option<&'static ts_ast::ModifierList>,
+pub struct ModifierList(ModifiersRef);
+
+/// The list that a `ModifierList` names.
+#[derive(Clone, Copy, Debug, Default)]
+enum ModifiersRef {
+    /// Go `nil`.
+    #[default]
+    Nil,
+    /// A ts_ast list of file `file` (see `ListRef::Ts`).
+    Ts {
+        file: u32,
+        list: &'static ts_ast::ModifierList,
+    },
+    /// A store list of store `file` that no node data holds yet.
+    Pending {
+        file: u32,
+        list: &'static PendingModifierList,
+    },
 }
+
+const _: () = assert!(std::mem::size_of::<ModifierList>() == 16);
 
 impl PartialEq for ModifierList {
     fn eq(&self, other: &Self) -> bool {
-        match (self.list, other.list) {
-            (None, None) => true,
-            (Some(a), Some(b)) => std::ptr::eq(a, b),
+        match (self.0, other.0) {
+            (ModifiersRef::Nil, ModifiersRef::Nil) => true,
+            (ModifiersRef::Ts { list: a, .. }, ModifiersRef::Ts { list: b, .. }) => {
+                std::ptr::eq(a, b)
+            }
+            (ModifiersRef::Pending { list: a, .. }, ModifiersRef::Pending { list: b, .. }) => {
+                std::ptr::eq(a, b)
+            }
             _ => false,
         }
     }
@@ -788,27 +1171,87 @@ impl Eq for ModifierList {}
 
 impl ModifierList {
     /// Go `nil`.
-    pub const NIL: Self = Self {
-        file: 0,
-        list: None,
-    };
+    pub const NIL: Self = Self(ModifiersRef::Nil);
+
+    /// The handle of ts_ast list `list` of file `file` (see
+    /// `NodeList::from_ts`). `None` is Go `nil`.
+    #[inline]
+    #[must_use]
+    pub fn from_ts(file: usize, list: Option<&'static ts_ast::ModifierList>) -> Self {
+        match list {
+            Some(list) => Self(ModifiersRef::Ts {
+                file: file as u32,
+                list,
+            }),
+            None => Self::NIL,
+        }
+    }
+
+    /// The handle of pending list `list` of store `file` (U1 (e)).
+    #[inline]
+    #[must_use]
+    pub(crate) fn pending(file: usize, list: &'static PendingModifierList) -> Self {
+        Self(ModifiersRef::Pending {
+            file: file as u32,
+            list,
+        })
+    }
+
+    /// The file of the list (see `NodeList::file`). 0 for
+    /// `ModifierList::NIL`.
+    #[inline]
+    #[must_use]
+    pub fn file(self) -> usize {
+        match self.0 {
+            ModifiersRef::Nil => 0,
+            ModifiersRef::Ts { file, .. } | ModifiersRef::Pending { file, .. } => file as usize,
+        }
+    }
+
+    /// The ts_ast list of the handle. `None` for `ModifierList::NIL` and for
+    /// a pending list.
+    #[inline]
+    #[must_use]
+    pub fn ts_list(self) -> Option<&'static ts_ast::ModifierList> {
+        match self.0 {
+            ModifiersRef::Ts { list, .. } => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The pending store list of the handle (U1 (e)), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn pending_list(self) -> Option<&'static PendingModifierList> {
+        match self.0 {
+            ModifiersRef::Pending { list, .. } => Some(list),
+            _ => None,
+        }
+    }
 
     #[must_use]
     pub const fn is_nil(self) -> bool {
-        self.list.is_none()
+        matches!(self.0, ModifiersRef::Nil)
     }
 
     #[must_use]
     pub const fn is_some(self) -> bool {
-        self.list.is_some()
+        !self.is_nil()
     }
 
     /// Go `modifiers.NodeList`.
     #[must_use]
     pub fn node_list(self) -> NodeList {
-        NodeList {
-            file: self.file,
-            list: self.list.map(|m| &m.list),
+        match self.0 {
+            ModifiersRef::Nil => NodeList::NIL,
+            ModifiersRef::Ts { file, list } => NodeList(ListRef::Ts {
+                file,
+                list: &list.list,
+            }),
+            ModifiersRef::Pending { file, list } => NodeList(ListRef::Pending {
+                file,
+                list: &list.list,
+            }),
         }
     }
 
@@ -841,14 +1284,18 @@ impl ModifierList {
     // they read it like Go does instead of walking the modifier nodes.
     #[must_use]
     pub fn modifier_flags(self) -> ModifierFlags {
-        let Some(list) = self.list else {
-            return ModifierFlags::NONE;
-        };
-        let file = self.file as usize;
-        if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
-            return ModifierFlags(list.flags.0);
+        match self.0 {
+            ModifiersRef::Nil => ModifierFlags::NONE,
+            ModifiersRef::Ts { file, list } => {
+                let file = file as usize;
+                if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
+                    return ModifierFlags(list.flags.0);
+                }
+                self.legacy_modifier_flags()
+            }
+            // A store list.
+            ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
         }
-        self.legacy_modifier_flags()
     }
 
     // PORT: lists of the legacy frontend (ts_parser) store ts_parser flag
@@ -1073,13 +1520,11 @@ impl Node {
     }
 
     // Go: ast.go:198 Name
-    #[must_use]
-    pub fn name(self) -> Node {
-        by_data!(
-            self,
+    data_accessor! {
+        pub fn name, name_in(n) -> Node {
             Node::NIL,
             // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-            [QualifiedName] => |f, d| if self.kind() == SyntaxKind::PropertyAccessExpression {
+            [QualifiedName] => |f, d| if n.kind() == SyntaxKind::PropertyAccessExpression {
                 req(f, d.right)
             } else {
                 Node::NIL
@@ -1129,52 +1574,11 @@ impl Node {
                 TypeParameterDeclaration,
                 VariableDeclaration,
             ] => |f, d| req(f, d.name),
-        )
+        }
     }
 
     // Go: ast.go:199 Modifiers
-    #[must_use]
-    pub fn modifiers(self) -> ModifierList {
-        by_data!(
-            self,
-            ModifierList::NIL,
-            [
-                ArrowFunction,
-                BinaryExpression,
-                ClassDeclaration,
-                ClassExpression,
-                ClassStaticBlockDeclaration,
-                ConstructorDeclaration,
-                ConstructorTypeNode,
-                EnumDeclaration,
-                EnumMember,
-                ExportAssignment,
-                ExportDeclaration,
-                FunctionDeclaration,
-                FunctionExpression,
-                FunctionTypeNode,
-                GetAccessorDeclaration,
-                SetAccessorDeclaration,
-                ImportDeclaration,
-                ImportEqualsDeclaration,
-                IndexSignatureDeclaration,
-                InterfaceDeclaration,
-                MethodDeclaration,
-                MethodSignatureDeclaration,
-                MissingDeclaration,
-                ModuleDeclaration,
-                NamespaceExportDeclaration,
-                ParameterDeclaration,
-                PropertyAssignment,
-                PropertyDeclaration,
-                PropertySignatureDeclaration,
-                ShorthandPropertyAssignment,
-                TypeAliasDeclaration,
-                TypeParameterDeclaration,
-                VariableStatement,
-            ] => |f, d| mods(f, &d.modifiers),
-        )
-    }
+    modifiers_variants!(modifiers_accessor! {});
 
     // Go: ast.go:205 ParameterList
     /// Go `FunctionLikeData().Parameters`. Nil for other nodes.
@@ -1257,14 +1661,27 @@ impl Node {
     }
 
     // Go: ast.go:245 Locals
+    // PERF: U1 (d). Go `Locals()` is nil when `LocalsContainerData()` is nil.
+    // A frozen store node whose kind is no locals container gives nil from
+    // the kind table, without the binder data lookup. The binder sets locals
+    // only on locals containers (debug_asserts in binder_p1 and binder_p2).
     #[must_use]
     pub fn locals(self) -> SymbolTable {
+        if locals_container_variants!(kind_lacks_data! { self, }) {
+            debug_assert!(self.bind().locals.is_nil());
+            return SymbolTable::NIL;
+        }
         self.bind().locals
     }
 
     /// Go `LocalsContainerData().NextContainer`.
+    // PERF: U1 (d), as `locals`.
     #[must_use]
     pub fn next_container(self) -> Node {
+        if locals_container_variants!(kind_lacks_data! { self, }) {
+            debug_assert!(self.bind().next_container.is_nil());
+            return Node::NIL;
+        }
         self.bind().next_container
     }
 
@@ -1393,8 +1810,8 @@ impl Node {
     #[must_use]
     pub fn text(self) -> &'static str {
         match data(self) {
-            NodeData::Identifier(d) => &d.text,
-            NodeData::PrivateIdentifier(d) => &d.text,
+            NodeData::Identifier(d) => name_node_text(self, &d.text),
+            NodeData::PrivateIdentifier(d) => name_node_text(self, &d.text),
             NodeData::StringLiteral(d) => &d.text,
             NodeData::NumericLiteral(d) => &d.text,
             NodeData::BigIntLiteral(d) => &d.text,
@@ -1421,6 +1838,54 @@ impl Node {
             NodeData::JsxText(d) => &d.text,
             _ => "",
         }
+    }
+
+    /// `Name::from(self.text())`: the interned Go `node.Text()`.
+    // PERF: U1 (a). A frozen Identifier or PrivateIdentifier store node reads
+    // the name interned when its slot was made (`frozen_store_text_name`),
+    // without its node data and without an intern.
+    #[inline]
+    #[must_use]
+    pub fn text_name(self) -> Name {
+        if let Some(name) = frozen_store_text_name(self) {
+            debug_assert_eq!(name, Name::from(self.text()));
+            return name;
+        }
+        Name::from(self.text())
+    }
+
+    /// Go `node.Text() == name`.
+    // PERF: U1 (a). A frozen Identifier or PrivateIdentifier store node
+    // compares name ids (`frozen_store_text_name`). Other nodes compare the
+    // text, so they do not intern it.
+    #[inline]
+    #[must_use]
+    pub fn text_is(self, name: &Name) -> bool {
+        match frozen_store_text_name(self) {
+            Some(own) => {
+                debug_assert_eq!(own == *name, self.text() == name.as_str());
+                own == *name
+            }
+            None => self.text() == name.as_str(),
+        }
+    }
+
+    /// Go `scanner.GetIdentifierToken(node.Text()) != ast.KindIdentifier`:
+    /// the text is a keyword.
+    // PERF: U1 (a). A frozen Identifier or PrivateIdentifier store node reads
+    // a header bit set when its slot was made
+    // (`frozen_store_text_is_keyword`).
+    #[inline]
+    #[must_use]
+    pub fn text_is_keyword(self) -> bool {
+        if let Some(is_keyword) = frozen_store_text_is_keyword(self) {
+            debug_assert_eq!(
+                is_keyword,
+                get_identifier_token(self.text()) != SyntaxKind::Identifier
+            );
+            return is_keyword;
+        }
+        get_identifier_token(self.text()) != SyntaxKind::Identifier
     }
 
     // Go: ast.go:299 Expression
@@ -1628,8 +2093,14 @@ impl Node {
     }
 
     // Go: ast.go:601 ModifierFlags
+    // PERF: U1 (b). A frozen store node reads its flags from the store column
+    // (`frozen_store_modifier_flags`), without its node data and list.
     #[must_use]
     pub fn modifier_flags(self) -> ModifierFlags {
+        if let Some(flags) = frozen_store_modifier_flags(self) {
+            debug_assert_eq!(flags, self.modifiers().modifier_flags());
+            return flags;
+        }
         self.modifiers().modifier_flags()
     }
 
@@ -1695,10 +2166,8 @@ impl Node {
     }
 
     // Go: ast.go:739 Initializer
-    #[must_use]
-    pub fn initializer(self) -> Node {
-        by_data!(
-            self,
+    data_accessor! {
+        pub fn initializer, initializer_in(n) -> Node {
             Node::NIL,
             [
                 VariableDeclaration,
@@ -1714,7 +2183,7 @@ impl Node {
                 PropertyAssignment,
                 ForInOrOfStatement,
             ] => |f, d| req(f, d.initializer),
-        )
+        }
     }
 
     // Go: ast.go:793 TagName
@@ -1953,10 +2422,8 @@ impl Node {
     }
 
     // Go: ast.go:1056 PostfixToken
-    #[must_use]
-    pub fn postfix_token(self) -> Node {
-        by_data!(
-            self,
+    data_accessor! {
+        pub fn postfix_token, postfix_token_in(n) -> Node {
             Node::NIL,
             [
                 MethodDeclaration,
@@ -1969,14 +2436,32 @@ impl Node {
                 GetAccessorDeclaration,
                 SetAccessorDeclaration,
             ] => |f, d| opt(f, d.postfix_token),
-        )
+        }
     }
 
     // Go: ast.go:1080 QuestionToken
     #[must_use]
     pub fn question_token(self) -> Node {
-        let own = by_data!(
-            self,
+        match self.own_question_token() {
+            Some(token) => token,
+            None => question_of_postfix(self.postfix_token()),
+        }
+    }
+
+    /// `Node::question_token` on `d`, the data of this node that the caller
+    /// already loaded with `ast_data_of` (see `data_accessor!`).
+    #[must_use]
+    pub fn question_token_in(self, d: &'static NodeData) -> Node {
+        match self.own_question_token_in(d) {
+            Some(token) => token,
+            None => question_of_postfix(self.postfix_token_in(d)),
+        }
+    }
+
+    data_accessor! {
+        /// The first step of Go `QuestionToken`: `Some` of the node's own
+        /// question token field, `None` for kinds without that field.
+        fn own_question_token, own_question_token_in(n) -> Option<Node> {
             None,
             [
                 ParameterDeclaration,
@@ -1984,15 +2469,7 @@ impl Node {
                 NamedTupleMember,
             ] => |f, d| Some(opt(f, d.question_token)),
             [ConditionalExpression] => |f, d| Some(req(f, d.question_token)),
-        );
-        if let Some(token) = own {
-            return token;
         }
-        let postfix = self.postfix_token();
-        if postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken {
-            return postfix;
-        }
-        Node::NIL
     }
 
     // Go: ast.go:1098 QuestionDotToken
@@ -3635,38 +4112,11 @@ pub fn is_declaration_node(node: Node) -> bool {
 // Go: ast.go:1532 IsLocalsContainer
 /// Go `node.LocalsContainerData() != nil`: the node types that embed
 /// `LocalsContainerBase`.
+// PORT: the variant list is `locals_container_variants!`, shared with the
+// kind test of `Node::locals`.
 #[must_use]
 pub fn is_locals_container(node: Node) -> bool {
-    matches!(
-        data(node),
-        NodeData::ArrowFunction(_)
-            | NodeData::Block(_)
-            | NodeData::CallSignatureDeclaration(_)
-            | NodeData::CaseBlock(_)
-            | NodeData::CatchClause(_)
-            | NodeData::ClassDeclaration(_)
-            | NodeData::ClassExpression(_)
-            | NodeData::ClassStaticBlockDeclaration(_)
-            | NodeData::ConditionalTypeNode(_)
-            | NodeData::ConstructSignatureDeclaration(_)
-            | NodeData::ConstructorDeclaration(_)
-            | NodeData::ConstructorTypeNode(_)
-            | NodeData::ForInOrOfStatement(_)
-            | NodeData::ForStatement(_)
-            | NodeData::FunctionDeclaration(_)
-            | NodeData::FunctionExpression(_)
-            | NodeData::FunctionTypeNode(_)
-            | NodeData::GetAccessorDeclaration(_)
-            | NodeData::IndexSignatureDeclaration(_)
-            | NodeData::JsDocSignature(_)
-            | NodeData::MappedTypeNode(_)
-            | NodeData::MethodDeclaration(_)
-            | NodeData::MethodSignatureDeclaration(_)
-            | NodeData::ModuleDeclaration(_)
-            | NodeData::SetAccessorDeclaration(_)
-            | NodeData::SourceFile(_)
-            | NodeData::TypeAliasDeclaration(_)
-    )
+    locals_container_variants!(data_is_variant! { data(node), })
 }
 
 impl Node {

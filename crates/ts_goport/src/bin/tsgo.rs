@@ -15,10 +15,9 @@
 //! `cmd::tsgo::api::run_api` (Go cmd/tsgo/lsp.go and api.go), the entry
 //! points that `goport --lsp` and `goport --api` run too.
 //!
-//! PORT: Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is not ported. The
-//! process keeps the default signal behavior. The compile gets
-//! `context::background()`, which never ends; only watch and build mode
-//! read it.
+//! Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is
+//! `cmd::tsgo::main::notify_context`. Only watch and build mode read the
+//! context; a plain compile goes on after a signal, as in Go.
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with a 1 GiB
 //! stack, like the other goport bins.
@@ -34,6 +33,7 @@ use std::time::Instant;
 
 use ts_goport::cmd::tsgo::api::run_api;
 use ts_goport::cmd::tsgo::lsp::run_lsp;
+use ts_goport::cmd::tsgo::main::notify_context;
 use ts_goport::execute::build::worker::{
     BUILD_WORKER_FLAG, compile_and_emit_worker, marshal_worker_compile_result,
     marshal_worker_program_fs_cache, read_worker_fs_cache,
@@ -130,16 +130,20 @@ fn run_main(start: Instant) -> i32 {
         }
     }
 
+    // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    let (ctx, stop) = notify_context(&context::background());
+    // PORT: Go `newSystem()` calls `os.Exit` on this error, so `stop` does
+    // not run there either.
     let sys = match new_os_system() {
         Ok(sys) => sys,
         Err(status) => return status.code(),
     };
     let sys: Rc<dyn System> = Rc::new(sys.with_start(start));
     let result = catch_unwind(AssertUnwindSafe(|| {
-        command_line(&context::background(), sys.clone(), &args, &GoTsc)
-            .status
-            .code()
+        command_line(&ctx, sys.clone(), &args, &GoTsc).status.code()
     }));
+    // Go: defer stop()
+    stop();
     // `--showConfig` output has no trailing newline, and
     // `std::process::exit` runs no destructors, so flush here.
     let _ = sys.writer().borrow_mut().flush();

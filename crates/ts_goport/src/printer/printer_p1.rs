@@ -1873,9 +1873,9 @@ impl Printer {
 // PORT: Go compares `*ast.NodeList` pointers. Two handles name the same list
 // when both are nil, or both point at the same list in the same file.
 fn same_node_list(a: NodeList, b: NodeList) -> bool {
-    match (a.list, b.list) {
+    match (a.list_ptr(), b.list_ptr()) {
         (None, None) => true,
-        (Some(x), Some(y)) => a.file == b.file && std::ptr::eq(x, y),
+        (Some(x), Some(y)) => a.file() == b.file() && x == y,
         _ => false,
     }
 }

@@ -1,7 +1,7 @@
 //! The Linux file watcher on the real kernel (Go internal/fswatch
 //! `TestWatchFileCreate` and `TestSubscribeSubfileUpdate`, default backend
-//! only). `fswatch::default()` is inotify here: the rustix shim has no
-//! fanotify, so fanotify is never available.
+//! only). `fswatch::default()` is fanotify when `fanotify_init` succeeds
+//! (Linux 5.13 or later with the needed permission), else inotify, as in Go.
 #![cfg(target_os = "linux")]
 
 use std::fs;
@@ -63,9 +63,16 @@ fn expect_event(rx: &mpsc::Receiver<Vec<Event>>, kind: EventKind, path: &Path) {
     panic!("no {kind:?} event for {want}; saw {seen:?}");
 }
 
+// Go: fanotify_linux.go:180 init and inotify_linux.go:116 init pick the
+// default backend.
 #[test]
-fn default_watcher_is_inotify() {
-    assert_eq!(fswatch::default().name(), "inotify");
+fn default_watcher_is_the_go_choice() {
+    let want = if fswatch::fanotify_linux::fanotify_available() {
+        "fanotify"
+    } else {
+        "inotify"
+    };
+    assert_eq!(fswatch::default().name(), want);
     assert!(fswatch::default().available());
 }
 

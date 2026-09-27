@@ -108,20 +108,33 @@ impl Checker {
             type_arguments.push(self.map_with_combined_mappers(t_mapper, m, tp));
         }
         // PORT: Go `c.instantiateTypeAlias(t.alias, m)` when `alias` is nil.
-        // The instantiated alias is boxed in an `Rc` only on a cache miss,
-        // because a hit never uses it.
-        let instantiated_alias: Option<TypeAlias> = if alias.is_none() {
-            self.ty(t).alias.clone().map(|t_alias| TypeAlias {
-                symbol: t_alias.symbol,
-                type_arguments: self.instantiate_types(&t_alias.type_arguments, m),
+        // PERF: the instantiated alias type arguments go into a stack list,
+        // and the key hashes the alias symbol and that list. The owned `Vec`
+        // and the `Rc<TypeAlias>` are made only on a cache miss, because a
+        // hit never uses them. `instantiate_types_into` makes the same
+        // `instantiate_type` calls in the same order as `instantiate_types`.
+        let mut instantiated_alias_type_arguments: SmallVec<[TypeId; 8]> = SmallVec::new();
+        let instantiated_alias_symbol: Option<SymbolId> = if alias.is_none() {
+            self.ty(t).alias.clone().map(|t_alias| {
+                self.instantiate_types_into(
+                    &t_alias.type_arguments,
+                    m,
+                    &mut instantiated_alias_type_arguments,
+                );
+                t_alias.symbol
             })
         } else {
             None
         };
-        let key = get_type_instantiation_key(
+        let key_alias = match &alias {
+            Some(a) => Some((a.symbol, a.type_arguments.as_slice())),
+            None => instantiated_alias_symbol
+                .map(|symbol| (symbol, instantiated_alias_type_arguments.as_slice())),
+        };
+        let key = type_instantiation_key_parts(
             &self.symbols,
             &type_arguments,
-            alias.as_deref().or(instantiated_alias.as_ref()),
+            key_alias,
             t_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE),
         );
         if self.ty(target).as_object_type().instantiations.is_none() {
@@ -146,7 +159,14 @@ impl Checker {
             .and_then(|instantiations| instantiations.get(&key).copied())
             .unwrap_or_default();
         if result.is_nil() {
-            let new_alias = alias.or_else(|| instantiated_alias.map(Rc::new));
+            let new_alias = alias.or_else(|| {
+                instantiated_alias_symbol.map(|symbol| {
+                    Rc::new(TypeAlias {
+                        symbol,
+                        type_arguments: instantiated_alias_type_arguments.into_vec(),
+                    })
+                })
+            });
             let type_arguments = SharedList::from(&type_arguments[..]);
             let mut new_mapper =
                 self.new_type_mapper_shared(outer_type_parameters, type_arguments.clone());
@@ -919,6 +939,23 @@ impl Checker {
         self.instantiate_list(types, m, Checker::instantiate_type)
     }
 
+    /// Go `instantiateTypes` into a scratch list: `out` is cleared, then gets
+    /// `instantiate_type(t, m)` for each `t` of `types`. Same calls in the
+    /// same order as `instantiate_types`, with no heap list for up to 8.
+    pub fn instantiate_types_into(
+        &mut self,
+        types: &[TypeId],
+        m: MapperId,
+        out: &mut SmallVec<[TypeId; 8]>,
+    ) {
+        out.clear();
+        out.reserve(types.len());
+        for &t in types {
+            let instantiated = self.instantiate_type(t, m);
+            out.push(instantiated);
+        }
+    }
+
     // Go: checker/checker.go:22671 instantiateSymbols
     pub fn instantiate_symbols(&mut self, symbols: &[SymbolId], m: MapperId) -> Vec<SymbolId> {
         self.instantiate_list(symbols, m, Checker::instantiate_symbol)
@@ -1528,8 +1565,11 @@ impl Checker {
             );
             // PORT: the arguments stay on the stack; `create_type_reference_ex`
             // copies them only on a cache miss.
+            // PERF: copy loops, not `from_slice` (memmove and memcpy calls).
+            let outer_type_parameters = self.ty(t).as_interface_type().outer_type_parameters();
             let mut type_arguments: SmallVec<[TypeId; 8]> =
-                SmallVec::from_slice(self.ty(t).as_interface_type().outer_type_parameters());
+                SmallVec::with_capacity(outer_type_parameters.len() + local_type_arguments.len());
+            type_arguments.extend(outer_type_parameters.iter().copied());
             type_arguments.extend(local_type_arguments);
             return self.create_type_reference_ex(t, &type_arguments, ObjectFlags::FROM_TYPE_NODE);
         }

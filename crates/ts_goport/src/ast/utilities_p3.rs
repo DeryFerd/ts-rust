@@ -951,12 +951,16 @@ pub fn is_const_assertion(node: Node) -> bool {
     false
 }
 
+/// `const`, interned once for `is_const_type_reference`.
+static CONST_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("const"));
+
 // Go: ast/utilities.go:2454 IsConstTypeReference
+// PERF: U1 (a). Compares name ids (`Node::text_is`), with no text load.
 pub fn is_const_type_reference(node: Node) -> bool {
     is_type_reference_node(node)
         && node.type_arguments().len() == 0
         && is_identifier(node.type_name())
-        && node.type_name().text() == "const"
+        && node.type_name().text_is(&CONST_NAME)
 }
 
 // Go: ast/utilities.go:2458 IsGlobalSourceFile
@@ -1254,8 +1258,7 @@ pub fn find_import_or_require(text: &str, start: i32) -> (i32, i32) {
     let mut size: usize;
     while index < n {
         // Go strings.IndexAny(text[index:], "ir"); both are ASCII so a byte scan matches.
-        let next = bytes[index..].iter().position(|&b| b == b'i' || b == b'r');
-        let Some(next) = next else {
+        let Some(next) = memchr::memchr2(b'i', b'r', &bytes[index..]) else {
             break;
         };
         index += next;
@@ -1285,7 +1288,8 @@ pub fn for_each_dynamic_import_or_require_call(
     cb: &mut dyn FnMut(Node, Node) -> bool,
 ) -> bool {
     let is_java_script_file = is_in_js_file(file);
-    let (mut last_index, mut size) = find_import_or_require(source_file_text(file), 0);
+    let text = source_file_text(file);
+    let (mut last_index, mut size) = find_import_or_require(text, 0);
     while last_index >= 0 {
         let node = get_node_at_position(
             file,
@@ -1311,7 +1315,7 @@ pub fn for_each_dynamic_import_or_require_call(
         }
         // skip past import/require
         last_index += size;
-        (last_index, size) = find_import_or_require(source_file_text(file), last_index);
+        (last_index, size) = find_import_or_require(text, last_index);
     }
     false
 }

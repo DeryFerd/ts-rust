@@ -1,10 +1,9 @@
 //! Go: internal/fswatch/fanotify_linux.go (the Linux fanotify backend).
 //!
 //! PORT: D-W1 (no `libc`, no `unsafe`). The syscalls go through the `unix`
-//! shim, whose fanotify calls are `unported!` (rustix has no fanotify).
-//! `fanotify_available()` gives Go's result for
-//! a failed `FanotifyInit` probe (false) without calling it, so the factory
-//! stays `None` and `Default()` picks inotify. Records are read with
+//! shim (`nix` for fanotify, `name-to-handle-at` for file handles, `rustix`
+//! for the rest). `fanotify_available()` probes `FanotifyInit` as Go does, so
+//! `Default()` picks fanotify when the kernel allows it. Records are read with
 //! `unix::FanotifyEventMetadata::from_ne_bytes` and `from_ne_bytes` on the
 //! info records instead of Go's `unsafe.Pointer` cast and
 //! `binary.NativeEndian`.
@@ -240,14 +239,7 @@ pub fn init(fanotify_watcher: &mut WatcherStruct) {
 // Go: fanotify_linux.go:188 fanotifyAvailable
 /// fanotifyAvailable probes whether fanotify_init succeeds with the flags
 /// this backend needs.
-///
-/// PORT: D-W1. `unix.FanotifyInit` is unported. Go returns false when
-/// `FanotifyInit` fails; the port returns that result without the call, so
-/// no unported code runs when the LSP server calls `Default()`.
 pub fn fanotify_available() -> bool {
-    if unix::FANOTIFY_UNPORTED {
-        return false;
-    }
     let fd = match unix::fanotify_init(
         FANOTIFY_INIT_FLAGS,
         (unix::O_RDONLY | unix::O_CLOEXEC) as u32,

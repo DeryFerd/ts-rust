@@ -80,10 +80,12 @@ pub fn unmarshal_params<T: UnmarshalerFrom + Default>(
 
 /// Go `%v` of the value `recover()` returns in the connections' request
 /// handlers.
-/// PORT: a Rust panic payload is the panic message (`&str` or `String`);
-/// any other payload has no text.
+/// PORT: a Rust panic payload is the panic message (`&str` or `String`,
+/// or the message of a `core::go_panic`); any other payload has no text.
 pub fn recovered_value(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
+    if let Some(panic) = payload.downcast_ref::<crate::core::GoPanic>() {
+        panic.message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()

@@ -55,7 +55,7 @@ impl Checker {
                 if target == check_base {
                     return true;
                 }
-                let base_types = c.get_base_types(target);
+                let base_types = c.get_base_types_shared(target);
                 return base_types.iter().any(|&b| check(c, b, check_base));
             }
             if c.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
@@ -93,7 +93,9 @@ impl Checker {
                     // allocation for up to 8 arguments.
                     let mut args: SmallVec<[TypeId; 8]> =
                         SmallVec::with_capacity(type_arguments.len() + 1);
-                    args.extend_from_slice(&type_arguments);
+                    // PERF: a copy loop; `extend_from_slice` calls memmove
+                    // and memcpy for a few ids.
+                    args.extend(type_arguments.iter().copied());
                     args
                 })
             };

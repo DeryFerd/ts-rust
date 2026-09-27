@@ -2,6 +2,7 @@
 //! through appendIndexInfo).
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 impl Checker {
     // Go: checker/checker.go:20351 reportErrorsFromWidening
@@ -550,7 +551,11 @@ impl Checker {
         let result = self
             .symbols
             .new_table_with_capacity(self.symbols.len(symbols));
-        for (id, symbol) in self.symbols.entries(symbols) {
+        // PERF: the snapshot of the table (the loop calls `&mut self`
+        // methods) goes on the stack when it is small, in place of the
+        // `entries()` Vec. Same entries in the same order.
+        let entries: SmallVec<[(Name, SymbolId); 16]> = self.symbols.iter_names(symbols).collect();
+        for (id, symbol) in entries {
             if self.is_named_member(symbol, &id) {
                 let instantiated = self.instantiate_symbol(symbol, m);
                 self.symbols.set(result, id, instantiated);
@@ -626,10 +631,17 @@ impl Checker {
         };
         self.symbol_count += 1;
         let result = self.symbols.push_symbol(full);
-        let result_links = self.value_symbol_links.get(result);
-        result_links.target = symbol;
-        result_links.mapper = m;
-        result_links.name_type = links_name_type;
+        // PERF: Go `Get` and then sets three fields. `result` is new, so its
+        // record is added once with every field set.
+        self.value_symbol_links.insert_new(
+            result,
+            ValueSymbolLinks {
+                target: symbol,
+                mapper: m,
+                name_type: links_name_type,
+                ..ValueSymbolLinks::default()
+            },
+        );
         result
     }
 
@@ -925,7 +937,9 @@ impl Checker {
                                     } else {
                                         SymbolFlags::NONE
                                     },
-                                prop_name.as_str(),
+                                // PERF: the `Name`, not its text, so the name
+                                // is not interned a second time.
+                                prop_name.clone(),
                             );
                             c.sym_mut(prop).check_flags = late_flag
                                 | CheckFlags::MAPPED
@@ -939,17 +953,28 @@ impl Checker {
                                 } else {
                                     CheckFlags::NONE
                                 };
-                            let value_links = c.value_symbol_links.get(prop);
-                            value_links.containing_type = t;
-                            value_links.name_type = prop_name_type;
-                            let mapped_links = c.mapped_symbol_links.get(prop);
-                            mapped_links.key_type = key_type;
-                            if modifiers_prop.is_some() {
-                                mapped_links.synthetic_origin = modifiers_prop;
-                                if should_link_prop_declarations {
-                                    let declarations = c.sym(modifiers_prop).declarations.clone();
-                                    c.sym_mut(prop).declarations = declarations;
-                                }
+                            // PERF: Go `Get` and then sets the fields. `prop`
+                            // is new, so each record is added once with its
+                            // fields set. A nil `modifiers_prop` is the
+                            // default (nil) origin.
+                            c.value_symbol_links.insert_new(
+                                prop,
+                                ValueSymbolLinks {
+                                    containing_type: t,
+                                    name_type: prop_name_type,
+                                    ..ValueSymbolLinks::default()
+                                },
+                            );
+                            c.mapped_symbol_links.insert_new(
+                                prop,
+                                MappedSymbolLinks {
+                                    key_type,
+                                    synthetic_origin: modifiers_prop,
+                                },
+                            );
+                            if modifiers_prop.is_some() && should_link_prop_declarations {
+                                let declarations = c.sym(modifiers_prop).declarations.clone();
+                                c.sym_mut(prop).declarations = declarations;
                             }
                             c.symbols.set(members, prop_name, prop);
                         }

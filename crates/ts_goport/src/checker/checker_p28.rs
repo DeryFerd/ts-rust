@@ -21,26 +21,29 @@ impl Checker {
 
     // Go: checker/checker.go:24965 newObjectType
     pub fn new_object_type(&mut self, object_flags: ObjectFlags, symbol: SymbolId) -> TypeId {
-        let data = if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
-            TypeData::Interface(Box::default())
-        } else if object_flags.intersects(ObjectFlags::TUPLE) {
-            TypeData::Tuple(Box::default())
-        } else if object_flags.intersects(ObjectFlags::REFERENCE) {
-            TypeData::TypeReference(TypeReference::default())
-        } else if object_flags.intersects(ObjectFlags::MAPPED) {
-            TypeData::Mapped(Box::default())
-        } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
-            TypeData::ReverseMapped(Box::default())
-        } else if object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
-            TypeData::EvolvingArray(Box::default())
-        } else if object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
-            TypeData::InstantiationExpression(Box::default())
-        } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
-            TypeData::Object(ObjectType::default())
-        } else {
-            panic!("Unhandled case in newObjectType")
-        };
-        let t = self.new_type(TypeFlags::OBJECT, object_flags, data);
+        // PERF: the data is built in the `new_type_with` closure, so the
+        // large inline variants are written straight into the arena slot.
+        let t = self.new_type_with(TypeFlags::OBJECT, object_flags, || {
+            if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
+                TypeData::Interface(Box::default())
+            } else if object_flags.intersects(ObjectFlags::TUPLE) {
+                TypeData::Tuple(Box::default())
+            } else if object_flags.intersects(ObjectFlags::REFERENCE) {
+                TypeData::TypeReference(TypeReference::default())
+            } else if object_flags.intersects(ObjectFlags::MAPPED) {
+                TypeData::Mapped(Box::default())
+            } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
+                TypeData::ReverseMapped(Box::default())
+            } else if object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+                TypeData::EvolvingArray(Box::default())
+            } else if object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
+                TypeData::InstantiationExpression(Box::default())
+            } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
+                TypeData::Object(ObjectType::default())
+            } else {
+                panic!("Unhandled case in newObjectType")
+            }
+        });
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -218,11 +221,9 @@ impl Checker {
 
     // Go: checker/checker.go:25070 newTypeParameter
     pub fn new_type_parameter(&mut self, symbol: SymbolId) -> TypeId {
-        let t = self.new_type(
-            TypeFlags::TYPE_PARAMETER,
-            ObjectFlags::NONE,
-            TypeData::TypeParameter(TypeParameter::default()),
-        );
+        let t = self.new_type_with(TypeFlags::TYPE_PARAMETER, ObjectFlags::NONE, || {
+            TypeData::TypeParameter(TypeParameter::default())
+        });
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -254,7 +255,7 @@ impl Checker {
         self.new_type(
             TypeFlags::UNION,
             object_flags,
-            TypeData::Union(Box::new(data)),
+            TypeData::Union(ArenaBox::new(data)),
         )
     }
 
@@ -265,7 +266,7 @@ impl Checker {
         self.new_type(
             TypeFlags::INTERSECTION,
             object_flags,
-            TypeData::Intersection(Box::new(data)),
+            TypeData::Intersection(ArenaBox::new(data)),
         )
     }
 
@@ -276,15 +277,13 @@ impl Checker {
         index_type: TypeId,
         access_flags: AccessFlags,
     ) -> TypeId {
-        let mut data = IndexedAccessType::default();
-        data.object_type = object_type;
-        data.index_type = index_type;
-        data.access_flags = access_flags;
-        self.new_type(
-            TypeFlags::INDEXED_ACCESS,
-            ObjectFlags::NONE,
-            TypeData::IndexedAccess(data),
-        )
+        self.new_type_with(TypeFlags::INDEXED_ACCESS, ObjectFlags::NONE, || {
+            let mut data = IndexedAccessType::default();
+            data.object_type = object_type;
+            data.index_type = index_type;
+            data.access_flags = access_flags;
+            TypeData::IndexedAccess(data)
+        })
     }
 
     // Go: checker/checker.go:25110 newIndexType
@@ -1359,10 +1358,31 @@ impl Checker {
             } else {
                 // PORT: the set is sorted and has no duplicates, so the Rust
                 // insertion index matches Go `slices.BinarySearchFunc`.
-                if let Err(index) =
-                    type_set.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0))
-                {
-                    type_set.insert(index, t);
+                // PERF: many callers add types from an already sorted list, so
+                // compare with the last element first. `compare_types` is a
+                // total order that ends with a type id compare, so "after the
+                // last" means append and "equal to the last" means found. Both
+                // give the binary search result. Otherwise search as before.
+                let len = type_set.len();
+                let last_cmp = type_set.last().map(|&last| self.compare_types(last, t));
+                match last_cmp {
+                    Some(c) if c <= 0 => {
+                        debug_assert_eq!(
+                            type_set.binary_search_by(|&p| self.compare_types(p, t).cmp(&0)),
+                            if c < 0 { Err(len) } else { Ok(len - 1) },
+                            "sorted-append fast path disagrees with binary search"
+                        );
+                        if c < 0 {
+                            type_set.push(t);
+                        }
+                    }
+                    _ => {
+                        if let Err(index) =
+                            type_set.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0))
+                        {
+                            type_set.insert(index, t);
+                        }
+                    }
                 }
             }
         }

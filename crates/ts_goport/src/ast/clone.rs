@@ -1468,10 +1468,7 @@ impl NodeFactory {
         let D::ImportAttributes(d) = ast_data_of(node) else {
             panic!("AsImportAttributes called on {:?}", node.kind());
         };
-        let attributes = NodeList {
-            file: node.file_index() as u32,
-            list: Some(&d.attributes),
-        };
+        let attributes = NodeList::from_ts(node.file_index(), Some(&d.attributes));
         clone_node_from(
             self.new_import_attributes(node.token(), attributes, node.multi_line()),
             node,

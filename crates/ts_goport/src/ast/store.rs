@@ -98,6 +98,13 @@ pub struct NodeHeader {
     /// Set by `mark_source_file_roots`: Go `GetSourceFileOfNode(node)` is the
     /// root of this store (`FileStore::root`). False means "walk the parents".
     source_file_is_root: bool,
+    /// Set when the slot is made or its data is replaced, for an Identifier
+    /// or PrivateIdentifier slot: Go `scanner.GetIdentifierToken(node.Text())
+    /// != KindIdentifier` (`frozen_store_text_is_keyword`). False for other
+    /// slots.
+    // PERF: U1 (a). The header has a spare byte after `source_file_is_root`,
+    // so this bit adds no memory.
+    text_is_keyword: bool,
 }
 
 impl NodeHeader {
@@ -129,6 +136,7 @@ impl NodeHeader {
             flags: NodeFlags::NONE,
             kind: SyntaxKind::Unknown,
             source_file_is_root: false,
+            text_is_keyword: false,
         }
     }
 }
@@ -187,9 +195,186 @@ struct FileStore {
     /// `headers[i].kind` for every slot (`Frozen::kinds`). Made when the
     /// file is frozen. A length other than `headers.len()` means "not made".
     kinds: Box<[SyntaxKind]>,
-    /// `resolve_slot` for every slot (`Frozen::resolved`), with the file id
-    /// of the store. Same length rule as `kinds`.
+    /// Made with `kinds`, in the same pass, so it is valid when `kinds` is.
+    facts: StoreFacts,
+    /// `resolve_slot` for every slot (`FrozenStore::resolved`), with the
+    /// file id of the store. Same length rule as `kinds`. Never made for an
+    /// alias-free store (`StoreFacts::alias_free`).
     resolved: Box<[Node]>,
+    /// U1 (a): Go `node.Text()` of every Identifier and PrivateIdentifier
+    /// slot, interned (`Frozen::names`). `Name::default()` for other slots.
+    /// Moved from `build_names` when `kinds` is made (`move_build_columns`),
+    /// same length rule. U1 (d): the only copy of the text of a node that
+    /// `alloc_store_name_node` made (`store_identifier_name`).
+    names: Box<[Name]>,
+    /// U1 (b): `ModifierList::modifier_flags` of the node's own modifier list
+    /// for every slot, 0 when it has none (`Frozen::modifier_bits`). Moved
+    /// from `build_modifier_bits` when `kinds` is made. Empty when made but a
+    /// value does not fit in 16 bits; the reads then use the list.
+    modifier_bits: Box<[u16]>,
+    /// U1 (a) while the parser runs: the `names` entry of every slot, in slot
+    /// order, pushed when the slot is made (one entry per header).
+    // PERF: the text is interned while the new node data is hot, not in a
+    // pass over every slot after the parse, which loaded each Identifier
+    // data box again when it was cold.
+    build_names: Vec<Name>,
+    /// U1 (b) while the parser runs: the `modifier_bits` entry of every slot,
+    /// pushed when the slot is made, 0 when the value does not fit in 16 bits
+    /// (see `modifier_bits_overflow`).
+    build_modifier_bits: Vec<u16>,
+    /// Some slot got a modifier value that does not fit in 16 bits.
+    modifier_bits_overflow: bool,
+    /// Go parser `identifiers` (`internIdentifier`): the name and keyword
+    /// bit of each identifier text of this file, keyed by the interned text.
+    /// Dropped by the freeze.
+    // PERF: one text hash per identifier node; the process-wide intern (a
+    // shard `Mutex`) runs once per distinct text of the file.
+    identifier_names: FxHashMap<&'static str, (Name, bool)>,
+    /// U1 (e): binder capacity hints, made with `kinds`.
+    bind_estimate: BindEstimate,
+}
+
+/// Facts about the slots of one finished store, made in the pass that makes
+/// `FileStore::kinds`. They do not depend on the store id, so a detached
+/// store gets them when its parse ends.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreFacts {
+    /// Every slot after slot 0 holds a node (the store has no alias slot),
+    /// so `resolve_slot(file, i) == handle(file, i)` for every `i >= 1`,
+    /// and a child walk from a node of this store stays in this store.
+    pub alias_free: bool,
+    /// The parent of every node slot is nil or a node of this store, so a
+    /// parent walk from a node of this store stays in this store.
+    pub parents_local: bool,
+    /// Some node slot has kind `ExportAssignment` or `ExportSpecifier`.
+    pub has_export_alias_kind: bool,
+    /// Some node slot has kind `ConditionalType` or `MappedType`.
+    pub has_flow_constraint_kind: bool,
+}
+
+impl StoreFacts {
+    /// The facts of a store that has only slot 0. `add` adds the others.
+    const ONLY_NIL_SLOT: Self = Self {
+        alias_free: true,
+        parents_local: true,
+        has_export_alias_kind: false,
+        has_flow_constraint_kind: false,
+    };
+
+    /// Adds slot `header` (a node slot when `is_node`), after slot 0.
+    #[inline]
+    fn add(&mut self, header: &NodeHeader, is_node: bool) {
+        if !is_node {
+            self.alias_free = false;
+            return;
+        }
+        if header.parent.is_some() && header.parent.file_index() != LOCAL_STORE {
+            self.parents_local = false;
+        }
+        match header.kind {
+            SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => {
+                self.has_export_alias_kind = true;
+            }
+            SyntaxKind::ConditionalType | SyntaxKind::MappedType => {
+                self.has_flow_constraint_kind = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// U1 (e): capacity hints for the binder of a store file, counted from the
+/// slot kinds when the store is frozen (`frozen_store_bind_estimate`).
+/// Only capacities: the binder output does not depend on them.
+#[derive(Clone, Copy, Debug, Default)]
+struct BindEstimate {
+    /// `NodeBindBuilder` entries: about the nodes that get binder data.
+    entries: u32,
+    /// `Binder::flow_nodes`: about the flow nodes the binder makes.
+    flow_nodes: u32,
+}
+
+/// The slot kind counts of a `BindEstimate`, one `add` per slot kind.
+// PERF: U1 (e). `set_kinds_and_facts` adds each kind in its pass over the
+// headers, so the estimate needs no second pass over the kinds.
+#[derive(Default)]
+struct BindCounts {
+    identifiers: usize,
+    others: usize,
+    flow_nodes: usize,
+}
+
+impl BindCounts {
+    #[inline]
+    fn add(&mut self, kind: SyntaxKind) {
+        match kind {
+            // The nil slot and alias slots.
+            SyntaxKind::Unknown => {}
+            SyntaxKind::Identifier => self.identifiers += 1,
+            _ => {
+                self.others += 1;
+                self.flow_nodes += flow_node_weight(kind);
+            }
+        }
+    }
+
+    fn estimate(&self) -> BindEstimate {
+        // Every identifier gets its flow node (binder.go `bind`), and about
+        // one other node in two is a declaration, a container, a statement
+        // or a narrowable reference. An estimate above the count only costs
+        // untouched capacity until the builder is dropped.
+        let entries = self.identifiers + self.others / 2 + 1;
+        // The unreachable flow node and the source file start node.
+        let flow_nodes = self.flow_nodes + 2;
+        BindEstimate {
+            entries: u32::try_from(entries).unwrap_or(u32::MAX),
+            flow_nodes: u32::try_from(flow_nodes).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// About how many flow nodes the binder makes for a node of kind `kind`
+/// (binder.go `bindContainer` and the `bind*Flow` functions).
+fn flow_node_weight(kind: SyntaxKind) -> usize {
+    match kind {
+        // A start node for a control flow container, a flow call, a flow
+        // assignment, or a logical or assignment operator.
+        SyntaxKind::MethodSignature
+        | SyntaxKind::CallSignature
+        | SyntaxKind::ConstructSignature
+        | SyntaxKind::FunctionType
+        | SyntaxKind::ConstructorType
+        | SyntaxKind::FunctionDeclaration
+        | SyntaxKind::MethodDeclaration
+        | SyntaxKind::GetAccessor
+        | SyntaxKind::SetAccessor
+        | SyntaxKind::FunctionExpression
+        | SyntaxKind::ArrowFunction
+        | SyntaxKind::ModuleBlock
+        | SyntaxKind::CallExpression
+        | SyntaxKind::VariableDeclaration
+        | SyntaxKind::BindingElement
+        | SyntaxKind::BinaryExpression
+        | SyntaxKind::PostfixUnaryExpression
+        | SyntaxKind::DeleteExpression => 1,
+        // A start node and a return label, or a clause and its label.
+        SyntaxKind::Constructor
+        | SyntaxKind::ClassStaticBlockDeclaration
+        | SyntaxKind::CaseClause
+        | SyntaxKind::DefaultClause
+        | SyntaxKind::LabeledStatement => 2,
+        // Branch or loop labels and the true and false conditions.
+        SyntaxKind::IfStatement
+        | SyntaxKind::ConditionalExpression
+        | SyntaxKind::WhileStatement
+        | SyntaxKind::DoStatement
+        | SyntaxKind::ForStatement
+        | SyntaxKind::ForInStatement
+        | SyntaxKind::ForOfStatement
+        | SyntaxKind::SwitchStatement
+        | SyntaxKind::TryStatement => 5,
+        _ => 0,
+    }
 }
 
 /// A store that is not published yet. It lives in a leaked cell of the
@@ -324,13 +509,55 @@ struct Frozen {
     /// `headers[file][i].kind`, packed (`FileStore::kinds`). `Node::kind`
     /// reads only this.
     kinds: Box<[&'static [SyntaxKind]]>,
-    /// `try_resolve_store_id(file, i)` for every slot, computed once
-    /// (`FileStore::resolved`). `Node::new` reads only this.
-    resolved: Box<[&'static [Node]]>,
+    /// U1 (a): `FileStore::names` of each store (`Node::text_name`).
+    names: Box<[&'static [Name]]>,
+    /// U1 (b): `FileStore::modifier_bits` of each store
+    /// (`Node::modifier_flags`).
+    modifier_bits: Box<[&'static [u16]]>,
+    /// What `Node::new` reads for each store, and its facts.
+    per_store: Box<[FrozenStore]>,
     /// The `GoFile` of each file id of the publish.
     go_files: Box<[GoFile]>,
     /// True for the legacy loader: `go_files` only, no stores.
     legacy: bool,
+}
+
+/// The per-store part of `Frozen` that `Node::new` reads.
+#[derive(Clone, Copy)]
+struct FrozenStore {
+    /// `try_resolve_store_id(file, i)` for every slot, computed once
+    /// (`FileStore::resolved`). Empty for an alias-free store.
+    resolved: &'static [Node],
+    /// What slot 0 resolves to (Go `nil`).
+    nil: Node,
+    facts: StoreFacts,
+}
+
+/// `try_resolve_store_id(file, index)` for store `file` of publish `f`, whose
+/// per-store part is `s`.
+// PERF: effect P7-1. Most stores have no alias slot. For them a child id is
+// the slot handle (or the slot 0 value), so `Node::new` needs no load from
+// a per-slot table.
+#[inline]
+fn frozen_resolve_slot(f: &Frozen, s: &FrozenStore, file: usize, index: usize) -> Node {
+    if !s.facts.alias_free {
+        return s.resolved[index];
+    }
+    let n = if index == NIL_SLOT as usize {
+        s.nil
+    } else {
+        handle(file, index as u32)
+    };
+    debug_assert_eq!(
+        n,
+        resolve_slot(
+            file,
+            index,
+            f.nodes[file - f.base],
+            f.headers[file - f.base]
+        )
+    );
+    n
 }
 
 /// Tier 0: the first publish.
@@ -446,16 +673,15 @@ fn inactive_unpublished_store(file: usize) -> StoreCell {
         .unwrap_or_else(|| panic!("file {file:#x} has no node store on this thread"))
 }
 
-/// Writes the node slot of a store handle. Panics on a frozen store.
-fn with_slot_mut<R>(
-    n: Node,
-    f: impl FnOnce(&mut &'static ts_ast::Node, &mut NodeHeader) -> R,
-) -> R {
+/// Writes the header of the node slot of a store handle. Panics on a frozen
+/// store. Data writes go through `replace_store_node_data`, which keeps the
+/// U1 build entries of the slot.
+fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut NodeHeader) -> R) -> R {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
         let index = slot_index(n);
-        match &mut s.nodes[index] {
-            Some(node) => f(node, &mut s.headers[index]),
+        match s.nodes[index] {
+            Some(_) => f(&mut s.headers[index]),
             None => panic!("store handle does not name a node slot"),
         }
     })
@@ -490,15 +716,85 @@ fn assert_no_legacy_publish() {
     );
 }
 
+/// Text bytes per slot that a new store reserves for (`FileStore::new`).
+// PERF: U1 (e). The TypeScript parser makes one node for about 6 to 8 text
+// bytes of the Query, Zod and Hono sources, and one for about 14 to 21 bytes
+// of the lib and `@types` declaration files and the Effect sources (long
+// JSDoc comments). At 12 a declaration file, such as lib.dom, fills its
+// vectors without a `realloc` copy, and a source file grows them once.
+// `end_parse` gives the unused capacity back.
+const STORE_TEXT_BYTES_PER_SLOT: usize = 12;
+
 impl FileStore {
     fn new(file_name: &'static str, text: &'static str) -> Self {
+        let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+        let mut headers = Vec::with_capacity(slots);
+        headers.push(NodeHeader::target(Node::NIL));
+        let mut nodes = Vec::with_capacity(slots);
+        nodes.push(None);
+        let mut build_names = Vec::with_capacity(slots);
+        build_names.push(Name::default());
+        let mut build_modifier_bits = Vec::with_capacity(slots);
+        build_modifier_bits.push(0);
+        // PERF: U1 (a). About one distinct identifier text per 16 slots, so
+        // the map of a large file does not rehash while it grows.
+        let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
         Self {
             file_name,
             text,
-            headers: vec![NodeHeader::target(Node::NIL)],
-            nodes: vec![None],
+            headers,
+            nodes,
+            build_names,
+            build_modifier_bits,
+            identifier_names,
             ..Self::default()
         }
+    }
+
+    /// U1 (a): the `names` entry and the `text_is_keyword` bit of a new slot
+    /// of kind `kind` with data `node`. The text is `text`, or the data text
+    /// when `text` is `None`. `Name::default()` and false for a kind other
+    /// than Identifier and PrivateIdentifier.
+    #[inline]
+    fn slot_text_name(
+        &mut self,
+        kind: SyntaxKind,
+        node: &'static ts_ast::Node,
+        text: Option<&str>,
+    ) -> (Name, bool) {
+        if !matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
+            return (Name::default(), false);
+        }
+        let text = text.unwrap_or_else(|| identifier_text(node));
+        if let Some(entry) = self.identifier_names.get(text) {
+            return entry.clone();
+        }
+        // U1 (d): the key is the interned text, which lives as long as the
+        // map. The data of a store identifier has no text to borrow.
+        let entry = (
+            Name::from(text),
+            get_identifier_token(text) != SyntaxKind::Identifier,
+        );
+        self.identifier_names
+            .insert(entry.0.as_str(), entry.clone());
+        entry
+    }
+
+    /// U1 (b): `bits` as the `modifier_bits` entry of a slot: the value, or
+    /// 0 and `modifier_bits_overflow` when it does not fit in 16 bits.
+    #[inline]
+    fn slot_modifier_bits(&mut self, bits: u32) -> u16 {
+        u16::try_from(bits).unwrap_or_else(|_| {
+            self.modifier_bits_overflow = true;
+            0
+        })
+    }
+
+    /// Both U1 build vectors have one entry per slot.
+    #[inline]
+    fn debug_assert_build_columns(&self) {
+        debug_assert_eq!(self.build_names.len(), self.headers.len());
+        debug_assert_eq!(self.build_modifier_bits.len(), self.headers.len());
     }
 }
 
@@ -618,7 +914,8 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
         // The lazy JSDoc nodes are synthetic nodes of the parse worker.
         store.lazy_jsdoc_cache = FxHashMap::default();
         // The resolved table holds handles of the store id, which changes
-        // here. `publish_file_stores` makes it for the real id.
+        // here. `publish_file_stores` makes it for the real id. The U1
+        // columns are slot-indexed and hold no store id, so they stay.
         store.resolved = Box::default();
         let cell: StoreCell = leak_in_ast_arena(RefCell::new(store));
         b.stores.push(cell);
@@ -829,8 +1126,8 @@ pub fn is_file_store_before_program(file: usize) -> bool {
 /// Ends the parse of a file. Header and data writes panic after this.
 /// Headers cannot change after this, so it also marks the source file roots
 /// (`mark_source_file_roots`) and builds the tables that the publish puts
-/// in the registry (`FileStore::kinds`, `FileStore::resolved`) on the
-/// parsing thread.
+/// in the registry (`FileStore::kinds`, `FileStore::facts`,
+/// `FileStore::resolved`) on the parsing thread.
 pub fn freeze_file_store(file: usize) {
     with_store_mut(file, |s| s.freeze(file));
 }
@@ -839,22 +1136,130 @@ impl FileStore {
     /// `freeze_file_store` for this store, which has id `file`.
     fn freeze(&mut self, file: usize) {
         self.end_parse();
-        // One pass over the headers for the parser flags and the kinds.
+        // One pass over the headers for the parser flags, the kinds and the
+        // facts.
         let mut flags = Vec::with_capacity(self.headers.len());
-        let mut kinds = Vec::with_capacity(self.headers.len());
-        for h in &self.headers {
-            flags.push(h.flags);
-            kinds.push(h.kind);
-        }
+        self.set_kinds_and_facts(|h| flags.push(h.flags));
         self.parser_flags = Some(flags);
-        self.kinds = kinds.into_boxed_slice();
         // PERF: query Q7. The table is made here, on the parse thread, not
         // in `publish_file_stores` on the loader. A detached store gets its
         // real id only when the loader adopts it, so its table waits for
-        // `publish_file_stores`.
-        if !is_detached_id(file) {
+        // `publish_file_stores`. An alias-free store needs no table.
+        if !is_detached_id(file) && !self.facts.alias_free {
             self.resolved = self.resolved_table(file);
         }
+    }
+
+    /// Makes `kinds`, `facts` and the U1 (e) `bind_estimate` in one pass over
+    /// the slots, and calls `each` on every slot header. Then moves the U1
+    /// build vectors into the `names` and `modifier_bits` columns
+    /// (`move_build_columns`).
+    fn set_kinds_and_facts(&mut self, mut each: impl FnMut(&NodeHeader)) {
+        let mut facts = StoreFacts::ONLY_NIL_SLOT;
+        let mut kinds = Vec::with_capacity(self.headers.len());
+        let mut counts = BindCounts::default();
+        for (i, (h, node)) in self.headers.iter().zip(&self.nodes).enumerate() {
+            each(h);
+            kinds.push(h.kind);
+            counts.add(h.kind);
+            if i != NIL_SLOT as usize {
+                facts.add(h, node.is_some());
+            }
+        }
+        self.kinds = kinds.into_boxed_slice();
+        self.facts = facts;
+        self.bind_estimate = counts.estimate();
+        self.move_build_columns();
+    }
+
+    /// U1 (a) (b): moves `build_names` and `build_modifier_bits`, made when
+    /// each slot was made, into `names` and `modifier_bits`, and drops
+    /// `identifier_names`. Needs `kinds`. A modifier vector without one entry
+    /// per slot is not used: `modifier_bits_column` makes that column from
+    /// the slots.
+    // PERF: no pass over the node data. Debug builds check the moved columns
+    // and the header keyword bits against the node data.
+    fn move_build_columns(&mut self) {
+        let slots = self.headers.len();
+        self.identifier_names = FxHashMap::default();
+        let names = std::mem::take(&mut self.build_names);
+        // PORT: U1 (d). The name column is the only copy of the text of an
+        // identifier that `alloc_store_name_node` made, so it cannot be made
+        // again from the node data. Every slot push adds its entry.
+        assert_eq!(
+            names.len(),
+            slots,
+            "U1 (a) build_names must have one entry per slot"
+        );
+        self.names = names.into_boxed_slice();
+        #[cfg(debug_assertions)]
+        self.debug_check_text_names();
+        let bits = std::mem::take(&mut self.build_modifier_bits);
+        // PORT: a slot whose value did not fit may have got new data since
+        // (`replace_store_node_data`), so an overflow makes the column from
+        // the slots, as before. Store lists hold 16-bit values, so this does
+        // not happen.
+        if bits.len() == slots && !self.modifier_bits_overflow {
+            self.modifier_bits = bits.into_boxed_slice();
+            debug_assert_eq!(
+                self.modifier_bits,
+                self.modifier_bits_column(),
+                "U1 (b) modifier bits differ from modifier_bits_column"
+            );
+        } else {
+            self.modifier_bits = self.modifier_bits_column();
+        }
+    }
+
+    /// U1 (a) (d), debug builds: checks `names` and the `text_is_keyword`
+    /// header bits against `kinds` and the node data. An identifier slot
+    /// whose data has a text has that name; one whose data text is empty
+    /// (`alloc_store_name_node`) keeps the name it was made with.
+    #[cfg(debug_assertions)]
+    fn debug_check_text_names(&self) {
+        let slots = self.kinds.iter().zip(&self.nodes).zip(&self.headers);
+        for (((&kind, node), header), name) in slots.zip(&self.names[..]) {
+            match (kind, node) {
+                (SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier, Some(node)) => {
+                    let text = identifier_text(node);
+                    assert!(
+                        text.is_empty() || name.as_str() == text,
+                        "U1 (a) name differs from the node data"
+                    );
+                    assert_eq!(
+                        header.text_is_keyword,
+                        get_identifier_token(name.as_str()) != SyntaxKind::Identifier,
+                        "U1 (a) keyword bit differs from the name"
+                    );
+                }
+                _ => {
+                    assert_eq!(*name, Name::default(), "U1 (a) name on a non-name slot");
+                    assert!(
+                        !header.text_is_keyword,
+                        "U1 (a) keyword bit on a non-name slot"
+                    );
+                }
+            }
+        }
+    }
+
+    /// U1 (b): `FileStore::modifier_bits` from `kinds`. Only the slots whose
+    /// kind can hold a modifier list read their data. Empty when a value
+    /// does not fit in 16 bits. `move_build_columns` uses it only when
+    /// `build_modifier_bits` cannot be used, and to check it in debug builds.
+    // PORT: store lists hold `ModifiersToFlags(nodes)`, which only has the
+    // syntactic bits (`ModifierFlags::SYNTACTIC_MODIFIERS`, 16 bits). The
+    // empty column keeps the result exact if that ever changes.
+    fn modifier_bits_column(&self) -> Box<[u16]> {
+        let mut bits = Vec::with_capacity(self.kinds.len());
+        for (&kind, node) in self.kinds.iter().zip(&self.nodes) {
+            let flags = node.map_or(0, |node| super::node::store_node_modifier_bits(kind, node));
+            match u16::try_from(flags) {
+                Ok(flags) => bits.push(flags),
+                Err(_) => return Box::default(),
+            }
+        }
+        bits.into_boxed_slice()
     }
 
     /// Marks the store finished and marks its source file roots.
@@ -890,9 +1295,9 @@ impl FileStore {
             self.root = handle(file, self.root_slot);
         }
         if self.kinds.len() != self.headers.len() {
-            self.kinds = self.headers.iter().map(|h| h.kind).collect();
+            self.set_kinds_and_facts(|_| {});
         }
-        if self.resolved.len() != self.headers.len() {
+        if !self.facts.alias_free && self.resolved.len() != self.headers.len() {
             self.resolved = self.resolved_table(file);
         }
     }
@@ -902,10 +1307,12 @@ impl FileStore {
     fn publish_work(&self) -> usize {
         let slots = self.headers.len();
         let mut work = PUBLISH_WORK_PER_STORE;
-        if self.kinds.len() != slots {
+        // `facts` is valid only when `kinds` is made.
+        let kinds_made = self.kinds.len() == slots;
+        if !kinds_made {
             work += slots;
         }
-        if self.resolved.len() != slots {
+        if self.resolved.len() != slots && !(kinds_made && self.facts.alias_free) {
             work += slots;
         }
         work
@@ -1046,7 +1453,17 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
         headers: stores.iter().map(|s| &s.headers[..]).collect(),
         nodes: stores.iter().map(|s| &s.nodes[..]).collect(),
         kinds: stores.iter().map(|s| &s.kinds[..]).collect(),
-        resolved: stores.iter().map(|s| &s.resolved[..]).collect(),
+        names: stores.iter().map(|s| &s.names[..]).collect(),
+        modifier_bits: stores.iter().map(|s| &s.modifier_bits[..]).collect(),
+        per_store: stores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| FrozenStore {
+                resolved: &s.resolved[..],
+                nil: resolve_slot(base + i, NIL_SLOT as usize, &s.nodes, &s.headers),
+                facts: s.facts,
+            })
+            .collect(),
         go_files: go_files.into_boxed_slice(),
         legacy,
     };
@@ -1359,11 +1776,63 @@ pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
 fn try_resolve_store_id_slow(file: usize, index: usize) -> Option<Node> {
     let resolve = |s: &FileStore| resolve_slot(file, index, &s.nodes, &s.headers);
     match FROZEN.get() {
-        Some(f) => match f.resolved.get(file) {
-            Some(resolved) => Some(resolved[index]),
+        Some(f) => match f.per_store.get(file) {
+            Some(s) => Some(frozen_resolve_slot(f, s, file, index)),
             None => after_tier0_miss(f, file, resolve),
         },
         None => inactive_build_store(file).map(|store| resolve(&store.borrow())),
+    }
+}
+
+/// The text in the data of an Identifier or PrivateIdentifier node. Empty
+/// for a store node made by `alloc_store_name_node` (see
+/// `store_identifier_name`) and for other kinds.
+fn identifier_text(node: &ts_ast::Node) -> &str {
+    match &node.data {
+        NodeData::Identifier(d) => &d.text,
+        NodeData::PrivateIdentifier(d) => &d.text,
+        _ => "",
+    }
+}
+
+/// U1 (d): Go `node.Text()` of an Identifier or PrivateIdentifier store
+/// node, from the name column of its slot (`FileStore::names`, or
+/// `build_names` while the file is parsed), in tier 0, tier 1 or an
+/// unpublished store of this thread. `None` for nil, synthetic and legacy
+/// nodes. `Name::default()` (the empty text) for other slots.
+#[inline]
+#[must_use]
+pub fn store_identifier_name(n: Node) -> Option<Name> {
+    if n.is_nil() {
+        return None;
+    }
+    let (file, index) = (n.file_index(), slot_index(n));
+    if let Some(f) = FROZEN.get()
+        && let Some(names) = f.names.get(file)
+    {
+        return Some(names[index].clone());
+    }
+    store_identifier_name_slow(file, index)
+}
+
+/// `store_identifier_name` for a node that is not in tier 0: a tier 1
+/// store, or an unpublished (built or detached) store of this thread.
+// PORT: the name column is the only copy of the text, so every store that
+// a thread can read must answer here, not only tier 0.
+#[inline(never)]
+fn store_identifier_name_slow(file: usize, index: usize) -> Option<Name> {
+    let read = |s: &FileStore| {
+        // A finished file has moved `build_names` into `names`.
+        let names = if s.names.len() == s.headers.len() {
+            &s.names[..]
+        } else {
+            &s.build_names[..]
+        };
+        names[index].clone()
+    };
+    match FROZEN.get() {
+        Some(tier0) => after_tier0_miss(tier0, file, read),
+        None => with_thread_store(file, read),
     }
 }
 
@@ -1382,11 +1851,44 @@ fn resolve_slot(
 }
 
 /// `try_resolve_store_id(file, _)` for every slot of tier 0 store `file`,
-/// indexed by `NodeId::index()`. `None` for any other file.
+/// indexed by `NodeId::index()`. `None` for any other file and for an
+/// alias-free store, which has no table (`Node::new` resolves its ids
+/// without one).
 #[inline]
 #[must_use]
 pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
-    FROZEN.get()?.resolved.get(file).copied()
+    let s = FROZEN.get()?.per_store.get(file)?;
+    (!s.facts.alias_free).then_some(s.resolved)
+}
+
+/// Hook for `Node::new(file, id)` on a tier 0 store: `try_resolve_store_id(
+/// file, id)` without a per-slot table load for an alias-free store. `None`
+/// for any other file (tier 1, unpublished, synthetic or legacy).
+#[inline]
+#[must_use]
+pub fn frozen_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+    let f = FROZEN.get()?;
+    let s = f.per_store.get(file)?;
+    Some(frozen_resolve_slot(f, s, file, id.index()))
+}
+
+/// The `StoreFacts` of tier 0 store `file`. `None` for any other file.
+#[inline]
+#[must_use]
+pub fn frozen_store_facts(file: usize) -> Option<StoreFacts> {
+    FROZEN.get()?.per_store.get(file).map(|s| s.facts)
+}
+
+/// The `StoreFacts` of the store of `n` when it is a tier 0 store node.
+/// `None` for any other node: nil, synthetic, legacy, tier 1 and
+/// unpublished store nodes.
+#[inline]
+#[must_use]
+pub fn frozen_node_store_facts(n: Node) -> Option<StoreFacts> {
+    if n.is_nil() {
+        return None;
+    }
+    frozen_store_facts(n.file_index())
 }
 
 /// Go `SourceFile.ECMALineMap()` of published store file `file`. It is
@@ -1423,6 +1925,114 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
     headers[slot_index(n)]
         .source_file_is_root
         .then(|| f.stores[file].root)
+}
+
+/// U1 (a): Go `node.Text()` of a tier 0 Identifier or PrivateIdentifier
+/// store node, interned when its slot was made (`FileStore::names`).
+/// `None` for other kinds and for any other node: nil, synthetic, legacy,
+/// tier 1 and unpublished store nodes.
+#[inline]
+#[must_use]
+pub fn frozen_store_text_name(n: Node) -> Option<Name> {
+    if n.is_nil() {
+        return None;
+    }
+    let f = FROZEN.get()?;
+    let (file, index) = (n.file_index(), slot_index(n));
+    match f.kinds.get(file)?[index] {
+        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
+            Some(f.names[file][index].clone())
+        }
+        _ => None,
+    }
+}
+
+/// U1 (a): Go `scanner.GetIdentifierToken(node.Text()) != KindIdentifier` of
+/// a tier 0 Identifier or PrivateIdentifier store node, from its header.
+/// `None` as for `frozen_store_text_name`.
+#[inline]
+#[must_use]
+pub fn frozen_store_text_is_keyword(n: Node) -> Option<bool> {
+    let h = frozen_header(n)?;
+    matches!(
+        h.kind,
+        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+    )
+    .then_some(h.text_is_keyword)
+}
+
+/// U1 (b): Go `node.ModifierFlags()` (the flags of the node's own modifier
+/// list) of a tier 0 store node, from `FileStore::modifier_bits`. `None`
+/// for a store whose column is empty and for any other node: nil,
+/// synthetic, legacy, tier 1 and unpublished store nodes.
+#[inline]
+#[must_use]
+pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
+    if n.is_nil() {
+        return None;
+    }
+    let bits = FROZEN.get()?.modifier_bits.get(n.file_index())?;
+    bits.get(slot_index(n))
+        .map(|&bits| ModifierFlags(u32::from(bits)))
+}
+
+/// U1 (c): how `Node::new(file, id)` maps the child ids of one tier 0 store,
+/// read once for a loop over many ids (`NodeSliceIter`).
+#[derive(Clone, Copy, Debug)]
+pub enum FrozenIds {
+    /// A store with alias slots: its resolved table (`FrozenStore::resolved`).
+    Table(&'static [Node]),
+    /// An alias-free store: id 0 is `nil` (what slot 0 resolves to), and
+    /// any other id is the handle `base | (id + 1)`, `base` = `file << 32`.
+    Direct { base: u64, nil: Node },
+}
+
+impl FrozenIds {
+    /// `Node::new(file, id)` for the store this value was read for.
+    #[inline]
+    #[must_use]
+    pub fn node(self, id: ts_ast::NodeId) -> Node {
+        match self {
+            FrozenIds::Table(resolved) => resolved[id.index()],
+            FrozenIds::Direct { base, nil } => {
+                if id.index() == NIL_SLOT as usize {
+                    nil
+                } else {
+                    Node(base | (id.index() as u64 + 1))
+                }
+            }
+        }
+    }
+}
+
+/// U1 (c): the `FrozenIds` of tier 0 store `file`. `None` for any other
+/// file (tier 1, unpublished, synthetic or legacy).
+#[inline]
+#[must_use]
+pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
+    let s = FROZEN.get()?.per_store.get(file)?;
+    Some(if s.facts.alias_free {
+        FrozenIds::Direct {
+            base: (file as u64) << 32,
+            nil: s.nil,
+        }
+    } else {
+        FrozenIds::Table(s.resolved)
+    })
+}
+
+/// U1 (e): capacity hints for binding published store file `file`
+/// (`NodeBindBuilder` entries, flow nodes), tier 0 or tier 1. `None` for an
+/// unpublished store and a file without a store.
+#[must_use]
+pub fn frozen_store_bind_estimate(file: usize) -> Option<(usize, usize)> {
+    let tier0 = FROZEN.get()?;
+    let store = match tier0.stores.get(file) {
+        Some(store) => store,
+        None => later_store(tier0, file)?,
+    };
+    let e = store.bind_estimate;
+    Some((e.entries as usize, e.flow_nodes as usize))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1498,29 +2108,51 @@ pub fn try_set_store_node_parent(n: Node, parent: Node) -> bool {
 /// Go `node.Parent = parent` on a node of an unfrozen file.
 pub fn set_store_node_parent(n: Node, parent: Node) {
     let parent = NodeHeader::stored_parent(n.file_index(), parent);
-    with_slot_mut(n, |_, h| h.parent = parent);
+    with_slot_mut(n, |h| h.parent = parent);
 }
 
 /// Go `node.Loc = loc` on a node of an unfrozen file.
 pub fn set_store_node_loc(n: Node, loc: TextRange) {
-    with_slot_mut(n, |_, h| h.loc = loc);
+    with_slot_mut(n, |h| h.loc = loc);
 }
 
 /// Go `node.Flags = flags` on a node of an unfrozen file.
 pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
-    with_slot_mut(n, |_, h| h.flags = flags);
+    with_slot_mut(n, |h| h.flags = flags);
 }
 
 /// Go write to a data field of a node of an unfrozen file (reparser.go,
 /// `internIdentifier`). The new data replaces the old; the old node leaks.
+/// The U1 build entries and the keyword bit of the slot follow the new data.
 pub fn replace_store_node_data(n: Node, data: NodeData) {
-    with_slot_mut(n, |node, _| {
+    with_store_mut(n.file_index(), |s| {
+        assert!(!s.frozen, "cannot mutate a node of a finished file");
+        let index = slot_index(n);
+        let Some(old) = s.nodes[index] else {
+            panic!("store handle does not name a node slot");
+        };
         debug_assert!(
-            data.matches_syntax_kind(node.kind),
+            data.matches_syntax_kind(old.kind),
             "{:?} does not fit its NodeData",
-            node.kind
+            old.kind
         );
-        *node = leak_ast_node(node.kind, data);
+        let node = leak_ast_node(old.kind, data);
+        s.nodes[index] = Some(node);
+        // The same code as `alloc_store_node`, on the header kind (the kind
+        // `debug_check_text_names` and `modifier_bits_column` read).
+        let kind = s.headers[index].kind;
+        // PORT: U1 (d). Data cloned from a store identifier has an empty text
+        // (`alloc_store_name_node`), so an empty text keeps the slot name. A
+        // new text replaces it. Go writes no empty identifier text here.
+        let keeps_name = matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
+            && identifier_text(node).is_empty();
+        if !keeps_name {
+            let (name, text_is_keyword) = s.slot_text_name(kind, node, None);
+            s.headers[index].text_is_keyword = text_is_keyword;
+            s.build_names[index] = name;
+        }
+        let modifier_bits = s.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
+        s.build_modifier_bits[index] = modifier_bits;
     });
 }
 
@@ -1544,8 +2176,11 @@ thread_local! {
 }
 
 /// Moves `value` into this thread's leaked AST arena.
+// PERF: U1 (b). Only the arena reference comes out of the out-of-line
+// `LocalKey::with`, so `value` is not copied through its closure.
 pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
-    AST_ARENA.with(|arena| &*arena.alloc(value))
+    let arena: &'static bumpalo::Bump = AST_ARENA.with(|a| *a);
+    arena.alloc(value)
 }
 
 /// Sets the size of the first chunk of this thread's AST arena (1 MiB by
@@ -1582,22 +2217,52 @@ fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
 /// Go `newNode(kind, data, hooks)` in store `file`: `Loc =
 /// UndefinedTextRange()`, nil parent, no flags.
 pub fn alloc_store_node(file: usize, kind: SyntaxKind, data: NodeData) -> Node {
+    alloc_store_slot(file, kind, data, None)
+}
+
+/// `alloc_store_node` for an Identifier or PrivateIdentifier with Go text
+/// `text`, whose `data` has an empty text: the name column of the slot
+/// holds the text (`store_identifier_name`).
+// PERF: U1 (d). The node data needs no `String` for the text.
+pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: NodeData, text: &str) -> Node {
+    debug_assert!(
+        matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier),
+        "{kind:?} is not a name kind"
+    );
+    alloc_store_slot(file, kind, data, Some(text))
+}
+
+/// `alloc_store_node` with the name text `text` (`slot_text_name`).
+#[inline]
+fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<&str>) -> Node {
     debug_assert!(
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
     let node = leak_ast_node(kind, data);
+    debug_assert!(
+        text.is_none() || identifier_text(node).is_empty(),
+        "a name node keeps its text in the name column"
+    );
+    // PERF: U1 (b). Read while the new data is hot, not at freeze.
+    let modifier_bits = super::node::store_node_modifier_bits(kind, node);
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.headers.len() as u32;
+        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
         s.headers.push(NodeHeader {
             parent: Node::NIL,
             loc: TextRange::undefined(),
             flags: NodeFlags::NONE,
             kind,
             source_file_is_root: false,
+            text_is_keyword,
         });
         s.nodes.push(Some(node));
+        s.build_names.push(name);
+        let modifier_bits = s.slot_modifier_bits(modifier_bits);
+        s.build_modifier_bits.push(modifier_bits);
+        s.debug_assert_build_columns();
         handle(file, index)
     })
 }
@@ -1620,6 +2285,9 @@ pub fn store_child_id(file: usize, n: Node) -> ts_ast::NodeId {
         let index = s.headers.len() as u32;
         s.headers.push(NodeHeader::target(n));
         s.nodes.push(None);
+        s.build_names.push(Name::default());
+        s.build_modifier_bits.push(0);
+        s.debug_assert_build_columns();
         s.aliases.insert(n, index);
         ts_ast::NodeId::new(index)
     })
@@ -1652,28 +2320,79 @@ fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> ts_ast::NodeList {
     }
 }
 
+/// U1 (e): a list that the parser made in a store and that no node data
+/// holds yet: what a pending `NodeList` handle names. Its ids live in the
+/// AST bump arena. `store_list_value` builds the ts_ast list from it, once
+/// for each node data that stores it.
+#[derive(Debug)]
+pub struct PendingList {
+    /// Go `list.Loc` in ts_ast form (`ts_range`).
+    pub(crate) range: ts_core::TextRange,
+    /// The store ids of the nodes (`store_child_id`).
+    pub(crate) nodes: &'static [ts_ast::NodeId],
+    /// The ts_ast bit (`NodeList::stored_trailing_comma`).
+    pub(crate) has_trailing_comma: bool,
+}
+
+impl PendingList {
+    /// A pending list of store `file` over `nodes`, at `loc`. Makes the
+    /// alias slots of the nodes in order, as `ts_list` does.
+    fn new(file: usize, nodes: &[Node], loc: TextRange) -> Self {
+        let arena: &'static bumpalo::Bump = AST_ARENA.with(|a| *a);
+        Self {
+            range: ts_range(loc),
+            nodes: arena.alloc_slice_fill_iter(nodes.iter().map(|&n| store_child_id(file, n))),
+            has_trailing_comma: false,
+        }
+    }
+
+    /// The ts_ast list with the same range, ids and bit.
+    fn to_ts(&self) -> ts_ast::NodeList {
+        ts_ast::NodeList {
+            range: self.range,
+            nodes: self.nodes.to_vec(),
+            has_trailing_comma: self.has_trailing_comma,
+        }
+    }
+}
+
+/// U1 (e): the `PendingList` of a modifier list, with Go
+/// `ModifiersToFlags(nodes)`.
+#[derive(Debug)]
+pub struct PendingModifierList {
+    pub(crate) list: PendingList,
+    pub(crate) flags: ts_ast::ModifierFlags,
+}
+
+impl PendingModifierList {
+    /// The ts_ast modifier list with the same list and flags.
+    fn to_ts(&self) -> ts_ast::ModifierList {
+        ts_ast::ModifierList {
+            list: self.list.to_ts(),
+            flags: self.flags,
+        }
+    }
+}
+
 /// Go `f.NewNodeList(nodes)` followed by `list.Loc = loc`, in store `file`.
+// PERF: U1 (e). A pending handle: the ids go into the AST bump arena, not
+// into a `Vec` that `store_list_value` copied again (two mallocs, and the
+// first copy leaked).
 #[must_use]
 pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeList {
-    let list: &'static ts_ast::NodeList = leak_in_ast_arena(ts_list(file, nodes, loc));
-    NodeList {
-        file: file as u32,
-        list: Some(list),
-    }
+    NodeList::pending(file, leak_in_ast_arena(PendingList::new(file, nodes, loc)))
 }
 
 /// Go `f.NewModifierList(nodes)` followed by `list.Loc = loc`, in store
 /// `file`. `ModifierFlags = ModifiersToFlags(nodes)` as in Go.
+// PERF: U1 (e), as `new_store_node_list`.
 #[must_use]
 pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list: &'static ts_ast::ModifierList = leak_in_ast_arena(ts_ast::ModifierList {
-        list: ts_list(file, nodes, loc),
+    let list = leak_in_ast_arena(PendingModifierList {
+        list: PendingList::new(file, nodes, loc),
         flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
     });
-    ModifierList {
-        file: file as u32,
-        list: Some(list),
-    }
+    ModifierList::pending(file, list)
 }
 
 /// A list value to store inside new `NodeData` of store `file`. Go stores
@@ -1686,9 +2405,14 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<ts_ast::NodeList>
     if list.is_nil() {
         return None;
     }
-    let l = list.list?;
-    if list.file as usize == file {
-        return Some(l.clone());
+    if list.file() == file {
+        // U1 (e): the ts_ast list of a pending list is made here, once.
+        if let Some(p) = list.pending_list() {
+            return Some(p.to_ts());
+        }
+        if let Some(l) = list.ts_list() {
+            return Some(l.clone());
+        }
     }
     let nodes = list.nodes().to_vec();
     Some(ts_list(file, &nodes, list.loc()))
@@ -1712,9 +2436,17 @@ pub fn store_req_list_value(file: usize, list: NodeList) -> ts_ast::NodeList {
 /// A modifier list value to store inside new `NodeData` of store `file`.
 #[must_use]
 pub fn store_modifiers_value(file: usize, modifiers: ModifierList) -> Option<ts_ast::ModifierList> {
-    let m = modifiers.list?;
-    if modifiers.file as usize == file {
-        return Some(m.clone());
+    if modifiers.is_nil() {
+        return None;
+    }
+    if modifiers.file() == file {
+        // U1 (e): as in `store_list_value`.
+        if let Some(p) = modifiers.pending_list() {
+            return Some(p.to_ts());
+        }
+        if let Some(m) = modifiers.ts_list() {
+            return Some(m.clone());
+        }
     }
     let nodes = modifiers.nodes().to_vec();
     Some(ts_ast::ModifierList {
@@ -1727,7 +2459,15 @@ pub fn store_modifiers_value(file: usize, modifiers: ModifierList) -> Option<ts_
 #[inline]
 #[must_use]
 pub fn is_nil_list_marker(l: &ts_ast::NodeList) -> bool {
-    l.range.start.get() == NIL_LIST_POS && l.range.end.get() == NIL_LIST_POS
+    is_nil_list_range(&l.range)
+}
+
+/// True when `range` is the range of a Go `nil` marker list
+/// (`NIL_LIST_POS`).
+#[inline]
+#[must_use]
+pub fn is_nil_list_range(range: &ts_core::TextRange) -> bool {
+    range.start.get() == NIL_LIST_POS && range.end.get() == NIL_LIST_POS
 }
 
 #[cfg(test)]
@@ -1768,6 +2508,139 @@ mod tests {
 
         freeze_file_store(file);
         assert!(std::panic::catch_unwind(|| set_node_parent(b, q)).is_err());
+    }
+
+    #[test]
+    fn freeze_makes_the_name_and_modifier_columns() {
+        let file = new_file_store("/c.ts", "");
+        let f = NodeFactory::for_file(file);
+        let keyword = f.new_identifier("await");
+        let plain = f.new_identifier("b");
+        let private = f.new_private_identifier("#c");
+        let export = f.new_modifier(SyntaxKind::ExportKeyword);
+        let declare = f.new_modifier(SyntaxKind::DeclareKeyword);
+        let modifiers = f.new_modifier_list(&[export, declare]);
+        let list = f.new_variable_declaration_list(NodeList::NIL, NodeFlags::NONE);
+        let statement = f.new_variable_statement(modifiers, list);
+        freeze_file_store(file);
+
+        with_store(file, |s| {
+            let names = |n: Node| s.names[slot_index(n)].clone();
+            assert_eq!(names(keyword), Name::from("await"));
+            assert_eq!(names(plain), Name::from("b"));
+            assert_eq!(names(private), Name::from("#c"));
+            assert_eq!(names(statement), Name::default());
+            let is_keyword = |n: Node| s.headers[slot_index(n)].text_is_keyword;
+            assert!(is_keyword(keyword));
+            assert!(!is_keyword(plain));
+            assert!(!is_keyword(private));
+            let bits = |n: Node| u32::from(s.modifier_bits[slot_index(n)]);
+            assert_eq!(
+                bits(statement),
+                (ModifierFlags::EXPORT | ModifierFlags::AMBIENT).0
+            );
+            assert_eq!(bits(list), 0);
+            assert_eq!(bits(export), 0);
+        });
+    }
+
+    #[test]
+    fn replaced_data_updates_the_name_and_modifier_columns() {
+        let file = new_file_store("/d.ts", "");
+        let f = NodeFactory::for_file(file);
+        let id = f.new_identifier("a");
+        let export = f.new_modifier(SyntaxKind::ExportKeyword);
+        let modifiers = f.new_modifier_list(&[export]);
+        let list = f.new_variable_declaration_list(NodeList::NIL, NodeFlags::NONE);
+        let statement = f.new_variable_statement(modifiers, list);
+        with_store(file, |s| {
+            assert_eq!(s.build_names[slot_index(id)], Name::from("a"));
+            assert_ne!(s.build_modifier_bits[slot_index(statement)], 0);
+        });
+
+        let mut data = store_ast_node(id).data.clone();
+        if let NodeData::Identifier(d) = &mut data {
+            d.text = "await".to_string();
+        }
+        replace_store_node_data(id, data);
+        let mut data = store_ast_node(statement).data.clone();
+        if let NodeData::VariableStatement(d) = &mut data {
+            d.modifiers = None;
+        }
+        replace_store_node_data(statement, data);
+        freeze_file_store(file);
+
+        with_store(file, |s| {
+            assert_eq!(s.names[slot_index(id)], Name::from("await"));
+            assert!(s.headers[slot_index(id)].text_is_keyword);
+            assert_eq!(s.modifier_bits[slot_index(statement)], 0);
+        });
+    }
+
+    #[test]
+    fn store_identifier_text_lives_in_the_name_column() {
+        let file = new_file_store("/e.ts", "");
+        let f = NodeFactory::for_file(file);
+        let id = f.new_identifier("abc");
+        let private = f.new_private_identifier("#p");
+        let missing = f.new_identifier("");
+        assert!(identifier_text(store_ast_node(id)).is_empty());
+        assert_eq!(id.text(), "abc");
+        assert_eq!(private.text(), "#p");
+        assert_eq!(missing.text(), "");
+        // Data cloned from a store identifier has no text; the name stays.
+        replace_store_node_data(id, store_ast_node(id).data.clone());
+        assert_eq!(id.text(), "abc");
+        // A synthetic identifier keeps its text in the data.
+        assert_eq!(NodeFactory::new().new_identifier("syn").text(), "syn");
+        freeze_file_store(file);
+        assert_eq!(id.text(), "abc");
+        assert_eq!(missing.text(), "");
+    }
+
+    #[test]
+    fn pending_lists_are_built_once_into_node_data() {
+        assert_eq!(std::mem::size_of::<NodeList>(), 16);
+        assert_eq!(std::mem::size_of::<ModifierList>(), 16);
+        let file = new_file_store("/f.ts", "");
+        let f = NodeFactory::for_file(file);
+        let a = f.new_identifier("a");
+        let list = f.new_node_list_with_loc(&[a], TextRange::new(1, 4));
+        assert!(list.pending_list().is_some());
+        assert_eq!(list, list);
+        assert_eq!(list.nodes().get(0), a);
+        assert_eq!(list.loc(), TextRange::new(1, 4));
+        let decls = f.new_variable_declaration_list(list, NodeFlags::NONE);
+        let stored = decls.declarations();
+        assert!(stored.ts_list().is_some());
+        assert_eq!(stored, decls.declarations());
+        assert_ne!(stored, list);
+        assert_eq!(stored.nodes().get(0), a);
+        assert_eq!(stored.loc(), TextRange::new(1, 4));
+
+        let export = f.new_modifier(SyntaxKind::ExportKeyword);
+        let modifiers = f.new_modifier_list(&[export]);
+        assert!(modifiers.pending_list().is_some());
+        assert_eq!(modifiers.modifier_flags(), ModifierFlags::EXPORT);
+        let statement = f.new_variable_statement(modifiers, decls);
+        assert_eq!(
+            statement.modifiers().modifier_flags(),
+            ModifierFlags::EXPORT
+        );
+        assert_ne!(statement.modifiers(), modifiers);
+
+        let empty = f.new_node_list_with_loc(&[], TextRange::new(2, 2));
+        let missing = empty.with_missing_marker();
+        assert!(!crate::frontend::parser::parser_p1::is_missing_node_list(
+            empty
+        ));
+        assert!(crate::frontend::parser::parser_p1::is_missing_node_list(
+            missing
+        ));
+        let holder = f.new_variable_declaration_list(missing, NodeFlags::NONE);
+        assert!(crate::frontend::parser::parser_p1::is_missing_node_list(
+            holder.declarations()
+        ));
     }
 
     #[test]

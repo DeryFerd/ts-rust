@@ -2,11 +2,10 @@
 //! fswatch uses. There is no Go file for this module in typescript-go.
 //!
 //! PORT: D-W1 allows a safe syscall crate. The inotify, pipe, poll, read,
-//! write, close, open, getdents and lstat calls go through `rustix` (already
-//! a dependency, safe API) or `std`. No `libc`, no `unsafe`. rustix has no
-//! fanotify, `name_to_handle_at` or `statfs` wrapper that fswatch can use, so
-//! those calls stay `unported!` and fanotify is never available: Linux uses
-//! the inotify backend, which is Go's choice when `fanotify_init` fails.
+//! write, close, open, getdents, lstat and statfs calls go through `rustix`
+//! (safe API) or `std`. rustix has no fanotify or `name_to_handle_at`, so
+//! fanotify goes through `nix::sys::fanotify` and `name_to_handle_at` through
+//! the `name-to-handle-at` crate (both safe APIs). No `libc`, no `unsafe`.
 //! Every syscall keeps its Go name, parameters and result. Types, constants
 //! and errno values are the Go values (zerrors_linux.go,
 //! zerrors_linux_amd64.go, ztypes_linux.go, ztypes_linux_amd64.go). A Go
@@ -19,11 +18,7 @@
 
 use crate::fswatch::prelude::*;
 use crate::gostd::errors;
-
-/// PORT: true while the fanotify syscalls below are `unported!` (D-W1).
-/// Go's probe `fanotifyAvailable` reads it to give Go's "syscall failed"
-/// result without reaching unported code.
-pub const FANOTIFY_UNPORTED: bool = true;
+use std::os::fd::AsFd;
 
 // ---------------------------------------------------------------------------
 // Errno (Go syscall.Errno)
@@ -46,18 +41,30 @@ pub const EWOULDBLOCK: Errno = Errno(0xb);
 impl Errno {
     // Go: syscall/syscall_unix.go Errno.Error (go1.26)
     // PORT: Go's table has every errno; the port lists the ones fswatch
-    // names (zerrors_linux_amd64.go `errorList`).
+    // names and the ones fanotify_init, fanotify_mark, name_to_handle_at and
+    // statfs can return (go1.26 syscall/zerrors_linux_amd64.go `errors`).
     pub fn error(&self) -> String {
         let s = match self.0 {
+            0x1 => "operation not permitted",
             0x2 => "no such file or directory",
             0x4 => "interrupted system call",
+            0x5 => "input/output error",
             0x9 => "bad file descriptor",
-            0x18 => "too many open files",
-            0x1c => "no space left on device",
             0xb => "resource temporarily unavailable",
+            0xc => "cannot allocate memory",
             0xd => "permission denied",
+            0xe => "bad address",
+            0x11 => "file exists",
+            0x12 => "invalid cross-device link",
+            0x13 => "no such device",
             0x14 => "not a directory",
             0x16 => "invalid argument",
+            0x18 => "too many open files",
+            0x1c => "no space left on device",
+            0x24 => "file name too long",
+            0x26 => "function not implemented",
+            0x28 => "too many levels of symbolic links",
+            0x4b => "value too large for defined data type",
             0x5f => "operation not supported",
             _ => "",
         };
@@ -363,18 +370,47 @@ impl FileHandle {
 // with EBADF, as the kernel does for a closed fd. `poll`, `read` and `write`
 // hold their own reference, so a concurrent `close` takes effect when they
 // return.
-static FDS: std::sync::LazyLock<
-    std::sync::Mutex<FxHashMap<i32, std::sync::Arc<std::os::fd::OwnedFd>>>,
-> = std::sync::LazyLock::new(Default::default);
+static FDS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<i32, std::sync::Arc<ShimFd>>>> =
+    std::sync::LazyLock::new(Default::default);
 
-fn register_fd(fd: std::os::fd::OwnedFd) -> i32 {
+// PORT: an fd in `FDS`. A fanotify group keeps its `nix` `Fanotify`, because
+// `fanotify_mark` needs the `Fanotify::mark` method and safe code cannot make
+// a `Fanotify` again from an `OwnedFd`.
+enum ShimFd {
+    Owned(std::os::fd::OwnedFd),
+    Fanotify(nix::sys::fanotify::Fanotify),
+}
+
+impl AsFd for ShimFd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            ShimFd::Owned(fd) => fd.as_fd(),
+            ShimFd::Fanotify(f) => f.as_fd(),
+        }
+    }
+}
+
+impl From<std::os::fd::OwnedFd> for ShimFd {
+    fn from(fd: std::os::fd::OwnedFd) -> Self {
+        ShimFd::Owned(fd)
+    }
+}
+
+impl From<nix::sys::fanotify::Fanotify> for ShimFd {
+    fn from(f: nix::sys::fanotify::Fanotify) -> Self {
+        ShimFd::Fanotify(f)
+    }
+}
+
+fn register_fd(fd: impl Into<ShimFd>) -> i32 {
     use std::os::fd::AsRawFd;
-    let n = fd.as_raw_fd();
+    let fd = fd.into();
+    let n = fd.as_fd().as_raw_fd();
     FDS.lock().unwrap().insert(n, std::sync::Arc::new(fd));
     n
 }
 
-fn lookup_fd(fd: i32) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, GoError> {
+fn lookup_fd(fd: i32) -> Result<std::sync::Arc<ShimFd>, GoError> {
     FDS.lock()
         .unwrap()
         .get(&fd)
@@ -384,6 +420,14 @@ fn lookup_fd(fd: i32) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, GoError> {
 
 fn errno_error(e: rustix::io::Errno) -> GoError {
     errors::from_value(Errno(e.raw_os_error() as usize))
+}
+
+fn nix_error(e: nix::errno::Errno) -> GoError {
+    errors::from_value(Errno(e as i32 as usize))
+}
+
+fn io_error(e: std::io::Error) -> GoError {
+    errors::from_value(Errno(e.raw_os_error().unwrap_or(EINVAL.0 as i32) as usize))
 }
 
 // Go: syscall_linux.go:139 Pipe2
@@ -525,9 +569,7 @@ fn dirent_type(t: rustix::fs::FileType) -> u8 {
 /// PORT: `std::fs::symlink_metadata` makes the same lstat(2) call.
 pub fn lstat(path: &str, stat: &mut Stat_t) -> Result<(), GoError> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).map_err(|e| {
-        errors::from_value(Errno(e.raw_os_error().unwrap_or(EINVAL.0 as i32) as usize))
-    })?;
+    let m = std::fs::symlink_metadata(path).map_err(io_error)?;
     *stat = Stat_t {
         dev: m.dev(),
         ino: m.ino(),
@@ -583,11 +625,23 @@ pub fn inotify_rm_watch(fd: i32, watchdesc: u32) -> Result<i32, GoError> {
 }
 
 // Go: zsyscall_linux.go:14 FanotifyInit
+/// PORT: `nix` `Fanotify::init` makes the same fanotify_init(2) call. nix
+/// names no FAN_REPORT_* flag, so the Go bits pass through
+/// `from_bits_retain`.
 pub fn fanotify_init(flags: u32, event_f_flags: u32) -> Result<i32, GoError> {
-    unported!("unix.FanotifyInit")
+    use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags};
+    let f = Fanotify::init(
+        InitFlags::from_bits_retain(flags),
+        EventFFlags::from_bits_retain(event_f_flags),
+    )
+    .map_err(nix_error)?;
+    Ok(register_fd(f))
 }
 
 // Go: syscall_linux.go:53 FanotifyMark
+/// PORT: `nix` `Fanotify::mark` makes the same fanotify_mark(2) call. Go
+/// passes a nil pathname for "", as `None` does here. An fd that is not a
+/// fanotify group fails with EINVAL, as in the kernel.
 pub fn fanotify_mark(
     fd: i32,
     flags: u32,
@@ -595,19 +649,80 @@ pub fn fanotify_mark(
     dir_fd: i32,
     pathname: &str,
 ) -> Result<(), GoError> {
-    unported!("unix.FanotifyMark")
+    use nix::sys::fanotify::{MarkFlags, MaskFlags};
+    let group = lookup_fd(fd)?;
+    let ShimFd::Fanotify(f) = &*group else {
+        return Err(errors::from_value(EINVAL));
+    };
+    let flags = MarkFlags::from_bits_retain(flags);
+    let mask = MaskFlags::from_bits_retain(mask);
+    let pathname = (!pathname.is_empty()).then_some(pathname);
+    let res = if dir_fd == AT_FDCWD {
+        f.mark(flags, mask, rustix::fs::CWD, pathname)
+    } else {
+        let dir = lookup_fd(dir_fd)?;
+        f.mark(flags, mask, &*dir, pathname)
+    };
+    res.map_err(nix_error)
 }
 
 // Go: syscall_linux.go:2370 NameToHandleAt
 /// NameToHandleAt wraps the name_to_handle_at system call; it obtains
 /// a handle for a path name.
 ///
-/// PORT: Go `(handle FileHandle, mountID int, err error)`.
+/// PORT: Go `(handle FileHandle, mountID int, err error)`. The
+/// `name-to-handle-at` crate makes the call. It asks for the handle size
+/// first where Go first tries a 32 byte buffer; the handle is the same. Go's
+/// `BytePtrFromString` fails with EINVAL for a NUL in `path`; the crate would
+/// cut the path there, so the port checks first.
 pub fn name_to_handle_at(dirfd: i32, path: &str, flags: i32) -> Result<(FileHandle, i32), GoError> {
-    unported!("unix.NameToHandleAt")
+    if path.contains('\0') {
+        return Err(errors::from_value(EINVAL));
+    }
+    let path = std::path::Path::new(path);
+    let (handle, mount_id) = if dirfd == AT_FDCWD {
+        ::name_to_handle_at::name_to_handle_at(&rustix::fs::CWD, path, flags)
+    } else {
+        let dir = lookup_fd(dirfd)?;
+        ::name_to_handle_at::name_to_handle_at(&*dir, path, flags)
+    }
+    .map_err(io_error)?;
+    let mount_id = match mount_id {
+        ::name_to_handle_at::MountId::Reusable(id) => id as i32,
+        ::name_to_handle_at::MountId::Unique(id) => id as i32,
+    };
+    Ok((
+        FileHandle {
+            handle_type: handle.handle_type,
+            handle: handle.handle,
+        },
+        mount_id,
+    ))
 }
 
 // Go: zsyscall_linux_amd64.go:357 Statfs
+/// PORT: `rustix::fs::statvfs` makes the same statfs(2) call. rustix keeps
+/// the kernel `f_fsid` as `val[0] | val[1] << 32` (u32 halves, rustix 1.1.5
+/// linux_raw backend), which gives back Go's `Fsid.Val`. `StatVfs` has no
+/// `f_type` or `f_spare`, so `type_` and `spare` stay zero; fswatch reads
+/// only `fsid`.
 pub fn statfs(path: &str, buf: &mut Statfs_t) -> Result<(), GoError> {
-    unported!("unix.Statfs")
+    let st = rustix::fs::statvfs(path).map_err(errno_error)?;
+    *buf = Statfs_t {
+        type_: 0,
+        bsize: st.f_bsize as i64,
+        blocks: st.f_blocks,
+        bfree: st.f_bfree,
+        bavail: st.f_bavail,
+        files: st.f_files,
+        ffree: st.f_ffree,
+        fsid: Fsid {
+            val: [st.f_fsid as u32 as i32, (st.f_fsid >> 32) as u32 as i32],
+        },
+        namelen: st.f_namemax as i64,
+        frsize: st.f_frsize as i64,
+        flags: st.f_flag.bits() as i64,
+        spare: [0; 4],
+    };
+    Ok(())
 }

@@ -7,10 +7,12 @@
 #
 # Steps:
 #   1. goport-profile build with -Cprofile-generate (instrumented).
-#   2. Training runs: goport on query, hono, zod, effect and elysia plus a
-#      spread of corpus cases, and goport_emit on query and hono.
+#   2. Training runs: goport and `tsgo --noEmit` on query, hono, zod, effect
+#      and elysia, goport on a spread of corpus cases, and goport_emit on
+#      query and hono.
 #   3. Merge the .profraw files with llvm-profdata.
-#   4. goport-profile build with -Cprofile-use. The binaries land in
+#   4. goport-profile build with -Cprofile-use. The binaries (goport,
+#      goport_emit, goport_build, goport_typesyms, tsgo) land in
 #      <out-dir>/target-use/goport.
 #
 # Environment:
@@ -27,8 +29,9 @@
 #   CARGO_FEATURES    extra cargo flags, for example "--features jemalloc".
 #                     Retrain when the allocator or hot code changes.
 #
-# The training runs only read project inputs: goport does not write, and
-# goport_emit writes to a temp --outDir.
+# The training runs only read project inputs: goport does not write,
+# goport_emit writes to a temp --outDir and tsgo writes the .tsbuildinfo of
+# the composite projects to a temp file.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,11 +80,13 @@ merged="$out/goport.profdata"
 rm -rf "$profiles"
 mkdir -p "$profiles"
 
+# Each step needs its own target (other RUSTFLAGS). sccache is off: it could
+# reuse an object built with an older profile at the same path.
 build() { # build <target-subdir> <rustflags>
   local target="$out/$1"
   echo "== build $1 ($2)"
   # shellcheck disable=SC2086
-  env CARGO_TARGET_DIR="$target" RUSTFLAGS="$2" \
+  env CARGO_TARGET_DIR="$target" TS_CARGO_SEPARATE_TARGET=1 TS_CARGO_SCCACHE=0 RUSTFLAGS="$2" \
     "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport --bins $features \
     > "$out/build-$1.log" 2>&1 || { tail -20 "$out/build-$1.log" >&2; exit 1; }
 }
@@ -107,6 +112,13 @@ for name in query hono zod effect elysia; do
 done
 emit_tmp="$(mktemp -d)"
 trap 'rm -rf "$emit_tmp"' EXIT
+for name in query hono zod effect elysia; do
+  buildinfo=()
+  [[ $name == hono || $name == effect ]] && buildinfo=(--tsBuildInfoFile "$emit_tmp/$name.tsbuildinfo")
+  s=$SECONDS
+  "$gen/tsgo" -p "${projects[$name]}" --noEmit "${buildinfo[@]}" > /dev/null 2>&1 || true
+  echo "train tsgo $name $((SECONDS - s))s"
+done
 for cfg in "${projects[query]}" "${projects[hono]}"; do
   "$gen/goport_emit" -p "$cfg" --outDir "$emit_tmp/out" > /dev/null 2>&1 || true
   rm -rf "$emit_tmp/out"
@@ -136,4 +148,4 @@ if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; th
   echo "error: rustc did not use the profile; the binaries are not PGO builds" >&2
   exit 1
 fi
-echo "PGO binaries: $out/target-use/goport/{goport,goport_emit,goport_build,goport_typesyms}"
+echo "PGO binaries: $out/target-use/goport/{goport,goport_emit,goport_build,goport_typesyms,tsgo}"

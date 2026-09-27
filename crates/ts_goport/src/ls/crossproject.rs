@@ -361,7 +361,9 @@ where
         let result =
             std::panic::catch_unwind(AssertUnwindSafe(|| self.process_item(item, response)));
         if let Err(r) = result {
-            let text = if let Some(s) = r.downcast_ref::<&str>() {
+            let text = if let Some(p) = r.downcast_ref::<crate::core::GoPanic>() {
+                p.message.clone()
+            } else if let Some(s) = r.downcast_ref::<&str>() {
                 (*s).to_string()
             } else if let Some(s) = r.downcast_ref::<String>() {
                 s.clone()

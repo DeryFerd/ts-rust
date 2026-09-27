@@ -2,11 +2,10 @@
 //! library package `runtime/pprof` (go1.26.4, the oracle's toolchain) that
 //! it calls.
 //!
-//! PORT: only `BeginProfiling` and `ProfileSession.Stop` are ported. They
-//! are the calls of `tscCompilation` and `tscBuildCompilation`
-//! (execute/execute_tsc.rs). `CPUProfiler`, `SaveHeapProfile`,
-//! `SaveAllocProfile` and `RunGC` serve the language server and are not
-//! ported.
+//! `BeginProfiling` and `ProfileSession.Stop` serve `tscCompilation` and
+//! `tscBuildCompilation` (execute/execute_tsc.rs). `CPUProfiler`,
+//! `SaveHeapProfile`, `SaveAllocProfile` and `RunGC` serve the language
+//! server (lsp/server.rs) and the API session (api/session_p1.rs).
 //!
 //! PORT: Go `runtime/pprof` builds its profiles from samples that the Go
 //! runtime takes: CPU samples on SIGPROF, and allocation samples every
@@ -19,13 +18,22 @@
 //! the file names, the file order and the printed lines are Go's. The pid,
 //! the times, the mappings and the profile bytes never match Go, like the
 //! memory statistics (execute/tsc/statistics.rs `read_mem_stats`).
+//!
+//! PORT: Go `runtime.GC()` has nothing to do in Rust (no garbage
+//! collector), so `run_gc` is a no-op. The `os` calls of the language
+//! server functions (`MkdirAll`, `Create`, `Remove`) give Go's error texts
+//! (`mkdir_all`, `path_error`).
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+use std::mem::ManuallyDrop;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
@@ -36,6 +44,7 @@ use crate::execute::tsc::compile::{Writer, write_str};
 // PORT: the paths are port forms of Go strings (see
 // `scanner_util::GO_STRING_MARKER`); the OS gets their Go bytes (`os_path`).
 use crate::frontend::vfs::osvfs::{filepath_clean, os_path};
+use crate::gostd::{GoError, errors};
 
 // Go: pprof/pprof.go:15 ProfileSession
 // PORT: `cpu_file` is `None` after Go `p.cpuFile.Close()`. `cpu_profile`
@@ -140,6 +149,275 @@ fn os_create(name: &str) -> File {
     }
 }
 
+// Go: pprof/pprof.go:69 CPUProfiler
+// CPUProfiler manages on-demand CPU profiling.
+// PORT: the session is `ManuallyDrop` because a Go session that nobody
+// stops stays open: a `CPUProfiler` that drops while profiling must not
+// stop the profile (`ProfileSession` stops when it drops).
+#[derive(Default)]
+pub struct CpuProfiler {
+    mu: Mutex<Option<ManuallyDrop<ProfileSession>>>,
+}
+
+impl CpuProfiler {
+    // Go: pprof/pprof.go:75 StartCPUProfile
+    // StartCPUProfile starts CPU profiling, writing to the specified directory when stopped.
+    pub fn start_cpu_profile(&self, profile_dir: &str) -> Result<(), GoError> {
+        let mut session = lock(&self.mu);
+
+        if session.is_some() {
+            return Err(errors::new("CPU profiling already in progress"));
+        }
+
+        if let Err(err) = mkdir_all(profile_dir, 0o755) {
+            return Err(wrap("failed to create profile directory", err));
+        }
+
+        let cpu_profile_path = profile_path(profile_dir, "cpuprofile");
+        let cpu_file = match create(&cpu_profile_path) {
+            Ok(file) => file,
+            Err(err) => return Err(wrap("failed to create CPU profile file", err)),
+        };
+
+        // Go: pprof.StartCPUProfile(cpuFile)
+        let cpu_profile = match start_cpu_profile() {
+            Ok(cpu_profile) => cpu_profile,
+            Err(err) => {
+                // Go: cpuFile.Close()
+                drop(cpu_file);
+                // Go: os.Remove(cpuProfilePath). Go ignores its error.
+                let _ = std::fs::remove_file(os_path(&cpu_profile_path));
+                return Err(wrap("failed to start CPU profile", errors::new(err)));
+            }
+        };
+
+        // Go: logWriter: io.Discard
+        let log_writer: Writer = Rc::new(RefCell::new(io::sink()));
+        *session = Some(ManuallyDrop::new(ProfileSession {
+            cpu_file_path: cpu_profile_path,
+            mem_file_path: String::new(),
+            cpu_file: Some(cpu_file),
+            log_writer,
+            cpu_profile: Some(cpu_profile),
+        }));
+        Ok(())
+    }
+
+    // Go: pprof/pprof.go:108 StopCPUProfile
+    // StopCPUProfile stops CPU profiling and returns the path to the profile file.
+    pub fn stop_cpu_profile(&self) -> Result<String, GoError> {
+        let mut session = lock(&self.mu);
+
+        let Some(stopped) = session.take() else {
+            return Err(errors::new("CPU profiling not in progress"));
+        };
+
+        let file_path = stopped.cpu_file_path.clone();
+        // Go: c.session.Stop(), then c.session = nil (the `take` above).
+        drop(ManuallyDrop::into_inner(stopped));
+
+        Ok(file_path)
+    }
+}
+
+// Go: pprof/pprof.go:124 SaveHeapProfile
+// SaveHeapProfile saves a heap profile to the specified directory.
+pub fn save_heap_profile(profile_dir: &str) -> Result<String, GoError> {
+    if let Err(err) = mkdir_all(profile_dir, 0o755) {
+        return Err(wrap("failed to create profile directory", err));
+    }
+
+    let heap_profile_path = profile_path(profile_dir, "heapprofile");
+    // Go: defer heapFile.Close(). The file closes when it drops.
+    let heap_file = match create(&heap_profile_path) {
+        Ok(file) => file,
+        Err(err) => return Err(wrap("failed to create heap profile file", err)),
+    };
+
+    run_gc();
+    // Go: pprof.Lookup("heap").WriteTo(heapFile, 0)
+    if let Err(err) = write_heap(&heap_file) {
+        // Go: os.Remove(heapProfilePath). Go ignores its error.
+        let _ = std::fs::remove_file(os_path(&heap_profile_path));
+        let err = path_error("write", &heap_profile_path, &err);
+        return Err(wrap("failed to write heap profile", err));
+    }
+
+    Ok(heap_profile_path)
+}
+
+// Go: pprof/pprof.go:146 SaveAllocProfile
+// SaveAllocProfile saves an allocation profile to the specified directory.
+pub fn save_alloc_profile(profile_dir: &str) -> Result<String, GoError> {
+    if let Err(err) = mkdir_all(profile_dir, 0o755) {
+        return Err(wrap("failed to create profile directory", err));
+    }
+
+    let alloc_profile_path = profile_path(profile_dir, "allocprofile");
+    // Go: defer allocFile.Close(). The file closes when it drops.
+    let alloc_file = match create(&alloc_profile_path) {
+        Ok(file) => file,
+        Err(err) => return Err(wrap("failed to create alloc profile file", err)),
+    };
+
+    // Go: pprof.Lookup("allocs").WriteTo(allocFile, 0)
+    if let Err(err) = write_alloc(&alloc_file) {
+        // Go: os.Remove(allocProfilePath). Go ignores its error.
+        let _ = std::fs::remove_file(os_path(&alloc_profile_path));
+        let err = path_error("write", &alloc_profile_path, &err);
+        return Err(wrap("failed to write alloc profile", err));
+    }
+
+    Ok(alloc_profile_path)
+}
+
+// Go: pprof/pprof.go:167 RunGC
+// RunGC triggers garbage collection.
+// PORT: Go `runtime.GC()`. Rust has no garbage collector, so there is
+// nothing to do.
+pub fn run_gc() {}
+
+// Go: filepath.Join(profileDir, fmt.Sprintf("%d-%d-<kind>.pb.gz", os.Getpid(),
+// time.Now().UnixMilli())). `profileDir` is not empty: `MkdirAll("")` fails
+// first.
+fn profile_path(profile_dir: &str, kind: &str) -> String {
+    let pid = std::process::id();
+    let ms = unix_milli(SystemTime::now());
+    filepath_clean(&format!("{profile_dir}/{pid}-{ms}-{kind}.pb.gz"))
+}
+
+// Go: fmt.Errorf("<text>: %w", err)
+fn wrap(text: &str, err: GoError) -> GoError {
+    errors::errorf(format!("{text}: {err}"), vec![err])
+}
+
+// PORT: Go `sync.Mutex.Lock`. A panic while the lock is held does not
+// poison a Go mutex.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------
+// Go standard library: os (go1.26.8)
+// ---------------------------------------------------------------------
+
+// Go: os/path.go:19 MkdirAll
+// MkdirAll creates a directory named path,
+// along with any necessary parents, and returns nil,
+// or else returns an error.
+// PORT: Go `Stat`, `Mkdir` and `Lstat` are `std::fs::metadata`,
+// `DirBuilder::create` and `std::fs::symlink_metadata`. There is no
+// volume name on Unix.
+fn mkdir_all(path: &str, perm: u32) -> Result<(), GoError> {
+    // Fast path: if we can tell whether path is a directory or file, stop with success or error.
+    if let Ok(dir) = std::fs::metadata(os_path(path)) {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        // Go: &PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+        return Err(errors::new(format!(
+            "mkdir {path}: {}",
+            errno_text(ENOTDIR)
+        )));
+    }
+
+    // Slow path: make sure parent exists and then call Mkdir for path.
+
+    // Extract the parent folder from path by first removing any trailing
+    // path separator and then scanning backward until finding a path
+    // separator or reaching the beginning of the string.
+    let p = path.as_bytes();
+    let mut i = p.len() as isize - 1;
+    while i >= 0 && p[i as usize] == b'/' {
+        i -= 1;
+    }
+    while i >= 0 && p[i as usize] != b'/' {
+        i -= 1;
+    }
+    if i < 0 {
+        i = 0;
+    }
+
+    // If there is a parent directory, and it is not the volume name,
+    // recurse to ensure parent directory exists.
+    let parent = &path[..i as usize];
+    if !parent.is_empty() {
+        mkdir_all(parent, perm)?;
+    }
+
+    // Parent now exists; invoke Mkdir and use its result.
+    if let Err(err) = DirBuilder::new().mode(perm).create(os_path(path)) {
+        // Handle arguments like "foo/." by
+        // double-checking that directory doesn't exist.
+        if std::fs::symlink_metadata(os_path(path)).is_ok_and(|dir| dir.is_dir()) {
+            return Ok(());
+        }
+        return Err(path_error("mkdir", path, &err));
+    }
+    Ok(())
+}
+
+// Go: os/file.go:399 Create, which returns `&PathError{Op: "open", ...}`.
+fn create(name: &str) -> Result<File, GoError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(os_path(name))
+        .map_err(|err| path_error("open", name, &err))
+}
+
+// Go: io/fs.PathError.Error, "op path: err", with the Go text of the errno.
+pub(crate) fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
+    let text = match err.raw_os_error() {
+        Some(errno) => errno_text(errno),
+        None => err.to_string(),
+    };
+    errors::new(format!("{op} {path}: {text}"))
+}
+
+// Go: syscall/zerrors_linux_amd64.go ENOTDIR
+const ENOTDIR: i32 = 0x14;
+
+// Go: syscall/syscall_unix.go:110 Errno.Error, with the texts of
+// syscall/zerrors_linux_amd64.go `errors`.
+// PORT: only the errnos that stat, mkdir, open, write and read can give.
+fn errno_text(errno: i32) -> String {
+    let text = match errno {
+        1 => "operation not permitted",
+        2 => "no such file or directory",
+        4 => "interrupted system call",
+        5 => "input/output error",
+        6 => "no such device or address",
+        9 => "bad file descriptor",
+        11 => "resource temporarily unavailable",
+        12 => "cannot allocate memory",
+        13 => "permission denied",
+        14 => "bad address",
+        16 => "device or resource busy",
+        17 => "file exists",
+        19 => "no such device",
+        20 => "not a directory",
+        21 => "is a directory",
+        22 => "invalid argument",
+        23 => "too many open files in system",
+        24 => "too many open files",
+        26 => "text file busy",
+        27 => "file too large",
+        28 => "no space left on device",
+        30 => "read-only file system",
+        31 => "too many links",
+        36 => "file name too long",
+        40 => "too many levels of symbolic links",
+        75 => "value too large for defined data type",
+        95 => "operation not supported",
+        122 => "disk quota exceeded",
+        _ => return format!("errno {errno}"),
+    };
+    text.to_string()
+}
+
 // ---------------------------------------------------------------------
 // Go standard library: runtime/pprof (go1.26.4)
 // ---------------------------------------------------------------------
@@ -194,6 +472,14 @@ fn stop_cpu_profile(b: ProfileBuilder, w: &File) {
         return;
     }
     let _ = b.build(w);
+}
+
+// Go: runtime/pprof/pprof.go:621 writeHeap
+// PORT: Go `pprof.Lookup("heap").WriteTo(w, 0)` calls it with debug 0, so
+// `writeHeapInternal` calls `writeHeapProto` with no default sample type
+// (see `write_alloc`).
+fn write_heap(w: &File) -> io::Result<()> {
+    write_heap_proto(w, MEM_PROFILE_RATE, "")
 }
 
 // Go: runtime/pprof/pprof.go:627 writeAlloc
@@ -533,6 +819,14 @@ fn unix_nano(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i64,
         Err(err) => -(err.duration().as_nanos() as i64),
+    }
+}
+
+// Go: time.Time.UnixMilli
+fn unix_milli(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(err) => -(err.duration().as_millis() as i64),
     }
 }
 

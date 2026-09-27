@@ -496,10 +496,9 @@ pub type TypeTestFn = Rc<dyn Fn(&mut Checker, TypeId) -> bool>;
 /// Go `func(*ast.Node) bool`.
 pub type NodeTestFn = Rc<dyn Fn(&mut Checker, Node) -> bool>;
 /// Go `func(location, name, meaning, nameNotFoundMessage, isUse, excludeGlobals) *ast.Symbol`.
-/// A nil Go message is `None`.
-pub type ResolveNameFn = Rc<
-    dyn Fn(&mut Checker, Node, &str, SymbolFlags, Option<&'static Message>, bool, bool) -> SymbolId,
->;
+/// A nil Go message is `None` (see `NameNotFound`).
+pub type ResolveNameFn =
+    Rc<dyn Fn(&mut Checker, Node, &str, SymbolFlags, Option<NameNotFound>, bool, bool) -> SymbolId>;
 /// Go `func(*ast.Symbol, *ast.Symbol) int`.
 pub type CompareSymbolsFn = Rc<dyn Fn(&mut Checker, SymbolId, SymbolId) -> i32>;
 /// Go `func([]*ast.Symbol, []*ast.Symbol) int`.
@@ -529,7 +528,7 @@ fn nil_resolve_name_fn() -> ResolveNameFn {
          _: Node,
          _: &str,
          _: SymbolFlags,
-         _: Option<&'static Message>,
+         _: Option<NameNotFound>,
          _: bool,
          _: bool|
          -> SymbolId { panic!("call of nil func") },
@@ -578,6 +577,76 @@ fn nil_iteration_types_resolver() -> Rc<IterationTypesResolver> {
         must_have_a_value_diagnostic:
             diag::The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property,
     })
+}
+
+/// The instantiation cache of one active mapper (an entry of Go
+/// `activeTypeMappersCaches`, keyed by a `keyBuilder` hash).
+// PERF: Go hashes a key with no alias from the type id and a 0 byte, a
+// bijection of the id, so `plain` keys it by the type id itself, in a
+// `FlatMap` with 8-byte entries (the key and value share a cache line). A
+// key with an alias stays a hashed key in `aliased`. The maps are never
+// iterated, so their layout cannot change any output.
+#[derive(Default)]
+pub struct ActiveMapperCache {
+    /// Written only through `insert_plain` and `clear_plain`, so
+    /// `plain_keys` stays in sync.
+    plain: FlatMap<TypeId, TypeId>,
+    /// The first keys put in `plain` since it was last empty, up to the
+    /// inline size. The list never spills to the heap.
+    plain_keys: smallvec::SmallVec<[TypeId; 8]>,
+    pub aliased: CacheKeyMap<TypeId>,
+}
+
+impl ActiveMapperCache {
+    #[inline]
+    #[must_use]
+    pub fn get_plain(&self, key: TypeId) -> Option<&TypeId> {
+        self.plain.get(&key)
+    }
+
+    #[inline]
+    pub fn insert_plain(&mut self, key: TypeId, value: TypeId) {
+        if self.plain.insert(key, value).is_none()
+            && self.plain_keys.len() < self.plain_keys.inline_size()
+        {
+            self.plain_keys.push(key);
+        }
+    }
+
+    /// Empties `plain` and keeps its table for reuse.
+    ///
+    /// PERF: a popped mapper often leaves a few keys in a large table. When
+    /// every key is in `plain_keys`, only those keys are removed, instead of
+    /// a reset of every slot. Else, with `drop_sparse`, a table of more than
+    /// 256 keys that is less than 1/8 full is dropped, because a clear costs
+    /// time in the table size, and any other table is cleared.
+    pub fn clear_plain(&mut self, drop_sparse: bool) {
+        let plain = &mut self.plain;
+        if plain.len() == self.plain_keys.len() {
+            for key in self.plain_keys.drain(..) {
+                plain.remove(&key);
+            }
+            return;
+        }
+        self.plain_keys.clear();
+        if drop_sparse && plain.capacity() > 256 && plain.len() < plain.capacity() / 8 {
+            *plain = FlatMap::default();
+        } else {
+            plain.clear();
+        }
+    }
+}
+
+// PORT: perf. `FlatMap` indexes by the low bits of the hash, and type ids
+// are dense, so the id is multiplied by the 64-bit golden ratio and the high
+// half is folded down to mix the low bits. The nil id is the empty-slot
+// marker; `FlatMap` keeps that key in its side slot.
+impl FlatKey for TypeId {
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        let x = u64::from(self.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^ (x >> 32)
+    }
 }
 
 // Checker
@@ -910,7 +979,7 @@ pub struct Checker {
     pub skip_direct_inference_nodes: FxHashSet<Node>,
     pub packages_map: FxHashMap<String, bool>,
     pub active_mappers: Vec<MapperId>,
-    pub active_type_mappers_caches: Vec<CacheKeyMap<TypeId>>,
+    pub active_type_mappers_caches: Vec<ActiveMapperCache>,
     /// Go `ambientModulesOnce sync.Once`: true once the Go `Do` body ran.
     pub ambient_modules_once: bool,
     pub ambient_modules: Vec<SymbolId>,
@@ -1429,7 +1498,7 @@ impl Checker {
                   location: Node,
                   name: &str,
                   meaning: SymbolFlags,
-                  name_not_found_message: Option<&'static Message>,
+                  name_not_found_message: Option<NameNotFound>,
                   is_use: bool,
                   exclude_globals: bool|
                   -> SymbolId {
@@ -1450,7 +1519,7 @@ impl Checker {
                   location: Node,
                   name: &str,
                   meaning: SymbolFlags,
-                  name_not_found_message: Option<&'static Message>,
+                  name_not_found_message: Option<NameNotFound>,
                   is_use: bool,
                   exclude_globals: bool|
                   -> SymbolId {

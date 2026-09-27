@@ -93,20 +93,67 @@ pub fn bind_alias_resolver_source_file(current_directory: &str, file: Node) {
 }
 
 /// The module names that a checker of an alias resolver can resolve from
-/// `file` (Go `GetResolvedModule`): the imports and the string literal module
-/// augmentations of the file, the names that a `compiler.Program` resolves
-/// (Go compiler/fileloader.go resolveImportsAndModuleAugmentations).
+/// `file` (Go `GetResolvedModule` in checker `resolveExternalModule`): every
+/// string module specifier of an import, export, import-equals or JSDoc
+/// import at any module declaration depth, the import calls, `require`
+/// calls and import types, and the string literal module augmentations.
+// PORT: a syntactic walk shaped like Go parser/references.go
+// collectExternalModuleReferences. That walk makes `file.imports`, and it
+// skips relative names inside ambient modules and the bodies of
+// augmentations and namespaces. The checker still resolves those names
+// (`declare module "pkg" { export { foo } from "./impl"; }`), so this walk
+// keeps them. The import calls, `require` calls and import types come from
+// `file.imports`: the parser found them with
+// `ForEachDynamicImportOrRequireCall` (references.go:16), which reads the
+// whole file text, ambient module bodies too. A name found twice is resolved
+// once (`prefetch_resolved_module`).
 fn checker_module_references(file: Node) -> Vec<String> {
     let info = source_file_info(file);
-    info.imports
-        .iter()
-        .chain(
-            info.module_augmentations
-                .iter()
-                .filter(|name| is_string_literal(**name)),
-        )
-        .map(|name| name.text().to_string())
-        .collect()
+    let mut names: Vec<String> = Vec::new();
+    for node in file.statements().iter() {
+        collect_checker_module_references(node, &mut names);
+    }
+    names.extend(info.imports.iter().map(|name| name.text().to_string()));
+    // Go: checker mergeModuleAugmentation resolves each augmentation name.
+    names.extend(
+        info.module_augmentations
+            .iter()
+            .filter(|name| is_string_literal(**name))
+            .map(|name| name.text().to_string()),
+    );
+    names
+}
+
+// Go: parser/references.go:24 collectModuleReferences
+// PORT: without the ambient module conditions (see
+// `checker_module_references`). Go checker `resolveExternalModuleNameWorker`
+// takes any string literal like specifier.
+fn collect_checker_module_references(node: Node, names: &mut Vec<String>) {
+    if is_any_import_or_re_export(node) {
+        let module_name_expr = crate::ast::get_external_module_name(node);
+        if module_name_expr.is_some() && is_string_literal_like(module_name_expr) {
+            let module_name = module_name_expr.text();
+            if !module_name.is_empty() {
+                names.push(module_name.to_string());
+            }
+        }
+        return;
+    }
+    if is_module_declaration(node) {
+        // The body is a module block, or the next module declaration of
+        // `namespace A.B {}`.
+        let body = node.body();
+        if body.is_nil() {
+            return;
+        }
+        if is_module_block(body) {
+            for statement in body.statements().iter() {
+                collect_checker_module_references(statement, names);
+            }
+        } else {
+            collect_checker_module_references(body, names);
+        }
+    }
 }
 
 /// True when the arena of a checker of `program` holds the symbols of
@@ -137,8 +184,8 @@ impl AliasResolver {
     // binds each file when `GetSourceFile` parses it, while the checker
     // runs. Here the files that the checker can reach are read and bound
     // first: the root files, `also_reads`, and from each file the modules
-    // that its imports and module augmentations resolve to. This reads more
-    // files than Go, never fewer. The resolutions are kept
+    // that its module specifiers resolve to (`checker_module_references`).
+    // This reads more files than Go, never fewer. The resolutions are kept
     // (`prefetch_resolved_module`); `get_resolved_module` fills the Go cache
     // and reports a failed lookup only when the checker asks, as Go does. A
     // file that the checker asks for later and that its arena does not hold
@@ -236,7 +283,8 @@ impl AliasResolver {
     /// Go `binder.BindSourceFile(file)` in `GetSourceFile`.
     // PORT: before the checker exists, the file is published and bound
     // (`bind_alias_resolver_source_file`). After, the checker's arena must
-    // already hold it (see `new_checker`).
+    // already hold it (see `new_checker`). The unported guard is for a
+    // module name that `checker_module_references` does not find.
     fn bind_source_file(&self, file: Node) {
         let Some(program) = self.checker_program.get() else {
             bind_alias_resolver_source_file(self.host.get_current_directory(), file);

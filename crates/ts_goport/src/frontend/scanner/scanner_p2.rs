@@ -1306,7 +1306,7 @@ impl Scanner {
         min_count: i32,
         scan_as_many_as_possible: bool,
         can_have_separators: bool,
-    ) -> String {
+    ) -> &'static str {
         let mut digit_count = 0;
         let start = self.scanner_state.pos;
         let mut allow_separator = false;
@@ -1351,15 +1351,16 @@ impl Scanner {
             );
         }
         if digit_count < min_count {
-            return String::new();
+            return "";
         }
-        let original = self.text[start as usize..self.scanner_state.pos as usize].to_string();
+        let original = &self.text[start as usize..self.scanner_state.pos as usize];
         // PORT: Go allocates `hexDigitCache` on first use; the Rust map is
-        // always allocated.
-        if let Some(cached) = self.hex_digit_cache.get(&original) {
-            cached.clone()
+        // always allocated. The lookup borrows the text; the key is copied
+        // and the digits interned only on a miss.
+        if let Some(&cached) = self.hex_digit_cache.get(original) {
+            cached
         } else {
-            let mut digits = original.clone();
+            let mut digits = original.to_string();
             if self
                 .scanner_state
                 .token_flags
@@ -1368,7 +1369,8 @@ impl Scanner {
                 digits = digits.replace('_', "");
             }
             digits = digits.to_ascii_lowercase(); // standardize hex literals to lowercase
-            self.hex_digit_cache.insert(original, digits.clone());
+            let digits = intern_token_value(&digits);
+            self.hex_digit_cache.insert(original.into(), digits);
             digits
         }
     }

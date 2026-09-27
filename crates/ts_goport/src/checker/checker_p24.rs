@@ -21,6 +21,17 @@ pub(crate) struct NamedMembersScratch {
     container_ranges: Vec<TextRange>,
 }
 
+/// `is_reserved_member_name` of a symbol table key.
+// PERF: a reserved name starts with `INTERNAL_SYMBOL_NAME_PREFIX`, and
+// exactly those names have the `Name::is_internal` bit (set from the text
+// at intern time), so a normal name reads no text.
+#[inline]
+fn is_reserved_member_name_of(name: &Name) -> bool {
+    let reserved = name.is_internal() && is_reserved_member_name(name.as_str());
+    debug_assert_eq!(reserved, is_reserved_member_name(name.as_str()));
+    reserved
+}
+
 impl Checker {
     // Go: checker/checker.go:21264 findMixins
     pub fn find_mixins(&mut self, types: &[TypeId]) -> (Vec<bool>, i32) {
@@ -224,9 +235,11 @@ impl Checker {
         let mut single_prop = SymbolId::NIL;
         // PORT: Go `orderedSet[*ast.Symbol]` is a list here, kept free of
         // duplicates by `ordered_symbol_set_add`. Most sets hold a few symbols.
-        let mut prop_set: Vec<SymbolId> = Vec::new();
+        // PERF: `prop_set`, `index_types` and `prop_types` are short, so they
+        // live on the stack up to their inline size.
+        let mut prop_set: SmallVec<[SymbolId; 8]> = SmallVec::new();
         let mut prop_set_index: FxHashSet<SymbolId> = FxHashSet::default();
-        let mut index_types: Vec<TypeId> = Vec::new();
+        let mut index_types: SmallVec<[TypeId; 4]> = SmallVec::new();
         let is_union = self.ty(containing_type).flags.intersects(TypeFlags::UNION);
         // Flags we want to propagate to the result if they exist in all source symbols
         let mut check_flags = CheckFlags::NONE;
@@ -425,7 +438,8 @@ impl Checker {
         let mut declarations: Vec<Node> = Vec::with_capacity(declaration_count);
         let mut first_type = TypeId::NIL;
         let mut name_type = TypeId::NIL;
-        let mut prop_types: Vec<TypeId> = Vec::with_capacity(prop_set.len() + index_types.len());
+        let mut prop_types: SmallVec<[TypeId; 4]> =
+            SmallVec::with_capacity(prop_set.len() + index_types.len());
         // PORT: Go nil slice `writeTypes` is `None`.
         let mut write_types: Option<Vec<TypeId>> = None;
         let mut first_value_declaration = Node::NIL;
@@ -448,7 +462,7 @@ impl Checker {
             let write_type = self.get_write_type_of_symbol(prop);
             if write_types.is_some() || write_type != t {
                 if write_types.is_none() {
-                    write_types = Some(prop_types.clone());
+                    write_types = Some(prop_types.to_vec());
                 }
                 write_types.as_mut().unwrap().push(write_type);
             }
@@ -486,7 +500,7 @@ impl Checker {
             self.sym_mut(result).check_flags |= CheckFlags::DEFERRED_TYPE;
             let deferred = self.deferred_symbol_links.get(result);
             deferred.parent = containing_type;
-            deferred.constituents = prop_types;
+            deferred.constituents = prop_types.into_vec();
             deferred.write_constituents = write_types.unwrap_or_default();
             return result;
         }
@@ -1343,8 +1357,8 @@ impl Checker {
         container_ranges.clear();
         candidates.extend(
             self.symbols
-                .iter(members)
-                .filter(|(id, _)| !is_reserved_member_name(id))
+                .iter_names(members)
+                .filter(|(id, _)| !is_reserved_member_name_of(id))
                 .map(|(_, symbol)| symbol),
         );
         let is_class_or_interface_container = container.is_some()
@@ -1418,8 +1432,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21986 isNamedMember
-    pub fn is_named_member(&mut self, symbol: SymbolId, id: &str) -> bool {
-        !is_reserved_member_name(id) && self.symbol_is_value(symbol)
+    // PORT: takes the table key as a `Name`, so a normal name reads no text
+    // (`is_reserved_member_name_of`).
+    pub fn is_named_member(&mut self, symbol: SymbolId, id: &Name) -> bool {
+        !is_reserved_member_name_of(id) && self.symbol_is_value(symbol)
     }
 
     // Go: checker/checker.go:21990 symbolIsValue
@@ -1502,21 +1518,25 @@ impl Checker {
         if index == -1 {
             self.push_active_mapper(m);
         }
-        let key = match alias.as_deref() {
-            None => type_key_no_alias(t),
-            Some(alias) => {
-                let mut b = KeyBuilder::default();
-                b.write_type(t);
-                b.write_alias(&self.symbols, Some(alias));
-                b.hash()
-            }
-        };
+        // PERF: a key with no alias is `t` itself, in the `plain` map
+        // (`ActiveMapperCache`). `None` here means that key.
+        let alias_key = alias.as_deref().map(|alias| {
+            let mut b = KeyBuilder::default();
+            b.write_type(t);
+            b.write_alias(&self.symbols, Some(alias));
+            b.hash()
+        });
         let cache_index = if index != -1 {
             index as usize
         } else {
             self.active_mappers.len() - 1
         };
-        if let Some(&cached_type) = self.active_type_mappers_caches[cache_index].get(&key) {
+        let cache = &self.active_type_mappers_caches[cache_index];
+        let cached = match &alias_key {
+            None => cache.get_plain(t),
+            Some(key) => cache.aliased.get(key),
+        };
+        if let Some(&cached_type) = cached {
             return cached_type;
         }
         // PORT: `instantiation_depth` goes first (perf experiment K). The
@@ -1529,7 +1549,13 @@ impl Checker {
         if index == -1 {
             self.pop_active_mapper();
         } else {
-            self.active_type_mappers_caches[cache_index].insert(key, result);
+            let cache = &mut self.active_type_mappers_caches[cache_index];
+            match alias_key {
+                None => cache.insert_plain(t, result),
+                Some(key) => {
+                    cache.aliased.insert(key, result);
+                }
+            }
         }
         self.instantiation_depth -= 1;
         result
@@ -1543,22 +1569,28 @@ impl Checker {
         let last_index = self.active_mappers.len();
         self.active_mappers.push(mapper);
         if last_index >= self.active_type_mappers_caches.len() {
-            self.active_type_mappers_caches.push(CacheKeyMap::default());
+            self.active_type_mappers_caches
+                .push(ActiveMapperCache::default());
         }
     }
 
     // Go: checker/checker.go:22060 popActiveMapper
     pub fn pop_active_mapper(&mut self) {
+        // PORT: clearing costs time in the map capacity, so a mostly empty
+        // large map is dropped instead. Both maps of the cache get this rule.
+        fn drop_or_clear<K, V, S: Default>(map: &mut std::collections::HashMap<K, V, S>) {
+            if map.capacity() > 256 && map.len() < map.capacity() / 8 {
+                *map = std::collections::HashMap::default();
+            } else if !map.is_empty() {
+                map.clear();
+            }
+        }
         self.active_mappers.pop();
         // Clear the map, but leave it in the list for later reuse.
         let cache = &mut self.active_type_mappers_caches[self.active_mappers.len()];
-        // PORT: clearing costs time in the map capacity, so a mostly empty
-        // large map is dropped instead.
-        if cache.capacity() > 256 && cache.len() < cache.capacity() / 8 {
-            *cache = CacheKeyMap::default();
-        } else if !cache.is_empty() {
-            cache.clear();
-        }
+        // The same rule on `plain`, when it has keys that were not recorded.
+        cache.clear_plain(true);
+        drop_or_clear(&mut cache.aliased);
     }
 
     // Go: checker/checker.go:22070 findActiveMapper
@@ -1572,8 +1604,9 @@ impl Checker {
     // Go: checker/checker.go:22074 clearActiveMapperCaches
     pub fn clear_active_mapper_caches(&mut self) {
         for cache in self.active_type_mappers_caches.iter_mut() {
-            if !cache.is_empty() {
-                cache.clear();
+            cache.clear_plain(false);
+            if !cache.aliased.is_empty() {
+                cache.aliased.clear();
             }
         }
     }
@@ -1848,7 +1881,11 @@ fn table_key_name(key: TableKey<'_>) -> Name {
 /// Go `orderedSet.Add` for a small symbol set kept as a list. Lookups scan the
 /// list while it is short; from `ORDERED_SYMBOL_SET_SCAN` symbols on, `index`
 /// holds every member and answers them instead.
-fn ordered_symbol_set_add(list: &mut Vec<SymbolId>, index: &mut FxHashSet<SymbolId>, s: SymbolId) {
+fn ordered_symbol_set_add(
+    list: &mut SmallVec<[SymbolId; 8]>,
+    index: &mut FxHashSet<SymbolId>,
+    s: SymbolId,
+) {
     const ORDERED_SYMBOL_SET_SCAN: usize = 32;
     if list.len() < ORDERED_SYMBOL_SET_SCAN {
         if !list.contains(&s) {

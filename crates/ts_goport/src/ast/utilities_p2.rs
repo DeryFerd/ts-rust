@@ -1,6 +1,7 @@
 //! Port of typescript-go `internal/ast/utilities.go` lines 906-1805.
 
 use crate::prelude::*;
+use ts_ast::NodeData;
 
 // Go: ast/utilities.go:906 SetImportsOfSourceFile
 // PORT: skipped. Go documents it as "should never be called outside the
@@ -103,6 +104,12 @@ pub fn modifiers_to_flags(modifiers: &[Node]) -> ModifierFlags {
 // Go: ast/utilities.go:1017 HasSyntacticModifier
 pub fn has_syntactic_modifier(node: Node, flags: ModifierFlags) -> bool {
     node.modifier_flags().intersects(flags)
+}
+
+/// `has_syntactic_modifier` on `d`, the data of `node` that the caller
+/// already loaded with `ast_data_of` (query Q7-3, see `Node::modifiers_in`).
+pub fn has_syntactic_modifier_in(node: Node, d: &'static NodeData, flags: ModifierFlags) -> bool {
+    node.modifiers_in(d).modifier_flags().intersects(flags)
 }
 
 // Go: ast/utilities.go:1021 HasAccessorModifier
@@ -546,9 +553,14 @@ pub fn is_module_identifier(node: Node) -> bool {
     is_identifier(node) && node.text() == "module"
 }
 
+/// `this`, interned once for `is_this_identifier`.
+static THIS_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("this"));
+
 // Go: ast/utilities.go:1344 IsThisIdentifier
+// PERF: U1 (a). Compares name ids (`Node::text_is`), with no text load.
+// `is_this_in_type_query` calls this first.
 pub fn is_this_identifier(node: Node) -> bool {
-    is_identifier(node) && node.text() == "this"
+    is_identifier(node) && node.text_is(&THIS_NAME)
 }
 
 // Go: ast/utilities.go:1348 IsThisParameter
@@ -674,7 +686,21 @@ pub fn get_name_of_declaration(declaration: Node) -> Node {
     if declaration.is_nil() {
         return Node::NIL;
     }
-    let non_assigned_name = get_non_assigned_name_of_declaration(declaration);
+    name_of_declaration(declaration, || declaration.name())
+}
+
+/// `get_name_of_declaration` on `d`, the data of the non-nil `declaration`
+/// that the caller already loaded with `ast_data_of` (query Q7-3, see
+/// `Node::name_in`).
+pub fn get_name_of_declaration_in(declaration: Node, d: &'static NodeData) -> Node {
+    name_of_declaration(declaration, || declaration.name_in(d))
+}
+
+/// The body of `get_name_of_declaration` for a non-nil declaration.
+/// `read_name` reads `declaration.name()`, so the `_in` variant can read it
+/// from loaded data.
+fn name_of_declaration(declaration: Node, read_name: impl FnOnce() -> Node) -> Node {
+    let non_assigned_name = non_assigned_name_of_declaration(declaration, read_name);
     if non_assigned_name.is_some() {
         return non_assigned_name;
     }
@@ -689,6 +715,12 @@ pub fn get_name_of_declaration(declaration: Node) -> Node {
 
 // Go: ast/utilities.go:1442 GetNonAssignedNameOfDeclaration
 pub fn get_non_assigned_name_of_declaration(declaration: Node) -> Node {
+    non_assigned_name_of_declaration(declaration, || declaration.name())
+}
+
+/// The body of `get_non_assigned_name_of_declaration`. `read_name` reads
+/// `declaration.name()` (see `name_of_declaration`).
+fn non_assigned_name_of_declaration(declaration: Node, read_name: impl FnOnce() -> Node) -> Node {
     // !!!
     match declaration.kind() {
         SyntaxKind::BinaryExpression | SyntaxKind::CallExpression => {
@@ -719,7 +751,7 @@ pub fn get_non_assigned_name_of_declaration(declaration: Node) -> Node {
         }
         _ => {}
     }
-    declaration.name()
+    read_name()
 }
 
 // Go: ast/utilities.go:1467 GetAssignedName
@@ -840,6 +872,13 @@ pub fn is_bindable_object_define_property_call(node: Node) -> bool {
 ///      immediately followed by a NumericLiteral.
 pub fn has_dynamic_name(declaration: Node) -> bool {
     let name = get_name_of_declaration(declaration);
+    name.is_some() && is_dynamic_name(name)
+}
+
+/// `has_dynamic_name` on `d`, the data of the non-nil `declaration` that
+/// the caller already loaded with `ast_data_of` (query Q7-3).
+pub fn has_dynamic_name_in(declaration: Node, d: &'static NodeData) -> bool {
+    let name = get_name_of_declaration_in(declaration, d);
     name.is_some() && is_dynamic_name(name)
 }
 

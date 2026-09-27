@@ -18,31 +18,30 @@
 use crate::prelude::*;
 use ts_jsnum::{Number, PseudoBigInt};
 
-/// An immutable list shared by reference count. It works like a Go slice
-/// over an array that is never written again: a clone or a sub-slice copies
-/// no elements. An empty list does not allocate.
+/// An immutable list. It works like a Go slice over an array that is never
+/// written again: a clone or a sub-slice copies no elements (a sub-slice of
+/// an `Owned` list is a copy). An empty list does not allocate.
 ///
 /// PORT: Go returns resolved member, signature, index info and type argument
 /// slices without a copy. Callers read the list through `Deref<[T]>`.
 ///
 /// PORT: layout only. A list of up to `SHARED_LIST_INLINE` elements is kept
-/// inline, so it needs no `Rc` block and a read does not follow a pointer.
-/// The `Rc` pointer niche holds the variant tag, so the list stays 24 bytes
-/// (asserted below). All element types are `Copy` ids, and `Default` fills
-/// the unused inline slots.
-pub struct SharedList<T> {
+/// inline, so it needs no heap copy and a read does not follow a pointer.
+/// The list stays 24 bytes (asserted below). All element types are `Copy`
+/// ids, and `Default` fills the unused inline slots. A longer list is in the
+/// checker arena of a one-program process, else owned (`use_checker_arena`).
+pub struct SharedList<T: 'static> {
     repr: SharedListRepr<T>,
 }
 
 /// Number of elements a `SharedList` keeps inline.
 const SHARED_LIST_INLINE: usize = 3;
 
-enum SharedListRepr<T> {
-    Heap {
-        items: Rc<[T]>,
-        start: u32,
-        end: u32,
-    },
+enum SharedListRepr<T: 'static> {
+    /// A longer list, in this thread's checker arena. Never freed.
+    Arena(&'static [T]),
+    /// A longer list of a multi-program process, freed with its last copy.
+    Owned(Rc<[T]>),
     /// `items[..len]` is the list. Empty is `len == 0`.
     Inline {
         len: u8,
@@ -62,8 +61,20 @@ impl<T: Copy + Default> SharedList<T> {
     /// elements.
     #[inline]
     fn inline(items: &[T]) -> Self {
-        let mut buffer = [T::default(); SHARED_LIST_INLINE];
-        buffer[..items.len()].copy_from_slice(items);
+        debug_assert!(items.len() <= SHARED_LIST_INLINE);
+        // PERF: one arm for each length, so each element is one store into
+        // the destination. LLVM turns a copy loop (or `copy_from_slice`) into
+        // a `memcpy` call, and the list is then read back from the stack at
+        // once. The arrays are `[T; 3]`, so they stop compiling if
+        // `SHARED_LIST_INLINE` changes.
+        let d = T::default();
+        let buffer: [T; SHARED_LIST_INLINE] = match *items {
+            [] => [d, d, d],
+            [a] => [a, d, d],
+            [a, b] => [a, b, d],
+            [a, b, c] => [a, b, c],
+            _ => unreachable!("inline list longer than SHARED_LIST_INLINE"),
+        };
         Self {
             repr: SharedListRepr::Inline {
                 len: items.len() as u8,
@@ -72,20 +83,38 @@ impl<T: Copy + Default> SharedList<T> {
         }
     }
 
-    /// The sub-list `range` of this list. A long sub-list shares the same
-    /// storage; a short one is copied inline.
+    /// A heap list with a copy of `items`, which has more than
+    /// `SHARED_LIST_INLINE` elements.
+    ///
+    /// PERF: out of line, so the inlined `From<&[T]>` keeps only the short
+    /// inline path at each call site. In a one-program process the copy goes
+    /// in the checker arena, a pointer bump and not a malloc. It is never
+    /// freed, like the types that hold it. Else it is an `Rc` copy, freed
+    /// with the checker (`use_checker_arena`).
+    #[inline(never)]
+    fn heap(items: &[T]) -> Self {
+        let repr = if use_checker_arena() {
+            SharedListRepr::Arena(checker_arena().alloc_slice_copy(items))
+        } else {
+            SharedListRepr::Owned(Rc::from(items))
+        };
+        Self { repr }
+    }
+
+    /// The sub-list `range` of this list. A long sub-list of an arena list
+    /// shares the same storage; a short one is copied inline, and a long
+    /// one of an owned list is a new owned copy.
     pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
         assert!(range.start <= range.end && range.end <= self.len());
         if range.len() <= SHARED_LIST_INLINE {
             return Self::inline(&self[range]);
         }
         match &self.repr {
-            SharedListRepr::Heap { items, start, .. } => Self {
-                repr: SharedListRepr::Heap {
-                    items: items.clone(),
-                    start: start + range.start as u32,
-                    end: start + range.end as u32,
-                },
+            SharedListRepr::Arena(items) => Self {
+                repr: SharedListRepr::Arena(&items[range]),
+            },
+            SharedListRepr::Owned(items) => Self {
+                repr: SharedListRepr::Owned(Rc::from(&items[range])),
             },
             // An inline list is never longer than `SHARED_LIST_INLINE`.
             SharedListRepr::Inline { .. } => unreachable!(),
@@ -98,11 +127,8 @@ impl<T: Copy> Clone for SharedList<T> {
     fn clone(&self) -> Self {
         Self {
             repr: match &self.repr {
-                SharedListRepr::Heap { items, start, end } => SharedListRepr::Heap {
-                    items: items.clone(),
-                    start: *start,
-                    end: *end,
-                },
+                SharedListRepr::Arena(items) => SharedListRepr::Arena(items),
+                SharedListRepr::Owned(items) => SharedListRepr::Owned(items.clone()),
                 SharedListRepr::Inline { len, items } => SharedListRepr::Inline {
                     len: *len,
                     items: *items,
@@ -130,7 +156,8 @@ impl<T> std::ops::Deref for SharedList<T> {
     #[inline]
     fn deref(&self) -> &[T] {
         match &self.repr {
-            SharedListRepr::Heap { items, start, end } => &items[*start as usize..*end as usize],
+            SharedListRepr::Arena(items) => items,
+            SharedListRepr::Owned(items) => items,
             SharedListRepr::Inline { len, items } => &items[..*len as usize],
         }
     }
@@ -143,18 +170,12 @@ impl<T: Copy + Default> From<Vec<T>> for SharedList<T> {
 }
 
 impl<T: Copy + Default> From<&[T]> for SharedList<T> {
+    #[inline]
     fn from(items: &[T]) -> Self {
         if items.len() <= SHARED_LIST_INLINE {
             return Self::inline(items);
         }
-        let end = u32::try_from(items.len()).expect("list too long");
-        Self {
-            repr: SharedListRepr::Heap {
-                items: items.into(),
-                start: 0,
-                end,
-            },
-        }
+        Self::heap(items)
     }
 }
 
@@ -201,7 +222,7 @@ impl<T: Copy> IntoIterator for SharedList<T> {
 }
 
 /// The owning iterator of a `SharedList`. It yields copies of the elements.
-pub struct SharedListIter<T> {
+pub struct SharedListIter<T: 'static> {
     list: SharedList<T>,
     front: usize,
     back: usize,
@@ -236,6 +257,33 @@ impl<T: Copy> DoubleEndedIterator for SharedListIter<T> {
 }
 
 impl<T: Copy> ExactSizeIterator for SharedListIter<T> {}
+
+thread_local! {
+    /// Long `SharedList`s and union and intersection data of a one-program
+    /// process. They live as long as the checker, which is never dropped
+    /// there (`program.rs` forgets it at thread exit), so each one costs a
+    /// pointer bump, not a malloc. The arena is leaked and never frees, like
+    /// the AST arena in `ast/store.rs`.
+    static CHECKER_ARENA: &'static bumpalo::Bump =
+        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
+}
+
+/// Whether new checker data goes in this thread's `CHECKER_ARENA`: only in
+/// a one-program process. A multi-program process (watch, language server)
+/// drops the checkers of a released program, so there the data is an `Rc`
+/// or `Box` that is freed with its checker. Else each released program
+/// would leave its arena data behind.
+#[inline(always)]
+fn use_checker_arena() -> bool {
+    !crate::core::is_multi_program()
+}
+
+/// This thread's leaked checker arena. The `&'static Bump` is taken out of
+/// the thread local first, so the allocation runs outside `with`.
+#[inline]
+fn checker_arena() -> &'static bumpalo::Bump {
+    CHECKER_ARENA.with(|arena| *arena)
+}
 
 // PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is an untyped constant
 // outside the generated `TypeFormatFlags` block.
@@ -285,7 +333,15 @@ pub struct ValueSymbolLinks {
     pub name_type: TypeId,
     pub containing_type: TypeId, // Mapped type for mapped type property, containing union or intersection type for synthetic property
     pub function_or_constructor_checked: bool,
+    /// PORT: memo, no Go counterpart. The declaration test of Go
+    /// `getTypeOfParameter` (initializer or question token on
+    /// `value_declaration`), set on the first call for this symbol. It fits
+    /// in the padding after the bool.
+    pub optional_parameter: Tristate,
 }
+
+// The memo byte must not grow the record.
+const _: () = assert!(std::mem::size_of::<ValueSymbolLinks>() == 28);
 
 // Additional links for mapped symbols
 
@@ -479,6 +535,26 @@ pub struct SymbolNodeLinks {
 pub struct TypeNodeLinks {
     pub resolved_type: TypeId, // Resolved type associated with node
     pub outer_type_parameters: Option<SharedList<TypeId>>, // Outer type parameters of anonymous object type. None until computed, like Go nil.
+    /// PERF: memo of the `getConditionalFlowTypeOfType` parent walk from this
+    /// node (AST facts only, see `Checker::get_conditional_flow_type_of_type`).
+    /// False until `flow_steps` is computed.
+    pub flow_steps_known: bool,
+    /// The flow steps of the walk, in walk order. None is no step, so the
+    /// memo of most nodes does not allocate.
+    pub flow_steps: Option<Rc<[FlowStep]>>,
+}
+
+/// One ancestor in the `getConditionalFlowTypeOfType` parent walk where a
+/// branch of the loop body can add a constraint. Only the tests on the
+/// type are left for each call.
+#[derive(Clone, Copy, Debug)]
+pub enum FlowStep {
+    /// The walk comes up from the true type of this `ConditionalType` node.
+    /// `covariant` is the walk variance at this step.
+    Conditional { parent: Node, covariant: bool },
+    /// The walk comes up from the type of this `MappedType` node, which has
+    /// no name type.
+    Mapped { parent: Node },
 }
 
 // Links for enum members
@@ -1078,7 +1154,9 @@ impl Type {
     // Common accessors
 
     // Go: checker/types.go:733 Type.Target
-    #[inline]
+    // PERF: `inline(always)`: with a plain `#[inline]` hint LLVM kept this
+    // out of line (elysia: 0.8 to 1.0% self).
+    #[inline(always)]
     pub fn target(&self) -> TypeId {
         if self.flags.intersects(TypeFlags::OBJECT) {
             return self.as_object_type().target;
@@ -1226,6 +1304,70 @@ impl Checker {
     }
 }
 
+/// A value in this thread's checker arena, or a `Box` in a multi-program
+/// process (`use_checker_arena`). It holds the union and intersection data
+/// of `TypeData`.
+///
+/// PERF: a `Box` cost one malloc for each union or intersection type. The
+/// arena costs a pointer bump. In a one-program process types are never
+/// dropped (the checker is leaked), so the arena memory is never freed
+/// either. When an arena `ArenaBox` is dropped, the value is not: its own
+/// heap fields stay allocated. A released program of a multi-program
+/// process frees its checkers, so there the value is a `Box`.
+pub struct ArenaBox<T: 'static>(ArenaBoxRepr<T>);
+
+enum ArenaBoxRepr<T: 'static> {
+    Arena(&'static mut T),
+    Owned(Box<T>),
+}
+
+impl<T> ArenaBox<T> {
+    /// Moves `value` into this thread's checker arena, or into a `Box`.
+    #[inline(always)]
+    pub fn new(value: T) -> Self {
+        ArenaBox(if use_checker_arena() {
+            ArenaBoxRepr::Arena(checker_arena().alloc(value))
+        } else {
+            ArenaBoxRepr::Owned(Box::new(value))
+        })
+    }
+}
+
+impl<T> std::ops::Deref for ArenaBox<T> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        match &self.0 {
+            ArenaBoxRepr::Arena(value) => value,
+            ArenaBoxRepr::Owned(value) => value,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for ArenaBox<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut T {
+        match &mut self.0 {
+            ArenaBoxRepr::Arena(value) => value,
+            ArenaBoxRepr::Owned(value) => value,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ArenaBox<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+/// A clone is a new copy, like a `Box` clone.
+impl<T: Clone> Clone for ArenaBox<T> {
+    fn clone(&self) -> Self {
+        ArenaBox::new((**self).clone())
+    }
+}
+
 // TypeData
 
 // PORT: Go `TypeData` is an interface over pointers to the concrete structs
@@ -1234,7 +1376,9 @@ impl Checker {
 // where Go returns nil. Go `AsType()` has no port: `Type` owns its data.
 // PORT: the large variants are boxed so `Type` stays small in the arena.
 // Interface, tuple, mapped, reverse mapped, evolving array and instantiation
-// expression types are rare; union and intersection data is large.
+// expression types are rare; union and intersection data is large, and in a
+// one-program process it is in the checker arena (`ArenaBox`), not a malloc
+// block.
 // Go: checker/types.go:841 TypeData
 #[derive(Clone)]
 pub enum TypeData {
@@ -1256,8 +1400,8 @@ pub enum TypeData {
     Mapped(Box<MappedType>),
     ReverseMapped(Box<ReverseMappedType>),
     EvolvingArray(Box<EvolvingArrayType>),
-    Union(Box<UnionType>),
-    Intersection(Box<IntersectionType>),
+    Union(ArenaBox<UnionType>),
+    Intersection(ArenaBox<IntersectionType>),
 }
 
 // PORT: the arena keeps a dummy `Type` at index 0, so `TypeData` needs a
@@ -1648,7 +1792,8 @@ pub struct InterfaceType {
     pub base_types_resolved: bool,
     pub declared_members_resolved: bool,
     pub resolved_base_constructor_type: TypeId,
-    pub resolved_base_types: Vec<TypeId>,
+    // PERF: shared, so `get_base_types_shared` returns it without a copy.
+    pub resolved_base_types: SharedList<TypeId>,
     pub declared_members: SymbolTable, // Declared members
     pub declared_call_signatures: Vec<SignatureId>, // Declared call signatures
     pub declared_construct_signatures: Vec<SignatureId>, // Declared construct signatures
@@ -1861,6 +2006,7 @@ pub struct IndexType {
 
 impl IndexType {
     // Go: checker/types.go:1183 IndexType.Target
+    #[inline]
     pub fn target(&self) -> TypeId {
         self.target
     }
@@ -1925,6 +2071,7 @@ pub struct StringMappingType {
 
 impl StringMappingType {
     // Go: checker/types.go:1211 StringMappingType.Target
+    #[inline]
     pub fn target(&self) -> TypeId {
         self.target
     }
@@ -2048,6 +2195,7 @@ impl Signature {
     }
 
     // Go: checker/types.go:1309 Signature.Target
+    #[inline]
     pub fn target(&self) -> SignatureId {
         self.target
     }
@@ -2254,9 +2402,17 @@ pub struct ChunkedArena<T> {
     len: usize,
 }
 
-const ARENA_CHUNK_SHIFT: usize = 12;
+// PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
+// entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
+// 1,440). One chunk of each element type stays under 2 MiB, so a small project
+// does not get a 2 MiB huge page for each arena. `Type` is 192 bytes, so 13 is
+// the largest shift under that limit.
+const ARENA_CHUNK_SHIFT: usize = 13;
 const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
 const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
+const ARENA_CHUNK_MAX_BYTES: usize = 2 << 20;
+const _: () = assert!(std::mem::size_of::<Type>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
+const _: () = assert!(std::mem::size_of::<TypeMapper>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
 
 impl<T> ChunkedArena<T> {
     /// Creates an arena that holds only `nil`, the dummy entry at index 0.
@@ -2277,14 +2433,52 @@ impl<T> ChunkedArena<T> {
         self.len == 0
     }
 
+    // PERF: always inlined, so the caller builds `value` straight in its
+    // chunk slot. Out of line, the caller wrote the value to the stack with
+    // small stores and this function read it back at once with 16-byte
+    // loads (a store forwarding stall), or copied a `Type` with `memmove`.
+    // The rare new-chunk path stays out of line.
+    #[inline(always)]
     pub fn push(&mut self, value: T) {
+        self.push_with(move || value);
+    }
+
+    /// Pushes the value `make` returns. `make` runs after the chunk slot is
+    /// ready, so a large value (a `Type`) is built straight in its slot.
+    ///
+    /// PERF: with `push(make())` the value is built first, and the grow
+    /// branch of `Vec::push` then sits between building and storing, so the
+    /// value goes to the stack and is copied with `memcpy`. Here the room
+    /// test comes first. It never fails: a chunk is made with room for
+    /// `ARENA_CHUNK_LEN` entries and the entry after a full chunk gets a new
+    /// chunk. When `make` makes no call, LLVM knows the chunk did not change
+    /// and drops the grow branch of the `Vec::push` below.
+    #[inline(always)]
+    pub fn push_with(&mut self, make: impl FnOnce() -> T) {
         if self.len & ARENA_CHUNK_MASK == 0 {
-            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+            self.add_chunk();
         }
         let chunk = self.chunks.last_mut().expect("arena chunk");
-        chunk.push(value);
+        if chunk.len() == chunk.capacity() {
+            arena_chunk_full();
+        }
+        chunk.push(make());
         self.len += 1;
     }
+
+    /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries.
+    #[cold]
+    #[inline(never)]
+    fn add_chunk(&mut self) {
+        self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+    }
+}
+
+/// The last arena chunk has no room. `push_with` never gets here.
+#[cold]
+#[inline(never)]
+fn arena_chunk_full() -> ! {
+    panic!("arena chunk is full")
 }
 
 impl<T> std::ops::Index<usize> for ChunkedArena<T> {

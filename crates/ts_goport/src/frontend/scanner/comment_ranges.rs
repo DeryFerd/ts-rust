@@ -1,5 +1,9 @@
 //! Go scanner.go:2813-2931 comment range iteration.
 
+use std::sync::LazyLock;
+
+use memchr::memmem;
+
 use crate::frontend::prelude::*;
 use crate::scanner_util::{is_shebang_trivia, scan_shebang_trivia};
 
@@ -15,6 +19,12 @@ pub fn get_leading_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec<
 pub fn get_trailing_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec<CommentRange> {
     iterate_comment_ranges(f, text, pos, true)
 }
+
+// Finds the "*/" that ends a block comment. PORT: Go uses strings.Index.
+// One shared searcher gives the same first byte offset without the searcher
+// setup that str::find and memmem::find do on each call.
+static BLOCK_COMMENT_END: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new("*/"));
 
 // Go: scanner/scanner.go:2827 iterateCommentRanges
 fn iterate_comment_ranges(
@@ -85,7 +95,7 @@ fn iterate_comment_ranges(
                             }
                             pos += s;
                         }
-                    } else if let Some(i) = text[pos as usize..].find("*/") {
+                    } else if let Some(i) = BLOCK_COMMENT_END.find(&bytes[pos as usize..]) {
                         pos += i as i32 + 2;
                     } else {
                         pos = len;

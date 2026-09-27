@@ -4,7 +4,6 @@
 
 use crate::prelude::*;
 
-use smallvec::SmallVec;
 use std::hash::Hasher as _;
 
 impl Checker {
@@ -442,12 +441,38 @@ impl Checker {
     pub fn get_type_of_parameter(&mut self, symbol: SymbolId) -> TypeId {
         let declaration = self.sym(symbol).value_declaration;
         let t = self.get_type_of_symbol(symbol);
-        self.add_optionality_ex(
-            t,
-            false,
-            declaration.is_some()
-                && (declaration.initializer().is_some() || is_optional_declaration(declaration)),
-        )
+        let is_optional = self.parameter_declaration_is_optional(symbol, declaration);
+        self.add_optionality_ex(t, false, is_optional)
+    }
+
+    /// The declaration test of Go `getTypeOfParameter`.
+    ///
+    /// PORT: memo, no Go counterpart. The test reads only the AST of the
+    /// symbol's `value_declaration`, which does not change once the symbol is
+    /// a signature parameter, so it runs once per symbol and the result is in
+    /// `ValueSymbolLinks::optional_parameter`. The record is the one
+    /// `get_type_of_symbol` has just read. When it has no record (a symbol
+    /// with an error type), the test runs with no memo, so no record is added
+    /// that `value_symbol_links.has` could see.
+    fn parameter_declaration_is_optional(&mut self, symbol: SymbolId, declaration: Node) -> bool {
+        let test =
+            |d: Node| d.is_some() && (d.initializer().is_some() || is_optional_declaration(d));
+        match self
+            .value_symbol_links
+            .try_get(symbol)
+            .map(|links| links.optional_parameter)
+        {
+            Some(Tristate::Unknown) => {
+                let optional = test(declaration);
+                self.value_symbol_links.get(symbol).optional_parameter = bool_to_tristate(optional);
+                optional
+            }
+            Some(memo) => {
+                debug_assert_eq!(memo.is_true(), test(declaration));
+                memo.is_true()
+            }
+            None => test(declaration),
+        }
     }
 
     // Go: checker/checker.go:16955 getConstraintOfType
@@ -954,6 +979,7 @@ impl Checker {
 // Go: checker/checker.go:17283 hashWrite32
 // PORT: Go is generic over `~int32 | ~uint32`; callers pass the value as
 // `u32` (`TypeId.0`, flag `.0`, or `as u32`).
+#[inline]
 pub fn hash_write32(h: &mut KeyHasher, value: u32) {
     h.write_u32(value);
 }
@@ -961,6 +987,7 @@ pub fn hash_write32(h: &mut KeyHasher, value: u32) {
 // Go: checker/checker.go:17293 hashWrite64
 // PORT: Go is generic over `~int | ~uint | ~int64 | ~uint64`; callers pass
 // the value as `u64` (Go `uint64(value)` conversion, so negative ints wrap).
+#[inline]
 pub fn hash_write64(h: &mut KeyHasher, value: u64) {
     h.write_u64(value);
 }
@@ -1000,49 +1027,141 @@ impl CacheHashKey {
 /// `Hash128` over all written bytes, so this hasher buffers them too. Split
 /// writes hash the same as one write, like Go.
 ///
-/// PERF: `SmallVec::new` leaves the inline storage uninitialized, so a new
-/// hasher costs no zero fill. Keys up to 512 bytes (type lists, generic
-/// relation keys, conditional keys) stay inline; longer keys spill to the heap.
-#[derive(Clone, Debug, Default)]
+/// PERF: the bytes go into a fixed inline buffer, so a fixed-size write is
+/// one bounds check and one fixed-size copy. The buffer costs a 256-byte zero
+/// fill for each new hasher (safe code cannot leave it uninitialized). Keys up
+/// to 256 bytes stay inline. A longer key moves all its bytes to `spill` once
+/// and writes there after that.
+#[derive(Clone)]
 pub struct KeyHasher {
-    buf: SmallVec<[u8; KEY_HASHER_INLINE]>,
+    /// Number of bytes written. Past `KEY_HASHER_INLINE` the bytes are in
+    /// `spill`, and `inline` is not read.
+    len: usize,
+    inline: [u8; KEY_HASHER_INLINE],
+    /// Empty until the key grows past `inline`; then holds every byte.
+    spill: Vec<u8>,
 }
 
-const KEY_HASHER_INLINE: usize = 512;
+const KEY_HASHER_INLINE: usize = 256;
+
+impl Default for KeyHasher {
+    #[inline]
+    fn default() -> Self {
+        KeyHasher {
+            len: 0,
+            inline: [0; KEY_HASHER_INLINE],
+            spill: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for KeyHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyHasher")
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
 
 impl KeyHasher {
+    /// The bytes written so far.
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        if self.len <= KEY_HASHER_INLINE {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
+        }
+    }
+
     /// Go `h.Write(bytes)`.
     #[inline]
     pub fn write(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
+        let len = self.len;
+        let room = self
+            .inline
+            .get_mut(len..)
+            .and_then(|rest| rest.get_mut(..bytes.len()));
+        if let Some(dst) = room {
+            dst.copy_from_slice(bytes);
+            self.len = len + bytes.len();
+        } else {
+            self.write_spill(bytes);
+        }
     }
 
-    // PERF: the fixed-size writes below append the same bytes as `write`.
-    // `extend_from_slice` goes through `insert_from_slice`, which calls
-    // memmove and memcpy for every write. `push` and `extend` over a
-    // fixed-size array inline to a capacity check and byte stores.
+    /// Appends `bytes` to the heap buffer, first moving the inline bytes
+    /// there if this is the first write past the inline buffer.
+    #[cold]
+    #[inline(never)]
+    fn write_spill(&mut self, bytes: &[u8]) {
+        if self.len <= KEY_HASHER_INLINE {
+            self.spill.reserve(2 * KEY_HASHER_INLINE);
+            self.spill.extend_from_slice(&self.inline[..self.len]);
+        }
+        self.spill.extend_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    /// Fixed-size write. `N` is a constant, so the room test is one compare
+    /// and the copy is one store.
+    #[inline(always)]
+    fn write_array<const N: usize>(&mut self, bytes: [u8; N]) {
+        let len = self.len;
+        if len <= KEY_HASHER_INLINE - N {
+            self.inline[len..len + N].copy_from_slice(&bytes);
+            self.len = len + N;
+        } else {
+            self.write_spill(&bytes);
+        }
+    }
 
     /// Go `h.Write([]byte{c})` (`keyBuilder.writeByte`).
     #[inline]
     pub fn write_byte(&mut self, c: u8) {
-        self.buf.push(c);
+        self.write_array([c]);
     }
 
     /// Go `hashWrite32`: the 4 little-endian bytes of `value`.
     #[inline]
     pub fn write_u32(&mut self, value: u32) {
-        self.buf.extend(value.to_le_bytes());
+        self.write_array(value.to_le_bytes());
     }
 
     /// Go `hashWrite64`: the 8 little-endian bytes of `value`.
     #[inline]
     pub fn write_u64(&mut self, value: u64) {
-        self.buf.extend(value.to_le_bytes());
+        self.write_array(value.to_le_bytes());
+    }
+
+    /// Go `keyBuilder.writeTypes`: the count as `writeInt` (8 bytes) and then
+    /// `hashWrite32` of each type id. One room test for the whole list.
+    #[inline]
+    fn write_type_list(&mut self, types: &[TypeId]) {
+        let count = (types.len() as i32 as i64 as u64).to_le_bytes();
+        let len = self.len;
+        let room = self
+            .inline
+            .get_mut(len..)
+            .and_then(|rest| rest.get_mut(..count.len() + 4 * types.len()));
+        let Some(dst) = room else {
+            self.write_u64(u64::from_le_bytes(count));
+            for &t in types {
+                self.write_u32(t.0);
+            }
+            return;
+        };
+        let (head, tail) = dst.split_at_mut(count.len());
+        head.copy_from_slice(&count);
+        for (d, &t) in tail.chunks_exact_mut(4).zip(types) {
+            d.copy_from_slice(&t.0.to_le_bytes());
+        }
+        self.len = len + count.len() + 4 * types.len();
     }
 
     /// Go `h.Sum128()`.
     pub fn sum128(&self) -> CacheHashKey {
-        let (hi, lo) = xxh3_hash128(&self.buf);
+        let (hi, lo) = xxh3_hash128(self.bytes());
         CacheHashKey { hi, lo }
     }
 }
@@ -1167,6 +1286,37 @@ fn xxh3_hash128_4to8(first: u64, last: u64, l: u64) -> (u64, u64) {
     (xxh3_avalanche(r_hi), r_lo)
 }
 
+/// The 9..=16 byte path of `xxh3_hash128`, from the first and last 8 bytes
+/// (little endian) and the length `l`. Returns `(hi, lo)`.
+#[inline(always)]
+fn xxh3_hash128_9to16(input_lo: u64, input_hi: u64, l: u64) -> (u64, u64) {
+    let bitflipl = xxh_key64(32) ^ xxh_key64(40);
+    let bitfliph = xxh_key64(48) ^ xxh_key64(56);
+    let mut input_hi = input_hi;
+    let m = ((input_lo ^ input_hi ^ bitflipl) as u128).wrapping_mul(XXH_PRIME64_1 as u128);
+    let mut m_h = (m >> 64) as u64;
+    let mut m_l = m as u64;
+    m_l = m_l.wrapping_add((l - 1) << 54);
+    input_hi ^= bitfliph;
+    m_h = m_h.wrapping_add(
+        input_hi.wrapping_add((input_hi & 0xffff_ffff).wrapping_mul(XXH_PRIME32_2 - 1)),
+    );
+    m_l ^= m_h.swap_bytes();
+    let r = (m_l as u128).wrapping_mul(XXH_PRIME64_2 as u128);
+    let r_hi = ((r >> 64) as u64).wrapping_add(m_h.wrapping_mul(XXH_PRIME64_2));
+    (xxh3_avalanche(r_hi), xxh3_avalanche(r as u64))
+}
+
+/// `xxh3_hash128` of a short key built in a stack array, with no
+/// `KeyHasher`. `N` is 9..=16, so the length dispatch is gone and the two
+/// 8-byte reads fold into register moves.
+#[inline(always)]
+fn short_key_hash<const N: usize>(p: &[u8; N]) -> CacheHashKey {
+    const { assert!(N > 8 && N <= 16) };
+    let (hi, lo) = xxh3_hash128_9to16(xxh_read64(p, 0), xxh_read64(p, N - 8), N as u64);
+    CacheHashKey { hi, lo }
+}
+
 /// Go `keyBuilder{}; writeType(t); writeAlias(nil); hash()`, computed in
 /// registers. The key bytes are `t` (4 bytes LE) and then `0`, so the last
 /// 4 bytes are `t >> 8`. Same value as the `KeyBuilder` path.
@@ -1183,22 +1333,7 @@ fn xxh3_hash128(p: &[u8]) -> (u64, u64) {
     if l <= 16 {
         let (lo, hi);
         if l > 8 {
-            let bitflipl = xxh_key64(32) ^ xxh_key64(40);
-            let bitfliph = xxh_key64(48) ^ xxh_key64(56);
-            let input_lo = xxh_read64(p, 0);
-            let mut input_hi = xxh_read64(p, l - 8);
-            let m = ((input_lo ^ input_hi ^ bitflipl) as u128).wrapping_mul(XXH_PRIME64_1 as u128);
-            let mut m_h = (m >> 64) as u64;
-            let mut m_l = m as u64;
-            m_l = m_l.wrapping_add((lu - 1) << 54);
-            input_hi ^= bitfliph;
-            m_h = m_h.wrapping_add(
-                input_hi.wrapping_add((input_hi & 0xffff_ffff).wrapping_mul(XXH_PRIME32_2 - 1)),
-            );
-            m_l ^= m_h.swap_bytes();
-            let r = (m_l as u128).wrapping_mul(XXH_PRIME64_2 as u128);
-            let r_hi = ((r >> 64) as u64).wrapping_add(m_h.wrapping_mul(XXH_PRIME64_2));
-            return (xxh3_avalanche(r_hi), xxh3_avalanche(r as u64));
+            return xxh3_hash128_9to16(xxh_read64(p, 0), xxh_read64(p, l - 8), lu);
         } else if l > 3 {
             return xxh3_hash128_4to8(xxh_read32(p, 0), xxh_read32(p, l - 4), lu);
         } else if l == 3 {
@@ -1334,16 +1469,17 @@ impl KeyBuilder {
 
     // Go: checker/checker.go:17337 keyBuilder.writeType
     // PORT: Go writes `t.id`; the handle value is the type id.
+    #[inline]
     pub fn write_type(&mut self, t: TypeId) {
         hash_write32(&mut self.h, t.0);
     }
 
     // Go: checker/checker.go:17341 keyBuilder.writeTypes
+    // PERF: `write_type_list` writes the same bytes as `write_int(len)` and
+    // then `write_type` for each type, with one room test for the list.
+    #[inline]
     pub fn write_types(&mut self, types: &[TypeId]) {
-        self.write_int(types.len() as i32);
-        for &t in types {
-            self.write_type(t);
-        }
+        self.h.write_type_list(types);
     }
 
     // Go: checker/checker.go:17348 keyBuilder.writeAlias
@@ -1453,6 +1589,110 @@ impl KeyBuilder {
     }
 }
 
+/// Size of the `ShortKey` buffer. A type list and an alias with 4 types each
+/// and a flag byte take 58 bytes.
+const SHORT_KEY_CAP: usize = 64;
+
+/// Byte length of Go `keyBuilder.writeTypes` for `n` types: the count as 8
+/// bytes and then 4 bytes for each type.
+#[inline(always)]
+const fn type_list_key_len(n: usize) -> usize {
+    8 + 4 * n
+}
+
+/// Byte length of Go `keyBuilder.writeAlias`: 1 for a nil alias, else the
+/// tag byte, the 8-byte symbol id and the type list.
+#[inline(always)]
+fn alias_key_len(alias: Option<(SymbolId, &[TypeId])>) -> usize {
+    match alias {
+        Some((_, types)) => 9 + type_list_key_len(types.len()),
+        None => 1,
+    }
+}
+
+/// PERF: a cache key built in a 64-byte stack array, for the hot
+/// `getTypeInstantiationKey`, `getConditionalTypeKey` and
+/// `getIntersectionKey`. A `KeyBuilder` zero-fills 256 bytes and owns a
+/// `spill` vector, and its type list copy loop becomes a `memcpy` call.
+/// Here the fill is 64 bytes (safe code must initialize the array; this is
+/// a few vector stores and no call), and lists of up to 4 types are
+/// fixed-size stores. The caller tests the room for the whole key once and
+/// uses the `KeyBuilder` path for a longer key, so the bounds checks of the
+/// stores never fail. The bytes and their order are the `KeyBuilder` bytes,
+/// so the xxh3 hash is the same.
+struct ShortKey {
+    len: usize,
+    buf: [u8; SHORT_KEY_CAP],
+}
+
+impl ShortKey {
+    #[inline(always)]
+    fn new() -> Self {
+        ShortKey {
+            len: 0,
+            buf: [0; SHORT_KEY_CAP],
+        }
+    }
+
+    /// Fixed-size store of `bytes` after the bytes written so far.
+    #[inline(always)]
+    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
+        let len = self.len;
+        self.buf[len..len + N].copy_from_slice(&bytes);
+        self.len = len + N;
+    }
+
+    /// Same bytes as `KeyBuilder::write_types`. Up to 4 types are fixed-size
+    /// stores (two types are one 8-byte store); a longer list uses the slice
+    /// copy.
+    #[inline(always)]
+    fn write_types(&mut self, types: &[TypeId]) {
+        // `a` then `b`, 4 little-endian bytes each.
+        let pair = |a: TypeId, b: TypeId| (u64::from(a.0) | (u64::from(b.0) << 32)).to_le_bytes();
+        self.put((types.len() as i32 as i64 as u64).to_le_bytes());
+        match *types {
+            [] => {}
+            [a] => self.put(a.0.to_le_bytes()),
+            [a, b] => self.put(pair(a, b)),
+            [a, b, c] => {
+                self.put(pair(a, b));
+                self.put(c.0.to_le_bytes());
+            }
+            [a, b, c, d] => {
+                self.put(pair(a, b));
+                self.put(pair(c, d));
+            }
+            _ => {
+                let len = self.len;
+                let end = len + 4 * types.len();
+                for (d, &t) in self.buf[len..end].chunks_exact_mut(4).zip(types) {
+                    d.copy_from_slice(&t.0.to_le_bytes());
+                }
+                self.len = end;
+            }
+        }
+    }
+
+    /// Same bytes as `KeyBuilder::write_alias`, with the alias given as its
+    /// symbol and type arguments.
+    #[inline(always)]
+    fn write_alias(&mut self, symbols: &SymbolArena, alias: Option<(SymbolId, &[TypeId])>) {
+        if let Some((symbol, types)) = alias {
+            self.put([1]);
+            self.put(get_symbol_id(symbols, symbol).to_le_bytes());
+            self.write_types(types);
+        } else {
+            self.put([0]);
+        }
+    }
+
+    #[inline(always)]
+    fn hash(&self) -> CacheHashKey {
+        let (hi, lo) = xxh3_hash128(&self.buf[..self.len]);
+        CacheHashKey { hi, lo }
+    }
+}
+
 // PORT: the Go `get*Key` functions below are package functions. The ones
 // that only use type ids (and alias symbols) are free functions; functions
 // that write aliases take the symbol arena because `ast.GetSymbolId` does.
@@ -1460,7 +1700,32 @@ impl KeyBuilder {
 // (supplying `&self.symbols`), so callers can use either form.
 
 // Go: checker/checker.go:17403 getTypeListKey
+// PERF: a list of 1 or 2 types is a 12 or 16 byte key (the count as 8 bytes,
+// then 4 bytes for each type). It is built in a stack array and hashed with
+// no `KeyBuilder`. Same bytes, so the same key.
 pub fn get_type_list_key(types: &[TypeId]) -> CacheHashKey {
+    let key = match *types {
+        [t] => {
+            let mut p = [0u8; 12];
+            p[..8].copy_from_slice(&1u64.to_le_bytes());
+            p[8..].copy_from_slice(&t.0.to_le_bytes());
+            short_key_hash(&p)
+        }
+        [t0, t1] => {
+            let mut p = [0u8; 16];
+            p[..8].copy_from_slice(&2u64.to_le_bytes());
+            p[8..12].copy_from_slice(&t0.0.to_le_bytes());
+            p[12..].copy_from_slice(&t1.0.to_le_bytes());
+            short_key_hash(&p)
+        }
+        _ => return type_list_key_with_builder(types),
+    };
+    debug_assert_eq!(key, type_list_key_with_builder(types));
+    key
+}
+
+/// Go `getTypeListKey` through `keyBuilder`.
+fn type_list_key_with_builder(types: &[TypeId]) -> CacheHashKey {
     let mut b = KeyBuilder::default();
     b.write_types(types);
     b.hash()
@@ -1474,7 +1739,41 @@ pub fn get_alias_key(symbols: &SymbolArena, alias: Option<&TypeAlias>) -> CacheH
 }
 
 // Go: checker/checker.go:17439 getIntersectionKey
+// PERF: built in a `ShortKey` when the whole key fits in it, else through
+// `keyBuilder`. Same bytes, so the same key.
 pub fn get_intersection_key(
+    symbols: &SymbolArena,
+    types: &[TypeId],
+    flags: IntersectionFlags,
+    alias: Option<&TypeAlias>,
+) -> CacheHashKey {
+    let alias_parts = alias.map(|a| (a.symbol, a.type_arguments.as_slice()));
+    let reduce = !flags.intersects(IntersectionFlags::NO_CONSTRAINT_REDUCTION);
+    let tail_len = if reduce {
+        alias_key_len(alias_parts)
+    } else {
+        1
+    };
+    if type_list_key_len(types.len()) + tail_len > SHORT_KEY_CAP {
+        return intersection_key_with_builder(symbols, types, flags, alias);
+    }
+    let mut b = ShortKey::new();
+    b.write_types(types);
+    if reduce {
+        b.write_alias(symbols, alias_parts);
+    } else {
+        b.put([b'*']);
+    }
+    let key = b.hash();
+    debug_assert_eq!(
+        key,
+        intersection_key_with_builder(symbols, types, flags, alias)
+    );
+    key
+}
+
+/// Go `getIntersectionKey` through `keyBuilder`.
+fn intersection_key_with_builder(
     symbols: &SymbolArena,
     types: &[TypeId],
     flags: IntersectionFlags,
@@ -1529,10 +1828,62 @@ pub fn get_type_instantiation_key(
     alias: Option<&TypeAlias>,
     single_signature: bool,
 ) -> CacheHashKey {
-    let mut b = KeyBuilder::default();
+    type_instantiation_key_parts(
+        symbols,
+        type_arguments,
+        alias.map(|a| (a.symbol, a.type_arguments.as_slice())),
+        single_signature,
+    )
+}
+
+/// Go `getTypeInstantiationKey` and `getConditionalTypeKey`, which have the
+/// same body: `writeTypes(typeArguments)`, `writeAlias(alias)` and then
+/// `'!'` when `flag`. The alias is given as its symbol and type arguments,
+/// so a caller can hash an alias that it has not built yet.
+/// PERF: built in a `ShortKey` when the whole key fits in it, else through
+/// `keyBuilder`. Same bytes, so the same key.
+pub fn type_instantiation_key_parts(
+    symbols: &SymbolArena,
+    type_arguments: &[TypeId],
+    alias: Option<(SymbolId, &[TypeId])>,
+    flag: bool,
+) -> CacheHashKey {
+    let len = type_list_key_len(type_arguments.len()) + alias_key_len(alias) + usize::from(flag);
+    if len > SHORT_KEY_CAP {
+        return type_instantiation_key_with_builder(symbols, type_arguments, alias, flag);
+    }
+    let mut b = ShortKey::new();
     b.write_types(type_arguments);
     b.write_alias(symbols, alias);
-    if single_signature {
+    if flag {
+        b.put([b'!']);
+    }
+    let key = b.hash();
+    debug_assert_eq!(
+        key,
+        type_instantiation_key_with_builder(symbols, type_arguments, alias, flag)
+    );
+    key
+}
+
+/// `type_instantiation_key_parts` through `keyBuilder`.
+fn type_instantiation_key_with_builder(
+    symbols: &SymbolArena,
+    type_arguments: &[TypeId],
+    alias: Option<(SymbolId, &[TypeId])>,
+    flag: bool,
+) -> CacheHashKey {
+    let mut b = KeyBuilder::default();
+    b.write_types(type_arguments);
+    // Go `b.writeAlias(alias)`, from the alias parts.
+    if let Some((symbol, alias_type_arguments)) = alias {
+        b.write_byte(1);
+        b.write_symbol(symbols, symbol);
+        b.write_types(alias_type_arguments);
+    } else {
+        b.write_byte(0);
+    }
+    if flag {
         b.write_byte(b'!');
     }
     b.hash()
@@ -1576,13 +1927,12 @@ pub fn get_conditional_type_key(
     alias: Option<&TypeAlias>,
     for_constraint: bool,
 ) -> CacheHashKey {
-    let mut b = KeyBuilder::default();
-    b.write_types(type_arguments);
-    b.write_alias(symbols, alias);
-    if for_constraint {
-        b.write_byte(b'!');
-    }
-    b.hash()
+    type_instantiation_key_parts(
+        symbols,
+        type_arguments,
+        alias.map(|a| (a.symbol, a.type_arguments.as_slice())),
+        for_constraint,
+    )
 }
 
 // Go: checker/checker.go:17538 getNodeListKey
@@ -1715,21 +2065,34 @@ impl Checker {
         if is_identity && source > target {
             std::mem::swap(&mut source, &mut target);
         }
-        let mut b = KeyBuilder::default();
-        let constrained;
         if self.is_type_reference_with_generic_arguments(source)
             && self.is_type_reference_with_generic_arguments(target)
         {
+            let mut b = KeyBuilder::default();
             b.write_byte(b'g');
-            constrained = b.write_generic_type_references(self, source, target, ignore_constraints);
-        } else {
+            let constrained =
+                b.write_generic_type_references(self, source, target, ignore_constraints);
+            hash_write32(&mut b.h, intersection_state.0);
+            return (b.hash(), constrained);
+        }
+        // PERF: the plain key is 13 bytes ('s', source, target, intersection
+        // state). It is built in a stack array and hashed with no
+        // `KeyBuilder`. Same bytes, so the same key.
+        let mut p = [0u8; 13];
+        p[0] = b's';
+        p[1..5].copy_from_slice(&source.0.to_le_bytes());
+        p[5..9].copy_from_slice(&target.0.to_le_bytes());
+        p[9..].copy_from_slice(&intersection_state.0.to_le_bytes());
+        let key = short_key_hash(&p);
+        debug_assert_eq!(key, {
+            let mut b = KeyBuilder::default();
             b.write_byte(b's');
             b.write_type(source);
             b.write_type(target);
-            constrained = false;
-        }
-        hash_write32(&mut b.h, intersection_state.0);
-        (b.hash(), constrained)
+            hash_write32(&mut b.h, intersection_state.0);
+            b.hash()
+        });
+        (key, false)
     }
 
     // Go: checker/checker.go:17538 getNodeListKey
@@ -1931,6 +2294,67 @@ mod key_hash_tests {
             // `write_alias(None)` writes this byte.
             b.write_byte(0);
             assert_eq!(type_key_no_alias(t), b.hash());
+        }
+    }
+
+    /// `KeyHasher` hashes the bytes it was given, in order, for keys that
+    /// stay inline and keys that spill past the inline buffer. The short
+    /// `get_type_list_key` paths hash the same bytes as the builder.
+    #[test]
+    fn key_hasher_and_short_keys_match_bytes() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2_000 {
+            let mut h = KeyHasher::default();
+            let mut want = Vec::new();
+            let writes = next() % 200;
+            for _ in 0..writes {
+                let v = next();
+                match v % 5 {
+                    0 => {
+                        h.write_byte(v as u8);
+                        want.push(v as u8);
+                    }
+                    1 => {
+                        h.write_u32(v as u32);
+                        want.extend((v as u32).to_le_bytes());
+                    }
+                    2 => {
+                        h.write_u64(v);
+                        want.extend(v.to_le_bytes());
+                    }
+                    3 => {
+                        let bytes = v.to_le_bytes();
+                        let s = &bytes[..(v >> 60) as usize % 9];
+                        h.write(s);
+                        want.extend_from_slice(s);
+                    }
+                    _ => {
+                        let types: Vec<TypeId> =
+                            (0..(v >> 56) % 80).map(|_| TypeId(next() as u32)).collect();
+                        h.write_type_list(&types);
+                        want.extend((types.len() as u64).to_le_bytes());
+                        for t in &types {
+                            want.extend(t.0.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            let (hi, lo) = xxh3_hash128(&want);
+            assert_eq!(h.sum128(), CacheHashKey { hi, lo }, "len {}", want.len());
+        }
+        for _ in 0..100_000 {
+            let (t0, t1) = (TypeId(next() as u32), TypeId(next() as u32));
+            assert_eq!(get_type_list_key(&[t0]), type_list_key_with_builder(&[t0]));
+            assert_eq!(
+                get_type_list_key(&[t0, t1]),
+                type_list_key_with_builder(&[t0, t1])
+            );
         }
     }
 }

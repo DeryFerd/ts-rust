@@ -1304,10 +1304,12 @@ pub fn utf16_len(s: &str) -> i32 {
 // PORT: Go `iter.Seq[T]` -> `IntoIterator`; `getName(T)` -> `FnMut(&T)`.
 // Names are port forms (see `GO_STRING_MARKER`). Go counts their bytes
 // (`go_len`) and runes (`go_runes`, where each invalid byte is U+FFFD).
-pub fn get_spelling_suggestion<T: Clone + Default>(
+// PERF: `get_name` returns any string type (`S`), so a caller whose names are
+// already stored (such as `&'static str`) makes no `String` per candidate.
+pub fn get_spelling_suggestion<T: Clone + Default, S: AsRef<str>>(
     name: &str,
     candidates: impl IntoIterator<Item = T>,
-    mut get_name: impl FnMut(&T) -> String,
+    mut get_name: impl FnMut(&T) -> S,
     mut compare: impl FnMut(&T, &T) -> i32,
 ) -> T {
     let rune_name: Vec<char> = go_runes(name);
@@ -1317,15 +1319,16 @@ pub fn get_spelling_suggestion<T: Clone + Default>(
     let mut has_best = false;
     for candidate in candidates {
         let candidate_name = get_name(&candidate);
+        let candidate_name: &str = candidate_name.as_ref();
         // PORT: Go compares the candidate byte length with the name rune count.
-        let candidate_len = go_len(&candidate_name);
+        let candidate_len = go_len(candidate_name);
         let max_len = candidate_len.max(rune_name.len()) as i64;
         let min_len = candidate_len.min(rune_name.len()) as i64;
         if !candidate_name.is_empty() && max_len - min_len <= maximum_length_difference {
             if candidate_name == name {
                 continue;
             }
-            let candidate_runes: Vec<char> = go_runes(&candidate_name);
+            let candidate_runes: Vec<char> = go_runes(candidate_name);
             // Only consider candidates less than 3 characters long when they differ by case.
             // Otherwise, don't bother, since a user would usually notice differences of a 2-character name.
             if candidate_len < 3 && !equal_fold(&candidate_runes, &rune_name) {

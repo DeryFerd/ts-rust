@@ -27,8 +27,8 @@ struct TriviaPositions {
 // Go: printer/changetrackerwriter.go:19 triviaPositionKey
 // Go: interface { // *astNode | *ast.NodeList
 // PORT: Go keys the maps by pointer. `NodeList` has no `Hash`, so a list is
-// keyed by the address of its `&'static ts_ast::NodeList` (pointer identity,
-// as Go and `NodeList`'s `PartialEq`).
+// keyed by the address of the list it names (`NodeList::list_ptr`; pointer
+// identity, as Go and `NodeList`'s `PartialEq`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum TriviaPositionKey {
     Node(Node),
@@ -37,7 +37,7 @@ enum TriviaPositionKey {
 
 impl TriviaPositionKey {
     fn node_list(list: NodeList) -> TriviaPositionKey {
-        TriviaPositionKey::NodeList(list.list.map_or(0, |l| std::ptr::from_ref(l) as usize))
+        TriviaPositionKey::NodeList(list.list_ptr().map_or(0, |l| l as usize))
     }
 }
 

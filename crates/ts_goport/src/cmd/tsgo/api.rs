@@ -1,11 +1,8 @@
 //! Go `cmd/tsgo/api.go`.
-//!
-//! PORT: Go `signal.NotifyContext` is not ported (no signal handling, plan
-//! decision D-W3); the context is a plain cancel context.
 
 use crate::cmd::tsgo::prelude::*;
 
-use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set};
+use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
 use crate::frontend::bundled;
 use crate::gostd::context;
 
@@ -62,7 +59,7 @@ pub fn run_api(args: &[String]) -> i32 {
     let mut s = crate::api::new_stdio_server(options);
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    let (ctx, stop) = context::with_cancel(&context::background());
+    let (ctx, stop) = notify_context(&context::background());
 
     let result = s.run(&ctx);
     // Go: defer stop()

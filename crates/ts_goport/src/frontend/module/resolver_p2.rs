@@ -1270,7 +1270,9 @@ pub fn move_to_next_directory_separator_if_available(
     is_folder: bool,
 ) -> i32 {
     let offset = (prev_separator_index + 1) as usize;
-    match path[offset..].find('/') {
+    // PORT: Go slices bytes. `offset` is one byte after the start of the
+    // package name, which can be inside a multi-byte character.
+    match path.as_bytes()[offset..].iter().position(|&b| b == b'/') {
         None => {
             if is_folder {
                 return path.len() as i32;
@@ -1455,12 +1457,37 @@ pub fn match_pattern_or_exact(patterns: &ParsedPatterns, candidate: &str) -> Pat
 // in `.` are actually normalized to `./` before proceeding with the resolution algorithm.
 pub fn normalize_path_for_cjs_resolution(containing_directory: &str, module_name: &str) -> String {
     let combined = combine_paths(containing_directory, &[module_name]);
-    let parts = get_path_components(&combined, "");
-    let last_part = &parts[parts.len() - 1];
+    // PORT: Go builds `GetPathComponents(combined, "")` only to read its last
+    // entry. `last_path_component` reads that entry in place.
+    let last_part = last_path_component(&combined);
+    debug_assert_eq!(
+        Some(last_part),
+        get_path_components(&combined, "")
+            .last()
+            .map(String::as_str)
+    );
     if last_part == "." || last_part == ".." {
         return ensure_trailing_directory_separator(&normalize_path(&combined));
     }
     normalize_path(&combined)
+}
+
+// PORT: the last entry of `get_path_components(path, "")` with no allocation.
+// `path` must already have normalized slashes (`combine_paths` output), so the
+// combine step in `get_path_components` returns it unchanged. Same rules as
+// `path_components`: the root is the first entry, one trailing separator is
+// removed, and a path that is only a root (or is empty) ends with the root.
+fn last_path_component(path: &str) -> &str {
+    let root_length = get_root_length(path);
+    let rest = &path[root_length..];
+    if rest.is_empty() {
+        return &path[..root_length];
+    }
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    match memchr::memrchr(b'/', rest.as_bytes()) {
+        Some(index) => &rest[index + 1..],
+        None => rest,
+    }
 }
 
 // Go: module/resolver.go:2051 matchesPatternWithTrailer

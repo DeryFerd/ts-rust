@@ -1453,7 +1453,7 @@ pub fn create_module_not_found_chain(
     let resolved_module = get_resolved_module(file, module_reference, mode);
 
     if let Some(resolved_module) = resolved_module
-        .as_ref()
+        .as_deref()
         .filter(|m| !m.alternate_result.is_empty())
     {
         if resolved_module
