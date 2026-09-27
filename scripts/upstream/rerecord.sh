@@ -33,7 +33,9 @@ STEPS=${3:-prep,sync,projects,f1,sweep,emit,ls,api,fetch}
 CURRENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["current"])' "$REPO/UPSTREAM.json")
 ROOT=$(python3 "$PIN" path root "$KEY")
 ORACLE=$(python3 "$PIN" path oracle "$KEY")
-OSHA=$(sha256sum "$ORACLE" 2>/dev/null | cut -c1-12)
+# Oracle sha12 of a pin, from UPSTREAM.json. (Inside a pin run the default oracle path shows the pin oracle.)
+osha() { python3 "$PIN" show "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oracle"]["sha256"][:12])'; }
+OSHA=$(osha "$KEY")
 JOBS=${JOBS:-12}
 LOG=$ROOT/rerecord
 LS_ROOTS=(ls-oracle/battery tests2/lsp complete/lsp)
@@ -43,7 +45,7 @@ mkdir -p "$LOG"
 
 # Batteries with a selfchecked golden set for the current pin oracle (b3-effect was never finished).
 batteries() {
-  local d; for d in "$R/$1/golden/$(sha256sum "$(python3 "$PIN" path oracle "$CURRENT")" | cut -c1-12)"/*/; do
+  local d; for d in "$R/$1/golden/$(osha "$CURRENT")"/*/; do
     [[ -f $d/selfcheck-summary.json ]] && basename "$d"
   done
 }
@@ -88,9 +90,11 @@ step_api() {
   done
 }
 step_fetch() {
-  local dirs=("$ROOT") root
-  [[ $KEY == "$CURRENT" ]] || for root in "${LS_ROOTS[@]}" tests2/api; do dirs+=("$R/$root/golden/$OSHA"); done
-  bash scripts/goport/remote.sh fetch "$HOST" "${dirs[@]}"
+  bash scripts/goport/remote.sh fetch "$HOST" "$ROOT" || return
+  local root
+  [[ $KEY == "$CURRENT" ]] || for root in "${LS_ROOTS[@]}" tests2/api; do
+    bash scripts/goport/remote.sh fetch "$HOST" "$R/$root/golden/$OSHA" || echo "no $root/golden/$OSHA on $HOST"
+  done
 }
 
 run_step() {
@@ -108,7 +112,7 @@ if [[ $KEY == "$CURRENT" ]]; then
     [[ " prep sync projects f1 fetch " == *" $s "* ]] || { echo "step $s does not run for the current pin $KEY" >&2; exit 2; }
   done
 fi
-[[ -n $OSHA ]] || { echo "missing pin oracle $ORACLE" >&2; exit 2; }
+[[ -n $OSHA && -e $ORACLE ]] || { echo "missing pin oracle $ORACLE" >&2; exit 2; }
 [[ $HOST == local && -z ${GOPORT_PIN_ACTIVE:-} ]] || echo "rerecord $KEY on $HOST: $STEPS (pin oracle $OSHA, root $ROOT)"
 if [[ $HOST == local ]]; then
   # Host steps need the pin overlay; pin.py exec starts it once for the whole run.
