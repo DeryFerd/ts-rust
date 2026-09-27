@@ -816,8 +816,8 @@ fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     )
 }
 
-/// Number of bind threads. `GOPORT_BIND_THREADS` sets it (below 2 binds
-/// serially).
+/// Number of bind threads: one per core up to `ThreadBudget::bind`.
+/// `GOPORT_BIND_THREADS` sets it (below 2 binds serially).
 fn bind_thread_count() -> usize {
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
         .ok()
@@ -825,17 +825,96 @@ fn bind_thread_count() -> usize {
     {
         return count;
     }
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        // Each new thread gets its own glibc malloc arena, and freed per-file
-        // bind data stays resident there, so RSS grows with the cap.
-        .min(BIND_THREAD_CAP)
+    available_cores().min(ThreadBudget::current().bind)
 }
 
-/// The most bind threads. 8 is the measured best: effect binds in 48 ms
-/// (83 ms with 4) and peak RSS grows by 2 to 5 MB. More threads give less
-/// than 5 ms and cost more RSS.
-const BIND_THREAD_CAP: usize = 8;
+/// The cores that this process may run on.
+pub fn available_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// The most parse threads (the loading thread included) and bind threads
+/// of a program load, and the glibc malloc arenas of the process, in one
+/// budget.
+///
+/// glibc gives each thread that mallocs its own arena until `arena_max`
+/// arenas exist. A later thread shares the arena of another thread, and
+/// when both malloc at once they wait on its lock. Each arena in use also
+/// adds peak RSS, because freed per-file data stays in it. The parse
+/// mallocs most (a quarter of the parse thread cycles), so the parse
+/// threads must fit the arenas: with 7 arenas at 16 cores, the 7 parse
+/// workers of effect made 3,763 futex waits (19 at 4 cores). The bind
+/// threads malloc little (about 5% of their cycles), so they can share
+/// arenas: 8 bind threads bind effect in the same time with 7 arenas as
+/// with 16. In the check, the checkers and the loading thread malloc.
+/// Main, and in `tsgo` the signal and text hash threads, hold an arena too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadBudget {
+    /// The most parse threads, the loading thread included.
+    pub parse: usize,
+    /// The most bind threads.
+    pub bind: usize,
+    /// `glibc.malloc.arena_max`.
+    pub arena_max: usize,
+}
+
+static THREAD_BUDGET: OnceLock<ThreadBudget> = OnceLock::new();
+
+/// Go's default checker count (`checker_count`).
+const DEFAULT_CHECKERS: usize = 4;
+
+impl ThreadBudget {
+    /// A process that loads several programs at once (`goport_build`: about
+    /// 20 threads per program), and the counts of a process that installs
+    /// no budget.
+    pub const WIDE: ThreadBudget = ThreadBudget {
+        parse: 8,
+        bind: 8,
+        arena_max: 16,
+    };
+
+    /// The budget of a one-program process (`tsgo`, `goport`): one arena
+    /// for each thread alive while the checkers run (the checkers, main,
+    /// the loading thread and `extra`; `tsgo` has 1 extra, its signal
+    /// thread). The parse uses as many threads as the check (4 parse
+    /// workers with the loading thread), so with main and `extra` it fits
+    /// these arenas. The bind keeps 8 threads.
+    // PERF (perf9 round 2, env-only runs on cup2 and zbook): with 8 parse
+    // threads at 8 and 16 cores, the parse threads shared arena locks. With
+    // 5, the query parse on cup2 took 21 ms instead of 29 (wall 8% to 12%
+    // less) and query peak RSS was 135 MB instead of 136 to 137 (Go 119).
+    // 7 parse threads with 10 arenas were faster on effect, but query then
+    // needs 143 MB, over the 1.15x RSS rule. 4 bind threads cost zod 13 ms
+    // and effect 18 ms of bind. At 4 cores nothing changes: the counts are
+    // the core count there.
+    pub fn one_program(extra: usize) -> Self {
+        ThreadBudget {
+            parse: DEFAULT_CHECKERS + 1,
+            bind: 8,
+            arena_max: DEFAULT_CHECKERS + 2 + extra,
+        }
+    }
+
+    /// Makes this the budget of the program loads of this process. The
+    /// first install wins.
+    pub fn install(self) {
+        let _ = THREAD_BUDGET.set(self);
+    }
+
+    /// The installed budget, or `WIDE`.
+    pub fn current() -> Self {
+        THREAD_BUDGET.get().copied().unwrap_or(Self::WIDE)
+    }
+
+    /// The `GLIBC_TUNABLES` value of this budget (see `bin/goport.rs`
+    /// `set_malloc_tunables`).
+    pub fn glibc_tunables(&self) -> String {
+        format!(
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max={}:glibc.malloc.top_pad=67108864",
+            self.arena_max
+        )
+    }
+}
 
 /// One file bound on a bind thread, with its ids already moved to program
 /// ids, or None when binding it made thread-local state or panicked.

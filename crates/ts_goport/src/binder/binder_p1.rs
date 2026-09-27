@@ -257,6 +257,19 @@ pub struct BoundFile {
 /// Parallel binding binds each file into its own arena with this, then
 /// moves the symbols into the program arena (`BoundFile::remap`).
 pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> BoundFile {
+    // PERF: r2-lib-bind-snapshot. A large bundled lib file (lib.dom) bound
+    // into a new arena loads its output from the embedded snapshot when the
+    // key matches, instead of binding. The output equals a live bind (see
+    // `lib_snapshot`). Any other file, or any mismatch, binds live.
+    if let Some(bound) = super::lib_snapshot::load(file, symbols) {
+        return bound;
+    }
+    bind_source_file_live(file, symbols)
+}
+
+/// `bind_source_file_detached` without the lib bind snapshot: always binds.
+/// The snapshot generator and its test use it for the live side.
+pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile {
     let file_index = file.file_index();
     let go_file = crate::ast::go_file(file_index);
     let node_count = go_file.parser_flags.len();

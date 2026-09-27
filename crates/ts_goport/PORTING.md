@@ -308,15 +308,22 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
   read-write in full when glibc makes it, so THP `always` maps it with
   2 MiB pages. Without it, glibc before 2.44 (cup2, alvin) grows the heaps
   in 4 KiB steps and every new page faults. On cup2 the settings cut
-  `tsgo` wall time by 26% to 42% (perf9 round 1). `arena_max` is 6 in
-  `goport` and 7 in `tsgo`: one arena for each thread that is alive while
-  the checkers run (tsgo also has a signal thread). `goport_build` runs
-  about 20 threads per program and uses 16. More arenas go to the parse
-  threads and raise query peak RSS. Keep query peak RSS under 1.15 times Go
-  tsgo: at 16 cores `goport` and `tsgo` have 133 MB against 119 MB (with 8
-  arenas 142 and 139 MB). jemalloc and mimalloc have the same speed as
-  these settings on cup2 but more RSS (jemalloc query 143 to 153 MB), so
-  the `jemalloc` feature stays off.
+  `tsgo` wall time by 26% to 42% (perf9 round 1). `arena_max` and the
+  parse and bind thread caps come from one budget (`program::ThreadBudget`),
+  which each binary installs at start. `goport` and `tsgo`
+  (`ThreadBudget::one_program`) have one arena for each thread that is
+  alive while the checkers run: 6 in `goport`, 7 in `tsgo` (its signal
+  thread). The parse mallocs most, so it runs at most 5 threads (4 workers
+  and the loading thread), which fit these arenas; with 8 parse threads at
+  16 cores the parse threads shared arena locks. The bind mallocs little
+  and keeps 8 threads. `goport_build` (about 20 threads per program) and
+  bins that install no budget keep `ThreadBudget::WIDE`: 8 parse and 8
+  bind threads, 16 arenas in `goport_build`. Each arena in use raises
+  peak RSS. Keep query peak RSS under 1.15 times Go tsgo (119 MB, so
+  137 MB): at 16 cores `tsgo` has 135 MB (7 parse threads with 10 arenas:
+  143 MB). jemalloc and mimalloc have the same speed as these settings on
+  cup2 but more RSS (jemalloc query 143 to 153 MB), so the `jemalloc`
+  feature stays off.
 - PGO: `scripts/build-pgo.sh [out-dir]` does an instrumented build
   (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
   about 200 corpus cases (plus `tsgo --noEmit` on the five projects and

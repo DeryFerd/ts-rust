@@ -336,7 +336,10 @@ impl FilesParser {
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
         let prefetch = PrefetchGuard::install(pool.shared.clone());
-        self.run(loader, tasks);
+        self.start(loader, tasks, 0);
+        pool.shared
+            .rank_roots(tasks, ROOT_RANK_PER_WORKER * pool.threads.len());
+        self.run_queue(loader);
         // Closes the queue, then waits for the workers.
         drop(prefetch);
         drop(pool);
@@ -346,7 +349,11 @@ impl FilesParser {
     /// queue until it is empty.
     fn run(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
         self.start(loader, tasks, 0);
-        // Go: core/workgroup.go singleThreadedWorkGroup.RunAndWait
+        self.run_queue(loader);
+    }
+
+    // Go: core/workgroup.go singleThreadedWorkGroup.RunAndWait
+    fn run_queue(&mut self, loader: &FileLoader) {
         while let Some(queued) = self.queue.pop() {
             self.run_queued(loader, queued);
         }
@@ -1074,7 +1081,8 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 /// loading thread.
 const PARSE_STACK_SIZE: usize = 1 << 30;
 
-/// Number of parse workers next to the loading thread.
+/// Number of parse workers next to the loading thread: one per core, up to
+/// `ThreadBudget::parse` parse threads with the loading thread.
 /// `GOPORT_PARSE_THREADS` sets it (0 turns prefetch off).
 fn prefetch_worker_count() -> usize {
     if let Some(count) = std::env::var("GOPORT_PARSE_THREADS")
@@ -1083,10 +1091,7 @@ fn prefetch_worker_count() -> usize {
     {
         return count;
     }
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(PARSE_THREAD_CAP)
-        - 1
+    crate::program::available_cores().min(crate::program::ThreadBudget::current().parse) - 1
 }
 
 /// True when a program load on this thread starts parse workers
@@ -1095,9 +1100,9 @@ pub(crate) fn parse_workers_enabled() -> bool {
     prefetch_worker_count() > 0 && PREFETCH.with(|p| p.borrow().is_none())
 }
 
-/// The most parse threads, the loading thread included. 8 is the measured
-/// best with glibc malloc: more workers make zod and effect parse slower.
-const PARSE_THREAD_CAP: usize = 8;
+/// How many of the largest root files per parse worker the workers parse
+/// before the other jobs (`PrefetchShared::rank_roots`).
+const ROOT_RANK_PER_WORKER: usize = 2;
 
 /// The parse of one file by a parse worker.
 struct PrefetchJob {
@@ -1143,11 +1148,16 @@ pub enum Prefetched {
 #[derive(Default)]
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
-    /// the loader's queue, but take `lib.dom.d.ts` before all others.
+    /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
+    /// can be in the list twice (`rank_largest`); a worker skips a job that
+    /// is no longer queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The queued `lib.dom.d.ts` job. It is the largest file of most
     /// programs, so its parse starts first to end before the loader needs it.
     first: Option<Arc<PrefetchJob>>,
+    /// The root file jobs for the next free worker to rank by file size,
+    /// and how many of the largest to move up (`PrefetchShared::rank_roots`).
+    rank: Option<(Vec<Arc<PrefetchJob>>, usize)>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
     next_job: usize,
@@ -1227,6 +1237,63 @@ struct PrefetchShared {
     /// Set when the loader takes the workers (`FilesParser::parse`). Until
     /// then, and with `None` inside, the workers do not resolve.
     resolve: OnceLock<Option<WorkerResolveConfig>>,
+    /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
+    /// is set and printed to stderr when the pool stops.
+    counts: Option<Mutex<PrefetchStats>>,
+}
+
+/// What `take_prefetched` gave the loader during one program load.
+#[derive(Default)]
+struct PrefetchStats {
+    /// Worker parses that the loader took.
+    taken: usize,
+    /// The files that the loader parsed itself, and why: no worker had
+    /// started the job (the loader claims it), no job was queued, or the
+    /// worker parse was not usable.
+    claimed: Vec<String>,
+    not_queued: Vec<String>,
+    unusable: Vec<String>,
+    /// Running worker parses that the loader waited for, and the time.
+    waited: usize,
+    wait: std::time::Duration,
+}
+
+impl PrefetchStats {
+    /// Prints the counts to stderr. The sizes are read here, so only a
+    /// debug run pays for them.
+    fn print(&self) {
+        let size = |name: &String| {
+            crate::frontend::bundled::bundled_text(name).map_or_else(
+                || std::fs::metadata(name).map_or(0, |m| m.len()),
+                |text| text.len() as u64,
+            )
+        };
+        let mut own: Vec<(u64, &String)> = self
+            .claimed
+            .iter()
+            .chain(&self.not_queued)
+            .chain(&self.unusable)
+            .map(|name| (size(name), name))
+            .collect();
+        own.sort_by_key(|&(size, _)| std::cmp::Reverse(size));
+        let bytes: u64 = own.iter().map(|(size, _)| size).sum();
+        eprintln!(
+            "goport prefetch: loader parsed {} files ({} KB): claimed {}, not queued {}, unusable {}; took {} worker parses; waited {} times ({:.1} ms); largest: {}",
+            own.len(),
+            bytes / 1024,
+            self.claimed.len(),
+            self.not_queued.len(),
+            self.unusable.len(),
+            self.taken,
+            self.waited,
+            self.wait.as_secs_f64() * 1e3,
+            own.iter()
+                .take(5)
+                .map(|(size, name)| format!("{name} {} KB", size / 1024))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
 }
 
 thread_local! {
@@ -1248,6 +1315,8 @@ impl PrefetchShared {
             config,
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
+            counts: std::env::var_os("GOPORT_PREFETCH_STATS")
+                .map(|_| Mutex::new(PrefetchStats::default())),
         }
     }
 
@@ -1260,6 +1329,66 @@ impl PrefetchShared {
 
     fn is_closed(&self) -> bool {
         self.closed.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Updates the debug counts, when they are kept (`GOPORT_PREFETCH_STATS`).
+    fn count(&self, update: impl FnOnce(&mut PrefetchStats)) {
+        if let Some(counts) = &self.counts {
+            update(&mut lock(counts));
+        }
+    }
+
+    /// Asks the next free worker to move the `count` largest root files
+    /// that no worker has started to the top of the queue
+    /// (`rank_largest`). Call it after `FilesParser::start` queued the
+    /// root tasks.
+    // PERF: the loader loads imports depth first, so it needs root files
+    // such as effect's `Effect.ts` (460 KB) early, while the workers take
+    // the root jobs in root order and reach them last. The loader then
+    // parses them itself, at 16 threads as a loader-only tail after the
+    // workers are idle. The largest roots go first, so the long parses run
+    // on workers in parallel. The loader order does not change, and it
+    // still checks every worker parse.
+    fn rank_roots(&self, tasks: &[ParseTaskRef], count: usize) {
+        let mut queue = lock(&self.queue);
+        let jobs: Vec<_> = tasks
+            .iter()
+            .filter_map(|task| {
+                queue
+                    .by_name
+                    .get(&task.borrow().normalized_file_path)
+                    .cloned()
+            })
+            .collect();
+        if jobs.len() < 2 || count == 0 {
+            return;
+        }
+        queue.rank = Some((jobs, count));
+        drop(queue);
+        self.ready.notify_one();
+    }
+
+    /// Pushes the `count` largest of `jobs` that are still queued on top of
+    /// the queue, the largest last so it is taken first. A worker runs it,
+    /// so the loader does not wait for the `stat` calls.
+    fn rank_largest(&self, fs: &dyn Fs, jobs: Vec<Arc<PrefetchJob>>, count: usize) {
+        let queued = |job: &Arc<PrefetchJob>| matches!(*lock(&job.state), PrefetchState::Queued);
+        let mut sized: Vec<(i64, Arc<PrefetchJob>)> = jobs
+            .into_iter()
+            .filter(|job| queued(job))
+            .filter_map(|job| fs.stat(&job.opts.file_name).map(|info| (info.size(), job)))
+            .collect();
+        // Stable: files of one size keep the root order.
+        sized.sort_by_key(|(size, _)| *size);
+        let largest = sized.split_off(sized.len().saturating_sub(count));
+        let mut queue = lock(&self.queue);
+        for (_, job) in largest {
+            if queued(&job) {
+                queue.pending.push(job);
+            }
+        }
+        drop(queue);
+        self.ready.notify_all();
     }
 
     /// Queues a parse of `opts.file_name`, unless one is queued already.
@@ -1408,8 +1537,13 @@ impl PrefetchPool {
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         self.shared.close();
+        // A discarded pool has no threads here and prints no counts.
+        let used = !self.threads.is_empty();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
+        }
+        if used && let Some(counts) = &self.shared.counts {
+            lock(counts).print();
         }
     }
 }
@@ -1569,7 +1703,8 @@ impl FileRefs {
 
 /// A parse worker: parses queued files, newest first (the loader's queue
 /// is a stack too), until the queue closes. After each parse it queues the
-/// files that the parse references.
+/// files that the parse references. The first free worker after the root
+/// tasks are queued ranks them (`PrefetchShared::rank_roots`).
 fn run_prefetch_worker(shared: &PrefetchShared) {
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()). The workers share one
     // stat cache, like the Go parse tasks share the host's cachedvfs.
@@ -1586,7 +1721,16 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
                 if queue.closed {
                     return;
                 }
-                if let Some(job) = queue.first.take().or_else(|| queue.pending.pop()) {
+                if let Some(job) = queue.first.take() {
+                    break job;
+                }
+                if let Some((jobs, count)) = queue.rank.take() {
+                    drop(queue);
+                    shared.rank_largest(&*fs, jobs, count);
+                    queue = lock(&shared.queue);
+                    continue;
+                }
+                if let Some(job) = queue.pending.pop() {
                     break job;
                 }
                 queue = shared
@@ -1916,14 +2060,20 @@ pub fn take_prefetched(
         return Prefetched::Nothing;
     };
     let Some(job) = lock(&shared.queue).by_name.get(&opts.file_name).cloned() else {
+        shared.count(|c| c.not_queued.push(opts.file_name.clone()));
         return Prefetched::Nothing;
     };
     let mut state = lock(&job.state);
+    let mut waited: Option<std::time::Instant> = None;
     let result = loop {
         match std::mem::replace(&mut *state, PrefetchState::Claimed) {
-            PrefetchState::Queued | PrefetchState::Claimed => return Prefetched::Nothing,
+            PrefetchState::Queued | PrefetchState::Claimed => {
+                shared.count(|c| c.claimed.push(opts.file_name.clone()));
+                return Prefetched::Nothing;
+            }
             PrefetchState::Running => {
                 *state = PrefetchState::Running;
+                waited.get_or_insert_with(std::time::Instant::now);
                 state = job
                     .done
                     .wait(state)
@@ -1933,6 +2083,12 @@ pub fn take_prefetched(
         }
     };
     drop(state);
+    if let Some(start) = waited {
+        shared.count(|c| {
+            c.waited += 1;
+            c.wait += start.elapsed();
+        });
+    }
     let Some(PrefetchResult {
         text: worker_text,
         parse,
@@ -1940,10 +2096,13 @@ pub fn take_prefetched(
     else {
         return Prefetched::Nothing;
     };
+    let unusable = || shared.count(|c| c.unusable.push(opts.file_name.clone()));
     if text.is_some_and(|text| text != worker_text) {
+        unusable();
         return Prefetched::Nothing;
     }
     let Some(parse) = parse else {
+        unusable();
         return Prefetched::Text(worker_text);
     };
     let file_opts = &parse.file.parse_options;
@@ -1954,8 +2113,10 @@ pub fn take_prefetched(
             || file_opts.external_module_indicator_options
                 == opts.external_module_indicator_options);
     if same {
+        shared.count(|c| c.taken += 1);
         Prefetched::Parse(adopt_detached_parse(parse, opts))
     } else {
+        unusable();
         Prefetched::Text(worker_text)
     }
 }

@@ -655,11 +655,15 @@ impl Parser {
     // initializeClosures: `n.Parent = p.currentParent; return false`). The
     // closure body is inlined here, because the visitor cannot borrow the
     // parser while `for_each_child` runs.
+    // PERF: R2-5. The same visit writes the binder child links of `node`
+    // (`StoreChildLinks`), while its data is hot, so the binder can walk
+    // the children without loading the node data (`bind_each_child`).
     pub fn override_parent_in_immediate_children(&mut self, node: Node) {
         self.current_parent = node;
         let parent = self.current_parent;
+        let mut links = StoreChildLinks::new(parent);
         node.for_each_child(|n| {
-            if !try_set_store_node_parent(n, parent) {
+            if !links.set_parent(n) {
                 set_node_parent(n, parent);
             }
             false

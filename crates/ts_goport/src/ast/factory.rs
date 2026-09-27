@@ -152,9 +152,13 @@ impl NodeFactory {
     /// `new_text_node` for an Identifier or PrivateIdentifier with Go text
     /// `text`. `data` makes the node data from the text it holds.
     // PERF: U1 (d). A store node gets an empty data text, which needs no
-    // allocation. The store keeps `text` in the name column of the slot
-    // (`alloc_store_name_node`), and `Node::text` reads it there. A
-    // synthetic node keeps the text in its data.
+    // allocation. The store keeps `text` in the name column of the slot,
+    // and `Node::text` reads it there. A synthetic node keeps the text in
+    // its data.
+    // PERF: S1. With an empty text the store payload is always the same
+    // (no flow node either), so the slot points at one shared ts_ast node
+    // (`alloc_store_shared_name_node`) and `data` is not called. Debug
+    // builds call it and check that it equals the shared payload.
     fn new_name_node(
         &self,
         kind: SyntaxKind,
@@ -166,7 +170,9 @@ impl NodeFactory {
         };
         self.text_count.set(self.text_count.get() + 1);
         self.node_count.set(self.node_count.get() + 1);
-        let node = alloc_store_name_node(store, kind, data(String::new()), text.as_ref());
+        #[cfg(debug_assertions)]
+        debug_assert_shared_name_data(kind, &data(String::new()));
+        let node = alloc_store_shared_name_node(store, kind, text.as_ref());
         // Go: ast.go:73
         if let Some(h) = &self.hooks.on_create {
             h(node);
