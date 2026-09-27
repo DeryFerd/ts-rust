@@ -576,7 +576,10 @@ impl ConfigFileRegistryBuilder {
                             );
                             source_file_text(config_file.source_file)
                         };
-                        if !ok || text.as_str() != config_text() {
+                        if !ok
+                            || entry.borrow().command_line.is_none()
+                            || text.as_str() != config_text()
+                        {
                             entry.borrow_mut().pending_reload = PendingReload::FULL;
                         } else {
                             entry.borrow_mut().pending_reload = PendingReload::FILE_NAMES;

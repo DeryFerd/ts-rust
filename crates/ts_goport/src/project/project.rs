@@ -303,8 +303,9 @@ impl Project {
         let program = self
             .program
             .expect("invalid memory address or nil pointer dereference: Project.Program");
-        // Go: core.Concatenate
-        let mut diagnostics = ls_program::get_program_diagnostics(program);
+        // Go: slices.Concat
+        let mut diagnostics = program.get_config_file_parsing_diagnostics();
+        diagnostics.extend(ls_program::get_program_diagnostics(program));
         diagnostics.extend(global_diags);
         sort_and_deduplicate_diagnostics(diagnostics)
     }

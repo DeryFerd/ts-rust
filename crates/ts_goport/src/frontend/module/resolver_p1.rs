@@ -314,6 +314,11 @@ impl Resolver {
         ResolutionState::zero(self, self.compiler_options.clone())
             .get_package_scope_for_path(directory)
     }
+
+    // Go: module/resolver.go:215 PackageJsonCacheEntries (tsgo#4301)
+    pub fn package_json_cache_entries(&self, f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+        self.caches.package_json_info_cache.range(f);
+    }
 }
 
 impl Tracer {

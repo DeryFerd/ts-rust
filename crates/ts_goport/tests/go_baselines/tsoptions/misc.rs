@@ -176,6 +176,35 @@ fn non_zero_value_like(zero: &CompilerOptionsValue) -> CompilerOptionsValue {
 // wildcarddirectories_test.go
 // ---------------------------------------------------------------------------
 
+// Go: wildcarddirectories_test.go:10 TestGetWildcardDirectories_DotPrefixedIncludeWithDotDirExclude
+#[test]
+fn get_wildcard_directories_dot_prefixed_include_with_dot_dir_exclude() {
+    // https://github.com/microsoft/typescript-go/issues/3733
+    // "./"-prefixed include specs must be fully normalized before being tested
+    // against exclude patterns; otherwise the leftover literal "." path segment
+    // matches dot-directory excludes like "**/.*/", silently dropping every
+    // wildcard directory (and with them, root file watching for the config).
+    let include: Vec<String> = ["./app/**/*.ts", "./app/**/*.tsx"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let exclude: Vec<String> = ["**/node_modules", "**/.*/", "./build"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let result = get_wildcard_directories(
+        &include,
+        &exclude,
+        &ComparePathsOptions {
+            current_directory: "/home/projects/monorepo/apps/web".to_string(),
+            use_case_sensitive_file_names: true,
+        },
+    );
+    let expected: HashMap<String, bool> =
+        HashMap::from([("/home/projects/monorepo/apps/web/app".to_string(), true)]);
+    assert_eq!(result.into_iter().collect::<HashMap<_, _>>(), expected);
+}
+
 // Go: wildcarddirectories_test.go:9 TestGetWildcardDirectories_NonASCIICharacters
 #[test]
 fn get_wildcard_directories_non_ascii_characters() {

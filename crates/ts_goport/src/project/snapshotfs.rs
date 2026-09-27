@@ -221,6 +221,7 @@ pub struct SnapshotFSBuilder {
     pub node_modules_realpath_aliases:
         Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+    pub accessible_entries: RefCell<FxHashMap<tspath::Path, vfs::Entries>>,
 }
 
 // Go: project/snapshotfs.go:145 newSnapshotFSBuilder
@@ -273,6 +274,7 @@ pub fn new_snapshot_fs_builder(
         disk_directories: dirty::new_map(disk_directories),
         node_modules_realpath_aliases: dirty::new_sync_map(node_modules_realpath_aliases),
         to_path,
+        accessible_entries: RefCell::default(),
     })
 }
 
@@ -794,17 +796,27 @@ impl FileSource for SnapshotFSBuilder {
 
     // Go: project/snapshotfs.go:321 snapshotFSBuilder.GetAccessibleEntries
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
-        let mut entries = self.fs.get_accessible_entries(path);
-        let Some(overlay_directories) = self.overlay_directories.get(&(self.to_path)(path)) else {
+        let entries = self.fs.get_accessible_entries(path);
+        let p = (self.to_path)(path);
+        let Some(overlay_directories) = self.overlay_directories.get(&p) else {
             return entries;
         };
 
+        if let Some(merged) = self.accessible_entries.borrow().get(&p) {
+            return merged.clone();
+        }
+        let mut merged = entries;
         read_directory_into_entries(
             overlay_directories,
             &|p: &tspath::Path| self.is_open_file(p),
-            &mut entries,
+            &mut merged,
         );
-        entries
+        // Go: LoadOrStore
+        self.accessible_entries
+            .borrow_mut()
+            .entry(p)
+            .or_insert(merged)
+            .clone()
     }
 }
 

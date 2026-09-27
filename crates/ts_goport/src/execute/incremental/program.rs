@@ -425,6 +425,20 @@ impl Program {
                 snapshot.build_info_emit_pending = true;
             }
         }
+        if self.snapshot.borrow().package_jsons.is_none() {
+            self.ensure_package_jsons_for_state();
+            let mut snapshot = self.snapshot.borrow_mut();
+            if snapshot.package_jsons.as_deref().unwrap_or_default()
+                != snapshot.package_jsons_from_old_state.as_slice()
+                || snapshot
+                    .missing_package_jsons
+                    .as_deref()
+                    .unwrap_or_default()
+                    != snapshot.missing_package_jsons_from_old_state.as_slice()
+            {
+                snapshot.build_info_emit_pending = true;
+            }
+        }
         if !self.snapshot.borrow().build_info_emit_pending {
             return None;
         }
@@ -565,6 +579,69 @@ impl Program {
             snapshot.has_semantic_errors = !is_incremental;
         }
     }
+
+    // Go: incremental/program.go:402 ensurePackageJsonsForState
+    // PORT: Go appends to the snapshot slices inside the callback. The
+    // callback here fills local lists, so the snapshot is not borrowed while
+    // the file system runs.
+    fn ensure_package_jsons_for_state(&self) {
+        let (mut package_jsons, mut missing_package_jsons) = {
+            let mut snapshot = self.snapshot.borrow_mut();
+            (
+                snapshot.package_jsons.take().unwrap_or_default(),
+                snapshot.missing_package_jsons.take().unwrap_or_default(),
+            )
+        };
+        let config = get_directory_path(command_line().config_name());
+        if !config.is_empty() {
+            package_json_cache_entries(|_key, value| {
+                let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
+                if value.exists() || value.directory_exists {
+                    package_json = host().fs().realpath(&package_json);
+                }
+                if value.exists() {
+                    package_jsons.push(package_json);
+                } else if package_json.contains("/node_modules/") {
+                    missing_package_jsons.push(package_json);
+                }
+                true
+            });
+        }
+        let mut snapshot = self.snapshot.borrow_mut();
+        snapshot.package_jsons = Some(normalize_package_jsons(package_jsons));
+        snapshot.missing_package_jsons = Some(normalize_package_jsons(missing_package_jsons));
+    }
+
+    // Go: incremental/program.go:433 PackageJsonLookupPaths
+    #[must_use]
+    pub fn package_json_lookup_paths(&self) -> Vec<String> {
+        let config = get_directory_path(command_line().config_name());
+        if config.is_empty() {
+            return Vec::new();
+        }
+
+        let mut package_jsons = Vec::new();
+        package_json_cache_entries(|_key, value| {
+            let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
+            if value.exists() || value.directory_exists {
+                package_json = host().fs().realpath(&package_json);
+            }
+            package_jsons.push(package_json);
+            true
+        });
+        package_jsons.sort();
+        package_jsons.dedup();
+        package_jsons
+    }
+}
+
+// Go: incremental/program.go:425 normalizePackageJsons
+// PORT: Go returns a new empty slice for nil. The list is sorted, so
+// `dedup` gives the same result as Go `core.Deduplicate`.
+fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
+    package_jsons.sort();
+    package_jsons.dedup();
+    package_jsons
 }
 
 // Go: compiler/program.go:1728 HandleNoEmitOnError

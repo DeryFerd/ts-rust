@@ -2280,6 +2280,7 @@ impl ServerShared {
                 ),
                 diagnostic_provider: Some(lsproto::DiagnosticOptionsOrRegistrationOptions {
                     options: Some(lsproto::DiagnosticOptions {
+                        identifier: Some("typescript".to_string()),
                         inter_file_dependencies: true,
                         ..Default::default()
                     }),
@@ -2290,7 +2291,9 @@ impl ServerShared {
                         ls::TRIGGER_CHARACTERS.iter().map(|c| c.to_string()).collect(),
                     ),
                     resolve_provider: Some(true),
-                    // !!! other options
+                    completion_item: Some(lsproto::ServerCompletionItemOptions {
+                        label_details_support: Some(true),
+                    }),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(lsproto::SignatureHelpOptions {

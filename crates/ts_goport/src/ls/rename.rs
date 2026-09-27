@@ -113,6 +113,10 @@ impl LanguageService {
         let ch = &mut *checker.borrow_mut();
 
         let quote_preference = lsutil::get_quote_preference(source_file, &self.user_preferences());
+        let use_aliases_for_rename = self
+            .user_preferences()
+            .use_aliases_for_rename
+            .is_true_or_unknown();
 
         for entry in &entries {
             let uri = self.get_file_name_of_entry(entry);
@@ -132,6 +136,7 @@ impl LanguageService {
                     &params.new_name,
                     ch,
                     quote_preference,
+                    use_aliases_for_rename,
                 ),
             };
             changes.entry(uri).or_default().push(text_edit);
@@ -287,7 +292,7 @@ pub fn is_defined_in_library_file(
     )) && tspath::is_declaration_file_name(source_file_file_name(decl_source_file))
 }
 
-// Go: ls/rename.go:187 wouldRenameInOtherNodeModules
+// Go: ls/rename.go:188 wouldRenameInOtherNodeModules
 // wouldRenameInOtherNodeModules checks if renaming the symbol would affect node_modules.
 pub fn would_rename_in_other_node_modules(
     original_file: Node,
@@ -296,7 +301,7 @@ pub fn would_rename_in_other_node_modules(
     preferences: &lsutil::UserPreferences,
 ) -> Option<&'static Message> {
     let mut sym = symbol;
-    if !preferences.use_aliases_for_rename.is_true()
+    if !preferences.use_aliases_for_rename.is_true_or_unknown()
         && ch.sym(sym).flags.intersects(SymbolFlags::ALIAS)
     {
         let import_specifier = ch
@@ -487,7 +492,7 @@ impl LanguageService {
         new_path
     }
 
-    // Go: ls/rename.go:296 getTextForRename
+    // Go: ls/rename.go:297 getTextForRename
     // PORT: Go `entry *ReferenceEntry` is the shared entry handle.
     pub fn get_text_for_rename(
         &self,
@@ -496,12 +501,14 @@ impl LanguageService {
         new_text: &str,
         ch: &mut Checker,
         quote_preference: lsutil::QuotePreference,
+        use_aliases_for_rename: bool,
     ) -> String {
         let (entry_kind, entry_node) = {
             let entry = entry.borrow();
             (entry.kind, entry.node)
         };
-        if entry_kind != EntryKind::RANGE
+        if use_aliases_for_rename
+            && entry_kind != EntryKind::RANGE
             && (is_identifier(original_node) || is_string_literal_like(original_node))
         {
             let node = get_reparsed_node_for_node(entry_node);

@@ -62,12 +62,24 @@ pub struct SnapshotData {
     pub snapshot: Rc<project::Snapshot>,
     pub ref_count: Cell<i32>,
 
+    // Symbol IDs come from ast.GetSymbolId, a global atomic counter, so the same
+    // *ast.Symbol pointer always has the same unique ID across all projects in the
+    // snapshot. Symbols are registered snapshot-wide to ensure identity semantics:
+    // querying the same symbol from two different projects returns the same handle.
     pub symbol_registry: RefCell<FxHashMap<SymbolID, (Rc<RefCell<Checker>>, SymbolId)>>,
 
+    pub project_registries: RefCell<FxHashMap<ProjectID, Rc<ProjectRegistryData>>>,
+}
+
+// Go: api/session.go:64 projectRegistryData
+// projectRegistryData holds per-project type and signature registries.
+// Types and signatures use per-checker sequential IDs, so the same local ID
+// can appear in multiple projects. Separate maps per project prevent collisions
+// and allow clean teardown when a project is removed.
+pub struct ProjectRegistryData {
     pub type_registry: RefCell<FxHashMap<TypeID, (Rc<RefCell<Checker>>, TypeId)>>,
 
     pub signature_registry: RefCell<FxHashMap<SignatureID, (Rc<RefCell<Checker>>, SignatureId)>>,
-    pub signature_next_id: Cell<u64>,
 }
 
 impl SnapshotData {
@@ -77,6 +89,25 @@ impl SnapshotData {
         &self,
         project_handle: &ProjectID,
     ) -> Result<&'static compiler::NewProgram, GoError> {
+        let proj = self.get_project(project_handle)?;
+
+        let program = proj.borrow().get_program();
+        let Some(program) = program else {
+            return Err(errors::errorf(
+                format!("{}: project has no program", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+
+        Ok(program)
+    }
+
+    // Go: api/session.go:88 getProject
+    // getProject looks up a project from a project handle within this snapshot.
+    pub fn get_project(
+        &self,
+        project_handle: &ProjectID,
+    ) -> Result<Rc<RefCell<project::Project>>, GoError> {
         let project_name = parse_project_handle(project_handle);
         let proj = self
             .snapshot
@@ -92,16 +123,7 @@ impl SnapshotData {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         };
-
-        let program = proj.borrow().get_program();
-        let Some(program) = program else {
-            return Err(errors::errorf(
-                format!("{}: project has no program", *ERR_CLIENT_ERROR),
-                vec![ERR_CLIENT_ERROR.clone()],
-            ));
-        };
-
-        Ok(program)
+        Ok(proj)
     }
 
     // Go: api/session.go:66 nodeHandleFrom
@@ -115,8 +137,29 @@ impl SnapshotData {
         NodeHandle(format!("{}.{}.{}", idx, node.kind() as i16, path))
     }
 
+    // Go: api/session.go:108 getOrCreateProjectRegistry
+    // getOrCreateProjectRegistry returns the registry for the given project, creating it if needed.
+    pub fn get_or_create_project_registry(
+        &self,
+        project_id: &ProjectID,
+    ) -> Rc<ProjectRegistryData> {
+        if project_id.0.is_empty() {
+            panic!("getOrCreateProjectRegistry: empty project ID");
+        }
+        self.project_registries
+            .borrow_mut()
+            .entry(project_id.clone())
+            .or_insert_with(|| {
+                Rc::new(ProjectRegistryData {
+                    type_registry: RefCell::new(FxHashMap::default()),
+                    signature_registry: RefCell::new(FxHashMap::default()),
+                })
+            })
+            .clone()
+    }
+
     // Go: api/session.go:75 newSymbolResponse
-    // newSymbolResponse registers a symbol in this snapshot's registry and returns the response.
+    // newSymbolResponse registers a symbol in the snapshot's registry and returns the response.
     // PORT: `checker` owns `symbol`; its arena holds the symbol data.
     pub fn new_symbol_response(
         &self,
@@ -190,26 +233,33 @@ impl SnapshotData {
     }
 
     // Go: api/session.go:129 newTypeResponse
-    // newTypeResponse registers a type in this snapshot's registry and returns the response.
+    // newTypeResponse registers a type in the project's registry and returns the response.
     pub fn new_type_response(
         &self,
+        project_id: &ProjectID,
         checker: &Rc<RefCell<Checker>>,
         t: TypeId,
     ) -> Option<TypeResponse> {
         if t.is_nil() {
             return None;
         }
-        let id = self.register_type(checker, t);
+        let id = self.register_type(project_id, checker, t);
         Some(new_type_response(&checker.borrow(), t, id))
     }
 
     // Go: api/session.go:136 registerType
-    pub fn register_type(&self, checker: &Rc<RefCell<Checker>>, t: TypeId) -> TypeID {
+    pub fn register_type(
+        &self,
+        project_id: &ProjectID,
+        checker: &Rc<RefCell<Checker>>,
+        t: TypeId,
+    ) -> TypeID {
         if t.is_nil() {
             return TypeID(0);
         }
         let id = type_handle(t);
-        let mut registry = self.type_registry.borrow_mut();
+        let reg = self.get_or_create_project_registry(project_id);
+        let mut registry = reg.type_registry.borrow_mut();
         let existing = registry.get(&id);
 
         if let Some(existing) = existing {
@@ -225,7 +275,7 @@ impl SnapshotData {
     }
 
     // Go: api/session.go:157 resolveSymbolHandle
-    // resolveSymbolHandle resolves a symbol handle to a symbol within this snapshot.
+    // resolveSymbolHandle resolves a symbol handle within the snapshot's registry.
     // PORT: returns the checker that owns the symbol with it (file header).
     pub fn resolve_symbol_handle(
         &self,
@@ -254,10 +304,11 @@ impl SnapshotData {
     }
 
     // Go: api/session.go:174 resolveTypeHandle
-    // resolveTypeHandle resolves a type handle to a type within this snapshot.
+    // resolveTypeHandle resolves a type handle within the project's registry.
     // PORT: returns the checker that owns the type with it (file header).
     pub fn resolve_type_handle(
         &self,
+        project_id: &ProjectID,
         handle: TypeID,
     ) -> Result<(Rc<RefCell<Checker>>, TypeId), GoError> {
         if handle.0 == 0 {
@@ -266,13 +317,34 @@ impl SnapshotData {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         }
+        if project_id.0.is_empty() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: empty project ID for type handle {}",
+                    *ERR_CLIENT_ERROR, handle.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
 
-        let t = self.type_registry.borrow().get(&handle).cloned();
+        let reg = self.project_registries.borrow().get(project_id).cloned();
+
+        let Some(reg) = reg else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: type handle {} not found (no registry for project {})",
+                    *ERR_CLIENT_ERROR, handle.0, project_id.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+
+        let t = reg.type_registry.borrow().get(&handle).cloned();
 
         let Some(t) = t else {
             return Err(errors::errorf(
                 format!(
-                    "{}: type handle {} not found in snapshot registry",
+                    "{}: type handle {} not found in project registry",
                     *ERR_CLIENT_ERROR, handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
@@ -283,10 +355,11 @@ impl SnapshotData {
     }
 
     // Go: api/session.go:191 resolveSignatureHandle
-    // resolveSignatureHandle resolves a signature handle to a signature within this snapshot.
+    // resolveSignatureHandle resolves a signature handle within the project's registry.
     // PORT: returns the checker that owns the signature with it (file header).
     pub fn resolve_signature_handle(
         &self,
+        project_id: &ProjectID,
         handle: SignatureID,
     ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
         if handle.0 == 0 {
@@ -295,13 +368,34 @@ impl SnapshotData {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         }
+        if project_id.0.is_empty() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: empty project ID for signature handle {}",
+                    *ERR_CLIENT_ERROR, handle.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
 
-        let sig = self.signature_registry.borrow().get(&handle).cloned();
+        let reg = self.project_registries.borrow().get(project_id).cloned();
+
+        let Some(reg) = reg else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: signature handle {} not found (no registry for project {})",
+                    *ERR_CLIENT_ERROR, handle.0, project_id.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+
+        let sig = reg.signature_registry.borrow().get(&handle).cloned();
 
         let Some(sig) = sig else {
             return Err(errors::errorf(
                 format!(
-                    "{}: signature handle {} not found in snapshot registry",
+                    "{}: signature handle {} not found in project registry",
                     *ERR_CLIENT_ERROR, handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
@@ -312,9 +406,10 @@ impl SnapshotData {
     }
 
     // Go: api/session.go:208 newSignatureResponse
-    // newSignatureResponse registers a signature in this snapshot's registry and returns the response.
+    // newSignatureResponse registers a signature in the project's registry and returns the response.
     pub fn new_signature_response(
         &self,
+        project_id: &ProjectID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> Option<SignatureResponse> {
@@ -324,7 +419,7 @@ impl SnapshotData {
         let c = checker.borrow();
         let s = c.sig(sig);
         let mut resp = SignatureResponse {
-            id: self.register_signature(checker, sig),
+            id: self.register_signature(project_id, checker, sig),
             flags: s.flags().0,
             ..Default::default()
         };
@@ -355,6 +450,7 @@ impl SnapshotData {
     // Go: api/session.go:240 registerSignature
     pub fn register_signature(
         &self,
+        project_id: &ProjectID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> SignatureID {
@@ -362,8 +458,8 @@ impl SnapshotData {
             return SignatureID(0);
         }
         let id = signature_handle(sig);
-
-        let mut registry = self.signature_registry.borrow_mut();
+        let reg = self.get_or_create_project_registry(project_id);
+        let mut registry = reg.signature_registry.borrow_mut();
         let existing = registry.get(&id);
 
         if let Some(existing) = existing {
@@ -510,6 +606,50 @@ pub struct CheckerSetup {
     pub program: &'static compiler::NewProgram,
     pub checker: Rc<RefCell<Checker>>,
     pub done: ls_program::Release,
+    pub project_id: ProjectID,
+}
+
+impl CheckerSetup {
+    // Go: api/session.go:464 checkerSetup.newTypeResponse
+    pub fn new_type_response(&self, t: TypeId) -> Option<TypeResponse> {
+        self.sd
+            .new_type_response(&self.project_id, &self.checker, t)
+    }
+
+    // Go: api/session.go:468 checkerSetup.newSymbolResponse
+    pub fn new_symbol_response(&self, sym: SymbolId) -> Option<SymbolResponse> {
+        self.sd.new_symbol_response(&self.checker, sym)
+    }
+
+    // Go: api/session.go:472 checkerSetup.newSignatureResponse
+    pub fn new_signature_response(&self, sig: SignatureId) -> Option<SignatureResponse> {
+        self.sd
+            .new_signature_response(&self.project_id, &self.checker, sig)
+    }
+
+    // Go: api/session.go:476 checkerSetup.resolveTypeHandle
+    pub fn resolve_type_handle(
+        &self,
+        id: TypeID,
+    ) -> Result<(Rc<RefCell<Checker>>, TypeId), GoError> {
+        self.sd.resolve_type_handle(&self.project_id, id)
+    }
+
+    // Go: api/session.go:480 checkerSetup.resolveSymbolHandle
+    pub fn resolve_symbol_handle(
+        &self,
+        id: SymbolID,
+    ) -> Result<(Rc<RefCell<Checker>>, SymbolId), GoError> {
+        self.sd.resolve_symbol_handle(id)
+    }
+
+    // Go: api/session.go:484 checkerSetup.resolveSignatureHandle
+    pub fn resolve_signature_handle(
+        &self,
+        id: SignatureID,
+    ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
+        self.sd.resolve_signature_handle(&self.project_id, id)
+    }
 }
 
 /// PORT: Go returns a typed handler result as `any`. A typed nil pointer or
@@ -579,6 +719,7 @@ impl Session {
             program,
             checker: c,
             done,
+            project_id: project_handle.clone(),
         })
     }
 
@@ -586,6 +727,14 @@ impl Session {
     // setupLanguageService creates a LanguageService for the given snapshot/project.
     // Unlike setupChecker, this does NOT acquire a checker from the pool, so callers that
     // only need an LS (and not a Checker) can avoid blocking on / holding a pooled checker.
+    //
+    // The LS acquires its own checker internally (keyed by the ctx's checker lifetime).
+    // If a handler returns symbol/type/signature handles the client may later re-query
+    // on the API checker (e.g. completion with IncludeSymbol -> GetTypeOfSymbol), wrap
+    // ctx with core.WithCheckerLifetime(ctx, core.CheckerLifetimeAPI) so those handles
+    // are produced on the persistent API checker and stay resolvable. Only safe when the
+    // LS operation acquires a checker exactly once; nested acquisitions (e.g. find-all-
+    // references) would deadlock on the single-slot persistent checker.
     pub fn setup_language_service(
         &self,
         sd: &SnapshotData,
@@ -608,10 +757,10 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         };
-        let config_file_path = proj.borrow().config_file_path();
+        let project_id = proj.borrow().id();
         let host: Rc<dyn ls::Host> = sd.snapshot.clone();
         Ok(ls::new_language_service(
-            config_file_path,
+            project_id,
             program,
             host,
             active_file,
@@ -668,6 +817,9 @@ impl Handler for Session {
             m if m == Method::GET_SOURCE_FILE.0 => {
                 self.handle_get_source_file(ctx, assert_params(&parsed))
             }
+            m if m == Method::GET_SOURCE_FILE_NAMES.0 => self
+                .handle_get_source_file_names(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_SYMBOL_AT_POSITION.0 => self
                 .handle_get_symbol_at_position(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -842,6 +994,9 @@ impl Handler for Session {
             m if m == Method::GET_PROPERTIES_OF_TYPE.0 => self
                 .handle_get_properties_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_APPARENT_TYPE.0 => self
+                .handle_get_apparent_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_INDEX_INFOS_OF_TYPE.0 => self
                 .handle_get_index_infos_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -850,6 +1005,12 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_TYPE_ARGUMENTS.0 => self
                 .handle_get_type_arguments(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
+                .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_MEMBER_IN_MODULE_EXPORTS.0 => self
+                .handle_get_member_in_module_exports(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_ANY_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_any_type)
@@ -887,6 +1048,9 @@ impl Handler for Session {
             m if m == Method::GET_SYNTACTIC_DIAGNOSTICS.0 => self
                 .handle_get_syntactic_diagnostics(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_BIND_DIAGNOSTICS.0 => self
+                .handle_get_bind_diagnostics(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_SEMANTIC_DIAGNOSTICS.0 => self
                 .handle_get_semantic_diagnostics(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -895,6 +1059,12 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_DECLARATION_DIAGNOSTICS.0 => self
                 .handle_get_declaration_diagnostics(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_PROGRAM_DIAGNOSTICS.0 => self
+                .handle_get_program_diagnostics(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_GLOBAL_DIAGNOSTICS.0 => self
+                .handle_get_global_diagnostics(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_CONFIG_FILE_PARSING_DIAGNOSTICS.0 => self
                 .handle_get_config_file_parsing_diagnostics(ctx, assert_params(&parsed))
@@ -1058,9 +1228,7 @@ impl Session {
                 snapshot: snapshot.clone(),
                 ref_count: Cell::new(1),
                 symbol_registry: RefCell::new(FxHashMap::default()),
-                type_registry: RefCell::new(FxHashMap::default()),
-                signature_registry: RefCell::new(FxHashMap::default()),
-                signature_next_id: Cell::new(0),
+                project_registries: RefCell::new(FxHashMap::default()),
             });
             self.snapshots.borrow_mut().insert(handle, sd);
         }
@@ -1069,6 +1237,9 @@ impl Session {
         let projects = snapshot.project_collection.projects();
         let mut project_responses = Vec::with_capacity(projects.len());
         for proj in &projects {
+            if proj.borrow().command_line.is_none() {
+                continue;
+            }
             project_responses.push(new_project_response(&proj.borrow()));
         }
 
@@ -1243,6 +1414,25 @@ impl Session {
         }))
     }
 
+    // Go: api/session.go:1080 handleGetSourceFileNames
+    // handleGetSourceFileNames returns file names of all source files in a project.
+    pub fn handle_get_source_file_names(
+        &self,
+        _ctx: &Context,
+        params: &GetSourceFileNamesParams,
+    ) -> Result<Vec<String>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let source_files = program.get_source_files();
+        let mut result = Vec::with_capacity(source_files.len());
+        for source_file in source_files {
+            result.push(source_file.file_name().to_string());
+        }
+        Ok(result)
+    }
+
     // Go: api/session.go:804 handleGetSymbolAtPosition
     // handleGetSymbolAtPosition returns the symbol at a position in a file.
     pub fn handle_get_symbol_at_position(
@@ -1284,7 +1474,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_symbol_response(&setup.checker, symbol))
+        Ok(setup.new_symbol_response(symbol))
     }
 
     // Go: api/session.go:831 handleGetSymbolsAtPositions
@@ -1327,7 +1517,7 @@ impl Session {
                 .borrow_mut()
                 .get_symbol_at_location_exported(node);
             if symbol.is_some() {
-                results[i] = setup.sd.new_symbol_response(&setup.checker, symbol);
+                results[i] = setup.new_symbol_response(symbol);
             }
         }
 
@@ -1358,7 +1548,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_symbol_response(&setup.checker, symbol))
+        Ok(setup.new_symbol_response(symbol))
     }
 
     // Go: api/session.go:884 handleGetSymbolsAtLocations
@@ -1382,7 +1572,7 @@ impl Session {
                 .borrow_mut()
                 .get_symbol_at_location_exported(node);
             if symbol.is_some() {
-                results[i] = setup.sd.new_symbol_response(&setup.checker, symbol);
+                results[i] = setup.new_symbol_response(symbol);
             }
         }
 
@@ -1398,7 +1588,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
         if symbol.is_nil() {
             return Ok(None);
         }
@@ -1412,7 +1602,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:934 handleGetTypesOfSymbols
@@ -1427,7 +1617,7 @@ impl Session {
         let mut results: Vec<Option<TypeResponse>> =
             (0..params.symbols.len()).map(|_| None).collect();
         for (i, &sym_handle) in params.symbols.iter().enumerate() {
-            let (owner, symbol) = setup.sd.resolve_symbol_handle(sym_handle)?;
+            let (owner, symbol) = setup.resolve_symbol_handle(sym_handle)?;
             if symbol.is_nil() {
                 continue;
             }
@@ -1437,7 +1627,7 @@ impl Session {
                 .borrow_mut()
                 .get_type_of_symbol_exported(symbol);
             if t.is_some() {
-                results[i] = setup.sd.new_type_response(&setup.checker, t);
+                results[i] = setup.new_type_response(t);
             }
         }
 
@@ -1453,7 +1643,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
         if symbol.is_nil() {
             return Ok(None);
         }
@@ -1467,7 +1657,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:984 handleResolveName
@@ -1516,7 +1706,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_symbol_response(&setup.checker, symbol))
+        Ok(setup.new_symbol_response(symbol))
     }
 
     // Go: api/session.go:1015 handleGetSignaturesOfType
@@ -1528,7 +1718,7 @@ impl Session {
     ) -> Result<Vec<Option<SignatureResponse>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let sigs = setup
@@ -1537,7 +1727,7 @@ impl Session {
             .get_signatures_of_type_exported(t, SignatureKind(params.kind));
         let mut results = Vec::with_capacity(sigs.len());
         for sig in sigs {
-            results.push(setup.sd.new_signature_response(&setup.checker, sig));
+            results.push(setup.new_signature_response(sig));
         }
 
         Ok(results)
@@ -1563,7 +1753,7 @@ impl Session {
             .checker
             .borrow_mut()
             .get_resolved_signature_exported(node);
-        Ok(setup.sd.new_signature_response(&setup.checker, sig))
+        Ok(setup.new_signature_response(sig))
     }
 
     // Go: api/session.go:1057 handleGetTypeAtLocation
@@ -1587,7 +1777,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1081 handleGetTypeAtLocations
@@ -1608,7 +1798,7 @@ impl Session {
             }
             let t = setup.checker.borrow_mut().get_type_at_location(node);
             if t.is_some() {
-                results[i] = setup.sd.new_type_response(&setup.checker, t);
+                results[i] = setup.new_type_response(t);
             }
         }
 
@@ -1653,7 +1843,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1134 handleGetTypesAtPositions
@@ -1693,7 +1883,7 @@ impl Session {
             }
             let t = setup.checker.borrow_mut().get_type_at_location(node);
             if t.is_some() {
-                results[i] = setup.sd.new_type_response(&setup.checker, t);
+                results[i] = setup.new_type_response(t);
             }
         }
 

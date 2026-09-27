@@ -1616,10 +1616,11 @@ impl ProjectCollectionBuilder {
         if update_program {
             entry.locked(&mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| {
                 entry.change(&mut |project: &Rc<RefCell<Project>>| {
-                    let (old_host, old_checker_pool, current_directory) = {
+                    let (old_host, old_program, old_checker_pool, current_directory) = {
                         let p = project.borrow();
                         (
                             p.host.clone(),
+                            p.program,
                             p.checker_pool.clone(),
                             p.current_directory.clone(),
                         )
@@ -1671,7 +1672,13 @@ impl ProjectCollectionBuilder {
                     }
                     p.dirty = false;
                     p.dirty_file_path = tspath::Path::default();
+                    let project_path = p.config_file_path.clone();
                     drop(p);
+                    self.release_dropped_project_references(
+                        old_program,
+                        Some(result.program),
+                        &project_path,
+                    );
                     if let Some(old_checker_pool) = old_checker_pool {
                         old_checker_pool.discard();
                     }
@@ -1800,6 +1807,43 @@ impl ProjectCollectionBuilder {
         self.config_file_registry_builder
             .release_config_for_project(&project_path, &project_path);
         project.delete();
+    }
+
+    // Go: project/projectcollectionbuilder.go:1242 releaseDroppedProjectReferences
+    // releaseDroppedProjectReferences releases the config entries for project references
+    // that were present in oldProgram but are no longer referenced by newProgram. Creating
+    // newProgram already re-acquires the config for every reference it still resolves, so
+    // only the dropped references need to be released here.
+    pub fn release_dropped_project_references(
+        &self,
+        old_program: Option<&'static compiler::NewProgram>,
+        new_program: Option<&'static compiler::NewProgram>,
+        project_path: &tspath::Path,
+    ) {
+        let Some(old_program) = old_program else {
+            return;
+        };
+        if new_program.is_some_and(|new_program| std::ptr::eq(old_program, new_program)) {
+            return;
+        }
+        let mut new_references: FxHashSet<tspath::Path> = FxHashSet::default();
+        if let Some(new_program) = new_program {
+            new_program.range_resolved_project_reference(
+                |reference_path: &tspath::Path, _, _, _| -> bool {
+                    new_references.insert(reference_path.clone());
+                    true
+                },
+            );
+        }
+        old_program.range_resolved_project_reference(
+            |reference_path: &tspath::Path, _, _, _| -> bool {
+                if !new_references.contains(reference_path) {
+                    self.config_file_registry_builder
+                        .release_config_for_project(reference_path, project_path);
+                }
+                true
+            },
+        );
     }
 }
 

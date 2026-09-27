@@ -732,6 +732,8 @@ impl DeclarationTransformer {
                 && !is_entity_name_expression(extends_clause.expression())
                 && extends_clause.expression().kind() != SyntaxKind::NullKeyword
             {
+                self.tracker
+                    .report_inference_fallback(extends_clause.expression()); // Add an isolated declarations error on this extends clause
                 let mut old_id = "default".to_string();
                 if node_is_present(input.name())
                     && is_identifier(input.name())

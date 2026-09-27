@@ -1905,7 +1905,6 @@ impl Session {
                     ));
                     s.logger.log(&new_snapshot.builder_logs.string());
                     s.log_project_changes(old_snapshot, new_snapshot);
-                    s.log_runtime_metrics();
                     s.logger.log("");
                 }
                 if s.options.watch_enabled {
@@ -2367,52 +2366,7 @@ impl Session {
     }
 }
 
-// Go: project/session.go:1491 runtimeMetricsSamples
-// PORT: Go `sync.OnceValue` over `metrics.All()`, keeping the `/memory/`
-// and `/gc/` metrics. `metrics.All()` describes the Go runtime; this
-// runtime has no Go metrics, so the list is empty (log text only).
-fn runtime_metrics_samples() -> Vec<MetricsSample> {
-    let descs: Vec<&'static str> = Vec::new();
-    let mut samples: Vec<MetricsSample> = Vec::new();
-    for name in descs {
-        if name.starts_with("/memory/") || name.starts_with("/gc/") {
-            samples.push(MetricsSample {
-                name,
-                ..Default::default()
-            });
-        }
-    }
-    samples
-}
-
 impl Session {
-    // Go: project/session.go:1503 logRuntimeMetrics
-    // PORT: log text only. The sample list is empty (see
-    // `runtime_metrics_samples`), so `metrics.Read` is not called; the log
-    // keeps the header line.
-    pub fn log_runtime_metrics(&self) {
-        let samples = runtime_metrics_samples();
-        // Go: gometrics.Read(samples) (skipped; no Go runtime metrics)
-
-        let mut builder = String::new();
-        builder.push_str("\n======== Runtime Metrics ========");
-        for sample in &samples {
-            match sample.value {
-                MetricsValue::Uint64(v) => {
-                    builder.push_str(&format!("\n{} = {}", sample.name, v));
-                }
-                MetricsValue::Float64(v) => {
-                    builder.push_str(&format!("\n{} = {:.6}", sample.name, v));
-                }
-                MetricsValue::Float64Histogram => {
-                    // Skip histograms for log readability
-                }
-                MetricsValue::Bad => {}
-            }
-        }
-        self.logger.log(&builder);
-    }
-
     // Go: project/session.go:1522 logCacheStats
     pub fn log_cache_stats(&self, snapshot: &Rc<Snapshot>) {
         let mut parse_cache_size = 0;
@@ -2583,7 +2537,10 @@ impl Session {
         old_prefs: &lsutil::UserPreferences,
         new_prefs: &lsutil::UserPreferences,
     ) {
-        if old_prefs.custom_config_file_name != new_prefs.custom_config_file_name {
+        if old_prefs.custom_config_file_name != new_prefs.custom_config_file_name
+            || old_prefs.report_style_checks_as_warnings
+                != new_prefs.report_style_checks_as_warnings
+        {
             self.schedule_diagnostics_refresh();
         }
     }

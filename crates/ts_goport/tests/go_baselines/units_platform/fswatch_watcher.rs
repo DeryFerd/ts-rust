@@ -266,7 +266,7 @@ fn join(dir: &str, name: &str) -> String {
 
 // Go: watcher_test.go:137 newDirectWatcher
 fn new_direct_watcher(t: &T, dir: &str) -> Arc<DirWatch> {
-    let w = new_dir_watch(dir, new_debounce(), true);
+    let w = new_dir_watch(dir, dir, new_debounce(), true);
     let w2 = w.clone();
     t.cleanup(move || w2.destroy_debounce());
     w
@@ -1511,7 +1511,7 @@ fn test_backend_run_returns_start_error() {
 // fresh dirWatch.
 #[test]
 fn test_dir_watch_error_implements_error() {
-    let dw = new_dir_watch("/unused", new_debounce(), false);
+    let dw = new_dir_watch("/unused", "/unused", new_debounce(), false);
     let err = DirWatchError {
         err: errors::new("boom"),
         dir_watch: dw.clone(),

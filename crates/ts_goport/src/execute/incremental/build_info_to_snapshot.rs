@@ -26,7 +26,7 @@ pub fn build_info_to_snapshot(
         .iter()
         .flatten()
         .map(|file_name| {
-            if !file_name.starts_with('.') {
+            if is_build_info_file_name_default_library(file_name) {
                 return to_path(
                     &combine_paths(&host.default_library_path(), &[file_name]),
                     &host.get_current_directory(),
@@ -83,6 +83,7 @@ pub fn build_info_to_snapshot(
     };
     to.snapshot.has_semantic_errors = build_info.semantic_errors;
     to.snapshot.check_pending = build_info.check_pending;
+    to.set_package_jsons();
     to.snapshot
 }
 
@@ -291,6 +292,26 @@ impl ToSnapshot<'_> {
                 },
             );
         }
+    }
+
+    // Go: incremental/buildinfotosnapshot.go:187 setPackageJsons
+    fn set_package_jsons(&mut self) {
+        self.snapshot.package_jsons = Some(
+            self.build_info
+                .package_jsons
+                .iter()
+                .flatten()
+                .map(|package_json| self.to_absolute_path(package_json))
+                .collect(),
+        );
+        self.snapshot.missing_package_jsons = Some(
+            self.build_info
+                .missing_package_jsons
+                .iter()
+                .flatten()
+                .map(|package_json| self.to_absolute_path(package_json))
+                .collect(),
+        );
     }
 }
 

@@ -529,7 +529,7 @@ pub fn is_dir_covered_by_watch(
             if tspath::contains_path(wdir, dir, opts) {
                 return true;
             }
-        } else if dir == wdir.as_str() {
+        } else if tspath::compare_paths(dir, wdir, opts) == 0 {
             return true;
         }
     }

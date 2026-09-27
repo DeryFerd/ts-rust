@@ -99,19 +99,21 @@ pub struct UserPreferences {
 
     // ------- OrganizeImports -------
 
+    // Indicates which deterministic preset should be used to sort imports.
+    // "auto" detects the existing ordinal case sensitivity where possible.
+    pub organize_imports_sort: OrganizeImportsSort, // !!!
     // Indicates whether imports should be organized in a case-insensitive manner.
     //
     // Default: TSUnknown ("auto" in strada), will perform detection
     pub organize_imports_ignore_case: Tristate, // !!!
     // Indicates whether imports should be organized via an "ordinal" (binary) comparison using the numeric value of their
-    // code points, or via "unicode" collation (via the Unicode Collation Algorithm (https://unicode.org/reports/tr10/#Scope))
-    //
-    // using rules associated with the locale specified in organizeImportsCollationLocale.
+    // code points, or via "unicode" natural sorting. This implementation is locale-agnostic and approximates the practical
+    // import-sorting behavior rather than the full Unicode Collation Algorithm.
     //
     // Default: Ordinal
     pub organize_imports_collation: OrganizeImportsCollation, // !!!
-    // Indicates the locale to use for "unicode" collation. If not specified, the locale `"en"` is used as an invariant
-    // for the sake of consistent sorting. Use `"auto"` to use the detected UI locale.
+    // Indicates the locale to use for "unicode" collation in legacy clients. This is accepted for compatibility, but
+    // currently ignored because organize-import sorting is deterministic and locale-agnostic.
     //
     // This preference is ignored if organizeImportsCollation is not `unicode`.
     //
@@ -124,16 +126,13 @@ pub struct UserPreferences {
     //
     // Default: `false`
     pub organize_imports_numeric_collation: Tristate, // !!!
-    // Indicates whether accents and other diacritic marks are considered unequal for the purpose of collation. When
-    // `true`, characters with accents and other diacritics will be collated in the order defined by the locale specified
-    // in organizeImportsCollationLocale.
+    // Indicates whether accents and other diacritic marks are considered unequal for the purpose of sorting.
     //
     // This preference is ignored if organizeImportsCollation is not `unicode`.
     //
     // Default: `true`
     pub organize_imports_accent_collation: Tristate, // !!!
-    // Indicates whether upper case or lower case should sort first. When `false`, the default order for the locale
-    // specified in organizeImportsCollationLocale is used.
+    // Indicates whether upper case or lower case should sort first.
     //
     // This permission is ignored if:
     //	- organizeImportsCollation is not `unicode`
@@ -262,6 +261,15 @@ impl IncludeInlayParameterNameHints {
     pub const LITERALS: IncludeInlayParameterNameHints = IncludeInlayParameterNameHints("literals");
 }
 
+// Go: ls/lsutil/userpreferences.go:252 OrganizeImportsSort
+go_enum!(OrganizeImportsSort, i32 {
+    AUTO = 0;
+    ORDINAL = 1;
+    ORDINAL_IGNORE_CASE = 2;
+    NATURAL = 3;
+    NATURAL_IGNORE_CASE = 4;
+});
+
 // Go: ls/lsutil/userpreferences.go:243 OrganizeImportsCollation
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct OrganizeImportsCollation(pub bool);
@@ -298,6 +306,7 @@ enum FieldType {
     QuotePreference,
     JsxAttributeCompletionStyle,
     IncludeInlayParameterNameHints,
+    OrganizeImportsSort,
     OrganizeImportsCollation,
     OrganizeImportsCaseFirst,
     OrganizeImportsTypeOrder,
@@ -325,6 +334,7 @@ impl FieldType {
         match self {
             FieldType::Tristate => FieldKind::Uint8,
             FieldType::IndentStyle
+            | FieldType::OrganizeImportsSort
             | FieldType::OrganizeImportsCaseFirst
             | FieldType::OrganizeImportsTypeOrder
             | FieldType::Int => FieldKind::Int,
@@ -351,6 +361,7 @@ enum FieldValue {
     QuotePreference(QuotePreference),
     JsxAttributeCompletionStyle(JsxAttributeCompletionStyle),
     IncludeInlayParameterNameHints(IncludeInlayParameterNameHints),
+    OrganizeImportsSort(OrganizeImportsSort),
     OrganizeImportsCollation(OrganizeImportsCollation),
     OrganizeImportsCaseFirst(OrganizeImportsCaseFirst),
     OrganizeImportsTypeOrder(OrganizeImportsTypeOrder),
@@ -374,6 +385,7 @@ impl FieldValue {
             FieldValue::IncludeInlayParameterNameHints(_) => {
                 FieldType::IncludeInlayParameterNameHints
             }
+            FieldValue::OrganizeImportsSort(_) => FieldType::OrganizeImportsSort,
             FieldValue::OrganizeImportsCollation(_) => FieldType::OrganizeImportsCollation,
             FieldValue::OrganizeImportsCaseFirst(_) => FieldType::OrganizeImportsCaseFirst,
             FieldValue::OrganizeImportsTypeOrder(_) => FieldType::OrganizeImportsTypeOrder,
@@ -406,6 +418,7 @@ impl FieldValue {
     fn int(&self) -> i64 {
         match self {
             FieldValue::IndentStyle(v) => i64::from(v.0),
+            FieldValue::OrganizeImportsSort(v) => i64::from(v.0),
             FieldValue::OrganizeImportsCaseFirst(v) => i64::from(v.0),
             FieldValue::OrganizeImportsTypeOrder(v) => i64::from(v.0),
             FieldValue::Int(v) => i64::from(*v),
@@ -455,6 +468,7 @@ impl FieldValue {
             FieldValue::QuotePreference(v) => v.0.is_empty(),
             FieldValue::JsxAttributeCompletionStyle(v) => v.0.is_empty(),
             FieldValue::IncludeInlayParameterNameHints(v) => v.0.is_empty(),
+            FieldValue::OrganizeImportsSort(v) => v.0 == 0,
             FieldValue::OrganizeImportsCollation(v) => !v.0,
             FieldValue::OrganizeImportsCaseFirst(v) => v.0 == 0,
             FieldValue::OrganizeImportsTypeOrder(v) => v.0 == 0,
@@ -538,6 +552,30 @@ fn type_parsers(t: FieldType) -> Option<fn(&LspAny) -> FieldValue> {
                 }
             }
             FieldValue::IncludeInlayParameterNameHints(IncludeInlayParameterNameHints::NONE)
+        }),
+        FieldType::OrganizeImportsSort => Some(|val: &LspAny| -> FieldValue {
+            if let LspAny::String(s) = val {
+                match strings_to_lower(s).as_str() {
+                    "ordinal" => {
+                        return FieldValue::OrganizeImportsSort(OrganizeImportsSort::ORDINAL);
+                    }
+                    "ordinalignorecase" => {
+                        return FieldValue::OrganizeImportsSort(
+                            OrganizeImportsSort::ORDINAL_IGNORE_CASE,
+                        );
+                    }
+                    "natural" => {
+                        return FieldValue::OrganizeImportsSort(OrganizeImportsSort::NATURAL);
+                    }
+                    "naturalignorecase" => {
+                        return FieldValue::OrganizeImportsSort(
+                            OrganizeImportsSort::NATURAL_IGNORE_CASE,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            FieldValue::OrganizeImportsSort(OrganizeImportsSort::AUTO)
         }),
         FieldType::OrganizeImportsCollation => Some(|val: &LspAny| -> FieldValue {
             if let LspAny::String(s) = val
@@ -655,6 +693,22 @@ fn type_serializers(t: FieldType) -> Option<fn(&FieldValue) -> LspAny> {
                 Tristate::True => LspAny::Bool(true),
                 Tristate::False => LspAny::Bool(false),
                 _ => LspAny::Null,
+            }
+        }),
+        FieldType::OrganizeImportsSort => Some(|val: &FieldValue| -> LspAny {
+            let FieldValue::OrganizeImportsSort(v) = val else {
+                panic!("interface conversion: interface {{}} is not lsutil.OrganizeImportsSort")
+            };
+            match *v {
+                OrganizeImportsSort::ORDINAL => LspAny::String("ordinal".to_string()),
+                OrganizeImportsSort::ORDINAL_IGNORE_CASE => {
+                    LspAny::String("ordinalIgnoreCase".to_string())
+                }
+                OrganizeImportsSort::NATURAL => LspAny::String("natural".to_string()),
+                OrganizeImportsSort::NATURAL_IGNORE_CASE => {
+                    LspAny::String("naturalIgnoreCase".to_string())
+                }
+                _ => LspAny::String("auto".to_string()),
             }
         }),
         FieldType::OrganizeImportsCollation => Some(|val: &FieldValue| -> LspAny {
@@ -1063,6 +1117,13 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
         prefer_type_only_auto_imports
     ),
     pref_field!(
+        "OrganizeImportsSort",
+        "organizeImportsSort",
+        "preferences.organizeImports.sort",
+        OrganizeImportsSort,
+        organize_imports_sort
+    ),
+    pref_field!(
         "OrganizeImportsIgnoreCase",
         "organizeImportsIgnoreCase",
         "preferences.organizeImports.caseSensitivity",
@@ -1292,7 +1353,7 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
     pref_field!(
         "CustomConfigFileName",
         "customConfigFileName",
-        "native-preview.customConfigFileName",
+        "customConfigFileName",
         String,
         custom_config_file_name
     ),
@@ -1414,32 +1475,45 @@ fn set_nested_value(config: &mut IndexMap<String, LspAny>, path: &str, value: Ls
     current.insert(parts[parts.len() - 1].to_string(), value);
 }
 
+// Go: ls/lsutil/userpreferences.go:658 setRawFieldsFromConfig
+// PORT: Go takes the struct as a `reflect.Value`; here it is `p`.
+fn set_raw_fields_from_config(
+    p: &mut UserPreferences,
+    infos: &[FieldInfo],
+    settings: &IndexMap<String, LspAny>,
+) {
+    let index = &*UNSTABLE_NAME_INDEX;
+    // PORT: Go ranges over a map in random order. Each raw name sets its own
+    // field, so the order does not change the result.
+    for (name, value) in settings {
+        if let Some(&idx) = index.get(name.as_str()) {
+            let info = &infos[idx];
+            let mut value = value.clone();
+            if info.raw_invert
+                && let LspAny::Bool(b) = value
+            {
+                value = LspAny::Bool(!b);
+            }
+            set_field_from_value(p, info, &value);
+        }
+    }
+}
+
 impl UserPreferences {
-    // Go: ls/lsutil/userpreferences.go:549 (UserPreferences).withConfig
+    // Go: ls/lsutil/userpreferences.go:674 (UserPreferences).withConfig
     // PORT: Go has a value receiver; this works on a copy of `self`.
     pub(crate) fn with_config(&self, config: &IndexMap<String, LspAny>) -> UserPreferences {
         let mut p = self.clone();
         let infos = &*FIELD_INFO_CACHE;
 
+        // Raw UserPreferences can be provided directly, notably via LSP initializationOptions.
+        set_raw_fields_from_config(&mut p, infos, config);
+
         // Process "unstable" section first - allows any field to be set by raw name.
         // This mirrors VS Code's behavior: { ...config.get('unstable'), ...stableOptions }
         // where stable options are spread after and take precedence.
         if let Some(LspAny::Object(unstable)) = config.get("unstable") {
-            let index = &*UNSTABLE_NAME_INDEX;
-            // PORT: Go ranges over a map in random order. Each raw name sets
-            // its own field, so the order does not change the result.
-            for (name, value) in unstable {
-                if let Some(&idx) = index.get(name.as_str()) {
-                    let info = &infos[idx];
-                    let mut value = value.clone();
-                    if info.raw_invert
-                        && let LspAny::Bool(b) = value
-                    {
-                        value = LspAny::Bool(!b);
-                    }
-                    set_field_from_value(&mut p, info, &value);
-                }
-            }
+            set_raw_fields_from_config(&mut p, infos, unstable);
         }
 
         // Process path-based config (VS Code style nested paths).
@@ -1497,7 +1571,7 @@ fn set_field_from_value(p: &mut UserPreferences, info: &FieldInfo, val: &LspAny)
     }
     let field_type = (info.get)(p).type_();
 
-    // Check custom parsers first (for types like Tristate, OrganizeImportsCollation, etc.)
+    // Check custom parsers first (for types like Tristate, enums, etc.)
     if let Some(parser) = type_parsers(field_type) {
         (info.set)(p, parser(val));
         return;
@@ -1597,7 +1671,7 @@ fn sort_any_keys_deterministic(v: &mut LspAny) {
 // PORT: Go `nil` is `LspAny::Null`. A Go `int` is written as a JSON number;
 // `LspAny::Number` is an `f64`, which holds every `i32` exactly.
 fn serialize_field(field: &FieldValue) -> LspAny {
-    // Check custom serializers first (for types like Tristate, OrganizeImportsCollation, etc.)
+    // Check custom serializers first (for types like Tristate, enums, etc.)
     if let Some(serializer) = type_serializers(field.type_()) {
         return serializer(field);
     }

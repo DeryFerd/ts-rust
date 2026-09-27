@@ -1,5 +1,6 @@
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::up_to_date_status::*;
+use crate::execute::incremental::build_info::is_build_info_file_name_default_library;
 use crate::execute::incremental::{BuildInfo, compute_hash};
 use crate::execute::tsc::{ExitStatus, Statistics};
 use crate::frontend::prelude::*;
@@ -131,6 +132,7 @@ impl TaskResult {
 //   (watch mode only).
 // - `fs_cache`: the cached file system entries the worker added (see
 //   shared_fs.rs). The orchestrator merges them into its cache.
+// - `package_jsons`: `incremental.Program.PackageJsonLookupPaths()`.
 #[derive(Clone, Debug)]
 pub struct WorkerCompileResult {
     pub exit_status: ExitStatus,
@@ -143,6 +145,7 @@ pub struct WorkerCompileResult {
     pub statistics: Option<Statistics>,
     pub output_time_stamps: Vec<(String, SystemTime)>,
     pub fs_cache: CachedFsState,
+    pub package_jsons: Vec<String>,
 }
 
 // One diagnostic of the worker's `result.Diagnostics` (Go `*ast.Diagnostic`),
@@ -334,6 +337,7 @@ pub struct BuildTask {
     pub result: Option<TaskResult>,
 
     pub build_info_entry: Option<BuildInfoEntry>,
+    pub package_jsons: Vec<String>,
 
     pub errors: Vec<Diagnostic>,
     pub pending: bool,
@@ -353,6 +357,7 @@ impl BuildTask {
             status: None,
             result: None,
             build_info_entry: None,
+            package_jsons: Vec::new(),
             errors: Vec::new(),
             pending: true,
             is_initial_cycle,
@@ -601,6 +606,7 @@ impl BuildTask {
 
         self.result_mut().exit_status = worker_result.exit_status;
         self.result_mut().statistics = worker_result.statistics;
+        self.package_jsons = worker_result.package_jsons;
         if (!self
             .resolved()
             .compiler_options()
@@ -927,6 +933,61 @@ impl BuildTask {
             }
         }
 
+        if build_info.is_incremental() {
+            let mut resolved_roots: FxHashSet<Path> = FxHashSet::default();
+            for root in reader.roots() {
+                let (_, resolved) = reader.get_build_info_file_info(root);
+                if !resolved.as_str().is_empty() {
+                    resolved_roots.insert(resolved);
+                }
+            }
+            let file_names = build_info.file_names.as_deref().unwrap_or_default();
+            for (index, build_info_file_info) in build_info.file_infos.iter().flatten().enumerate()
+            {
+                let build_info_file_name = &file_names[index];
+                // Lib files bundled with the compiler can change only with the version of the compiler,
+                // which is already verified with buildInfo.Version
+                if is_build_info_file_name_default_library(build_info_file_name) {
+                    continue;
+                }
+                let input_file =
+                    get_normalized_absolute_path(build_info_file_name, &build_info_directory);
+                let input_path = orchestrator.to_path(&input_file);
+                // Root files are already checked
+                if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
+                    continue;
+                }
+                let input_time = orchestrator.get_m_time(&input_file);
+                if input_time.is_none() {
+                    // Input file that was part of the program is missing (eg: dependency was removed)
+                    return UpToDateStatus::with_data(
+                        UpToDateStatusType::InputFileMissing,
+                        UpToDateStatusData::String(input_file),
+                    );
+                }
+                if input_time > oldest_output_file_and_time.time {
+                    let mut current_version = String::new();
+                    let version = build_info_file_info.get_file_info().version().to_string();
+                    if !version.is_empty() {
+                        let (text, ok) = orchestrator.fs().read_file(&input_file);
+                        if ok {
+                            current_version = compute_hash(&text, orchestrator.testing().is_some());
+                        }
+                    }
+                    if version.is_empty() || version != current_version {
+                        return UpToDateStatus::with_data(
+                            UpToDateStatusType::InputFileNewer,
+                            UpToDateStatusData::InputOutputName(InputOutputName {
+                                input: input_file,
+                                output: build_info_path,
+                            }),
+                        );
+                    }
+                    input_text_unchanged = true;
+                }
+            }
+        }
+
         if !options.is_incremental() {
             // Check output file stamps
             for output_file in resolved.get_output_file_names() {
@@ -1048,14 +1109,39 @@ impl BuildTask {
             }
         }
 
-        // !!! sheetal TODO : watch??
-        // // Check package file time
-        // const packageJsonLookups = state.lastCachedPackageJsonLookups.get(resolvedPath);
-        // const dependentPackageFileStatus = packageJsonLookups && forEachKey(
-        //     packageJsonLookups,
-        //     path => checkConfigFileUpToDateStatus(state, path, oldestOutputFileTime, oldestOutputFileName),
-        // );
-        // if (dependentPackageFileStatus) return dependentPackageFileStatus;
+        for package_json in build_info.get_package_jsons(&build_info_directory) {
+            let package_json_time = orchestrator.get_m_time(&package_json);
+            if package_json_time.is_none() {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileMissing,
+                    UpToDateStatusData::String(package_json),
+                );
+            }
+            if package_json_time > oldest_output_file_and_time.time {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileNewer,
+                    UpToDateStatusData::InputOutputName(InputOutputName {
+                        input: package_json,
+                        output: oldest_output_file_and_time.file.clone(),
+                    }),
+                );
+            }
+        }
+        for package_json in build_info.get_missing_package_jsons(&build_info_directory) {
+            if orchestrator.get_m_time(&package_json).is_some() {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileNewer,
+                    UpToDateStatusData::InputOutputName(InputOutputName {
+                        input: package_json,
+                        output: oldest_output_file_and_time.file.clone(),
+                    }),
+                );
+            }
+        }
+        self.package_jsons = build_info
+            .get_package_jsons(&build_info_directory)
+            .chain(build_info.get_missing_package_jsons(&build_info_directory))
+            .collect();
 
         UpToDateStatus::with_data(
             if ref_dts_unchanged {

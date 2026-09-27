@@ -25,9 +25,9 @@ use ts_goport::ls::lsconv::{
 use ts_goport::ls::lsutil::{
     self, EditorSettings, FormatCodeSettings, IncludeInlayParameterNameHints, IndentStyle,
     InlayHintsPreferences, JsxAttributeCompletionStyle, OrganizeImportsCaseFirst,
-    OrganizeImportsCollation, OrganizeImportsTypeOrder, QuotePreference, SemicolonPreference,
-    UserPreferences, new_default_user_preferences, parse_user_preferences,
-    probably_uses_semicolons,
+    OrganizeImportsCollation, OrganizeImportsSort, OrganizeImportsTypeOrder, QuotePreference,
+    SemicolonPreference, UserPreferences, new_default_user_preferences, parse_user_preferences,
+    probably_uses_semicolons, resolve_organize_imports_sort,
 };
 use ts_goport::lsp::lsproto;
 use ts_goport::modulespecifiers::{
@@ -630,6 +630,89 @@ let c = 3;
     t.finish();
 }
 
+// Go: ls/lsutil/utilities_test.go:69 TestResolveOrganizeImportsSort
+#[test]
+fn test_resolve_organize_imports_sort() {
+    let unicode = OrganizeImportsCollation::UNICODE;
+    let tests: Vec<(&str, UserPreferences, OrganizeImportsSort)> = vec![
+        (
+            "explicit sort wins",
+            UserPreferences {
+                organize_imports_sort: OrganizeImportsSort::ORDINAL,
+                organize_imports_collation: unicode,
+                organize_imports_ignore_case: Tristate::True,
+                ..Default::default()
+            },
+            OrganizeImportsSort::ORDINAL,
+        ),
+        (
+            "unicode case-sensitive maps to natural",
+            UserPreferences {
+                organize_imports_collation: unicode,
+                organize_imports_ignore_case: Tristate::False,
+                ..Default::default()
+            },
+            OrganizeImportsSort::NATURAL,
+        ),
+        (
+            "unicode ignore case maps to natural ignore case",
+            UserPreferences {
+                organize_imports_collation: unicode,
+                organize_imports_ignore_case: Tristate::True,
+                ..Default::default()
+            },
+            OrganizeImportsSort::NATURAL_IGNORE_CASE,
+        ),
+        (
+            "unicode unknown case sensitivity stays auto for detection",
+            UserPreferences {
+                organize_imports_collation: unicode,
+                ..Default::default()
+            },
+            OrganizeImportsSort::AUTO,
+        ),
+        (
+            "ordinal ignore case maps to ordinal ignore case",
+            UserPreferences {
+                organize_imports_ignore_case: Tristate::True,
+                ..Default::default()
+            },
+            OrganizeImportsSort::ORDINAL_IGNORE_CASE,
+        ),
+        (
+            "ordinal case sensitive maps to ordinal",
+            UserPreferences {
+                organize_imports_ignore_case: Tristate::False,
+                ..Default::default()
+            },
+            OrganizeImportsSort::ORDINAL,
+        ),
+        (
+            "unknown ordinal stays auto",
+            UserPreferences::default(),
+            OrganizeImportsSort::AUTO,
+        ),
+    ];
+
+    let mut t = Subtests::new("TestResolveOrganizeImportsSort");
+    for (name, preferences, want) in &tests {
+        t.run(name, || {
+            let got = resolve_organize_imports_sort(preferences);
+            if got != *want {
+                return Err(format!(
+                    "ResolveOrganizeImportsSort() = {got:?}, want {want:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: ls/lsutil/utilities_test.go:139 TestCompareOrganizeImportsNaturalStrings
+// PORT: in `src/ls/lsutil/organizeimports.rs` (it calls an unexported Go
+// function).
+
 // ---------------------------------------------------------------------------
 // ls/lsutil/userpreferences_test.go
 // ---------------------------------------------------------------------------
@@ -691,6 +774,7 @@ fn fill_non_zero_values() -> UserPreferences {
         auto_import_file_exclude_patterns: test(),
         auto_import_entrypoint_directory_search: f,
         prefer_type_only_auto_imports: f,
+        organize_imports_sort: OrganizeImportsSort(1),
         organize_imports_ignore_case: f,
         organize_imports_collation: OrganizeImportsCollation(true),
         organize_imports_locale: "test".to_string(),

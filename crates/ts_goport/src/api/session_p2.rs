@@ -32,7 +32,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        let (checker, t) = sd.resolve_type_handle(&params.project, params.type_)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -41,7 +41,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(sd.new_type_response(&checker, result))
+        Ok(sd.new_type_response(&params.project, &checker, result))
     }
 
     // Go: api/session.go:1293 resolveTypeArrayPropertyOfType
@@ -53,7 +53,7 @@ impl Session {
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        let (checker, t) = sd.resolve_type_handle(&params.project, params.type_)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -64,7 +64,7 @@ impl Session {
 
         let mut results = Vec::with_capacity(types.len());
         for sub in types {
-            results.push(sd.new_type_response(&checker, sub));
+            results.push(sd.new_type_response(&params.project, &checker, sub));
         }
         Ok(results)
     }
@@ -78,7 +78,7 @@ impl Session {
     ) -> Result<Option<SymbolResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, t) = sd.resolve_type_handle(params.type_)?;
+        let (checker, t) = sd.resolve_type_handle(&params.project, params.type_)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -146,7 +146,7 @@ impl Session {
     ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        let (checker, sig) = sd.resolve_signature_handle(&params.project, params.signature)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -171,7 +171,7 @@ impl Session {
     ) -> Result<Option<SymbolResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        let (checker, sig) = sd.resolve_signature_handle(&params.project, params.signature)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -190,7 +190,7 @@ impl Session {
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        let (checker, sig) = sd.resolve_signature_handle(&params.project, params.signature)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -201,7 +201,7 @@ impl Session {
 
         let mut results = Vec::with_capacity(types.len());
         for sub in types {
-            results.push(sd.new_type_response(&checker, sub));
+            results.push(sd.new_type_response(&params.project, &checker, sub));
         }
         Ok(results)
     }
@@ -214,7 +214,7 @@ impl Session {
     ) -> Result<Option<SignatureResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let (checker, sig) = sd.resolve_signature_handle(params.signature)?;
+        let (checker, sig) = sd.resolve_signature_handle(&params.project, params.signature)?;
         // Node handles in the answer read lazy JSDoc (session_p1.rs header).
         let _program = ls_program::enter_version(checker.borrow().program);
 
@@ -222,7 +222,7 @@ impl Session {
         if result.is_nil() {
             return Ok(None);
         }
-        Ok(sd.new_signature_response(&checker, result))
+        Ok(sd.new_signature_response(&params.project, &checker, result))
     }
 
     // Go: api/session.go:1463 handleGetContextualType
@@ -249,7 +249,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1487 handleGetBaseTypeOfLiteralType
@@ -261,7 +261,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup
@@ -272,7 +272,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, result))
+        Ok(setup.new_type_response(result))
     }
 
     // Go: api/session.go:1508 handleGetNonNullableType
@@ -284,7 +284,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup.checker.borrow_mut().get_non_nullable_type(t);
@@ -292,7 +292,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, result))
+        Ok(setup.new_type_response(result))
     }
 
     // Go: api/session.go:1529 handleGetTypeFromTypeNode
@@ -319,7 +319,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1553 handleGetWidenedType
@@ -331,7 +331,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup.checker.borrow_mut().get_widened_type_exported(t);
@@ -339,7 +339,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, result))
+        Ok(setup.new_type_response(result))
     }
 
     // Go: api/session.go:1574 handleGetParameterType
@@ -351,7 +351,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let (owner, sig) = setup.resolve_signature_handle(params.signature)?;
         let sig = checker_signature(&setup.checker, &owner, sig);
 
         if params.index < 0 {
@@ -369,7 +369,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1599 handleIsArrayLikeType
@@ -381,7 +381,7 @@ impl Session {
     ) -> Result<bool, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup.checker.borrow_mut().is_array_like_type_exported(t);
@@ -397,8 +397,8 @@ impl Session {
     ) -> Result<bool, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (source_owner, source) = setup.sd.resolve_type_handle(params.source)?;
-        let (target_owner, target) = setup.sd.resolve_type_handle(params.target)?;
+        let (source_owner, source) = setup.resolve_type_handle(params.source)?;
+        let (target_owner, target) = setup.resolve_type_handle(params.target)?;
         let source = checker_type(&setup.checker, &source_owner, source);
         let target = checker_type(&setup.checker, &target_owner, target);
 
@@ -433,7 +433,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_symbol_response(&setup.checker, symbol))
+        Ok(setup.new_symbol_response(symbol))
     }
 
     // Go: api/session.go:1659 handleGetTypeOfSymbolAtLocation
@@ -445,7 +445,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
         if symbol.is_nil() {
             return Ok(None);
         }
@@ -466,7 +466,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1691 handleTypeToTypeNode
@@ -478,7 +478,7 @@ impl Session {
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let mut enclosing_declaration = Node::NIL;
@@ -524,7 +524,7 @@ impl Session {
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let (owner, sig) = setup.resolve_signature_handle(params.signature)?;
         let sig = checker_signature(&setup.checker, &owner, sig);
 
         let mut enclosing_declaration = Node::NIL;
@@ -579,7 +579,7 @@ impl Session {
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let mut enclosing_declaration = Node::NIL;
@@ -663,7 +663,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1831 handleIsContextSensitive
@@ -698,7 +698,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let (owner, sig) = setup.resolve_signature_handle(params.signature)?;
         let sig = checker_signature(&setup.checker, &owner, sig);
 
         let t = setup
@@ -709,7 +709,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1871 handleGetRestTypeOfSignature
@@ -721,7 +721,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let (owner, sig) = setup.resolve_signature_handle(params.signature)?;
         let sig = checker_signature(&setup.checker, &owner, sig);
 
         let t = setup
@@ -732,7 +732,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, t))
+        Ok(setup.new_type_response(t))
     }
 
     // Go: api/session.go:1892 handleGetTypePredicateOfSignature
@@ -744,7 +744,7 @@ impl Session {
     ) -> Result<Option<TypePredicateResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, sig) = setup.sd.resolve_signature_handle(params.signature)?;
+        let (owner, sig) = setup.resolve_signature_handle(params.signature)?;
         let sig = checker_signature(&setup.checker, &owner, sig);
 
         let pred = setup
@@ -772,7 +772,7 @@ impl Session {
             ..Default::default()
         };
         if pred_type.is_some() {
-            resp.type_ = setup.sd.new_type_response(&setup.checker, pred_type);
+            resp.type_ = setup.new_type_response(pred_type);
         }
 
         Ok(Some(resp))
@@ -787,7 +787,7 @@ impl Session {
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let base_types = setup.checker.borrow_mut().get_base_types_exported(t);
@@ -797,7 +797,7 @@ impl Session {
 
         let mut results = Vec::with_capacity(base_types.len());
         for bt in base_types {
-            results.push(setup.sd.new_type_response(&setup.checker, bt));
+            results.push(setup.new_type_response(bt));
         }
 
         Ok(results)
@@ -812,7 +812,7 @@ impl Session {
     ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let props = setup
@@ -825,10 +825,30 @@ impl Session {
 
         let mut results = Vec::with_capacity(props.len());
         for prop in props {
-            results.push(setup.sd.new_symbol_response(&setup.checker, prop));
+            results.push(setup.new_symbol_response(prop));
         }
 
         Ok(results)
+    }
+
+    // Go: api/session.go:2369 handleGetApparentType
+    // handleGetApparentType returns the apparent type of a type.
+    pub fn handle_get_apparent_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let apparent = setup.checker.borrow_mut().get_apparent_type_exported(t);
+        if apparent.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_type_response(apparent))
     }
 
     // Go: api/session.go:1974 handleGetIndexInfosOfType
@@ -840,7 +860,7 @@ impl Session {
     ) -> Result<Vec<IndexInfoResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let infos = setup
@@ -863,16 +883,14 @@ impl Session {
                     info.declaration(),
                 )
             };
-            // PORT: Go dereferences the `*TypeResponse` (`*sd.newTypeResponse(..)`),
+            // PORT: Go dereferences the `*TypeResponse` (`*setup.newTypeResponse(..)`),
             // which panics on nil.
             let mut result = IndexInfoResponse {
                 key_type: setup
-                    .sd
-                    .new_type_response(&setup.checker, key_type)
+                    .new_type_response(key_type)
                     .expect("invalid memory address or nil pointer dereference"),
                 value_type: setup
-                    .sd
-                    .new_type_response(&setup.checker, value_type)
+                    .new_type_response(value_type)
                     .expect("invalid memory address or nil pointer dereference"),
                 is_readonly,
                 ..Default::default()
@@ -895,7 +913,7 @@ impl Session {
     ) -> Result<Option<TypeResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let constraint = setup
@@ -906,7 +924,7 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.sd.new_type_response(&setup.checker, constraint))
+        Ok(setup.new_type_response(constraint))
     }
 
     // Go: api/session.go:2028 handleGetTypeArguments
@@ -918,7 +936,7 @@ impl Session {
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, t) = setup.sd.resolve_type_handle(params.type_)?;
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
 
         let type_args = setup.checker.borrow_mut().get_type_arguments_exported(t);
@@ -928,10 +946,62 @@ impl Session {
 
         let mut results = Vec::with_capacity(type_args.len());
         for ta in type_args {
-            results.push(setup.sd.new_type_response(&setup.checker, ta));
+            results.push(setup.new_type_response(ta));
         }
 
         Ok(results)
+    }
+
+    // Go: api/session.go:2577 handleGetImmediateAliasedSymbol
+    // handleGetImmediateAliasedSymbol resolves one level of alias indirection.
+    pub fn handle_get_immediate_aliased_symbol(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let aliased = setup
+            .checker
+            .borrow_mut()
+            .get_immediate_aliased_symbol_exported(symbol);
+        if aliased.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_symbol_response(aliased))
+    }
+
+    // Go: api/session.go:2632 handleGetMemberInModuleExports
+    // handleGetMemberInModuleExports returns an export by name from a module symbol.
+    pub fn handle_get_member_in_module_exports(
+        &self,
+        ctx: &Context,
+        params: &GetMemberInModuleExportsParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let member = setup
+            .checker
+            .borrow_mut()
+            .try_get_member_in_module_exports(&params.name, symbol);
+        if member.is_nil() {
+            return Ok(None);
+        }
+
+        Ok(setup.new_symbol_response(member))
     }
 }
 
@@ -1185,6 +1255,26 @@ impl Session {
         Ok(new_diagnostic_responses(&diags))
     }
 
+    // Go: api/session.go:2959 handleGetBindDiagnostics
+    // handleGetBindDiagnostics returns bind diagnostics for a file or all files.
+    pub fn handle_get_bind_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+
+        let source_file = self.resolve_optional_source_file(program, params.file.as_ref())?;
+
+        let diags = ls_program::get_bind_diagnostics(program, ctx, source_file);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
     // Go: api/session.go:2215 handleGetSemanticDiagnostics
     // handleGetSemanticDiagnostics returns semantic diagnostics for a file or all files.
     pub fn handle_get_semantic_diagnostics(
@@ -1262,6 +1352,61 @@ impl Session {
         Ok(new_diagnostic_responses(&diags))
     }
 
+    // Go: api/session.go:3063 handleGetProgramDiagnostics
+    // handleGetProgramDiagnostics returns program-wide diagnostics, including options diagnostics.
+    pub fn handle_get_program_diagnostics(
+        &self,
+        _ctx: &Context,
+        params: &GetProjectDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+
+        let diags = ls_program::get_program_diagnostics(program);
+        Ok(new_diagnostic_responses(&diags))
+    }
+
+    // Go: api/session.go:3079 handleGetGlobalDiagnostics
+    // handleGetGlobalDiagnostics returns global (non-file-specific) semantic diagnostics.
+    pub fn handle_get_global_diagnostics(
+        &self,
+        ctx: &Context,
+        params: &GetProjectDiagnosticsParams,
+    ) -> Result<Vec<DiagnosticResponse>, GoError> {
+        let ctx = &core_context::with_checker_lifetime(ctx, CheckerLifetime::DIAGNOSTICS);
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let proj = sd.get_project(&params.project)?;
+
+        let program = proj.borrow().get_program();
+        let Some(program) = program else {
+            return Err(errors::errorf(
+                format!("{}: project has no program", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+
+        // Global diagnostics are accumulated lazily by the project's checker pool as
+        // files are checked. Force a full semantic pass so any global (non-file-specific)
+        // diagnostics are produced; otherwise this would return an empty result for
+        // projects using an external checker pool (the typical API case), since
+        // compiler.Program.GetGlobalDiagnostics only reports for the internal pool.
+        let _ = ls_program::get_semantic_diagnostics(program, ctx, Node::NIL);
+
+        let diags: Vec<Diagnostic> = proj
+            .borrow()
+            .get_project_diagnostics(ctx)
+            .into_iter()
+            .filter(|d| d.file.is_nil())
+            .collect();
+        Ok(new_diagnostic_responses(&diags))
+    }
+
     // Go: api/session.go:2298 resolveOptionalSourceFile
     // resolveOptionalSourceFile resolves an optional DocumentIdentifier to a source file.
     // Returns nil if the identifier is nil (meaning all files).
@@ -1298,7 +1443,7 @@ impl Session {
     ) -> Result<Vec<NodeHandle>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (owner, symbol) = setup.sd.resolve_symbol_handle(params.symbol)?;
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
         if symbol.is_nil() {
             return Ok(Vec::new());
         }
@@ -1376,6 +1521,13 @@ impl Session {
         ctx: &Context,
         params: &GetCompletionsAtPositionParams,
     ) -> Result<Option<CompletionInfoResponse>, GoError> {
+        let api_ctx;
+        let ctx = if params.include_symbol {
+            api_ctx = core_context::with_checker_lifetime(ctx, CheckerLifetime::API);
+            &api_ctx
+        } else {
+            ctx
+        };
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).

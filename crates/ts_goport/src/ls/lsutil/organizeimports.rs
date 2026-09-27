@@ -2,7 +2,8 @@ use crate::ls::lsutil::prelude::*;
 
 use crate::frontend::core_binarysearch::binary_search_unique_func;
 use crate::frontend::stringutil_ls;
-use crate::gostd::collate;
+use crate::gostd::norm;
+use crate::gostd::unicode_tables::{self, RangeTable};
 
 // Port of Go `ls/lsutil/organizeimports.go`.
 
@@ -15,21 +16,7 @@ pub type StringComparer = Rc<dyn Fn(&str, &str) -> i32>;
 // PORT: Go `func(s1, s2 *ast.Node) int` values returned to callers.
 pub type NodeComparer = Rc<dyn Fn(Node, Node) -> i32>;
 
-// Go: ls/lsutil/organizeimports.go:17 caseInsensitiveOrganizeImportsComparer, caseSensitiveOrganizeImportsComparer, organizeImportsComparers
-// PORT: Go package vars. `Rc` is not `Sync`, so they are thread-local; all
-// language-service code runs on the dispatch thread.
-thread_local! {
-    static CASE_INSENSITIVE_ORGANIZE_IMPORTS_COMPARER: Vec<StringComparer> =
-        vec![get_organize_imports_ordinal_string_comparer(true)];
-    static CASE_SENSITIVE_ORGANIZE_IMPORTS_COMPARER: Vec<StringComparer> =
-        vec![get_organize_imports_ordinal_string_comparer(false)];
-    static ORGANIZE_IMPORTS_COMPARERS: Vec<StringComparer> = vec![
-        CASE_INSENSITIVE_ORGANIZE_IMPORTS_COMPARER.with(|c| c[0].clone()),
-        CASE_SENSITIVE_ORGANIZE_IMPORTS_COMPARER.with(|c| c[0].clone()),
-    ];
-}
-
-// Go: ls/lsutil/organizeimports.go:27 FilterImportDeclarations
+// Go: ls/lsutil/organizeimports.go:18 FilterImportDeclarations
 // FilterImportDeclarations filters out non-import declarations from a list of statements.
 pub fn filter_import_declarations(statements: &[Node]) -> Vec<Node> {
     statements
@@ -39,18 +26,21 @@ pub fn filter_import_declarations(statements: &[Node]) -> Vec<Node> {
         .collect()
 }
 
-// Go: ls/lsutil/organizeimports.go:34 GetDetectionLists
+// Go: ls/lsutil/organizeimports.go:25 GetDetectionLists
 // GetDetectionLists returns the lists of comparers and type orders to test for organize imports detection.
 pub fn get_detection_lists(
     preferences: &UserPreferences,
 ) -> (Vec<StringComparer>, Vec<OrganizeImportsTypeOrder>) {
     let comparers_to_test: Vec<StringComparer>;
     let type_orders_to_test: Vec<OrganizeImportsTypeOrder>;
-    if !preferences.organize_imports_ignore_case.is_unknown() {
-        let ignore_case = preferences.organize_imports_ignore_case.is_true();
+    if preferences.organize_imports_sort != OrganizeImportsSort::AUTO {
+        comparers_to_test = vec![get_organize_imports_preset_string_comparer(
+            preferences.organize_imports_sort,
+        )];
+    } else if !preferences.organize_imports_ignore_case.is_unknown() {
         comparers_to_test = vec![get_organize_imports_string_comparer(
             preferences,
-            ignore_case,
+            preferences.organize_imports_ignore_case.is_true(),
         )];
     } else {
         comparers_to_test = vec![
@@ -72,7 +62,28 @@ pub fn get_detection_lists(
     (comparers_to_test, type_orders_to_test)
 }
 
-// Go: ls/lsutil/organizeimports.go:58 getOrganizeImportsOrdinalStringComparer
+// Go: ls/lsutil/organizeimports.go:50 ResolveOrganizeImportsSort
+pub fn resolve_organize_imports_sort(preferences: &UserPreferences) -> OrganizeImportsSort {
+    if preferences.organize_imports_sort != OrganizeImportsSort::AUTO {
+        return preferences.organize_imports_sort;
+    }
+
+    if preferences.organize_imports_collation == OrganizeImportsCollation::UNICODE {
+        return match preferences.organize_imports_ignore_case {
+            Tristate::True => OrganizeImportsSort::NATURAL_IGNORE_CASE,
+            Tristate::False => OrganizeImportsSort::NATURAL,
+            _ => OrganizeImportsSort::AUTO,
+        };
+    }
+
+    match preferences.organize_imports_ignore_case {
+        Tristate::True => OrganizeImportsSort::ORDINAL_IGNORE_CASE,
+        Tristate::False => OrganizeImportsSort::ORDINAL,
+        _ => OrganizeImportsSort::AUTO,
+    }
+}
+
+// Go: ls/lsutil/organizeimports.go:76 getOrganizeImportsOrdinalStringComparer
 fn get_organize_imports_ordinal_string_comparer(ignore_case: bool) -> StringComparer {
     if ignore_case {
         return Rc::new(stringutil_ls::compare_strings_case_insensitive_eslint_compatible);
@@ -80,99 +91,216 @@ fn get_organize_imports_ordinal_string_comparer(ignore_case: bool) -> StringComp
     Rc::new(stringutil_ls::compare_strings_case_sensitive)
 }
 
-// Go: ls/lsutil/organizeimports.go:65 getOrganizeImportsUnicodeStringComparer
-// PORT: a Go collator keeps iterator state, so each one is in a `RefCell`.
+// Go: ls/lsutil/organizeimports.go:83 getOrganizeImportsNaturalStringComparer
+fn get_organize_imports_natural_string_comparer(case_sensitive: bool) -> StringComparer {
+    Rc::new(move |a: &str, b: &str| -> i32 {
+        compare_organize_imports_natural_strings(a, b, case_sensitive)
+    })
+}
+
+// Go: ls/lsutil/organizeimports.go:89 getOrganizeImportsUnicodeStringComparer
 fn get_organize_imports_unicode_string_comparer(
     ignore_case: bool,
     preferences: &UserPreferences,
 ) -> StringComparer {
-    let resolved_locale = get_organize_imports_locale(preferences);
-
     let case_first = preferences.organize_imports_case_first;
     let numeric = preferences.organize_imports_numeric_collation.is_true();
     let accents = !preferences.organize_imports_accent_collation.is_false();
 
-    let (tag, _) = locale::language::parse(&resolved_locale);
+    Rc::new(move |a: &str, b: &str| -> i32 {
+        compare_organize_imports_unicode_strings(a, b, ignore_case, case_first, numeric, accents)
+    })
+}
 
-    let mut opts: Vec<collate::CollateOption> = Vec::new();
-
-    if numeric {
-        opts.push(collate::NUMERIC);
+// Go: ls/lsutil/organizeimports.go:99 compareOrganizeImportsNaturalStrings
+fn compare_organize_imports_natural_strings(a: &str, b: &str, case_sensitive: bool) -> i32 {
+    let cmp = compare_strings_numeric(&natural_collation_key(a), &natural_collation_key(b));
+    if cmp != 0 {
+        return cmp;
     }
 
-    let mut loose_opts = opts.clone();
-    loose_opts.push(collate::LOOSE);
-    let loose_collator = RefCell::new(collate::new(&tag, loose_opts));
-
-    if !ignore_case {
-        let mut case_insensitive_opts = opts.clone();
-        case_insensitive_opts.push(collate::IGNORE_CASE);
-        let case_insensitive_collator = RefCell::new(collate::new(&tag, case_insensitive_opts));
-
-        let full_collator = RefCell::new(collate::new(&tag, opts.clone()));
-
-        return Rc::new(move |a: &str, b: &str| -> i32 {
-            let primary_cmp = if !accents {
-                loose_collator.borrow_mut().compare_string(a, b)
-            } else {
-                case_insensitive_collator.borrow_mut().compare_string(a, b)
-            };
-            if primary_cmp != 0 {
-                return primary_cmp;
-            }
-
-            let a_runes: Vec<char> = a.chars().collect();
-            let b_runes: Vec<char> = b.chars().collect();
-            let min_len = a_runes.len().min(b_runes.len());
-
-            for i in 0..min_len {
-                let a_upper = unicode_is_upper(a_runes[i]);
-                let b_upper = unicode_is_upper(b_runes[i]);
-                if a_upper != b_upper {
-                    match case_first {
-                        OrganizeImportsCaseFirst::UPPER => {
-                            if a_upper {
-                                return -1;
-                            }
-                            return 1;
-                        }
-                        OrganizeImportsCaseFirst::LOWER => {
-                            if !a_upper {
-                                return -1;
-                            }
-                            return 1;
-                        }
-                        _ => {
-                            if a_upper {
-                                return 1;
-                            }
-                            return -1;
-                        }
-                    }
-                }
-            }
-
-            if !accents {
-                if a_runes.len() != b_runes.len() {
-                    return a_runes.len() as i32 - b_runes.len() as i32;
-                }
-                return 0;
-            }
-
-            full_collator.borrow_mut().compare_string(a, b)
-        });
-    }
-
-    if ignore_case {
-        opts.push(collate::IGNORE_CASE);
-        if !accents {
-            opts.push(collate::LOOSE);
+    if case_sensitive {
+        let cmp = compare_organize_imports_case_upper_first(a, b);
+        if cmp != 0 {
+            return cmp;
         }
     }
 
-    let collator = RefCell::new(collate::new(&tag, opts));
+    a.cmp(b) as i32
+}
 
-    Rc::new(move |a: &str, b: &str| -> i32 { collator.borrow_mut().compare_string(a, b) })
+// Go: ls/lsutil/organizeimports.go:113 compareOrganizeImportsUnicodeStrings
+fn compare_organize_imports_unicode_strings(
+    a: &str,
+    b: &str,
+    ignore_case: bool,
+    case_first: OrganizeImportsCaseFirst,
+    numeric: bool,
+    accents: bool,
+) -> i32 {
+    let cmp = compare_organize_imports_unicode_keys(
+        &natural_collation_key(a),
+        &natural_collation_key(b),
+        numeric,
+    );
+    if cmp != 0 {
+        return cmp;
+    }
+
+    if accents {
+        let cmp = compare_organize_imports_unicode_keys(
+            &strings_to_lower(a),
+            &strings_to_lower(b),
+            numeric,
+        );
+        if cmp != 0 {
+            return cmp;
+        }
+    }
+
+    if !ignore_case {
+        let cmp = compare_organize_imports_case(a, b, case_first);
+        if cmp != 0 {
+            return cmp;
+        }
+    }
+
+    a.cmp(b) as i32
+}
+
+// Go: ls/lsutil/organizeimports.go:133 naturalCollationKey
+fn natural_collation_key(s: &str) -> String {
+    strings_to_lower(&remove_diacritics(s))
+}
+
+// Go: ls/lsutil/organizeimports.go:137 removeDiacritics
+// PORT: Go `strings.Map` over `norm.NFD.String(s)`. The NFD form of a valid
+// UTF-8 string is valid UTF-8, so the lossy conversion never replaces.
+fn remove_diacritics(s: &str) -> String {
+    let nfd = norm::NFD.append(s.as_bytes());
+    String::from_utf8_lossy(&nfd)
+        .chars()
+        .filter(|&r| !unicode_is(&unicode_tables::MN, r as u32))
+        .collect()
+}
+
+// Go: ls/lsutil/organizeimports.go:146 compareOrganizeImportsUnicodeKeys
+fn compare_organize_imports_unicode_keys(a: &str, b: &str, numeric: bool) -> i32 {
+    if numeric {
+        return compare_strings_numeric(a, b);
+    }
+    a.cmp(b) as i32
+}
+
+// Go: ls/lsutil/organizeimports.go:153 compareStringsNumeric
+// PORT: Go decodes one rune with `utf8.DecodeRuneInString`; a `&str` is
+// valid UTF-8, so its first `char` is that rune.
+fn compare_strings_numeric(a: &str, b: &str) -> i32 {
+    let mut a = a;
+    let mut b = b;
+    while !a.is_empty() && !b.is_empty() {
+        if is_ascii_digit(a.as_bytes()[0]) && is_ascii_digit(b.as_bytes()[0]) {
+            let a_run_end = ascii_digit_run_end(a);
+            let b_run_end = ascii_digit_run_end(b);
+
+            let cmp = compare_numeric_text(&a[..a_run_end], &b[..b_run_end]);
+            if cmp != 0 {
+                return cmp;
+            }
+
+            a = &a[a_run_end..];
+            b = &b[b_run_end..];
+            continue;
+        }
+
+        let a_rune = a.chars().next().expect("a is not empty");
+        let b_rune = b.chars().next().expect("b is not empty");
+        if a_rune != b_rune {
+            return a_rune.cmp(&b_rune) as i32;
+        }
+
+        a = &a[a_rune.len_utf8()..];
+        b = &b[b_rune.len_utf8()..];
+    }
+
+    a.len().cmp(&b.len()) as i32
+}
+
+// Go: ls/lsutil/organizeimports.go:181 isASCIIDigit
+fn is_ascii_digit(ch: u8) -> bool {
+    ch.is_ascii_digit()
+}
+
+// Go: ls/lsutil/organizeimports.go:185 asciiDigitRunEnd
+fn ascii_digit_run_end(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && is_ascii_digit(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
+// Go: ls/lsutil/organizeimports.go:193 compareNumericText
+fn compare_numeric_text(a: &str, b: &str) -> i32 {
+    let mut a_digits = a.trim_start_matches('0');
+    let mut b_digits = b.trim_start_matches('0');
+    if a_digits.is_empty() {
+        a_digits = "0";
+    }
+    if b_digits.is_empty() {
+        b_digits = "0";
+    }
+
+    if a_digits.len() != b_digits.len() {
+        return a_digits.len().cmp(&b_digits.len()) as i32;
+    }
+    let cmp = a_digits.cmp(b_digits) as i32;
+    if cmp != 0 {
+        return cmp;
+    }
+    a.cmp(b) as i32
+}
+
+// Go: ls/lsutil/organizeimports.go:212 compareOrganizeImportsCaseUpperFirst
+fn compare_organize_imports_case_upper_first(a: &str, b: &str) -> i32 {
+    compare_organize_imports_case(a, b, OrganizeImportsCaseFirst::UPPER)
+}
+
+// Go: ls/lsutil/organizeimports.go:216 compareOrganizeImportsCase
+fn compare_organize_imports_case(a: &str, b: &str, case_first: OrganizeImportsCaseFirst) -> i32 {
+    let a_runes: Vec<char> = a.chars().collect();
+    let b_runes: Vec<char> = b.chars().collect();
+    let min_len = a_runes.len().min(b_runes.len());
+
+    for i in 0..min_len {
+        let a_upper = unicode_is_upper(a_runes[i]);
+        let b_upper = unicode_is_upper(b_runes[i]);
+        if a_upper != b_upper {
+            match case_first {
+                OrganizeImportsCaseFirst::UPPER => {
+                    if a_upper {
+                        return -1;
+                    }
+                    return 1;
+                }
+                OrganizeImportsCaseFirst::LOWER => {
+                    if !a_upper {
+                        return -1;
+                    }
+                    return 1;
+                }
+                _ => {
+                    if a_upper {
+                        return 1;
+                    }
+                    return -1;
+                }
+            }
+        }
+    }
+
+    a_runes.len().cmp(&b_runes.len()) as i32
 }
 
 /// Go `unicode.IsUpper`: general category Lu.
@@ -189,45 +317,70 @@ fn unicode_is_upper(c: char) -> bool {
     )
 }
 
-// Go: ls/lsutil/organizeimports.go:155 getOrganizeImportsLocale
-fn get_organize_imports_locale(preferences: &UserPreferences) -> String {
-    let mut locale_str = "en".to_string();
-    if !preferences.organize_imports_locale.is_empty() {
-        locale_str = preferences.organize_imports_locale.clone();
+// Go: unicode/letter.go:163 Is
+/// Go `unicode.Is`: reports whether the rune is in the table of ranges.
+/// PORT: the same scan as `gostd::collate`; Go's linear and binary searches
+/// give the same answer.
+fn unicode_is(range_tab: &RangeTable, r: u32) -> bool {
+    let r16 = range_tab.r16;
+    if let Some(&(_, hi, _)) = r16.last()
+        && r <= u32::from(hi)
+    {
+        return r16.iter().any(|&(lo, hi, stride)| {
+            let (lo, hi, stride) = (u32::from(lo), u32::from(hi), u32::from(stride));
+            lo <= r && r <= hi && (stride == 1 || (r - lo) % stride == 0)
+        });
     }
-
-    if locale_str == "auto" {
-        let default: &crate::locale::Locale = &crate::locale::DEFAULT;
-        if *default != crate::locale::Locale::default() {
-            let tag = default;
-            return tag.0.string();
-        }
-        return "en".to_string();
+    let r32 = range_tab.r32;
+    if let Some(&(lo, _, _)) = r32.first()
+        && r >= lo
+    {
+        return r32.iter().any(|&(lo, hi, stride)| {
+            lo <= r && r <= hi && (stride == 1 || (r - lo) % stride == 0)
+        });
     }
-
-    let (locale, ok) = crate::locale::parse(&locale_str);
-    if ok {
-        let tag = locale;
-        return tag.0.string();
-    }
-
-    "en".to_string()
+    false
 }
 
-// Go: ls/lsutil/organizeimports.go:177 getOrganizeImportsStringComparer
+// PORT: Go `strings.ToLower` maps each rune with the simple (one rune)
+// `unicode.ToLower`. The first char of Rust `char::to_lowercase` is that
+// mapping (U+0130 is the only multi-char case, and it starts with 'i'). Rust
+// `str::to_lowercase` also applies the final-sigma rule, which Go does not.
+fn strings_to_lower(s: &str) -> String {
+    s.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+// Go: ls/lsutil/organizeimports.go:248 getOrganizeImportsPresetStringComparer
+fn get_organize_imports_preset_string_comparer(sort: OrganizeImportsSort) -> StringComparer {
+    match sort {
+        OrganizeImportsSort::ORDINAL_IGNORE_CASE => {
+            get_organize_imports_ordinal_string_comparer(true)
+        }
+        OrganizeImportsSort::NATURAL => get_organize_imports_natural_string_comparer(true),
+        OrganizeImportsSort::NATURAL_IGNORE_CASE => {
+            get_organize_imports_natural_string_comparer(false)
+        }
+        _ => get_organize_imports_ordinal_string_comparer(false),
+    }
+}
+
+// Go: ls/lsutil/organizeimports.go:261 getOrganizeImportsStringComparer
 fn get_organize_imports_string_comparer(
     preferences: &UserPreferences,
     ignore_case: bool,
 ) -> StringComparer {
-    let collation = preferences.organize_imports_collation;
-
-    if collation == OrganizeImportsCollation::UNICODE {
+    if preferences.organize_imports_sort != OrganizeImportsSort::AUTO {
+        return get_organize_imports_preset_string_comparer(preferences.organize_imports_sort);
+    }
+    if preferences.organize_imports_collation == OrganizeImportsCollation::UNICODE {
         return get_organize_imports_unicode_string_comparer(ignore_case, preferences);
     }
     get_organize_imports_ordinal_string_comparer(ignore_case)
 }
 
-// Go: ls/lsutil/organizeimports.go:186 getModuleSpecifierExpression
+// Go: ls/lsutil/organizeimports.go:271 getModuleSpecifierExpression
 fn get_module_specifier_expression(declaration: Node) -> Node {
     match declaration.kind() {
         SyntaxKind::ImportEqualsDeclaration => {
@@ -255,7 +408,7 @@ fn get_module_specifier_expression(declaration: Node) -> Node {
     }
 }
 
-// Go: ls/lsutil/organizeimports.go:214 GetExternalModuleName
+// Go: ls/lsutil/organizeimports.go:299 GetExternalModuleName
 // GetExternalModuleName returns the module name from a module specifier expression.
 pub fn get_external_module_name(specifier: Node) -> String {
     if specifier.is_some() && is_string_literal_like(specifier) {
@@ -264,7 +417,7 @@ pub fn get_external_module_name(specifier: Node) -> String {
     String::new()
 }
 
-// Go: ls/lsutil/organizeimports.go:222 CompareModuleSpecifiers
+// Go: ls/lsutil/organizeimports.go:307 CompareModuleSpecifiers
 // CompareModuleSpecifiers compares two module specifiers using the given comparer.
 pub fn compare_module_specifiers(m1: Node, m2: Node, comparer: &dyn Fn(&str, &str) -> i32) -> i32 {
     let name1 = get_external_module_name(m1);
@@ -283,7 +436,7 @@ pub fn compare_module_specifiers(m1: Node, m2: Node, comparer: &dyn Fn(&str, &st
     comparer(&name1, &name2)
 }
 
-// Go: ls/lsutil/organizeimports.go:234 compareImportKind
+// Go: ls/lsutil/organizeimports.go:319 compareImportKind
 fn compare_import_kind(s1: Node, s2: Node) -> i32 {
     get_import_kind_order(s1).cmp(&get_import_kind_order(s2)) as i32
 }
@@ -296,7 +449,7 @@ fn compare_import_kind(s1: Node, s2: Node) -> i32 {
 // 5. Named imports
 // 6. ImportEqualsDeclarations
 // 7. Require variable statements
-// Go: ls/lsutil/organizeimports.go:246 importKindOrder consts
+// Go: ls/lsutil/organizeimports.go:331 importKindOrder consts
 const IMPORT_KIND_ORDER_SIDE_EFFECT: i32 = 0;
 const IMPORT_KIND_ORDER_TYPE_ONLY: i32 = 1;
 const IMPORT_KIND_ORDER_NAMESPACE: i32 = 2;
@@ -306,7 +459,7 @@ const IMPORT_KIND_ORDER_IMPORT_EQUALS: i32 = 5;
 const IMPORT_KIND_ORDER_REQUIRE: i32 = 6;
 const IMPORT_KIND_ORDER_UNKNOWN: i32 = 7;
 
-// Go: ls/lsutil/organizeimports.go:257 getImportKindOrder
+// Go: ls/lsutil/organizeimports.go:342 getImportKindOrder
 fn get_import_kind_order(s1: Node) -> i32 {
     match s1.kind() {
         SyntaxKind::ImportDeclaration => {
@@ -334,7 +487,7 @@ fn get_import_kind_order(s1: Node) -> i32 {
     }
 }
 
-// Go: ls/lsutil/organizeimports.go:285 CompareImportsOrRequireStatements
+// Go: ls/lsutil/organizeimports.go:370 CompareImportsOrRequireStatements
 // CompareImportsOrRequireStatements compares two import or require statements.
 pub fn compare_imports_or_require_statements(
     s1: Node,
@@ -352,7 +505,7 @@ pub fn compare_imports_or_require_statements(
     compare_import_kind(s1, s2)
 }
 
-// Go: ls/lsutil/organizeimports.go:292 compareImportOrExportSpecifiers
+// Go: ls/lsutil/organizeimports.go:377 compareImportOrExportSpecifiers
 fn compare_import_or_export_specifiers(
     s1: Node,
     s2: Node,
@@ -384,7 +537,7 @@ fn compare_import_or_export_specifiers(
     }
 }
 
-// Go: ls/lsutil/organizeimports.go:315 GetNamedImportSpecifierComparer
+// Go: ls/lsutil/organizeimports.go:400 GetNamedImportSpecifierComparer
 // GetNamedImportSpecifierComparer returns a comparer function for sorting import specifiers.
 // PORT: the returned Go closure captures a copy of `preferences`; this one
 // holds a clone.
@@ -398,7 +551,10 @@ pub fn get_named_import_specifier_comparer(
         if !preferences.organize_imports_ignore_case.is_unknown() {
             ignore_case = preferences.organize_imports_ignore_case.is_true();
         }
-        comparer = Some(get_organize_imports_ordinal_string_comparer(ignore_case));
+        comparer = Some(get_organize_imports_string_comparer(
+            preferences,
+            ignore_case,
+        ));
     }
     let comparer = comparer.expect("set above when nil");
     let preferences = preferences.clone();
@@ -407,7 +563,7 @@ pub fn get_named_import_specifier_comparer(
     })
 }
 
-// Go: ls/lsutil/organizeimports.go:329 GetImportSpecifierInsertionIndex
+// Go: ls/lsutil/organizeimports.go:414 GetImportSpecifierInsertionIndex
 // GetImportSpecifierInsertionIndex returns the index at which to insert a new import specifier.
 pub fn get_import_specifier_insertion_index(
     sorted_imports: &[Node],
@@ -417,7 +573,7 @@ pub fn get_import_specifier_insertion_index(
     binary_search_unique_func(sorted_imports, |_mid, value| comparer(value, new_import)).0
 }
 
-// Go: ls/lsutil/organizeimports.go:336 GetImportDeclarationInsertIndex
+// Go: ls/lsutil/organizeimports.go:421 GetImportDeclarationInsertIndex
 // GetImportDeclarationInsertIndex returns the index at which to insert a new import declaration.
 pub fn get_import_declaration_insert_index(
     sorted_imports: &[Node],
@@ -427,7 +583,7 @@ pub fn get_import_declaration_insert_index(
     binary_search_unique_func(sorted_imports, |_mid, value| comparer(value, new_import)).0
 }
 
-// Go: ls/lsutil/organizeimports.go:343 GetOrganizeImportsStringComparerWithDetection
+// Go: ls/lsutil/organizeimports.go:428 GetOrganizeImportsStringComparerWithDetection
 // GetOrganizeImportsStringComparerWithDetection returns a string comparer based on detecting the order of import statements by the module specifier
 pub fn get_organize_imports_string_comparer_with_detection(
     original_import_decls: &[Node],
@@ -440,25 +596,34 @@ pub fn get_organize_imports_string_comparer_with_detection(
     (result, sorted)
 }
 
-// Go: ls/lsutil/organizeimports.go:348 getComparers
+// Go: ls/lsutil/organizeimports.go:433 getComparers
 fn get_comparers(preferences: &UserPreferences) -> Vec<StringComparer> {
-    match preferences.organize_imports_ignore_case {
-        Tristate::True => return CASE_INSENSITIVE_ORGANIZE_IMPORTS_COMPARER.with(|c| c.clone()),
-        Tristate::False => return CASE_SENSITIVE_ORGANIZE_IMPORTS_COMPARER.with(|c| c.clone()),
-        _ => {}
+    if preferences.organize_imports_sort != OrganizeImportsSort::AUTO
+        || !preferences.organize_imports_ignore_case.is_unknown()
+    {
+        let mut ignore_case = false;
+        if !preferences.organize_imports_ignore_case.is_unknown() {
+            ignore_case = preferences.organize_imports_ignore_case.is_true();
+        }
+        return vec![get_organize_imports_string_comparer(
+            preferences,
+            ignore_case,
+        )];
     }
-
-    ORGANIZE_IMPORTS_COMPARERS.with(|c| c.clone())
+    vec![
+        get_organize_imports_string_comparer(preferences, true),
+        get_organize_imports_string_comparer(preferences, false),
+    ]
 }
 
-// Go: ls/lsutil/organizeimports.go:359 namedImportSortResult
+// Go: ls/lsutil/organizeimports.go:447 namedImportSortResult
 struct NamedImportSortResult {
     named_import_comparer: Option<StringComparer>,
     type_order: OrganizeImportsTypeOrder,
     is_sorted: bool,
 }
 
-// Go: ls/lsutil/organizeimports.go:366 DetectNamedImportOrganizationBySort
+// Go: ls/lsutil/organizeimports.go:454 DetectNamedImportOrganizationBySort
 // DetectNamedImportOrganizationBySort detects the order of named imports throughout the file by considering the named imports in each statement as a group
 // PORT: the unexported Go `detectNamedImportOrganizationBySort` has the same
 // snake name, so this exported one ends in `_exported` (PORTING "Names").
@@ -475,7 +640,7 @@ pub fn detect_named_import_organization_by_sort_exported(
     (result.named_import_comparer, result.type_order, true)
 }
 
-// Go: ls/lsutil/organizeimports.go:378 detectNamedImportOrganizationBySort
+// Go: ls/lsutil/organizeimports.go:466 detectNamedImportOrganizationBySort
 // PORT: Go `map[OrganizeImportsTypeOrder]T` reads give the zero value (0 or
 // nil) for a missing key; `get(..).unwrap_or(0)` and `get(..).cloned()` do
 // the same. Go `math.MaxInt` is `i32::MAX` here (PORTING `int` -> `i32`);
@@ -629,13 +794,13 @@ fn detect_named_import_organization_by_sort(
     })
 }
 
-// Go: ls/lsutil/organizeimports.go:509 caseSensitivityDetectionResult
+// Go: ls/lsutil/organizeimports.go:597 caseSensitivityDetectionResult
 struct CaseSensitivityDetectionResult {
     comparer: Option<StringComparer>,
     is_sorted: bool,
 }
 
-// Go: ls/lsutil/organizeimports.go:515 DetectModuleSpecifierCaseBySort
+// Go: ls/lsutil/organizeimports.go:603 DetectModuleSpecifierCaseBySort
 // DetectModuleSpecifierCaseBySort detects the order of module specifiers based on import statements throughout the module/file
 pub fn detect_module_specifier_case_by_sort(
     import_decls_by_group: &[Vec<Node>],
@@ -659,7 +824,7 @@ pub fn detect_module_specifier_case_by_sort(
     (result.comparer, result.is_sorted)
 }
 
-// Go: ls/lsutil/organizeimports.go:532 detectCaseSensitivityBySort
+// Go: ls/lsutil/organizeimports.go:620 detectCaseSensitivityBySort
 // PORT: Go `math.MaxInt` is `i32::MAX` here (PORTING `int` -> `i32`).
 fn detect_case_sensitivity_by_sort(
     original_groups: &[Vec<String>],
@@ -696,7 +861,7 @@ fn detect_case_sensitivity_by_sort(
     }
 }
 
-// Go: ls/lsutil/organizeimports.go:563 measureSortedness
+// Go: ls/lsutil/organizeimports.go:651 measureSortedness
 // PORT: Go passes the elements by value; this passes references.
 fn measure_sortedness<T>(arr: &[T], comparer: impl Fn(&T, &T) -> i32) -> i32 {
     let mut i = 0;
@@ -708,7 +873,7 @@ fn measure_sortedness<T>(arr: &[T], comparer: impl Fn(&T, &T) -> i32) -> i32 {
     i
 }
 
-// Go: ls/lsutil/organizeimports.go:574 GetNamedImportSpecifierComparerWithDetection
+// Go: ls/lsutil/organizeimports.go:662 GetNamedImportSpecifierComparerWithDetection
 // GetNamedImportSpecifierComparerWithDetection returns a specifier comparer based on detecting the existing sort order within a single import statement
 pub fn get_named_import_specifier_comparer_with_detection(
     import_decl: Node,
@@ -726,7 +891,7 @@ pub fn get_named_import_specifier_comparer_with_detection(
         get_named_import_specifier_comparer(preferences, Some(comparers_to_test[0].clone()));
     let mut is_sorted = Tristate::Unknown;
 
-    if (preferences.organize_imports_ignore_case.is_unknown()
+    if (resolve_organize_imports_sort(preferences) == OrganizeImportsSort::AUTO
         || preferences.organize_imports_type_order == OrganizeImportsTypeOrder::AUTO)
         && import_stmt.is_some()
     {
@@ -765,4 +930,33 @@ pub fn get_named_import_specifier_comparer_with_detection(
     }
 
     (specifier_comparer, is_sorted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: ls/lsutil/utilities_test.go:139 TestCompareOrganizeImportsNaturalStrings
+    // PORT: in this file because it calls the unexported
+    // `getOrganizeImportsPresetStringComparer`.
+    #[test]
+    fn test_compare_organize_imports_natural_strings() {
+        let comparer =
+            get_organize_imports_preset_string_comparer(OrganizeImportsSort::NATURAL_IGNORE_CASE);
+        #[rustfmt::skip]
+        let tests: &[(&str, &str, &str, i32)] = &[
+            ("numeric runs sort by numeric value", "a2", "a100", -1),
+            ("numeric runs with equal value use raw tie break", "a02", "a2", -1),
+            ("accents are folded for primary comparison", "À", "B", -1),
+            ("raw comparison breaks accent ties", "A", "À", -1),
+            ("hyphen sorts before slash like Intl.Collator fallback", "app-init", "app/app", -1),
+        ];
+        for &(name, a, b, want) in tests {
+            let got = comparer(a, b).signum();
+            assert_eq!(
+                got, want,
+                "{name}: comparer({a:?}, {b:?}) = {got}, want sign {want}"
+            );
+        }
+    }
 }

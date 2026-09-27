@@ -55,16 +55,17 @@ impl LanguageService {
         let preferences = self.user_preferences();
         let (comparers_to_test, type_orders_to_test) = lsutil::get_detection_lists(&preferences);
         let default_comparer = comparers_to_test[0].clone();
+        let sort = lsutil::resolve_organize_imports_sort(&preferences);
 
         let mut module_specifier_comparer: Option<lsutil::StringComparer> = None;
         let mut named_import_comparer: Option<lsutil::StringComparer> = None;
-        if !preferences.organize_imports_ignore_case.is_unknown() {
+        if sort != lsutil::OrganizeImportsSort::AUTO {
             module_specifier_comparer = Some(default_comparer.clone());
             named_import_comparer = Some(default_comparer.clone());
         }
         let mut type_order = preferences.organize_imports_type_order;
 
-        if preferences.organize_imports_ignore_case.is_unknown() {
+        if sort == lsutil::OrganizeImportsSort::AUTO {
             let (result, _) = lsutil::detect_module_specifier_case_by_sort(
                 &top_level_import_group_decls,
                 &comparers_to_test,
@@ -73,7 +74,7 @@ impl LanguageService {
         }
 
         if type_order == lsutil::OrganizeImportsTypeOrder::AUTO
-            || preferences.organize_imports_ignore_case.is_unknown()
+            || sort == lsutil::OrganizeImportsSort::AUTO
         {
             let (named_import_comparer2, type_order2, found) =
                 lsutil::detect_named_import_organization_by_sort_exported(
@@ -82,9 +83,7 @@ impl LanguageService {
                     &type_orders_to_test,
                 );
             if found {
-                if named_import_comparer.is_none()
-                    || preferences.organize_imports_ignore_case.is_unknown()
-                {
+                if named_import_comparer.is_none() || sort == lsutil::OrganizeImportsSort::AUTO {
                     named_import_comparer = named_import_comparer2;
                 }
                 if type_order == lsutil::OrganizeImportsTypeOrder::AUTO {

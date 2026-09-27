@@ -10,7 +10,9 @@ use super::Subtests;
 use crate::support::vfstest;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use ts_goport::frontend::module::{ResolutionHost, Resolver, new_resolver};
+use ts_goport::frontend::module::{
+    ResolutionHost, Resolver, new_resolver, parse_node_module_from_path,
+};
 use ts_goport::frontend::tspath::{self, Path};
 use ts_goport::frontend::vfs::{Fs, Replacements, wrapvfs_wrap};
 use ts_goport::modulespecifiers::deps::OutputPathsHost;
@@ -291,6 +293,178 @@ fn test_resolve_subpath_nil_contents_race() {
         "\"/repo/src/a/file.ts\" failed to resolve pkg/sub"
     );
     assert!(second, "\"/repo/src/b/file.ts\" failed to resolve pkg/sub");
+}
+
+// Go: module/resolver_test.go:301 TestParseNodeModuleFromPath
+#[test]
+fn test_parse_node_module_from_path() {
+    let tests: &[(&str, &str, bool, &str)] = &[
+        (
+            "file in package",
+            "/a/node_modules/b/lib/index.d.ts",
+            false,
+            "/a/node_modules/b",
+        ),
+        (
+            "file in scoped package",
+            "/a/node_modules/@scope/b/lib/index.d.ts",
+            false,
+            "/a/node_modules/@scope/b",
+        ),
+        (
+            "folder subpath",
+            "/a/node_modules/b/lib/File",
+            true,
+            "/a/node_modules/b",
+        ),
+        (
+            "folder subpath scoped",
+            "/a/node_modules/@scope/b/lib/File",
+            true,
+            "/a/node_modules/@scope/b",
+        ),
+        (
+            "package root folder",
+            "/a/node_modules/b",
+            true,
+            "/a/node_modules/b",
+        ),
+        (
+            "scoped package root folder",
+            "/a/node_modules/@scope/b",
+            true,
+            "/a/node_modules/@scope/b",
+        ),
+        // A bare scope directory has no package name; must not panic (https://github.com/microsoft/typescript-go/issues/4373).
+        (
+            "scope-only folder",
+            "/a/node_modules/@scope",
+            true,
+            "/a/node_modules/@scope",
+        ),
+        (
+            "types scope-only folder",
+            "/a/node_modules/@types",
+            true,
+            "/a/node_modules/@types",
+        ),
+        ("not in node_modules", "/a/src/index.ts", false, ""),
+    ];
+
+    let mut t = Subtests::new("TestParseNodeModuleFromPath");
+    for &(name, path, is_folder, want) in tests {
+        t.run(name, || {
+            let got = parse_node_module_from_path(path, is_folder);
+            if got != want {
+                return Err(format!(
+                    "ParseNodeModuleFromPath({path:?}, {is_folder}) = {got:?}, want {want:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: module/resolver_test.go:339 TestResolvePeerDependencyNilContentsRace
+/// Regression test for https://github.com/microsoft/typescript-go/issues/4478.
+///
+/// While resolving a package with peerDependencies, two goroutines look up the
+/// peer package's package.json concurrently. A `flipFileExistsFS` forces the
+/// first lookup to cache a nil-Contents entry and the second lookup to receive
+/// that stale entry from `Set`. The resolver must not dereference the peer
+/// package.json contents unless the entry actually exists.
+// PORT: single-threaded, as in the tests above. The outer resolution (from
+// `b`) is the Go second goroutine: its `FileExists` of the peer package.json
+// runs the whole inner resolution (from `a`, the Go first goroutine) before
+// it returns. The inner one's `FileExists` returns false and it sets the
+// nil-Contents entry first; then the outer one sees true, reads the file and
+// gets that entry back from its `Set`, as in Go.
+#[test]
+fn test_resolve_peer_dependency_nil_contents_race() {
+    const PEER_PKG_JSON: &str = "/repo/node_modules/peer/package.json";
+    let files = [
+        (
+            "/repo/node_modules/pkg/package.json",
+            r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts","peerDependencies":{"peer":"*"}}"#,
+        ),
+        (
+            "/repo/node_modules/pkg/index.d.ts",
+            "export declare const x: number;",
+        ),
+        (PEER_PKG_JSON, r#"{"name":"peer","version":"2.0.0"}"#),
+        ("/repo/src/a/file.ts", ""),
+        ("/repo/src/b/file.ts", ""),
+    ];
+    let inner = vfstest::from_map(files, true);
+    let nested: Nested = Rc::new(RefCell::new(None));
+    let call_count = Rc::new(Cell::new(0));
+    let fs = {
+        let inner = Rc::clone(&inner);
+        let nested = Rc::clone(&nested);
+        let call_count = Rc::clone(&call_count);
+        wrapvfs_wrap(
+            Rc::clone(&inner),
+            Replacements {
+                file_exists: Some(Box::new(move |path: &str| {
+                    if path == PEER_PKG_JSON {
+                        call_count.set(call_count.get() + 1);
+                        let n = call_count.get();
+                        if n == 1 {
+                            // The outer (Go second) caller: the inner (Go
+                            // first) caller runs and finishes first.
+                            let next = nested.borrow_mut().take();
+                            if let Some(next) = next {
+                                next();
+                            }
+                            return inner.file_exists(path); // second caller: file is visible
+                        }
+                        if n == 2 {
+                            return false; // first caller: simulate "file not yet visible"
+                        }
+                    }
+                    inner.file_exists(path)
+                })),
+                ..Default::default()
+            },
+        )
+    };
+    let resolver = Rc::new(new_repo_resolver(fs));
+
+    let first: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+    {
+        let resolver: Weak<Resolver> = Rc::downgrade(&resolver);
+        let first = Rc::clone(&first);
+        *nested.borrow_mut() = Some(Box::new(move || {
+            let resolver = resolver.upgrade().expect("resolver");
+            first.set(Some(resolves(&resolver, "pkg", "/repo/src/a/file.ts")));
+        }));
+    }
+    let panicked;
+    let second = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resolves(&resolver, "pkg", "/repo/src/b/file.ts")
+    })) {
+        Ok(resolved) => {
+            panicked = false;
+            resolved
+        }
+        Err(_) => {
+            panicked = true;
+            false
+        }
+    };
+
+    assert!(
+        !panicked,
+        "resolver panicked due to nil Contents dereference in readPackageJsonPeerDependencies"
+    );
+    assert!(call_count.get() >= 2, "both callers reached FileExists");
+    assert_eq!(
+        first.get(),
+        Some(true),
+        "\"/repo/src/a/file.ts\" failed to resolve pkg"
+    );
+    assert!(second, "\"/repo/src/b/file.ts\" failed to resolve pkg");
 }
 
 // ---------------------------------------------------------------------------

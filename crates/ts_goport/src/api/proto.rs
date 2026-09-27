@@ -224,6 +224,17 @@ pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
 
+    // MethodGetServerTiming retrieves the server's collected per-request
+    // processing-time totals and recent-request ring buffer. It is handled by
+    // the connection itself (not the session) and is not recorded in the timing
+    // it reports.
+    pub const GET_SERVER_TIMING: Method = Method(Cow::Borrowed("getServerTiming"));
+
+    // MethodResetServerTiming clears the server's collected timing totals and
+    // recent-request ring buffer. Like MethodGetServerTiming, it is handled by
+    // the connection itself and is not recorded.
+    pub const RESET_SERVER_TIMING: Method = Method(Cow::Borrowed("resetServerTiming"));
+
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
@@ -238,6 +249,7 @@ impl Method {
     pub const GET_DECLARED_TYPE_OF_SYMBOL: Method =
         Method(Cow::Borrowed("getDeclaredTypeOfSymbol"));
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
+    pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const RESOLVE_NAME: Method = Method(Cow::Borrowed("resolveName"));
     pub const GET_SIGNATURES_OF_TYPE: Method = Method(Cow::Borrowed("getSignaturesOfType"));
     pub const GET_RESOLVED_SIGNATURE: Method = Method(Cow::Borrowed("getResolvedSignature"));
@@ -310,10 +322,15 @@ impl Method {
         Method(Cow::Borrowed("getTypePredicateOfSignature"));
     pub const GET_BASE_TYPES: Method = Method(Cow::Borrowed("getBaseTypes"));
     pub const GET_PROPERTIES_OF_TYPE: Method = Method(Cow::Borrowed("getPropertiesOfType"));
+    pub const GET_APPARENT_TYPE: Method = Method(Cow::Borrowed("getApparentType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
         Method(Cow::Borrowed("getConstraintOfTypeParameter"));
     pub const GET_TYPE_ARGUMENTS: Method = Method(Cow::Borrowed("getTypeArguments"));
+    pub const GET_IMMEDIATE_ALIASED_SYMBOL: Method =
+        Method(Cow::Borrowed("getImmediateAliasedSymbol"));
+    pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
+        Method(Cow::Borrowed("getMemberInModuleExports"));
 
     // Reference methods
     pub const GET_REFERENCES_TO_SYMBOL_IN_FILE: Method =
@@ -328,11 +345,14 @@ impl Method {
 
     // Diagnostic methods
     pub const GET_SYNTACTIC_DIAGNOSTICS: Method = Method(Cow::Borrowed("getSyntacticDiagnostics"));
+    pub const GET_BIND_DIAGNOSTICS: Method = Method(Cow::Borrowed("getBindDiagnostics"));
     pub const GET_SEMANTIC_DIAGNOSTICS: Method = Method(Cow::Borrowed("getSemanticDiagnostics"));
     pub const GET_SUGGESTION_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getSuggestionDiagnostics"));
     pub const GET_DECLARATION_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getDeclarationDiagnostics"));
+    pub const GET_PROGRAM_DIAGNOSTICS: Method = Method(Cow::Borrowed("getProgramDiagnostics"));
+    pub const GET_GLOBAL_DIAGNOSTICS: Method = Method(Cow::Borrowed("getGlobalDiagnostics"));
     pub const GET_CONFIG_FILE_PARSING_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getConfigFileParsingDiagnostics"));
 
@@ -670,6 +690,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetSourceFileParams>,
     );
     m.insert(
+        Method::GET_SOURCE_FILE_NAMES,
+        unmarshaller_for::<GetSourceFileNamesParams>,
+    );
+    m.insert(
         Method::GET_SYMBOL_AT_POSITION,
         unmarshaller_for::<GetSymbolAtPositionParams>,
     );
@@ -899,6 +923,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_APPARENT_TYPE,
+        unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
         Method::GET_INDEX_INFOS_OF_TYPE,
         unmarshaller_for::<CheckerTypeParams>,
     );
@@ -909,6 +937,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_TYPE_ARGUMENTS,
         unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
+        Method::GET_IMMEDIATE_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_MEMBER_IN_MODULE_EXPORTS,
+        unmarshaller_for::<GetMemberInModuleExportsParams>,
     );
     m.insert(
         Method::GET_REFERENCES_TO_SYMBOL_IN_FILE,
@@ -976,6 +1012,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetDiagnosticsParams>,
     );
     m.insert(
+        Method::GET_BIND_DIAGNOSTICS,
+        unmarshaller_for::<GetDiagnosticsParams>,
+    );
+    m.insert(
         Method::GET_SEMANTIC_DIAGNOSTICS,
         unmarshaller_for::<GetDiagnosticsParams>,
     );
@@ -986,6 +1026,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_DECLARATION_DIAGNOSTICS,
         unmarshaller_for::<GetDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_PROGRAM_DIAGNOSTICS,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_GLOBAL_DIAGNOSTICS,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
     );
     m.insert(
         Method::GET_CONFIG_FILE_PARSING_DIAGNOSTICS,
@@ -1104,11 +1152,9 @@ impl MarshalerTo for ProjectResponse {
 // PORT: Go shares the `*core.CompilerOptions` pointer; the response keeps
 // a copy (responses cross into `Box<dyn AnyValue>`, which is `Send`).
 pub fn new_project_response(p: &project::Project) -> ProjectResponse {
-    // Go dereferences a nil CommandLine in FileNames and panics.
-    let command_line = p
-        .command_line
-        .as_ref()
-        .expect("runtime error: invalid memory address or nil pointer dereference");
+    let Some(command_line) = p.command_line.as_ref() else {
+        panic!("NewProjectResponse called with unloaded project");
+    };
     ProjectResponse {
         id: project_handle(p),
         config_file_name: p.name(),
@@ -1459,6 +1505,8 @@ pub fn literal_value_to_json(value: Option<&LiteralValue>) -> LspAny {
         Some(LiteralValue::String(v)) => LspAny::String(v.clone()),
         Some(LiteralValue::Number(v)) => LspAny::Number(v.0),
         Some(LiteralValue::Bool(v)) => LspAny::Bool(*v),
+        // Encode bigint literals as a signed decimal string (e.g. "-123"); the
+        // API client decodes this back into a real bigint. JSON has no bigint.
         Some(LiteralValue::PseudoBigInt(v)) => LspAny::String(v.to_string()),
         None => LspAny::Null,
     }
@@ -1500,6 +1548,18 @@ proto_json!(both GetSourceFileParams {
     file: "file" plain,
 });
 
+// Go: proto.go:770 GetSourceFileNamesParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSourceFileNamesParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+}
+
+proto_json!(both GetSourceFileNamesParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+});
+
 // Go: proto.go:690 ResolveNameParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolveNameParams {
@@ -1529,11 +1589,13 @@ proto_json!(both ResolveNameParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypePropertyParams {
     pub snapshot: SnapshotID,
+    pub project: ProjectID,
     pub type_: TypeID,
 }
 
 proto_json!(both GetTypePropertyParams {
     snapshot: "snapshot" plain,
+    project: "project" plain,
     type_: "objectId" plain,
 });
 
@@ -1555,11 +1617,13 @@ proto_json!(both GetSymbolPropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturePropertyParams {
     pub snapshot: SnapshotID,
+    pub project: ProjectID,
     pub signature: SignatureID,
 }
 
 proto_json!(both GetSignaturePropertyParams {
     snapshot: "snapshot" plain,
+    project: "project" plain,
     signature: "objectId" plain,
 });
 
@@ -2026,6 +2090,39 @@ proto_json!(both CheckerTypeParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
     type_: "type" plain,
+});
+
+// GetMemberInModuleExportsParams are parameters for getMemberInModuleExports.
+// Go: proto.go:1049 GetMemberInModuleExportsParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetMemberInModuleExportsParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub symbol: SymbolID,
+    pub name: String,
+}
+
+proto_json!(both GetMemberInModuleExportsParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    symbol: "symbol" plain,
+    name: "name" plain,
+});
+
+// CheckerSymbolParams are parameters for checker methods that operate on a symbol.
+// Go: proto.go:1064 CheckerSymbolParams
+// PORT: Go adds this type in tsgo#4424, which waits on perf9; tsgo#4436 uses it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CheckerSymbolParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub symbol: SymbolID,
+}
+
+proto_json!(both CheckerSymbolParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    symbol: "symbol" plain,
 });
 
 // CheckerSignatureParams are parameters for checker methods that operate on a signature.
