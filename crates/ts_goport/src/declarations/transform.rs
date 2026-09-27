@@ -6,7 +6,9 @@
 //!
 //! PORT: Go `tx.Visitor()` is the root visitor. Its `Visit` field is
 //! `tx.visit`, so Go `tx.Visitor().Visit(n)` is `self.visit(n)` here. The
-//! other root visitor methods go through `with_visitor` (transform_p2.rs).
+//! other root visitor methods go through `with_visitor` (transform_p2.rs),
+//! whose callback is `root_visit`: `visit` that descends with the visitor
+//! that calls it (see `visit`).
 //! The other Go visitor fields (`cjsExportAssignmentVisitor`,
 //! `expressionVisitor`, ...) are not fields; see `transform_source_file`.
 
@@ -21,7 +23,7 @@ use super::util::{
     can_produce_diagnostics, is_declaration_and_not_visible, is_enclosing_declaration,
     needs_scope_marker,
 };
-use crate::ast::visitor::syntax_list_children;
+use crate::ast::visitor::{NodeVisitor, syntax_list_children};
 use crate::checker::checker_p17::tspath_p17;
 use crate::checker::nodebuilder_types::{InternalNodeBuilderFlags, NodeBuilderFlags};
 use crate::prelude::*;
@@ -221,6 +223,46 @@ impl CleanupDiagnosticContext {
     }
 }
 
+/// What a `visitDeclarationSubtree` arm does with its node.
+// PORT: Go arms call `tx.Visitor().VisitEachChild(input)`. Here they return
+// `EachChild` and the caller descends: `visit` with a new root visitor,
+// `root_visit` with the visitor that runs, as Go reuses `tx.Visitor()`.
+pub(super) enum VisitStep {
+    /// The result for the node.
+    Done(Node),
+    /// Go `tx.Visitor().VisitEachChild(input)`.
+    EachChild,
+}
+
+/// The locals of `visitDeclarationSubtree` that its end reads.
+struct SubtreeScope {
+    previous_enclosing_declaration: Node,
+    can_prodice_diagnostic: bool,
+    cleanup_diagnostic_context: CleanupDiagnosticContext,
+}
+
+/// What `begin_visit` did with a node.
+enum BeginVisit {
+    /// The result for the node.
+    Done(Node),
+    /// Go `tx.Visitor().VisitEachChild(input)` in `visitDeclarationSubtree`.
+    /// The caller visits each child, then calls `finish_each_child`.
+    EachChild(SubtreeScope),
+}
+
+/// The callback of the root visitor (Go `tx.Visitor()`) that `with_visitor`
+/// builds. It is `DeclarationTransformer::visit`, but it descends with `v`,
+/// not with a new visitor.
+pub(super) fn root_visit(node: Node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>) -> Node {
+    match v.ctx.begin_visit(node) {
+        BeginVisit::Done(result) => result,
+        BeginVisit::EachChild(scope) => {
+            let result = v.visit_each_child(node);
+            v.ctx.finish_each_child(node, result, scope)
+        }
+    }
+}
+
 impl DeclarationTransformer {
     // Go: transformers/transformer.go:39 Transformer.TransformSourceFile
     pub fn transform_source_file_root(&mut self, file: Node) -> Node {
@@ -317,11 +359,26 @@ impl DeclarationTransformer {
 
     // Go: transformers/declarations/transform.go:225 DeclarationTransformer.visit
     // functions as both `visitDeclarationStatements` and `transformRoot`, utilitzing SyntaxList nodes
+    // PORT: the Go body is `begin_visit`. Where it stops at a
+    // `tx.Visitor().VisitEachChild(input)`, this builds a root visitor for
+    // that call. `root_visit` is the same function for the root visitor.
     pub fn visit(&mut self, node: Node) -> Node {
-        if node.is_nil() {
-            return Node::NIL;
+        match self.begin_visit(node) {
+            BeginVisit::Done(result) => result,
+            BeginVisit::EachChild(scope) => {
+                let result = self.with_visitor(|v| v.visit_each_child(node));
+                self.finish_each_child(node, result, scope)
+            }
         }
-        match node.kind() {
+    }
+
+    /// Go `visit` up to a `tx.Visitor().VisitEachChild(input)` in
+    /// `visitDeclarationSubtree`. See `visit`.
+    fn begin_visit(&mut self, node: Node) -> BeginVisit {
+        if node.is_nil() {
+            return BeginVisit::Done(Node::NIL);
+        }
+        let result = match node.kind() {
             SyntaxKind::SourceFile => self.visit_source_file(node),
             // statements we keep but do something to
             SyntaxKind::FunctionDeclaration
@@ -359,8 +416,9 @@ impl DeclarationTransformer {
             | SyntaxKind::MissingDeclaration
             | SyntaxKind::ExpressionStatement => Node::NIL,
             // parts of things, things we just visit children of
-            _ => self.visit_declaration_subtree(node),
-        }
+            _ => return self.visit_declaration_subtree(node),
+        };
+        BeginVisit::Done(result)
     }
 
     // Go: transformers/declarations/transform.go:279 DeclarationTransformer.visitSourceFile
@@ -724,13 +782,16 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:571 DeclarationTransformer.visitDeclarationSubtree
-    fn visit_declaration_subtree(&mut self, input: Node) -> Node {
+    // PORT: returns `EachChild` where Go calls
+    // `tx.Visitor().VisitEachChild(input)`. The caller descends and then runs
+    // the end of this function with `finish_each_child`. See `visit`.
+    fn visit_declaration_subtree(&mut self, input: Node) -> BeginVisit {
         if self.should_strip_internal(input) {
-            return Node::NIL;
+            return BeginVisit::Done(Node::NIL);
         }
         if is_declaration(input) {
             if is_declaration_and_not_visible(&self.emit_context, &*self.resolver, input) {
-                return Node::NIL;
+                return BeginVisit::Done(Node::NIL);
             }
             if has_dynamic_name(input) {
                 let isolated_declarations = self.state.borrow().isolated_declarations;
@@ -749,7 +810,7 @@ impl DeclarationTransformer {
                                 diag::Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations,
                                 args![],
                             ));
-                            return Node::NIL;
+                            return BeginVisit::Done(Node::NIL);
                         } else if (is_interface_declaration(input.parent())
                             || is_type_literal_node(input.parent()))
                             && !is_entity_name_expression(input.name().expression())
@@ -760,7 +821,7 @@ impl DeclarationTransformer {
                                 diag::Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedDeclarations,
                                 args![],
                             ));
-                            return Node::NIL;
+                            return BeginVisit::Done(Node::NIL);
                         }
                     }
                 } else if !self
@@ -768,24 +829,24 @@ impl DeclarationTransformer {
                     .is_late_bound(self.emit_context.parse_node(input))
                     || !is_entity_name_expression(input.name().expression())
                 {
-                    return Node::NIL;
+                    return BeginVisit::Done(Node::NIL);
                 }
             }
         }
 
         // Elide implementation signatures from overload sets
         if is_function_like(input) && self.resolver.is_implementation_of_overload(input) {
-            return Node::NIL;
+            return BeginVisit::Done(Node::NIL);
         }
 
         if input.kind() == SyntaxKind::SemicolonClassElement {
-            return Node::NIL;
+            return BeginVisit::Done(Node::NIL);
         }
 
         if is_heritage_clause(input) {
             let types = input.types().nodes();
             if types.len() == 0 || (types.len() == 1 && node_is_missing(types.get(0))) {
-                return Node::NIL;
+                return BeginVisit::Done(Node::NIL);
             }
         }
 
@@ -796,61 +857,94 @@ impl DeclarationTransformer {
 
         let (can_prodice_diagnostic, cleanup_diagnostic_context) =
             self.setup_diagnostic_context(input);
+        let scope = SubtreeScope {
+            previous_enclosing_declaration,
+            can_prodice_diagnostic,
+            cleanup_diagnostic_context,
+        };
 
-        let result = match input.kind() {
-            SyntaxKind::MappedType => self.transform_mapped_type_node(input),
+        use VisitStep::{Done, EachChild};
+        let step = match input.kind() {
+            SyntaxKind::MappedType => Done(self.transform_mapped_type_node(input)),
             SyntaxKind::HeritageClause => self.transform_heritage_clause(input),
-            SyntaxKind::MethodSignature => self.transform_method_signature_declaration(input),
-            SyntaxKind::MethodDeclaration => self.transform_method_declaration(input),
-            SyntaxKind::ConstructSignature => self.transform_construct_signature_declaration(input),
-            SyntaxKind::Constructor => self.transform_constructor_declaration(input),
-            SyntaxKind::GetAccessor => self.transform_get_accesor_declaration(input),
-            SyntaxKind::SetAccessor => self.transform_set_accessor_declaration(input),
-            SyntaxKind::PropertyDeclaration => self.transform_property_declaration(input),
-            SyntaxKind::PropertySignature => self.transform_property_signature_declaration(input),
-            SyntaxKind::CallSignature => self.transform_call_signature_declaration(input),
-            SyntaxKind::IndexSignature => self.transform_index_signature_declaration(input),
-            SyntaxKind::VariableDeclaration => self.transform_variable_declaration(input),
+            SyntaxKind::MethodSignature => Done(self.transform_method_signature_declaration(input)),
+            SyntaxKind::MethodDeclaration => Done(self.transform_method_declaration(input)),
+            SyntaxKind::ConstructSignature => {
+                Done(self.transform_construct_signature_declaration(input))
+            }
+            SyntaxKind::Constructor => Done(self.transform_constructor_declaration(input)),
+            SyntaxKind::GetAccessor => Done(self.transform_get_accesor_declaration(input)),
+            SyntaxKind::SetAccessor => Done(self.transform_set_accessor_declaration(input)),
+            SyntaxKind::PropertyDeclaration => Done(self.transform_property_declaration(input)),
+            SyntaxKind::PropertySignature => {
+                Done(self.transform_property_signature_declaration(input))
+            }
+            SyntaxKind::CallSignature => Done(self.transform_call_signature_declaration(input)),
+            SyntaxKind::IndexSignature => Done(self.transform_index_signature_declaration(input)),
+            SyntaxKind::VariableDeclaration => Done(self.transform_variable_declaration(input)),
             SyntaxKind::TypeParameter => self.transform_type_parameter_declaration(input),
             SyntaxKind::ExpressionWithTypeArguments => {
                 self.transform_expression_with_type_arguments(input)
             }
             SyntaxKind::TypeReference => self.transform_type_reference(input),
-            SyntaxKind::ConditionalType => self.transform_conditional_type_node(input),
-            SyntaxKind::FunctionType => self.transform_function_type_node(input),
-            SyntaxKind::ConstructorType => self.transform_constructor_type_node(input),
-            SyntaxKind::ImportType => self.transform_import_type_node(input),
+            SyntaxKind::ConditionalType => Done(self.transform_conditional_type_node(input)),
+            SyntaxKind::FunctionType => Done(self.transform_function_type_node(input)),
+            SyntaxKind::ConstructorType => Done(self.transform_constructor_type_node(input)),
+            SyntaxKind::ImportType => Done(self.transform_import_type_node(input)),
             SyntaxKind::TypeQuery => {
                 let enclosing_declaration = self.enclosing_declaration;
                 self.check_entity_name_visibility(input.expr_name(), enclosing_declaration);
-                self.with_visitor(|v| v.visit_each_child(input))
+                EachChild
             }
-            SyntaxKind::TupleType => {
-                let result = self.with_visitor(|v| v.visit_each_child(input));
-                if result.is_some() && is_original_node_single_line(&self.emit_context, input) {
-                    self.emit_context
-                        .add_emit_flags(result, EmitFlags::SINGLE_LINE);
-                }
-                result
+            // `finish_each_child` adds `EFSingleLine` after the descend.
+            SyntaxKind::TupleType => EachChild,
+            SyntaxKind::JsDocTypeExpression => Done(self.transform_js_doc_type_expression(input)),
+            SyntaxKind::JsDocTypeLiteral => Done(self.transform_js_doc_type_literal(input)),
+            SyntaxKind::JsDocPropertyTag => Done(self.transform_js_doc_property_tag(input)),
+            SyntaxKind::JsDocAllType => Done(self.transform_js_doc_all_type(input)),
+            SyntaxKind::JsDocNullableType => Done(self.transform_js_doc_nullable_type(input)),
+            SyntaxKind::JsDocNonNullableType => {
+                Done(self.transform_js_doc_non_nullable_type(input))
             }
-            SyntaxKind::JsDocTypeExpression => self.transform_js_doc_type_expression(input),
-            SyntaxKind::JsDocTypeLiteral => self.transform_js_doc_type_literal(input),
-            SyntaxKind::JsDocPropertyTag => self.transform_js_doc_property_tag(input),
-            SyntaxKind::JsDocAllType => self.transform_js_doc_all_type(input),
-            SyntaxKind::JsDocNullableType => self.transform_js_doc_nullable_type(input),
-            SyntaxKind::JsDocNonNullableType => self.transform_js_doc_non_nullable_type(input),
-            SyntaxKind::JsDocOptionalType => self.transform_js_doc_optional_type(input),
-            SyntaxKind::JsDocVariadicType => self.transform_js_doc_variadic_type(input),
-            _ => self.with_visitor(|v| v.visit_each_child(input)),
+            SyntaxKind::JsDocOptionalType => Done(self.transform_js_doc_optional_type(input)),
+            SyntaxKind::JsDocVariadicType => Done(self.transform_js_doc_variadic_type(input)),
+            _ => EachChild,
         };
 
-        if result.is_some() && can_prodice_diagnostic && has_dynamic_name(input) {
+        match step {
+            Done(result) => BeginVisit::Done(self.finish_declaration_subtree(input, result, scope)),
+            EachChild => BeginVisit::EachChild(scope),
+        }
+    }
+
+    /// The end of `visitDeclarationSubtree` for an arm that called
+    /// `tx.Visitor().VisitEachChild(input)`. `result` is the result of that call.
+    fn finish_each_child(&mut self, input: Node, result: Node, scope: SubtreeScope) -> Node {
+        // Go: the rest of the `ast.KindTupleType` arm.
+        if input.kind() == SyntaxKind::TupleType
+            && result.is_some()
+            && is_original_node_single_line(&self.emit_context, input)
+        {
+            self.emit_context
+                .add_emit_flags(result, EmitFlags::SINGLE_LINE);
+        }
+        self.finish_declaration_subtree(input, result, scope)
+    }
+
+    /// The end of `visitDeclarationSubtree`, after its switch.
+    fn finish_declaration_subtree(
+        &mut self,
+        input: Node,
+        result: Node,
+        scope: SubtreeScope,
+    ) -> Node {
+        if result.is_some() && scope.can_prodice_diagnostic && has_dynamic_name(input) {
             self.check_name(input);
         }
 
-        self.enclosing_declaration = previous_enclosing_declaration;
+        self.enclosing_declaration = scope.previous_enclosing_declaration;
         // Go: defer cleanupDiagnosticContext()
-        cleanup_diagnostic_context.run(self);
+        scope.cleanup_diagnostic_context.run(self);
         result
     }
 
@@ -901,7 +995,9 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:735 DeclarationTransformer.transformHeritageClause
-    fn transform_heritage_clause(&mut self, clause: Node) -> Node {
+    // PORT: returns `EachChild` for Go `tx.Visitor().VisitEachChild(clause)`;
+    // see `VisitStep`.
+    fn transform_heritage_clause(&mut self, clause: Node) -> VisitStep {
         let types = clause.types().nodes();
         let retained_clauses: Vec<Node> = types
             .iter()
@@ -912,16 +1008,18 @@ impl DeclarationTransformer {
             })
             .collect();
         if retained_clauses.is_empty() {
-            return Node::NIL; // elide empty clause
+            return VisitStep::Done(Node::NIL); // elide empty clause
         }
         if retained_clauses.len() == types.len() {
-            return self.with_visitor(|v| v.visit_each_child(clause));
+            return VisitStep::EachChild;
         }
         let retained = self.emit_context.factory().new_node_list(&retained_clauses);
         let types = self.with_visitor(|v| v.visit_nodes(retained));
-        self.emit_context
-            .factory()
-            .update_heritage_clause(clause, clause.token(), types)
+        VisitStep::Done(self.emit_context.factory().update_heritage_clause(
+            clause,
+            clause.token(),
+            types,
+        ))
     }
 }
 

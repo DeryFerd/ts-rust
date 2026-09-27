@@ -8,6 +8,9 @@
 //! through `with_visitor`, which builds an `ast` visitor over the transformer.
 //! `with_visitor` uses `EmitContext::new_node_visitor`, so the emit context
 //! hooks (`VisitParameters`, `VisitFunctionBody`, ...) are attached as in Go.
+//! Its callback is `root_visit` (transform.rs). Where Go calls
+//! `tx.Visitor().VisitEachChild(input)` for the node that `visit` gets, the
+//! helpers here return `VisitStep::EachChild`, and the caller descends.
 //!
 //! Methods ported in other files of this module (`rewriteModuleSpecifier`,
 //! `ensureType`, `ensureModifiers`, `preserveJsDoc`, ...) are called with their
@@ -15,7 +18,7 @@
 
 use super::diagnostics::{SymbolAccessibilityDiagnostic, bound_symbol_declarations};
 use super::tracker::SymbolTrackerImpl;
-use super::transform::DeclarationTransformer;
+use super::transform::{DeclarationTransformer, VisitStep, root_visit};
 use super::transform_p3::is_common_js_alias_export;
 use super::util::{
     get_binding_name_visible, is_private_method_type_parameter, unwrap_parenthesized_expression,
@@ -60,16 +63,14 @@ impl Drop for ResetWatchedClassSymbol {
 
 impl DeclarationTransformer {
     /// Runs `f` with Go `tx.Visitor()`.
-    // PORT: see the module comment.
+    // PORT: see the module comment. The nodes below the one that `f` visits
+    // use this visitor too (see `root_visit`).
     pub(super) fn with_visitor<R>(
         &mut self,
         f: impl FnOnce(&mut NodeVisitor<'_, &mut DeclarationTransformer>) -> R,
     ) -> R {
         let emit_context = self.emit_context.clone();
-        let mut visitor = emit_context.new_node_visitor(
-            |node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| v.ctx.visit(node),
-            self,
-        );
+        let mut visitor = emit_context.new_node_visitor(root_visit, self);
         f(&mut visitor)
     }
 
@@ -141,35 +142,38 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:807 DeclarationTransformer.transformTypeReference
-    pub(super) fn transform_type_reference(&mut self, input: Node) -> Node {
+    // PORT: `EachChild` is Go `tx.Visitor().VisitEachChild(input)`.
+    pub(super) fn transform_type_reference(&mut self, input: Node) -> VisitStep {
         self.check_entity_name_visibility(input.type_name(), self.enclosing_declaration);
-        self.with_visitor(|v| v.visit_each_child(input))
+        VisitStep::EachChild
     }
 
     // Go: transformers/declarations/transform.go:812 DeclarationTransformer.transformExpressionWithTypeArguments
-    pub(super) fn transform_expression_with_type_arguments(&mut self, input: Node) -> Node {
+    // PORT: `EachChild` is Go `tx.Visitor().VisitEachChild(input)`.
+    pub(super) fn transform_expression_with_type_arguments(&mut self, input: Node) -> VisitStep {
         if is_entity_name(input.expression()) || is_entity_name_expression(input.expression()) {
             self.check_entity_name_visibility(input.expression(), self.enclosing_declaration);
         }
-        self.with_visitor(|v| v.visit_each_child(input))
+        VisitStep::EachChild
     }
 
     // Go: transformers/declarations/transform.go:819 DeclarationTransformer.transformTypeParameterDeclaration
-    pub(super) fn transform_type_parameter_declaration(&mut self, input: Node) -> Node {
+    // PORT: `EachChild` is Go `tx.Visitor().VisitEachChild(input)`.
+    pub(super) fn transform_type_parameter_declaration(&mut self, input: Node) -> VisitStep {
         if is_private_method_type_parameter(&*self.host, input)
             && (input.default_type().is_some() || input.constraint().is_some())
         {
             let ec = self.emit_context.clone();
-            return ec.factory().update_type_parameter_declaration(
+            return VisitStep::Done(ec.factory().update_type_parameter_declaration(
                 input,
                 input.modifiers(),
                 input.name(),
                 Node::NIL,
                 input.expression(),
                 Node::NIL,
-            );
+            ));
         }
-        self.with_visitor(|v| v.visit_each_child(input))
+        VisitStep::EachChild
     }
 
     // Go: transformers/declarations/transform.go:833 DeclarationTransformer.transformVariableDeclaration

@@ -72,8 +72,7 @@ pub fn emit_with(
     options: EmitOptions,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> EmitResult {
-    let _trace = crate::tracing::get()
-        .map(|tr| tr.push(crate::tracing::Phase::Emit, "emit", Vec::new(), true));
+    let _trace = trace_emit();
     if options.emit_only != EmitOnly::ForcedDts {
         if let Some(result) = handle_no_emit_on_error(options.target_source_file) {
             return result;
@@ -86,23 +85,116 @@ pub fn emit_with(
     );
     let emit_only = options.emit_only;
     let write_file = options.write_file.clone();
+    let results = run_emit_jobs(source_files, move |source_file| {
+        wrap(&|| emit_source_file(source_file, emit_only, write_file.clone()))
+    });
+
+    // collect results from emit, preserving input order
+    combine_emit_results(results)
+}
+
+/// `emit` for many targets at once, one result per target in input order.
+pub fn emit_batch(targets: Vec<EmitOptions>) -> Vec<EmitResult> {
+    emit_batch_with(targets, |emit_file| emit_file())
+}
+
+/// `emit_with` for many targets at once, one result per target in input
+/// order. Each result is the same as `emit_with` of that target alone.
+///
+/// Go `emitFilesIncremental` calls `Program.Emit` for each pending file
+/// inside a work group, so the files emit in parallel. `emit_files_incremental`
+/// can build one `EmitOptions` per pending file (one target file each, from
+/// `get_emit_options`) and call this once instead of `emit` per file.
+///
+/// Each target must name one source file, and no file can be in the batch
+/// twice. With `noEmitOnError` each target runs through `emit_with`, one at
+/// a time, because the diagnostics check must come first.
+pub fn emit_batch_with(
+    targets: Vec<EmitOptions>,
+    wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
+) -> Vec<EmitResult> {
+    if options().no_emit_on_error.is_true() {
+        return targets
+            .into_iter()
+            .map(|target| emit_with(target, wrap))
+            .collect();
+    }
+
+    // Without `noEmitOnError`, `handle_no_emit_on_error` returns None, so
+    // `emit_with` of one target is only the emit of its 0 or 1 file.
+    let mut files = Vec::new();
+    let mut has_file = Vec::with_capacity(targets.len());
+    let mut file_targets: FxHashMap<Node, (EmitOnly, Option<WriteFile>)> = FxHashMap::default();
+    for target in targets {
+        debug_assert!(
+            target.target_source_file.is_some(),
+            "emit_batch target without a file"
+        );
+        let force_dts_emit = target.emit_only == EmitOnly::ForcedDts;
+        let file = get_source_files_to_emit(target.target_source_file, force_dts_emit)
+            .first()
+            .copied();
+        has_file.push(file.is_some());
+        match file {
+            Some(file) => {
+                let previous = file_targets.insert(file, (target.emit_only, target.write_file));
+                debug_assert!(previous.is_none(), "file is in the emit batch twice");
+                files.push(file);
+            }
+            // Go `Program.Emit` still traces a target that emits no file.
+            None => drop(trace_emit()),
+        }
+    }
+
+    // The closure gets only the file, so it finds the file's target here.
+    let file_targets = Arc::new(file_targets);
+    let mut results = run_emit_jobs(files, move |source_file| {
+        // One Go `Program.Emit` trace event per target, on the emit thread.
+        let _trace = trace_emit();
+        let (emit_only, write_file) = &file_targets[&source_file];
+        wrap(&|| emit_source_file(source_file, *emit_only, write_file.clone()))
+    })
+    .into_iter();
+
+    // `combine_emit_results` of one result is that result.
+    has_file
+        .into_iter()
+        .map(|has_file| {
+            if has_file {
+                results.next().expect("one emit result per batch file")
+            } else {
+                combine_emit_results(Vec::new())
+            }
+        })
+        .collect()
+}
+
+/// Go `tr.Push(tracing.PhaseEmit, "emit", nil, true)` at the start of
+/// `Program.Emit`. The event ends when the returned value drops.
+fn trace_emit() -> Option<crate::tracing::Pop> {
+    crate::tracing::get().map(|tr| tr.push(crate::tracing::Phase::Emit, "emit", Vec::new(), true))
+}
+
+/// Runs `job(file)` for each file on the file's checker thread and returns
+/// the results in file order. Each checker thread runs its jobs in the
+/// order they are sent (FIFO).
+fn run_emit_jobs(
+    files: Vec<Node>,
+    job: impl Fn(Node) -> EmitResult + Send + Sync + 'static,
+) -> Vec<EmitResult> {
     // Go `core.singleThreadedWorkGroup` runs the queued emits
     // last-queued-first (core/workgroup.go:67). With one checker thread the
     // jobs run in the order they are sent, so send them reversed.
     let last_queued_first = single_threaded();
-    let mut queued = source_files;
+    let mut queued = files;
     if last_queued_first {
         queued.reverse();
     }
-    let mut results = run_on_checker_threads_for_files(&queued, move |source_file| {
-        wrap(&|| emit_source_file(source_file, emit_only, write_file.clone()))
-    });
+    let mut results = run_on_checker_threads_for_files(&queued, job);
     if last_queued_first {
         results.reverse();
     }
-
-    // collect results from emit, preserving input order
-    combine_emit_results(results)
+    results
 }
 
 /// The body of the Go `wg.Queue` closure in `Program.Emit`.

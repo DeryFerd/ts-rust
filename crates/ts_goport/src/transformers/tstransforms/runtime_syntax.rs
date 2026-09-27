@@ -80,18 +80,28 @@ impl TransformerVisit for RuntimeSyntaxTransformer {
     // Go: transformers/tstransforms/runtimesyntax.go:79 RuntimeSyntaxTransformer.visit
     /// Visits each node in the AST
     fn visit(&mut self, node: Node) -> Node {
-        let grandparent_node = self.push_node(node);
-        let (saved_current_scope, saved_current_scope_first_declarations_of_name) =
-            self.push_scope(node);
+        self.with_visitor(|v| Self::root_callback(node, v))
+    }
 
-        let result = self.visit_worker(node);
+    // Go: transformers/tstransforms/runtimesyntax.go:79 RuntimeSyntaxTransformer.visit
+    /// Go `tx.visit` as the callback of the root visitor `v`. Where Go calls
+    /// `tx.Visitor().VisitEachChild(node)`, this descends on `v`.
+    fn root_callback(node: Node, v: &mut NodeVisitor<'_, &mut Self>) -> Node {
+        let grandparent_node = v.ctx.push_node(node);
+        let (saved_current_scope, saved_current_scope_first_declarations_of_name) =
+            v.ctx.push_scope(node);
+
+        let result = match v.ctx.visit_worker(node) {
+            Some(result) => result,
+            None => v.visit_each_child(node),
+        };
 
         // PORT: Go pops both with `defer`, so `popScope` runs first.
-        self.pop_scope(
+        v.ctx.pop_scope(
             saved_current_scope,
             saved_current_scope_first_declarations_of_name,
         );
-        self.pop_node(grandparent_node);
+        v.ctx.pop_node(grandparent_node);
         result
     }
 }
@@ -157,16 +167,18 @@ impl RuntimeSyntaxTransformer {
     }
 
     /// The body of Go `visit` after the pushes (Go pops with `defer`).
-    fn visit_worker(&mut self, node: Node) -> Node {
+    /// `None` is Go `tx.Visitor().VisitEachChild(node)`: the caller descends
+    /// on the running root visitor (see `root_callback`).
+    fn visit_worker(&mut self, node: Node) -> Option<Node> {
         let facts = node.subtree_facts();
         if !facts.intersects(SubtreeFacts::SUBTREE_CONTAINS_TYPE_SCRIPT)
             && (self.current_namespace.is_nil() && self.current_enum.is_nil()
                 || !facts.intersects(SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER))
         {
-            return node;
+            return Some(node);
         }
 
-        match node.kind() {
+        let result = match node.kind() {
             // TypeScript parameter property modifiers are elided
             SyntaxKind::PublicKeyword
             | SyntaxKind::PrivateKeyword
@@ -190,7 +202,7 @@ impl RuntimeSyntaxTransformer {
                     // do not emit ES6 imports and exports since they are illegal inside a namespace
                     Node::NIL
                 } else {
-                    self.visit_each_child(node)
+                    return None;
                 }
             }
             SyntaxKind::ImportEqualsDeclaration => {
@@ -216,8 +228,9 @@ impl RuntimeSyntaxTransformer {
             SyntaxKind::ShorthandPropertyAssignment => {
                 self.visit_shorthand_property_assignment(node)
             }
-            _ => self.visit_each_child(node),
-        }
+            _ => return None,
+        };
+        Some(result)
     }
 
     // Go: transformers/tstransforms/runtimesyntax.go:137 RuntimeSyntaxTransformer.recordDeclarationInScope

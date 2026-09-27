@@ -104,11 +104,24 @@ pub trait TransformerVisit: Sized {
     /// Go `tx.visit`, the callback of the root visitor.
     fn visit(&mut self, node: Node) -> Node;
 
+    /// The callback of the root visitor that `with_visitor` builds. `v` is
+    /// that running visitor, and `v.ctx` is this transformer. The default
+    /// calls `visit`.
+    ///
+    /// PORT: not in Go. Go reuses one `tx.Visitor()`, but `with_visitor`
+    /// builds a new visitor on each call. A transformer can override this to
+    /// run Go `tx.Visitor().VisitEachChild(node)` as `v.visit_each_child(node)`
+    /// on the running visitor, which is the same as a new root visitor and
+    /// does not build one for each node.
+    fn root_callback(node: Node, v: &mut NodeVisitor<'_, &mut Self>) -> Node {
+        v.ctx.visit(node)
+    }
+
     /// Runs `f` with Go `tx.Visitor()`.
     fn with_visitor<R>(&mut self, f: impl FnOnce(&mut NodeVisitor<'_, &mut Self>) -> R) -> R {
         let emit_context = self.emit_context_rc();
         let mut visitor = emit_context.new_node_visitor(
-            |node, v: &mut NodeVisitor<'_, &mut Self>| v.ctx.visit(node),
+            |node, v: &mut NodeVisitor<'_, &mut Self>| Self::root_callback(node, v),
             self,
         );
         f(&mut visitor)
