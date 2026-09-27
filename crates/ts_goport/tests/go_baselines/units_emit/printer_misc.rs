@@ -118,7 +118,6 @@ fn test_is_recognized_triple_slash_comment() {
 
 // Go: printer/printer_test.go:2433 TestNameGeneration
 #[test]
-#[ignore = "bug: S3-001 temp name check on a factory SourceFile needs a current program"]
 fn test_name_generation() {
     let ec = new_emit_context();
     let f = ec.factory();
