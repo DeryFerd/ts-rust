@@ -1427,6 +1427,22 @@
       "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
       "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
       "extendedUtc": "2026-09-27T05:21:05.147522+00:00"
+    },
+    {
+      "id": "pin-bump-batch",
+      "batchId": "standing:pin-bump",
+      "approvedBy": "Theo",
+      "date": "2026-09-27T13:49:34.185584+00:00",
+      "instruction": "Theo chose \"Approve bumps, start now (Recommended)\": approve a standing pin-bump batch rule; start bump A (pin to the v7.0.2 content) in the lanes perf9 does not own, and take the checker, binder and frontend lanes after perf9 frees them.",
+      "scope": "Batches that move the Go pin from O to N. At N, pinned Go evidence means evidence re-recorded against an oracle built from N, in new pin-keyed directories; old oracles and evidence stay. Protected cargo roster: no lost name. Rust expectations pinning old Go behavior change only with Go-at-N evidence, an old-to-new name mapping and independent review.",
+      "plan": "target/continuation-r97-goport/upstream/drift.md",
+      "upstream": {
+        "repo": "microsoft/TypeScript",
+        "subdir": "tsc",
+        "oldPin": "dc37b5249 (typescript-go) = 4d44e1c49 (TypeScript)",
+        "firstTarget": "v7.0.2 content (main a5a219c3b; typescript-go 52168999f)"
+      },
+      "reason": "typescript-go is archived and TypeScript 7 ships from microsoft/TypeScript tsc/. A drop-in replacement must follow upstream; the pin bump changes what pinned Go evidence means, so it is an acceptance-rule change."
     }
   ]
 }
