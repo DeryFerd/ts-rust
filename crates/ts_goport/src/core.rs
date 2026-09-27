@@ -222,6 +222,23 @@ impl Name {
     fn table_hash(&self) -> u32 {
         intern::table_hash(self.0)
     }
+
+    /// The id of this name when every process of this build gives the text
+    /// the same id: "", "default" and the bundled lib names (`lib_names`).
+    /// `None` for other names, whose ids depend on intern order. The lib
+    /// bind snapshot (`binder/lib_snapshot.rs`) stores these names by id.
+    #[inline]
+    #[must_use]
+    pub fn stable_id(&self) -> Option<u32> {
+        intern::is_stable(self.0).then_some(self.0)
+    }
+
+    /// The name of stable id `id` (`stable_id`), ready for table lookups as
+    /// if `Name::from` had made it. `None` when `id` is not a stable id.
+    #[must_use]
+    pub fn from_stable_id(id: u32) -> Option<Name> {
+        intern::stable(id)
+    }
 }
 
 // PORT: not `Copy`, so existing `.clone()` calls stay clean for clippy.
@@ -654,6 +671,36 @@ mod intern {
             .expect("unknown name id")
     }
 
+    /// The lib name index of name id `id`, or `None` when `id` is not a lib
+    /// name id.
+    #[inline]
+    fn lib_index(id: u32) -> Option<usize> {
+        let lib = (id >> 1).wrapping_sub(LIB_FIRST_SEQ) as usize;
+        (id & INTERNAL_BIT == 0 && lib < lib_names::COUNT).then_some(lib)
+    }
+
+    /// True for the ids that do not depend on intern order: 0 (""),
+    /// `DEFAULT_ID` and the lib name ids (see `Name::stable_id`).
+    #[inline]
+    pub(super) fn is_stable(id: u32) -> bool {
+        id == 0 || id == DEFAULT_ID || lib_index(id).is_some()
+    }
+
+    /// The name of stable id `id`, as `intern` of its text gives it: a lib
+    /// name gets its table hash recorded (`lib_name`), and "default" goes
+    /// through the shards, which intern it first.
+    pub(super) fn stable(id: u32) -> Option<Name> {
+        if id == 0 {
+            return Some(Name(0));
+        }
+        if id == DEFAULT_ID {
+            return Some(intern(crate::ast::INTERNAL_SYMBOL_NAME_DEFAULT));
+        }
+        let lib = lib_index(id)?;
+        set_hash(id, hash_str(lib_text(lib)));
+        Some(Name(id))
+    }
+
     /// The table hash of the text of name id `id`.
     #[inline]
     pub(super) fn table_hash(id: u32) -> u32 {
@@ -792,6 +839,21 @@ mod intern {
             assert!((other.0 >> 1) >= LIB_FIRST_SEQ + lib_names::COUNT as u32);
             assert_eq!(other.as_str(), "notALibName_u5");
             assert!(Name::from("default").is_default_symbol_name());
+        }
+
+        /// "", "default" and the lib names have stable ids, and a name made
+        /// from a stable id equals the interned name.
+        #[test]
+        fn stable_ids() {
+            for text in ["", "default", "addEventListener"] {
+                let name = Name::from(text);
+                let id = name.stable_id().expect(text);
+                let loaded = Name::from_stable_id(id).expect(text);
+                assert_eq!(loaded, name);
+                assert_eq!(loaded.table_hash(), super::super::table_hash(text));
+            }
+            assert_eq!(Name::from("notALibName_u6").stable_id(), None);
+            assert!(Name::from_stable_id(u32::MAX).is_none());
         }
     }
 }
@@ -1600,6 +1662,62 @@ impl SymbolArena {
         self.symbols.len()
     }
 
+    // The dump and load API of the lib bind snapshot
+    // (`binder/lib_snapshot.rs`). A dump reads symbols `1..symbol_count()`
+    // (`sym`), tables `1..table_count()` (`iter_names`) and
+    // `private_names`. A load pushes them in the same order into a new
+    // arena (`is_new`): `push_symbol`, `push_table_from_entries` and
+    // `note_private_name`. Ids are indexes, so they equal the dumped ones.
+
+    /// True for an arena as `SymbolArena::new` makes it: only the nil
+    /// symbol and table, and no private names.
+    #[must_use]
+    pub fn is_new(&self) -> bool {
+        self.symbols.len() == 1 && self.tables.len() == 1 && self.private_names.is_empty()
+    }
+
+    /// The number of tables, with the nil table at index 0.
+    #[must_use]
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// The names given to `note_private_name`, in order.
+    pub fn private_names(&self) -> impl Iterator<Item = Name> + '_ {
+        self.private_names.iter().map(|&id| Name(id))
+    }
+
+    /// Pushes a new table that holds `entries` in this order and returns
+    /// it: Go `make(ast.SymbolTable)` plus `table[name] = symbol` for each
+    /// entry. The names must all differ, as in any table (`Table::insert`
+    /// keeps one entry per name). The entries and the index are built once.
+    pub fn push_table_from_entries(
+        &mut self,
+        entries: impl ExactSizeIterator<Item = (Name, SymbolId)>,
+    ) -> SymbolTable {
+        let mut table = Table {
+            entries: Vec::with_capacity(entries.len()),
+            index: Box::default(),
+        };
+        table
+            .entries
+            .extend(entries.map(|(name, symbol)| TableEntry {
+                hash: name.table_hash(),
+                name: name.0,
+                symbol,
+            }));
+        table.reindex();
+        debug_assert!(
+            table
+                .entries
+                .iter()
+                .enumerate()
+                .all(|(position, e)| table.find_id(e.hash, e.name) == Some(position)),
+            "table entries with the same name"
+        );
+        self.push_table(table)
+    }
+
     /// Notes that the binder gave `name` to a private identifier symbol
     /// (`get_symbol_name_for_private_identifier`), so the name holds a
     /// symbol id.
@@ -2206,6 +2324,43 @@ impl FileNodeBind {
     /// stays non-empty and distinct under an id remap.
     pub fn entries_mut(&mut self) -> &mut [NodeBindData] {
         &mut self.entries
+    }
+
+    /// The stored form: the per-node slots, the block bases and the
+    /// entries. The lib bind snapshot (`binder/lib_snapshot.rs`) dumps it.
+    #[must_use]
+    pub fn parts(&self) -> (&[u8], &[u32], &[NodeBindData]) {
+        (&self.slots, &self.bases, &self.entries)
+    }
+
+    /// The value whose `parts` these are. `None` when they do not fit
+    /// together: a base count that does not match the slots, or a base or
+    /// slot that points past the entries of its block.
+    #[must_use]
+    pub fn from_parts(slots: Vec<u8>, bases: Vec<u32>, entries: Vec<NodeBindData>) -> Option<Self> {
+        if bases.len() != slots.len().div_ceil(NODE_BIND_BLOCK) {
+            return None;
+        }
+        for (block, block_slots) in slots.chunks(NODE_BIND_BLOCK).enumerate() {
+            // `new` gives a block the entries from its base to the next base.
+            let start = bases[block] as usize;
+            let end = bases
+                .get(block + 1)
+                .map_or(entries.len(), |&next| next as usize);
+            let count = end.checked_sub(start)?;
+            if end > entries.len()
+                || block_slots
+                    .iter()
+                    .any(|&slot| slot != NO_NODE_BIND && usize::from(slot) >= count)
+            {
+                return None;
+            }
+        }
+        Some(FileNodeBind {
+            slots,
+            bases,
+            entries,
+        })
     }
 
     /// The data of node `index` (`NodeId::index()`).

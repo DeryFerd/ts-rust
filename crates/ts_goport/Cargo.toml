@@ -35,9 +35,10 @@ name-to-handle-at = "=0.1.0"
 tikv-jemallocator = { version = "=0.7.0", optional = true }
 
 [features]
-# Opt-in: jemalloc as the global allocator of the goport binaries. It is
-# faster than glibc malloc but costs query peak RSS (see bin/goport.rs
-# `set_malloc_tunables`).
+default = ["jemalloc"]
+# jemalloc as the global allocator of the goport binaries (default; the
+# shipped build). `--no-default-features` gives glibc malloc with its
+# tunables. See bin/goport.rs `set_malloc_tunables`.
 jemalloc = ["dep:tikv-jemallocator"]
 
 [lints]

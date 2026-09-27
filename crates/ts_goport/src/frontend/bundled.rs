@@ -63,6 +63,15 @@ pub fn is_bundled(path: &str) -> bool {
     split_path(path).is_some()
 }
 
+/// The base name of bundled lib path `path` (`bundled:///libs/lib.dom.d.ts`
+/// gives `lib.dom.d.ts`). `None` for any other path. The lib bind snapshot
+/// (`binder/lib_snapshot.rs`) finds a lib file by this name.
+// PORT: not in Go.
+#[must_use]
+pub fn bundled_lib_name(path: &str) -> Option<&str> {
+    split_path(path)?.strip_prefix("libs/")
+}
+
 // wrappedFS is implemented directly rather than going through [io/fs.FS].
 // Our vfs.FS works with file contents in terms of strings, and that's
 // what go:embed does under the hood, but going through fs.FS will cause

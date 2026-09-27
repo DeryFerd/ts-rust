@@ -344,16 +344,26 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Value<V> for SyncMapEntry<K, V>
 
 // Go: project/dirty/syncmap.go:192 SyncMap
 // PORT: Go `dirty collections.SyncMap` is a `RefCell<IndexMap>` (insertion
-// order; PORT: Go map order is random). `base` is never written. `this` is
-// the Go pointer that new entries point back to.
+// order; PORT: Go map order is random). `base` is never written. It is an
+// `Rc` because a Go map is a reference: the base map is shared with the
+// value it came from, and `finalize_shared` gives it back unchanged. `this`
+// is the Go pointer that new entries point back to.
 pub struct SyncMap<K, V> {
-    pub base: FxHashMap<K, V>,
+    pub base: Rc<FxHashMap<K, V>>,
     pub dirty: RefCell<IndexMap<K, Rc<SyncMapEntry<K, V>>>>,
     this: Weak<SyncMap<K, V>>,
 }
 
 // Go: project/dirty/syncmap.go:197 NewSyncMap
+// PORT: takes an owned base map. `new_sync_map_shared` takes a shared one.
 pub fn new_sync_map<K, V>(base: FxHashMap<K, V>) -> Rc<SyncMap<K, V>> {
+    new_sync_map_shared(Rc::new(base))
+}
+
+// Go: project/dirty/syncmap.go:197 NewSyncMap
+// PORT: Go keeps the caller's map without a copy. This form does the same
+// with a shared `Rc` map.
+pub fn new_sync_map_shared<K, V>(base: Rc<FxHashMap<K, V>>) -> Rc<SyncMap<K, V>> {
     Rc::new_cyclic(|this| SyncMap {
         base,
         dirty: RefCell::new(IndexMap::new()),
@@ -488,7 +498,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
                 break;
             }
         }
-        for (key, value) in &self.base {
+        for (key, value) in self.base.iter() {
             if seen_in_dirty.contains(key) {
                 continue; // already processed in dirty entries
             }
@@ -509,9 +519,22 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
     }
 
     // Go: project/dirty/syncmap.go:315 finalize
-    // PORT: Go returns the shared base map when nothing changed; the port
-    // returns a copy. No borrow is held while a hook runs.
-    pub fn finalize(&self, mut hooks: FinalizationHooks<'_, K, V>) -> (FxHashMap<K, V>, bool) {
+    // PORT: returns an owned map for callers that keep a plain `FxHashMap`.
+    // When nothing changed, that is a copy of the base map.
+    // `finalize_shared` returns the base map itself, as Go does.
+    pub fn finalize(&self, hooks: FinalizationHooks<'_, K, V>) -> (FxHashMap<K, V>, bool) {
+        let (result, changed) = self.finalize_shared(hooks);
+        (Rc::unwrap_or_clone(result), changed)
+    }
+
+    // Go: project/dirty/syncmap.go:315 finalize
+    // PORT: when nothing changed, the result is the base map (an `Rc` clone),
+    // as in Go. When an entry changed, it is a new map. No borrow is held
+    // while a hook runs.
+    pub fn finalize_shared(
+        &self,
+        mut hooks: FinalizationHooks<'_, K, V>,
+    ) -> (Rc<FxHashMap<K, V>>, bool) {
         let mut changed = false;
         let mut result: Option<FxHashMap<K, V>> = None;
 
@@ -530,7 +553,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
             if delete {
                 // Go: ensureCloned()
                 if !changed {
-                    result = Some(self.base.clone());
+                    result = Some((*self.base).clone());
                     changed = true;
                 }
                 if let Some(on_delete) = hooks.on_delete.as_mut() {
@@ -540,7 +563,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
             } else if dirty {
                 // Go: ensureCloned()
                 if !changed {
-                    result = Some(self.base.clone());
+                    result = Some((*self.base).clone());
                     changed = true;
                 }
                 if hooks.on_change.is_some() || hooks.on_add.is_some() {
@@ -560,7 +583,10 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
                 );
             }
         }
-        (result.unwrap_or_else(|| self.base.clone()), changed)
+        match result {
+            Some(result) => (Rc::new(result), changed),
+            None => (self.base.clone(), changed), // no changes, return base map
+        }
     }
 
     // Go: project/dirty/syncmap.go:356 Finalize

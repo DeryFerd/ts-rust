@@ -33,8 +33,12 @@
 //!    `dirty::new_box` takes `Option<T>`. `change(&mut |v: &T| ..)` gives the
 //!    handle to `apply`, which mutates through `v.borrow_mut()` exactly as
 //!    Go mutates through the pointer. Base maps are `FxHashMap<K, V>` (the
-//!    PORTING default for a Go map); `finalize` returns an owned map (Go
-//!    shares the base map when nothing changed; the port returns a copy).
+//!    PORTING default for a Go map). `Map` and `SyncMap` keep the base map
+//!    in an `Rc`, because Go shares it: `new_map_shared` /
+//!    `new_sync_map_shared` take it without a copy, and `finalize_shared`
+//!    returns it unchanged when nothing changed, as Go does. `new_map` /
+//!    `new_sync_map` take an owned map, and `finalize`, `finalize_exported`
+//!    and `finalize_with` return an owned map (a copy when nothing changed).
 //!    Constructors return `Rc` (Go returns pointers): `dirty::new_map`,
 //!    `dirty::new_sync_map`, `dirty::new_box`, `dirty::new_map_builder`.
 //!    Entries are `Rc<dirty::MapEntry<K, V>>` / `Rc<dirty::SyncMapEntry<K,

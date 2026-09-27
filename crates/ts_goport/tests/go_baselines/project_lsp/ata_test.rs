@@ -95,7 +95,6 @@ const PACKAGE_JSON_JQUERY: &str = r#"{
 
 child_test! {
     // Go: ata_test.go:58 TestATA/configured projects
-    #[ignore = "bug: S4-001 WaitForBackgroundTasks returns before the debounced RefreshDiagnostics after ATA runs"]
     fn configured_projects() {
         let files = files(&[
             (APP, ""),
@@ -616,7 +615,6 @@ child_test! {
 
 child_test! {
     // Go: ata_test.go:722 TestATA/ATA re-enabled after being disabled triggers diagnostics refresh
-    #[ignore = "bug: S4-001 WaitForBackgroundTasks returns before the debounced RefreshDiagnostics runs"]
     fn ata_re_enabled_after_being_disabled_triggers_diagnostics_refresh() {
         let files = files(&[(APP, ""), ("/user/username/projects/project/package.json", PACKAGE_JSON_JQUERY)]);
         let (session, utils) = projecttestutil::setup_with_typings_installer(

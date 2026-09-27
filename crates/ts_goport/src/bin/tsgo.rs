@@ -50,15 +50,26 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// large projects.
 const STACK_SIZE: usize = 1 << 30;
 
-/// The opt-in `jemalloc` feature makes jemalloc the global allocator
-/// (see `goport.rs` `set_malloc_tunables`).
+/// jemalloc is the global allocator (default feature `jemalloc`). A build
+/// without the feature uses glibc malloc. See `goport.rs`
+/// `set_malloc_tunables`.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Same as `goport.rs` `JEMALLOC_CONF`. `scripts/build-release.sh` reads it
+/// from this line for its BOLT runs.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
-    set_malloc_tunables();
+    // One budget sets the parse and bind threads and the malloc arenas.
+    // tsgo has one more thread with an arena than goport: the
+    // `notify_context` signal thread.
+    let budget = ThreadBudget::one_program(1);
+    set_malloc_tunables(&budget);
+    budget.install();
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
@@ -77,22 +88,22 @@ fn main() {
 }
 
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
-/// values. `arena_max` is 7 here because tsgo has one more thread alive
-/// while the checkers run (the `notify_context` signal thread). At 6, two
-/// checkers share one arena lock (zod: 3.9k voluntary context switches, 0.5k
-/// at 7). Build workers inherit the variable, so they do not exec again.
-fn set_malloc_tunables() {
+/// values. jemalloc gets `JEMALLOC_CONF`. With glibc malloc, `arena_max`
+/// comes from `budget` (`ThreadBudget::one_program`): with the signal thread
+/// it is 7 here, and 10 at 8 or more cores (3 spare arenas for the parse
+/// workers that a large program adds). At 6, two checkers share one arena
+/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). Build workers
+/// inherit the variable, so they do not exec again.
+fn set_malloc_tunables(budget: &ThreadBudget) {
+    // Unused off Linux and with jemalloc.
+    let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
         #[cfg(not(feature = "jemalloc"))]
-        const TUNABLES: (&str, &str) = (
-            "GLIBC_TUNABLES",
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=7:glibc.malloc.top_pad=67108864",
-        );
+        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]
-        const TUNABLES: (&str, &str) = ("_RJEM_MALLOC_CONF", "narenas:4");
-        let (name, value) = TUNABLES;
+        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
         if std::env::var_os(name).is_some() {
             return;
         }

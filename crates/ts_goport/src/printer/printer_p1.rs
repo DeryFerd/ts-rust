@@ -72,10 +72,13 @@ pub(crate) fn source_file_is_declaration_file(file: Node) -> bool {
     source_file_info(file).is_declaration_file
 }
 
-/// The parsed SourceFile whose Go `Identifiers` a SourceFile has.
-// PORT: Go `UpdateSourceFile` copies `Identifiers` from the original file.
-// `is_file_level_unique_name` collects them from the tree it gets, so a
-// transformed (factory) SourceFile maps to its most original file here.
+/// The SourceFile whose Go `Identifiers` a SourceFile has.
+// PORT: Go `UpdateSourceFile` and `Clone` copy `Identifiers` from the old
+// file (`copyFrom`). The Rust factory SourceFile does not keep them, so a
+// copy maps to its most original file through the emit context (the
+// `onUpdate` and `onClone` hooks set the original). A file made by
+// `NewSourceFile` has no original and maps to itself, and
+// `is_file_level_unique_name` gives it no identifiers, as Go nil.
 pub(crate) fn identifiers_source_file(emit_context: &EmitContext, file: Node) -> Node {
     if is_synthetic_node(file) {
         return emit_context.most_original(file);

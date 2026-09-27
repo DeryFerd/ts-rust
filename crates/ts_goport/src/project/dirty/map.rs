@@ -159,16 +159,26 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Value<V> for MapEntry<K, V> {
 
 // Go: project/dirty/map.go:52 Map
 // PORT: Go `*Map` is shared and mutated, so the maps use `RefCell`. `dirty`
-// keeps insertion order (PORT: Go map order is random). `this` is the Go
-// pointer that new entries point back to.
+// keeps insertion order (PORT: Go map order is random). The base map is an
+// `Rc` because a Go map is a reference: it is shared with the value it came
+// from, and `finalize_shared` gives it back unchanged. Only `clear`
+// replaces it. `this` is the Go pointer that new entries point back to.
 pub struct Map<K, V> {
-    pub base: RefCell<FxHashMap<K, V>>,
+    pub base: RefCell<Rc<FxHashMap<K, V>>>,
     pub dirty: RefCell<IndexMap<K, Rc<MapEntry<K, V>>>>,
     this: Weak<Map<K, V>>,
 }
 
 // Go: project/dirty/map.go:57 NewMap
+// PORT: takes an owned base map. `new_map_shared` takes a shared one.
 pub fn new_map<K, V>(base: FxHashMap<K, V>) -> Rc<Map<K, V>> {
+    new_map_shared(Rc::new(base))
+}
+
+// Go: project/dirty/map.go:57 NewMap
+// PORT: Go keeps the caller's map without a copy. This form does the same
+// with a shared `Rc` map.
+pub fn new_map_shared<K, V>(base: Rc<FxHashMap<K, V>>) -> Rc<Map<K, V>> {
     Rc::new_cyclic(|this| Map {
         base: RefCell::new(base),
         dirty: RefCell::new(IndexMap::new()),
@@ -251,7 +261,9 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
     }
 
     // Go: project/dirty/map.go:124 Range
-    // PORT: the entries are copied out first so `fn_` can change the map.
+    // PORT: the dirty entries are copied out first so `fn_` can change the
+    // map. The base loop holds its own `Rc` of the base map, as Go ranges
+    // over the map value it read (a `clear` in `fn_` does not change it).
     // Go keeps going with the base map after `fn_` stops the dirty loop;
     // the port does the same.
     pub fn range(&self, fn_: &mut dyn FnMut(&Rc<MapEntry<K, V>>) -> bool) {
@@ -264,22 +276,17 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
                 break;
             }
         }
-        let base: Vec<(K, V)> = self
-            .base
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (key, value) in base {
-            if seen_in_dirty.contains(&key) {
+        let base: Rc<FxHashMap<K, V>> = self.base.borrow().clone();
+        for (key, value) in base.iter() {
+            if seen_in_dirty.contains(key) {
                 continue; // already processed in dirty entries
             }
             let entry = new_map_entry(
                 &self.this,
                 MapEntryImpl {
-                    key,
+                    key: key.clone(),
                     original: Some(value.clone()),
-                    value: Some(value),
+                    value: Some(value.clone()),
                     dirty: false,
                     delete: false,
                 },
@@ -293,18 +300,27 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
     // Go: project/dirty/map.go:147 Clear
     pub fn clear(&self) {
         *self.dirty.borrow_mut() = IndexMap::new();
-        *self.base.borrow_mut() = FxHashMap::default();
+        *self.base.borrow_mut() = Rc::new(FxHashMap::default());
     }
 
     // Go: project/dirty/map.go:152 Finalize
-    // PORT: Go returns the shared base map when nothing changed; the port
-    // returns a copy.
+    // PORT: returns an owned map for callers that keep a plain `FxHashMap`.
+    // When nothing changed, that is a copy of the base map.
+    // `finalize_shared` returns the base map itself, as Go does.
     pub fn finalize(&self) -> (FxHashMap<K, V>, bool) {
+        let (result, changed) = self.finalize_shared();
+        (Rc::unwrap_or_clone(result), changed)
+    }
+
+    // Go: project/dirty/map.go:152 Finalize
+    // PORT: when nothing changed, the result is the base map (an `Rc` clone),
+    // as in Go. Otherwise it is a new map.
+    pub fn finalize_shared(&self) -> (Rc<FxHashMap<K, V>>, bool) {
         if self.dirty.borrow().is_empty() {
             return (self.base.borrow().clone(), false); // no changes, return base map
         }
         // Go: a nil base map gives make(map[K]V, len(m.dirty)); else maps.Clone.
-        let mut result = self.base.borrow().clone();
+        let mut result: FxHashMap<K, V> = (**self.base.borrow()).clone();
         let dirty: Vec<(K, Rc<MapEntry<K, V>>)> = self
             .dirty
             .borrow()
@@ -326,6 +342,6 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
                 );
             }
         }
-        (result, true)
+        (Rc::new(result), true)
     }
 }

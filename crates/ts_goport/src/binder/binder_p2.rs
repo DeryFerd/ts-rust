@@ -1421,7 +1421,26 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1744 bindEachChild
+    // PERF: R2-5. A tier 0 store node walks its child links
+    // (`frozen_store_children`): the same children in the same order as
+    // `for_each_child`, from the first child and next sibling of each slot,
+    // so a node that the binder only passes through (type references,
+    // unions) never loads its data.
+    // Debug builds compare the walk with `for_each_child`.
     pub fn bind_each_child(&mut self, node: Node) {
+        if let Some(children) = frozen_store_children(node) {
+            debug_assert!(
+                children.eq(node.iter_children()),
+                "R2-5 child links differ from for_each_child"
+            );
+            for child in children {
+                // Go `ForEachChild` stops when the visitor returns true.
+                if self.bind(child) {
+                    break;
+                }
+            }
+            return;
+        }
         // PORT: Go passes the cached `b.bindFunc` closure; a fresh closure is equivalent.
         node.for_each_child(&mut |child: Node| self.bind(child));
     }

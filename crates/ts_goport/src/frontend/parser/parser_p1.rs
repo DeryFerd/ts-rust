@@ -263,7 +263,13 @@ pub fn parse_source_file(
     p.initialize_state(opts, source_text, script_kind);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     p.store = new_file_store(file_name, source_text);
-    let result = p.parse_into_store();
+    // PERF: R3-1. A large bundled lib whose snapshot key matches is loaded
+    // into the new store from `lib_parse.bin` (`lib_parse_snapshot.rs`),
+    // with the same store and result as a parse.
+    let result = match super::lib_parse_snapshot::load(p.store, opts, source_text, script_kind) {
+        Some(loaded) => loaded.file,
+        None => p.parse_into_store(),
+    };
     set_source_file_diagnostics(result.root, result.diagnostics.clone());
     result
 }
@@ -303,6 +309,16 @@ pub fn parse_source_file_detached(
     let _ = take_detached_file_store();
     p.store = new_detached_file_store(job, file_name, source_text);
     reset_module_indicator_options_read();
+    // PERF: R3-1, as in `parse_source_file`. A snapshot parse did not read
+    // the module indicator options.
+    if let Some(loaded) = super::lib_parse_snapshot::load(p.store, opts, source_text, script_kind) {
+        return DetachedParse {
+            file: loaded.file,
+            store: take_detached_file_store().expect("the detached store of the parse"),
+            read_module_indicator_options: false,
+            import_specifiers: loaded.import_specifiers,
+        };
+    }
     let file = p.parse_into_store();
     let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
     DetachedParse {
