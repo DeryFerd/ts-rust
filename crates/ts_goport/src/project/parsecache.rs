@@ -75,12 +75,18 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             let opts = key.source_file_parse_options();
             let content = fh.content();
             // PORT: during a program load a parse worker (`FilesParser`
-            // prefetch) may have parsed this text already, as in
-            // compiler/host.rs. It is used only when it equals the parse
-            // below.
-            let file = match compiler::take_prefetched_parse(&opts, &content, key.script_kind) {
-                Some(file) => file,
-                None => {
+            // prefetch) may have read and parsed this text already, as in
+            // compiler/host.rs. A worker result is used only for the same
+            // text, and its parse only when it equals the parse below.
+            let prefetched =
+                compiler::take_prefetched(&opts, key.script_kind, Some(content.as_str()));
+            let file = match prefetched {
+                compiler::Prefetched::Parse(file) => file,
+                // The worker text has the same bytes and is already leaked.
+                compiler::Prefetched::Text(text) => {
+                    parser::parse_source_file(&opts, text, key.script_kind)
+                }
+                compiler::Prefetched::Nothing => {
                     // PORT: the parser takes `&'static str` (node data points
                     // into the text), so the text is leaked, as in
                     // compiler/host.rs.
