@@ -204,7 +204,7 @@ pub(super) fn try_load_with(
     }
     // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
     // `install_new_program`, which also builds the Go files, as the build
-    // worker times it.
+    // task times `new_program` and `new_program_version`.
     let parse_start = std::time::Instant::now();
     let program = install_new_program(opts);
     times.parse_time = parse_start.elapsed();
@@ -585,6 +585,16 @@ fn build_program(
     });
     // The stores become read-only here, before the program is installed.
     publish_file_stores(files);
+    // A program file must be published as a source file. A parse that an
+    // earlier publish did not know (see `note_parsed_source_file`) became a
+    // store with no root there, and its bind would fail far from the cause.
+    for &store in &source_file_order {
+        assert!(
+            crate::ast::go_file(store).root.is_some(),
+            "program file {} was published as a store that is not a source file",
+            parsed[&store].file_name()
+        );
+    }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
         program: None,

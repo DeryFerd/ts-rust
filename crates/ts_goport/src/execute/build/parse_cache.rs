@@ -52,6 +52,16 @@ impl<K: Clone + Eq + Hash, V: Clone> ParseCache<K, V> {
         value
     }
 
+    /// Calls `f` with each key that has a stored value.
+    // PORT: not in Go (see `CompilerHost::cached_source_file_names`).
+    pub fn for_each_stored(&self, mut f: impl FnMut(&K)) {
+        for (key, value) in self.entries.borrow().iter() {
+            if value.is_some() {
+                f(key);
+            }
+        }
+    }
+
     // Go: build/parseCache.go:34 (*parseCache).store
     pub fn store(&self, key: K, value: Option<V>) {
         self.entries.borrow_mut().insert(key, value);

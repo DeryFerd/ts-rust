@@ -5791,10 +5791,11 @@ impl Parser {
         loop {
             let span = self.parse_template_type_span();
             list.push(span);
-            let D::TemplateLiteralTypeSpan(d) = ast_data_of(span) else {
-                unreachable!()
-            };
-            if resolve_synthetic_id(d.literal).kind() != SyntaxKind::TemplateMiddle {
+            let literal = with_ast_data(span, |d| match d {
+                D::TemplateLiteralTypeSpan(d) => d.literal,
+                _ => unreachable!(),
+            });
+            if resolve_synthetic_id(literal).kind() != SyntaxKind::TemplateMiddle {
                 break;
             }
         }
@@ -6805,10 +6806,11 @@ impl Parser {
         loop {
             let span = self.parse_template_span(is_tagged_template);
             list.push(span);
-            let D::TemplateSpan(d) = ast_data_of(span) else {
-                unreachable!()
-            };
-            if resolve_synthetic_id(d.literal).kind() != SyntaxKind::TemplateMiddle {
+            let literal = with_ast_data(span, |d| match d {
+                D::TemplateSpan(d) => d.literal,
+                _ => unreachable!(),
+            });
+            if resolve_synthetic_id(literal).kind() != SyntaxKind::TemplateMiddle {
                 break;
             }
         }

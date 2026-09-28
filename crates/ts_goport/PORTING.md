@@ -192,16 +192,31 @@ methods reach the AST through it.
   `to_vec()`; empty when nil). `NodeList` has `.nodes() -> NodeSlice`,
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
-- `NodeList`, `ModifierList` and `NodeSlice` are Copy structs defined in
-  `ast/node.rs` (for example `{ file: u32, list: Option<&'static ts_ast::NodeList> }`).
+- `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
+  `ast/node.rs`. A list of parsed data points at its ts_ast list (it lives
+  for the process). A list of synthetic data is an index into the thread's
+  synthetic arena (`SyntheticList`), so it is valid only on the thread
+  that made it, like a synthetic `Node`. Equality is Go pointer equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
-- New code reads node data through `by_data!`, `data_accessor!` or the
-  binder `_in` pair. Do not add `ast_data_of` call sites: the multiprog D3
-  to D5 port removes `ast_data_of`.
-- New store columns are read through one file lookup helper, not
-  `FROZEN.get()` directly, so the multiprog port can make that lookup
-  tier 1 aware in one place.
+- Node data reads are scoped, because a thread owns its synthetic nodes
+  and frees them when its program is released (`ast/synthetic.rs`). Read
+  a field with `by_data!`, `with_data!` or `with_ast_data(n, |d| ...)`,
+  and a list field with `list_of!` or `modifiers_of!` (`list_by_data!` in
+  `node.rs`). Nothing returns a reference into node data. Only parsed data
+  is `&'static` (`static_ast_node`): the binder, which binds parsed nodes
+  only, loads it once with `parsed_node_data` for the `_in` reads
+  (`data_accessor!`). `Node::bind()` returns the binder data by value, and
+  the text of a synthetic node is interned (`Name`).
+- Store columns and the other registry tables of a published file are read
+  through one file lookup (`frozen_of` in `ast/store.rs`), not
+  `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
+  inline, tier 1 (every later publish), so the nodes of a later program
+  (`tsc -b`, an edited file) read the same columns as the nodes of the
+  first program. The tier 1 part is a cold block, so it adds no code to
+  the hot path of a one-program process; keep new tier 1 work after
+  `later_publish_path()`. A new column gets a `Frozen` table and a reader
+  that calls `frozen_of` with that table.
 
 ## Program (owned by program.rs)
 
@@ -218,7 +233,30 @@ The batch that adds it is not accepted until Theo approves.
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
 - `program::release_program` frees the checker pool and the frontend of a
-  version. The program shell and the file versions stay leaked for now.
+  version. Each checker worker frees its checker and the synthetic nodes
+  it made (`free_synthetic_nodes`). The program shell and the file
+  versions stay leaked for now. A one-program process forgets its
+  checkers and their synthetic nodes at the end, like Go.
+- A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
+  like Go: each project's program is a version made with `new_program` and
+  `program::new_program_version`, and it is released when its task
+  reports. The build host shares its parsed `.d.ts` and `.json` files
+  between the programs, and the parse workers of a later program do not
+  parse them again (`CompilerHost::cached_source_file_names`, not in Go).
+  A file that one program parsed and left out (a deduplicated package)
+  can be a program file of a later one, so the build
+  host notes each parse that it keeps (`program::note_parsed_source_file`)
+  and a publish gives it its complete `GoFile`. The publish asserts that
+  every program file is a source file. The programs are made on one
+  thread, but each program's check starts on its own checker pool when
+  the program is made (`incremental::Program::start_check`), and a
+  released pool frees its checkers in the background
+  (`program::release_program_in_background`). So the pools of up to 4
+  started projects work at the same time, like Go's goroutines. The
+  started projects still emit one at a time in build order, and a
+  project's emit runs on its own checker threads only: the emit resolver
+  needs the file's checker, which lives on its worker thread, and
+  synthetic nodes are thread-local (`ast/synthetic.rs`).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -237,29 +275,27 @@ execute/tsc/emit.go:65): 0 success, 1 diagnostics with emit skipped, 2
 diagnostics with emit not skipped. Under
 noEmit, a program with no emittable file (no inputs, or only `.d.ts`
 files) exits 2. `goport_build` returns the Go build status, which can also
-be 3 or 4. Unported code, any other panic, a worker-thread failure and a
-failed build worker exit `execute::tsc::EXIT_UNPORTED` (70,
-`EX_SOFTWARE`). Go uses 0 to 5 (3 in cmd/tsgo/sys.go:66, 4 in build mode,
-5 NotImplemented), so a harness must treat a goport exit of 70 as a crash,
-never as a tsgo status.
+be 3 or 4. Unported code, any other panic and a worker-thread failure
+exit `execute::tsc::EXIT_UNPORTED` (70, `EX_SOFTWARE`). Go uses 0 to 5 (3
+in cmd/tsgo/sys.go:66, 4 in build mode, 5 NotImplemented), so a harness
+must treat a goport exit of 70 as a crash, never as a tsgo status.
 
 A site where the pinned Go panics on the same input uses
 `core::go_panic(message)`, not `panic!`. It is not a port gap: the guards
 that keep a run going pass it on (`core::resume_go_panic`), and the bins
 end the run as the Go runtime does. The output written so far stays,
 stderr gets `panic: <message>` (then the port site in place of the
-goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`). A build
-worker exits 2 with no result line, and the orchestrator then exits 2 too.
+goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 
 ## Threads
 
 - `prog()` is the current program of the thread. A one-program process
   calls `core::set_prog` once, and every thread with no current program
   reads that program. `WorkerSeed` sets it on checker and bind threads. A
-  multi-program process (watch, language server, tests) registers each
-  version with `core::register_program_version` and makes one current for
-  a scope with `core::enter_program`. There, `prog()` panics on a thread
-  with no current program.
+  multi-program process (watch, `tsc -b`, language server, tests)
+  registers each version with `core::register_program_version` and makes
+  one current for a scope with `core::enter_program`. There, `prog()`
+  panics on a thread with no current program.
 - Programs and the program state are read only after load, so they hold
   only thread-safe data (`Arc`, `OnceLock`, `Mutex`).
 - Files bind in parallel, each into its own arena, and join the binder

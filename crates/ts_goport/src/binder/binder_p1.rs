@@ -574,7 +574,7 @@ impl Binder {
         // PERF: query Q7-3. The node data is looked up once here, and the
         // field reads below (modifiers, name) use it. The reads and their
         // order are the same as Go's.
-        let data = ast_data_of(node);
+        let data = parsed_node_data(node);
         debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
         let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
             || is_export_specifier(node) && module_export_name_is_default(node.name_in(data));
@@ -782,11 +782,11 @@ impl Binder {
     // and allocates nothing for an identifier name. `&mut self` only to note
     // a private identifier name in the arena (`note_private_name`).
     pub fn get_declaration_name(&mut self, node: Node) -> Name {
-        self.get_declaration_name_in(node, ast_data_of(node))
+        self.get_declaration_name_in(node, parsed_node_data(node))
     }
 
     /// `get_declaration_name` on `d`, the data of `node` that the caller
-    /// already loaded with `ast_data_of` (query Q7-3). It holds the body.
+    /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
     pub fn get_declaration_name_in(&mut self, node: Node, d: &'static NodeData) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
@@ -1406,7 +1406,7 @@ impl Binder {
         // (like TypeLiterals for example) will not be put in any table.
         // PORT: the kind is read once. The binder never changes a node's kind.
         // PERF: query Q7-3. The property, method and accessor arms load the
-        // node data once (`ast_data_of`) and pass it on, so their field reads
+        // node data once (`parsed_node_data`) and pass it on, so their field reads
         // (`postfix_token`, `modifiers`, `name`) skip the node lookup.
         let kind = node.kind();
         match kind {
@@ -1489,12 +1489,12 @@ impl Binder {
                 self.bind_variable_declaration_or_binding_element(node);
             }
             SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
-                self.bind_property_worker(node, ast_data_of(node));
+                self.bind_property_worker(node, parsed_node_data(node));
             }
             SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::PROPERTY,
                     SymbolFlags::PROPERTY_EXCLUDES,
                 );
@@ -1502,7 +1502,7 @@ impl Binder {
             SyntaxKind::EnumMember => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::ENUM_MEMBER,
                     SymbolFlags::ENUM_MEMBER_EXCLUDES,
                 );
@@ -1517,7 +1517,7 @@ impl Binder {
                 );
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
-                let d = ast_data_of(node);
+                let d = parsed_node_data(node);
                 // Go `ast.IsObjectLiteralMethod(node)` with the kind known.
                 let excludes = if kind == SyntaxKind::MethodDeclaration
                     && node.parent().kind() == SyntaxKind::ObjectLiteralExpression
@@ -1546,7 +1546,7 @@ impl Binder {
             SyntaxKind::GetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::GET_ACCESSOR,
                     SymbolFlags::GET_ACCESSOR_EXCLUDES,
                 );
@@ -1554,7 +1554,7 @@ impl Binder {
             SyntaxKind::SetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::SET_ACCESSOR,
                     SymbolFlags::SET_ACCESSOR_EXCLUDES,
                 );

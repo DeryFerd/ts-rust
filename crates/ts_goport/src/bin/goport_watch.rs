@@ -14,9 +14,6 @@
 //! starts. Then it stops the watch and writes the tsc output to
 //! `out-file`. `changed-file` gets its original text back.
 //!
-//! With `-b --watch`, the build workers are the `tsgo` binary next to this
-//! one.
-//!
 //! Exit 0 when every build ran, 1 when a build did not end in time, and 70
 //! (`EXIT_UNPORTED`) when unported code ran or the run panicked.
 
@@ -26,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ts_goport::execute::build::worker::BUILD_WORKER_FLAG;
 use ts_goport::execute::execute_tsc::{GoTsc, command_line};
 use ts_goport::execute::tsc::{EXIT_UNPORTED, System, Writer, new_os_system};
 use ts_goport::execute::watcher::set_test_watch_backend;
@@ -47,12 +43,6 @@ const EDIT_DELAY: Duration = Duration::from_millis(300);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // A `-b --watch` build runs each project in a worker process that runs
-    // the current binary with `BUILD_WORKER_FLAG` (`WorkerLauncher`). The
-    // `tsgo` binary next to this one is that worker.
-    if args.first().map(String::as_str) == Some(BUILD_WORKER_FLAG) {
-        run_tsgo_worker(&args);
-    }
     let Some(split) = args.iter().position(|arg| arg == "--") else {
         usage();
     };
@@ -90,17 +80,6 @@ fn main() {
         }
     };
     std::process::exit(code);
-}
-
-/// Replaces this process with the `tsgo` build worker (same arguments,
-/// stdin and stdout).
-fn run_tsgo_worker(args: &[String]) -> ! {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().expect("no current executable");
-    let tsgo = exe.with_file_name("tsgo");
-    let error = std::process::Command::new(&tsgo).args(args).exec();
-    eprintln!("goport_watch: cannot run {}: {error}", tsgo.display());
-    std::process::exit(EXIT_UNPORTED);
 }
 
 fn usage() -> ! {

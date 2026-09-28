@@ -263,8 +263,7 @@ struct EmitBin {
 
 impl TscCompilationHooks for EmitBin {
     // PORT: `-b` is unported here: the build writes outputs without the
-    // write guard, and the build workers re-run the bin. `goport_build` runs
-    // build mode.
+    // write guard. `goport_build` runs build mode.
     fn build_mode(&self) -> bool {
         false
     }

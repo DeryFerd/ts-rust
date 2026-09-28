@@ -77,7 +77,7 @@ fn create_test_watcher() -> (Box<dyn Watcher>, Rc<TestSys>) {
         command_line_args: vec!["--watch".to_string()],
         ..Default::default()
     };
-    let sys = new_in_process_test_sys(&input, &["--watch"]);
+    let sys = new_in_process_test_sys(&input);
     let result = command_line(&context::background(), &sys, &["--watch"]);
     let w = result
         .watcher
@@ -338,7 +338,7 @@ fn build_watch_stops_when_context_is_cancelled() {
             thread::Builder::new()
                 .stack_size(STACK_SIZE)
                 .spawn(move || {
-                    let sys = new_in_process_test_sys(&input, &ARGS);
+                    let sys = new_in_process_test_sys(&input);
                     let result = command_line(&ctx, &sys, &ARGS);
                     let _ = result_tx.send((result.status, result.watcher.is_some()));
                 })

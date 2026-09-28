@@ -1,15 +1,11 @@
 //! The process protocol of the tsc runner. No Go
-//! equivalent: Go runs every `execute.CommandLine` and every build task in
-//! the test process.
+//! equivalent: Go runs every `execute.CommandLine` in the test process.
 //!
 //! PORT: a plain `tsc` run installs one program for the process
-//! (`core::set_prog`), the OS override (`install_os_override`) is for the
-//! whole process, and a `tsc -b` build compiles each project in a build
-//! worker. So the runner runs each command in a child process (this test
-//! binary again, test `__tsctest_child`), and a child's build runs each
-//! worker in a process of its own (test `__tsctest_build_worker`), one at a
-//! time on the orchestrator thread, so the one map file system and the fake
-//! clock see one ordered sequence.
+//! (`core::set_prog`), and the OS override (`install_os_override`) is for
+//! the whole process. So the runner runs each command in a child process
+//! (this test binary again, test `__tsctest_child`). A `tsc -b` build
+//! compiles every project in that child, as Go does in its one process.
 //!
 //! ```text
 //! runner (TestSys: map file system, clock, written files, default libs,
@@ -22,21 +18,14 @@
 //!      A child with a watcher stays. Each edit sends it a watch request
 //!      (changed paths, state); it sends the paths to its MockWatchBackend,
 //!      runs DoCycle and sends a response (state, watch state).
-//!      -> build worker (tsc -b only, TestSys::build_worker_runner):
-//!         request (TSCTEST_WORKER_REQUEST): state, config, build command
-//!         line, cached file system JSON; the worker runs
-//!         compile_and_emit_worker; response (TSCTEST_WORKER_RESPONSE):
-//!         state, result line, program cache line, the program baseline
-//!         and the emitted file times.
 //! ```
 //!
 //! Requests and responses are files under `TSCTEST_TMP` (default
 //! `target/continuation-r97-goport/go-baseline-tests/tmp`), deleted after
 //! use unless `TSCTEST_KEEP_CHILD_FILES=1`. The runner sends a command
 //! child each file pair as a line on its stdin, and the child prints
-//! `READY_MARKER` when the response is written. A build worker gets its
-//! pair in the environment. The encoding is length prefixed bytes (little
-//! endian lengths), so file data keeps its Go bytes.
+//! `READY_MARKER` when the response is written. The encoding is length
+//! prefixed bytes (little endian lengths), so file data keeps its Go bytes.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -48,40 +37,29 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use ts_goport::core::{record_unported, unported_report};
+use ts_goport::core::unported_report;
 use ts_goport::emitter::program_emit::{WriteFile, WriteFileData};
-use ts_goport::execute::build::build_task::WorkerCompileResult;
-use ts_goport::execute::build::worker::{
-    WORKER_SINCE_START_ENV, WORKER_TTY_ENV, compile_and_emit_worker, marshal_worker_compile_result,
-    marshal_worker_program_fs_cache, parse_worker_compile_result, parse_worker_program_fs_cache,
-    read_worker_fs_cache,
-};
 use ts_goport::execute::execute_tsc::{TscCompilationHooks, command_line};
 use ts_goport::execute::tsc::compile::{CommandLineResult, CommandLineTesting, ExitStatus, System};
 use ts_goport::execute::watcher::set_test_watch_backend;
-use ts_goport::frontend::vfs::{CachedFsState, Fs, OsOverride, install_os_override, osvfs_fs};
+use ts_goport::frontend::vfs::{Fs, OsOverride, install_os_override, osvfs_fs};
 use ts_goport::gostd::{Context, context};
 
 use crate::support::fsbaselineutil::FileChange;
 use crate::support::runner::{FileMap, TscInput};
 use crate::support::test_sys::{
-    ClockState, ProgramParts, SerializedMtimes, SharedFs, SysMode, TestClock, TestSys,
-    fs_error_text, lock, new_test_sys,
+    ClockState, SharedFs, SysMode, TestClock, TestSys, fs_error_text, lock, new_test_sys,
 };
 use crate::support::vfstest::{MapFs, MapFsState, MapFsStateFile, from_unix_nanos, unix_nanos};
 
 /// The test that runs one command (see main.rs).
 const CHILD_TEST: &str = "__tsctest_child";
-/// The test that runs one build worker (see main.rs).
-const BUILD_WORKER_TEST: &str = "__tsctest_build_worker";
 
 /// Set for a command child (see `CommandChildProcess`).
 const COMMAND_CHILD_ENV: &str = "TSCTEST_COMMAND_CHILD";
 /// The libtest name of the test that `run_test_in_child` runs in this
 /// process.
 const IN_CHILD_ENV: &str = "TSCTEST_IN_CHILD";
-const WORKER_REQUEST_ENV: &str = "TSCTEST_WORKER_REQUEST";
-const WORKER_RESPONSE_ENV: &str = "TSCTEST_WORKER_RESPONSE";
 const TMP_ENV: &str = "TSCTEST_TMP";
 const KEEP_FILES_ENV: &str = "TSCTEST_KEEP_CHILD_FILES";
 const DEFAULT_TMP: &str =
@@ -100,8 +78,6 @@ const WATCH_REQUEST_MAGIC: &[u8] = b"TSCTEST-WATCH-REQUEST-1";
 const WATCH_RESPONSE_MAGIC: &[u8] = b"TSCTEST-WATCH-RESPONSE-1";
 /// The stdout line of a command child after each response file.
 const READY_MARKER: &str = "TSCTEST-CHILD-RESPONSE-READY";
-const WORKER_REQUEST_MAGIC: &[u8] = b"TSCTEST-WORKER-REQUEST-1";
-const WORKER_RESPONSE_MAGIC: &[u8] = b"TSCTEST-WORKER-RESPONSE-1";
 
 // ---------------------------------------------------------------------------
 // State
@@ -195,7 +171,7 @@ fn apply_child_state(sys: &TestSys, mut state: SysState) {
     apply_state(sys, state);
 }
 
-/// The test system that a child or a build worker rebuilds from `state`.
+/// The test system that a child rebuilds from `state`.
 fn sys_from_state(state: SysState, mode: SysMode) -> TestSys {
     let clock = Arc::new(TestClock::new(state.clock.start));
     clock.set_state(state.clock);
@@ -233,8 +209,8 @@ fn sys_from_state(state: SysState, mode: SysMode) -> TestSys {
     sys
 }
 
-/// Installs the osvfs override of a child or a build worker: every thread
-/// that reads the OS file system gets a `testFs` view of `shared`.
+/// Installs the osvfs override of a child: every thread that reads the OS
+/// file system gets a `testFs` view of `shared`.
 fn install_override(shared: &SharedFs, current_directory: String) {
     let shared = shared.clone();
     install_os_override(OsOverride {
@@ -368,15 +344,6 @@ impl Enc {
                 }
             }
             None => self.bool(false),
-        }
-    }
-
-    fn program_parts(&mut self, parts: &[ProgramParts]) {
-        self.len(parts.len());
-        for part in parts {
-            self.str(&part.config_file_path);
-            self.str(&part.body);
-            self.str(&part.include_body);
         }
     }
 
@@ -558,19 +525,6 @@ impl<'a> Dec<'a> {
         })
     }
 
-    fn program_parts(&mut self) -> DecResult<Vec<ProgramParts>> {
-        let n = self.len()?;
-        let mut parts = Vec::with_capacity(n);
-        for _ in 0..n {
-            parts.push(ProgramParts {
-                config_file_path: self.str()?,
-                body: self.str()?,
-                include_body: self.str()?,
-            });
-        }
-        Ok(parts)
-    }
-
     fn unported(&mut self) -> DecResult<Vec<(String, u64)>> {
         let n = self.len()?;
         let mut unported = Vec::with_capacity(n);
@@ -620,54 +574,6 @@ fn new_file_pair(kind: &str) -> (PathBuf, PathBuf) {
 fn remove_file(path: &OsPath) {
     if !keep_files() {
         let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Runs `test` of this test binary with the request file and returns the
-/// response bytes. No response is an `Err` with the tail of the process's
-/// stderr.
-fn run_test_process(
-    test: &str,
-    request_env: &str,
-    response_env: &str,
-    kind: &str,
-    request: &[u8],
-) -> Result<Vec<u8>, String> {
-    let (request_path, response_path) = new_file_pair(kind);
-    std::fs::write(&request_path, request)
-        .map_err(|err| format!("cannot write {}: {err}", request_path.display()))?;
-    let _ = std::fs::remove_file(&response_path);
-    let exe = std::env::current_exe().map_err(|err| format!("current test binary: {err}"))?;
-    let output = std::process::Command::new(exe)
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
-        .env_remove(WORKER_REQUEST_ENV)
-        .env_remove(WORKER_RESPONSE_ENV)
-        .env(request_env, &request_path)
-        .env(response_env, &response_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    remove_file(&request_path);
-    let output = output.map_err(|err| format!("cannot run {test}: {err}"))?;
-    if let Ok(response) = std::fs::read(&response_path) {
-        remove_file(&response_path);
-        // Pass on what a build worker wrote to stderr (a panic in a
-        // checker thread, unported code) so the runner's failure shows
-        // it.
-        if !output.stderr.is_empty() && test == BUILD_WORKER_TEST {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(&output.stderr);
-        }
-        Ok(response)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let lines: Vec<&str> = stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join("\n");
-        Err(format!(
-            "{test} ended with {} and no response; stderr tail:\n{tail}",
-            output.status
-        ))
     }
 }
 
@@ -747,19 +653,9 @@ pub fn command_line_in_process(
 /// Go `newTestSys(input, false)` for a test that runs the compiler in this
 /// process, which must be a child process of its own (see
 /// `run_test_in_child`): it installs the OS override for the new system.
-/// `command_line_args` is the command line that a `-b` build passes to its
-/// build workers.
-pub fn new_in_process_test_sys(input: &TscInput, command_line_args: &[&str]) -> Rc<TestSys> {
+pub fn new_in_process_test_sys(input: &TscInput) -> Rc<TestSys> {
     let state = export_state(&new_test_sys(input, false));
-    let sys = Rc::new(sys_from_state(
-        state,
-        SysMode::Child {
-            command_line_args: command_line_args
-                .iter()
-                .map(|arg| arg.to_string())
-                .collect(),
-        },
-    ));
+    let sys = Rc::new(sys_from_state(state, SysMode::Child));
     install_override(sys.shared(), sys.get_current_directory());
     sys
 }
@@ -777,8 +673,6 @@ pub fn run_test_in_child(test: &str, body: impl FnOnce() + Send + 'static) {
     let exe = std::env::current_exe().expect("current test binary");
     let output = std::process::Command::new(exe)
         .args(["--exact", test, "--nocapture", "--test-threads", "1"])
-        .env_remove(WORKER_REQUEST_ENV)
-        .env_remove(WORKER_RESPONSE_ENV)
         .env(IN_CHILD_ENV, test)
         .stdin(std::process::Stdio::null())
         .output()
@@ -885,8 +779,6 @@ impl CommandChildProcess {
         let exe = std::env::current_exe().map_err(|err| format!("current test binary: {err}"))?;
         let mut child = std::process::Command::new(exe)
             .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
-            .env_remove(WORKER_REQUEST_ENV)
-            .env_remove(WORKER_RESPONSE_ENV)
             .env_remove(IN_CHILD_ENV)
             .env(COMMAND_CHILD_ENV, "1")
             .stdin(std::process::Stdio::piped())
@@ -1089,12 +981,7 @@ pub fn command_child_entry() {
         })();
         let (args, state) = decoded.unwrap_or_else(|err| panic!("bad child request: {err}"));
 
-        let sys = Rc::new(sys_from_state(
-            state,
-            SysMode::Child {
-                command_line_args: args.clone(),
-            },
-        ));
+        let sys = Rc::new(sys_from_state(state, SysMode::Child));
         // Before any compiler call (see `install_override`).
         install_override(sys.shared(), sys.get_current_directory());
 
@@ -1150,230 +1037,5 @@ pub fn command_child_entry() {
             write_response(&response_path, &enc.buf);
             signal_ready();
         }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Build worker
-// ---------------------------------------------------------------------------
-
-/// What a command child's build worker runner needs (`Send + Sync`, see
-/// `TestSys::build_worker_runner`).
-pub struct WorkerContext {
-    pub shared: SharedFs,
-    pub cwd: String,
-    pub env: BTreeMap<String, String>,
-    pub default_library_path: String,
-    /// The child's `-b` command line (Go `o.opts.Command`).
-    pub build_command_line: Vec<String>,
-    /// The child's `TestSys::child_serialized_mtimes`, read when a worker
-    /// starts.
-    pub serialized_mtimes: SerializedMtimes,
-    pub results: Arc<Mutex<crate::support::test_sys::WorkerResults>>,
-}
-
-/// Runs one build worker for `config` in a process of its own and applies
-/// its state to the child (`BuildWorkerRunner`, called by the orchestrator
-/// on its own thread). A worker without a response is reported like a
-/// failed worker process (`WorkerLauncher::run`): `NotImplemented`, and the
-/// child counts it as unported.
-pub fn run_build_worker(
-    context: &WorkerContext,
-    config: &str,
-    fs_cache: &str,
-    on_program_fs_cache: &mut dyn FnMut(CachedFsState),
-) -> WorkerCompileResult {
-    let failed = |message: String| {
-        eprintln!("tsctest: build worker for {config} failed: {message}");
-        record_unported("build worker");
-        WorkerCompileResult {
-            exit_status: ExitStatus::NotImplemented,
-            output: String::new(),
-            diagnostics: Vec::new(),
-            diagnostic_file_texts: Vec::new(),
-            emitted_files: Vec::new(),
-            has_changed_dts_file: false,
-            build_info_emit: None,
-            statistics: None,
-            output_time_stamps: Vec::new(),
-            fs_cache: CachedFsState::default(),
-            package_jsons: Vec::new(),
-        }
-    };
-
-    // The worker's system gives the orchestrator's answers: Go `TestSys`
-    // output is a TTY, and `SinceStart` is the test clock's.
-    let mut env = context.env.clone();
-    env.insert(WORKER_TTY_ENV.to_string(), "1".to_string());
-    env.insert(WORKER_SINCE_START_ENV.to_string(), "0".to_string());
-    let shared = &context.shared;
-    let mut written_files: Vec<String> = lock(&shared.written_files).iter().cloned().collect();
-    written_files.sort();
-    let default_libs = lock(&shared.default_libs).as_ref().map(|libs| {
-        let mut libs: Vec<String> = libs.iter().cloned().collect();
-        libs.sort();
-        libs
-    });
-    let serialized_mtimes = lock(&context.serialized_mtimes).clone().flatten();
-    let serialized_mtimes = serialized_mtimes.as_ref().map(|mtimes| {
-        let mut mtimes: Vec<(String, Option<SystemTime>)> =
-            mtimes.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        mtimes.sort();
-        mtimes
-    });
-    let state = SysState {
-        cwd: context.cwd.clone(),
-        env,
-        default_library_path: context.default_library_path.clone(),
-        use_case_sensitive_file_names: shared.map_fs.use_case_sensitive_file_names(),
-        for_incremental_correctness: false,
-        clock: shared.clock.state(),
-        map_fs: shared.map_fs.export_state(),
-        written_files,
-        default_libs,
-        output: Vec::new(),
-        program_baselines: String::new(),
-        program_include_baselines: String::new(),
-        serialized_mtimes,
-    };
-
-    let mut enc = Enc::default();
-    enc.buf.extend_from_slice(WORKER_REQUEST_MAGIC);
-    enc.str(config);
-    enc.strs(&context.build_command_line);
-    enc.bytes(fs_cache.as_bytes());
-    enc.sys_state(&state);
-    let response = match run_test_process(
-        BUILD_WORKER_TEST,
-        WORKER_REQUEST_ENV,
-        WORKER_RESPONSE_ENV,
-        "worker",
-        &enc.buf,
-    ) {
-        Ok(response) => response,
-        Err(message) => return failed(message),
-    };
-
-    let mut dec = Dec::new(&response);
-    let decoded = (|| -> DecResult<WorkerResponse> {
-        dec.magic(WORKER_RESPONSE_MAGIC)?;
-        let state = dec.sys_state()?;
-        let result_line = dec.str()?;
-        let program_line = dec.str()?;
-        let programs = dec.program_parts()?;
-        let n = dec.len()?;
-        let mut emitted_times = Vec::with_capacity(n);
-        for _ in 0..n {
-            emitted_times.push((dec.str()?, dec.time()?));
-        }
-        let unported = dec.unported()?;
-        dec.end()?;
-        Ok(WorkerResponse {
-            state,
-            result_line,
-            program_line,
-            programs,
-            emitted_times,
-            unported,
-        })
-    })();
-    let mut response = match decoded {
-        Ok(response) => response,
-        Err(err) => return failed(format!("bad worker response: {err}")),
-    };
-
-    // The worker wrote through the same file system and clock.
-    apply_shared_state(shared, &mut response.state);
-    {
-        let mut results = lock(&context.results);
-        results
-            .programs
-            .entry(config.to_string())
-            .or_default()
-            .extend(response.programs);
-        results.emitted_times.extend(response.emitted_times);
-    }
-    if !response.unported.is_empty() {
-        eprintln!(
-            "tsctest: build worker for {config} reached unported code: {}",
-            unported_text(&response.unported)
-        );
-        // Like `WorkerLauncher::run` after `EXIT_UNPORTED`.
-        record_unported("build worker");
-    }
-    if let Some(state) = parse_worker_program_fs_cache(response.program_line.as_bytes()) {
-        on_program_fs_cache(state);
-    }
-    match parse_worker_compile_result(&response.result_line) {
-        Some(result) => result,
-        None => failed("bad worker result line".to_string()),
-    }
-}
-
-struct WorkerResponse {
-    state: SysState,
-    result_line: String,
-    program_line: String,
-    programs: Vec<ProgramParts>,
-    emitted_times: Vec<(String, SystemTime)>,
-    unported: Vec<(String, u64)>,
-}
-
-/// The entry of a build worker (`__tsctest_build_worker` in main.rs).
-/// Returns at once unless a command child started this process.
-pub fn build_worker_entry() {
-    let Some(request_path) = std::env::var_os(WORKER_REQUEST_ENV) else {
-        return;
-    };
-    let response_path = std::env::var_os(WORKER_RESPONSE_ENV)
-        .expect("TSCTEST_WORKER_RESPONSE is set with TSCTEST_WORKER_REQUEST");
-    run_on_compile_thread("tsctest-build-worker", move || {
-        let request = read_request(&request_path);
-        let mut dec = Dec::new(&request);
-        let decoded = (|| -> DecResult<(String, Vec<String>, Vec<u8>, SysState)> {
-            dec.magic(WORKER_REQUEST_MAGIC)?;
-            let config = dec.str()?;
-            let build_command_line = dec.strs()?;
-            let fs_cache = dec.bytes()?;
-            let state = dec.sys_state()?;
-            dec.end()?;
-            Ok((config, build_command_line, fs_cache, state))
-        })();
-        let (config, build_command_line, fs_cache, state) =
-            decoded.unwrap_or_else(|err| panic!("bad build worker request: {err}"));
-
-        let sys = Rc::new(sys_from_state(state, SysMode::Worker));
-        // Before any compiler call (see `install_override`).
-        install_override(sys.shared(), sys.get_current_directory());
-
-        let fs_cache = read_worker_fs_cache(&mut fs_cache.as_slice())
-            .unwrap_or_else(|message| panic!("build worker: bad file system cache: {message}"));
-        let mut program_line = String::new();
-        let mut record = |state: &CachedFsState| {
-            program_line = marshal_worker_program_fs_cache(state);
-        };
-        let result = compile_and_emit_worker(
-            sys.clone(),
-            &config,
-            &build_command_line,
-            &fs_cache,
-            &mut record,
-            Some(sys.clone()),
-        );
-
-        let mut enc = Enc::default();
-        enc.buf.extend_from_slice(WORKER_RESPONSE_MAGIC);
-        enc.sys_state(&export_state(&sys));
-        enc.str(&marshal_worker_compile_result(&result));
-        enc.str(&program_line);
-        enc.program_parts(&sys.take_worker_programs());
-        let emitted_times = sys.take_emitted_times();
-        enc.len(emitted_times.len());
-        for (file, time) in &emitted_times {
-            enc.str(file);
-            enc.time(*time);
-        }
-        enc.unported(&unported_report());
-        write_response(&response_path, &enc.buf);
     });
 }

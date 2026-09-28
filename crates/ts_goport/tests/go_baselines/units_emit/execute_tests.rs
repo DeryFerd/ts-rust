@@ -9,8 +9,7 @@ use std::rc::Rc;
 use ts_goport::execute::build::command_line::parse_build_command_line;
 use ts_goport::execute::build::host::TscExtendedConfigCache;
 use ts_goport::execute::build::orchestrator::{Options, new_orchestrator};
-use ts_goport::execute::build::worker::{SystemParseConfigHost, WorkerLauncher};
-use ts_goport::execute::tsc::compile::System;
+use ts_goport::execute::tsc::compile::{System, SystemParseConfigHost};
 use ts_goport::frontend::tsoptions::{
     ParseConfigHost, ParsedCommandLine, get_parsed_command_line_of_config_file,
 };
@@ -204,7 +203,6 @@ impl BuildOrderTestCase {
             new_orchestrator(Options {
                 sys: Rc::clone(&sys),
                 command: Rc::new(build_command),
-                worker: WorkerLauncher::current(Vec::new()),
                 testing: None,
             })
         };

@@ -1,6 +1,6 @@
 //! Port of execute/incremental/snapshottobuildinfo.go.
 //!
-//! PORT: Go `*compiler.Program` is the installed program (plan D1). Go nil
+//! PORT: Go `*compiler.Program` is the current program (`prog()`). Go nil
 //! slices in `BuildInfo` are `None`: a Go `append` to a nil slice or a
 //! `core.Map` of a non-empty slice makes `Some`, and nothing appended (or a
 //! `core.Map` of a nil or empty `slices.Collect`) stays `None`.

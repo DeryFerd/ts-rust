@@ -14,10 +14,10 @@
 //! build_task.rs), so the lines that make new ones are left out. Go
 //! `atomic.Bool` flags on one goroutine are plain `bool`s.
 //!
-//! PORT: each project still compiles in a build worker process (plan D1),
-//! which reads its old program from build info, as Go does in build mode
-//! (buildtask.go:199). So `-b --watch` needs no second program in this
-//! process.
+//! PORT: each project compiles in this process (build_task.rs). A watch
+//! cycle makes new program versions, and each is released when its task
+//! reports. The old program is read from build info, as Go does in build
+//! mode (buildtask.go:199).
 
 use crate::execute::build::build_task::BuildTask;
 use crate::execute::build::orchestrator::Orchestrator;

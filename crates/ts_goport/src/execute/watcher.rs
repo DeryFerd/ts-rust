@@ -18,11 +18,11 @@
 //! next build has read it (Go drops the old program there).
 
 use crate::execute::build::host::TscExtendedConfigCache;
-use crate::execute::build::worker::SystemParseConfigHost;
 use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_write_file};
 use crate::execute::incremental;
 use crate::execute::tsc::compile::{
-    CommandLineTesting, CompileAndEmitResult, CompileTimes, System, write_str,
+    CommandLineTesting, CompileAndEmitResult, CompileTimes, System, SystemParseConfigHost,
+    write_str,
 };
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_watch_status_reporter,

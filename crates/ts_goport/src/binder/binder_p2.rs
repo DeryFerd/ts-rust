@@ -216,7 +216,7 @@ impl Binder {
 
     // Go: binder/binder.go:977 bindPropertyOrMethodOrAccessor
     // PERF: query Q7-3. `d` is the data of `node`, which the caller already
-    // loaded with `ast_data_of`.
+    // loaded with `parsed_node_data`.
     pub fn bind_property_or_method_or_accessor(
         &mut self,
         node: Node,
@@ -608,7 +608,7 @@ impl Binder {
     pub fn bind_parameter(&mut self, node: Node) {
         // PERF: query Q7-3. The node data is looked up once, and the field
         // reads below (name, modifiers, question token) use it.
-        let d = ast_data_of(node);
+        let d = parsed_node_data(node);
         let decl_name = node.name_in(d);
         if !node_flags(self, node).intersects(NodeFlags::AMBIENT) {
             // It is a SyntaxError if the identifier eval or arguments appears within a FormalParameterList of a

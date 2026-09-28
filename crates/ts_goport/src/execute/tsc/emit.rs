@@ -2,10 +2,10 @@
 //!
 //! PORT: Go `compiler.ProgramLike` (compiler/program.go:1710) is the
 //! `ProgramLike` trait below, because this is its first user in the port.
-//! `CompilerProgram` is the plain `*compiler.Program` over the installed
-//! process program; the incremental program implements the same trait.
-//! The process has one program, so Go `EmitInput.Program` (the underlying
-//! `*compiler.Program`) is the installed program and is not a field.
+//! `CompilerProgram` is the plain `*compiler.Program` over the current
+//! program (`prog()`); the incremental program implements the same trait.
+//! Go `EmitInput.Program` (the underlying `*compiler.Program`) is the
+//! current program and is not a field.
 
 use crate::prelude::*;
 
@@ -27,7 +27,7 @@ use std::time::SystemTime;
 // Go: compiler/program.go:1710 ProgramLike
 // PORT: only the methods that `EmitFilesAndReportErrors` and
 // `GetDiagnosticsOfAnyProgram` call. Config, syntactic and program
-// diagnostics are read from the installed program by
+// diagnostics are read from the current program by
 // `get_diagnostics_of_any_program`; Go `incremental.Program` forwards them
 // to its program too. Go passes a context; the port has none. The methods
 // take `&self` like Go interface methods; an implementation with state
@@ -41,7 +41,7 @@ pub trait ProgramLike {
     fn emit(&self, options: EmitOptions) -> EmitResult;
 }
 
-/// Go `*compiler.Program` as a `ProgramLike`: the installed program.
+/// Go `*compiler.Program` as a `ProgramLike`: the current program.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompilerProgram;
 
@@ -90,7 +90,7 @@ pub fn get_trace_with_writer_from_sys(
 }
 
 // Go: execute/tsc/emit.go:30 EmitInput
-// PORT: `Program` is the installed program (see the module comment).
+// PORT: `Program` is the current program (see the module comment).
 // `Testing` and `TestingMTimesCache` are `None` outside Go tests; the cache
 // is the build host `m_times` (a `Mutex`, Go `SyncMap`). `Tracing` is the
 // process session (`crate::tracing::get`). Go `Config` is optional here:

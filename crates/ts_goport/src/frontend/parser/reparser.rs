@@ -19,7 +19,7 @@ use ts_ast::NodeData as D;
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and
 /// stores it back.
 fn mutate(n: Node, f: impl FnOnce(&mut D)) {
-    let mut data = ast_data_of(n).clone();
+    let mut data = with_ast_data(n, Clone::clone);
     f(&mut data);
     replace_node_data(n, data);
 }
