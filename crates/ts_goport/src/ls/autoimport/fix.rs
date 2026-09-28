@@ -1028,7 +1028,12 @@ impl View {
             })];
         }
 
-        let import_kind = get_import_kind(self.importing_file, export, self.program);
+        let import_kind = get_import_kind(
+            self.importing_file,
+            export,
+            self.program,
+            false, /*forceImportKeyword*/
+        );
         let add_as_type_only =
             get_add_as_type_only(is_valid_type_only_use_site, export, self.program.options());
 
@@ -1102,7 +1107,12 @@ impl View {
             return None;
         }
 
-        if get_import_kind(self.importing_file, export, self.program) != lsproto::ImportKind::NAMED
+        if get_import_kind(
+            self.importing_file,
+            export,
+            self.program,
+            false, /*forceImportKeyword*/
+        ) != lsproto::ImportKind::NAMED
         {
             return None;
         }
@@ -1190,7 +1200,12 @@ impl View {
             return None;
         }
 
-        let import_kind = get_import_kind(self.importing_file, export, self.program);
+        let import_kind = get_import_kind(
+            self.importing_file,
+            export,
+            self.program,
+            false, /*forceImportKeyword*/
+        );
         if import_kind == lsproto::ImportKind::COMMON_JS
             || import_kind == lsproto::ImportKind::NAMESPACE
         {
@@ -1300,13 +1315,31 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:780 getImportKind
+// Go: ls/autoimport/fix.go:797 GetImportKindForImportStatement
+// The completions of an import statement (`import F|`) call this. It always
+// writes an `import` keyword, so an `export =` module in a JS file without an
+// external module indicator gives a default import, not `require`.
+pub fn get_import_kind_for_import_statement(
+    importing_file: Node,
+    export: &Export,
+    program: &'static compiler::NewProgram,
+) -> lsproto::ImportKind {
+    get_import_kind(
+        importing_file,
+        export,
+        program,
+        true, /*forceImportKeyword*/
+    )
+}
+
+// Go: ls/autoimport/fix.go:801 getImportKind
 // PORT: Go `fallthrough` from the Named case into the Modifier case is the
 // shared `NAMED` result.
 fn get_import_kind(
     importing_file: Node,
     export: &Export,
     program: &'static compiler::NewProgram,
+    force_import_keyword: bool,
 ) -> lsproto::ImportKind {
     if program.options().verbatim_module_syntax.is_true()
         && program.get_emit_module_format_of_file(&source_file_has_file_name(importing_file))
@@ -1349,6 +1382,7 @@ fn get_import_kind(
             if source_file_info(importing_file)
                 .external_module_indicator
                 .is_some()
+                || force_import_keyword
                 || !is_source_file_js(importing_file)
             {
                 return lsproto::ImportKind::DEFAULT;
