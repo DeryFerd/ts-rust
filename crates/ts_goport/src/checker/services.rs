@@ -898,7 +898,7 @@ impl Checker {
 
 // Go: checker/services.go:622 isExportSpecifierAlias
 pub fn is_export_specifier_alias(reference_location: Node, export_specifier: Node) -> bool {
-    debug_assert!(
+    go_assert!(
         export_specifier.property_name() == reference_location
             || export_specifier.name() == reference_location,
         "referenceLocation is not export specifier name or property name"

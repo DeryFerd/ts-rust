@@ -595,13 +595,12 @@ impl ClassFieldsTransformer {
         match node.kind() {
             SyntaxKind::PropertyDeclaration => self.transform_field_initializer(node),
             SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => self.visit_class_element(node),
-            _ => {
-                debug_assert!(
-                    false,
-                    "Expected node to either be a PropertyDeclaration, GetAccessorDeclaration, or SetAccessorDeclaration"
-                );
-                Node::NIL
-            }
+            _ => crate::gostd::debug::fail_bad_syntax_kind(
+                node.kind(),
+                Some(
+                    "Expected node to either be a PropertyDeclaration, GetAccessorDeclaration, or SetAccessorDeclaration",
+                ),
+            ),
         }
     }
 
@@ -880,7 +879,7 @@ impl ClassFieldsTransformer {
 
     // Go: transformers/estransforms/classfields.go:676 classFieldsTransformer.visitMethodOrAccessorDeclaration
     pub(super) fn visit_method_or_accessor_declaration(&mut self, node: Node) -> Node {
-        debug_assert!(!has_decorators(node));
+        go_assert!(!has_decorators(node));
 
         if !is_private_identifier_class_element_declaration(node)
             || !self.should_transform_class_element_to_weak_map(node)
@@ -890,7 +889,7 @@ impl ClassFieldsTransformer {
 
         // leave invalid code untransformed
         let info = self.access_private_identifier(node.name());
-        debug_assert!(
+        go_assert!(
             info.is_some(),
             "Undeclared private name for property declaration."
         );
@@ -1026,9 +1025,9 @@ impl ClassFieldsTransformer {
 
     // Go: transformers/estransforms/classfields.go:782 classFieldsTransformer.getHoistedFunctionName
     pub(super) fn get_hoisted_function_name(&self, node: Node) -> Node {
-        debug_assert!(node.name().is_some() && is_private_identifier(node.name()));
+        go_assert!(node.name().is_some() && is_private_identifier(node.name()));
         let info = self.access_private_identifier(node.name());
-        debug_assert!(
+        go_assert!(
             info.is_some(),
             "Undeclared private name for property declaration."
         );
@@ -1175,7 +1174,7 @@ impl ClassFieldsTransformer {
         if self.should_transform_class_element_to_weak_map(node) {
             // If we are transforming private elements into WeakMap/WeakSet, we should elide the node.
             let info = self.access_private_identifier(node.name());
-            debug_assert!(
+            go_assert!(
                 info.is_some(),
                 "Undeclared private name for property declaration."
             );
@@ -1298,7 +1297,7 @@ impl ClassFieldsTransformer {
 
     // Go: transformers/estransforms/classfields.go:996 classFieldsTransformer.transformFieldInitializer
     pub(super) fn transform_field_initializer(&mut self, node: Node) -> Node {
-        debug_assert!(
+        go_assert!(
             !has_decorators(node),
             "Decorators should already have been transformed and elided."
         );
@@ -1381,13 +1380,9 @@ impl ClassFieldsTransformer {
                     fn_,
                 )
             }
-            PrivateIdentifierKind::UNTRANSFORMED => {
-                debug_assert!(
-                    false,
-                    "Access helpers should not be created for untransformed private elements"
-                );
-                Node::NIL
-            }
+            PrivateIdentifierKind::UNTRANSFORMED => crate::gostd::debug::fail(
+                "Access helpers should not be created for untransformed private elements",
+            ),
             _ => {
                 debug_assert!(false, "Unknown private element type");
                 Node::NIL
@@ -1967,7 +1962,7 @@ impl ClassFieldsTransformer {
 
             if self.is_named_evaluation_needing_assigned_name(node) {
                 node = transform_named_evaluation(&ec, node, false, "");
-                debug_assert!(node.is_some() && is_assignment_expression(node, false));
+                go_assert!(node.is_some() && is_assignment_expression(node, false));
             }
 
             let left = skip_outer_expressions(

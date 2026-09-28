@@ -474,8 +474,10 @@ fn add_outlining_for_leading_comments_for_pos(
                 ));
                 single_line_comment_count = 0;
             }
-            // Go: debug.AssertNever(comment.Kind)
-            _ => panic!("Illegal value: {:?}", comment.kind),
+            _ => crate::gostd::debug::assert_never(
+                &crate::gostd::debug::kind_string(comment.kind),
+                None,
+            ),
         }
     }
     let added_comments = combine_and_add_multiple_single_line_comments(

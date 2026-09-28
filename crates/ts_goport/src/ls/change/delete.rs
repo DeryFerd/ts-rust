@@ -243,7 +243,7 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
         // import d|, * as ns| from './file'
         // import d|, { a }| from './file'
         let previous_token = astnav::get_token_at_position(source_file, node.pos() - 1);
-        debug_assert!(previous_token.is_some(), "previousToken should not be nil");
+        crate::go_assert!(previous_token.is_some(), "previousToken should not be nil");
         let start_pos = t.converters.position_to_line_and_character(
             &source_file,
             astnav::get_start_of_node(previous_token, source_file, false),
@@ -264,7 +264,7 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
         // |import * as ns from './file'|
         // |import { a } from './file'|
         let import_decl = find_ancestor_kind(node, SyntaxKind::ImportDeclaration);
-        debug_assert!(import_decl.is_some(), "importDecl should not be nil");
+        crate::go_assert!(import_decl.is_some(), "importDecl should not be nil");
         delete_node(
             t,
             source_file,
@@ -290,7 +290,7 @@ fn delete_variable_declaration(
             astnav::find_child_of_kind(parent, SyntaxKind::OpenParenToken, source_file);
         let close_paren =
             astnav::find_child_of_kind(parent, SyntaxKind::CloseParenToken, source_file);
-        debug_assert!(
+        crate::go_assert!(
             open_paren.is_some() && close_paren.is_some(),
             "catch clause should have parens"
         );
@@ -343,15 +343,10 @@ fn delete_variable_declaration(
             );
         }
 
-        _ => {
-            // PORT: Go `debug.Fail` panics with "Debug failure. " and the
-            // reason. Go `Kind.String()` prints "KindX"; this prints the Rust
-            // kind name. Panic text only.
-            panic!(
-                "Debug failure. Unexpected grandparent kind: {:?}",
-                gp.kind()
-            );
-        }
+        _ => crate::gostd::debug::fail(&format!(
+            "Unexpected grandparent kind: {}",
+            crate::gostd::debug::kind_string(gp.kind())
+        )),
     }
 }
 
@@ -391,7 +386,7 @@ fn delete_node_in_list(
     node: Node,
 ) {
     let containing_list = format::get_containing_list(node, source_file);
-    debug_assert!(
+    crate::go_assert!(
         containing_list.is_some(),
         "containingList should not be nil"
     );
@@ -400,7 +395,7 @@ fn delete_node_in_list(
         .iter()
         .position(|n| n == node)
         .map_or(-1, |i| i as i32);
-    debug_assert!(index != -1, "node should be in containing list");
+    crate::go_assert!(index != -1, "node should be in containing list");
 
     if containing_nodes.len() == 1 {
         delete_node(
@@ -415,7 +410,7 @@ fn delete_node_in_list(
 
     // Note: We will only delete a comma *after* a node. This will leave a trailing comma if we delete the last node.
     // That's handled in the end by finishTrailingCommaAfterDeletingNodesInList.
-    debug_assert!(
+    crate::go_assert!(
         !deleted_nodes_in_lists.contains(&node),
         "Deleting a node twice"
     );

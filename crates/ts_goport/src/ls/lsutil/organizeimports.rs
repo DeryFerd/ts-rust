@@ -3,6 +3,7 @@ use crate::ls::lsutil::prelude::*;
 use crate::frontend::core_binarysearch::binary_search_unique_func;
 use crate::frontend::stringutil_ls;
 use crate::gostd::norm;
+use crate::gostd::unicode;
 use crate::gostd::unicode_tables::{self, RangeTable};
 
 // Port of Go `ls/lsutil/organizeimports.go`.
@@ -274,8 +275,8 @@ fn compare_organize_imports_case(a: &str, b: &str, case_first: OrganizeImportsCa
     let min_len = a_runes.len().min(b_runes.len());
 
     for i in 0..min_len {
-        let a_upper = unicode_is_upper(a_runes[i]);
-        let b_upper = unicode_is_upper(b_runes[i]);
+        let a_upper = unicode::is_upper(a_runes[i]);
+        let b_upper = unicode::is_upper(b_runes[i]);
         if a_upper != b_upper {
             match case_first {
                 OrganizeImportsCaseFirst::UPPER => {
@@ -303,20 +304,6 @@ fn compare_organize_imports_case(a: &str, b: &str, case_first: OrganizeImportsCa
     a_runes.len().cmp(&b_runes.len()) as i32
 }
 
-/// Go `unicode.IsUpper`: general category Lu.
-// PORT: the Rust `Uppercase` property is Lu plus `Other_Uppercase`; the
-// `Other_Uppercase` ranges are removed so the result is Go's category test
-// (the same helper as in `ls/symbols.rs`).
-fn unicode_is_upper(c: char) -> bool {
-    if !c.is_uppercase() {
-        return false;
-    }
-    !matches!(
-        c as u32,
-        0x2160..=0x216F | 0x24B6..=0x24CF | 0x1F130..=0x1F149 | 0x1F150..=0x1F169 | 0x1F170..=0x1F189
-    )
-}
-
 // Go: unicode/letter.go:163 Is
 /// Go `unicode.Is`: reports whether the rune is in the table of ranges.
 /// PORT: the same scan as `gostd::collate`; Go's linear and binary searches
@@ -342,14 +329,11 @@ fn unicode_is(range_tab: &RangeTable, r: u32) -> bool {
     false
 }
 
-// PORT: Go `strings.ToLower` maps each rune with the simple (one rune)
-// `unicode.ToLower`. The first char of Rust `char::to_lowercase` is that
-// mapping (U+0130 is the only multi-char case, and it starts with 'i'). Rust
-// `str::to_lowercase` also applies the final-sigma rule, which Go does not.
+// PORT: Go `strings.ToLower` maps each rune with `unicode.ToLower`. Rust
+// `str::to_lowercase` uses the full mapping of a newer Unicode and the
+// final-sigma rule, which Go does not.
 fn strings_to_lower(s: &str) -> String {
-    s.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+    s.chars().map(unicode::to_lower).collect()
 }
 
 // Go: ls/lsutil/organizeimports.go:248 getOrganizeImportsPresetStringComparer

@@ -191,7 +191,7 @@ impl PendingEmitBatch {
 /// The first half of `emit_batch_with`: sends the jobs of every target to
 /// the emit pool and the checker threads, and returns without waiting.
 /// Each checker thread runs them after the jobs sent to it before (the
-/// early emit: `execute::incremental::Program::start_check_and_emit`).
+/// early emit: `execute::incremental::Program::start_emit`).
 /// With `noEmitOnError` it emits every target before it returns.
 pub fn start_emit_batch_with(
     targets: Vec<EmitOptions>,
@@ -262,11 +262,12 @@ pub fn start_emit_batch_with(
     })
 }
 
-/// PORT: not in Go (perf). True when `tsc -p` with an incremental program
-/// may send the emit of the current program right behind its check
-/// (`execute::incremental::Program::start_check_and_emit`): each checker
-/// then emits when its own check ends, and the emit pool runs during the
-/// check. Go waits for the whole check before it emits. Each checker still
+/// PORT: not in Go (perf). True when `tsc -p` or `tsc -b` with an
+/// incremental program may send the emit of the current program right
+/// behind its check (`execute::incremental::Program::start_emit`): each
+/// checker then emits when its own check ends, and the emit pool runs
+/// during the check. Go waits for the whole check before it emits. Each
+/// checker still
 /// gets the same jobs in the same order, and all state that emit writes is
 /// per thread, per checker, per emit, loading thread only or a pure cache,
 /// except the file system: a check can probe files, and the emit writes
@@ -302,7 +303,8 @@ pub fn emit_can_start_with_check() -> bool {
 /// `noEmitOnError` (the emit needs every diagnostic first),
 /// `--singleThreaded`, a trace, `preserveSymlinks` (F4), `outFile`, and
 /// `GOPORT_EARLY_EMIT=0`. Then `tsc -p` keeps Go's order exactly: it does
-/// not start the check early either.
+/// not start the check early either. `tsc -b` starts each check early in
+/// any case, and then emits in Go's order.
 #[must_use]
 pub fn early_emit_options_allow() -> bool {
     let options = options();
@@ -316,8 +318,8 @@ pub fn early_emit_options_allow() -> bool {
 }
 
 /// The program file part of `emit_can_start_with_check`: F1, F2 and F3.
-/// It reads every program file, so `start_check_and_emit` runs it after it
-/// sent the check.
+/// It reads every program file, so `start_emit` runs it after
+/// `start_check` sent the check.
 #[must_use]
 pub fn check_cannot_see_outputs() -> bool {
     let options = options();

@@ -3,9 +3,10 @@
 # change, not the source.
 #
 # Default (the shipped build): dynamic glibc with jemalloc as the allocator
-# (default cargo feature `jemalloc`; the bins set
-# _RJEM_MALLOC_CONF=narenas:4,thp:always,metadata_thp:always, see
-# bin/goport.rs `set_malloc_tunables`). The bins link against glibc 2.28, so
+# (default cargo feature `jemalloc`; jemalloc has
+# narenas:4,thp:always,metadata_thp:always built in through
+# .cargo/config.toml JEMALLOC_SYS_WITH_MALLOC_CONF, see bin/goport.rs
+# `set_malloc_tunables`; step 4 checks it). The bins link against glibc 2.28, so
 # they start on any x86-64 Linux with glibc 2.28 or later (Debian 10, RHEL 8,
 # Ubuntu 20.04 and later).
 # RELEASE_STATIC=1: static glibc with glibc malloc, for comparison.
@@ -91,7 +92,8 @@
 #   - Each run trains PGO and BOLT again. Do not reuse a profile after a
 #     source change: a stale profile only makes rustc or BOLT warn.
 #   - The BOLT runs of a jemalloc build set _RJEM_MALLOC_CONF to the
-#     JEMALLOC_CONF line of the bin source, so the bin does not exec itself.
+#     JEMALLOC_CONF line of the bin source, so the bin does not exec itself
+#     even when its jemalloc lacks the built-in value.
 #     The glibc tunables depend on the core count (ThreadBudget in
 #     program.rs), so glibc bins exec themselves under perf. The perf2bolt
 #     check below fails when the samples do not map to the bin.
@@ -304,6 +306,18 @@ if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; th
   exit 1
 fi
 use="$out/target-use/$host/goport"
+# jemalloc: the bins do not exec themselves at start when jemalloc has their
+# JEMALLOC_CONF built in (.cargo/config.toml). jemalloc prints the built-in
+# value (config.malloc_conf) with its exit stats.
+if [[ $jemalloc == 1 ]]; then
+  conf="$(malloc_env tsgo)"
+  conf="${conf#_RJEM_MALLOC_CONF=}"
+  stats="$(_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:mdablxe "$use/tsgo" --version 2>&1 || true)"
+  if [[ -z $conf || $stats != *"config.malloc_conf: \"$conf\""* ]]; then
+    echo "error: the jemalloc of $use/tsgo does not have \"$conf\" built in; .cargo/config.toml JEMALLOC_SYS_WITH_MALLOC_CONF must equal JEMALLOC_CONF in bin/tsgo.rs" >&2
+    exit 1
+  fi
+fi
 if [[ $static == 1 ]] && readelf -d "$use/tsgo" | grep -q NEEDED; then
   echo "error: $use/tsgo still loads shared libraries" >&2
   exit 1
@@ -487,7 +501,7 @@ done
   else
     echo "static glibc: 0, glibc floor $glibc_floor, sysroot $glibc_root"
   fi
-  echo "allocator: $([[ $jemalloc == 1 ]] && echo "jemalloc, $(malloc_env tsgo)" || echo "glibc malloc")"
+  echo "allocator: $([[ $jemalloc == 1 ]] && echo "jemalloc, built-in $(malloc_env tsgo)" || echo "glibc malloc")"
   echo "cargo feature args: ${feature_args[*]:-none}"
   if [[ $bolt == 1 ]]; then
     echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"

@@ -1,6 +1,7 @@
 use crate::ls::lsutil::prelude::*;
 
 use crate::flags_macros::go_enum;
+use crate::gostd::unicode;
 
 // Port of Go `ls/lsutil/formatcodeoptions.go`.
 
@@ -162,12 +163,9 @@ pub fn get_default_format_code_settings() -> FormatCodeSettings {
     }
 }
 
-// PORT: Go `strings.ToLower` maps each rune with the simple (one rune)
-// `unicode.ToLower`. The first char of Rust `char::to_lowercase` is that
-// mapping (U+0130 is the only multi-char case, and it starts with 'i'). Rust
-// `str::to_lowercase` also applies the final-sigma rule, which Go does not.
+// PORT: Go `strings.ToLower` maps each rune with `unicode.ToLower`. Rust
+// `str::to_lowercase` uses the full mapping of a newer Unicode and the
+// final-sigma rule, which Go does not.
 fn strings_to_lower(s: &str) -> String {
-    s.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+    s.chars().map(unicode::to_lower).collect()
 }

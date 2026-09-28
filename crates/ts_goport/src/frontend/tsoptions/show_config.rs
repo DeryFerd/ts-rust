@@ -402,7 +402,7 @@ fn serialize_compiler_options(
 
         match option_decl.kind {
             CommandLineOptionKind::LIST_OR_ELEMENT => {
-                debug_assert!(false, "listOrElement option should not reach serialization");
+                crate::go_assert!(false, "listOrElement option should not reach serialization");
             }
             CommandLineOptionKind::LIST => {
                 let elem = option_decl.elements();

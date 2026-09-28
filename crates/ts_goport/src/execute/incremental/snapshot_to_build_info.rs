@@ -72,7 +72,9 @@ struct ToBuildInfo<'a> {
     build_info_directory: String,
     compare_paths_options: ComparePathsOptions,
     file_name_to_file_id: FxHashMap<String, BuildInfoFileId>,
-    file_names_to_file_id_list_id: FxHashMap<String, BuildInfoFileIdListId>,
+    // PORT: Go keys this map by the ids joined with ","; the sorted id list
+    // is the same key without the text.
+    file_names_to_file_id_list_id: FxHashMap<Vec<BuildInfoFileId>, BuildInfoFileIdListId>,
     roots: IndexMap<Node, Path>,
 }
 
@@ -111,23 +113,18 @@ impl ToBuildInfo<'_> {
         let mut file_ids: Vec<BuildInfoFileId> =
             set.iter().map(|path| self.to_file_id(path)).collect();
         file_ids.sort();
-        let key = file_ids
-            .iter()
-            .map(|id| id.0.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
 
         let mut file_id_list_id = self
             .file_names_to_file_id_list_id
-            .get(&key)
+            .get(&file_ids)
             .copied()
             .unwrap_or_default();
         if file_id_list_id.0 == 0 {
             let file_ids_list = self.build_info.file_ids_list.get_or_insert_with(Vec::new);
-            file_ids_list.push(file_ids);
+            file_ids_list.push(file_ids.clone());
             file_id_list_id = BuildInfoFileIdListId(file_ids_list.len() as i32);
             self.file_names_to_file_id_list_id
-                .insert(key, file_id_list_id);
+                .insert(file_ids, file_id_list_id);
         }
         file_id_list_id
     }
@@ -303,21 +300,31 @@ impl ToBuildInfo<'_> {
                 .file_infos
                 .get(&file_path)
                 .expect("file info of a program file");
+            // PERF: the check below computes the relative path of the file
+            // again. When `to_file_id` makes the id here, it stores that
+            // path or the lib name, which the check accepts, so only an id
+            // made before is checked (none today: program paths are unique
+            // and this is the first `to_file_id` caller). effect: about 650
+            // files.
+            let made_before = self.file_name_to_file_id.contains_key(file_path.as_str());
             let file_id = self.to_file_id(&file_path);
             //  tryAddRoot(key, fileId);
-            let stored_name = self.build_info.file_names.as_ref().expect("fileNames")
-                [(file_id.0 - 1) as usize]
-                .clone();
-            if stored_name != self.relative_to_build_info(&file_path) {
-                let lib_file = get_default_lib_file(&file_path);
-                if lib_file.is_none_or(|lib_file| lib_file.replaced || stored_name != lib_file.name)
-                {
-                    panic!(
-                        "File name at index {} does not match expected relative path or libName: {} != {}",
-                        file_id.0 - 1,
-                        stored_name,
-                        self.relative_to_build_info(&file_path)
-                    );
+            if made_before {
+                let stored_name = self.build_info.file_names.as_ref().expect("fileNames")
+                    [(file_id.0 - 1) as usize]
+                    .clone();
+                if stored_name != self.relative_to_build_info(&file_path) {
+                    let lib_file = get_default_lib_file(&file_path);
+                    if lib_file
+                        .is_none_or(|lib_file| lib_file.replaced || stored_name != lib_file.name)
+                    {
+                        panic!(
+                            "File name at index {} does not match expected relative path or libName: {} != {}",
+                            file_id.0 - 1,
+                            stored_name,
+                            self.relative_to_build_info(&file_path)
+                        );
+                    }
                 }
             }
             if snapshot.options.composite.is_true()

@@ -241,7 +241,7 @@ impl FormattingScanner {
     // PORT: Go returns the struct by value (the trivia slices are shared);
     // this returns a clone.
     pub fn read_token_info(&mut self, n: Node) -> TokenInfo {
-        debug_assert!(self.is_on_token());
+        crate::go_assert!(self.is_on_token());
 
         // normally scanner returns the smallest available token
         // check the kind of context node to determine if scanner should have more greedy behavior and consume more text.
@@ -326,7 +326,7 @@ impl FormattingScanner {
                 if token == SyntaxKind::GreaterThanToken {
                     self.last_scan_action = ScanAction::ACTION_RESCAN_GREATER_THAN_TOKEN;
                     let new_token = self.s.re_scan_greater_than_token();
-                    debug_assert!(n.kind() == new_token);
+                    crate::go_assert!(n.kind() == new_token);
                     return new_token;
                 }
             }
@@ -335,7 +335,7 @@ impl FormattingScanner {
                     self.last_scan_action = ScanAction::ACTION_RESCAN_SLASH_TOKEN;
                     // PORT: Go `ReScanSlashToken()` with no argument reports no errors.
                     let new_token = self.s.re_scan_slash_token(false);
-                    debug_assert!(n.kind() == new_token);
+                    crate::go_assert!(n.kind() == new_token);
                     return new_token;
                 }
             }
@@ -358,16 +358,17 @@ impl FormattingScanner {
                 return self.s.re_scan_jsx_attribute_value();
             }
             ScanAction::ACTION_SCAN => {}
-            _ => {
-                debug_assert!(false, "unhandled scan action kind");
-            }
+            _ => crate::gostd::debug::assert_never(
+                &expected_scan_action.0.to_string(),
+                Some("unhandled scan action kind"),
+            ),
         }
         token
     }
 
     // Go: format/scanner.go:294 readEOFTokenRange
     pub fn read_eof_token_range(&self) -> TextRangeWithKind {
-        debug_assert!(self.is_on_eof());
+        crate::go_assert!(self.is_on_eof());
         new_text_range_with_kind(
             self.s.token_full_start(),
             self.s.token_end(),

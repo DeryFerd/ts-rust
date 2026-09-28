@@ -31,7 +31,7 @@ pub fn get_rules(context: &mut FormattingContext, rules: &mut Vec<Arc<RuleImpl>>
 
 // Go: format/rulesmap.go:34 getRuleBucketIndex
 pub fn get_rule_bucket_index(row: SyntaxKind, column: SyntaxKind) -> i32 {
-    debug_assert!(
+    crate::go_assert!(
         row as u16 <= SyntaxKind::LAST_KEYWORD as u16
             && column as u16 <= SyntaxKind::LAST_KEYWORD as u16,
         "Must compute formatting context from tokens"
@@ -181,7 +181,7 @@ pub fn get_rule_insertion_index(mut index_bitmap: i32, mask_position: RulesPosit
 // Go: format/rulesmap.go:152 increaseInsertionIndex
 pub fn increase_insertion_index(index_bitmap: i32, mask_position: RulesPosition) -> i32 {
     let value = ((index_bitmap >> mask_position.0) & MASK) + 1;
-    debug_assert!(
+    crate::go_assert!(
         (value & MASK) == value,
         "Adding more rules into the sub-bucket than allowed. Maximum allowed is 32 rules."
     );
