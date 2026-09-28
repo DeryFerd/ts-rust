@@ -15,13 +15,19 @@ The script mirrors these Go files (pinned dc37b5249, /home/theo/.explore/repos/m
 
 Upstream pins (UPSTREAM.json, scripts/upstream/pin.py): with GOPORT_PIN=<key> the tool runs itself
 again under `pin.py exec`, so the default oracle, Go checkout and traces/ show that pin's files (traces/
-is a pin cache; golden/ is keyed by the oracle anyway). The O pin dc37b5249ab6 speaks protocol 1, every
-later pin protocol 2 (Go changed the API in bump A):
+is a pin cache; golden/ is keyed by the oracle anyway). The O pin dc37b5249ab6 speaks protocol 1, the
+bump A pin 52168999f3dc protocol 2, every later pin protocol 3. Protocol 2 (Go changed the API in bump A):
   - updateSnapshot takes openProjects: [config] (tsgo#4402), not openProject;
   - the type, symbol and signature property requests (objectId) need a project (tsgo#4341:
     GetTypePropertyParams, GetSymbolPropertyParams, GetSignaturePropertyParams);
   - internal symbol names come escaped (ast.EscapeSymbolName): "__@iterator@<id>", not "\ufffd@...".
-`build` writes protocol 2 traces and normalization reads the escaped names only in a protocol 2 run.
+Protocol 3 (bump B, 16c25522e123) adds to protocol 2:
+  - the per-file diagnostics requests take files: [file] (tsgo#4552: GetDiagnosticsParams.Files). Go ignores
+    the old "file" field there and answers for the whole program.
+  The other API changes up to 16c25522e123 keep the requests of `build`: new methods only (transpile*
+  tsgo#4849, emit, getSymbolsInScope, ...), the language service methods keep their wire names (tsgo#4893
+  moves them only in the TS client), and tsgo#4915 adds only generator comments and tags.
+`build` writes traces of the run's protocol. Normalization reads the escaped names from protocol 2 on.
 Build the traces at each pin: they hold positions from the pin's encoded AST (UTF-16 offsets after the
 O pin, UTF-8 at O; they differ in files with non-ASCII text). With GOPORT_PIN unset the run uses the
 current pin of UPSTREAM.json.
@@ -117,6 +123,7 @@ SUMMARY_FORMAT = "goport-api-summary/1"
 REPO = "/home/theo/Code/sandbox/ts-rust"
 PIN_TOOL = REPO + "/scripts/upstream/pin.py"
 O_PIN = "dc37b5249ab6"  # the last pin with API protocol 1
+A_PIN = "52168999f3dc"  # the last pin with API protocol 2
 
 
 def run_pin():
@@ -132,7 +139,8 @@ def run_pin():
 
 
 PIN = run_pin()
-PROTOCOL2 = PIN != O_PIN
+PROTOCOL = 1 if PIN == O_PIN else 2 if PIN == A_PIN else 3
+PROTOCOL2 = PROTOCOL >= 2
 DEFAULT_OUT_ROOT = REPO + "/target/continuation-r97-goport/tests2/api"
 DEFAULT_ORACLE = os.path.expanduser("~/.local/bin/tsgo-oracle")
 GO_REPO = "/home/theo/.explore/repos/microsoft__typescript-go"
@@ -1932,6 +1940,11 @@ class TraceBuilder:
         return {"snapshot": "@SNAPSHOT@", "project": kw.pop("project", "@PROJECT@"), **kw}
 
     @staticmethod
+    def diag(file):
+        """Params of a per-file diagnostics request. Protocol 3 sends a file list (tsgo#4552)."""
+        return TraceBuilder.ck(files=[file]) if PROTOCOL >= 3 else TraceBuilder.ck(file=file)
+
+    @staticmethod
     def obj(project="@PROJECT@"):
         """Params of an objectId request (a type, symbol or signature property). Protocol 2 needs the project."""
         return {"snapshot": "@SNAPSHOT@", "project": project} if PROTOCOL2 else {"snapshot": "@SNAPSHOT@"}
@@ -2156,7 +2169,7 @@ def file_trace(preset, rel, s: FileSamples, caps, apath):
     tb.req("getSourceFile", ck(file=file))
     for m in ("getSyntacticDiagnostics", "getSemanticDiagnostics", "getSuggestionDiagnostics",
               "getDeclarationDiagnostics"):
-        tb.req(m, ck(file=file))
+        tb.req(m, tb.diag(file))
     string_type = (tb.req("getStringType", ck()), "")
     h = lambda i: s.handle(i, apath)  # noqa: E731
     prev_type = None
@@ -2356,7 +2369,7 @@ def changes_trace(preset, battery, files):
 
     def probe(file, position):
         tb.req("getSourceFile", ck(file=file))
-        tb.req("getSemanticDiagnostics", ck(file=file))
+        tb.req("getSemanticDiagnostics", tb.diag(file))
         t = tb.req("getTypeAtPosition", ck(file=file, position=position))
         tb.req("typeToString", ck(), {"event": t, "pointer": "/id", "into": "/type"})
 
@@ -2394,7 +2407,7 @@ def lsp_trace(preset, battery, files, samples):
     ck = tb.ck
     tb.req("getDefaultProjectForFile", {"snapshot": "@SNAPSHOT@", "file": file})
     tb.req("getSourceFile", ck(file=file))
-    tb.req("getSemanticDiagnostics", ck(file=file))
+    tb.req("getSemanticDiagnostics", tb.diag(file))
     for i, pos in s.ids[:4]:
         a = tb.req("getSymbolAtPosition", ck(file=file, position=pos))
         tb.req("getTypeOfSymbol", ck(), {"event": a, "pointer": "/id", "into": "/symbol"})
