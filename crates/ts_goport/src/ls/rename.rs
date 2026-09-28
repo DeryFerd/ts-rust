@@ -4,6 +4,10 @@
 //! checker lease `ch, done := program.GetTypeChecker(ctx)` is
 //! `ls_program::get_type_checker`, with `done` kept alive to the end of the
 //! scope (Go `defer done()`).
+//! PORT: `symbolAndEntriesToRename` and what it calls are generic over the
+//! program (`ProgramView`, program_view.rs) so that a cross-project rename
+//! can run them on a search thread; there the lease is
+//! `ProgramView::get_type_checker`.
 
 use crate::ls::prelude::*;
 
@@ -38,6 +42,7 @@ impl LanguageService {
             params,
             orchestrator,
             LanguageService::symbol_and_entries_to_rename,
+            Some(start_search::<RenameSearch>),
             combine_rename_response,
             true,  /*isRename*/
             false, /*implementations*/
@@ -70,7 +75,9 @@ impl LanguageService {
         }
         get_rename_info_error(ctx, diag::You_cannot_rename_this_element)
     }
+}
 
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/rename.go:62 symbolAndEntriesToRename
     pub fn symbol_and_entries_to_rename(
         &self,
@@ -109,7 +116,7 @@ impl LanguageService {
         // is random, so the IndexMap keeps first-insert order.
         let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
         // Go: `defer done()`; `_done` releases the lease at the end of the scope.
-        let (checker, _done) = ls_program::get_type_checker(program, ctx);
+        let (checker, _done) = program.get_type_checker(ctx);
         let ch = &mut *checker.borrow_mut();
 
         let quote_preference = lsutil::get_quote_preference(source_file, &self.user_preferences());
@@ -157,10 +164,10 @@ impl LanguageService {
         new_name: &str,
         node: Node,
         source_file: Node,
-        program: &'static compiler::NewProgram,
+        program: P,
     ) -> (RenameInfo, bool) {
         // Go: `defer done()`; `_done` releases the lease at the end of the scope.
-        let (checker, _done) = ls_program::get_type_checker(program, ctx);
+        let (checker, _done) = program.get_type_checker(ctx);
         let ch = &mut *checker.borrow_mut();
 
         let symbol = ch.get_symbol_at_location_exported(node);
@@ -227,6 +234,25 @@ impl LanguageService {
     }
 }
 
+/// `ProvideRename` as a `CrossProjectSearch`: its searches in other projects
+/// run on search threads.
+pub struct RenameSearch;
+
+impl CrossProjectSearch for RenameSearch {
+    type Req = lsproto::RenameParams;
+    type Resp = lsproto::WorkspaceEditOrNull;
+
+    fn to_resp<P: ProgramView>(
+        ls: &LanguageService<P>,
+        ctx: &Context,
+        params: &Self::Req,
+        data: SymbolAndEntriesData,
+        options: SymbolEntryTransformOptions,
+    ) -> Result<Self::Resp, GoError> {
+        ls.symbol_and_entries_to_rename(ctx, params, data, options)
+    }
+}
+
 // Go: ls/rename.go:144 nodeIsEligibleForRename
 pub fn node_is_eligible_for_rename(node: Node) -> bool {
     match node.kind() {
@@ -240,7 +266,7 @@ pub fn node_is_eligible_for_rename(node: Node) -> bool {
     }
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/rename.go:161 renameBlockedReason
     // renameBlockedReason returns a non-nil diagnostic message if the rename should be blocked
     // because the symbol is a library definition, a default keyword, or would cross node_modules boundaries.
@@ -250,7 +276,7 @@ impl LanguageService {
         node: Node,
         symbol: SymbolId,
         ch: &mut Checker,
-        program: &'static compiler::NewProgram,
+        program: P,
     ) -> Option<&'static Message> {
         for &declaration in ch.sym(symbol).declarations.iter() {
             if is_defined_in_library_file(program, declaration) {
@@ -282,10 +308,7 @@ impl LanguageService {
 
 // Go: ls/rename.go:181 isDefinedInLibraryFile
 // isDefinedInLibraryFile checks if a declaration is from a default library file (e.g., lib.d.ts).
-pub fn is_defined_in_library_file(
-    program: &'static compiler::NewProgram,
-    declaration: Node,
-) -> bool {
+pub fn is_defined_in_library_file<P: ProgramView>(program: P, declaration: Node) -> bool {
     let decl_source_file = get_source_file_of_node(declaration);
     program.is_source_file_default_library(&tspath::Path(
         source_file_info(decl_source_file).path.clone(),
@@ -377,7 +400,7 @@ pub fn client_supports_rename_resource_operations(ctx: &Context) -> bool {
         .contains(&lsproto::ResourceOperationKind::RENAME)
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/rename.go:235 getRenameInfoForModule
     // getRenameInfoForModule handles rename validation for module specifiers.
     // PORT: Go reads `moduleSymbol.Declarations` without a checker; the

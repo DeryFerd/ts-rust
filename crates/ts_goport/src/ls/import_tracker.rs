@@ -17,7 +17,6 @@ use crate::ls::prelude::*;
 //   parameter is `&ExportInfo`.
 
 use crate::flags_macros::go_enum;
-use crate::frontend::compiler;
 use crate::frontend::tspath;
 use crate::gostd::Context;
 use std::rc::Weak;
@@ -101,9 +100,9 @@ pub struct ModuleReference {
 // search). It takes the checker as its first argument.
 // PERF: the map comes from `get_direct_imports_map_cached`, which reuses the
 // map of an earlier search with the same checker.
-pub fn create_import_tracker<'a>(
+pub fn create_import_tracker<'a, P: ProgramView>(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: P,
     source_files: &'a [Node],
     source_files_set: &'a FxHashSet<String>,
     checker: &mut Checker,
@@ -140,9 +139,9 @@ pub fn create_import_tracker<'a>(
 
 // Go: ls/importTracker.go:84 getDirectImportsMap
 // Returns a map from a module symbol to all import statements that directly reference the module
-pub fn get_direct_imports_map(
+pub fn get_direct_imports_map<P: ProgramView>(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: P,
     source_files: &[Node],
     checker: &mut Checker,
 ) -> FxHashMap<SymbolId, Vec<Node>> {
@@ -168,15 +167,17 @@ pub fn get_direct_imports_map(
 /// A direct imports map that `get_direct_imports_map_cached` keeps for one
 /// checker of one program.
 struct CachedDirectImportsMap {
-    program: &'static compiler::NewProgram,
+    /// `ProgramView::identity` of the program.
+    program: usize,
     /// The checker's `identity_relation` (see `get_direct_imports_map_cached`).
     checker: Weak<RefCell<crate::checker::Relation>>,
     map: Rc<FxHashMap<SymbolId, Vec<Node>>>,
 }
 
 thread_local! {
-    // PORT: every language service request runs on the dispatch thread, and
-    // checkers are not shared between threads.
+    // PORT: a checker stays on the thread that made it: the dispatch thread
+    // or a cross-project search thread (search_thread.rs). Each thread keeps
+    // the maps of its own checkers.
     static DIRECT_IMPORTS_MAPS: RefCell<Vec<CachedDirectImportsMap>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -200,19 +201,14 @@ thread_local! {
 // Rc instead, which only `Checker::new` makes. The `Weak` keeps that address from being
 // used again, and its strong count is 0 after the checker is dropped. The
 // maps of dropped checkers are removed at the next call.
-fn get_direct_imports_map_cached(
+fn get_direct_imports_map_cached<P: ProgramView>(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: P,
     source_files: &[Node],
     checker: &mut Checker,
 ) -> Rc<FxHashMap<SymbolId, Vec<Node>>> {
-    let program_files = program.get_source_files();
-    let all_program_files = ctx.err().is_none()
-        && source_files.len() == program_files.len()
-        && source_files
-            .iter()
-            .zip(program_files)
-            .all(|(&file, parsed)| file == parsed.root);
+    let all_program_files =
+        ctx.err().is_none() && source_files == program.source_file_roots().as_slice();
     if !all_program_files {
         return Rc::new(get_direct_imports_map(ctx, program, source_files, checker));
     }
@@ -222,7 +218,7 @@ fn get_direct_imports_map_cached(
         maps.retain(|entry| entry.checker.strong_count() != 0);
         maps.iter()
             .find(|entry| {
-                std::ptr::eq(entry.program, program)
+                entry.program == program.identity()
                     && std::ptr::eq(entry.checker.as_ptr(), checker_key)
             })
             .map(|entry| Rc::clone(&entry.map))
@@ -234,7 +230,7 @@ fn get_direct_imports_map_cached(
     if ctx.err().is_none() {
         DIRECT_IMPORTS_MAPS.with(|maps| {
             maps.borrow_mut().push(CachedDirectImportsMap {
-                program,
+                program: program.identity(),
                 checker: Rc::downgrade(&checker.identity_relation),
                 map: Rc::clone(&map),
             });
@@ -247,18 +243,18 @@ fn get_direct_imports_map_cached(
 // Calls `action` for each import, re-export, or require() in a file
 // PORT: Go `sourceFile.Path()` is the installed program's path of the file
 // (`source_file_info(file).path`).
-pub fn for_each_import(
-    program: &'static compiler::NewProgram,
+pub fn for_each_import<P: ProgramView>(
+    program: P,
     source_file: Node,
     action: &mut dyn FnMut(Node, Node), /*importStatement, imported*/
 ) {
     let mut implicit_imports: Vec<Node> = Vec::new();
     let source_file_path = tspath::Path(source_file_info(source_file).path.clone());
-    let (_, jsx_specifier) = program.get_jsx_runtime_import_specifier(&source_file_path);
+    let jsx_specifier = program.jsx_runtime_import_specifier(&source_file_path);
     if jsx_specifier.is_some() {
         implicit_imports.push(jsx_specifier);
     }
-    let import_helpers_specifier = program.get_import_helpers_import_specifier(&source_file_path);
+    let import_helpers_specifier = program.import_helpers_import_specifier(&source_file_path);
     if import_helpers_specifier.is_some() {
         implicit_imports.push(import_helpers_specifier);
     }
@@ -1202,11 +1198,11 @@ pub fn symbol_name_no_default(symbols: &SymbolArena, symbol: SymbolId) -> String
 // Go: ls/importTracker.go:716 findModuleReferences
 // findModuleReferences finds all references to a module symbol across the given source files.
 // This includes import statements, <reference> directives, and implicit references (e.g., JSX runtime imports).
-// PORT: Go passes the `*ast.SourceFile` to the program methods. `NewProgram`
-// takes its parsed file, found here by the file's path, or in another
-// program that has the file (`ls_program::parsed_source_file`).
-pub fn find_module_references(
-    program: &'static compiler::NewProgram,
+// PORT: the `<reference path>` and `<reference types>` checks read the
+// program's parsed file; they are `ProgramView::references_to_file`
+// (program_view.rs), in the same order.
+pub fn find_module_references<P: ProgramView>(
+    program: P,
     source_files: &[Node],
     search_module_symbol: SymbolId,
     checker: &mut Checker,
@@ -1216,46 +1212,14 @@ pub fn find_module_references(
     for &referencing_file in source_files {
         let search_source_file = checker.sym(search_module_symbol).value_declaration;
         if search_source_file.is_some() && search_source_file.kind() == SyntaxKind::SourceFile {
-            let referencing_parsed_file = program
-                .get_source_file_by_path(&tspath::Path(
-                    source_file_info(referencing_file).path.clone(),
-                ))
-                .filter(|parsed| parsed.root == referencing_file)
-                .or_else(|| ls_program::parsed_source_file(referencing_file))
-                .expect("invalid memory address or nil pointer dereference");
-
-            // Check <reference path> directives
-            for ref_ in &referencing_parsed_file.referenced_files {
-                if program
-                    .get_source_file_from_reference(&referencing_parsed_file, ref_)
-                    .is_some_and(|file| file.root == search_source_file)
-                {
-                    refs.push(ModuleReference {
-                        kind: ModuleReferenceKind::REFERENCE,
-                        literal: Node::NIL,
-                        referencing_file,
-                        ref_: Some(ref_.clone()),
-                    });
-                }
-            }
-
-            // Check <reference types> directives
-            for ref_ in &referencing_parsed_file.type_reference_directives {
-                let referenced = program
-                    .get_resolved_type_reference_directive_from_type_reference_directive(
-                        ref_,
-                        &referencing_parsed_file,
-                    );
-                if referenced.is_some_and(|referenced| {
-                    referenced.resolved_file_name == source_file_file_name(search_source_file)
-                }) {
-                    refs.push(ModuleReference {
-                        kind: ModuleReferenceKind::REFERENCE,
-                        literal: Node::NIL,
-                        referencing_file,
-                        ref_: Some(ref_.clone()),
-                    });
-                }
+            // Check <reference path> directives, then <reference types> directives
+            for ref_ in program.references_to_file(referencing_file, search_source_file) {
+                refs.push(ModuleReference {
+                    kind: ModuleReferenceKind::REFERENCE,
+                    literal: Node::NIL,
+                    referencing_file,
+                    ref_: Some(ref_),
+                });
             }
         }
 
