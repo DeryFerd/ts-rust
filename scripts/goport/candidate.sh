@@ -357,6 +357,8 @@ side_unit() {
     ll=$(free_name "$R/ls-oracle/battery/results" "lsp-$label") rc=0
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
     remote_sync
+    # The goldens of this oracle (golden/<oracle sha256 prefix>) are not in every host mirror (R131: cup2).
+    [[ $host == local ]] || run_sh "scripts/goport/remote.sh push $host $R/ls-oracle/battery/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
     say "$(date -u +%FT%TZ) LSP oracle $ll on $host"
     l="cd target/worktrees/goport-int7 && python3 scripts/goport/lsp_oracle.py check --out-root $R/ls-oracle/battery"
     l+=" --battery $LSP_BATTERIES --goport $B/tsgo --oracle $oracle --label $ll --jobs 12"
