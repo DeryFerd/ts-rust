@@ -53,10 +53,11 @@
 //! - Tier 1 (`LATER`) holds every later publish (edited files, other
 //!   programs). One slot per id points at the `Frozen` of its publish.
 //! - Every read of a published store goes through one inline lookup
-//!   (`frozen_of`): tier 0 first, then the tier 1 slot of the id. So the hot
-//!   node reads in `node.rs` and the perf columns (kinds, names, modifier
-//!   bits, children, links, facts) answer for the nodes of a later program
-//!   too, and return `None` on a miss.
+//!   (`frozen_of`): tier 0 first, then the tier 1 slot of the id, in a cold
+//!   block so a one-program process keeps the tier 0 code layout. So the
+//!   hot node reads in `node.rs` and the perf columns (kinds, names,
+//!   modifier bits, children, links, facts) answer for the nodes of a later
+//!   program too, and return `None` on a miss.
 //! - After a registry miss, a synthetic id has no store (a few compares, no
 //!   call). Any other id takes one cold call: the detached store, then the
 //!   build stores of this thread.
@@ -822,12 +823,24 @@ static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
 // (the chunk and the slot of its id) than a node of the first program, not
 // two out-of-line calls and a closure. Before M3 the perf columns also
 // missed for such a node, so its reads took the slow paths in `node.rs`.
-#[inline]
+// `inline(always)`: in `frozen_of` it is in a cold block, where LLVM
+// inlines less.
+#[inline(always)]
 fn later(file: usize) -> Option<(&'static Frozen, usize)> {
     let chunk = LATER.get(file / LATER_CHUNK)?.get()?;
     let frozen: &'static Frozen = *chunk[file % LATER_CHUNK].get()?;
     Some((frozen, file - frozen.base))
 }
+
+/// Marks the tier 1 part of `frozen_of` as cold. It does nothing.
+// PERF: rustc gives a branch into a block that calls a `#[cold]` function
+// a low weight (`find_cold_blocks`), and LLVM puts that block after the hot
+// code. `std::hint::cold_path` does the same, but is stable only from Rust
+// 1.95. `inline(never)` keeps the call in the MIR until codegen reads it;
+// LLVM can then drop the call, as it has no effect.
+#[cold]
+#[inline(never)]
+fn later_publish_path() {}
 
 /// The one file lookup of the registry reads (PORTING.md "AST": store
 /// columns are read through one helper): for published store file `file`,
@@ -835,10 +848,17 @@ fn later(file: usize) -> Option<(&'static Frozen, usize)> {
 /// table that `table` picks. Tier 0 first, then tier 1 (`later`). `None`
 /// for any other file: unpublished, synthetic, provisional or legacy (a
 /// legacy publish has entries in `go_files` only).
-// PERF: M3. The tier 0 test is the bounds check of the picked table, so a
-// tier 0 read costs what it cost before tier 1 was read here (`goport -p`
-// never misses tier 0). The entry is found before the two tiers join, so
-// the caller indexes it with no second bounds check.
+// PERF: M3. The tier 0 test is the bounds check of the picked table. The
+// entry is found before the two tiers join, so the caller indexes it with
+// no second bounds check.
+// PERF: M3 `goport -p` cost (mp3). A one-program process never runs tier 1:
+// its only tier 0 misses are synthetic ids, which leave at the
+// `TIER1_LIMIT` compare. But tier 1 code inline in each hot read site made
+// `goport -p` 1.5% to 3.5% slower (more icache and branch misses, +0.3%
+// instructions; `mp2/m3.md`). So tier 1 is a cold block
+// (`later_publish_path`) that LLVM puts after the hot code. A later program
+// still reads tier 1 inline, with no call. A runtime "later publish" flag
+// would not help: it removes no code from the read sites.
 #[inline]
 fn frozen_of<T: 'static>(
     file: usize,
@@ -848,6 +868,12 @@ fn frozen_of<T: 'static>(
     if let Some(entry) = table(tier0).get(file) {
         return Some((tier0, file, entry));
     }
+    // A synthetic or provisional id is in no publish. It leaves here,
+    // outside the cold block.
+    if file >= TIER1_LIMIT {
+        return None;
+    }
+    later_publish_path();
     let (f, local) = later(file)?;
     Some((f, local, table(f).get(local)?))
 }
