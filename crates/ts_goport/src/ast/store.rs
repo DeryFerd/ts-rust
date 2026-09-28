@@ -184,11 +184,13 @@ struct FileStore {
     // drop them.
     lazy_jsdoc_cache: FxHashMap<Node, &'static [Node]>,
     /// Go `file.LanguageVariant`, the parse `file.Diagnostics()` and
-    /// `file.ContainsNonASCII` (Go `NewSourceFile` sets it from the text),
+    /// `file.ContainsNonASCII` (Go `NewSourceFile` set it from the text),
     /// written by `finishSourceFile`. Reads of a file that is not published
     /// use them (`ast::source_file_language_variant`,
-    /// `ast::source_file_diagnostics`, `ast::source_file_get_position_map`),
-    /// for example the format tests, which parse a file with no program.
+    /// `ast::source_file_diagnostics`), for example the format tests, which
+    /// parse a file with no program.
+    // PORT: Go removed `ContainsNonASCII` in tsgo#4776. It stays here until
+    // its last reader (`program/go_frontend.rs`) ports its part.
     language_variant: LanguageVariant,
     diagnostics: &'static [Diagnostic],
     contains_non_ascii: bool,
@@ -243,9 +245,9 @@ struct FileStore {
     /// (`SlotLinks::NONE`) when the slot is made and written by
     /// `StoreChildLinks` and `replace_store_node_data`.
     build_links: Vec<SlotLinks>,
-    /// Go parser `identifiers` (`internIdentifier`): the name and keyword
-    /// bit of each identifier text of this file, keyed by the interned text.
-    /// Dropped by the freeze.
+    /// The name and keyword bit of each identifier text of this file, keyed
+    /// by the interned text. Port only: Go stopped interning parser texts
+    /// (`internIdentifier`) in tsgo#4731. Dropped by the freeze.
     // PERF: one text hash per identifier node; the process-wide intern (a
     // shard `Mutex`) runs once per distinct text of the file.
     identifier_names: FxHashMap<&'static str, (Name, bool)>,
@@ -2814,8 +2816,8 @@ pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
     with_slot_mut(n, |h| h.flags = flags);
 }
 
-/// Go write to a data field of a node of an unfrozen file (reparser.go,
-/// `internIdentifier`). The new data replaces the old; the old node leaks.
+/// Go write to a data field of a node of an unfrozen file (reparser.go).
+/// The new data replaces the old; the old node leaks.
 /// The U1 and U4 build entries and the keyword bit of the slot follow the
 /// new data, and its R2-5 chain becomes unknown.
 pub fn replace_store_node_data(n: Node, data: NodeData) {

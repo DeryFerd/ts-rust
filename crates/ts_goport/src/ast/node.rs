@@ -5341,6 +5341,9 @@ thread_local! {
     /// Go `SourceFile.declarationMap`, computed once per file.
     static DECLARATION_MAPS: RefCell<FxHashMap<Node, &'static FxHashMap<String, Vec<Node>>>> =
         RefCell::new(FxHashMap::default());
+    /// Go `SourceFile.identifiers`, collected once per parsed file.
+    static IDENTIFIER_SETS: RefCell<FxHashMap<Node, &'static FxHashSet<&'static str>>> =
+        RefCell::new(FxHashMap::default());
 }
 
 // Go: ast.go:2566 (*SourceFile).Text
@@ -5353,6 +5356,47 @@ pub fn source_file_text(file: Node) -> &'static str {
         return file_store_text(file.file_index());
     }
     &file.go_file().legacy_source().source_text
+}
+
+// Go: ast.go:2687 (*SourceFile).HasIdentifier
+// PORT: Go `identifiersOnce` is a per-thread cache (`IDENTIFIER_SETS`) for a
+// parsed file, whose id is never reused. A factory SourceFile collects its
+// set on each call, because a released program frees its synthetic nodes
+// and a later node can get the same handle.
+#[must_use]
+pub fn source_file_has_identifier(file: Node, name: &str) -> bool {
+    if is_synthetic_node(file) {
+        return collect_identifiers_for_source_file(file).contains(name);
+    }
+    if let Some(identifiers) = IDENTIFIER_SETS.with(|c| c.borrow().get(&file).copied()) {
+        return identifiers.contains(name);
+    }
+    let identifiers: &'static FxHashSet<&'static str> =
+        Box::leak(Box::new(collect_identifiers_for_source_file(file)));
+    IDENTIFIER_SETS.with(|c| c.borrow_mut().insert(file, identifiers));
+    identifiers.contains(name)
+}
+
+// Go: ast.go:2694 collectIdentifiersForSourceFile
+fn collect_identifiers_for_source_file(source_file: Node) -> FxHashSet<&'static str> {
+    fn collect(node: Node, identifiers: &mut FxHashSet<&'static str>) -> bool {
+        match node.kind() {
+            SyntaxKind::Identifier
+            | SyntaxKind::PrivateIdentifier
+            | SyntaxKind::StringLiteral
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::BigIntLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral => {
+                identifiers.insert(node.text());
+            }
+            _ => {}
+        }
+        node.for_each_child(|child| collect(child, identifiers));
+        false
+    }
+    let mut identifiers = FxHashSet::default();
+    collect(source_file, &mut identifiers);
+    identifiers
 }
 
 // Go: ast.go:2570 (*SourceFile).FileName
@@ -5466,30 +5510,12 @@ pub fn source_file_is_bound(file: Node) -> bool {
 
 // Go: ast.go:2756 (*SourceFile).GetPositionMap
 // PORT: Go `positionMapOnce` is a per-thread cache (`POSITION_MAPS`).
-// `file.ContainsNonASCII` is in the store before the program is installed
-// (see `source_file_language_variant`) and in `SourceFileInfo` after. A
-// factory SourceFile does not keep the flag (see `SyntheticSourceFileData`),
-// so it reads its text, as Go `NewSourceFile` does.
 #[must_use]
 pub fn source_file_get_position_map(file: Node) -> &'static PositionMap {
     if let Some(map) = POSITION_MAPS.with(|c| c.borrow().get(&file).copied()) {
         return map;
     }
-    let contains_non_ascii = if is_synthetic_node(file) {
-        !source_file_text(file).is_ascii()
-    } else if is_file_store_before_program(file.file_index()) {
-        file_store_contains_non_ascii(file.file_index())
-    } else {
-        source_file_info(file).contains_non_ascii
-    };
-    let map = if contains_non_ascii {
-        compute_position_map(source_file_text(file))
-    } else {
-        PositionMap {
-            ascii_only: true,
-            ..PositionMap::default()
-        }
-    };
+    let map = compute_position_map(source_file_text(file));
     let map: &'static PositionMap = Box::leak(Box::new(map));
     POSITION_MAPS.with(|c| c.borrow_mut().insert(file, map));
     map

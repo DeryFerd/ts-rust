@@ -518,7 +518,14 @@ impl Parser {
         // We don't parse the name here in await context, instead we will report a grammar error in the checker.
         let name = self.parse_name_of_class_declaration_or_expression();
         let type_parameters = self.parse_type_parameters();
-        if modifiers.is_some() && modifiers.nodes().iter().any(is_export_modifier) {
+        if modifiers.is_some()
+            && self.parsing_contexts & (1 << (ParsingContext::SourceElements as i32)) != 0
+            && self.parsing_contexts
+                & ((1 << (ParsingContext::BlockStatements as i32))
+                    | (1 << (ParsingContext::SwitchClauseStatements as i32)))
+                == 0
+            && modifiers.nodes().iter().any(is_export_modifier)
+        {
             self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true /*value*/);
         }
         let heritage_clauses = self.parse_heritage_clauses();
@@ -1256,7 +1263,7 @@ impl Parser {
             keyword = SyntaxKind::GlobalKeyword;
         } else {
             // parse string literal
-            name = self.parse_literal_expression(true /*intern*/);
+            name = self.parse_literal_expression();
         }
         let mut body = Node::NIL;
         if self.token == SyntaxKind::OpenBraceToken {
@@ -1462,6 +1469,7 @@ impl Parser {
         }
         self.parse_entity_name(
             false, /*allowReservedWords*/
+            false, /*allowPrivateName*/
             None,  /*diagnosticMessage*/
         )
     }
@@ -1483,7 +1491,7 @@ impl Parser {
     // Go: parser/parser.go:2327 parseModuleSpecifier
     pub fn parse_module_specifier(&mut self) -> Node {
         if self.token == SyntaxKind::StringLiteral {
-            return self.parse_literal_expression(true /*intern*/);
+            return self.parse_literal_expression();
         }
         // We allow arbitrary expressions here, even though the grammar only allows string
         // literals.  We check to ensure that it is only a string literal later in the grammar
@@ -1692,7 +1700,7 @@ impl Parser {
         let mut name_ok = true;
 
         if self.token == SyntaxKind::StringLiteral {
-            return (self.parse_literal_expression(false /*intern*/), name_ok);
+            return (self.parse_literal_expression(), name_ok);
         }
         if disallow_keywords && is_keyword(self.token) && !self.is_identifier() {
             name_ok = false;

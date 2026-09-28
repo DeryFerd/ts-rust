@@ -79,9 +79,11 @@ impl ParsedSourceFile {
             language_variant: LanguageVariant::default(),
             script_kind: ScriptKind::default(),
             is_declaration_file: false,
-            // Go: NewSourceFile sets `ContainsNonASCII` from the text
+            // Go: NewSourceFile set `ContainsNonASCII` from the text
             // (`stringutil.ContainsNonASCII`: a byte >= 0x80). A Go byte
             // >= 0x80 is not ASCII in the port form either.
+            // PORT: Go removed the field in tsgo#4776. It stays until its
+            // readers (`program.rs`, `program/go_frontend.rs`) port their part.
             contains_non_ascii: !text.is_ascii(),
             uses_uri_style_node_core_modules: Tristate::Unknown,
             identifier_count: 0,
