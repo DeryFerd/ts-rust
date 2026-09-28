@@ -131,6 +131,11 @@ impl ConfigFileRegistry {
         None
     }
 
+    // Go: project/configfileregistry.go:130 ConfigFileRegistry.isTracked
+    pub fn is_tracked(&self, path: &tspath::Path) -> bool {
+        self.configs.contains_key(path)
+    }
+
     // Go: project/configfileregistry.go:94 ConfigFileRegistry.GetConfigFileName
     pub fn get_config_file_name(&self, path: &tspath::Path) -> String {
         if let Some(entry) = self.config_file_names.get(path) {

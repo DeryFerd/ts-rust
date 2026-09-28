@@ -207,7 +207,7 @@ impl ProjectCollectionBuilder {
         }
     }
 
-    // Go: project/projectcollectionbuilder.go:146 HandleAPIRequest
+    // Go: project/projectcollectionbuilder.go:161 HandleAPIRequest
     pub fn handle_api_request(
         self: &Rc<Self>,
         api_request: &APISnapshotRequest,
@@ -355,9 +355,9 @@ impl ProjectCollectionBuilder {
                 retain.extend(result.retain);
             }
             self.cleanup_configured_projects(&retain, logger.clone());
-            if self.inferred_project.value().is_some() {
-                self.update_program(&*self.inferred_project, logger.clone());
-            }
+        }
+        if self.inferred_project.value().is_some() {
+            self.update_program(&*self.inferred_project, logger.clone());
         }
 
         Ok(())

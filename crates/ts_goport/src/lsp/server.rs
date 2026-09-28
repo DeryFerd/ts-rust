@@ -92,7 +92,7 @@ use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Go runtime panic text for a nil pointer dereference.
@@ -101,6 +101,16 @@ const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer de
 // PORT: Go mutexes do not poison.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// PORT: Go `sync.RWMutex` read lock (no poison).
+fn read_lock<T: Clone>(m: &RwLock<T>) -> T {
+    m.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+// PORT: Go `sync.RWMutex` write lock (no poison).
+fn write_lock<T>(m: &RwLock<T>, value: T) {
+    *m.write().unwrap_or_else(|e| e.into_inner()) = value;
 }
 
 // Go: server.go:38 ServerOptions
@@ -162,11 +172,13 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         initialization_options: OnceLock::new(),
         client_capabilities: OnceLock::new(),
         position_encoding: OnceLock::new(),
-        locale: OnceLock::new(),
+        locale: RwLock::new(locale::Locale::default()),
+        init_locale: OnceLock::new(),
         last_request_time_ms: AtomicI64::new(0),
         progress_delay,
         project_progress: OnceLock::new(),
         start_watchdog: set_parent_process_id,
+        flake_logging: OnceLock::new(),
         warm_auto_import_preempt: OnceLock::new(),
     });
 
@@ -239,6 +251,35 @@ pub struct LspWriter {
     pub w: lsproto::BaseWriter,
 }
 
+// Go: server.go:123 messageMarshalError
+// PORT: a value type made with `errors::from_value_with_unwrap`, so
+// `errors::as_type` finds it. Go `Unwrap() []error` returns
+// `{lsproto.ErrorCodeInternalError, e.err}`; the port's value types have
+// only `Unwrap() error`, so the one unwrap result is an error that wraps
+// both, in the same order (see `new_message_marshal_error`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageMarshalError {
+    pub err: GoError,
+}
+
+// Go: server.go:127 messageMarshalError.Error
+impl std::fmt::Display for MessageMarshalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to marshal message: {}", self.err.error())
+    }
+}
+
+/// Go `&messageMarshalError{err: err}` as an `error`.
+fn new_message_marshal_error(err: GoError) -> GoError {
+    let value = MessageMarshalError { err: err.clone() };
+    // Go: server.go:129 messageMarshalError.Unwrap
+    let unwrap = errors::errorf(
+        value.to_string(),
+        vec![errors::from_value(ErrorCode::INTERNAL_ERROR), err],
+    );
+    errors::from_value_with_unwrap(value, unwrap)
+}
+
 // Go: `fmt.Errorf("%w: %w", code, err)`.
 fn wrap_error_code(code: ErrorCode, err: GoError) -> GoError {
     let code = errors::from_value(code);
@@ -287,16 +328,12 @@ pub fn to_reader(r: Box<dyn BufRead + Send>) -> Box<dyn Reader + Send> {
 }
 
 impl Writer for LspWriter {
-    // Go: server.go:136 lspWriter.Write
+    // Go: server.go:154 lspWriter.Write
     fn write(&mut self, msg: &lsproto::Message) -> Result<(), GoError> {
         let data = match crate::frontend::json::json_marshal(msg, &[]) {
             Ok(data) => data,
             Err(err) => {
-                let err = errors::from_value(err);
-                return Err(errors::errorf(
-                    format!("failed to marshal message: {}", err.error()),
-                    vec![err],
-                ));
+                return Err(new_message_marshal_error(errors::from_value(err)));
             }
         };
         self.w.write(data.as_bytes())
@@ -354,7 +391,13 @@ pub struct ServerShared {
     pub initialization_options: OnceLock<lsproto::InitializationOptions>,
     pub client_capabilities: OnceLock<Arc<lsproto::ResolvedClientCapabilities>>,
     pub position_encoding: OnceLock<lsproto::PositionEncodingKind>,
-    pub locale: OnceLock<locale::Locale>,
+    // PORT: Go `localeMu` is the `RwLock`. `locale` changes after
+    // `initialize` (#4660 `SetLocale`), so it is not a `OnceLock`.
+    pub locale: RwLock<locale::Locale>,
+    // initLocale is the locale resolved from the initialize request; it is
+    // used as the fallback when the user's locale preference is "auto".
+    // PORT: written once by `handle_initialize` on the reader thread.
+    pub init_locale: OnceLock<locale::Locale>,
 
     pub last_request_time_ms: AtomicI64,
 
@@ -362,6 +405,9 @@ pub struct ServerShared {
     pub project_progress: OnceLock<Arc<ProjectLoadingProgress>>,
 
     pub start_watchdog: Option<Box<dyn Fn(i32) + Send + Sync>>,
+
+    // PORT: written once by `handle_initialize` on the reader thread.
+    pub flake_logging: OnceLock<lsproto::DiagnosticFlakeLogLevel>,
 
     // PORT: the session's `warm_auto_import_preempt`, set by
     // `handle_initialized`. The reader thread cancels the warm with it.
@@ -450,8 +496,19 @@ impl ServerShared {
     }
 
     /// Go `s.locale` (the zero value until `initialize` parses one).
+    // PORT: read under `localeMu`, as Go `GetLocale` does.
     pub fn locale(&self) -> locale::Locale {
-        self.locale.get().cloned().unwrap_or_default()
+        read_lock(&self.locale)
+    }
+
+    /// Go `s.flakeLogging` (the zero value, `Off`, before `initialize`).
+    pub fn flake_logging(&self) -> lsproto::DiagnosticFlakeLogLevel {
+        self.flake_logging.get().copied().unwrap_or_default()
+    }
+
+    /// Go `s.initLocale` (the zero value before `initialize`).
+    pub fn init_locale(&self) -> locale::Locale {
+        self.init_locale.get().cloned().unwrap_or_default()
     }
 }
 
@@ -710,6 +767,50 @@ impl project::Client for Server {
             project_progress.finish(message, args);
         }
     }
+
+    // Go: server.go:776 GetLocale
+    // GetLocale implements project.Client.
+    fn get_locale(&self) -> locale::Locale {
+        self.shared.locale()
+    }
+
+    // Go: server.go:783 SetLocale
+    // SetLocale implements project.Client.
+    fn set_locale(&self, locale_string: &str) {
+        let mut new_locale = self.shared.init_locale();
+        if locale_string != "auto" {
+            let (parsed, ok) = locale::parse(locale_string);
+            if !ok {
+                return;
+            }
+            new_locale = parsed;
+        }
+        write_lock(&self.shared.locale, new_locale);
+    }
+}
+
+// Go: server.go:1900 generateDiagnosticDiffString
+// PORT: Go `[]*lsproto.Diagnostic` are the borrowed results of
+// `lsproto::compare_diagnostics`.
+fn generate_diagnostic_diff_string(
+    missing_from_pre: &[&lsproto::Diagnostic],
+    missing_from_post: &[&lsproto::Diagnostic],
+    stringifier: fn(&lsproto::Diagnostic) -> String,
+) -> String {
+    let mut b = String::new();
+    for elem in missing_from_pre {
+        b.push_str(&format!(
+            "Diagnostic {} was present after emit but not before emit\n",
+            stringifier(elem)
+        ));
+    }
+    for elem in missing_from_post {
+        b.push_str(&format!(
+            "Diagnostic {} was present before emit but not after emit\n",
+            stringifier(elem)
+        ));
+    }
+    b
 }
 
 /// Go `time.Now().UnixMilli()`.
@@ -1104,7 +1205,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:523 dispatchLoop
+    // Go: server.go:964 dispatchLoop
     pub fn dispatch_loop(self: &Rc<Self>, ctx: &Context) -> Result<(), GoError> {
         let (ctx, lsp_exit) = context::with_cancel_cause(ctx);
         // Go: defer lspExit(nil)
@@ -1156,6 +1257,7 @@ impl Server {
             self.shared
                 .last_request_time_ms
                 .store(unix_milli_now(), Ordering::SeqCst);
+            // Go: locale.WithLocale(ctx, s.GetLocale())
             let mut request_ctx = locale::with_locale(&ctx, self.shared.locale());
             let mut cancel: Option<CancelFunc> = None;
             if let Some(id) = &req.id {
@@ -1238,12 +1340,29 @@ impl Server {
 pub const IDLE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 impl ServerShared {
-    // Go: server.go:584 writeLoop
+    // Go: server.go:1025 writeLoop
     // PORT: `w` is the writer, which this thread owns.
     pub fn write_loop(&self, ctx: &Context, w: &mut dyn Writer) -> Result<(), GoError> {
         loop {
             let msg = self.outgoing_queue.get(ctx)?;
             if let Err(err) = w.write(&msg) {
+                if let Some(marshal_err) = errors::as_type::<MessageMarshalError>(&err)
+                    && msg.kind == crate::jsonrpc::MessageKind::RESPONSE
+                {
+                    let resp = msg.as_response();
+                    if let Some(id) = &resp.id
+                        && resp.error.is_none()
+                    {
+                        self.logger.errorf(&format!(
+                            "failed to marshal response for request {}: {}",
+                            id.string(),
+                            marshal_err
+                        ));
+                        let marshal_err = new_message_marshal_error(marshal_err.err);
+                        self.send_error(Some(id.clone()), marshal_err)?;
+                        continue;
+                    }
+                }
                 return Err(errors::errorf(
                     format!("failed to write message: {}", err.error()),
                     vec![err],
@@ -2214,7 +2333,7 @@ impl Server {
 }
 
 impl ServerShared {
-    // Go: server.go:1016 handleInitialize
+    // Go: server.go:1499 handleInitialize
     pub fn handle_initialize(
         self: &Arc<Self>,
         _ctx: &Context,
@@ -2244,6 +2363,9 @@ impl ServerShared {
             if is_valid_log_verbosity(v) {
                 self.logger.set_verbosity(v);
             }
+        }
+        if let Some(level) = self.initialization_options().track_flaky_diagnostics {
+            let _ = self.flake_logging.set(level);
         }
         let _ = self
             .client_capabilities
@@ -2278,8 +2400,9 @@ impl ServerShared {
 
         if let Some(l) = &params.locale {
             let (parsed, _) = locale::parse(l);
-            let _ = self.locale.set(parsed);
+            write_lock(&self.locale, parsed);
         }
+        let _ = self.init_locale.set(self.locale());
 
         if let Some(start_watchdog) = &self.start_watchdog {
             if let Some(process_id) = params.process_id.integer {
@@ -2480,7 +2603,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:1191 handleInitialized
+    // Go: server.go:1681 handleInitialized
     pub fn handle_initialized(
         self: &Rc<Self>,
         ctx: &Context,
@@ -2574,7 +2697,6 @@ impl Server {
                 telemetry_enabled: enable_telemetry,
                 debounce_delay: Duration::from_millis(500),
                 push_diagnostics_enabled: !disable_push_diagnostics,
-                locale: self.shared.locale(),
                 checker_pool_options: project::CheckerPoolOptions::default(),
             }),
             fs: self.fs.clone(),
@@ -2794,7 +2916,7 @@ impl Server {
         Ok(())
     }
 
-    // Go: server.go:1357 handleDocumentDiagnostic
+    // Go: server.go:1853 handleDocumentDiagnostic
     pub fn handle_document_diagnostic(
         self: &Rc<Self>,
         ctx: &Context,
@@ -2805,7 +2927,76 @@ impl Server {
             ctx,
             crate::frontend::core_context::CheckerLifetime::DIAGNOSTICS,
         );
-        ls.provide_diagnostics(&ctx, &params.text_document.uri)
+        let flake_logging = self.shared.flake_logging();
+        if flake_logging == lsproto::DiagnosticFlakeLogLevel::OFF {
+            return ls.provide_diagnostics(&ctx, &params.text_document.uri);
+        }
+        let direct = ls.provide_diagnostics(&ctx, &params.text_document.uri)?;
+        // Go:
+        //	ls.GetProgram().Emit(ctx, compiler.EmitOptions{
+        //		WriteFile: func(fileName, text string, data *compiler.WriteFileData) error {
+        //			// do nothing
+        //			return nil
+        //		},
+        //	})
+        // PORT: the language service program (`NewProgram`) has no `Emit`
+        // yet (program-core, #4699), so this emit is not run. The second
+        // `ProvideDiagnostics` below still runs, so a flake that does not
+        // come from emit is still found.
+        let Ok(secondary) = ls.provide_diagnostics(&ctx, &params.text_document.uri) else {
+            return Ok(direct);
+        };
+        let (missing_from_pre, missing_from_post) = lsproto::compare_diagnostics(
+            &direct
+                .full_document_diagnostic_report
+                .as_ref()
+                .expect(NIL_DEREF)
+                .items,
+            &secondary
+                .full_document_diagnostic_report
+                .as_ref()
+                .expect(NIL_DEREF)
+                .items,
+        );
+        if missing_from_pre.is_empty() && missing_from_post.is_empty() {
+            return Ok(direct);
+        }
+
+        let diff = generate_diagnostic_diff_string(
+            &missing_from_pre,
+            &missing_from_post,
+            lsproto::Diagnostic::as_string,
+        );
+
+        self.logger.error(&diff);
+
+        if self.telemetry_enabled.get() {
+            let sanitized_diff = generate_diagnostic_diff_string(
+                &missing_from_pre,
+                &missing_from_post,
+                lsproto::Diagnostic::code_as_string,
+            );
+            let _ = send_notification(
+                &self.shared,
+                &lsproto::TELEMETRY_EVENT_INFO,
+                lsproto::TelemetryEvent {
+                    request_failure_telemetry_event: Some(lsproto::RequestFailureTelemetryEvent {
+                        properties: Some(lsproto::RequestFailureTelemetryProperties {
+                            error_code: ErrorCode::INTERNAL_ERROR.string(),
+                            request_method: "textDocument.diagnostic.flakeLog".to_string(),
+                            stack: sanitized_diff,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+
+        if flake_logging == lsproto::DiagnosticFlakeLogLevel::PANIC {
+            panic!("flaky diagnostic(s) logged:\n{diff}");
+        }
+        Ok(direct)
     }
 
     // Go: server.go:1362 handleHover
@@ -2918,7 +3109,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:1423 handleWillRenameFilesWorker
+    // Go: server.go:1972 handleWillRenameFilesWorker
     // If `sendRenameFile` is true, the original `willRenameFiles` request is being handled as part of a rename operation
     // where the client doesn't support `willRenameFiles`,
     // so we should include the file rename in the edits we return
@@ -2944,7 +3135,7 @@ impl Server {
 
         let services = self
             .session_ref()
-            .get_language_services_for_documents(ctx, &uris);
+            .get_language_services_for_documents_loading_project_tree(ctx, &uris);
 
         // Go: type editKey struct { uri lsproto.DocumentUri; range_ lsproto.Range }
         let mut seen_edits: FxHashMap<(lsproto::DocumentUri, lsproto::Range), String> =
@@ -3150,7 +3341,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:1571 handleCompletionItemResolve
+    // Go: server.go:2120 handleCompletionItemResolve
     pub fn handle_completion_item_resolve(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3158,17 +3349,18 @@ impl Server {
         req_msg: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CompletionResolveResponse, GoError> {
         let params = params.expect(NIL_DEREF);
-        let data = params.data.clone();
-        let language_service = self.session_ref().get_language_service(
-            ctx,
-            &lsconv::file_name_to_document_uri(&data.as_ref().expect(NIL_DEREF).file_name),
-        )?;
+        let Some(data) = params.data.clone() else {
+            return Err(errors::new("completion item data is nil"));
+        };
+        let language_service = self
+            .session_ref()
+            .get_language_service(ctx, &lsconv::file_name_to_document_uri(&data.file_name))?;
         self.recover_guard(
             req_msg,
             || Ok(None),
             || {
                 language_service
-                    .resolve_completion_item(ctx, params.clone(), data)
+                    .resolve_completion_item(ctx, params.clone(), Some(data))
                     .map(Some)
             },
         )
@@ -3219,7 +3411,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:1612 handleWorkspaceSymbol
+    // Go: server.go:2160 handleWorkspaceSymbol
     pub fn handle_workspace_symbol(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3229,38 +3421,58 @@ impl Server {
         let params = params.expect(NIL_DEREF);
         let mut resp = lsproto::WorkspaceSymbolResponse::default();
         let mut ls_err: Option<GoError> = None;
-        self.session_ref()
-            .with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<Snapshot>| {
+        let mut provide_symbols =
+            |snapshot: &Rc<Snapshot>, programs: Vec<&'static compiler::NewProgram>| {
                 self.recover_guard(
                     req_msg,
                     || (),
-                    || {
-                        // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
-                        let programs: Vec<&'static compiler::NewProgram> = snapshot
-                            .project_collection
-                            .projects()
-                            .iter()
-                            .map(|p| p.borrow().get_program().expect(NIL_DEREF))
-                            .collect();
-                        match ls::provide_workspace_symbols(
-                            ctx,
-                            &programs,
-                            &snapshot.converters(),
-                            &snapshot.user_preferences(),
-                            &params.query,
-                        ) {
-                            Ok(r) => {
-                                resp = r;
-                                ls_err = None;
-                            }
-                            Err(err) => {
-                                resp = lsproto::WorkspaceSymbolResponse::default();
-                                ls_err = Some(err);
-                            }
+                    || match ls::provide_workspace_symbols(
+                        ctx,
+                        &programs,
+                        &snapshot.converters(),
+                        &snapshot.user_preferences(),
+                        &params.query,
+                    ) {
+                        Ok(r) => {
+                            resp = r;
+                            ls_err = None;
+                        }
+                        Err(err) => {
+                            resp = lsproto::WorkspaceSymbolResponse::default();
+                            ls_err = Some(err);
                         }
                     },
                 );
+            };
+        let session = self.session_ref();
+        if let Some(text_document) = &params.text_document
+            && session.config().workspace_symbols_scope
+                == lsutil::WorkspaceSymbolsScope::CURRENT_PROJECT
+        {
+            let uri = &text_document.uri;
+            session.with_snapshot_for_document(ctx, uri, &mut |snapshot: &Rc<Snapshot>| {
+                // Go: core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
+                let programs: Vec<&'static compiler::NewProgram> = snapshot
+                    .get_projects_containing_file(uri)
+                    .iter()
+                    .map(|p| p.get_program())
+                    .collect();
+                provide_symbols(snapshot, programs);
             });
+        } else {
+            session.with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<
+                Snapshot,
+            >| {
+                // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
+                let programs: Vec<&'static compiler::NewProgram> = snapshot
+                    .project_collection
+                    .projects()
+                    .iter()
+                    .map(|p| p.borrow().get_program().expect(NIL_DEREF))
+                    .collect();
+                provide_symbols(snapshot, programs);
+            });
+        }
         match ls_err {
             Some(err) => Err(err),
             None => Ok(resp),

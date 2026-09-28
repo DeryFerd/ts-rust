@@ -517,6 +517,8 @@ impl Snapshot {
                 ));
             } else if *reason == UpdateReason::IDLE_CLEAN_DISK_CACHE {
                 logger.logf("Reason: IdleCleanDiskCache");
+            } else if *reason == UpdateReason::DID_CHANGE_CONFIG_FILE {
+                logger.logf(&format!("Reason: DidChangeConfigFile - {}", get_details()));
             }
         }
         let logger = logger_out.clone();
@@ -563,7 +565,7 @@ impl Snapshot {
         } else {
             change.file_changes = fs.expand_and_filter_watch_events(change.file_changes);
             change.file_changes = self.fs.expand_realpath_aliases(change.file_changes);
-            fs.mark_dirty_files(&change.file_changes);
+            change.file_changes = fs.mark_dirty_files(change.file_changes);
             change.file_changes = fs.convert_open_and_close_to_changes(change.file_changes);
         }
 

@@ -6,7 +6,7 @@
 
 use crate::project::prelude::*;
 
-// Go: project/client.go:10 Client
+// Go: project/client.go:11 Client
 // PORT: `watchers []*lsproto.FileSystemWatcher` is `&[..]` (PORTING
 // "Types"). `params *lsproto.PublishDiagnosticsParams` is passed by value,
 // because the server moves it into the outgoing notification. `args ...any`
@@ -35,4 +35,8 @@ pub trait Client {
         telemetry: lsproto::TelemetryEvent,
     ) -> Result<(), GoError>;
     fn is_active(&self) -> bool;
+    // SetLocale updates the locale used for diagnostic messages.
+    fn set_locale(&self, locale: &str);
+    // GetLocale returns the current display locale for diagnostic messages.
+    fn get_locale(&self) -> locale::Locale;
 }

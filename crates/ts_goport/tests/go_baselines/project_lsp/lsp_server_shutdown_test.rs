@@ -164,3 +164,141 @@ fn server_outgoing_queue_does_not_block_without_writer() {
         Err(_) => panic!("sending outgoing messages blocked without a writer"),
     }
 }
+
+// Go: server_test.go:133 TestWriteLoopRecoversFromUnserializableResponse
+// PORT: Go renamed `server_shutdown_test.go` to `server_test.go` (#4896);
+// this file keeps its name. The Go bad result is a selection range 20000
+// levels deep, which the Go JSON encoder rejects (jsontext
+// `maxNestingDepth`). The port's JSON encoder has no nesting limit, so the
+// bad result here is a value whose marshal fails. The test checks the same
+// write loop behavior.
+#[derive(Debug)]
+struct UnserializableResult;
+
+impl ts_goport::frontend::json::MarshalerTo for UnserializableResult {
+    fn marshal_json_to(
+        &self,
+        _enc: &mut String,
+    ) -> Result<(), ts_goport::frontend::json::JsonError> {
+        Err(ts_goport::frontend::json::JsonError {
+            message: "exceeded max depth".to_string(),
+        })
+    }
+}
+
+// A response that exceeds the JSON encoder's nesting limit must fail only its
+// request. The write loop must remain available to deliver subsequent responses.
+#[test]
+fn write_loop_recovers_from_unserializable_response() {
+    let (pr, pw) = std::io::pipe().expect("pipe");
+    let fs = crate::support::vfstest::from_map(Vec::<(String, String)>::new(), false);
+    let server = lsp::new_server(lsp::ServerOptions {
+        in_: Box::new(ShutdownTestReader),
+        out: lsp::to_writer(Box::new(pw)),
+        err: Box::new(std::io::sink()),
+        ..server_options("/test", fs, String::new())
+    });
+
+    let (ctx, cancel) = context::with_cancel(&context::background());
+    let _ = server.shared.background_ctx.set(ctx.clone());
+
+    let (write_loop_err_tx, write_loop_err) = sync_channel::<Result<(), GoError>>(1);
+    let mut w = server.w.borrow_mut().take().expect("writer");
+    let shared = server.shared.clone();
+    let write_ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = write_loop_err_tx.send(shared.write_loop(&write_ctx, &mut *w));
+    });
+
+    let bad_id = ts_goport::jsonrpc::new_id_string("bad");
+    if let Err(err) = server.shared.send(
+        lsproto::ResponseMessage {
+            id: Some(bad_id.clone()),
+            result: Some(Box::new(UnserializableResult)),
+            ..Default::default()
+        }
+        .message(),
+    ) {
+        panic!("failed to enqueue bad response: {}", err.error());
+    }
+
+    // A subsequent well-formed response must still be delivered.
+    let good_id = ts_goport::jsonrpc::new_id_string("good");
+    if let Err(err) = server.shared.send(
+        lsproto::ResponseMessage {
+            id: Some(good_id.clone()),
+            result: Some(Box::new(lsproto::SelectionRangesOrNull::default())),
+            ..Default::default()
+        }
+        .message(),
+    ) {
+        panic!("failed to enqueue good response: {}", err.error());
+    }
+
+    // Go: readMessageWithTimeout (server_test.go:209).
+    // PORT: the timeout is 60 s (Go: 2 s) for a loaded test machine.
+    let (msg_tx, msg_rx) = sync_channel::<Result<lsproto::Message, String>>(2);
+    std::thread::spawn(move || {
+        let mut reader = lsp::to_reader(Box::new(std::io::BufReader::new(pr)));
+        for _ in 0..2 {
+            let result = match lsp::Reader::read(&mut *reader) {
+                (Some(msg), None) => Ok(msg),
+                (_, Some(err)) => Err(err.error()),
+                (None, None) => Err("no message".to_string()),
+            };
+            if msg_tx.send(result).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut saw_error = false;
+    let mut saw_good = false;
+    for _ in 0..2 {
+        let msg = match msg_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => panic!("failed to read message: {err}"),
+            Err(_) => panic!("timed out waiting for a message (write loop may have died)"),
+        };
+        let resp = msg.as_response();
+        if resp.id.as_ref() == Some(&bad_id) {
+            match &resp.error {
+                None => panic!(
+                    "expected an error response for the unserializable request, got a result"
+                ),
+                Some(err) => assert_eq!(
+                    err.code,
+                    lsproto::ErrorCode::INTERNAL_ERROR.0,
+                    "error response code = {}, want {}",
+                    err.code,
+                    lsproto::ErrorCode::INTERNAL_ERROR.0
+                ),
+            }
+            saw_error = true;
+        } else if resp.id.as_ref() == Some(&good_id) {
+            if let Some(err) = &resp.error {
+                panic!("expected a successful response for the good request, got error: {err:?}");
+            }
+            saw_good = true;
+        } else {
+            panic!("unexpected response id: {:?}", resp.id);
+        }
+    }
+
+    assert!(
+        saw_error,
+        "did not receive an error response for the unserializable request"
+    );
+    assert!(
+        saw_good,
+        "did not receive the subsequent well-formed response (write loop likely died)"
+    );
+
+    // The write loop must still be running.
+    if let Ok(result) = write_loop_err.try_recv() {
+        let err = result.err().map(|err| err.error()).unwrap_or_default();
+        panic!("write loop exited unexpectedly: {err}");
+    }
+    // Go: defer cancel()
+    cancel();
+}

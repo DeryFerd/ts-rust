@@ -51,6 +51,7 @@ impl UpdateReason {
     pub const REQUESTED_LOAD_PROJECT_TREE: UpdateReason = UpdateReason(8);
     pub const REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS: UpdateReason = UpdateReason(9);
     pub const IDLE_CLEAN_DISK_CACHE: UpdateReason = UpdateReason(10);
+    pub const DID_CHANGE_CONFIG_FILE: UpdateReason = UpdateReason(11);
 }
 
 // Go: project/session.go:51 watchRequestTimeout
@@ -72,7 +73,6 @@ pub struct SessionOptions {
     pub telemetry_enabled: bool,
     pub push_diagnostics_enabled: bool,
     pub debounce_delay: Duration,
-    pub locale: locale::Locale,
     pub checker_pool_options: CheckerPoolOptions,
 }
 
@@ -365,16 +365,36 @@ impl Session {
         self.workspace_user_preferences.borrow().clone()
     }
 
+    // Go: project/session.go:330 backgroundContext
+    fn background_context(&self) -> Context {
+        self.with_current_locale(&self.background_ctx)
+    }
+
+    // Go: project/session.go:334 withCurrentLocale
+    fn with_current_locale(&self, ctx: &Context) -> Context {
+        let Some(client) = &self.client else {
+            return ctx.clone();
+        };
+        locale::with_locale(ctx, client.get_locale())
+    }
+
     // Go: project/session.go:272 Trace
     // Trace implements module.ResolutionHost
     pub fn trace(&self, _msg: &str) {
         panic!("ATA module resolution should not use tracing");
     }
 
-    // Go: project/session.go:276 Configure
+    // Go: project/session.go:346 Configure
     pub fn configure(self: &Rc<Self>, config: lsutil::UserPreferences) {
         self.pending_user_config_changes.set(true);
         let old_config = self.workspace_user_preferences.replace(config.clone());
+
+        if !config.locale.is_empty() {
+            self.client
+                .as_ref()
+                .expect(NIL_DEREF)
+                .set_locale(&config.locale);
+        }
 
         // Tell the client to re-request certain commands depending on user preference changes.
         self.refresh_inlay_hints_if_needed(&old_config, &config);
@@ -467,7 +487,7 @@ impl Session {
         });
     }
 
-    // Go: project/session.go:356 DidChangeWatchedFiles
+    // Go: project/session.go:483 DidChangeWatchedFiles
     // PORT: Go `[]*lsproto.FileEvent` is `&[lsproto::FileEvent]`.
     pub fn did_change_watched_files(
         self: &Rc<Self>,
@@ -475,6 +495,9 @@ impl Session {
         changes: &[lsproto::FileEvent],
     ) {
         let mut file_changes: Vec<FileChange> = Vec::with_capacity(changes.len());
+        let mut has_relevant_change = false;
+        let mut has_config_change = false;
+        let config_file_registry = self.snapshot().config_file_registry.clone();
         for change in changes {
             let kind = match change.type_ {
                 lsproto::FileChangeType::CREATED => FileChangeKind::WATCH_CREATE,
@@ -487,12 +510,53 @@ impl Session {
                 uri: change.uri.clone(),
                 ..Default::default()
             });
+
+            if !has_config_change
+                && config_file_registry.is_tracked(&(self.to_path)(&change.uri.file_name()))
+            {
+                has_config_change = true;
+            }
+
+            if !has_relevant_change {
+                let file_name = change.uri.file_name();
+                let path = (self.to_path)(&file_name).remove_trailing_directory_separator();
+                let path_str = path.as_str();
+                let i = path_str.rfind('.');
+                if i.is_none_or(|i| path_str.rfind('/').is_some_and(|slash| slash > i)) {
+                    // Extensionless paths might be directories.
+                    // For creations/changes, we can check the file system.
+                    // For deletions, consult the current snapshot cache to avoid treating extensionless file deletions as relevant.
+                    if kind != FileChangeKind::WATCH_DELETE {
+                        has_relevant_change = self.fs.fs.directory_exists(&file_name);
+                    } else {
+                        let snapshot = self.snapshot.borrow().clone();
+                        if snapshot.fs.disk_directories.contains_key(&path)
+                            || is_node_modules_path(&path)
+                        {
+                            has_relevant_change = true;
+                        }
+                    }
+                } else if let Some(i) = i {
+                    if is_relevant_extension(&path_str[i..]) {
+                        has_relevant_change = true;
+                    }
+                }
+            }
         }
 
         self.pending_file_changes.borrow_mut().extend(file_changes);
 
-        // Schedule a debounced diagnostics refresh
-        self.schedule_diagnostics_refresh();
+        if has_relevant_change {
+            // Schedule a debounced diagnostics refresh only for paths
+            // that can affect the TypeScript program (relevant extensions or directories).
+            self.schedule_diagnostics_refresh();
+        }
+        if has_config_change {
+            // Config file diagnostics are pushed on snapshot updates rather than pulled,
+            // so they must not depend on the client re-pulling diagnostics in response to
+            // the refresh request above.
+            self.schedule_snapshot_update(UpdateReason::DID_CHANGE_CONFIG_FILE);
+        }
         self.cancel_warm_auto_import_cache();
         self.schedule_idle_cache_clean();
     }
@@ -534,7 +598,7 @@ impl Session {
         }
 
         // Create a new cancellable context for the debounce task
-        let (debounce_ctx, cancel) = gostd::context::with_cancel(&self.background_ctx);
+        let (debounce_ctx, cancel) = gostd::context::with_cancel(&self.background_context());
         self.diagnostics_refresh_generation
             .set(self.diagnostics_refresh_generation.get() + 1);
         let generation = self.diagnostics_refresh_generation.get();
@@ -568,7 +632,7 @@ impl Session {
                         .client
                         .as_ref()
                         .expect(NIL_DEREF)
-                        .refresh_diagnostics(&s.background_ctx)
+                        .refresh_diagnostics(&s.background_context())
                     {
                         if s.options.logging_enabled {
                             s.logger
@@ -621,7 +685,7 @@ impl Session {
         }
 
         // Create a new cancellable context for the debounce task
-        let (debounce_ctx, cancel) = gostd::context::with_cancel(&self.background_ctx);
+        let (debounce_ctx, cancel) = gostd::context::with_cancel(&self.background_context());
         self.scheduled_snapshot_update_generation
             .set(self.scheduled_snapshot_update_generation.get() + 1);
         let generation = self.scheduled_snapshot_update_generation.get();
@@ -802,7 +866,7 @@ impl Session {
 
                 s.cancel_scheduled_snapshot_update();
 
-                let ctx = s.background_ctx.clone();
+                let ctx = s.background_context();
                 let (file_changes, overlays, ata_changes, new_config) = s.flush_changes(&ctx);
                 s.update_snapshot_exported(
                     &ctx,
@@ -974,7 +1038,7 @@ impl Session {
         if !self.options.telemetry_enabled {
             return;
         }
-        let (ctx, cancel) = gostd::context::with_cancel(&self.background_ctx);
+        let (ctx, cancel) = gostd::context::with_cancel(&self.background_context());
         *self.performance_telemetry_cancel.borrow_mut() = Some(cancel);
         let s = self.clone();
         self.background_queue.enqueue(&ctx, move |ctx| {
@@ -1156,7 +1220,7 @@ impl Session {
         if !self.options.telemetry_enabled {
             return;
         }
-        let ctx = self.background_ctx.clone();
+        let ctx = self.background_context();
         crate::frontend::core_ls_ext::diff_ordered_maps(
             &old_snapshot.project_collection.projects_by_path(),
             &new_snapshot.project_collection.projects_by_path(),
@@ -1588,8 +1652,13 @@ impl Session {
         Ok(all_projects)
     }
 
-    // Go: project/session.go:1018 GetLanguageServicesForDocuments
-    pub fn get_language_services_for_documents(
+    // Go: project/session.go:1216 GetLanguageServicesForDocumentsLoadingProjectTree
+    // GetLanguageServicesForDocumentsLoadingProjectTree returns language services for
+    // every project in the snapshot, loading all project trees first so that projects
+    // that were never opened but reference the given documents are included. Loading the
+    // trees is expensive, so this should only be used by operations that need to touch
+    // every project in a solution, like file rename.
+    pub fn get_language_services_for_documents_loading_project_tree(
         self: &Rc<Self>,
         ctx: &Context,
         uris: &[lsproto::DocumentUri],
@@ -1598,6 +1667,7 @@ impl Session {
             ctx,
             ResourceRequest {
                 documents: uris.to_vec(),
+                project_tree: Some(ProjectTreeRequest::default()),
                 ..Default::default()
             },
             false, /*callerRef*/
@@ -1661,7 +1731,7 @@ impl Session {
         ))
     }
 
-    // Go: project/session.go:1064 WithSnapshotLoadingProjectTree
+    // Go: project/session.go:1265 WithSnapshotLoadingProjectTree
     // WithSnapshotLoadingProjectTree acquires a ref'd snapshot with the
     // requested project trees loaded, then calls fn. The snapshot stays alive
     // for the duration of fn.
@@ -1679,6 +1749,26 @@ impl Session {
                 project_tree: Some(ProjectTreeRequest {
                     referenced_projects: requested_project_trees.cloned(),
                 }),
+                ..Default::default()
+            },
+            true, /*callerRef*/
+        );
+        fn_(&snapshot);
+        // Go: defer snapshot.Deref(s)
+        Snapshot::deref(&snapshot, self);
+    }
+
+    // Go: project/session.go:1279 WithSnapshotForDocument
+    pub fn with_snapshot_for_document(
+        self: &Rc<Self>,
+        ctx: &Context,
+        uri: &lsproto::DocumentUri,
+        fn_: &mut dyn FnMut(&Rc<Snapshot>),
+    ) {
+        let snapshot = self.get_snapshot(
+            ctx,
+            ResourceRequest {
+                documents: vec![uri.clone()],
                 ..Default::default()
             },
             true, /*callerRef*/
@@ -1769,7 +1859,7 @@ impl Session {
         })))
     }
 
-    // Go: project/session.go:1129 GetLanguageServiceWithAutoImports
+    // Go: project/session.go:1344 GetLanguageServiceWithAutoImports
     // GetLanguageServiceWithAutoImports clones the given snapshot with auto-import
     // preparation for the given URI, without flushing pending file changes.
     // The cloned snapshot will be adopted as the session's current snapshot in the background
@@ -1780,6 +1870,54 @@ impl Session {
         base_snapshot: &Rc<Snapshot>,
         uri: &lsproto::DocumentUri,
     ) -> Result<ls::LanguageService, GoError> {
+        let new_snapshot =
+            self.clone_with_auto_imports(ctx, base_snapshot, uri, false /*callerRef*/);
+        let Some(project) = new_snapshot.get_default_project(uri) else {
+            // Clone's initial ref (1) is released since we won't use this snapshot.
+            Snapshot::deref(&new_snapshot, self);
+            return Err(gostd::errors::errorf(
+                format!("no project found for URI {}", uri),
+                vec![],
+            ));
+        };
+
+        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
+
+        let project = project.borrow();
+        Ok(ls::new_language_service(
+            project.config_file_path.clone(),
+            project.program.expect(NIL_DEREF),
+            new_snapshot.clone(),
+            &uri.file_name(),
+        ))
+    }
+
+    // Go: project/session.go:1363 GetSnapshotWithAutoImports
+    // GetSnapshotWithAutoImports clones the given snapshot with auto-import
+    // preparation for the given URI, without flushing pending file changes.
+    // The returned snapshot is ref'd for the caller, which must call Deref when done.
+    // The cloned snapshot will also be adopted as the session's current snapshot in
+    // the background if other changes haven't been adopted in the meantime.
+    pub fn get_snapshot_with_auto_imports(
+        self: &Rc<Self>,
+        ctx: &Context,
+        base_snapshot: &Rc<Snapshot>,
+        uri: &lsproto::DocumentUri,
+    ) -> Rc<Snapshot> {
+        let new_snapshot =
+            self.clone_with_auto_imports(ctx, base_snapshot, uri, true /*callerRef*/);
+        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
+        new_snapshot
+    }
+
+    // Go: project/session.go:1369 cloneWithAutoImports
+    fn clone_with_auto_imports(
+        self: &Rc<Self>,
+        ctx: &Context,
+        base_snapshot: &Rc<Snapshot>,
+        uri: &lsproto::DocumentUri,
+        caller_ref: bool,
+    ) -> Rc<Snapshot> {
         let change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
             resource_request: ResourceRequest {
@@ -1791,16 +1929,18 @@ impl Session {
         };
         let new_snapshot =
             Snapshot::clone_(base_snapshot, ctx, change, &base_snapshot.fs.overlays, self);
+        if caller_ref {
+            new_snapshot.ref_();
+        }
+        new_snapshot
+    }
 
-        let Some(project) = new_snapshot.get_default_project(uri) else {
-            // Clone's initial ref (1) is released since we won't use this snapshot.
-            Snapshot::deref(&new_snapshot, self);
-            return Err(gostd::errors::errorf(
-                format!("no project found for URI {}", uri),
-                vec![],
-            ));
-        };
-
+    // Go: project/session.go:1384 adoptSnapshotChangeInBackground
+    fn adopt_snapshot_change_in_background(
+        self: &Rc<Self>,
+        base_snapshot: &Rc<Snapshot>,
+        new_snapshot: &Rc<Snapshot>,
+    ) {
         // The clone's initial ref (1) is transferred to adoptSnapshotChange,
         // which will either promote it as the session's current snapshot or
         // release it if the session has moved on.
@@ -1808,20 +1948,12 @@ impl Session {
         let task_base_snapshot = base_snapshot.clone();
         let task_new_snapshot = new_snapshot.clone();
         self.background_queue
-            .enqueue(&self.background_ctx, move |_ctx| {
+            .enqueue(&self.background_context(), move |_ctx| {
                 s.adopt_snapshot_change(&task_base_snapshot, &task_new_snapshot);
             });
-
-        let project = project.borrow();
-        Ok(ls::new_language_service(
-            project.config_file_path.clone(),
-            project.program.expect(NIL_DEREF),
-            new_snapshot.clone(),
-            &uri.file_name(),
-        ))
     }
 
-    // Go: project/session.go:1160 adoptSnapshotChange
+    // Go: project/session.go:1397 adoptSnapshotChange
     // adoptSnapshotChange promotes a cloned snapshot as the session's current
     // snapshot so future requests benefit from the work already done. If the
     // session has moved on, the snapshot is discarded; the next request needing
@@ -1931,7 +2063,7 @@ impl Session {
         let task_old_snapshot = old_snapshot.clone();
         let task_new_snapshot = new_snapshot.clone();
         self.background_queue
-            .enqueue(&self.background_ctx, move |ctx| {
+            .enqueue(&self.background_context(), move |ctx| {
                 let old_snapshot = &task_old_snapshot;
                 let new_snapshot = &task_new_snapshot;
                 if s.options.logging_enabled {
@@ -2100,7 +2232,7 @@ impl Session {
     ) -> Result<(), GoError> {
         let errors: RefCell<Vec<GoError>> = RefCell::new(Vec::new());
         let start = Instant::now();
-        let ctx = self.background_ctx.clone();
+        let ctx = self.background_context();
         crate::frontend::core_ls_ext::diff_maps_func(
             &old_snapshot.config_file_registry.configs,
             &new_snapshot.config_file_registry.configs,
@@ -2537,7 +2669,7 @@ impl Session {
                 .client
                 .as_ref()
                 .expect(NIL_DEREF)
-                .refresh_inlay_hints(&self.background_ctx)
+                .refresh_inlay_hints(&self.background_context())
             {
                 if self.options.logging_enabled {
                     self.logger
@@ -2558,7 +2690,7 @@ impl Session {
                 .client
                 .as_ref()
                 .expect(NIL_DEREF)
-                .refresh_code_lens(&self.background_ctx)
+                .refresh_code_lens(&self.background_context())
             {
                 if self.options.logging_enabled {
                     self.logger
@@ -2619,7 +2751,7 @@ impl Session {
                     && old_open_projects.contains(config_file_path)
                 {
                     self.publish_project_diagnostics(
-                        &self.background_ctx,
+                        &self.background_context(),
                         config_file_path,
                         &[],
                         &old_snapshot.converters,
@@ -2629,7 +2761,7 @@ impl Session {
             return;
         }
 
-        let ctx = self.background_ctx.clone();
+        let ctx = self.background_context();
         let old_projects = old_snapshot.project_collection.projects_by_path();
         let new_projects = new_snapshot.project_collection.projects_by_path();
         let old_open_projects = old_snapshot
@@ -2730,7 +2862,7 @@ pub fn should_publish_program_diagnostics(p: &Project, snapshot_id: u64) -> bool
 }
 
 impl Session {
-    // Go: project/session.go:1679 publishProjectDiagnostics
+    // Go: project/session.go:1993 publishProjectDiagnostics
     // PORT: Go `[]*ast.Diagnostic` is `&[Diagnostic]` (nil is empty).
     pub fn publish_project_diagnostics(
         &self,
@@ -2744,6 +2876,7 @@ impl Session {
         } else {
             diagnostics
         };
+        let ctx = &self.with_current_locale(ctx);
         let mut lsp_diagnostics: Vec<lsproto::Diagnostic> = Vec::with_capacity(diagnostics.len());
         for diag in diagnostics {
             lsp_diagnostics.push(lsconv::diagnostic_to_lsp_push(ctx, converters, diag));
@@ -2777,7 +2910,7 @@ impl Session {
             self.global_diag_publish_pending.set(true);
             let s = self.clone();
             self.background_queue
-                .enqueue(&self.background_ctx, move |ctx| {
+                .enqueue(&self.background_context(), move |ctx| {
                     s.publish_global_diagnostics(ctx);
                 });
         }
@@ -2822,7 +2955,7 @@ impl Session {
             }
             let s = self.clone();
             self.background_queue
-                .enqueue(&self.background_ctx, move |_ctx| {
+                .enqueue(&self.background_context(), move |_ctx| {
                     let mut log_tree: Option<Rc<logging::LogTree>> = None;
                     if s.options.logging_enabled {
                         log_tree = logging::new_log_tree(&format!(

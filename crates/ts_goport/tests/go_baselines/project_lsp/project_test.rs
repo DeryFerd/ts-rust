@@ -326,6 +326,50 @@ child_test! {
 }
 
 child_test! {
+    // Go: project_test.go:462 TestPushDiagnostics/updates diagnostics when a config file changes on disk with no follow-up request
+    fn push_diagnostics_updates_diagnostics_when_a_config_file_changes_on_disk_with_no_follow_up_request() {
+        let (session, utils) = projecttestutil::setup(files(&[
+            ("/src/tsconfig.json", r#"{"compilerOptions": {}}"#),
+            ("/src/index.ts", "export const x = 1;"),
+        ]));
+        open(&session, SRC_INDEX, "export const x = 1;");
+        let _ = language_service(&session, SRC_INDEX);
+        session.wait_for_background_tasks();
+
+        let calls_before_change = utils.client().publish_diagnostics_calls().len();
+
+        // Editors do not attach the language server to JSON documents, so a config file
+        // edit only reaches the session through the file watcher. Config file diagnostics
+        // are pushed, so they must be republished without waiting for a client request.
+        utils
+            .fs()
+            .write_file("/src/tsconfig.json", r#"{"compilerOptions": {"target": "nope"}}"#)
+            .unwrap();
+        watch(&session, &[(CHANGED, "file:///src/tsconfig.json")]);
+        session.wait_for_background_tasks();
+
+        let calls = utils.client().publish_diagnostics_calls();
+        let tsconfig_calls =
+            filter_diagnostics_by_uri(&calls, "file:///src/tsconfig.json", calls_before_change);
+        assert!(
+            !tsconfig_calls.is_empty(),
+            "expected PublishDiagnostics call for tsconfig.json after watched file change"
+        );
+        let last_tsconfig_call = &tsconfig_calls[tsconfig_calls.len() - 1];
+
+        let expected_message = "Argument for '--target' option must be:";
+        assert!(
+            last_tsconfig_call
+                .diagnostics
+                .iter()
+                .any(|diag| diag.message.as_string().contains(expected_message)),
+            "expected invalid target diagnostic on tsconfig.json, got: {:?}",
+            last_tsconfig_call.diagnostics
+        );
+    }
+}
+
+child_test! {
     // Go: project_test.go:383 TestPushDiagnostics/does not publish for inferred projects
     fn push_diagnostics_does_not_publish_for_inferred_projects() {
         let (session, utils) =

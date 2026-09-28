@@ -52,6 +52,12 @@ impl Client for NoopClient {
     fn is_active(&self) -> bool {
         true
     }
+    // Go: extendedconfigcache_test.go:52 noopClient.GetLocale
+    fn get_locale(&self) -> ts_goport::locale::Locale {
+        ts_goport::locale::DEFAULT
+    }
+    // Go: extendedconfigcache_test.go:54 noopClient.SetLocale
+    fn set_locale(&self, _: &str) {}
 }
 
 // Go: extendedconfigcache_test.go:57 setup

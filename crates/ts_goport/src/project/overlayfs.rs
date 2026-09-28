@@ -8,7 +8,7 @@
 
 use crate::project::prelude::*;
 
-use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_ext::ensure_script_kind_from_file_name;
 use std::cell::{Cell, OnceCell};
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -121,7 +121,7 @@ impl DiskFile {
 
     // Go: project/overlayfs.go:101 diskFile.Kind
     pub fn kind(&self) -> ScriptKind {
-        get_script_kind_from_file_name(&self.file_base.file_name)
+        ensure_script_kind_from_file_name(&self.file_base.file_name)
     }
 
     // Go: project/overlayfs.go:105 diskFile.Clone
@@ -476,7 +476,7 @@ impl OverlayFS {
                 let mut script_kind =
                     lsconv::language_kind_to_script_kind(&open_change.language_kind);
                 if script_kind == ScriptKind::UNKNOWN {
-                    script_kind = get_script_kind_from_file_name(&uri.file_name());
+                    script_kind = ensure_script_kind_from_file_name(&uri.file_name());
                 }
                 new_overlays.insert(
                     path,

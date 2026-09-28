@@ -1168,7 +1168,7 @@ fn expand_realpath_aliases_is_a_no_op_with_no_aliases() {
     assert!(expanded.changed.contains(&uri("file:///some/file.ts")));
 }
 
-// Go: snapshotfs_test.go:1220 TestRealpathAliasLifecycle/markDirtyFiles invalidates symlinked file via realpath event
+// Go: snapshotfs_test.go:1267 TestRealpathAliasLifecycle/markDirtyFiles invalidates symlinked file via realpath event
 #[test]
 fn mark_dirty_files_invalidates_symlinked_file_via_realpath_event() {
     let test_fs = any_fs(
@@ -1209,7 +1209,7 @@ fn mark_dirty_files_invalidates_symlinked_file_via_realpath_event() {
     // Expand the realpath event to include the symlink path.
     let change = snapshot1.expand_realpath_aliases(change);
     // Now mark dirty — should find the file under the symlink key.
-    builder2.mark_dirty_files(&change);
+    builder2.mark_dirty_files(change);
 
     // Trigger reload by reading the file (simulates program construction).
     assert_eq!(
