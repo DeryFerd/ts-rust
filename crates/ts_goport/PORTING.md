@@ -297,7 +297,10 @@ worker exits 2 with no result line, and the orchestrator then exits 2 too.
 
 ## Release builds
 
-- Build release binaries with the workspace `goport` profile:
+- Correctness evidence (gate, bound runs, sweeps, corpus, oracle checks) uses
+  plain `--release`: `scripts/run-cargo-capped.sh build --release -p ts_goport --bins`.
+  Fat LTO does not change output, and it costs 7 to 20 minutes per build.
+- Timing and shipped binaries use the workspace `goport` profile:
   `scripts/run-cargo-capped.sh build --profile goport -p ts_goport --bins`.
   It inherits `release` and adds `lto = "fat"` and `codegen-units = 1`.
   Other crates keep the default release settings. The binaries land in

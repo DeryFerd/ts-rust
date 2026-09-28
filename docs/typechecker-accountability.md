@@ -171,6 +171,38 @@ pin from O to N (first N: the v7.0.2 content). At N, "pinned Go" means Go at N:
 - The plan and tooling are in `target/continuation-r97-goport/upstream/drift.md`. Root
   must not widen this rule by delegation.
 
+### Goport-only roster carry-forward
+
+On 2026-09-28 Theo approved a standing rule for all batches. It is saved in
+`acceptanceRuleChanges` with id `goport-only-roster-carry-forward`, `batchId: "*"` and
+`standing: true`. No other rule can use `batchId: "*"`.
+
+- **Rule.** When no file outside `crates/ts_goport` changed since an earlier measured
+  revision, do not run the protected cargo roster again (the `ts_checker`,
+  `ts_compiler` and `ts_fixture` stages and the current-source corpus). Use the saved
+  roster result of that revision. No roster crate depends on `ts_goport`.
+- **Proof.** `scripts/goport/roster_fp.py <checkout>` gives the roster fingerprint. It
+  uses the `fp.py` method on all files except `crates/ts_goport/**`. The fingerprint of
+  the current source must equal the fingerprint of the earlier source. Equal
+  fingerprints mean byte-identical roster inputs.
+- **Record.** `batch.rosterFingerprint` is the roster fingerprint of the current source.
+  `batch.rosterCarryForward` has `fromRevision`, `fromSourceFingerprint` and
+  `rosterFingerprint`. `fullResult`, `fullResultRaw` and `corpus` point at the saved
+  files of the earlier revision. Use `scripts/goport/accept_revision.py --carry-from <rev>`.
+- **Check.** The local check requires the standing rule and equal roster fingerprints.
+  The earlier history row must be `full_measured`, must not be a carried row, and must
+  have the same source, roster fingerprint and full result hash. The full result must
+  name the earlier source.
+- **What still runs.** Each revision still gets the gate, the bound Query and Hono runs,
+  the quality checks and both independent verdicts. The verdicts are bound to the
+  current source and the carried full result hash. The protected names and the
+  inherited-loss rule do not change.
+- **Auditor.** The regression auditor runs `roster_fp.py` again on the earlier source and
+  on the current source. Both values must be equal and must agree with the state. If
+  not, the verdict is STOP.
+- Root must not widen this rule by delegation. For example, root must not exclude more
+  paths or carry a partial or carried result.
+
 Any other rule change still needs Theo's approval.
 
 ## Project target and reporting

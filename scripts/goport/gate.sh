@@ -2,8 +2,9 @@
 # Regression gate for goport. Perf and compat work must pass it before any merge.
 #
 # usage: gate.sh <label> [--bins DIR] [--quick|--full] [--commit SHA]
-#   --bins DIR    dir with goport, goport_emit, goport_typesyms, goport_build
-#                 (default: runtime/cargo-target/release)
+#   --bins DIR    dir with goport, goport_emit, goport_typesyms, goport_build and tsgo
+#                 (default: runtime/cargo-target/release; build them with --release, not
+#                 the fat-LTO goport profile: output is the same and the build is much faster)
 #   --quick       project checks only (default is --full)
 #   --full        also 1,500-case diagnostic and emit corpus samples and effect typesyms
 #   --commit SHA  commit the binaries were built from (else read DIR/COMMIT, else "unknown")
@@ -16,6 +17,9 @@
 #   typesyms      Go vs Rust dumps for query and hono (+ effect in --full)
 #   build         build-mode/compare-build.sh seq <repo> cold edits flags foreign, repro and query-chain
 #   determinism   goport 3x on zod, effect, elysia: runs must be equal and equal to the oracle
+#   editor        ls_edit_bench.py on Query core and Hono (typing-paced, errfix-paced, imports, long)
+#                 against Go in the same run. RSS, growth and answers limits are judged; latency is
+#                 reported only, because load changes it. Holds /tmp/goport-lsguard.lock.
 #   corpus-diag   (--full) corpus-p5 1,500-case shard through corpus-full/run_shard_parallel.py
 #   corpus-emit   (--full) emit-corpus/run_emit_shard2.py shard 0 + shard 1 --limit 502
 #
@@ -36,7 +40,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SELF=$HERE/$(basename "$0")
 ALLOW=$HERE/gate-allow.txt
 
-usage() { sed -n '2,24p' "$SELF"; exit 2; }
+usage() { sed -n '2,28p' "$SELF"; exit 2; }
 LABEL=${1:-}; [[ -n $LABEL && $LABEL != -* ]] || usage; shift
 [[ $LABEL =~ ^[A-Za-z0-9._-]+$ ]] || { echo "label must match [A-Za-z0-9._-]+" >&2; exit 2; }
 BINS=$R/runtime/cargo-target/release; MODE=full; COMMIT=
@@ -50,7 +54,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 BINS=$(realpath "$BINS")
-for b in goport goport_emit goport_typesyms goport_build; do
+for b in goport goport_emit goport_typesyms goport_build tsgo; do
   [[ -x $BINS/$b ]] || { echo "missing binary $BINS/$b" >&2; exit 2; }
 done
 [[ -f $ALLOW ]] || { echo "missing allow-list $ALLOW" >&2; exit 2; }
@@ -176,6 +180,26 @@ def parse_build(stage, log, runs):
         if m:
             items.append(item(stage, f'{m[1]}/{m[2]}', m[3] == 'MATCH', line.strip()))
     return items
+
+
+# Editor limits the gate judges. Latency limits depend on host load, so they are only reported.
+EDITOR_LIMITS = ('rss', 'growth', 'answers')
+
+
+def cmd_editor(result_json, items_file, expected):
+    sessions = json.loads(Path(result_json).read_text())['sessions'] if Path(result_json).exists() else []
+    items = []
+    for s in sessions:
+        name = f"{s['project']}/{s['scenario']}"
+        rec = s['rust'].get('cand')
+        if s['go']['error'] or not rec:
+            items.append(item('editor', name, False, f"Go session failed: {s['go']['error']}" if s['go']['error'] else 'no Rust session'))
+            continue
+        bad = [f'{k} {t}' for k, (ok, t) in rec['limits'].items() if k in EDITOR_LIMITS and not ok]
+        slow = [f'{k} {t}' for k, (ok, t) in rec['limits'].items() if k not in EDITOR_LIMITS and not ok]
+        detail = '; '.join(bad) or 'memory and answers within limits'
+        items.append(item('editor', name, not bad, detail + (f" (latency, not judged: {'; '.join(slow)})" if slow else '')))
+    write_items(items_file, items, int(expected))
 
 
 PARSERS = {'measure': parse_measure, 'measure-extra': parse_sweep, 'sweep': parse_sweep, 'sweep-extra2': parse_sweep, 'sweep-wide': parse_sweep,
@@ -447,7 +471,7 @@ def cmd_finish(out, meta_json):
 
 
 if __name__ == '__main__':
-    commands = {'parse': cmd_parse, 'f1': cmd_f1, 'typesyms': cmd_typesyms, 'determinism': cmd_determinism,
+    commands = {'parse': cmd_parse, 'f1': cmd_f1, 'typesyms': cmd_typesyms, 'determinism': cmd_determinism, 'editor': cmd_editor,
                 'corpus-diag': cmd_corpus_diag, 'corpus-emit': cmd_corpus_emit, 'finish': cmd_finish}
     commands[sys.argv[1]](*sys.argv[2:])
 PYEOF
@@ -493,6 +517,13 @@ build_seq() {
 }
 stage build build_seq; parse build /tmp/goport-build 32
 stage determinism py determinism "$BINS/goport" "$OUT/runs/determinism" "$OUT/items/determinism.jsonl"
+# The editor leak in R122 and R123 passed every other stage. 2 projects x 4 scenarios = 8 sessions.
+editor_bench() {
+  flock /tmp/goport-lsguard.lock python3 "$HERE/ls_edit_bench.py" --rust "cand=$BINS/tsgo" \
+    --projects query-core,hono --scenarios typing-paced,errfix-paced,imports,long --out "$OUT/runs/editor"
+}
+stage editor editor_bench
+py editor "$OUT/runs/editor/result.json" "$OUT/items/editor.jsonl" 8 >> "$OUT/logs/editor.log" 2>&1
 if [[ $MODE == full ]]; then
   stage corpus-diag py corpus-diag "$BINS/goport" "$COMMIT_FULL" "$OUT/runs/corpus-diag" "$OUT/items/corpus-diag.jsonl"
   stage corpus-emit py corpus-emit "$BINS/goport_emit" "$COMMIT_FULL" "$OUT/runs/corpus-emit" "$OUT/items/corpus-emit.jsonl"
@@ -508,12 +539,12 @@ scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', R / '
            R.parent / 'project-inputs-extra/sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', R / 'tools-port/sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
-           R / 'emit-corpus/run_emit_shard2.py']
+           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py']
 print(json.dumps({
     'label': label, 'mode': mode, 'startedUtc': started, 'commit': commit, 'commitInput': commit_in or None,
     'binsDir': bins,
     'binaries': {b: {'path': f'{bins}/{b}', 'sha256': sha(f'{bins}/{b}'), 'bytes': Path(f'{bins}/{b}').stat().st_size}
-                 for b in ('goport', 'goport_emit', 'goport_typesyms', 'goport_build')},
+                 for b in ('goport', 'goport_emit', 'goport_typesyms', 'goport_build', 'tsgo')},
     'oracle': {'path': str(Path.home() / '.local/bin/tsgo-oracle'), 'sha256': sha(Path.home() / '.local/bin/tsgo-oracle')},
     'goDumper': {'path': str(R / 'typesyms/typesymdump-go'), 'sha256': sha(R / 'typesyms/typesymdump-go')},
     'gate': {'path': gate, 'sha256': sha(gate)},

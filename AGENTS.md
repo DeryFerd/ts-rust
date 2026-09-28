@@ -28,15 +28,34 @@ A STOP verdict blocks new feature work and acceptance. It permits bounded diagno
 
 These rules apply to every goal, including `/goal` runs.
 
-- Read-only research helpers are always allowed. They need no core build, demo match or batch condition. Give each one a distinct question and output file. They do not edit source or run Cargo.
+- Read-only research helpers are always allowed. They need no core build, demo match or batch condition. Give each one a distinct question. They return findings as text and root saves them (Claude Code blocks some subagents from writing report files). They do not edit source or run Cargo.
 - When a goal asks for parallel work, start a workflow within 30 minutes of the goal start. Do the setup that the workflow needs first. Do not work alone for hours because a batch condition gates writing helpers.
 - To fix a build that fails in many files, root builds once and writes one error file per Rust file. Each fix agent owns one file and its error list, and does not run Cargo. Root rebuilds and repeats. Compile fixes stay inside the batch's allowed files. Semantic checker changes keep the one-writer rule.
 - A later wave starts only after the earlier wave it depends on is integrated and builds. Do not start a wave that adds to files or definitions that an unfinished wave owns.
-- Use `scripts/run-cargo-capped.sh` for all Cargo work. It uses one target directory per worktree, `TS_CARGO_JOBS` jobs (16 on zbook, 1 elsewhere) and sccache when installed. Do not give agents their own `CARGO_TARGET_DIR`. Set `TS_CARGO_SEPARATE_TARGET=1` only for a deliberate fresh-target reproduction.
+- Use `scripts/run-cargo-capped.sh` for all Cargo work. It uses one target directory per worktree, `TS_CARGO_JOBS` jobs (16 on zbook, 1 elsewhere) and sccache when installed. Do not give agents their own `CARGO_TARGET_DIR`. Set `TS_CARGO_SEPARATE_TARGET=1` only for a deliberate fresh-target reproduction, not for revision builds.
+- Correctness evidence (gate, bound runs, sweeps, corpus, oracle checks) uses `--release` binaries. The fat-LTO `--profile goport` build takes 7 to 20 minutes and does not change output. Use it only for timing and shipped binaries.
 
 Remote runners: zbook builds. The cloud hosts alvin and cup2 run gates, corpus suites, sweeps and oracle checks through `scripts/goport/remote.sh`. They keep a mirror at the same absolute paths as zbook. Copy the binaries and scripts to the host before a run, and fetch the results after it. For perf timing, measure all sides of one comparison on the same machine. The protected regression pipeline stays on zbook.
 dbook (`dbook-lan`) is a LAN host with zbook's CPU and 26 GB RAM. It runs gates, checks and quiet timing under `flock /tmp/goport-remote-dbook.lock`; see `scripts/goport/README.md`.
 The LAN minis mini-743d and mini-abf9 also run gates and checks. `remote.sh` reaches them over the LAN, and every job on one takes its lock `/tmp/goport-remote-<host>.lock` on zbook (see `scripts/goport/README.md`).
+
+## Dev loop
+
+These rules come from an audit of the 2026-09-24 to 2026-09-28 runs (1,223 subagents, 82,587 tool calls).
+
+- **Goal mode: no questions.** In a `/goal` run, do not ask Theo. The `goal-no-ask` hook denies AskUserQuestion while a goal is active. Choose the option you would recommend, record it with `scripts/state record note`, name it in the next status report and continue. Three questions stopped a goal for 4.3 hours.
+- **Keep the queue full.** `docs/goport-next.md` is the work queue. In goal mode, keep at least 3 workflows running. When one ends, start the next ready item in the same turn.
+- **Agent prompts.** Start every workflow agent prompt with the text of `docs/goport-agent-brief.md`. It covers build, format, waits, timing, remote hosts and output.
+- **Do not message a workflow agent.** A SendMessage to an agent inside a running workflow starts a second copy of that agent, and two writers then share one worktree. Put follow-ups in the next workflow, or in a file the agent was told to read.
+- **Status.** Use `scripts/goport/wfstatus` (all runs) and `scripts/goport/wfstatus <run-id>` (agent results). Do not parse `journal.jsonl` by hand.
+- **Waits.** A subagent blocks in the foreground (Bash timeout up to 600000 ms) until its job ends. It must not end its turn while a job it started still runs, because its background jobs stop with it. Root runs long commands with `run_in_background` and acts on the completion notice. A job longer than 10 minutes runs under `systemd-run --user --collect`, so a session crash does not kill it, and its log ends with one line: `DONE` or `FAIL rc=<N>`. Monitors grep for those two words only.
+- **Revisions.** Use `scripts/goport/candidate.sh` (see its usage). It checks scope and rustfmt before binding, because R105, R114 and R124 were rejected only for rustfmt. When `scripts/goport/roster_fp.py` shows no change outside `crates/ts_goport`, carry the roster result forward (`accept_revision.py --carry-from`, rule in [the accountability rules](docs/typechecker-accountability.md)) and skip the 45-minute drive.
+- **Merges.** Bring an accepted revision into `main` with a real merge, not a squash or a `git diff | git apply`. Squashed copies made later merges show false conflicts.
+- **Timing.** Use `scripts/goport/perf.sh` on a quiet host (dbook-lan or mini-abf9). It refuses above load 1.5. zbook timings taken while agents build are noise. Compare numbers only within one run.
+- **Remote hosts.** Use `scripts/goport/remote.sh run auto <command>`. Use raw `ssh` only to look.
+- **Tools.** Keep every tool under `scripts/`. Never put a tool in `/tmp`: a reboot or tmpfiles removes it. `scripts/goport/tmp-port.sh restore` puts back the legacy `/tmp/port` files and the cargo pool runner.
+- **Gate.** `scripts/goport/gate.sh` has an editor stage (memory and answers of `ls_edit_bench.py` on Query core and Hono). The R122 and R123 editor leak passed every older stage. `--bins` must hold `tsgo`.
+- **Worktrees.** `scripts/goport/prune-worktrees.py` lists clean, merged, idle worktrees and merged branches. Run `--apply` only with Theo's approval.
 
 ## Required checks
 

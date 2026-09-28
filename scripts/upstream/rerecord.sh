@@ -63,7 +63,7 @@ step_sync() {
 step_projects() { python3 scripts/upstream/record.py projects "$KEY" --jobs "$JOBS"; }
 step_f1() { python3 scripts/upstream/record.py f1 "$KEY" --jobs "$JOBS"; }
 step_sweep() {
-  mkdir -p /tmp/port
+  bash scripts/goport/tmp-port.sh restore
   GOPORT_BIN=/usr/bin/true bash "$R/tools-port/sweep.sh" "../pins/$KEY/rerecord/sweep-runs" &&
     GOPORT_BIN=/usr/bin/true bash "$R/tools-port/sweep-hono-runtime.sh" "../pins/$KEY/rerecord/hono-rt-runs"
 }

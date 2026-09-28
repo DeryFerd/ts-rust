@@ -6,14 +6,26 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `gate.sh <label>`: full regression gate. Run it before any goport merge.
 - `bound2.sh <round>`: bound parity run with a manifest (Query, Hono, error copies, sweeps, emit).
 - `measure.sh`, `measure-extra.sh`, `sweep.sh`: the project comparisons that `bound2.sh` and `gate.sh` use.
-- `perf.sh <bin> <label>`: median wall time and peak RSS on Query, Hono, zod and effect.
+- `perf.sh <label> <bin>...`: median of 3 wall time and peak RSS on Query, Hono, zod and effect,
+  runs interleaved across the binaries. It refuses to start above load 1.5 (`PERF_WAIT=1` waits
+  for a quiet host). zbook is rarely quiet: run it on dbook-lan or mini-abf9.
+- `roster_fp.py <checkout>`: fingerprint of every file outside `crates/ts_goport`. Equal values
+  allow the goport-only roster carry-forward (docs/typechecker-accountability.md).
+- `wfstatus [--all]`: one line per workflow of the newest ts-rust session (state, agents done,
+  running labels, age). `wfstatus <run-id>` prints that run's agent results. Use it instead of
+  parsing `journal.jsonl` by hand.
+- `prune-worktrees.py`: lists stale worktrees and merged branches. `--apply` removes them.
 - `fp.py <checkout>`: the source fingerprint recorded in the saved state.
+- `gate.sh` also runs an editor stage (memory and answers limits of `ls_edit_bench.py` on Query
+  core and Hono), so `--bins` must hold `tsgo` too. Build the bins with `--release --bins`.
 - `ls_edit_bench.py --rust BIN`: editor sessions (typing, error then fix, VS Code request mix, imports,
   200-edit session, and typing and error then fix with a 150 ms pause between edits) on Query core,
   Hono and effect against Go. RSS, edit latency and answers; exit 1 when Rust is over the limits in
   its docstring.
 
 Revision bindings made before this move pin `/tmp/port/fp.py`. That copy is identical.
+`tmp-port.sh restore` puts back the legacy `/tmp/port` files and the cargo pool runner after a
+reboot or a tmpfiles cleanup (a login does it too). Put new tools here, never in `/tmp`.
 
 ## Editor sessions: `ls_edit_bench.py`
 
@@ -85,7 +97,9 @@ How to read the result:
 ## Remote runners
 
 `remote.sh` copies binaries and scripts to a remote host, runs a command there in the repo root
-and fetches the results. zbook builds. Each host keeps a mirror at zbook's absolute paths
+and fetches the results. zbook builds. Prefer `remote.sh run auto <command>`: it picks the first
+host whose lock is free and whose load is low, and holds that lock for the run. Do not wrap
+`run auto` in flock. Raw `ssh <host>` skips the locks and the path checks; use it only to look. Each host keeps a mirror at zbook's absolute paths
 (manifests and setup notes in `target/continuation-r97-goport/remote/`).
 
 - alvin, cup2: cloud hosts for gates, corpus suites, sweeps and oracle checks.

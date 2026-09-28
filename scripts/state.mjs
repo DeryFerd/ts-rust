@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 export const STATE_DIR = "docs/typechecker-state";
 const HASH = /^[a-f0-9]{64}$/;
+// current.json over this size grows back into the 885 KB file that cost 62 reads a session.
+const CURRENT_WARN_BYTES = 64 * 1024;
 // These live in history.jsonl only. current.json must not carry a second copy.
 const HISTORY_ONLY = ["additionalPassingResultsForAuditor"];
 // Kept in current.json by `migrate`. Every other legacy key becomes a note.
@@ -235,6 +237,13 @@ function summary(dir) {
     ["next action", batch.nextPermittedAction],
     ["history", `${readHistory(dir).length} lines. Use history --last N, --kind, --key, --revision.`],
   ];
+  const bytes = readFileSync(paths(dir).current).length;
+  if (bytes > CURRENT_WARN_BYTES) {
+    const largest = Object.entries(readJson(paths(dir).current))
+      .map(([key, value]) => [key, JSON.stringify(value)?.length ?? 0]).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    rows.push(["WARNING", `current.json is ${Math.round(bytes / 1024)} KB (limit ${CURRENT_WARN_BYTES / 1024} KB). Largest: `
+      + largest.map(([key, size]) => `${key} ${Math.round(size / 1024)} KB`).join(", ") + ". Move old entries to history with record note."]);
+  }
   return rows.map(([label, value]) => `${label.padEnd(15)}${value ?? "none"}`).join("\n");
 }
 

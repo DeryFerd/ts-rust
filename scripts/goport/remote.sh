@@ -9,7 +9,10 @@
 #        remote.sh run <host> <command...>    run a command in the repo root with a login shell; output streams
 #        remote.sh fetch <host> <dir>...      copy result dirs back to zbook; adds new files, never replaces one
 # <host> is alvin, cup2, dbook-lan, mini-743d, mini-abf9, "all" (sync-*: every host at the same time) or "auto"
-# (first idle host). Host order is alvin, cup2, dbook-lan, mini-743d, mini-abf9 (REMOTE_HOSTS overrides it).
+# (first host whose zbook lock /tmp/goport-remote-<host>.lock is free and whose load is under half its cores;
+# `run auto` holds that lock until the command ends, so do not wrap it in flock). An explicit <host> takes no
+# lock: wrap it in `flock /tmp/goport-remote-<host>.lock` as before. Host order is alvin, cup2, dbook-lan,
+# mini-743d, mini-abf9 (REMOTE_HOSTS overrides it).
 # dbook and the minis are on zbook's LAN and always go over it, never Tailscale. Relative dirs are relative to the repo root.
 set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
@@ -40,9 +43,13 @@ die() { echo "remote.sh: $*" >&2; exit 2; }
 abs() { (cd "$REPO" && realpath -ms "$1"); }
 # Never write into project inputs. Their measure/ output dirs are allowed (the sweep scripts write there).
 guard() { [[ $1 != "$T"/project-inputs* || $1 == "$T"/project-inputs*/measure/?* ]] || die "refusing to write into project inputs: $1"; }
-# First host in order whose repo path resolves to itself (else tools print other paths), with load under half its cores.
+# The zbook-side lock that serializes jobs on host $1 (dbook-lan uses the dbook lock).
+lockfile() { echo "/tmp/goport-remote-${1%-lan}.lock"; }
+# First host in order with a free lock, whose repo path resolves to itself (else tools print other paths),
+# with load under half its cores.
 pick() {
   local h; for h in "${HOSTS[@]}"; do
+    flock -n "$(lockfile "$h")" true || continue
     ssh ${SSH_OPTS[$h]:-} "$h" "{ [ -x ~/.local/bin/zbook-paths ] || [ \"\$(realpath $REPO)\" = $REPO ]; } && awk -v n=\$(nproc) '{exit !(\$1 < n / 2)}' /proc/loadavg" && { echo "$h"; return; }
   done
   die "no idle host with a correct mirror in: ${HOSTS[*]}"
@@ -68,7 +75,8 @@ sync_scripts() {
       $r/{cli-complete,tsgo-bin}/audit-r3/*.{py,sh} worktrees/goport-{int7,ls}/scripts/goport project-inputs-extra/sweep-extra2.sh; do
     [[ -e $f ]] && echo "$f"
   done | rs "$h" -r --exclude=__pycache__/ --files-from=- "$T/" "$h:$T/" || return
-  # compat/p5-corpus and typesyms/scale call /tmp/port/treehash.py. /tmp is tmpfs on alvin and cup2.
+  # Legacy: compat/p5-corpus and typesyms/scale call /tmp/port/treehash.py. /tmp is tmpfs on alvin and cup2.
+  # New tools go in scripts/, never /tmp (scripts/goport/tmp-port.sh restores /tmp/port on zbook).
   [[ ! -d /tmp/port ]] || rs "$h" --include='*.py' --include='*.sh' --include=gate-allow.txt --exclude='*' /tmp/port/ "$h:/tmp/port/"
 }
 # A tty (when there is one) lets Ctrl-C stop the remote command too.
@@ -93,13 +101,21 @@ fetch() {
     rs "$h" --ignore-existing "$h:$d/" "$d/" || return
   done
 }
-[[ $# -ge 2 ]] || { sed -n '7,13p' "$0"; exit 2; }
+[[ $# -ge 2 ]] || { sed -n '7,16p' "$0"; exit 2; }
 cmd=$1 host=$2; shift 2
 case $cmd in sync-bins|sync-scripts|run|fetch) ;; *) die "unknown command $cmd" ;; esac
 [[ $cmd == sync-scripts || $# -ge 1 ]] || die "$cmd needs more arguments"
 # dbook and the minis are on the same LAN as zbook: always use the LAN route, never the Tailscale name.
 host=$(canon "$host")
-[[ $host == auto ]] && { host=$(pick) || exit 2; }
+if [[ $host == auto ]]; then
+  host=$(pick) || exit 2
+  # Hold the host lock for the whole command. Another auto pick in between loses the race and waits here.
+  if [[ $cmd == run ]]; then
+    exec 7> "$(lockfile "$host")"
+    flock -n 7 || { echo "remote.sh: $host was taken; waiting for its lock" >&2; flock 7; }
+  fi
+  echo "remote.sh: auto picked $host" >&2
+fi
 if [[ $host == all ]]; then
   [[ $cmd == sync-* ]] || die "'all' only works with sync-bins and sync-scripts"
   pids=(); for h in "${HOSTS[@]}"; do "${cmd//-/_}" "$h" "$@" & pids+=($!); done

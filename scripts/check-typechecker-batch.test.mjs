@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BASELINE_SHA256, CHECKPOINT_SHA256, INHERITED_PIN, checkBatch, readPinnedJson } from "./check-typechecker-batch.mjs";
+import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, INHERITED_PIN, checkBatch, readPinnedJson } from "./check-typechecker-batch.mjs";
 
 const SOURCE = "a".repeat(64);
 const RESULT = "b".repeat(64);
@@ -370,4 +370,52 @@ test("approved unbound rows may keep a null source, never the current row", () =
   assert.equal(checkBatch(f.state, f.read).verdict, "PASS");
   Object.assign(f.state.batch.recoveryHistory[6], { sourceFingerprint: null });
   stopped(f, /Invalid or reset recovery history/);
+});
+
+// Revision 7 carries the full result of measured revision 6 (source FROM). Only
+// crates/ts_goport changed, so both rows have the same roster fingerprint.
+const FROM = "e".repeat(64), ROSTER = "f".repeat(64);
+function carryFixture() {
+  const f = continuationFixture();
+  for (const item of [f.candidate, f.candidate.closure, ...f.candidate.stages]) item.sourceFingerprint = FROM;
+  Object.assign(f.state.batch.recoveryHistory[5], { sourceFingerprint: FROM, fullResultSha256: RESULT, status: "full_measured", rosterFingerprint: ROSTER });
+  f.state.batch.rosterFingerprint = ROSTER;
+  f.state.batch.rosterCarryForward = { fromRevision: 6, fromSourceFingerprint: FROM, rosterFingerprint: ROSTER };
+  f.state.acceptanceRuleChanges = [{ id: CARRY_FORWARD_RULE, batchId: "*", standing: true, approvedBy: "Theo", date: "2026-09-28T09:00:00Z",
+    instruction: "Skip the roster run when only crates/ts_goport changed.", scope: "Every batch. Equal roster_fp.py hashes." }];
+  return f;
+}
+
+test("roster carry-forward checks the earlier measured result and reports it", () => {
+  const f = carryFixture(), result = checkBatch(f.state, f.read);
+  assert.equal(result.verdict, "PASS");
+  assert.deepEqual(result.rosterCarryForward, { rule: CARRY_FORWARD_RULE, fromRevision: 6, fromSourceFingerprint: FROM });
+  const plain = fixture();
+  assert.equal("rosterCarryForward" in checkBatch(plain.state, plain.read), false);
+  delete f.state.batch.rosterCarryForward;
+  stopped(f, /Full result source mismatch/);
+});
+
+test("roster carry-forward stops without the rule, equal fingerprints or an earlier measured row", () => {
+  const from = f => f.state.batch.recoveryHistory[5];
+  for (const [change, pattern] of [
+    [f => { f.state.acceptanceRuleChanges = []; }, /standing goport-only-roster-carry-forward rule/],
+    [f => { f.state.acceptanceRuleChanges[0].standing = false; }, /standing/],
+    [f => { f.state.acceptanceRuleChanges[0].batchId = "batch-1"; }, /standing/],
+    [f => { delete f.state.acceptanceRuleChanges[0].approvedBy; }, /standing/],
+    [f => { f.state.batch.rosterFingerprint = "d".repeat(64); }, /differs from the batch roster fingerprint/],
+    [f => { f.state.batch.rosterFingerprint = f.state.batch.rosterCarryForward.rosterFingerprint = "roster"; }, /SHA-256/],
+    [f => { from(f).rosterFingerprint = "d".repeat(64); }, /differs from the carry-forward record/],
+    [f => { from(f).fullResultSha256 = "d".repeat(64); }, /differs from the carry-forward record/],
+    [f => { from(f).sourceFingerprint = "d".repeat(64); }, /differs from the carry-forward record/],
+    [f => { from(f).status = "focused_only"; }, /not a full_measured revision/],
+    [f => { from(f).rosterCarryForward = { fromRevision: 5 }; }, /not a full_measured revision/],
+    [f => { f.state.batch.rosterCarryForward.fromRevision = 7; }, /earlier revision/],
+    [f => { f.state.batch.auditor.sourceFingerprint = FROM; }, /Verdict is not bound/],
+  ]) { const f = carryFixture(); change(f); stopped(f, pattern); }
+});
+
+test("only the carry-forward rule may use batchId *", () => {
+  const f = optInFixture(); f.state.acceptanceRuleChanges[0].batchId = "*";
+  assert.match(checkBatch(f.state, f.read, PIN).reasons.join(" "), /original accepted PASS names are FAIL or ABSENT\./);
 });

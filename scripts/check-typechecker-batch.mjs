@@ -9,6 +9,7 @@ export const CHECKPOINT_SHA256 = "60a372581586cb3c8d0046ba6e4ab0af65b515267485a0
 export const BASELINE_SHA256 = "f562cd3ca338de7203c6ae12693dfc4a726a6478b3da7f1393374c36194bdcba";
 // Theo's opt-in crate rule (2026-09-25) pins the inherited losses to the R96 full result.
 export const INHERITED_PIN = { sha256: "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7", originalAccepted: 290, laterPasses: 15 };
+export const CARRY_FORWARD_RULE = "goport-only-roster-carry-forward";
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
@@ -71,10 +72,11 @@ export function readPinnedJson(reference) {
 }
 
 // Theo-approved rule changes live in state.acceptanceRuleChanges. Each entry is bound
-// to one batch id. Rules that do not name this batch have no effect.
+// to one batch id. Rules that do not name this batch have no effect. Only the standing
+// carry-forward rule may use batchId "*" (see rosterCarry), so "*" never matches here.
 function approvedRule(state, id) {
   const rules = Array.isArray(state.acceptanceRuleChanges) ? state.acceptanceRuleChanges : [];
-  const rule = rules.find(item => item?.id === id && item.batchId === state.batch?.id);
+  const rule = rules.find(item => item?.id === id && item.batchId === state.batch?.id && item.batchId !== "*");
   if (!rule) return null;
   requireValue(rule.approvedBy === "Theo" && text(rule.instruction) && text(rule.date) && Number.isFinite(Date.parse(rule.date)),
     `Rule ${id} needs Theo's saved approval, instruction and date.`);
@@ -134,6 +136,33 @@ function validateBatch(state) {
   }
   requireValue(batch.auditor.agent !== batch.reviewer.agent && batch.auditor.role !== batch.reviewer.role, "Auditor and reviewer must have distinct roles and agent identities.");
   return batch;
+}
+
+// Theo's standing goport-only roster carry-forward rule (2026-09-28). When no file outside
+// crates/ts_goport changed (equal scripts/goport/roster_fp.py hashes), batch.fullResult may
+// be the saved result of an earlier measured revision. Returns null without
+// batch.rosterCarryForward, else the carry record, whose fromSourceFingerprint the full
+// result must name. Verdicts and the current history row stay bound to this batch.
+function rosterCarry(state, batch) {
+  const carry = batch.rosterCarryForward;
+  if (carry == null) return null;
+  const rules = Array.isArray(state.acceptanceRuleChanges) ? state.acceptanceRuleChanges : [];
+  const rule = rules.find(item => item?.id === CARRY_FORWARD_RULE && item.batchId === "*");
+  requireValue(rule?.standing === true && rule.approvedBy === "Theo" && text(rule.instruction) && text(rule.scope)
+    && text(rule.date) && /^\d{4}-\d{2}-\d{2}T/.test(rule.date) && Number.isFinite(Date.parse(rule.date)),
+  `Roster carry-forward needs Theo's standing ${CARRY_FORWARD_RULE} rule with batchId "*", instruction, scope and ISO date.`);
+  requireValue(HASH.test(batch.rosterFingerprint) && HASH.test(carry.rosterFingerprint) && HASH.test(carry.fromSourceFingerprint),
+    "Roster carry-forward needs SHA-256 roster and source fingerprints.");
+  requireValue(carry.rosterFingerprint === batch.rosterFingerprint, "Roster carry-forward fingerprint differs from the batch roster fingerprint.");
+  requireValue(Number.isInteger(carry.fromRevision) && carry.fromRevision < batch.recoveryRevision, "Roster carry-forward must name an earlier revision.");
+  const from = batch.recoveryHistory.find(row => row.revision === carry.fromRevision);
+  // A carried row never ran the roster, so it cannot be a source for another carry.
+  requireValue(typeof from?.status === "string" && from.status.startsWith("full_measured") && from.rosterCarryForward == null,
+    `Roster carry-forward source R${carry.fromRevision} is not a full_measured revision.`);
+  requireValue(from.sourceFingerprint === carry.fromSourceFingerprint && from.rosterFingerprint === batch.rosterFingerprint
+    && from.fullResultSha256 === batch.fullResult.sha256,
+  `R${carry.fromRevision} source, roster fingerprint or full result differs from the carry-forward record.`);
+  return carry;
 }
 
 function laterPasses(report) {
@@ -208,6 +237,7 @@ function losses(baseline, current) {
 export function checkBatch(state, readEvidence = readPinnedJson, inheritedPin = INHERITED_PIN) {
   try {
     const batch = validateBatch(state);
+    const carry = rosterCarry(state, batch);
     requireValue(state.acceptedBaseline?.sha256 === CHECKPOINT_SHA256, "Accepted checkpoint identity changed.");
     requireValue(state.originalAccepted?.sha256 === BASELINE_SHA256 && state.originalAccepted.expectedNames === 6055,
       "Original accepted baseline identity or count changed.");
@@ -220,7 +250,7 @@ export function checkBatch(state, readEvidence = readPinnedJson, inheritedPin = 
     requireValue(acceptedMap.size === 6055 && accepted.every(row => row.accepted?.status === "PASS"), "Original baseline must contain 6055 exact PASS names.");
     const later = laterPasses(readEvidence(state.laterPassBaseline));
     const candidate = readEvidence(batch.fullResult);
-    const current = currentResults(candidate, batch.sourceFingerprint);
+    const current = currentResults(candidate, carry?.fromSourceFingerprint ?? batch.sourceFingerprint);
     const candidateAccepted = rowsByKey(candidate.originalAccepted6055?.exactLedger, "Candidate accepted ledger");
     requireValue(candidateAccepted.size === acceptedMap.size, "Candidate accepted ledger changed its name count.");
     for (const [id] of acceptedMap) {
@@ -249,6 +279,7 @@ export function checkBatch(state, readEvidence = readPinnedJson, inheritedPin = 
     if (newOriginal.length) reasons.push(`${newOriginal.length} original accepted PASS names are FAIL or ABSENT${inherited ? " and not inherited" : ""}.`);
     if (newLater.length) reasons.push(`${newLater.length} later baseline PASS names are FAIL or ABSENT${inherited ? " and not inherited" : ""}.`);
     return { verdict: reasons.length ? "STOP" : "PASS", scope: SCOPE, reasons, rule: optIn ? optIn.id : null,
+      ...(carry && { rosterCarryForward: { rule: CARRY_FORWARD_RULE, fromRevision: carry.fromRevision, fromSourceFingerprint: carry.fromSourceFingerprint } }),
       counts: { originalAccepted: 6055, originalRetained: 6055 - originalLosses.length, laterPasses: 6330, laterRetained: 6330 - laterLosses.length,
         inheritedOriginal: inherited?.originalAccepted.length ?? null, inheritedLater: inherited?.laterPasses.length ?? null },
       losses: { originalAccepted: originalLosses, laterPasses: laterLosses } };
@@ -294,6 +325,17 @@ Theo-approved rules in acceptanceRuleChanges apply only to the named batch id:
 - unbound-history-rows: listed past revisions may keep a null source and result.
 - opt-in-crate-no-new-loss: losses already in the pinned inheritedResult are
   reported, not blocking. Inherited counts must equal the approved counts.
+A rule with batchId "*" is ignored, except this standing rule:
+- goport-only-roster-carry-forward (batchId "*", standing true, scope): used
+  only when batch.rosterCarryForward {fromRevision, fromSourceFingerprint,
+  rosterFingerprint} is present. batch.rosterFingerprint is the
+  scripts/goport/roster_fp.py hash (all files except crates/ts_goport). The
+  history row of the earlier fromRevision must be full_measured, not carried
+  itself, with that sourceFingerprint, the same rosterFingerprint, and
+  fullResultSha256 equal to batch.fullResult. The full result must then name
+  fromSourceFingerprint. Protected names, inherited losses, the current history
+  row and both verdicts stay bound to this batch source and full result. The
+  output then has rosterCarryForward.
 
 ${SCOPE}
 Independent review must compare retained history against saved batchRecords.
