@@ -5405,8 +5405,8 @@ pub struct ContentMapperSourceFileInfo {
 // (the emitter, the diagnostic writer, the language service). A parsed
 // file's node data cannot hold it and `ParsedSourceFile` must stay `Send`
 // (a parse worker makes it), so the info lives in a process table by file
-// id, like the file stores. It is set once and never freed, as a published
-// file is never freed.
+// (`content_mapper_key`), like the file stores. It is set once and never
+// freed, as a published file is never freed.
 #[derive(Debug)]
 pub struct ContentMapperFileInfo {
     pub content_mapper: String,
@@ -5420,9 +5420,26 @@ pub struct ContentMapperFileInfo {
     pub canonical_source_file: Node,
 }
 
-/// The content mapper info of each parsed file, by file id.
-static CONTENT_MAPPER_INFOS: std::sync::RwLock<FxHashMap<usize, &'static ContentMapperFileInfo>> =
-    std::sync::RwLock::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher));
+/// The content mapper info of each parsed file, by `content_mapper_key`.
+static CONTENT_MAPPER_INFOS: std::sync::RwLock<
+    FxHashMap<(usize, usize), &'static ContentMapperFileInfo>,
+> = std::sync::RwLock::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher));
+
+/// The key of the parsed file with id `file` in `CONTENT_MAPPER_INFOS`: the
+/// id and the address of the file name that its store keeps. Panics when
+/// this thread sees no store `file`.
+// PORT: Go keeps the info on the `*SourceFile`, so each parse has its own.
+// A file id alone does not name one parse: the build stores of every thread
+// take their ids from `PUBLISHED` (`store.rs`), so a store that is not
+// published on another thread, or on a thread that ended without a publish
+// (a test), can have the same id. `parse_source_file` leaks the file name
+// of each parse (a path, never empty), and a leak is never freed, so its
+// address names the parse. A clone of the `ParsedSourceFile` and a later
+// program that shares the published file read the same store, so they get
+// the same key.
+fn content_mapper_key(file: usize) -> (usize, usize) {
+    (file, file_store_file_name(file).as_ptr().addr())
+}
 
 /// True once any file has content mapper info, so a program with no content
 /// mapper reads no table.
@@ -5447,13 +5464,14 @@ static EMPTY_PARSE_OPTIONS: crate::frontend::parser::SourceFileParseOptions =
 /// `ParsedSourceFile::set_content_mapper_info` calls it.
 // PORT: panics when the info is already set, as Go does.
 pub fn set_source_file_content_mapper_info(file: Node, info: ContentMapperFileInfo) {
+    let key = content_mapper_key(file.file_index());
     let mut infos = CONTENT_MAPPER_INFOS
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if infos.contains_key(&file.file_index()) {
+    if infos.contains_key(&key) {
         panic!("content mapper source file info already set");
     }
-    infos.insert(file.file_index(), Box::leak(Box::new(info)));
+    infos.insert(key, Box::leak(Box::new(info)));
     HAS_CONTENT_MAPPER_INFO.store(true, std::sync::atomic::Ordering::Release);
 }
 
@@ -5467,10 +5485,14 @@ pub fn source_file_content_mapper_info(file: Node) -> Option<&'static ContentMap
     if is_synthetic_node(file) {
         return with_synthetic_source_file(file, |d| d.content_mapper_info);
     }
+    if !has_file_store(file.file_index()) {
+        return None;
+    }
+    let key = content_mapper_key(file.file_index());
     CONTENT_MAPPER_INFOS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&file.file_index())
+        .get(&key)
         .copied()
 }
 

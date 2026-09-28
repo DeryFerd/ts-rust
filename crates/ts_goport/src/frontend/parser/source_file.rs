@@ -169,10 +169,11 @@ impl ParsedSourceFile {
     // ── Content mapper info (tsgo#4712) ────────────────────────────────
     // PORT: Go keeps `contentMapperInfo` on the SourceFile. Here the node
     // side (`ContentMapperFileInfo`) is in the process table of `crate::ast`,
-    // keyed by the file id, and the `Rc` links are in `CONTENT_MAPPER_LINKS`
-    // of this thread (an `Rc<ParsedSourceFile>` stays on its thread). A
-    // clone of a `ParsedSourceFile` has the same file id, so it has the same
-    // info, as a Go copy of the pointer does.
+    // keyed by the file id and the file name address of its store (see
+    // `content_mapper_key` there), and the `Rc` links are in
+    // `CONTENT_MAPPER_LINKS` of this thread (an `Rc<ParsedSourceFile>` stays
+    // on its thread). A clone of a `ParsedSourceFile` has the same store, so
+    // it has the same info, as a Go copy of the pointer does.
 
     // Go: ast/ast.go:2561 OriginalText
     // OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
