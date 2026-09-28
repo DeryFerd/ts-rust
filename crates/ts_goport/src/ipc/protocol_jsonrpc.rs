@@ -1,17 +1,18 @@
-//! Port of internal/api/protocol_jsonrpc.go.
+//! Port of internal/ipc/protocol_jsonrpc.go (internal/api/protocol_jsonrpc.go
+//! before tsgo#4712).
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
-use crate::api::protocol::{Message, Protocol};
-use crate::api::transport::{ConnReader, ConnWriter, ReadWriteCloser};
 use crate::frontend::json::{json_marshal, json_unmarshal};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{GoError, errors};
+use crate::ipc::protocol::{Message, Protocol};
+use crate::ipc::transport::{ConnReader, ConnWriter, ReadWriteCloser};
 use crate::jsonrpc;
 use std::io::BufReader;
 use std::sync::Arc;
 
-// Go: protocol_jsonrpc.go:12 JSONRPCProtocol
+// Go: ipc/protocol_jsonrpc.go:12 JSONRPCProtocol
 // JSONRPCProtocol implements the Protocol interface using JSON-RPC 2.0
 // with the LSP base protocol framing (Content-Length headers).
 pub struct JSONRPCProtocol {
@@ -19,10 +20,10 @@ pub struct JSONRPCProtocol {
     writer: jsonrpc::Writer,
 }
 
-// Go: protocol_jsonrpc.go:17
+// Go: ipc/protocol_jsonrpc.go:17
 // var _ Protocol = (*JSONRPCProtocol)(nil) is the `impl Protocol` below.
 
-// Go: protocol_jsonrpc.go:20 NewJSONRPCProtocol
+// Go: ipc/protocol_jsonrpc.go:20 NewJSONRPCProtocol
 // NewJSONRPCProtocol creates a new JSON-RPC protocol handler.
 // PORT: Go takes an `io.ReadWriter`; the port takes the shared connection.
 // Go `jsonrpc.NewReader` adds a 4096-byte `bufio.Reader`; the Rust reader
@@ -38,7 +39,7 @@ pub fn new_jsonrpc_protocol(rw: Arc<dyn ReadWriteCloser>) -> JSONRPCProtocol {
 }
 
 impl Protocol for JSONRPCProtocol {
-    // Go: protocol_jsonrpc.go:28 ReadMessage
+    // Go: ipc/protocol_jsonrpc.go:28 ReadMessage
     // ReadMessage implements Protocol.
     fn read_message(&mut self) -> Result<Message, GoError> {
         let data = self.reader.read()?;
@@ -51,7 +52,7 @@ impl Protocol for JSONRPCProtocol {
         Ok(msg)
     }
 
-    // Go: protocol_jsonrpc.go:43 WriteRequest
+    // Go: ipc/protocol_jsonrpc.go:43 WriteRequest
     // WriteRequest implements Protocol.
     fn write_request(
         &mut self,
@@ -72,7 +73,7 @@ impl Protocol for JSONRPCProtocol {
         self.writer.write(data.as_bytes())
     }
 
-    // Go: protocol_jsonrpc.go:57 WriteNotification
+    // Go: ipc/protocol_jsonrpc.go:57 WriteNotification
     // WriteNotification implements Protocol.
     fn write_notification(
         &mut self,
@@ -91,7 +92,7 @@ impl Protocol for JSONRPCProtocol {
         self.writer.write(data.as_bytes())
     }
 
-    // Go: protocol_jsonrpc.go:70 WriteResponse
+    // Go: ipc/protocol_jsonrpc.go:70 WriteResponse
     // WriteResponse implements Protocol.
     fn write_response(
         &mut self,
@@ -114,7 +115,7 @@ impl Protocol for JSONRPCProtocol {
         self.writer.write(data.as_bytes())
     }
 
-    // Go: protocol_jsonrpc.go:86 WriteError
+    // Go: ipc/protocol_jsonrpc.go:86 WriteError
     // WriteError implements Protocol.
     fn write_error(
         &mut self,

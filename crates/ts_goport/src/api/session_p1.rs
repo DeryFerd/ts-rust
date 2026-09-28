@@ -5,7 +5,8 @@ use crate::api::prelude::*;
 // setup, the `HandleRequest` dispatch and the snapshot, project, symbol and
 // type handlers up to `handleGetTargetOfSignature`, the transpile handlers
 // (tsgo#4849), then `handleGetImportAdderEdits` and `toAPITextEdits`
-// (tsgo#3881). Lines 1272-2484 are `session_p2.rs`.
+// (tsgo#3881) and `originalTextOffset` (tsgo#4712). Lines 1272-2484 are
+// `session_p2.rs`.
 //
 // PORT notes for both files:
 // - Go `*ast.Symbol`, `*checker.Type` and `*checker.Signature` carry their
@@ -953,7 +954,7 @@ impl Session {
     }
 }
 
-impl Handler for Session {
+impl ipc::Handler for Session {
     // Go: api/session.go:375 HandleRequest
     // HandleRequest implements Handler.
     fn handle_request(
@@ -1866,7 +1867,6 @@ impl Session {
             None, /*existingOptions*/
             &config_file_name,
             &[],  /*resolutionStack*/
-            &[],  /*extraFileExtensions*/
             None, /*extendedConfigCache*/
         );
         Ok(new_config_file_response(Some(&parsed_command_line)))
@@ -1908,7 +1908,6 @@ impl Session {
             None, /*existingOptionsRaw*/
             &config_file_name,
             &[],  /*resolutionStack*/
-            &[],  /*extraFileExtensions*/
             None, /*extendedConfigCache*/
         );
 
@@ -2951,7 +2950,9 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1953 handleGetImportAdderEdits (tsgo#3881)
+    // Go: api/session.go:1953 handleGetImportAdderEdits (tsgo#3881, tsgo#4712)
+    // PORT: Go returns `[]*TextEdit`, and `toAPITextEdits` can return nil
+    // (JSON `null`); nil is `None`.
     // PORT: Go `defer preparedSnapshot.Deref(s.projectSession)` is the
     // `Release` guard `_deref_prepared`. It is declared before the checker
     // lease, so the lease (`defer done()`) ends first, as in Go. Go passes
@@ -2963,7 +2964,7 @@ impl Session {
         &self,
         ctx: &Context,
         params: &GetImportAdderEditsParams,
-    ) -> Result<Vec<TextEdit>, GoError> {
+    ) -> Result<Option<Vec<TextEdit>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
         let project_path = parse_project_handle(&params.project);
@@ -3046,7 +3047,7 @@ impl Session {
 
         let registry = working_snapshot.auto_import_registry();
         let Some(registry) = registry else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
 
         let (ch, _done) = ls_program::get_type_checker(program, ctx);
@@ -3108,34 +3109,110 @@ impl Session {
         }
 
         if !import_adder.has_fixes() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
-        Ok(to_api_text_edits(
-            source_file,
-            &working_snapshot.converters(),
-            &import_adder.edits(),
-        ))
+        Ok(to_api_text_edits(source_file, &import_adder.edits()))
     }
 }
 
-// Go: api/session.go:2044 toAPITextEdits (tsgo#3881)
-// PORT: this is the tsgo#3881 form (converters and the position map).
-// tsgo#4712 (wave 3) reads the original text of the file instead.
-pub fn to_api_text_edits(
-    source_file: Node,
-    converters: &lsconv::Converters,
-    edits: &[lsproto::TextEdit],
-) -> Vec<TextEdit> {
-    let position_map = source_file_get_position_map(source_file);
+// Go: api/session.go:2044 toAPITextEdits (tsgo#3881, tsgo#4712)
+// PORT: Go returns nil when an edit position is outside the original text;
+// nil is `None`.
+pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Option<Vec<TextEdit>> {
+    let original_text = source_file_original_text(source_file);
+    let line_map = lsconv::compute_lsp_line_starts(original_text);
+    let position_map = compute_position_map(original_text);
     let mut result = Vec::with_capacity(edits.len());
     for edit in edits {
-        let start = converters.line_and_character_to_position(&source_file, &edit.range.start);
-        let end = converters.line_and_character_to_position(&source_file, &edit.range.end);
+        let (start, ok) = original_text_offset(&line_map, &edit.range.start, original_text.len());
+        if !ok {
+            return None;
+        }
+        let (end, ok) = original_text_offset(&line_map, &edit.range.end, original_text.len());
+        if !ok {
+            return None;
+        }
         result.push(TextEdit {
             pos: position_map.utf8_to_utf16(start),
             end: position_map.utf8_to_utf16(end),
             new_text: edit.new_text.clone(),
         });
     }
-    result
+    Some(result)
+}
+
+// Go: api/session.go:2067 originalTextOffset (tsgo#4712)
+// PORT: Go `int` arithmetic is `i64` here; the offset is at most the text
+// length, so it fits the `i32` that `PositionMap` takes.
+pub fn original_text_offset(
+    line_map: &lsconv::LSPLineMap,
+    position: &lsproto::Position,
+    text_length: usize,
+) -> (i32, bool) {
+    let line = i64::from(position.line);
+    if line < 0 || line >= line_map.line_starts.len() as i64 {
+        return (0, false);
+    }
+    let line_start = i64::from(line_map.line_starts[line as usize]);
+    let offset = line_start + i64::from(position.character);
+    if offset < line_start || offset > text_length as i64 {
+        return (0, false);
+    }
+    (offset as i32, true)
+}
+
+// Go: api/session_textedit_test.go (tsgo#4712)
+#[cfg(test)]
+mod textedit_tests {
+    use super::*;
+    use crate::frontend::parser::{self, SourceFileParseOptions};
+
+    // Go: api/session_textedit_test.go:14 TestToAPITextEditsUsesOriginalCoordinates
+    // PORT: Go sets the info on the parsed `*ast.SourceFile`. Here the parse
+    // is recorded (`program::note_parsed_source_file`) and the info is set on
+    // the `ParsedSourceFile`, as the content mapper transform does.
+    #[test]
+    fn test_to_api_text_edits_uses_original_coordinates() {
+        let source_file = Rc::new(parser::parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/app.vue".to_string(),
+                path: tspath::Path("/app.vue".to_string()),
+                ..Default::default()
+            },
+            "const transformed = true;",
+            ScriptKind::TS,
+        ));
+        crate::program::note_parsed_source_file(&source_file);
+        source_file.set_content_mapper_info(ContentMapperSourceFileInfo {
+            original_text: "😀\nabc".to_string(),
+            content_mapper: "mapper".to_string(),
+            ..Default::default()
+        });
+
+        let edits = to_api_text_edits(
+            source_file.root,
+            &[lsproto::TextEdit {
+                range: lsproto::Range {
+                    start: lsproto::Position {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: lsproto::Position {
+                        line: 1,
+                        character: 2,
+                    },
+                },
+                new_text: "x".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            edits,
+            Some(vec![TextEdit {
+                pos: 4,
+                end: 5,
+                new_text: "x".to_string(),
+            }])
+        );
+    }
 }

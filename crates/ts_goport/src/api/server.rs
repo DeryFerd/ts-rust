@@ -3,15 +3,14 @@
 use crate::api::prelude::*;
 
 use crate::api::callbackfs::{CallbackFS, new_callback_fs};
-use crate::api::conn::{Conn, Handler};
-use crate::api::conn_async::new_async_conn_with_protocol;
-use crate::api::conn_sync::new_sync_conn;
-use crate::api::protocol_jsonrpc::new_jsonrpc_protocol;
 use crate::api::protocol_msgpack::new_message_pack_protocol;
-use crate::api::transport::{Transport, new_pipe_transport, new_stdio_transport};
 use crate::frontend::bundled;
 use crate::frontend::vfs::{self, Fs};
 use crate::gostd::{Context, GoError, errors};
+use crate::ipc::{
+    Conn, Handler, Transport, new_async_conn_with_protocol, new_jsonrpc_protocol,
+    new_pipe_transport, new_stdio_transport, new_sync_conn,
+};
 use crate::lsp::lsproto;
 use crate::project;
 use std::io::{Read, Write};

@@ -21,4 +21,5 @@ pub mod prelude {
     pub use crate::frontend::tspath;
     pub use crate::gostd::{self, Context, GoError};
     pub use crate::prelude::*;
+    pub use crate::spanmap;
 }

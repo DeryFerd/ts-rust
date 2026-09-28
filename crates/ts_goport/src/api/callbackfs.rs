@@ -2,7 +2,6 @@
 
 use crate::api::prelude::*;
 
-use crate::api::conn::Conn;
 use crate::frontend::json::{
     JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, json_unmarshal, json_unmarshal_decode,
 };
@@ -11,6 +10,7 @@ use crate::frontend::json_ext::{
 };
 use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
 use crate::gostd::{Context, GoError, errors};
+use crate::ipc::Conn;
 use std::time::SystemTime;
 
 // Go: callbackfs.go:19 callbackFS
