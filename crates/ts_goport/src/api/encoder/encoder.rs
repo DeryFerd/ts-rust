@@ -314,10 +314,20 @@ struct Uint128 {
 }
 
 /// Go `sourceFile.Hash`.
-// PORT: ts_goport keeps no `SourceFile.Hash` field. The project parse cache
-// sets Go `file.Hash` to `xxh3.HashString128` of the file content, which is
-// the parsed text, so the hash is computed here on demand (the same value).
+// PORT: ts_goport keeps no `SourceFile.Hash` field. Only the project parse
+// cache sets Go `file.Hash` (project/parsecache.go NewParseCache), to
+// `fh.Hash()`: the xxh3-128 of the file content, which is the parsed text.
+// So the hash is computed here on demand (the same value) for a file of a
+// language server program, which the parse cache made. Any other parse
+// (Go `parser.ParseSourceFile`, for example a tsconfig from
+// `tsoptions.NewTsconfigSourceFileFromFilePath`) keeps Go Hash 0. Such a
+// file is unpublished or in no program.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
+    let from_parse_cache = parsed_source_file_of(source_file).is_some()
+        && crate::ast::is_published(source_file.file_index());
+    if !from_parse_cache {
+        return Uint128::default();
+    }
     let h = xxhash_rust::xxh3::xxh3_128(source_file_text(source_file).as_bytes());
     Uint128 {
         hi: (h >> 64) as u64,
