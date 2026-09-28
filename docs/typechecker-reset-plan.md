@@ -6,6 +6,8 @@ Status: the initial recovery trial is complete. Theo has authorized continued wo
 
 The four-revision trial and seven-role limit below describe the initial plan. The standing continuation authorization supersedes those execution limits for later work. Protected results, source preservation, ordinary project inputs and complete project requirements remain in force.
 
+2026-09-28: Theo retired the legacy cargo roster ("i approve any rule changes that allow removing the legacy code", state note `legacy-removal-rule-approval-2026-09-28`). The protected results are now goport's own tests per name and the gate items, compared with the last accepted revision ([protected set](typechecker-accountability.md#protected-set)). The 6,055-name tables, the green reference commit and the first work block below are history of the legacy checker. They do not govern new batches. Where the later sections say accepted tests, accepted selection or corpus results, use the goport protected set.
+
 ## Decision
 
 I let the integration compiler accumulate regressions while Query stayed incomplete. I counted the failures, but did not use them to stop the work. That is my execution failure.
@@ -87,7 +89,7 @@ Bun kept its initial Rust port close to the existing implementation and reused t
 
 For ts-rust, port Go's algorithms and state transitions first. Use Rust types and stable IDs to represent them safely. Require a concrete reason for a different evaluation order, cache rule or recovery path. Do not make a new planning and proof system a prerequisite for each TypeScript feature.
 
-This is not permission to delete ownership checks or accept malformed caches. Full type, symbol and replay parity remain requirements.
+This is not permission to delete ownership checks or accept malformed caches. Full diagnostic, type and symbol parity with pinned Go remain requirements.
 
 ## First approved work block: choose a recovery path
 
@@ -163,13 +165,13 @@ First prove the smallest complete operation. Do not approve a checker-wide rewri
 1. Build implementation and test code in the existing profile.
 2. Execute focused positive, negative, recursive and repeated-call cases. Compare the semantic cases with pinned Go.
 3. Run unchanged ordinary Query on the same source. Keep configs, roots, libraries and inputs fixed.
-4. Execute the full checker regression before another semantic batch that changes shared planning, caches, mapped state or request transport.
-5. Before accepting a batch, execute the complete accepted selections and preserve all prior exact corpus results. Run formatting and lint checks required by the repository.
+4. Run the goport tests (`scripts/goport/goport-tests.sh`) before another semantic batch that changes shared planning, caches, mapped state or request transport.
+5. Before accepting a batch, run the whole goport protected set and compare it with the last accepted revision, per test name (`compare-tests.py`) and per gate item (`gate-compare.py`). Run formatting and lint checks required by the repository.
 6. Commit an accepted batch before starting the next operation. Keep one integration owner and one integration branch.
 
 Reuse existing logs and result parsers. Each batch needs one record: source identity, commands, normal completion, exact comparison and review result. One owner performs each mechanical check. Retain actual tool permissions, read restrictions and resource limits. Remove duplicate internal permission handoffs.
 
-Any new unexplained lost pass stops the batch. Repair or withdraw that batch before adding work. A new passing test cannot compensate for a lost one. Preserve later measured passing behavior in the ledger as well as the original accepted selection. A green-source recovery does not make later losses disappear. Any behavior not yet restored remains an explicit port gap, not an accepted removal.
+Any new unexplained lost pass stops the batch. Repair or withdraw that batch before adding work. A new passing test cannot compensate for a lost one. Each accepted revision's results become the base for the next, so every earlier pass stays protected. Any behavior not yet restored remains an explicit port gap, not an accepted removal.
 
 After two measured implementation batches without a useful change in ordinary Query, stop feature work and reassess the dependency path. Failed and unaccepted batches count. During regression recovery, use the stricter cumulative limit above and report Query separately. A new error label or a later assertion does not count as project completion or restart either counter.
 
@@ -185,13 +187,13 @@ The immediate milestone is unchanged:
 
 1. Unchanged Query core completes ordinary project checking. Its complete diagnostic result matches pinned Go, including locations and messages.
 2. A separate copy with a deliberate type error produces the expected Go-matching diagnostic. The original input remains unchanged.
-3. All accepted regression results remain accounted for and passing, except individually proved expectation updates.
+3. All goport protected results remain accounted for and passing, except individually proved expectation updates and checked name maps.
 
 Do not replace this with isolated-file counts or an empty partial diagnostic snapshot.
 
 Hono stays the cross-project check. Run it after a recovered shared operation and at the Query milestone. If Query work spans a full work day, run Hono on the latest accepted compiler once that day. Do not interrupt each small edit for a five-minute Hono run, and do not leave its status unmeasured for several days.
 
-After Query diagnostics pass, close Query type, symbol and replay mismatches. Then use the same process for Hono diagnostics and semantic parity. Keep all measured project results in the regression set.
+After Query diagnostics pass, close Query type and symbol mismatches. Then use the same process for Hono diagnostics and semantic parity. Keep all measured project results in the regression set.
 
 For the rest of the port, use missing Go behavior and conformance failures to order complete operations. Likely areas include generic inference, assignability, conditional and mapped types, overloads, contextual typing and control-flow narrowing. That is a list to measure, not a claim that every area is currently missing. Add module, configuration and standard-library work when it blocks ordinary project checking. Do not switch to new demo libraries to avoid a hard failure.
 
@@ -217,7 +219,7 @@ Forty workers can help later with independent Go operation maps, conformance gro
 
 Every batch report must answer:
 
-- Which previously accepted passes were retained, recovered, lost or absent?
+- Which goport test passes were retained, recovered, lost, absent or unrun, and which gate items regressed?
 - Did ordinary Query complete? What exact diagnostic difference changed?
 - When was Hono last run, and on which source?
 - Does the complete operation pass, including negative and repeated-call cases?
