@@ -1,5 +1,5 @@
 //! Port of the emit parts of Go `compiler/program.go` (`Emit`,
-//! `CombineEmitResults`, `HandleNoEmitOnError`, the emit option and result
+//! `CombineEmitResults`, `HandleNoEmitOptions`, the emit option and result
 //! types). The emit host (`program::EmitHost`) and the output paths
 //! (`program::get_output_paths_for_source_file`) are in `program.rs`, where
 //! the declaration diagnostics use them too.
@@ -10,6 +10,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::emitter::{EmitOnly, Emitter, js_emit_needs_checker};
+use crate::frontend::outputpaths::ForceEmitPaths;
 use crate::frontend::tspath::{Path, has_extension, path_is_relative, to_path};
 use crate::sourcemap::generator::RawSourceMap;
 
@@ -23,6 +24,8 @@ pub struct WriteFileData {
     pub build_info: Option<Arc<crate::execute::incremental::BuildInfo>>,
     pub diagnostics: Vec<Diagnostic>,
     pub skipped_dts_write: bool,
+    // #4699
+    pub source_file: Node,
 }
 
 // Go: compiler/program.go:1607 WriteFile
@@ -33,12 +36,56 @@ pub type WriteFile =
     Arc<dyn Fn(&str, &str, &mut WriteFileData) -> Result<(), String> + Send + Sync>;
 
 // Go: compiler/program.go:1609 EmitOptions
+// PORT: Go `TargetSourceFiles` nil is `None`. A Go non-nil empty slice is
+// `Some` of an empty list, which emits no file (#4699).
 #[derive(Clone, Default)]
 pub struct EmitOptions {
-    /// Single file to emit. If nil, emits all files
-    pub target_source_file: Node,
+    /// Source files to emit. If `None`, emits all files
+    pub target_source_files: Option<Vec<Node>>,
     pub emit_only: EmitOnly,
+    // #4699
+    pub force_emit: bool,
     pub write_file: Option<WriteFile>,
+}
+
+/// The `EmitOptions` fields that each file's emitter gets (Go `emitter`
+/// `emitOnly`, `forceEmit` and `writeFile`), and the force flags that Go
+/// `Program.Emit` computes from them.
+#[derive(Clone)]
+struct EmitterOptions {
+    emit_only: EmitOnly,
+    force_emit: bool,
+    write_file: Option<WriteFile>,
+}
+
+impl EmitterOptions {
+    fn of(options: &EmitOptions) -> Self {
+        Self {
+            emit_only: options.emit_only,
+            force_emit: options.force_emit,
+            write_file: options.write_file.clone(),
+        }
+    }
+
+    /// Go `forceDtsEmit` in `Program.Emit` (#4699, #4849).
+    fn force_dts_emit(&self) -> bool {
+        self.emit_only == EmitOnly::BuilderSignature
+            || self.force_emit && self.emit_only == EmitOnly::Dts
+    }
+
+    /// Go `forceJsEmit` in `Program.Emit` (#4699).
+    fn force_js_emit(&self) -> bool {
+        self.force_emit && self.emit_only == EmitOnly::Js
+    }
+
+    /// Go `outputpaths.ForceEmitPaths` in `Program.Emit` (#4699).
+    fn force_emit_paths(&self) -> ForceEmitPaths {
+        ForceEmitPaths {
+            dts: self.force_dts_emit(),
+            js: self.force_js_emit(),
+            declaration_map: self.force_emit && self.emit_only == EmitOnly::Dts,
+        }
+    }
 }
 
 // Go: compiler/program.go:1615 EmitResult
@@ -69,6 +116,7 @@ pub struct SourceMapEmitResult {
 // order. Each emit makes its own text writer. When the emit pool is on
 // (`program::emit_pool_enabled`), the JS part of a file whose transforms
 // make no checker call runs on the pool instead (`start_emit_files_with_pool`).
+// Go `ctx.Err()` checks are not ported: the port has no context here.
 pub fn emit(options: EmitOptions) -> EmitResult {
     emit_with(options, |emit_file| emit_file())
 }
@@ -82,25 +130,25 @@ pub fn emit_with(
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> EmitResult {
     let _trace = trace_emit();
-    if options.emit_only != EmitOnly::ForcedDts {
-        if let Some(result) = handle_no_emit_on_error(options.target_source_file) {
+    if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
+        // #4407: Go `HandleNoEmitOptions(ctx, p, options.TargetSourceFiles, nil)`.
+        if let Some(result) = handle_no_emit_options(options.target_source_files.as_deref()) {
             return result;
         }
     }
 
+    let target = EmitterOptions::of(&options);
     let source_files = get_source_files_to_emit(
-        options.target_source_file,
-        options.emit_only == EmitOnly::ForcedDts,
+        options.target_source_files.as_deref(),
+        target.force_dts_emit(),
+        target.force_js_emit(),
     );
-    let emit_only = options.emit_only;
-    let write_file = options.write_file.clone();
-    let pooled =
-        start_emit_files_with_pool(&source_files, |_| (emit_only, write_file.clone()), wrap)
-            .map(PendingPoolEmit::wait);
+    let pooled = start_emit_files_with_pool(&source_files, |_| target.clone(), wrap)
+        .map(PendingPoolEmit::wait);
     let results = match pooled {
         Some(results) => results,
         None => run_emit_jobs(source_files, move |source_file| {
-            wrap(&|| emit_source_file(source_file, emit_only, write_file.clone()))
+            wrap(&|| emit_source_file(source_file, &target))
         }),
     };
 
@@ -130,7 +178,8 @@ pub fn start_emit_batch(targets: Vec<EmitOptions>) -> PendingEmitBatch {
 ///
 /// Each target must name one source file, and no file can be in the batch
 /// twice. With `noEmitOnError` each target runs through `emit_with`, one at
-/// a time, because the diagnostics check must come first.
+/// a time, because the diagnostics check must come first. With `noEmit`
+/// each target also runs through `emit_with` (#4407).
 pub fn emit_batch_with(
     targets: Vec<EmitOptions>,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
@@ -192,12 +241,15 @@ impl PendingEmitBatch {
 /// the emit pool and the checker threads, and returns without waiting.
 /// Each checker thread runs them after the jobs sent to it before (the
 /// early emit: `execute::incremental::Program::start_emit`).
-/// With `noEmitOnError` it emits every target before it returns.
+/// With `noEmitOnError` or `noEmit` it emits every target before it
+/// returns.
 pub fn start_emit_batch_with(
     targets: Vec<EmitOptions>,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> PendingEmitBatch {
-    if options().no_emit_on_error.is_true() {
+    // #4407: with `noEmit`, `handle_no_emit_options` returns a result for
+    // a target too.
+    if options().no_emit_on_error.is_true() || options().no_emit.is_true() {
         return PendingEmitBatch(PendingBatch::Done(
             targets
                 .into_iter()
@@ -206,24 +258,30 @@ pub fn start_emit_batch_with(
         ));
     }
 
-    // Without `noEmitOnError`, `handle_no_emit_on_error` returns None, so
-    // `emit_with` of one target is only the emit of its 0 or 1 file.
+    // Without `noEmit` and `noEmitOnError`, `handle_no_emit_options`
+    // returns None, so `emit_with` of one target is only the emit of its 0
+    // or 1 file.
     let mut files = Vec::new();
     let mut has_file = Vec::with_capacity(targets.len());
-    let mut file_targets: FxHashMap<Node, (EmitOnly, Option<WriteFile>)> = FxHashMap::default();
+    let mut file_targets: FxHashMap<Node, EmitterOptions> = FxHashMap::default();
     for target in targets {
+        let target_files = target.target_source_files.as_deref();
         debug_assert!(
-            target.target_source_file.is_some(),
-            "emit_batch target without a file"
+            target_files.is_some_and(|files| files.len() == 1),
+            "emit_batch target without one file"
         );
-        let force_dts_emit = target.emit_only == EmitOnly::ForcedDts;
-        let file = get_source_files_to_emit(target.target_source_file, force_dts_emit)
-            .first()
-            .copied();
+        let emitter_options = EmitterOptions::of(&target);
+        let file = get_source_files_to_emit(
+            target_files,
+            emitter_options.force_dts_emit(),
+            emitter_options.force_js_emit(),
+        )
+        .first()
+        .copied();
         has_file.push(file.is_some());
         match file {
             Some(file) => {
-                let previous = file_targets.insert(file, (target.emit_only, target.write_file));
+                let previous = file_targets.insert(file, emitter_options);
                 debug_assert!(previous.is_none(), "file is in the emit batch twice");
                 files.push(file);
             }
@@ -250,8 +308,8 @@ pub fn start_emit_batch_with(
                 move |source_file| {
                     // One Go `Program.Emit` trace event per target, on the emit thread.
                     let _trace = trace_emit();
-                    let (emit_only, write_file) = &file_targets[&source_file];
-                    wrap(&|| emit_source_file(source_file, *emit_only, write_file.clone()))
+                    let target = &file_targets[&source_file];
+                    wrap(&|| emit_source_file(source_file, target))
                 },
             ))
         }
@@ -426,10 +484,17 @@ enum FileEmit {
     OnPool,
 }
 
-/// PORT: not in Go. Where the emit of `source_file` with `emit_only` runs.
+/// PORT: not in Go. Where the emit of `source_file` with `target` runs.
 /// A JS part goes to the emit pool when its transforms make no checker call
 /// (`js_emit_needs_checker`). The d.ts part always needs the checker.
-fn file_emit(source_file: Node, emit_only: EmitOnly) -> FileEmit {
+/// A forced emit (#4699, the API) runs on the checker thread, so a split
+/// emit never has `force_emit` and its parts get the paths of the whole
+/// emit.
+fn file_emit(source_file: Node, target: &EmitterOptions) -> FileEmit {
+    if target.force_emit {
+        return FileEmit::OnChecker;
+    }
+    let emit_only = target.emit_only;
     let options = options();
     // With `noEmit` the JS part only sets `emit_skipped`: not worth a job.
     let has_js = matches!(emit_only, EmitOnly::All | EmitOnly::Js)
@@ -453,15 +518,14 @@ fn file_emit(source_file: Node, emit_only: EmitOnly) -> FileEmit {
 /// The part of one file's emit that runs on its checker thread when the
 /// emit pool is on (`start_emit_files_with_pool`).
 struct CheckerPart {
-    emit_only: EmitOnly,
-    write_file: Option<WriteFile>,
+    target: EmitterOptions,
     /// The JS part on the emit pool when the file's emit is split; this is
     /// then the d.ts part.
     js_part: Option<EmitPoolJob<EmitResult>>,
 }
 
 /// PORT: not in Go. Starts `emit_with` and `emit_batch_with` of `files`
-/// (each with its `target`: `emit_only` and `write_file`) with the emit
+/// (each with its `target`: `emit_only`, `force_emit` and `write_file`) with the emit
 /// pool, and returns without waiting. None, before any work, when the pool
 /// is off (`emit_pool_enabled`) or would get no file: the caller then runs
 /// every file on its checker thread as before.
@@ -475,7 +539,7 @@ struct CheckerPart {
 /// so the outputs of a file are written in Go's order.
 fn start_emit_files_with_pool(
     files: &[Node],
-    target: impl Fn(Node) -> (EmitOnly, Option<WriteFile>),
+    target: impl Fn(Node) -> EmitterOptions,
     wrap: Wrap,
 ) -> Option<PendingPoolEmit> {
     if files.is_empty() || !emit_pool_enabled() {
@@ -486,7 +550,7 @@ fn start_emit_files_with_pool(
     bind_all();
     let ways: Vec<FileEmit> = files
         .iter()
-        .map(|&file| file_emit(file, target(file).0))
+        .map(|&file| file_emit(file, &target(file)))
         .collect();
     if ways.iter().all(|&way| way == FileEmit::OnChecker) {
         return None;
@@ -497,13 +561,11 @@ fn start_emit_files_with_pool(
         .zip(&ways)
         .filter(|&(_, &way)| way != FileEmit::OnChecker)
         .map(|(&file, &way)| {
-            let (emit_only, write_file) = target(file);
-            let emit_only = if way == FileEmit::Split {
-                EmitOnly::Js
-            } else {
-                emit_only
-            };
-            move || wrap(&|| emit_source_file_on_pool(file, emit_only, write_file.clone()))
+            let mut target = target(file);
+            if way == FileEmit::Split {
+                target.emit_only = EmitOnly::Js;
+            }
+            move || wrap(&|| emit_source_file_on_pool(file, &target))
         })
         .collect();
     let mut pool_jobs = send_emit_pool_jobs(pool_jobs).into_iter();
@@ -516,15 +578,13 @@ fn start_emit_files_with_pool(
             on_pool.push((index, pool_jobs.next().expect("a pool job per pool file")));
             continue;
         }
-        let (emit_only, write_file) = target(file);
         let js_part =
             (way == FileEmit::Split).then(|| pool_jobs.next().expect("a pool job per split file"));
         checker_files.push(file);
         checker_parts.insert(
             file,
             CheckerPart {
-                emit_only,
-                write_file,
+                target: target(file),
                 js_part,
             },
         );
@@ -540,10 +600,8 @@ fn start_emit_files_with_pool(
                 .remove(&source_file)
                 .expect("one checker part per file");
             match part.js_part {
-                Some(js_part) => emit_declaration_part(source_file, part.write_file, js_part, wrap),
-                None => {
-                    wrap(&|| emit_source_file(source_file, part.emit_only, part.write_file.clone()))
-                }
+                Some(js_part) => emit_declaration_part(source_file, part.target, js_part, wrap),
+                None => wrap(&|| emit_source_file(source_file, &part.target)),
             }
         })
     }));
@@ -628,7 +686,7 @@ impl PoolJsPart {
 /// either goes on.
 fn emit_declaration_part(
     source_file: Node,
-    write_file: Option<WriteFile>,
+    target: EmitterOptions,
     js_part: EmitPoolJob<EmitResult>,
     wrap: Wrap,
 ) -> EmitResult {
@@ -636,13 +694,16 @@ fn emit_declaration_part(
         job: Some(js_part),
         result: None,
     }));
+    let target = EmitterOptions {
+        emit_only: EmitOnly::Dts,
+        ..target
+    };
     let dts = catch_unwind(AssertUnwindSafe(|| {
         wrap(&|| {
             emit_source_file_with(
                 new_emit_host(source_file),
                 source_file,
-                EmitOnly::Dts,
-                write_file.clone(),
+                &target,
                 Some(js_part.clone()),
             )
         })
@@ -676,33 +737,13 @@ fn merge_emit_parts(js: EmitResult, dts: EmitResult) -> EmitResult {
 /// The JS part of a file's emit on the emit pool (`emit_only` is `Js`), or
 /// its whole emit when it has no d.ts part: `emit_source_file` with a host
 /// that has no checker.
-fn emit_source_file_on_pool(
-    source_file: Node,
-    emit_only: EmitOnly,
-    write_file: Option<WriteFile>,
-) -> EmitResult {
-    emit_source_file_with(
-        new_emit_host_without_checker(),
-        source_file,
-        emit_only,
-        write_file,
-        None,
-    )
+fn emit_source_file_on_pool(source_file: Node, target: &EmitterOptions) -> EmitResult {
+    emit_source_file_with(new_emit_host_without_checker(), source_file, target, None)
 }
 
 /// The body of the Go `wg.Queue` closure in `Program.Emit`.
-fn emit_source_file(
-    source_file: Node,
-    emit_only: EmitOnly,
-    write_file: Option<WriteFile>,
-) -> EmitResult {
-    emit_source_file_with(
-        new_emit_host(source_file),
-        source_file,
-        emit_only,
-        write_file,
-        None,
-    )
+fn emit_source_file(source_file: Node, target: &EmitterOptions) -> EmitResult {
+    emit_source_file_with(new_emit_host(source_file), source_file, target, None)
 }
 
 /// `emit_source_file` with the emit host, and for a d.ts part (`emit_only`
@@ -710,28 +751,25 @@ fn emit_source_file(
 fn emit_source_file_with(
     host: Rc<crate::program::EmitHost>,
     source_file: Node,
-    emit_only: EmitOnly,
-    write_file: Option<WriteFile>,
+    target: &EmitterOptions,
     js_part: Option<Rc<RefCell<PoolJsPart>>>,
 ) -> EmitResult {
     let new_line = options().new_line.get_new_line_character();
     let writer: Rc<RefCell<dyn EmitTextWriter>> =
         Rc::new(RefCell::new(new_text_writer(new_line, 0)));
     writer.borrow_mut().clear();
-    let paths = get_output_paths_for_source_file(
-        source_file,
-        host.as_ref(),
-        emit_only == EmitOnly::ForcedDts,
-    );
+    let paths =
+        get_output_paths_for_source_file(source_file, host.as_ref(), target.force_emit_paths());
     let mut emitter = Emitter {
         host,
-        emit_only,
+        emit_only: target.emit_only,
         emitter_diagnostics: DiagnosticsCollection::default(),
         writer: Some(writer),
         paths,
         source_file,
         emit_result: EmitResult::default(),
-        write_file,
+        force_emit: target.force_emit,
+        write_file: target.write_file.clone(),
         js_part,
     };
     emitter.emit();
@@ -753,26 +791,41 @@ pub fn combine_emit_results(results: Vec<EmitResult>) -> EmitResult {
     result
 }
 
-// Go: compiler/program.go:1728 HandleNoEmitOnError
-pub fn handle_no_emit_on_error(file: Node) -> Option<EmitResult> {
-    if !options().no_emit_on_error.is_true() {
-        return None; // No emit on error is not set, so we can proceed with emitting
-    }
+// Go: compiler/program.go:1905 HandleNoEmitOptions
+// HandleNoEmitOptions mirrors tsc's handleNoEmitOptions.
+// PORT: #4407 replaced Go `HandleNoEmitOnError`. This is the plain program
+// form, for `Program.Emit`, which passes a nil `emitBuildInfo`, so it has no
+// such parameter. The incremental program has its own form
+// (`execute::incremental::program`).
+pub fn handle_no_emit_options(files: Option<&[Node]>) -> Option<EmitResult> {
+    let options = options();
+    if !options.no_emit.is_true() {
+        if !options.no_emit_on_error.is_true() {
+            return None; // NoEmit is false and NoEmitOnError is also false, so we can proceed with normal emit
+        }
 
-    let diagnostics = get_diagnostics_of_any_program(
-        file,
-        true,
-        &mut get_bind_diagnostics,
-        &mut get_semantic_diagnostics,
-        &mut get_global_diagnostics,
-        &mut get_declaration_diagnostics,
-    );
-    if diagnostics.is_empty() {
-        return None; // No diagnostics, so we can proceed with emitting
+        let diagnostics = get_diagnostics_of_any_program(
+            files,
+            true,
+            &mut get_bind_diagnostics,
+            &mut get_semantic_diagnostics,
+            &mut get_global_diagnostics,
+            &mut get_declaration_diagnostics,
+        );
+        if diagnostics.is_empty() {
+            return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting
+        }
+        return Some(EmitResult {
+            diagnostics,
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
     }
-    Some(EmitResult {
-        diagnostics,
-        emit_skipped: true,
-        ..EmitResult::default()
-    })
+    if files.is_some() {
+        return Some(EmitResult {
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
+    }
+    Some(EmitResult::default())
 }

@@ -7,8 +7,7 @@
 
 use super::*;
 use crate::ast::store::{
-    file_store_contains_non_ascii, file_store_file_name, file_store_parser_flags,
-    publish_file_stores, unpublished_file_ids,
+    file_store_file_name, file_store_parser_flags, publish_file_stores, unpublished_file_ids,
 };
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
@@ -680,7 +679,6 @@ fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFil
         js_diagnostics: &file.js_diagnostics,
         jsdoc_diagnostics: &file.jsdoc_diagnostics,
         has_lazy_js_doc: file.has_lazy_js_doc,
-        contains_non_ascii: file.contains_non_ascii,
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
@@ -720,8 +718,6 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         js_diagnostics: &[],
         jsdoc_diagnostics: &[],
         has_lazy_js_doc: false,
-        // The parser flag of the config file, when the store was parsed.
-        contains_non_ascii: file_store_contains_non_ascii(store),
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
@@ -805,11 +801,12 @@ impl GoSharedState {
         let include_diagnostics = parsed
             .iter()
             .map(|(&store, file)| {
+                // #4825: keyed by the source file, not its name.
                 let diagnostics = p
                     .include_processor
                     .get_diagnostics(p)
                     .borrow_mut()
-                    .get_diagnostics_for_file(file.file_name());
+                    .get_diagnostics_for_file(file.root);
                 (store, diagnostics)
             })
             .collect();

@@ -181,9 +181,6 @@ pub struct SourceFileInfo {
     pub jsdoc_diagnostics: &'static [Diagnostic],
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
-    /// Go `SourceFile.ContainsNonASCII`: the scanner decoded a non-ASCII
-    /// rune. `ast::source_file_get_position_map` reads it.
-    pub contains_non_ascii: bool,
     /// Trivia runs of the text. They map the Rust token-start ranges to Go
     /// full-start ranges (see `ast::go_view`).
     pub trivia: crate::ast::go_view::TriviaRuns,
@@ -1565,10 +1562,6 @@ fn build_early_info(
         js_diagnostics: &[],
         jsdoc_diagnostics: &[],
         has_lazy_js_doc: script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX,
-        // PORT: the legacy parser has no Go scanner flag. A string literal
-        // with no escape or newline does not set the Go flag, so this can be
-        // true where Go is false.
-        contains_non_ascii: !text.is_ascii(),
         trivia: crate::ast::go_view::TriviaRuns::compute(&source.parse.arena, text),
         late: OnceLock::new(),
     };
@@ -3382,15 +3375,19 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
     // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
     alias_resolver_unimplemented();
-    source_file_may_be_emitted_worker(source_file, force_dts_emit)
+    source_file_may_be_emitted_worker(source_file, force_dts_emit, false)
 }
 
 // Go: compiler/emitter.go:451 sourceFileMayBeEmitted
-fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) -> bool {
+fn source_file_may_be_emitted_worker(
+    source_file: Node,
+    force_dts_emit: bool,
+    force_js_emit: bool,
+) -> bool {
     let options = &prog().options;
     let info = source_file_info(source_file);
     // Js files are emitted only if option is enabled
-    if options.no_emit_for_js_files.is_true() && is_source_file_js(source_file) {
+    if !force_js_emit && options.no_emit_for_js_files.is_true() && is_source_file_js(source_file) {
         return false;
     }
     // Declaration files are not emitted
@@ -3402,7 +3399,7 @@ fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) ->
         return false;
     }
     // forcing dts emit => file needs to be emitted
-    if force_dts_emit {
+    if force_dts_emit || force_js_emit {
         return true;
     }
     // Source files from referenced projects are not emitted
@@ -3613,14 +3610,15 @@ fn get_source_file_from_reference_legacy(origin: Node, r#ref: &FileReference) ->
 }
 
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
-// compiler/emitHost.go:94 emitHost.GetOutputPathsFor with the program options.
+// compiler/emitHost.go:94 emitHost.GetOutputPathsFor and Program.Emit with
+// the program options.
 // PORT: Go reads two fields of the source file. It is named for the emit
 // host method so it does not clash with the frontend `get_output_paths_for`
 // in the frontend prelude.
 pub fn get_output_paths_for_source_file(
     file: Node,
     host: &dyn crate::frontend::outputpaths::OutputPathsHost,
-    force_dts_paths: bool,
+    force: crate::frontend::outputpaths::ForceEmitPaths,
 ) -> crate::frontend::outputpaths::OutputPaths {
     let info = source_file_info(file);
     crate::frontend::outputpaths::get_output_paths_for_file(
@@ -3628,7 +3626,7 @@ pub fn get_output_paths_for_source_file(
         info.script_kind,
         options(),
         host,
-        force_dts_paths,
+        force,
     )
 }
 
@@ -3646,11 +3644,13 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
     let Some(info) = file_info_by_path(path) else {
         return (String::new(), Node::NIL);
     };
-    if info.script_kind != ScriptKind::JSX && info.script_kind != ScriptKind::TSX {
+    let file = crate::ast::go_file(info.file_index).root;
+    // #4694: every JS file (Go `isJavaScriptFile`), not only JSX.
+    let is_java_script_file = is_source_file_js(file);
+    if !is_java_script_file && info.script_kind != ScriptKind::TSX {
         return (String::new(), Node::NIL);
     }
     let options = &prog().options;
-    let file = crate::ast::go_file(info.file_index).root;
     let jsx_import = get_jsx_runtime_import(&get_jsx_implicit_import_base(options, file), options);
     if jsx_import.is_empty() {
         return (String::new(), Node::NIL);
@@ -3841,10 +3841,21 @@ fn checker_count() -> usize {
 // Go: compiler/checkerpool.go:98 createCheckers
 // PORT: binding runs first on this thread, so no worker binds and every
 // worker starts from the same bound program and thread-local state.
+// The file associations (#4313) come from the Go frontend program
+// (`ls_program::get_checker_associations`), whose files are in
+// `source_file_order` order. The legacy frontend has no Go node counts or
+// Go resolutions, so it keeps the old round-robin order. An alias resolver
+// program has no frontend either; Go gives it no checker pool.
 fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
     let program = prog();
+    let associations = match go_frontend_program() {
+        Some(np) => ls_program::get_checker_associations(np, count),
+        None => (0..program.source_file_order.len())
+            .map(|i| i % count)
+            .collect(),
+    };
     // One entry per file id up to the last program file.
     let len = program
         .source_file_order
@@ -3853,7 +3864,7 @@ fn create_checkers() -> CheckerPool {
         .map_or(0, |&last| last + 1);
     let mut file_associations = vec![0; len];
     for (i, &file_index) in program.source_file_order.iter().enumerate() {
-        file_associations[file_index] = i % count;
+        file_associations[file_index] = associations[i];
     }
     assert!(
         state().file_associations.set(file_associations).is_ok(),
@@ -4465,18 +4476,22 @@ fn declaration_diagnostic_cache() -> std::sync::MutexGuard<'static, FxHashMap<No
 
 // Go: compiler/emitter.go:506 getSourceFilesToEmit
 // PORT: Go takes a `SourceFileMayBeEmittedHost`; the program functions are that host.
+// Go `Program.getSourceFilesToEmit` caches the result for nil targets and no
+// force; this computes it each time. Go nil `targetSourceFiles` is `None`.
 pub(crate) fn get_source_files_to_emit(
-    target_source_file: Node,
+    target_source_files: Option<&[Node]>,
     force_dts_emit: bool,
+    force_js_emit: bool,
 ) -> Vec<Node> {
-    let source_files = if target_source_file.is_some() {
-        vec![target_source_file]
-    } else {
-        source_files()
+    let target_source_files = match target_source_files {
+        Some(files) => files.to_vec(),
+        None => source_files(),
     };
-    source_files
+    target_source_files
         .into_iter()
-        .filter(|&source_file| source_file_may_be_emitted(source_file, force_dts_emit))
+        .filter(|&source_file| {
+            source_file_may_be_emitted_worker(source_file, force_dts_emit, force_js_emit)
+        })
         .collect()
 }
 
@@ -4490,7 +4505,10 @@ fn is_source_file_not_json(file: Node) -> bool {
 // `GetDeclarationDiagnostics` above already has the snake name.
 fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Diagnostic> {
     // TODO: use p.getSourceFilesToEmit cache
-    let full_files: Vec<Node> = get_source_files_to_emit(file, false)
+    // Go `core.SingleElementSlice(file)`: nil for a nil file.
+    let target = [file];
+    let target_source_files = file.is_some().then_some(&target[..]);
+    let full_files: Vec<Node> = get_source_files_to_emit(target_source_files, false, false)
         .into_iter()
         .filter(|&f| is_source_file_not_json(f))
         .collect();
@@ -4591,7 +4609,12 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
         Box::new(get_output_paths_for_source_file(
             file,
             self,
-            force_dts_paths,
+            // #4699: Go `outputpaths.ForceEmitPaths{Dts: forceDtsPaths}`.
+            crate::frontend::outputpaths::ForceEmitPaths {
+                dts: force_dts_paths,
+                js: false,
+                declaration_map: false,
+            },
         ))
     }
 
@@ -4794,13 +4817,9 @@ fn get_suggestion_diagnostics_with_checker(
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
-    // Checker creation forces binding, so bind suggestion diagnostics will be populated.
-    bind_all();
-    let mut diags = file_bind_data(source_file)
-        .bind_suggestion_diagnostics
-        .clone();
-    diags.extend(file_checker.get_suggestion_diagnostics(ctx, source_file));
-    diags
+
+    // #4776: no bind suggestion diagnostics.
+    file_checker.get_suggestion_diagnostics(ctx, source_file)
 }
 
 // Go: compiler/program.go:1422 isCommentOrBlankLine
@@ -4917,19 +4936,36 @@ pub fn instantiation_count() -> i32 {
 // PORT: Go calls `program.GetGlobalDiagnostics` and
 // `program.GetDeclarationDiagnostics` directly. They are callbacks here so a
 // caller can guard them the same way as the bind and semantic callbacks.
+// Go nil `files` is `None` (#4699).
 pub fn get_diagnostics_of_any_program(
-    file: Node,
+    files: Option<&[Node]>,
     skip_no_emit_check_for_dts_diagnostics: bool,
     get_bind_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_semantic_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_global_diagnostics: &mut dyn FnMut() -> Vec<Diagnostic>,
     get_declaration_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
 ) -> Vec<Diagnostic> {
+    // Go `appendDiagnosticsForAllFiles` (a closure over `files`).
+    fn append_diagnostics_for_all_files(
+        files: Option<&[Node]>,
+        diagnostics: &mut Vec<Diagnostic>,
+        get_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
+    ) {
+        match files {
+            None => diagnostics.extend(get_diagnostics(Node::NIL)),
+            Some(files) => {
+                for &file in files {
+                    diagnostics.extend(get_diagnostics(file));
+                }
+            }
+        }
+    }
+
     let options = &prog().options;
     let mut all_diagnostics = get_config_file_parsing_diagnostics();
     let config_file_parsing_diagnostics_length = all_diagnostics.len();
 
-    all_diagnostics.extend(get_syntactic_diagnostics(file));
+    append_diagnostics_for_all_files(files, &mut all_diagnostics, &mut get_syntactic_diagnostics);
 
     // If we didn't have any syntactic errors, then also try getting the program (options),
     // global and semantic errors.
@@ -4937,13 +4973,17 @@ pub fn get_diagnostics_of_any_program(
         all_diagnostics.extend(get_program_diagnostics());
 
         // Do binding early so we can track the time.
-        get_bind_diagnostics(file);
+        append_diagnostics_for_all_files(files, &mut Vec::new(), get_bind_diagnostics);
 
         if options.list_files_only.is_false_or_unknown() {
             all_diagnostics.extend(get_global_diagnostics());
 
             if all_diagnostics.len() == config_file_parsing_diagnostics_length {
-                all_diagnostics.extend(get_semantic_diagnostics(file));
+                append_diagnostics_for_all_files(
+                    files,
+                    &mut all_diagnostics,
+                    get_semantic_diagnostics,
+                );
                 // Ask for the global diagnostics again (they were empty above); we may have found new during checking, e.g. missing globals.
                 all_diagnostics.extend(get_global_diagnostics());
             }
@@ -4952,7 +4992,11 @@ pub fn get_diagnostics_of_any_program(
                 && options.get_emit_declarations()
                 && all_diagnostics.len() == config_file_parsing_diagnostics_length
             {
-                all_diagnostics.extend(get_declaration_diagnostics(file));
+                append_diagnostics_for_all_files(
+                    files,
+                    &mut all_diagnostics,
+                    get_declaration_diagnostics,
+                );
             }
         }
     }

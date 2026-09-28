@@ -29,7 +29,8 @@ pub enum EmitOnly {
     All,
     Js,
     Dts,
-    ForcedDts,
+    // #4849: renamed from Go `EmitOnlyForcedDts`.
+    BuilderSignature,
 }
 
 // Go: compiler/emitter.go:33 emitter
@@ -43,6 +44,8 @@ pub struct Emitter {
     pub paths: OutputPaths,
     pub source_file: Node,
     pub emit_result: EmitResult,
+    // #4699
+    pub force_emit: bool,
     pub write_file: Option<WriteFile>,
     /// PORT: not in Go. Set when this emitter runs only the d.ts part of the
     /// file, on its checker thread, and the JS part runs on the emit pool
@@ -159,8 +162,9 @@ impl Emitter {
             return;
         }
 
-        if options.no_emit == Tristate::True
-            || crate::printer::EmitHost::is_emit_blocked(self.host.as_ref(), js_file_path)
+        if !self.force_emit
+            && (options.no_emit == Tristate::True
+                || crate::printer::EmitHost::is_emit_blocked(self.host.as_ref(), js_file_path))
         {
             self.emit_result.emit_skipped = true;
             return;
@@ -261,7 +265,8 @@ impl Emitter {
             self.emitter_diagnostics.add(elem.clone());
         }
 
-        if self.emit_only != EmitOnly::ForcedDts
+        if !self.force_emit
+            && self.emit_only != EmitOnly::BuilderSignature
             && (options.no_emit == Tristate::True
                 || crate::printer::EmitHost::is_emit_blocked(
                     self.host.as_ref(),
@@ -273,7 +278,8 @@ impl Emitter {
             return;
         }
 
-        let decl_blocked = !diags.is_empty() && self.emit_only != EmitOnly::ForcedDts;
+        let decl_blocked =
+            !diags.is_empty() && !self.force_emit && self.emit_only != EmitOnly::BuilderSignature;
         if decl_blocked {
             self.emit_result.emit_skipped = true;
             put_emit_context();
@@ -287,7 +293,8 @@ impl Emitter {
             // Module: 			   options.Module, // NYI
             // ModuleResolution:   options.ModuleResolution, // NYI
             target: options.get_emit_script_target(),
-            source_map: self.emit_only != EmitOnly::ForcedDts && options.declaration_map.is_true(),
+            source_map: self.emit_only != EmitOnly::BuilderSignature
+                && options.declaration_map.is_true(),
             inline_source_map: options.inline_source_map.is_true(),
             // InlineSources:       options.InlineSources.IsTrue(), // ignored, per strada
             // ExtendedDiagnostics: options.ExtendedDiagnostics.IsTrue(), // NYI
@@ -307,7 +314,7 @@ impl Emitter {
         );
 
         let declaration_map_options = CompilerOptions {
-            source_map: if self.emit_only != EmitOnly::ForcedDts
+            source_map: if self.emit_only != EmitOnly::BuilderSignature
                 && options.declaration_map.is_true()
             {
                 Tristate::True
@@ -411,12 +418,22 @@ impl Emitter {
             // Write the source map
             if !source_map_file_path.is_empty() {
                 let source_map = generator.borrow_mut().string();
-                let result = self.write_text(source_map_file_path, &source_map, None);
+                // #4699: the source map write gets the source file too.
+                let result = self.write_text(
+                    source_map_file_path,
+                    &source_map,
+                    &mut WriteFileData {
+                        source_file: self.source_file,
+                        ..WriteFileData::default()
+                    },
+                );
                 match result {
-                    Err(err) => self.emitter_diagnostics.add(new_compiler_diagnostic(
-                        diag::Could_not_write_file_0_Colon_1,
-                        args![js_file_path, err],
-                    )),
+                    Err(err) => {
+                        self.emitter_diagnostics.add(new_compiler_diagnostic(
+                            diag::Could_not_write_file_0_Colon_1,
+                            args![js_file_path, err],
+                        ));
+                    }
                     Ok(()) => self
                         .emit_result
                         .emitted_files
@@ -439,14 +456,17 @@ impl Emitter {
             build_info: None,
             diagnostics: self.write_data_diagnostics(),
             skipped_dts_write: false,
+            source_file: self.source_file,
         };
-        let result = self.write_text(js_file_path, &text, Some(&mut data));
+        let result = self.write_text(js_file_path, &text, &mut data);
         let skipped_dts_write = data.skipped_dts_write;
         match result {
-            Err(err) => self.emitter_diagnostics.add(new_compiler_diagnostic(
-                diag::Could_not_write_file_0_Colon_1,
-                args![js_file_path, err],
-            )),
+            Err(err) => {
+                self.emitter_diagnostics.add(new_compiler_diagnostic(
+                    diag::Could_not_write_file_0_Colon_1,
+                    args![js_file_path, err],
+                ));
+            }
             Ok(()) => {
                 if !skipped_dts_write {
                     self.emit_result
@@ -489,17 +509,13 @@ impl Emitter {
     }
 
     // Go: compiler/emitter.go:374 emitter.writeText
-    // PORT: Go passes a nil `*WriteFileData` for source maps; the callback
-    // gets a default one then.
     fn write_text(
         &self,
         file_name: &str,
         text: &str,
-        data: Option<&mut WriteFileData>,
+        data: &mut WriteFileData,
     ) -> Result<(), String> {
         if let Some(write_file) = &self.write_file {
-            let mut default_data = WriteFileData::default();
-            let data = data.unwrap_or(&mut default_data);
             return write_file(file_name, text, data);
         }
         crate::printer::EmitHost::write_file(self.host.as_ref(), file_name, text)

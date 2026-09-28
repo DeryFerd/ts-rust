@@ -34,7 +34,10 @@
 //! pool) is separate and does not change.
 
 use super::*;
+use crate::emitter::emitter::{EmitOnly, Emitter};
+use crate::emitter::program_emit::{EmitOptions, EmitResult, combine_emit_results};
 use crate::frontend::compiler::{CompilerHost, NewProgram, ProgramOptions};
+use crate::frontend::outputpaths::ForceEmitPaths;
 use crate::frontend::parser::ParsedSourceFile;
 use crate::frontend::tspath;
 use crate::gostd::Context;
@@ -522,6 +525,373 @@ pub struct CompilerCheckerPool {
     file_associations: OnceCell<FxHashMap<usize, usize>>,
 }
 
+// ---------------------------------------------------------------------------
+// Checker association (Go compiler/checkerpool.go, #4313)
+// ---------------------------------------------------------------------------
+
+// Go: compiler/checkerpool.go:38
+//
+// Checker association is a balanced graph-partitioning problem:
+//
+//   - A vertex is a source file.
+//   - An undirected edge connects two files for each resolved, in-program import
+//     entry between them. Multiple entries may connect the same pair and therefore
+//     strengthen their affinity. Self-imports and unresolved or external targets do
+//     not create edges.
+//   - A partition is a checker with its own symbol, type, and instantiation caches.
+//
+// Putting related files on the same checker reduces duplicated cache construction,
+// but concentrating too many roots on one checker increases the parallel critical
+// path. We use weighted FENNEL to trade off those objectives:
+//
+//   affinity(partition) - alpha * incrementalLoadPenalty(partition)
+//
+// See Tsourakakis et al., "FENNEL: Streaming Graph Partitioning for Massive Scale
+// Graphs", WSDM 2014: https://doi.org/10.1145/2556195.2556213.
+//
+// FENNEL is sensitive to stream order. Go's comment gives the calibration data;
+// stream order is part of the policy below, rather than an incidental
+// implementation detail.
+//
+// Go: compiler/checkerpool.go:74
+// The constants below are empirical safety factors for a work proxy that cannot
+// observe future semantic cache construction. They were swept across representative
+// projects including VS Code, TypeScript, MUI docs, XState, and Bluesky, with 2, 4,
+// and 8 checkers (Go's comment lists each sweep). These are project-independent
+// operating points, not formulas derived by FENNEL.
+// PORT: Go `int` is `i64` for weights and multipliers.
+
+// Go: compiler/checkerpool.go:100 const(
+pub const CHECKER_ASSOCIATION_TEXT_WEIGHT_DIVISOR: i64 = 100;
+pub const CHECKER_ASSOCIATION_SOURCE_FILE_WEIGHT_MULTIPLIER: i64 = 4;
+pub const CHECKER_ASSOCIATION_BALANCE_PENALTY_MULTIPLIER: i64 = 16;
+pub const CHECKER_ASSOCIATION_PRIORITIZED_SOURCE_PENALTY: i64 = 12;
+pub const CHECKER_ASSOCIATION_STRONG_BALANCE_MIN_CHECKER_COUNT: usize = 4;
+
+// Go: compiler/checkerpool.go:108 checkerAssociationPolicy
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckerAssociationPolicy {
+    pub prioritize_source_files: bool,
+    pub source_file_weight_multiplier: i64,
+    pub balance_penalty_multiplier: i64,
+}
+
+// Go: compiler/checkerpool.go:131 getCheckerAssociationPolicy
+// getCheckerAssociationPolicy selects one of three calibrated regimes:
+//
+//  1. Source-dominated, any checker count:
+//     source files first by descending weight; unmodified source-file weight;
+//     checkerAssociationPrioritizedSourcePenalty.
+//  2. Declaration-heavy, at least checkerAssociationStrongBalanceMinCheckerCount:
+//     program order; checkerAssociationSourceFileWeightMultiplier;
+//     checkerAssociationBalancePenaltyMultiplier.
+//  3. Declaration-heavy, fewer checkers:
+//     program order; unmodified source-file weight; unscaled adapted FENNEL
+//     penalty.
+//
+// The source-dominated test is evaluated first intentionally: projects with very
+// little declaration work benefit from balancing source-file roots directly even
+// with a small checker pool.
+#[must_use]
+pub fn get_checker_association_policy(
+    total_weight: i64,
+    declaration_weight: i64,
+    checker_count: usize,
+) -> CheckerAssociationPolicy {
+    if should_prioritize_source_files(total_weight, declaration_weight, checker_count) {
+        return CheckerAssociationPolicy {
+            prioritize_source_files: true,
+            source_file_weight_multiplier: 1,
+            balance_penalty_multiplier: CHECKER_ASSOCIATION_PRIORITIZED_SOURCE_PENALTY,
+        };
+    }
+    if checker_count >= CHECKER_ASSOCIATION_STRONG_BALANCE_MIN_CHECKER_COUNT {
+        return CheckerAssociationPolicy {
+            prioritize_source_files: false,
+            source_file_weight_multiplier: CHECKER_ASSOCIATION_SOURCE_FILE_WEIGHT_MULTIPLIER,
+            balance_penalty_multiplier: CHECKER_ASSOCIATION_BALANCE_PENALTY_MULTIPLIER,
+        };
+    }
+    CheckerAssociationPolicy {
+        prioritize_source_files: false,
+        source_file_weight_multiplier: 1,
+        balance_penalty_multiplier: 1,
+    }
+}
+
+// Go: compiler/checkerpool.go:164 getCheckerAssociationsInOrder
+// getCheckerAssociationsInOrder partitions the import graph using a weighted adaptation
+// of FENNEL's streaming graph-partitioning objective with gamma = 3/2. Each file
+// is placed where it has the most already-placed neighbors, minus the incremental
+// convex load penalty. The published alpha = m*sqrt(k)/n^(3/2) becomes
+// m*sqrt(k)/W^(3/2), where W is total estimated checker work. penaltyMultiplier
+// applies the empirical safety factor selected by getCheckerAssociationPolicy.
+//
+// A nil order means stable program order. The preferred maximum checker weight is
+// the larger of the largest file and roughly 101% of average. If no checker can
+// accept a file under that bound, the file is assigned to the least-loaded checker.
+// The 1% slack permits discrete files to pack near the average while preventing
+// affinity from deliberately creating meaningful estimated imbalance. Ties are
+// deterministic.
+// PORT: Go nil `fileOrder` is `None`. Go returns nil for no file; this
+// returns an empty list. The float math is in Go's order, so the scores are
+// the same bits.
+#[must_use]
+pub fn get_checker_associations_in_order(
+    file_weights: &[i64],
+    adjacent_files: &[Vec<usize>],
+    file_order: Option<&[usize]>,
+    checker_count: usize,
+    penalty_multiplier: i64,
+) -> Vec<usize> {
+    if file_weights.is_empty() {
+        return Vec::new();
+    }
+
+    let mut total_weight: i64 = 0;
+    let mut max_file_weight: i64 = 0;
+    let mut edge_count: usize = 0;
+    for (i, &weight) in file_weights.iter().enumerate() {
+        total_weight += weight;
+        max_file_weight = max_file_weight.max(weight);
+        edge_count += adjacent_files[i].len();
+    }
+
+    // Go -1 is `None`.
+    let mut associations: Vec<Option<usize>> = vec![None; file_weights.len()];
+    let mut checker_weights: Vec<i64> = vec![0; checker_count];
+    let checker_count_int = checker_count as i64;
+    let average_checker_weight = (total_weight + checker_count_int - 1) / checker_count_int;
+    let max_checker_weight =
+        max_file_weight.max(average_checker_weight + average_checker_weight / 100);
+    let total_weight_float = total_weight as f64;
+    let alpha = penalty_multiplier as f64 * (edge_count / 2) as f64 * (checker_count as f64).sqrt()
+        / (total_weight_float * total_weight_float.sqrt());
+    let mut neighbor_counts: Vec<i64> = vec![0; checker_count];
+
+    for position in 0..file_weights.len() {
+        let file_index = file_order.map_or(position, |order| order[position]);
+
+        neighbor_counts.fill(0);
+        for &adjacent_file in &adjacent_files[file_index] {
+            if let Some(checker_index) = associations[adjacent_file] {
+                neighbor_counts[checker_index] += 1;
+            }
+        }
+
+        let mut best_checker: Option<usize> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for (checker_index, &checker_weight) in checker_weights.iter().enumerate() {
+            if checker_weight + file_weights[file_index] > max_checker_weight {
+                continue;
+            }
+            let old_weight = checker_weight as f64;
+            let new_weight = (checker_weight + file_weights[file_index]) as f64;
+            let penalty = alpha * (new_weight * new_weight.sqrt() - old_weight * old_weight.sqrt());
+            let score = neighbor_counts[checker_index] as f64 - penalty;
+            if score > best_score
+                || score == best_score
+                    && best_checker.is_none_or(|best| checker_weight < checker_weights[best])
+            {
+                best_checker = Some(checker_index);
+                best_score = score;
+            }
+        }
+        // Go: the least-loaded checker, the first one on a tie.
+        let best_checker = best_checker.unwrap_or_else(|| {
+            let mut best_checker = 0;
+            for (checker_index, &checker_weight) in checker_weights.iter().enumerate().skip(1) {
+                if checker_weight < checker_weights[best_checker] {
+                    best_checker = checker_index;
+                }
+            }
+            best_checker
+        });
+        associations[file_index] = Some(best_checker);
+        checker_weights[best_checker] += file_weights[file_index];
+    }
+    associations
+        .into_iter()
+        .map(|checker_index| checker_index.expect("every file gets a checker"))
+        .collect()
+}
+
+// Go: compiler/checkerpool.go:237 getCheckerAssociationOrder
+// getCheckerAssociationOrder places source files before declarations and
+// orders each group by descending estimated work. This exposes expensive semantic
+// roots early, when all checker loads are still available. Returning nil preserves
+// program order without allocating an index array. Program order is itself a
+// locality choice: it preserves deterministic groups produced during program
+// construction and was consistently safer for declaration-heavy projects.
+// PORT: Go nil is `None`.
+#[must_use]
+pub fn get_checker_association_order(
+    file_weights: &[i64],
+    is_declaration_file: &[bool],
+    prioritize_source_files: bool,
+) -> Option<Vec<usize>> {
+    if !prioritize_source_files {
+        return None;
+    }
+    let mut file_order: Vec<usize> = (0..file_weights.len()).collect();
+    // Go `sort.Slice` with a total order, so any sort gives the same result.
+    file_order.sort_by(|&left, &right| {
+        if is_declaration_file[left] != is_declaration_file[right] {
+            // Source files (false) first.
+            return is_declaration_file[left].cmp(&is_declaration_file[right]);
+        }
+        if file_weights[left] != file_weights[right] {
+            return file_weights[right].cmp(&file_weights[left]);
+        }
+        left.cmp(&right)
+    });
+    Some(file_order)
+}
+
+// Go: compiler/checkerpool.go:259 getCheckerAssociationBaseWeight
+#[must_use]
+pub fn get_checker_association_base_weight(node_count: i64, text_length: i64) -> i64 {
+    (node_count + text_length / CHECKER_ASSOCIATION_TEXT_WEIGHT_DIVISOR).max(1)
+}
+
+// Go: compiler/checkerpool.go:272 shouldPrioritizeSourceFiles
+// shouldPrioritizeSourceFiles reports whether all declaration-file base work is at
+// most half of one average checker load:
+//
+//	declarationWeight <= totalWeight / (2 * checkerCount)
+//
+// This threshold separated source-dominated projects such as VS Code from projects
+// where declaration locality remained important, such as MUI docs, TypeScript, and
+// XState. Delaying at most half a checker-load of declarations was the stable
+// boundary in the cross-project sweeps.
+#[must_use]
+pub fn should_prioritize_source_files(
+    total_weight: i64,
+    declaration_weight: i64,
+    checker_count: usize,
+) -> bool {
+    declaration_weight * checker_count as i64 * 2 <= total_weight
+}
+
+// Go: compiler/checkerpool.go:283 getCheckerAssociationWeights
+// getCheckerAssociationWeights combines local syntax work with syntactic import
+// fanout. One import unit is totalBaseWeight / totalImports, so imports collectively
+// contribute approximately the same vertex weight as syntax. Syntactic imports are
+// deliberately broader than getImportAdjacency's resolved, in-program edges: this
+// term estimates the work of processing module references, while adjacency controls
+// checker affinity. Normalizing the term avoids a project-specific vertex-weight
+// constant.
+#[must_use]
+pub fn get_checker_association_weights(base_weights: &[i64], import_counts: &[i64]) -> Vec<i64> {
+    let mut total_base_weight: i64 = 0;
+    let mut total_imports: i64 = 0;
+    for (i, &base_weight) in base_weights.iter().enumerate() {
+        total_base_weight += base_weight;
+        total_imports += import_counts[i];
+    }
+    let mut import_weight: i64 = 0;
+    if total_imports > 0 {
+        import_weight = (total_base_weight / total_imports).max(1);
+    }
+    base_weights
+        .iter()
+        .zip(import_counts)
+        .map(|(&base_weight, &import_count)| base_weight + import_count * import_weight)
+        .collect()
+}
+
+/// The checker index of each file of `program.files`, in file order: the
+/// association part of Go `checkerPool.createCheckers` (#4313). The compile
+/// path pool (`program::create_checkers`) uses it too.
+// Go: compiler/checkerpool.go:363 (*checkerPool).createCheckers (the associations)
+#[must_use]
+pub fn get_checker_associations(program: &NewProgram, checker_count: usize) -> Vec<usize> {
+    let files = &program.files;
+    if checker_count <= 1 {
+        return vec![0; files.len()];
+    }
+    let mut base_weights: Vec<i64> = Vec::with_capacity(files.len());
+    let mut import_counts: Vec<i64> = Vec::with_capacity(files.len());
+    let mut is_declaration_file: Vec<bool> = Vec::with_capacity(files.len());
+    let mut total_base_weight: i64 = 0;
+    let mut declaration_base_weight: i64 = 0;
+    for file in files {
+        let base_weight =
+            get_checker_association_base_weight(file.node_count as i64, file.text.len() as i64);
+        total_base_weight += base_weight;
+        if file.is_declaration_file {
+            declaration_base_weight += base_weight;
+        }
+        base_weights.push(base_weight);
+        import_counts.push(file.imports.len() as i64);
+        is_declaration_file.push(file.is_declaration_file);
+    }
+    let policy =
+        get_checker_association_policy(total_base_weight, declaration_base_weight, checker_count);
+    if policy.source_file_weight_multiplier != 1 {
+        // Apply this before import normalization. The policy intentionally
+        // increases both source-file work and the normalized import unit.
+        for (base_weight, &declaration) in base_weights.iter_mut().zip(&is_declaration_file) {
+            if !declaration {
+                *base_weight *= policy.source_file_weight_multiplier;
+            }
+        }
+    }
+    let file_weights = get_checker_association_weights(&base_weights, &import_counts);
+    let adjacent_files = get_import_adjacency(program);
+    let file_order = get_checker_association_order(
+        &file_weights,
+        &is_declaration_file,
+        policy.prioritize_source_files,
+    );
+    get_checker_associations_in_order(
+        &file_weights,
+        &adjacent_files,
+        file_order.as_deref(),
+        checker_count,
+        policy.balance_penalty_multiplier,
+    )
+}
+
+// Go: compiler/checkerpool.go:421 (*checkerPool).getImportAdjacency
+// getImportAdjacency returns an undirected import graph represented by file
+// index. A directed import from A to B makes both files adjacent because either
+// file can benefit from sharing checker caches with the other.
+// PORT: Go ranges over the resolution map in random order; the order of a
+// list does not change the associations, only its length and contents do.
+fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
+    let files = &program.files;
+    let file_indices: FxHashMap<usize, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (file.store, i))
+        .collect();
+    let mut adjacent_files: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(resolved_modules) = program.processed_files.resolved_modules.get(file.path())
+        else {
+            continue;
+        };
+        for resolved in resolved_modules.values() {
+            if !resolved.is_resolved() {
+                continue;
+            }
+            let imported_index = program
+                .get_source_file_for_resolved_module(&resolved.resolved_file_name)
+                .and_then(|imported_file| file_indices.get(&imported_file.store).copied());
+            let Some(imported_index) = imported_index else {
+                continue;
+            };
+            if imported_index == file_index {
+                continue;
+            }
+            adjacent_files[file_index].push(imported_index);
+            adjacent_files[imported_index].push(file_index);
+        }
+    }
+    adjacent_files
+}
+
 // Go: compiler/checkerpool.go:36 newCheckerPool
 fn new_checker_pool(program: &'static NewProgram) -> CompilerCheckerPool {
     new_checker_pool_with_tracing(program)
@@ -631,9 +1001,11 @@ impl CompilerCheckerPool {
             let _ = self.checkers[i].set(Rc::new(RefCell::new(checker)));
         }
 
+        // #4313: balanced import affinity.
+        let associations = get_checker_associations(self.program, checker_count);
         let mut file_associations = FxHashMap::default();
         for (i, file) in self.program.files.iter().enumerate() {
-            file_associations.insert(file.root.file_index(), i % checker_count);
+            file_associations.insert(file.root.file_index(), associations[i]);
         }
         let _ = self.file_associations.set(file_associations);
     }
@@ -998,11 +1370,12 @@ pub fn get_include_processor_diagnostics(
     if skip_type_checking(p, source_file, false) {
         return Vec::new();
     }
+    // #4825: keyed by the source file, not its name.
     let diagnostics = p
         .include_processor
         .get_diagnostics(p)
         .borrow_mut()
-        .get_diagnostics_for_file(source_file_file_name(source_file));
+        .get_diagnostics_for_file(source_file);
     let (filtered, _) = get_diagnostics_with_preceding_directives(source_file, diagnostics);
     filtered
 }
@@ -1125,6 +1498,121 @@ fn new_emit_host(p: &'static NewProgram, ctx: &Context, file: Node) -> (Rc<EmitH
         crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker(&checker);
     let host = Rc::new(EmitHost { emit_resolver });
     (host, done)
+}
+
+// Go: compiler/program.go:1796 Program.Emit
+// PORT: the language service form of `program_emit::emit` (#4710: the
+// language server flake check; the API emit methods call Go `Program.Emit`
+// too). Each file's emit host gets its checker from the checker pool of `p`
+// (`new_emit_host`), as in Go, so the emit uses the checkers that the
+// diagnostics use, not a compile worker pool. Go runs the files on a
+// WorkGroup. On the dispatch thread they run one after another, in file
+// order. A language service program has no Go `opts.Tracing`, so there is
+// no trace event. Go returns nil when `ctx` is done after
+// `HandleNoEmitOptions` gave nil; here that is `EmitResult::default()`.
+pub fn emit(p: &'static NewProgram, ctx: &Context, options: EmitOptions) -> EmitResult {
+    let _program = enter(p);
+    if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
+        let result = handle_no_emit_options(p, ctx, options.target_source_files.as_deref());
+        if result.is_some() || ctx.err().is_some() {
+            return result.unwrap_or_default();
+        }
+    }
+
+    let new_line = p.options().new_line.get_new_line_character();
+    let force_dts_emit = options.emit_only == EmitOnly::BuilderSignature
+        || options.force_emit && options.emit_only == EmitOnly::Dts;
+    let force_js_emit = options.force_emit && options.emit_only == EmitOnly::Js;
+    let source_files = get_source_files_to_emit(
+        options.target_source_files.as_deref(),
+        force_dts_emit,
+        force_js_emit,
+    );
+
+    let results: Vec<EmitResult> = source_files
+        .into_iter()
+        .map(|source_file| {
+            let (host, done) = new_emit_host(p, ctx, source_file);
+
+            let writer: Rc<RefCell<dyn EmitTextWriter>> =
+                Rc::new(RefCell::new(new_text_writer(new_line, 0)));
+            writer.borrow_mut().clear();
+
+            // attach writer and perform emit
+            let paths = get_output_paths_for_source_file(
+                source_file,
+                host.as_ref(),
+                ForceEmitPaths {
+                    dts: force_dts_emit,
+                    js: force_js_emit,
+                    declaration_map: options.force_emit && options.emit_only == EmitOnly::Dts,
+                },
+            );
+            let mut emitter = Emitter {
+                host,
+                emit_only: options.emit_only,
+                emitter_diagnostics: DiagnosticsCollection::default(),
+                writer: Some(writer),
+                paths,
+                source_file,
+                emit_result: EmitResult::default(),
+                force_emit: options.force_emit,
+                write_file: options.write_file.clone(),
+                js_part: None,
+            };
+            emitter.emit();
+            emitter.writer = None;
+            // Go `defer done()`.
+            done.call();
+            emitter.emit_result
+        })
+        .collect();
+
+    // collect results from emit, preserving input order
+    combine_emit_results(results)
+}
+
+// Go: compiler/program.go:1905 HandleNoEmitOptions
+// PORT: the language service form of `program_emit::handle_no_emit_options`
+// (`Program.Emit` passes a nil `emitBuildInfo`). The bind, semantic, global
+// and declaration diagnostics come from `p` and its checker pool. The
+// config, syntactic and program diagnostics of `get_diagnostics_of_any_program`
+// read the current program, which is `p`.
+fn handle_no_emit_options(
+    p: &'static NewProgram,
+    ctx: &Context,
+    files: Option<&[Node]>,
+) -> Option<EmitResult> {
+    let options = p.options();
+    if !options.no_emit.is_true() {
+        if !options.no_emit_on_error.is_true() {
+            return None; // NoEmit is false and NoEmitOnError is also false, so we can proceed with normal emit
+        }
+
+        let diagnostics = get_diagnostics_of_any_program(
+            files,
+            true,
+            &mut |file: Node| get_bind_diagnostics(p, ctx, file),
+            &mut |file: Node| get_semantic_diagnostics(p, ctx, file),
+            &mut || get_global_diagnostics(p, ctx),
+            &mut |file: Node| get_declaration_diagnostics(p, ctx, file),
+        );
+        if diagnostics.is_empty() {
+            return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting
+        }
+        return Some(EmitResult {
+            diagnostics,
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
+    }
+    if files.is_some() {
+        return Some(EmitResult {
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
+    }
+    Some(EmitResult::default())
 }
 
 // Go: compiler/program.go:1548 IsGlobalTypingsFile
