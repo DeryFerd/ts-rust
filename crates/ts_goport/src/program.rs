@@ -19,6 +19,7 @@
 //! checker pool of each version, by program id.
 
 use crate::execute::tsc::compile::CompileTimes;
+use crate::gostd::{Context, context};
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::ops::Deref;
@@ -3885,18 +3886,21 @@ pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:654 GetSemanticDiagnostics
+// PORT: the compile path has no context; Go tsc passes context.Background()
+// (execute/tsc/emit.go:75). The same holds for the two functions below.
 pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, get_semantic_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, |c, f| {
+        get_semantic_diagnostics_with_checker(&context::background(), c, f)
+    })
 }
 
 // Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
 pub fn get_semantic_diagnostics_without_no_emit_filtering(
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
-    let all_diags = collect_checker_diagnostics_from_files(
-        source_files,
-        get_bind_and_check_diagnostics_with_checker,
-    );
+    let all_diags = collect_checker_diagnostics_from_files(source_files, |c, f| {
+        get_bind_and_check_diagnostics_with_checker(&context::background(), c, f)
+    });
     source_files
         .iter()
         .zip(all_diags)
@@ -3906,7 +3910,9 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
 
 // Go: compiler/program.go:667 GetSuggestionDiagnostics
 pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, get_suggestion_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, |c, f| {
+        get_suggestion_diagnostics_with_checker(&context::background(), c, f)
+    })
 }
 
 // Go: compiler/program.go:671 GetProgramDiagnostics
@@ -4271,11 +4277,12 @@ pub fn filter_no_emit_semantic_diagnostics(
 
 // Go: compiler/program.go:1315 getSemanticDiagnosticsWithChecker
 pub fn get_semantic_diagnostics_with_checker(
+    ctx: &Context,
     c: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags = filter_no_emit_semantic_diagnostics(
-        get_bind_and_check_diagnostics_with_checker(c, source_file),
+        get_bind_and_check_diagnostics_with_checker(ctx, c, source_file),
         &prog().options,
     );
     diags.extend(get_include_processor_diagnostics(source_file));
@@ -4284,6 +4291,7 @@ pub fn get_semantic_diagnostics_with_checker(
 
 // Go: compiler/program.go:1325 getBindAndCheckDiagnosticsWithChecker
 pub fn get_bind_and_check_diagnostics_with_checker(
+    ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -4294,7 +4302,7 @@ pub fn get_bind_and_check_diagnostics_with_checker(
     // Checker creation forces binding, so bind diagnostics will be populated.
     bind_all();
     let mut diags = file_bind_data(source_file).bind_diagnostics.clone();
-    diags.extend(file_checker.get_diagnostics_exported(source_file));
+    diags.extend(file_checker.get_diagnostics_exported(ctx, source_file));
 
     let is_plain_js = is_plain_js_file(source_file, compiler_options.check_js);
     if is_plain_js {
@@ -4375,6 +4383,7 @@ fn get_diagnostics_with_preceding_directives(
 
 // Go: compiler/program.go:1410 getSuggestionDiagnosticsWithChecker
 fn get_suggestion_diagnostics_with_checker(
+    ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -4386,7 +4395,7 @@ fn get_suggestion_diagnostics_with_checker(
     let mut diags = file_bind_data(source_file)
         .bind_suggestion_diagnostics
         .clone();
-    diags.extend(file_checker.get_suggestion_diagnostics(source_file));
+    diags.extend(file_checker.get_suggestion_diagnostics(ctx, source_file));
     diags
 }
 

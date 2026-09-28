@@ -95,3 +95,12 @@ and fetches the results. zbook builds. Each host keeps a mirror at zbook's absol
   `flock /tmp/goport-remote-dbook.lock scripts/goport/remote.sh run dbook-lan <command>`.
   dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
   name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
+- mini-743d (Ryzen 7 8845HS) and mini-abf9 (ssh alias `mini-abf9-1`, Ryzen 7 255): LAN minis with
+  16 threads and 28 GB RAM each. They run gates and checks. mini-abf9 is wired (2.5 Gb/s), so it is
+  also good for quiet timing and the editor benchmark (`ls_edit_bench.py`, every side on the same
+  host). mini-743d is on 2.4 GHz Wi-Fi (about 8 MB/s), so large syncs to it are slow. Every job
+  takes the host's own lock on zbook, timing included:
+  `flock /tmp/goport-remote-mini-743d.lock scripts/goport/remote.sh run mini-743d <command>`, and
+  `/tmp/goport-remote-mini-abf9.lock` with `run mini-abf9`. `remote.sh` always reaches them by the
+  LAN names mini-743d.local and mini-abf9.local, never Tailscale. It maps `mini-abf9-1` and the `-ts`
+  names to `mini-abf9` and `mini-743d`.

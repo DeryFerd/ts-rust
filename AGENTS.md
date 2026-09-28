@@ -36,6 +36,7 @@ These rules apply to every goal, including `/goal` runs.
 
 Remote runners: zbook builds. The cloud hosts alvin and cup2 run gates, corpus suites, sweeps and oracle checks through `scripts/goport/remote.sh`. They keep a mirror at the same absolute paths as zbook. Copy the binaries and scripts to the host before a run, and fetch the results after it. For perf timing, measure all sides of one comparison on the same machine. The protected regression pipeline stays on zbook.
 dbook (`dbook-lan`) is a LAN host with zbook's CPU and 26 GB RAM. It runs gates, checks and quiet timing under `flock /tmp/goport-remote-dbook.lock`; see `scripts/goport/README.md`.
+The LAN minis mini-743d and mini-abf9 also run gates and checks. `remote.sh` reaches them over the LAN, and every job on one takes its lock `/tmp/goport-remote-<host>.lock` on zbook (see `scripts/goport/README.md`).
 
 ## Required checks
 
