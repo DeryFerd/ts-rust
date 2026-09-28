@@ -341,19 +341,24 @@ impl EmitPool {
 /// The most threads of an emit pool.
 const MAX_EMIT_THREADS: usize = 32;
 
-/// The threads of a new emit pool: one per core (Go runs the emit on
-/// GOMAXPROCS goroutines), at most `MAX_EMIT_THREADS`.
-/// `GOPORT_EMIT_THREADS` sets the count (same maximum); 0 turns the pool off,
-/// so every emit runs on the checker threads as before the pool.
+/// The threads of a new emit pool of the current program: one per core (Go
+/// runs the emit on GOMAXPROCS goroutines), at most `MAX_EMIT_THREADS`, but
+/// 0 (no pool) when the cores are not more than the checkers. With no spare
+/// core the pool only competes with the checker threads, and each d.ts part
+/// loses the caches that its JS part warmed (effect at 4 cores and 4
+/// checkers: +1.6% wall, +30 MiB). `GOPORT_EMIT_THREADS` sets the count at
+/// any core count (same maximum); 0 turns the pool off, so every emit runs
+/// on the checker threads as before the pool.
 fn emit_thread_count() -> usize {
-    static COUNT: OnceLock<usize> = OnceLock::new();
-    *COUNT.get_or_init(|| {
+    static SET: OnceLock<Option<usize>> = OnceLock::new();
+    let set = *SET.get_or_init(|| {
         std::env::var("GOPORT_EMIT_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_else(available_cores)
-            .min(MAX_EMIT_THREADS)
-    })
+    });
+    let cores = available_cores();
+    set.unwrap_or(if cores > checker_count() { cores } else { 0 })
+        .min(MAX_EMIT_THREADS)
 }
 
 /// Makes the emit pool of the current program with `count` threads.

@@ -329,8 +329,10 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   the checker itself.
 - Each program also has an emit pool (not in Go; `program::send_emit_pool_jobs`):
   up to 32 threads with no checker, one per core, made on the first emit
-  that uses it. The JS part of a file goes there when its transforms make
-  no checker call (`emitter::emitter::js_emit_needs_checker`: Go's binder
+  that uses it. There is no pool when the cores are not more than the
+  checkers: then it has no spare core and only slows the checker threads.
+  The JS part of a file goes there when its transforms make no checker
+  call (`emitter::emitter::js_emit_needs_checker`: Go's binder
   reference resolver case of `getScriptTransformers`, and no enum in the
   file). The d.ts part, and a JS part that needs the checker, stay on the
   checker thread, so each checker gets the same calls in the same order.
@@ -341,7 +343,8 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   on every thread. A d.ts part waits for its file's JS part before it
   writes, so a file's outputs are written in Go's order. The pool is off
   with `--singleThreaded`, `--generateTrace`, an emit called on a checker
-  thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count).
+  thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count,
+  also when no core is spare).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
