@@ -321,10 +321,19 @@ struct Uint128 {
 // language server program, which the parse cache made. Any other parse
 // (Go `parser.ParseSourceFile`, for example a tsconfig from
 // `tsoptions.NewTsconfigSourceFileFromFilePath`) keeps Go Hash 0. Such a
-// file is unpublished or in no program.
+// file is in no program, also when a publish kept its parse (the root
+// config of a project, api/session.go handleGetConfigSourceFile at pin B).
+// So the test is "a program made here has this file"
+// (`program_parsed_source_file`), not "some parse of this file exists"
+// (`parsed_source_file_of`, which also finds that root config).
+// PORT: Go gives a content-mapped file (project/compilerhost.go
+// GetContentMappedSourceFiles) the hash of its cache key, not of its text.
+// The port has no content-mapped parse cache yet, so such a file gets the
+// text hash here.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
-    let from_parse_cache = parsed_source_file_of(source_file).is_some()
-        && crate::ast::is_published(source_file.file_index());
+    let from_parse_cache = !source_file.is_nil()
+        && !is_synthetic_node(source_file)
+        && crate::program::ls_program::program_parsed_source_file(source_file).is_some();
     if !from_parse_cache {
         return Uint128::default();
     }
