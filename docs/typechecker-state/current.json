@@ -3,7 +3,7 @@
   "status": "active",
   "decision": "REVIEW",
   "updated": "2026-09-28T15:07:50.145883+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-14 accepted at R127. Batch recovery-continuation-go-checker-port-15 opened at R128.",
+  "reason": "R128 withdrawn (release script defect); R129 opens with the complete int13 source.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -590,7 +590,13 @@
     "focusedResults": [],
     "runtimeToolHandles": [],
     "commands": [],
-    "interruptedRuns": [],
+    "interruptedRuns": [
+      {
+        "revision": 128,
+        "run": "candidate.sh side r128 (gate r128-full on mini-abf9)",
+        "reason": "candidate withdrawn: release script defect found by the perf13 lane"
+      }
+    ],
     "upstreamPin": {
       "from": "52168999f3dc",
       "to": "52168999f3dc",
