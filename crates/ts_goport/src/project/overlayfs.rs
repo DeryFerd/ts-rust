@@ -8,7 +8,7 @@
 
 use crate::project::prelude::*;
 
-use crate::frontend::core_ext::ensure_script_kind_from_file_name;
+use crate::frontend::core_ext::get_script_kind_from_file_name;
 use std::cell::{Cell, OnceCell};
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -120,8 +120,10 @@ impl DiskFile {
     }
 
     // Go: project/overlayfs.go:101 diskFile.Kind
+    // PORT: tsgo #4712 reverts #4628 here. An extensionless file keeps
+    // `ScriptKind::UNKNOWN`; `new_parse_cache_key` picks TS for the parse.
     pub fn kind(&self) -> ScriptKind {
-        ensure_script_kind_from_file_name(&self.file_base.file_name)
+        get_script_kind_from_file_name(&self.file_base.file_name)
     }
 
     // Go: project/overlayfs.go:105 diskFile.Clone
@@ -290,7 +292,9 @@ impl FileHandle for Overlay {
 }
 
 // PORT: Go passes an `*Overlay` to `Converters.FromLSPTextChange` as an
-// `lsconv.Script` (its `FileName` and `Text` methods).
+// `lsconv.Script` (its `FileName` and `Text` methods). tsgo #4712 adds
+// `OriginalFileName` (the file name), `SpanMap` (nil) and `OriginalText`
+// (the content) to `lsconv.Script`. They come here with that trait change.
 impl lsconv::Script for Overlay {
     fn file_name(&self) -> &str {
         &self.file_base.file_name
@@ -476,7 +480,7 @@ impl OverlayFS {
                 let mut script_kind =
                     lsconv::language_kind_to_script_kind(&open_change.language_kind);
                 if script_kind == ScriptKind::UNKNOWN {
-                    script_kind = ensure_script_kind_from_file_name(&uri.file_name());
+                    script_kind = get_script_kind_from_file_name(&uri.file_name());
                 }
                 new_overlays.insert(
                     path,
@@ -550,6 +554,9 @@ impl OverlayFS {
                             .clone()
                             .expect("invalid memory address or nil pointer dereference");
                         if let Some(partial_change) = &text_change.partial {
+                            // PORT: tsgo #4712 uses `lsconv.FromLSPRange(converters, o,
+                            // partialChange.Range, spanmap.FeatureAll)` and asserts one
+                            // range. An overlay has no span map, so that range is this one.
                             let new_content = converters
                                 .from_lsp_text_change(&*cur, partial_change)
                                 .apply_to(&cur.file_base.content);

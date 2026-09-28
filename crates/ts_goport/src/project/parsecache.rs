@@ -2,6 +2,7 @@
 
 use crate::project::prelude::*;
 
+use crate::frontend::core_ext::ensure_script_kind_from_file_name;
 use crate::frontend::parser;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -41,8 +42,11 @@ impl ParseCacheKey {
 pub fn new_parse_cache_key(
     options: &parser::SourceFileParseOptions,
     hash: u128,
-    script_kind: ScriptKind,
+    mut script_kind: ScriptKind,
 ) -> ParseCacheKey {
+    if script_kind == ScriptKind::UNKNOWN {
+        script_kind = ensure_script_kind_from_file_name(&options.file_name);
+    }
     ParseCacheKey {
         file_name: options.file_name.clone(),
         path: options.path.clone(),

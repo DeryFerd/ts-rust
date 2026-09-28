@@ -10,7 +10,9 @@
 
 use crate::project::prelude::*;
 
+use crate::contentmapper;
 use crate::frontend::parser;
+use std::cell::Cell;
 
 // Go: project/compilerhost.go:16 compilerHost
 pub struct CompilerHost {
@@ -24,6 +26,10 @@ pub struct CompilerHost {
     pub project: RefCell<Option<Rc<RefCell<Project>>>>,
     pub builder: RefCell<Option<Rc<ProjectCollectionBuilder>>>,
     pub logger: RefCell<Option<Rc<logging::LogTree>>>,
+    // tsgo#4712. PORT: Go nil interface is `None`. `content_mapper_once`
+    // is Go `contentMapperOnce` (`sync.Once`).
+    pub content_mapper_project: RefCell<Option<Rc<dyn contentmapper::Project>>>,
+    pub content_mapper_once: Cell<bool>,
 
     /// True when the project had no program when this host was made (its
     /// first load). `compiler::CompilerHost::prefetch_parses` returns it.
@@ -57,6 +63,8 @@ pub fn new_compiler_host(
         project: RefCell::new(Some(project.clone())),
         builder: RefCell::new(Some(builder.clone())),
         logger: RefCell::new(logger),
+        content_mapper_project: RefCell::new(None),
+        content_mapper_once: Cell::new(false),
 
         first_load,
     })
@@ -92,6 +100,34 @@ impl CompilerHost {
         if self.builder.borrow().is_none() || self.project.borrow().is_none() {
             panic!("method must not be called after snapshot initialization");
         }
+    }
+
+    // Go: project/compilerhost.go:153 compilerHost.ensureContentMapperProject (tsgo#4712)
+    // PORT: `ProjectCollectionBuilder` has no `contentMapperHost` yet (the
+    // #4712 builder and session part is not ported), so the host is Go's
+    // nil host and the project stays `None`.
+    fn ensure_content_mapper_project(&self) {
+        if self.content_mapper_once.replace(true) {
+            return;
+        }
+        let content_mapper_host: Option<Rc<dyn contentmapper::Host>> = None;
+        let Some(content_mapper_host) = content_mapper_host else {
+            return;
+        };
+        let project = self
+            .project
+            .borrow()
+            .clone()
+            .expect("invalid memory address or nil pointer dereference: compilerHost.project");
+        let command_line = project.borrow().get_command_line_with_typings_files().expect(
+            "invalid memory address or nil pointer dereference: project.getCommandLineWithTypingsFiles",
+        );
+        let content_mapper_project = content_mapper_host.project(contentmapper::ProjectSpec {
+            config_file_name: command_line.config_name().to_string(),
+            mappers: command_line.content_mappers().to_vec(),
+            compiler_options: Some(command_line.compiler_options().clone()),
+        });
+        *self.content_mapper_project.borrow_mut() = content_mapper_project;
     }
 }
 
@@ -165,6 +201,51 @@ impl compiler::CompilerHost for CompilerHost {
             return Some(builder.parse_cache.acquire(key, fh).file);
         }
         None
+    }
+
+    // Go: project/compilerhost.go:112 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
+    // GetContentMappedSourceFile implements compiler.CompilerHost.
+    // PORT: the builder has no `contentMappedParseCache` yet, so there is no
+    // cache key (diagnostic locale, transform identity hash), no `Hash` on
+    // the files and no `Deref` on a collision: each call transforms and
+    // parses. A file that cannot be read is `Ok` with no canonical file.
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &parser::SourceFileParseOptions,
+        mapper: &Rc<contentmapper::Mapper>,
+    ) -> Result<contentmapper::SourceFiles, GoError> {
+        self.ensure_alive();
+        let Some(fh) = self
+            .source_fs
+            .get_file_by_path(&parse_options.file_name, &parse_options.path)
+        else {
+            return Ok(contentmapper::SourceFiles::default());
+        };
+        self.ensure_content_mapper_project();
+        let Some(project) = self.content_mapper_project.borrow().clone() else {
+            return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
+        };
+        // PORT: Go hashes the identity into the cache key; only its error
+        // is used here.
+        if let Err(err) = project.identity(mapper) {
+            return Err(contentmapper::new_transform_error(
+                contentmapper::TransformErrorKind::PROJECT,
+                Some(err),
+            )
+            .to_go_error());
+        }
+        let files =
+            contentmapper::transform_and_parse(parse_options, &fh.content(), mapper, &*project)?;
+        let fs = compiler::CompilerHost::fs(self);
+        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
+            vfs::Fs::file_exists(&*fs, name)
+        })?;
+        Ok(files)
+    }
+
+    // Go: project/compilerhost.go:167 compilerHost.ContentMapperProject (tsgo#4712)
+    fn content_mapper_project(&self) -> Option<Rc<dyn contentmapper::Project>> {
+        self.content_mapper_project.borrow().clone()
     }
 
     // Go: project/compilerhost.go:106 compilerHost.Trace

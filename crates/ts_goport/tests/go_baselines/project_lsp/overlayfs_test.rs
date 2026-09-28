@@ -173,12 +173,11 @@ fn open_falls_back_to_file_extension_for_unknown_language_kind() {
     assert_eq!(fh.kind(), ScriptKind::TS);
 }
 
-// Go: overlayfs_test.go:187 TestProcessChanges/open extensionless file with unknown language kind falls back to TS
-// PORT: tsgo #4628. Upstream #4712 (bump B wave 3) renames this test to
-// "open extensionless file preserves unknown script kind" and expects
-// `ScriptKindUnknown`.
+// Go: overlayfs_test.go:187 TestProcessChanges/open extensionless file preserves unknown script kind
+// PORT: tsgo #4712 renamed this #4628 test (was "open extensionless file with
+// unknown language kind falls back to TS") and flipped it to `ScriptKindUnknown`.
 #[test]
-fn open_extensionless_file_with_unknown_language_kind_falls_back_to_ts() {
+fn open_extensionless_file_preserves_unknown_script_kind() {
     let fs = create_overlay_fs();
     let u = "file:///script";
 
@@ -190,19 +189,18 @@ fn open_extensionless_file_with_unknown_language_kind_falls_back_to_ts() {
     )]);
 
     let fh = file(&fs, u);
-    assert_eq!(fh.kind(), ScriptKind::TS);
+    assert_eq!(fh.kind(), ScriptKind::UNKNOWN);
 }
 
-// Go: overlayfs_test.go:207 TestProcessChanges/extensionless disk file falls back to TS
-// PORT: tsgo #4628. Upstream #4712 (bump B wave 3) renames this test to
-// "extensionless disk file preserves unknown script kind" and expects
-// `ScriptKindUnknown`.
+// Go: overlayfs_test.go:207 TestProcessChanges/extensionless disk file preserves unknown script kind
+// PORT: tsgo #4712 renamed this #4628 test (was "extensionless disk file falls
+// back to TS") and flipped it to `ScriptKindUnknown`.
 #[test]
-fn extensionless_disk_file_falls_back_to_ts() {
+fn extensionless_disk_file_preserves_unknown_script_kind() {
     let fs = create_overlay_fs();
 
     let fh = fs.get_file("/script").expect("file handle");
-    assert_eq!(fh.kind(), ScriptKind::TS);
+    assert_eq!(fh.kind(), ScriptKind::UNKNOWN);
 }
 
 // Go: overlayfs_test.go:186 TestProcessChanges/watch change on overlay marks as not matching disk
