@@ -1896,14 +1896,16 @@ impl RegistryBuilder {
                     continue;
                 }
             }
-            // Skip all node_modules files - they are always handled by node_modules buckets.
-            // This simplifies the logic and ensures exports are indexed consistently.
-            if file.file_name().contains("/node_modules/") {
-                continue;
-            }
-            // Skip files that are realpaths of symlinks in node_modules.
-            // These files will be indexed via their symlinked path in node_modules buckets.
-            if has_symlink_to_node_modules(file.path(), &project_root_path, Some(&*symlink_cache)) {
+            // Ordinary node_modules files are owned by node_modules buckets. Content-mapped files are not
+            // discovered by those buckets, but files already transformed in the Program can be indexed here.
+            if file.content_mapper().is_empty()
+                && (file.file_name().contains("/node_modules/")
+                    || has_symlink_to_node_modules(
+                        file.path(),
+                        &project_root_path,
+                        Some(&*symlink_cache),
+                    ))
+            {
                 continue;
             }
             // Go: wg.Go(func() {...})

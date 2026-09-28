@@ -234,10 +234,13 @@ impl ImportAdder for ImportAdderImpl {
             );
         }
 
-        // PORT: Go `GetChanges()[fileName]` is a nil slice for a missing key.
-        tracker
-            .get_changes()
-            .shift_remove(source_file_file_name(importing_file))
+        // Unmappable files are dropped by GetChanges, so a content-mapped importing file that cannot be
+        // faithfully rewritten yields no edits rather than a corrupting one.
+        // PORT: Go `changes[fileName]` is a nil slice for a missing key. Go
+        // `OriginalFileName()` is the `lsconv::Script` method of a file root `Node`.
+        let (mut changes, _) = tracker.get_changes();
+        changes
+            .shift_remove(lsconv::Script::original_file_name(&importing_file))
             .unwrap_or_default()
     }
 

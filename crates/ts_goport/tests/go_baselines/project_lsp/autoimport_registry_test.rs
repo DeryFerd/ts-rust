@@ -1,6 +1,6 @@
 //! Port of Go `internal/ls/autoimport/registry_test.go` (`TestRegistryLifecycle`,
-//! `TestHiddenDirectoriesInNodeModules`, `TestAutoImportEntrypointDirectorySearch`,
-//! `TestUpdateIndexesConcurrentMapSafety`).
+//! `TestContentMappedNodeModulesFileUsesProjectBucket`, `TestHiddenDirectoriesInNodeModules`,
+//! `TestAutoImportEntrypointDirectorySearch`, `TestUpdateIndexesConcurrentMapSafety`).
 
 use std::rc::Rc;
 
@@ -10,14 +10,14 @@ use ts_goport::ls::lsconv;
 use ts_goport::ls::lsutil;
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
-use ts_goport::project::Session;
+use ts_goport::project::{self, Session, SessionOptions};
 
 use super::autoimporttestutil::{
     self, MonorepoPackageConfig, MonorepoPackageTemplate, MonorepoSetupConfig, TextFileSpec,
 };
-use super::projecttestutil::{self, FileMap, files};
+use super::projecttestutil::{self, FileMap, TypingsInstallerOptions, files};
 use super::util::*;
-use crate::support::vfstest;
+use crate::support::{contentmappertest, vfstest};
 
 // Go: registry_test.go:1234 lifecycleProjectRoot, monorepoProjectRoot
 const LIFECYCLE_PROJECT_ROOT: &str = "/home/src/autoimport-lifecycle";
@@ -1065,6 +1065,81 @@ child_test! {
             "expected both app and repo node_modules buckets"
         );
         assert_eq!(stats.unique_package_count, 1, "expected one unique package after realpath dedup");
+    }
+}
+
+child_test! {
+    // Go: registry_test.go:958 TestContentMappedNodeModulesFileUsesProjectBucket
+    // PORT: Go `bundled.Embedded` is always true in the port, so the skip is dropped.
+    // PORT-HOLD: the session does not have Go `SessionOptions.RunExternalCode`
+    // (session.go:79) or `SessionInit.Spawner` (session.go:92) yet. The server
+    // lane owns src/project/session.rs. When it adds them, restore the two
+    // commented lines below and remove the `#[ignore]`.
+    #[ignore = "port: needs SessionOptions.run_external_code and SessionInit.spawner (Go session.go:79, :92)"]
+    fn content_mapped_node_modules_file_uses_project_bucket() {
+        const MAIN_TEXT: &str = "profileTitle;";
+        let mapper_package_json = contentmappertest::package_json(contentmappertest::COMPONENT_MAPPER);
+        let files = files(&[
+            (
+                "/home/project/tsconfig.json",
+                r#"{
+			"compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "strict": true, "skipLibCheck": true },
+			"contentMappers": [ { "package": "mapper", "extensions": [".vue"] } ]
+		}"#,
+            ),
+            ("/home/project/node_modules/mapper/package.json", mapper_package_json.as_str()),
+            (
+                "/home/project/node_modules/profile-package/ProfileCard.vue",
+                r#"<component name="ProfileCard">
+<script lang="ts">
+export const profileTitle = "Profile";
+</script>"#,
+            ),
+            (
+                "/home/project/node_modules/profile-package/HiddenCard.vue",
+                r#"<component name="HiddenCard">
+<script lang="ts">
+export const hiddenTitle = "Hidden";
+</script>"#,
+            ),
+            ("/home/project/node_modules/profile-package/ordinary.ts", "export const ordinary = true;"),
+            (
+                "/home/project/load.ts",
+                r#"import "profile-package/ProfileCard.vue";
+import "profile-package/ordinary";"#,
+            ),
+            ("/home/project/main.ts", MAIN_TEXT),
+        ]);
+        // PORT: the Go literal names 5 fields; the others are Go zero values
+        // (`watch_enabled` and `logging_enabled` false). Go nil `tiOptions`
+        // is the default `TypingsInstallerOptions`.
+        let (init, _) = projecttestutil::get_session_init_options(
+            files,
+            Some(SessionOptions {
+                // PORT-HOLD: Go `RunExternalCode: true`.
+                // run_external_code: true,
+                watch_enabled: false,
+                logging_enabled: false,
+                ..projecttestutil::session_options("/home/project")
+            }),
+            TypingsInstallerOptions::default(),
+        );
+        // PORT-HOLD: Go `init.Spawner = contentmappertest.NewSpawner()`.
+        // init.spawner = Some(contentmappertest::new_spawner());
+        let session = project::new_session(&init);
+
+        let main_uri = uri("file:///home/project/main.ts");
+        open_uri(&session, &main_uri, MAIN_TEXT, lsproto::LanguageKind::TYPE_SCRIPT);
+        with_auto_imports(&session, &main_uri);
+        session.wait_for_background_tasks();
+
+        let project_bucket = single_bucket(&auto_import_stats(&session).project_buckets);
+        assert_eq!(
+            project_bucket.file_count, 3,
+            "expected the two project roots and referenced mapped package file"
+        );
+        // Go: defer session.Close()
+        session.close();
     }
 }
 

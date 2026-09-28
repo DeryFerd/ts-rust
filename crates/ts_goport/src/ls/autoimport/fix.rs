@@ -80,8 +80,9 @@ pub struct AddToExistingImportFix {
 
 impl Fix {
     // Go: ls/autoimport/fix.go:53 Edits
-    // PORT: Go `tracker.GetChanges()[file.FileName()]` is a nil slice for a
-    // missing key; that is an empty `Vec`.
+    // Edits produces the text edits and a human-readable description for the fix. The returned bool is false
+    // when the fix targets a content-mapped file and any edit could not be placed within a single verbatim
+    // span, meaning it cannot be safely applied to the original text and the caller should discard it.
     pub fn edits(
         &self,
         ctx: &Context,
@@ -90,7 +91,7 @@ impl Fix {
         format_options: &lsutil::FormatCodeSettings,
         converters: &Rc<lsconv::Converters>,
         preferences: &lsutil::UserPreferences,
-    ) -> (Vec<lsproto::TextEdit>, String) {
+    ) -> (Vec<lsproto::TextEdit>, String, bool) {
         let f = self;
         let locale = locale::from_context(ctx);
         let mut tracker = change::new_tracker(
@@ -99,17 +100,11 @@ impl Fix {
             format_options.clone(),
             converters.clone(),
         );
-        let file_name = source_file_file_name(file);
         match f.kind {
             lsproto::AutoImportFixKind::USE_NAMESPACE => {
                 let description = add_namespace_qualifier(f, &mut tracker, file, &locale);
-                (
-                    tracker
-                        .get_changes()
-                        .shift_remove(file_name)
-                        .unwrap_or_default(),
-                    description,
-                )
+                let (edits, safe) = file_edits(&mut tracker, file);
+                (edits, description, safe)
             }
             lsproto::AutoImportFixKind::ADD_TO_EXISTING => {
                 if (source_file_imports(file).len() as i32) <= f.import_index {
@@ -127,16 +122,15 @@ impl Fix {
                     &named_imports,
                     preferences,
                 );
+                let (edits, safe) = file_edits(&mut tracker, file);
                 (
-                    tracker
-                        .get_changes()
-                        .shift_remove(file_name)
-                        .unwrap_or_default(),
+                    edits,
                     crate::diagnostics_loc::message_localize(
                         diag::Update_import_from_0,
                         &locale,
                         &args![f.module_specifier],
                     ),
+                    safe,
                 )
             }
             lsproto::AutoImportFixKind::ADD_NEW => {
@@ -208,16 +202,15 @@ impl Fix {
                 // if qualification != nil {
                 // 	addNamespaceQualifier(tracker, file, qualification)
                 // }
+                let (edits, safe) = file_edits(&mut tracker, file);
                 (
-                    tracker
-                        .get_changes()
-                        .shift_remove(file_name)
-                        .unwrap_or_default(),
+                    edits,
                     crate::diagnostics_loc::message_localize(
                         diag::Add_import_from_0,
                         &locale,
                         &args![f.module_specifier],
                     ),
+                    safe,
                 )
             }
             lsproto::AutoImportFixKind::PROMOTE_TYPE_ONLY => {
@@ -231,44 +224,51 @@ impl Fix {
                 if promoted_declaration.kind() == SyntaxKind::ImportSpecifier {
                     let module_spec =
                         get_module_specifier_text(promoted_declaration.parent().parent());
+                    let (edits, safe) = file_edits(&mut tracker, file);
                     return (
-                        tracker
-                            .get_changes()
-                            .shift_remove(file_name)
-                            .unwrap_or_default(),
+                        edits,
                         crate::diagnostics_loc::message_localize(
                             diag::Remove_type_from_import_of_0_from_1,
                             &locale,
                             &args![f.name, module_spec],
                         ),
+                        safe,
                     );
                 }
                 let module_spec = get_module_specifier_text(promoted_declaration);
+                let (edits, safe) = file_edits(&mut tracker, file);
                 (
-                    tracker
-                        .get_changes()
-                        .shift_remove(file_name)
-                        .unwrap_or_default(),
+                    edits,
                     crate::diagnostics_loc::message_localize(
                         diag::Remove_type_from_import_declaration_from_0,
                         &locale,
                         &args![module_spec],
                     ),
+                    safe,
                 )
             }
             lsproto::AutoImportFixKind::JSDOC_TYPE_IMPORT => {
                 let description = add_import_type(f, file, preferences, &mut tracker, &locale);
-                (
-                    tracker
-                        .get_changes()
-                        .shift_remove(file_name)
-                        .unwrap_or_default(),
-                    description,
-                )
+                let (edits, safe) = file_edits(&mut tracker, file);
+                (edits, description, safe)
             }
             _ => panic!("unimplemented fix edit"),
         }
     }
+}
+
+// Go: ls/autoimport/fix.go:133 fileEdits
+// fileEdits returns the edits recorded for file, along with whether they are safe to apply. GetChanges
+// drops the edits of any content-mapped file that cannot be faithfully mapped back to the original text,
+// so an empty result with safe == false means the fix could not be represented and must be discarded.
+// PORT: Go `changes[name]` is a nil slice for a missing key; that is an empty `Vec`.
+// Go `file.OriginalFileName()` is the `lsconv::Script` method of a file root `Node`.
+fn file_edits(tracker: &mut change::Tracker, file: Node) -> (Vec<lsproto::TextEdit>, bool) {
+    let (mut changes, unmappable) = tracker.get_changes();
+    let edits = changes
+        .shift_remove(lsconv::Script::original_file_name(&file))
+        .unwrap_or_default();
+    (edits, unmappable.is_empty())
 }
 
 // Go: ls/autoimport/fix.go:121 addImportType
