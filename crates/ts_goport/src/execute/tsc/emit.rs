@@ -39,6 +39,12 @@ pub trait ProgramLike {
     fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic>;
     fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic>;
     fn emit(&self, options: EmitOptions) -> EmitResult;
+
+    /// PORT: Go `programLike.(*incremental.Program)` (execute/tsc/emit.go).
+    /// Only the incremental program returns itself.
+    fn as_incremental_program(&self) -> Option<&crate::execute::incremental::program::Program> {
+        None
+    }
 }
 
 /// Go `*compiler.Program` as a `ProgramLike`: the current program.
@@ -158,7 +164,7 @@ pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, O
     (result, statistics)
 }
 
-// Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
+// Go: execute/tsc/emit.go:74 EmitFilesAndReportErrors
 // PORT: Go times each bind and check call with `sys.Now()`; the port keeps
 // the same assignments.
 pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
@@ -199,6 +205,16 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
             let check_start = std::time::Instant::now();
             let diags = program_like.get_semantic_diagnostics(file);
             times.borrow_mut().check_time = check_start.elapsed();
+            if let Some(program) = program_like.as_incremental_program() {
+                let nested_emit_time = program.take_nested_emit_time();
+                let mut times = times.borrow_mut();
+                if nested_emit_time > times.check_time {
+                    times.check_time = std::time::Duration::ZERO;
+                } else {
+                    times.check_time -= nested_emit_time;
+                }
+                times.emit_time += nested_emit_time;
+            }
             diags
         },
         &mut || program_like.get_global_diagnostics(),
@@ -216,7 +232,7 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
             write_file: input.write_file.clone(),
             ..EmitOptions::default()
         });
-        result.times.borrow_mut().emit_time = emit_start.elapsed();
+        result.times.borrow_mut().emit_time += emit_start.elapsed();
     }
     all_diagnostics.extend(emit_result.diagnostics.iter().cloned());
     // PORT: testing

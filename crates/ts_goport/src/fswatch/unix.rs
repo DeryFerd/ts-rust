@@ -33,9 +33,11 @@ pub const EINTR: Errno = Errno(0x4);
 pub const EBADF: Errno = Errno(0x9);
 pub const EAGAIN: Errno = Errno(0xb);
 pub const EACCES: Errno = Errno(0xd);
+pub const ENODEV: Errno = Errno(0x13);
 pub const ENOTDIR: Errno = Errno(0x14);
 pub const EINVAL: Errno = Errno(0x16);
 pub const EOPNOTSUPP: Errno = Errno(0x5f);
+pub const ENOTSUP: Errno = Errno(0x5f);
 pub const EWOULDBLOCK: Errno = Errno(0xb);
 
 impl Errno {

@@ -128,10 +128,13 @@ impl ExitStatus {
 /// (internal software error).
 pub const EXIT_UNPORTED: i32 = 70;
 
-// Go: execute/tsc/compile.go:41 Watcher
-// PORT: watch mode is out of scope; the trait exists for `CommandLineResult`.
+// Go: execute/tsc/compile.go:61 Watcher
 pub trait Watcher {
     fn do_cycle(&mut self);
+
+    /// PORT: not in Go. Go tests assert the concrete type
+    /// (`result.Watcher.(*execute.Watcher)`); a Rust test downcasts this.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // Go: execute/tsc/compile.go:45 CommandLineResult

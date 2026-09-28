@@ -42,6 +42,7 @@ pub fn program_to_snapshot(
         to.reuse_from_old_program();
         to.compute_program_file_changes();
         to.handle_file_delete();
+        to.handle_global_scope_change();
         to.handle_pending_emit();
         to.handle_pending_check();
     }
@@ -259,7 +260,41 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:172 handlePendingEmit
+    // Go: incremental/programtosnapshot.go:182 handleGlobalScopeChange
+    // PORT: Go ranges over a `SyncMap` (random order) and stops at the first
+    // file that lost global scope; the result does not depend on the order.
+    fn handle_global_scope_change(&mut self) {
+        let Some(old_program) = self.old_program else {
+            return;
+        };
+        if self.global_file_removed {
+            return;
+        }
+        let mut global_scope_lost = false;
+        for (file_path, old_info) in &old_program.snapshot.borrow().file_infos {
+            if !old_info.affects_global_scope {
+                continue;
+            }
+            if let Some(new_info) = self.snapshot.file_infos.get(file_path) {
+                if !new_info.affects_global_scope {
+                    global_scope_lost = true;
+                    break;
+                }
+            }
+        }
+        if global_scope_lost {
+            let files = self
+                .snapshot
+                .get_all_files_excluding_default_library_file(Node::NIL)
+                .to_vec();
+            for file in files {
+                self.snapshot
+                    .add_file_to_change_set(Path(source_file_info(file).path.clone()));
+            }
+        }
+    }
+
+    // Go: incremental/programtosnapshot.go:204 handlePendingEmit
     fn handle_pending_emit(&mut self) {
         if let Some(old_program) = self.old_program {
             if self.global_file_removed {

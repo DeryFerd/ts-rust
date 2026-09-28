@@ -115,12 +115,12 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
     }
 }
 
-// Go: cmd/tsgo/main.go:17 runMain
+// Go: cmd/tsgo/main.go:18 runMain
 // PORT: the arguments are the port form of the Go `os.Args` bytes (see
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).
 fn run_main(start: Instant) -> i32 {
-    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
+    let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
 
     if let Some(first) = args.first() {
         match first.as_str() {

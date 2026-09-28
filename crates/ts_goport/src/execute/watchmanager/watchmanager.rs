@@ -225,47 +225,6 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:180 WatchManager.createDirWatch
-    pub fn create_dir_watch(&self, dir: &str, recursive: bool) -> Result<(), GoError> {
-        let entry = Arc::new(WatchedDir {
-            closer: Mutex::new(None),
-            recursive,
-        });
-        let request = self.create_dir_watch_request(dir, &entry);
-        let backend = self.backend.as_ref().expect("watchmanager: backend is set");
-        let watch = match backend.watch_directory(
-            &request.dir,
-            request.callback,
-            request.recursive,
-            request.ignore,
-        ) {
-            Ok(watch) => watch,
-            Err(err) => {
-                if let Some(debug_log) = &self.debug_log {
-                    write_str(
-                        debug_log,
-                        &format!(
-                            "[watch] failed to watch directory {}: {}\n",
-                            dir,
-                            err.error()
-                        ),
-                    );
-                }
-                return Err(errors::errorf(
-                    format!("failed to watch directory {}: {}", dir, err.error()),
-                    vec![err],
-                ));
-            }
-        };
-        *entry.closer.lock().unwrap() = Some(watch);
-        self.shared
-            .watched_dirs
-            .lock()
-            .unwrap()
-            .insert(dir.to_string(), entry);
-        Ok(())
-    }
-
     // Go: watchmanager.go:195 WatchManager.createDirWatchRequest
     fn create_dir_watch_request(
         &self,
@@ -406,10 +365,7 @@ impl WatchManager {
         self.create_dir_watches(additions)
     }
 
-    // Go: watchmanager.go:279 WatchManager.createDirWatches
-    /// PORT: on an error Go also closes each non-nil `closers[i]`. Every Go
-    /// backend returns nil closers with an error, and a Rust `Err` carries
-    /// no watches, so there is nothing to close.
+    // Go: watchmanager.go:264 WatchManager.createDirWatches
     fn create_dir_watches(&self, updates: Vec<DirWatchUpdate>) -> Result<(), GoError> {
         if updates.is_empty() {
             return Ok(());
@@ -425,38 +381,38 @@ impl WatchManager {
             entries.push(entry);
         }
         let backend = self.backend.as_ref().expect("watchmanager: backend is set");
-        let closers = match backend.watch_directories(requests) {
-            Ok(closers) => closers,
-            Err(err) => {
-                if let Some(debug_log) = &self.debug_log {
-                    for update in &updates {
-                        write_str(
-                            debug_log,
-                            &format!(
-                                "[watch] failed to watch directory {}: {}\n",
-                                update.dir,
-                                err.error()
-                            ),
-                        );
-                    }
+        let err = match backend.watch_directories(requests) {
+            Ok(closers) => {
+                // PORT: the closers are set before `watched_dirs` is locked,
+                // so no closer lock is taken under that lock.
+                let mut closers = closers.into_iter();
+                for entry in &entries {
+                    let closer = closers.next().expect(
+                        "index out of range: WatchDirectories returns one closer per request",
+                    );
+                    *entry.closer.lock().unwrap() = Some(closer);
                 }
-                return Err(err);
+                let mut watched_dirs = self.shared.watched_dirs.lock().unwrap();
+                for (update, entry) in updates.into_iter().zip(entries) {
+                    watched_dirs.insert(update.dir, entry);
+                }
+                return Ok(());
             }
+            Err(err) => err,
         };
-        // PORT: the closers are set before `watched_dirs` is locked, as in
-        // `create_dir_watch`, so no closer lock is taken under that lock.
-        let mut closers = closers.into_iter();
-        for entry in &entries {
-            let closer = closers
-                .next()
-                .expect("index out of range: WatchDirectories returns one closer per request");
-            *entry.closer.lock().unwrap() = Some(closer);
+        if let Some(debug_log) = &self.debug_log {
+            for update in &updates {
+                write_str(
+                    debug_log,
+                    &format!(
+                        "[watch] failed to watch directory {}: {}\n",
+                        update.dir,
+                        err.error()
+                    ),
+                );
+            }
         }
-        let mut watched_dirs = self.shared.watched_dirs.lock().unwrap();
-        for (update, entry) in updates.into_iter().zip(entries) {
-            watched_dirs.insert(update.dir, entry);
-        }
-        Ok(())
+        Err(err)
     }
 
     // Go: watchmanager.go:322 WatchManager.IsPathUnderWatch
@@ -589,22 +545,57 @@ impl WatchManagerShared {
     }
 }
 
-// Go: watchmanager.go:309 IsDirCoveredByWatch
-pub fn is_dir_covered_by_watch(
-    dirs: &FxHashMap<String, bool>,
-    dir: &str,
-    opts: &tspath::ComparePathsOptions,
-) -> bool {
-    for (wdir, recursive) in dirs {
-        if *recursive {
-            if tspath::contains_path(wdir, dir, opts) {
-                return true;
-            }
-        } else if tspath::compare_paths(dir, wdir, opts) == 0 {
+// Go: watchmanager.go:295 DirWatchSet
+/// DirWatchSet accumulates the set of directories that should be watched while
+/// answering coverage queries efficiently. A directory is "covered" when it is
+/// already present in the set, or when it is contained within a recursive watch
+/// directory already in the set.
+pub struct DirWatchSet {
+    opts: tspath::ComparePathsOptions,
+    dirs: FxHashMap<String, bool>,
+}
+
+// Go: watchmanager.go:300 NewDirWatchSet
+pub fn new_dir_watch_set(opts: tspath::ComparePathsOptions) -> DirWatchSet {
+    DirWatchSet {
+        opts,
+        dirs: FxHashMap::default(),
+    }
+}
+
+impl DirWatchSet {
+    // Go: watchmanager.go:307 DirWatchSet.canonical
+    fn canonical(&self, dir: &str) -> String {
+        tspath::get_canonical_file_name(dir, self.opts.use_case_sensitive_file_names)
+    }
+
+    // Go: watchmanager.go:311 DirWatchSet.Set
+    pub fn set(&mut self, dir: &str, recursive: bool) {
+        let dir = self.canonical(dir);
+        let entry = self.dirs.entry(dir).or_insert(false);
+        *entry = *entry || recursive;
+    }
+
+    // Go: watchmanager.go:316 DirWatchSet.Covered
+    pub fn covered(&self, dir: &str) -> bool {
+        let mut dir = self.canonical(dir);
+        if self.dirs.contains_key(&dir) {
             return true;
         }
+        let root_length = tspath::get_root_length(&dir);
+        while dir.len() > root_length {
+            dir = tspath::get_directory_path(&dir);
+            if self.dirs.get(&dir).copied().unwrap_or(false) {
+                return true;
+            }
+        }
+        false
     }
-    false
+
+    // Go: watchmanager.go:331 DirWatchSet.Dirs
+    pub fn dirs(&self) -> &FxHashMap<String, bool> {
+        &self.dirs
+    }
 }
 
 // PORT: Go `fmt.Fprintf(w, ...)` on the callback thread, where `w` is the

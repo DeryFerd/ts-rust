@@ -22,7 +22,7 @@
 use crate::execute::build::build_task::BuildTask;
 use crate::execute::build::orchestrator::Orchestrator;
 use crate::execute::tsc::compile::{Watcher, write_str};
-use crate::execute::watchmanager::{can_watch_directory, is_dir_covered_by_watch};
+use crate::execute::watchmanager::{DirWatchSet, can_watch_directory, new_dir_watch_set};
 use crate::frontend::prelude::*;
 use crate::fswatch;
 use crate::gostd::Context;
@@ -258,11 +258,11 @@ impl Orchestrator {
         false
     }
 
-    // Go: build/orchestrator.go:419 (*Orchestrator).computeDesiredWatches
+    // Go: build/orchestrator.go:477 (*Orchestrator).computeDesiredWatches
     // PORT: Go ranges over `WildcardDirectories()` (a map, random order);
     // the result does not depend on the order.
     pub fn compute_desired_watches(&self) -> FxHashMap<String, bool> {
-        let mut desired_dirs: FxHashMap<String, bool> = FxHashMap::default();
+        let mut desired_dirs = new_dir_watch_set(self.compare_paths_options.clone());
         let fs = CompilerHost::fs(&*self.host);
 
         for config in &self.order {
@@ -273,9 +273,7 @@ impl Orchestrator {
             // Watch config file directory
             let config_dir = get_directory_path(&task.config);
             let real_config_dir = fs.realpath(&config_dir);
-            if !desired_dirs.contains_key(&real_config_dir) {
-                desired_dirs.insert(real_config_dir, false);
-            }
+            desired_dirs.set(&real_config_dir, false);
 
             let Some(resolved) = &task.resolved else {
                 continue;
@@ -285,19 +283,13 @@ impl Orchestrator {
             for cfg_path in resolved.extended_source_files() {
                 let real_path = fs.realpath(cfg_path);
                 let dir = get_directory_path(&real_path);
-                if !desired_dirs.contains_key(&dir) {
-                    desired_dirs.insert(dir, false);
-                }
+                desired_dirs.set(&dir, false);
             }
 
             // Wildcard directories from tsconfig
             for (dir, recursive) in resolved.wildcard_directories() {
                 let real_dir = fs.realpath(dir);
-                if let Some(existing) = desired_dirs.get(&real_dir).copied() {
-                    desired_dirs.insert(real_dir, existing || *recursive);
-                } else {
-                    desired_dirs.insert(real_dir, *recursive);
-                }
+                desired_dirs.set(&real_dir, *recursive);
             }
 
             // Input file directories not already covered
@@ -305,10 +297,8 @@ impl Orchestrator {
                 let abs_path =
                     get_normalized_absolute_path(file_name, &self.opts.sys.get_current_directory());
                 let dir = get_directory_path(&abs_path);
-                if !is_dir_covered_by_watch(&desired_dirs, &dir, &self.compare_paths_options)
-                    && can_watch_directory(&dir)
-                {
-                    desired_dirs.insert(dir, false);
+                if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                    desired_dirs.set(&dir, false);
                 }
             }
 
@@ -332,13 +322,8 @@ impl Orchestrator {
                             continue;
                         }
                         let dir = get_directory_path(&abs_path);
-                        if !is_dir_covered_by_watch(
-                            &desired_dirs,
-                            &dir,
-                            &self.compare_paths_options,
-                        ) && can_watch_directory(&dir)
-                        {
-                            desired_dirs.insert(dir, false);
+                        if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                            desired_dirs.set(&dir, false);
                         }
                     }
                     for package_json in build_info.get_package_jsons(&build_info_dir) {
@@ -354,24 +339,18 @@ impl Orchestrator {
             }
         }
 
-        self.wm.borrow().resolve_desired_dirs(&desired_dirs)
+        self.wm.borrow().resolve_desired_dirs(desired_dirs.dirs())
     }
 
-    // Go: build/orchestrator.go:503 (*Orchestrator).addWatchDir
-    fn add_watch_dir(&self, desired_dirs: &mut FxHashMap<String, bool>, dir: &str) {
-        if !is_dir_covered_by_watch(desired_dirs, dir, &self.compare_paths_options)
-            && can_watch_directory(dir)
-        {
-            desired_dirs.insert(dir.to_string(), false);
+    // Go: build/orchestrator.go:572 (*Orchestrator).addWatchDir
+    fn add_watch_dir(&self, desired_dirs: &mut DirWatchSet, dir: &str) {
+        if !desired_dirs.covered(dir) && can_watch_directory(dir) {
+            desired_dirs.set(dir, false);
         }
     }
 
-    // Go: build/orchestrator.go:509 (*Orchestrator).addPackageJsonWatchDirs
-    fn add_package_json_watch_dirs(
-        &self,
-        desired_dirs: &mut FxHashMap<String, bool>,
-        package_json: &str,
-    ) {
+    // Go: build/orchestrator.go:578 (*Orchestrator).addPackageJsonWatchDirs
+    fn add_package_json_watch_dirs(&self, desired_dirs: &mut DirWatchSet, package_json: &str) {
         let dir = get_directory_path(package_json);
         let mut dirs = vec![dir.clone()];
         let mut found_node_modules = false;
@@ -493,6 +472,10 @@ impl Orchestrator {
 impl Watcher for Orchestrator {
     fn do_cycle(&mut self) {
         Orchestrator::do_cycle(self);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

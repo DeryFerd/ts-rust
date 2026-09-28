@@ -24,12 +24,14 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ts_goport::fswatch::fanotify_linux::{
-    fanotify_available, make_fanotify_handle_key, new_fanotify_backend,
+    fanotify_available, make_fanotify_handle_key, maybe_wrap_unsupported_filesystem,
+    new_fanotify_backend,
 };
 use ts_goport::fswatch::{
-    self, DirWatch, DirWatchError, ERR_UNAVAILABLE, ERR_WATCH_TERMINATED, Event, EventKind,
-    EventList, MAX_WAIT_TIME, Watch, WatchCallback, WatchOption, Watcher, WatcherBase, WatcherImpl,
-    WatcherStruct, file_callback, new_debounce, new_dir_watch, new_watcher, with_recursive,
+    self, DirWatch, DirWatchError, ERR_FILESYSTEM_UNSUPPORTED, ERR_UNAVAILABLE,
+    ERR_WATCH_TERMINATED, Event, EventKind, EventList, MAX_WAIT_TIME, Watch, WatchCallback,
+    WatchOption, Watcher, WatcherBase, WatcherImpl, WatcherStruct, file_callback, new_debounce,
+    new_dir_watch, new_watcher, with_recursive,
 };
 use ts_goport::gostd::{GoError, errors};
 
@@ -2248,4 +2250,97 @@ fn test_fanotify_cross_watcher_same_fs() {
     if let Err(err) = result {
         panic!("{err}");
     }
+}
+
+// Go: fanotify_linux_test.go:124 TestLinuxFanotifyMaybeWrapUnsupportedFilesystem
+#[test]
+fn test_linux_fanotify_maybe_wrap_unsupported_filesystem() {
+    use ts_goport::fswatch::unix;
+
+    // Errnos that indicate the filesystem cannot support fanotify FID-based
+    // watching are tagged with ErrFilesystemUnsupported so higher layers can
+    // fall back to inotify (issue #63646).
+    for errno in [unix::EOPNOTSUPP, unix::ENODEV] {
+        let errno_err = errors::from_value(errno);
+        let wrapped = maybe_wrap_unsupported_filesystem(errors::errorf(
+            format!("name_to_handle_at: {}", errno_err.error()),
+            vec![errno_err.clone()],
+        ));
+        assert!(
+            errors::is(&wrapped, &ERR_FILESYSTEM_UNSUPPORTED),
+            "expected {} to be tagged ErrFilesystemUnsupported",
+            errno_err.error()
+        );
+        assert!(
+            errors::is(&wrapped, &errno_err),
+            "expected wrapped error to still unwrap to {}",
+            errno_err.error()
+        );
+    }
+
+    // Unrelated errnos are returned unchanged.
+    let other = maybe_wrap_unsupported_filesystem(errors::from_value(unix::EACCES));
+    assert!(
+        !errors::is(&other, &ERR_FILESYSTEM_UNSUPPORTED),
+        "EACCES should not be tagged ErrFilesystemUnsupported"
+    );
+}
+
+// Go: fanotify_linux_test.go:147 TestLinuxFanotifyMarkENODEVTagged
+#[test]
+fn test_linux_fanotify_mark_enodev_tagged() {
+    use ts_goport::fswatch::unix;
+
+    // On NTFS mounted via fuseblk, fanotify_mark itself fails with ENODEV
+    // ("no such device") — the bare errno, with no name_to_handle_at wrapping
+    // (issue #63678). markDir passes that straight to
+    // maybeWrapUnsupportedFilesystem, so it must be tagged and drive the inotify
+    // fallback just like the EOPNOTSUPP case.
+    let err = maybe_wrap_unsupported_filesystem(errors::from_value(unix::ENODEV));
+    assert!(
+        errors::is(&err, &ERR_FILESYSTEM_UNSUPPORTED),
+        "bare ENODEV from fanotify_mark should be tagged ErrFilesystemUnsupported"
+    );
+    assert!(
+        errors::is(&err, &errors::from_value(unix::ENODEV)),
+        "tagged error should still unwrap to ENODEV"
+    );
+}
+
+// Go: fanotify_linux_test.go:164 TestLinuxFanotifyUnsupportedTagSurvivesDirWatchError
+/// PORT: Go's `dirWatchError` literal has a nil `dirWatch`; the Rust field
+/// is not optional, so the error gets a direct watcher that is never used.
+#[test]
+fn test_linux_fanotify_unsupported_tag_survives_dir_watch_error() {
+    use ts_goport::fswatch::unix;
+
+    // Closes the loop between maybeWrapUnsupportedFilesystem and the higher
+    // layers: the tag must survive the exact wrapping that markDir + subscribe
+    // apply (fmt.Errorf with %w, then dirWatchError) so that errors.Is still
+    // finds ErrFilesystemUnsupported at the WatchDirectories boundary. Catches a
+    // regression such as a %w->%v change or a dropped dirWatchError.Unwrap.
+    let eopnotsupp = errors::from_value(unix::EOPNOTSUPP);
+    let inner = maybe_wrap_unsupported_filesystem(errors::errorf(
+        format!("name_to_handle_at: {}", eopnotsupp.error()),
+        vec![eopnotsupp.clone()],
+    ));
+    let t = T::new(1);
+    let sub_err = DirWatchError {
+        err: errors::errorf(
+            format!("fanotify_mark on '{}' failed: {}", "/x", inner.error()),
+            vec![inner],
+        ),
+        dir_watch: new_direct_watcher(&t, "/x"),
+    }
+    .to_go_error();
+
+    assert!(
+        errors::is(&sub_err, &ERR_FILESYSTEM_UNSUPPORTED),
+        "ErrFilesystemUnsupported did not survive dirWatchError wrapping"
+    );
+    assert!(
+        errors::is(&sub_err, &eopnotsupp),
+        "underlying errno did not survive dirWatchError wrapping"
+    );
+    t.finish();
 }
