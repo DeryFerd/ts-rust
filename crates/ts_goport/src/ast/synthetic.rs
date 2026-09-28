@@ -32,13 +32,34 @@
 //! `program::release_program`). A one-program process leaks it at the end
 //! instead (`forget_synthetic_nodes`), like the checker itself.
 //!
+//! Owners: the language server makes the nodes of every program version on
+//! its dispatch thread. There each program version owns the entries made
+//! while it is current (`open_synthetic_owner`), and its release frees them
+//! (`free_synthetic_owner`, called by `ls_program`). Other entries belong to
+//! the thread (the base owner). The tables are in chunks, and each chunk
+//! has one owner, so a handle stays an index and keeps Go pointer identity
+//! while its owner lives. A freed chunk leaves a hole that is never used
+//! again: a read of a freed entry panics, and a handle never names another
+//! node. The rules:
+//! - a new node, a factory list and a list copy go to the current program
+//!   version when it is an owner on this thread and no base scope
+//!   (`enter_base_synthetic_owner`) is open, else to the base owner;
+//! - a data write (`replace_node_data`, `set_node_kind`) goes to the owner
+//!   of the node, so a base node never points into a program version;
+//! - alias slots and node slices always go to the base owner.
+//!
+//! Code whose nodes a cache keeps across program versions (the token cache,
+//! lazy JSDoc, parses) opens a base scope.
+//! PORT: the Go GC frees request garbage at once and checker nodes with
+//! their checker. Here they stay until their program version is released.
+//!
 //! PORT: parsed nodes are immutable. The setters panic on a parsed node,
 //! except on a node of a ported-parser file that the parser has not finished
 //! (`ast/store.rs`). Go code that writes a field of a parsed node needs its
 //! own port decision.
 
 use crate::prelude::*;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use ts_ast::NodeData;
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
@@ -131,12 +152,16 @@ impl OwnList {
     }
 }
 
-/// Bytes per chunk of `SyntheticArena::datas` and `SyntheticArena::lists`.
+/// Bytes per chunk of `SyntheticArena::slots`, `datas` and `lists`.
 // PERF: 14 KiB is jemalloc's largest small size class, and small classes
 // pack densely in slabs. A larger chunk is a large allocation, which starts
 // at a random cache line offset and so touches one page more (10% for a
 // 40 KiB chunk).
 const CHUNK_BYTES: usize = 14 * 1024;
+
+/// Slots per chunk of `SyntheticArena::slots`.
+const SLOT_CHUNK: usize = CHUNK_BYTES / size_of::<Slot>();
+const _: () = assert!(SLOT_CHUNK >= 128);
 
 /// Cells per chunk of `SyntheticArena::datas`. The `Rc` header is 16 bytes.
 const DATA_CHUNK: usize = (CHUNK_BYTES - 16) / size_of::<OnceCell<ts_ast::Node>>();
@@ -144,97 +169,241 @@ const DATA_CHUNK: usize = (CHUNK_BYTES - 16) / size_of::<OnceCell<ts_ast::Node>>
 /// Lists per chunk of `SyntheticArena::lists`.
 const LIST_CHUNK: usize = CHUNK_BYTES / size_of::<OwnList>();
 
-/// A chunk of `SyntheticArena::datas`: `DATA_CHUNK` cells that fill in
-/// order.
+/// A chunk of `SyntheticArena::datas`: cells that fill in order.
 type DataChunk = Rc<[OnceCell<ts_ast::Node>]>;
 
-/// The synthetic nodes of one thread.
+/// The panic of a read of an entry whose owner was freed.
+const FREED: &str = "synthetic node of a released program version is read";
+
+/// The owner of an arena chunk (see "Owners" in the module comment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerKey {
+    /// The thread. Its chunks go only with the whole arena.
+    Base,
+    /// A language server program version (`GoProgram::id`).
+    Program(u32),
+}
+
+/// The chunk numbers of one owner, oldest first. New entries of the owner
+/// fill the last chunk of each table until it is full.
+#[derive(Default)]
+struct OwnerChunks {
+    slots: Vec<u32>,
+    datas: Vec<u32>,
+    /// The number of filled cells in the last chunk of `datas`.
+    data_fill: u32,
+    lists: Vec<u32>,
+}
+
+/// The synthetic nodes of one thread. Each table is a list of chunks, and
+/// each chunk has one owner. Entry `i` of a table with `N` entries per
+/// chunk is entry `i % N` of chunk `i / N`. A freed chunk is `None`. Chunk
+/// numbers only grow, so an index never names a second entry.
 struct SyntheticArena {
-    slots: Vec<Slot>,
+    /// Node slots, in chunks of `SLOT_CHUNK`.
+    slots: Vec<Option<Vec<Slot>>>,
+    /// The owner of each chunk of `slots`.
+    slot_owner: Vec<OwnerKey>,
     /// Alias slot of each parsed node, so one parsed node gets one slot.
     aliases: FxHashMap<Node, u32>,
     /// The ts_ast nodes of the node slots (see `SyntheticNode::data`), in
-    /// chunks. A read holds the chunk of its node (an `Rc`), so it can hold
-    /// the node while the arena is not borrowed. A new node fills the next
+    /// chunks of `DATA_CHUNK`. A read holds the chunk of its node (an `Rc`),
+    /// so it can hold the node while the arena is not borrowed, even when
+    /// the owner of the chunk is freed meanwhile. A new node fills the next
     /// cell (`OnceCell::set` needs no `&mut`), so it can be added while such
-    /// a read runs. Entry `i` is cell `i % DATA_CHUNK` of chunk
-    /// `i / DATA_CHUNK`.
+    /// a read runs.
     // PERF: one allocation per chunk. An `Rc` per node made each 40-byte
     // node a 64-byte allocation plus an 8-byte pointer (goport_typesyms on
     // effect: +16% peak memory).
-    datas: Vec<DataChunk>,
-    /// The number of filled cells in `datas`.
-    data_len: u32,
+    datas: Vec<Option<DataChunk>>,
     /// Factory lists (`SyntheticList::Own`), in chunks of `LIST_CHUNK`. A
     /// chunk never grows past its capacity, so a list keeps its address
-    /// (`synthetic_list_ptr`). Entry `i` is
-    /// `lists[i / LIST_CHUNK][i % LIST_CHUNK]`.
-    lists: Vec<Vec<OwnList>>,
+    /// (`synthetic_list_ptr`).
+    lists: Vec<Option<Vec<OwnList>>>,
     /// Node slices that node reads made (`SyntheticList::Slice`), where Go
-    /// allocates a new slice on each call.
+    /// allocates a new slice on each call. They belong to the thread.
     slices: Vec<Box<[Node]>>,
+    /// The chunks of the thread (the base owner).
+    base: OwnerChunks,
+    /// The chunks of each program version that is an owner on this thread,
+    /// by `GoProgram::id`.
+    owners: FxHashMap<u32, OwnerChunks>,
+    /// The last program that `current_owner` looked up, and its owner.
+    last: Option<(&'static GoProgram, OwnerKey)>,
+    /// The number of slots made on this thread, freed or not.
+    slots_made: usize,
 }
 
 impl SyntheticArena {
     fn new() -> Self {
-        Self {
-            slots: vec![Slot::Nil],
+        let mut arena = Self {
+            slots: Vec::new(),
+            slot_owner: Vec::new(),
             aliases: FxHashMap::default(),
             datas: Vec::new(),
-            data_len: 0,
             lists: Vec::new(),
             slices: Vec::new(),
+            base: OwnerChunks::default(),
+            owners: FxHashMap::default(),
+            last: None,
+            slots_made: 0,
+        };
+        let nil = arena.push_slot(OwnerKey::Base, Slot::Nil);
+        debug_assert_eq!(nil, NIL_SLOT);
+        arena
+    }
+
+    /// The owner of a new node, factory list or list copy: the current
+    /// program version when it is an owner on this thread and no base scope
+    /// is open, else the thread.
+    #[inline]
+    fn current_owner(&mut self) -> OwnerKey {
+        if self.owners.is_empty() || BASE_SCOPES.with(Cell::get) > 0 {
+            return OwnerKey::Base;
+        }
+        let Some(program) = crate::core::try_prog() else {
+            return OwnerKey::Base;
+        };
+        if let Some((last, owner)) = self.last
+            && std::ptr::eq(last, program)
+        {
+            return owner;
+        }
+        let owner = if self.owners.contains_key(&program.id) {
+            OwnerKey::Program(program.id)
+        } else {
+            OwnerKey::Base
+        };
+        self.last = Some((program, owner));
+        owner
+    }
+
+    /// The chunks of `owner`, which must be open.
+    fn chunks(&self, owner: OwnerKey) -> &OwnerChunks {
+        match owner {
+            OwnerKey::Base => &self.base,
+            OwnerKey::Program(id) => self.owners.get(&id).expect("synthetic owner is not open"),
         }
     }
 
-    /// The ts_ast node of data entry `index`.
+    /// `chunks` to write.
+    fn chunks_mut(&mut self, owner: OwnerKey) -> &mut OwnerChunks {
+        match owner {
+            OwnerKey::Base => &mut self.base,
+            OwnerKey::Program(id) => self
+                .owners
+                .get_mut(&id)
+                .expect("synthetic owner is not open"),
+        }
+    }
+
+    /// Slot `index`. Panics when its owner was freed.
+    #[inline]
+    fn slot(&self, index: usize) -> &Slot {
+        &self.slots[index / SLOT_CHUNK].as_ref().expect(FREED)[index % SLOT_CHUNK]
+    }
+
+    /// `slot` to write.
+    fn slot_mut(&mut self, index: usize) -> &mut Slot {
+        &mut self.slots[index / SLOT_CHUNK].as_mut().expect(FREED)[index % SLOT_CHUNK]
+    }
+
+    /// Adds a slot of `owner` and returns its index.
+    fn push_slot(&mut self, owner: OwnerKey, slot: Slot) -> u32 {
+        let open = self
+            .chunks(owner)
+            .slots
+            .last()
+            .copied()
+            .filter(|&c| self.slots[c as usize].as_ref().expect(FREED).len() < SLOT_CHUNK);
+        let c = match open {
+            Some(c) => c,
+            None => {
+                let c = new_chunk_number(self.slots.len(), SLOT_CHUNK);
+                self.slots.push(Some(Vec::with_capacity(SLOT_CHUNK)));
+                self.slot_owner.push(owner);
+                self.chunks_mut(owner).slots.push(c);
+                c
+            }
+        };
+        let chunk = self.slots[c as usize].as_mut().expect(FREED);
+        chunk.push(slot);
+        let index = c as usize * SLOT_CHUNK + chunk.len() - 1;
+        self.slots_made += 1;
+        index as u32
+    }
+
+    /// The ts_ast node of data entry `index`. Panics when its owner was
+    /// freed.
     #[inline]
     fn data(&self, index: u32) -> &ts_ast::Node {
         let i = index as usize;
-        self.datas[i / DATA_CHUNK][i % DATA_CHUNK]
+        self.datas[i / DATA_CHUNK].as_ref().expect(FREED)[i % DATA_CHUNK]
             .get()
             .expect("synthetic node data entry is not filled")
     }
 
-    /// Adds a data entry and returns its index.
-    fn push_data(&mut self, node: ts_ast::Node) -> u32 {
-        let i = self.data_len as usize;
-        if i % DATA_CHUNK == 0 {
-            self.datas
-                .push((0..DATA_CHUNK).map(|_| OnceCell::new()).collect());
-        }
+    /// Adds a data entry of `owner` and returns its index.
+    fn push_data(&mut self, owner: OwnerKey, node: ts_ast::Node) -> u32 {
+        let chunks = self.chunks(owner);
+        let fill = chunks.data_fill;
+        let open = chunks
+            .datas
+            .last()
+            .copied()
+            .filter(|_| (fill as usize) < DATA_CHUNK);
+        let (c, cell) = match open {
+            Some(c) => (c, fill),
+            None => {
+                let c = new_chunk_number(self.datas.len(), DATA_CHUNK);
+                self.datas
+                    .push(Some((0..DATA_CHUNK).map(|_| OnceCell::new()).collect()));
+                self.chunks_mut(owner).datas.push(c);
+                (c, 0)
+            }
+        };
+        self.chunks_mut(owner).data_fill = cell + 1;
         assert!(
-            self.datas[i / DATA_CHUNK][i % DATA_CHUNK].set(node).is_ok(),
+            self.datas[c as usize].as_ref().expect(FREED)[cell as usize]
+                .set(node)
+                .is_ok(),
             "synthetic node data entry is filled twice"
         );
-        self.data_len += 1;
-        i as u32
+        (c as usize * DATA_CHUNK + cell as usize) as u32
     }
 
-    /// The factory list of entry `index`.
+    /// The factory list of entry `index`. Panics when its owner was freed.
     #[inline]
     fn own_list(&self, index: u32) -> &OwnList {
         let i = index as usize;
-        &self.lists[i / LIST_CHUNK][i % LIST_CHUNK]
+        &self.lists[i / LIST_CHUNK].as_ref().expect(FREED)[i % LIST_CHUNK]
     }
 
-    /// Adds a factory list and returns its index.
-    fn push_list(&mut self, list: OwnList) -> u32 {
-        if self
+    /// Adds a factory list of `owner` and returns its index.
+    fn push_list(&mut self, owner: OwnerKey, list: OwnList) -> u32 {
+        let open = self
+            .chunks(owner)
             .lists
             .last()
-            .is_none_or(|chunk| chunk.len() == LIST_CHUNK)
-        {
-            self.lists.push(Vec::with_capacity(LIST_CHUNK));
-        }
-        let chunk = self.lists.len() - 1;
-        self.lists[chunk].push(list);
-        (chunk * LIST_CHUNK + self.lists[chunk].len() - 1) as u32
+            .copied()
+            .filter(|&c| self.lists[c as usize].as_ref().expect(FREED).len() < LIST_CHUNK);
+        let c = match open {
+            Some(c) => c,
+            None => {
+                let c = new_chunk_number(self.lists.len(), LIST_CHUNK);
+                self.lists.push(Some(Vec::with_capacity(LIST_CHUNK)));
+                self.chunks_mut(owner).lists.push(c);
+                c
+            }
+        };
+        let chunk = self.lists[c as usize].as_mut().expect(FREED);
+        chunk.push(list);
+        (c as usize * LIST_CHUNK + chunk.len() - 1) as u32
     }
 
     /// The node slot of synthetic handle `n`.
     fn node(&self, n: Node) -> &SyntheticNode {
-        match &self.slots[slot_index(n)] {
+        match self.slot(slot_index(n)) {
             Slot::Node(s) => s,
             _ => panic!("synthetic handle does not name a node slot"),
         }
@@ -242,7 +411,7 @@ impl SyntheticArena {
 
     /// The Go node that synthetic-space id `index` stands for.
     fn resolve(&self, index: usize) -> Node {
-        match &self.slots[index] {
+        match self.slot(index) {
             Slot::Nil => Node::NIL,
             Slot::Alias(target) => *target,
             Slot::Node(_) => handle(index as u32),
@@ -261,6 +430,17 @@ impl SyntheticArena {
     }
 }
 
+/// The number of a new chunk in a table of `len` chunks with `per_chunk`
+/// entries each. Entry ids are `u32` and are not used again, so a thread
+/// that makes about 4 billion entries of one kind runs out of them.
+fn new_chunk_number(len: usize, per_chunk: usize) -> u32 {
+    assert!(
+        (len + 1) * per_chunk < u32::MAX as usize,
+        "synthetic entry ids exhausted"
+    );
+    len as u32
+}
+
 static EMPTY_BIND: NodeBindData = NodeBindData {
     symbol: SymbolId::NIL,
     local_symbol: SymbolId::NIL,
@@ -274,20 +454,107 @@ static EMPTY_BIND: NodeBindData = NodeBindData {
 
 thread_local! {
     static ARENA: RefCell<SyntheticArena> = RefCell::new(SyntheticArena::new());
+    /// The number of open base scopes on this thread
+    /// (`enter_base_synthetic_owner`).
+    static BASE_SCOPES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// False when `GOPORT_SYNTHETIC_OWNERS=0`: then no program version becomes
+/// an owner, and every entry belongs to its thread, as before owners (for
+/// A/B runs, and as a fallback).
+fn owners_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("GOPORT_SYNTHETIC_OWNERS").as_deref(), Ok("0")))
+}
+
+/// Makes program version `id` an owner on this thread: the synthetic
+/// entries made while it is current go to its own chunks, until
+/// `free_synthetic_owner(id)` frees them. `ls_program` calls it for each
+/// language server program version. Other threads and programs have no
+/// owners, so all their entries belong to their thread.
+pub fn open_synthetic_owner(id: u32) {
+    if !owners_enabled() {
+        return;
+    }
+    ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        assert!(
+            a.owners.insert(id, OwnerChunks::default()).is_none(),
+            "synthetic owner {id} is opened twice"
+        );
+        a.last = None;
+    });
+}
+
+/// Frees the synthetic entries of program version `id` on this thread.
+/// Their handles must not be read again: a read panics. It does nothing
+/// when `id` is not an owner. A read that holds a node (`with_ast_node`)
+/// keeps the data chunk of that node until the read ends.
+// Not in Go: the GC frees the nodes that nothing reaches.
+pub fn free_synthetic_owner(id: u32) {
+    let freed = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let chunks = a.owners.remove(&id)?;
+        a.last = None;
+        let slots: Vec<_> = chunks
+            .slots
+            .iter()
+            .map(|&c| a.slots[c as usize].take())
+            .collect();
+        let datas: Vec<_> = chunks
+            .datas
+            .iter()
+            .map(|&c| a.datas[c as usize].take())
+            .collect();
+        let lists: Vec<_> = chunks
+            .lists
+            .iter()
+            .map(|&c| a.lists[c as usize].take())
+            .collect();
+        Some((slots, datas, lists))
+    });
+    drop(freed);
+}
+
+/// New synthetic entries of this thread belong to the thread (the base
+/// owner) while the scope lives, whatever program is current. Open it
+/// around code whose nodes a cache keeps across program versions: the token
+/// cache, lazy JSDoc and parses.
+#[must_use = "new entries go to the thread only while the scope lives"]
+pub fn enter_base_synthetic_owner() -> BaseOwnerScope {
+    BASE_SCOPES.with(|scopes| scopes.set(scopes.get() + 1));
+    BaseOwnerScope {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// From `enter_base_synthetic_owner`. It is `!Send`, so it drops on the
+/// thread that made it.
+pub struct BaseOwnerScope {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for BaseOwnerScope {
+    fn drop(&mut self) {
+        BASE_SCOPES.with(|scopes| scopes.set(scopes.get() - 1));
+    }
 }
 
 /// A copy of the synthetic nodes of one thread (see `synthetic_seed`). It
 /// owns deep copies of the node data, so it can move to another thread.
 pub struct SyntheticSeed {
-    slots: Vec<Slot>,
+    slots: Vec<Option<Vec<Slot>>>,
     aliases: FxHashMap<Node, u32>,
-    datas: Vec<ts_ast::Node>,
-    lists: Vec<OwnList>,
+    /// The filled cells of each chunk of `SyntheticArena::datas`.
+    datas: Vec<Option<Vec<ts_ast::Node>>>,
+    lists: Vec<Option<Vec<OwnList>>>,
     slices: Vec<Box<[Node]>>,
+    slots_made: usize,
 }
 
-/// A copy of the synthetic nodes made on this thread so far. A checker
-/// worker starts from the nodes of the loading thread
+/// A copy of the synthetic nodes made on this thread so far whose owner is
+/// not freed. Each entry keeps its index (a freed chunk stays a hole). A
+/// checker worker starts from the nodes of the loading thread
 /// (`install_synthetic_seed`), so the nodes that the parser and the binder
 /// made keep their handles on every thread.
 // PORT: Go factory nodes are shared pointers. Each checker thread owns a
@@ -300,34 +567,59 @@ pub fn synthetic_seed() -> SyntheticSeed {
         SyntheticSeed {
             slots: a.slots.clone(),
             aliases: a.aliases.clone(),
-            datas: (0..a.data_len).map(|i| a.data(i).clone()).collect(),
-            lists: a.lists.iter().flatten().cloned().collect(),
+            datas: a
+                .datas
+                .iter()
+                .map(|chunk| {
+                    chunk.as_ref().map(|chunk| {
+                        chunk
+                            .iter()
+                            .map_while(|cell| cell.get().cloned())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect(),
+            lists: a.lists.clone(),
             slices: a.slices.clone(),
+            slots_made: a.slots_made,
         }
     })
 }
 
-/// The number of synthetic slots on this thread. Work that must not make
-/// synthetic nodes compares it before and after.
+/// The number of synthetic slots made on this thread, freed or not. Work
+/// that must not make synthetic nodes compares it before and after.
 #[must_use]
 pub fn synthetic_slot_count() -> usize {
-    ARENA.with(|a| a.borrow().slots.len())
+    ARENA.with(|a| a.borrow().slots_made)
 }
 
-/// Makes `seed` the synthetic nodes of this thread.
+/// The number of synthetic slots on this thread whose owner is not freed.
+#[must_use]
+pub fn synthetic_live_slot_count() -> usize {
+    ARENA.with(|a| a.borrow().slots.iter().flatten().map(Vec::len).sum())
+}
+
+/// Makes `seed` the synthetic nodes of this thread. Every chunk of the seed
+/// belongs to the thread, and new entries start new chunks.
 pub fn install_synthetic_seed(seed: SyntheticSeed) {
-    let mut arena = SyntheticArena {
+    let arena = SyntheticArena {
+        slot_owner: vec![OwnerKey::Base; seed.slots.len()],
         slots: seed.slots,
         aliases: seed.aliases,
+        datas: seed
+            .datas
+            .into_iter()
+            .map(|chunk| {
+                chunk.map(|nodes| nodes.into_iter().map(OnceCell::from).collect::<DataChunk>())
+            })
+            .collect(),
+        lists: seed.lists,
         slices: seed.slices,
-        ..SyntheticArena::new()
+        base: OwnerChunks::default(),
+        owners: FxHashMap::default(),
+        last: None,
+        slots_made: seed.slots_made,
     };
-    for node in seed.datas {
-        arena.push_data(node);
-    }
-    for list in seed.lists {
-        arena.push_list(list);
-    }
     ARENA.with(|a| *a.borrow_mut() = arena);
 }
 
@@ -387,7 +679,7 @@ fn with_node_mut<R>(n: Node, f: impl FnOnce(&mut SyntheticNode) -> R) -> R {
         "cannot mutate a parsed node (kind {:?})",
         n.kind()
     );
-    ARENA.with(|a| match &mut a.borrow_mut().slots[slot_index(n)] {
+    ARENA.with(|a| match a.borrow_mut().slot_mut(slot_index(n)) {
         Slot::Node(s) => f(s),
         _ => panic!("synthetic handle does not name a node slot"),
     })
@@ -424,7 +716,7 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
         let a = a.borrow();
         let i = a.node(n).data as usize;
         HeldNode {
-            chunk: a.datas[i / DATA_CHUNK].clone(),
+            chunk: Rc::clone(a.datas[i / DATA_CHUNK].as_ref().expect(FREED)),
             cell: i % DATA_CHUNK,
         }
     })
@@ -778,15 +1070,16 @@ pub fn synthetic_list_eq(x: SyntheticList, y: SyntheticList) -> bool {
 }
 
 /// The address of the node list that `list` names, for Go pointer keys
-/// (`NodeList::list_ptr`). It stays the same while the thread's arena lives:
-/// node data and factory lists are in chunks that do not move.
+/// (`NodeList::list_ptr`). It stays the same while the owner of the list
+/// lives: node data and factory lists are in chunks that do not move.
 #[must_use]
 pub fn synthetic_list_ptr(list: SyntheticList) -> *const () {
     ARENA.with(|a| a.borrow().list(list).ptr())
 }
 
 /// A new node slice of this thread (Go allocates one on each call, for
-/// example in `Node.Decorators()`).
+/// example in `Node.Decorators()`). It belongs to the thread: `node.rs`
+/// keeps one per node.
 #[must_use]
 pub fn new_synthetic_slice(nodes: Vec<Node>) -> SyntheticList {
     ARENA.with(|a| {
@@ -820,8 +1113,12 @@ pub fn synthetic_missing_list(list: SyntheticList) -> SyntheticList {
 }
 
 fn push_own_list(list: OwnList) -> SyntheticList {
-    ARENA.with(|a| SyntheticList::Own {
-        index: a.borrow_mut().push_list(list),
+    ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let owner = a.current_owner();
+        SyntheticList::Own {
+            index: a.push_list(owner, list),
+        }
     })
 }
 
@@ -856,8 +1153,8 @@ pub fn set_node_flags(n: Node, flags: NodeFlags) {
 
 /// Gives synthetic node `n` a new ts_ast node that `f` makes from the
 /// current one. The old one stays in the arena for the list handles taken
-/// before (see `SyntheticNode::data`). `f` must not make or change synthetic
-/// nodes.
+/// before (see `SyntheticNode::data`). The new one belongs to the owner of
+/// `n`. `f` must not make or change synthetic nodes.
 fn replace_synthetic_ast_node(n: Node, f: impl FnOnce(&ts_ast::Node) -> ts_ast::Node) {
     assert!(
         is_synthetic_node(n),
@@ -866,9 +1163,11 @@ fn replace_synthetic_ast_node(n: Node, f: impl FnOnce(&ts_ast::Node) -> ts_ast::
     );
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
+        let index = slot_index(n);
         let node = f(a.data(a.node(n).data));
-        let data = a.push_data(node);
-        let Slot::Node(s) = &mut a.slots[slot_index(n)] else {
+        let owner = a.slot_owner[index / SLOT_CHUNK];
+        let data = a.push_data(owner, node);
+        let Slot::Node(s) = a.slot_mut(index) else {
             panic!("synthetic handle does not name a node slot");
         };
         s.data = data;
@@ -1001,7 +1300,8 @@ pub fn set_node_locals(n: Node, locals: SymbolTable) {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Go `newNode(kind, data, hooks)`: a new factory node with
-/// `Loc = UndefinedTextRange()`, nil parent, no flags and no binder data.
+/// `Loc = UndefinedTextRange()`, nil parent, no flags and no binder data. It
+/// belongs to the current owner (see "Owners" in the module comment).
 pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
     debug_assert!(
         data.matches_syntax_kind(kind),
@@ -1010,18 +1310,20 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
     let node = new_ts_node(kind, data);
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        let data = a.push_data(node);
-        let index = a.slots.len() as u32;
-        a.slots.push(Slot::Node(SyntheticNode {
-            data,
-            parent: Node::NIL,
-            flags: NodeFlags::NONE,
-            loc: TextRange::undefined(),
-            bind: None,
-            synthetic_type: TypeId::NIL,
-            source_file: None,
-        }));
-        handle(index)
+        let owner = a.current_owner();
+        let data = a.push_data(owner, node);
+        handle(a.push_slot(
+            owner,
+            Slot::Node(SyntheticNode {
+                data,
+                parent: Node::NIL,
+                flags: NodeFlags::NONE,
+                loc: TextRange::undefined(),
+                bind: None,
+                synthetic_type: TypeId::NIL,
+                source_file: None,
+            }),
+        ))
     })
 }
 
@@ -1139,7 +1441,8 @@ pub fn source_file_copy_from(node: Node, other: Node) {
 }
 
 /// The synthetic-space id that stands for `n` inside synthetic `NodeData`.
-/// Nil maps to the nil slot. A parsed node gets (or reuses) an alias slot.
+/// Nil maps to the nil slot. A parsed node gets (or reuses) an alias slot,
+/// which belongs to the thread.
 #[must_use]
 pub fn synthetic_child_id(n: Node) -> ts_ast::NodeId {
     if n.is_nil() {
@@ -1153,8 +1456,7 @@ pub fn synthetic_child_id(n: Node) -> ts_ast::NodeId {
         if let Some(&index) = a.aliases.get(&n) {
             return ts_ast::NodeId::new(index);
         }
-        let index = a.slots.len() as u32;
-        a.slots.push(Slot::Alias(n));
+        let index = a.push_slot(OwnerKey::Base, Slot::Alias(n));
         a.aliases.insert(n, index);
         ts_ast::NodeId::new(index)
     })
@@ -1325,6 +1627,78 @@ mod tests {
                 assert_eq!(list.nodes().to_vec(), vec![first]);
                 assert_eq!(first.text(), "first");
                 assert_eq!(last.nodes().get(0).text(), last_text);
+            })
+            .join()
+            .expect("seed thread panicked");
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    /// The message of a caught panic.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+    }
+
+    // A program version that is an owner owns the entries made while it is
+    // current, and keeps their identity while it lives. Its free drops them
+    // and keeps the base entries. A freed handle panics, and a new node gets
+    // a new index.
+    #[test]
+    fn program_owner_frees_its_entries() {
+        std::thread::spawn(|| {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                program: None,
+                source_file_order: Vec::new(),
+                options: CompilerOptions::default(),
+                bound_symbols: std::sync::OnceLock::new(),
+                state: std::sync::OnceLock::new(),
+            }));
+            let f = NodeFactory::new();
+            let base = f.new_identifier("base");
+            let base_slots = synthetic_live_slot_count();
+
+            open_synthetic_owner(program.id);
+            let (statement, list, block) = {
+                let _program = enter_program(Some(program));
+                let statement = f.new_expression_statement(base);
+                let list = f.new_node_list(&[statement]);
+                let block = f.new_block(list, false);
+                assert_eq!(block.statement_list(), block.statement_list());
+                assert_eq!(block.statement_list().nodes().to_vec(), vec![statement]);
+                assert_eq!(list.nodes().to_vec(), vec![statement]);
+                // A data write goes to the owner of the node: the base.
+                replace_node_data(base, with_ast_data(base, Clone::clone));
+                assert!(synthetic_live_slot_count() > base_slots);
+                (statement, list, block)
+            };
+            free_synthetic_owner(program.id);
+
+            assert_eq!(synthetic_live_slot_count(), base_slots);
+            assert_eq!(base.text(), "base");
+            let freed = std::panic::catch_unwind(|| block.kind())
+                .expect_err("a node of a freed owner is read");
+            assert_eq!(panic_message(&*freed), Some(FREED));
+            let freed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list.nodes().to_vec()))
+                    .expect_err("a list of a freed owner is read");
+            assert_eq!(panic_message(&*freed), Some(FREED));
+            let fresh = f.new_identifier("fresh");
+            assert!(fresh != statement && fresh != block);
+            assert_eq!(fresh.text(), "fresh");
+
+            // A seed keeps the base indexes and the holes.
+            let seed = synthetic_seed();
+            std::thread::spawn(move || {
+                install_synthetic_seed(seed);
+                assert_eq!(base.text(), "base");
+                assert_eq!(fresh.text(), "fresh");
+                assert!(std::panic::catch_unwind(|| block.kind()).is_err());
             })
             .join()
             .expect("seed thread panicked");

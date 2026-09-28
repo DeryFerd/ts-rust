@@ -416,8 +416,9 @@ pub fn release_program(p: &'static NewProgram) {
 }
 
 /// Removes `p` from the registry, which drops its checker pools once no
-/// project holds them, releases its program version, and releases each
-/// host of `p` that no live program uses now.
+/// project holds them, releases its program version, releases each host
+/// of `p` that no live program uses now, and frees the synthetic nodes
+/// that this thread made while the version was current.
 fn release_now(p: &'static NewProgram) {
     let Some(checkers) =
         PROGRAM_CHECKERS.with(|programs| programs.borrow_mut().remove(&program_key(p)))
@@ -426,6 +427,11 @@ fn release_now(p: &'static NewProgram) {
     };
     crate::program::release_program(checkers.version);
     release_hosts(&checkers);
+    let version = checkers.version;
+    drop(checkers);
+    // Not in Go: the GC frees the nodes that no checker or request reaches.
+    // No snapshot and no guard of the version is alive here.
+    crate::ast::free_synthetic_owner(version.id);
 }
 
 // Go: compiler/program.go:335 initCheckerPool
@@ -439,6 +445,9 @@ fn init_checker_pool(
     if !p.finished_processing {
         panic!("Program must finish processing files before initializing checker pool");
     }
+    // PORT: the synthetic nodes that this thread makes while `version` is
+    // current belong to it; `release_now` frees them.
+    crate::ast::open_synthetic_owner(version.id);
 
     let (checker_pool, compiler_checker_pool): (
         Rc<dyn CheckerPool>,
