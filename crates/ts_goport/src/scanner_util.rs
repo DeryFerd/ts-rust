@@ -1312,7 +1312,9 @@ pub fn get_spelling_suggestion<T: Clone + Default, S: AsRef<str>>(
     get_name: impl FnMut(&T) -> S,
     compare: impl FnMut(&T, &T) -> i32,
 ) -> T {
-    get_spelling_suggestion_unexported(name, candidates, get_name, compare, 0 /*maxCandidates*/)
+    get_spelling_suggestion_unexported(
+        name, candidates, get_name, compare, 0, /*maxCandidates*/
+    )
 }
 
 // Go: core/core.go:588 GetSpellingSuggestionWithMaxCandidateCount

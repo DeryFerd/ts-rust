@@ -635,7 +635,11 @@ impl Parser {
                     // Stop if the next operator would bind before the last operator when the assertion is erased.
                     let next_operator = self.re_scan_greater_than_token();
                     let next_precedence = get_binary_operator_precedence(next_operator);
-                    if should_consume_binary_operator(next_operator, next_precedence, last_precedence) {
+                    if should_consume_binary_operator(
+                        next_operator,
+                        next_precedence,
+                        last_precedence,
+                    ) {
                         break;
                     }
                 }

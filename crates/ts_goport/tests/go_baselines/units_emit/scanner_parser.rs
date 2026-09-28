@@ -157,7 +157,8 @@ const value = 0;"#;
     let type_expression = tags.nodes().get(0).type_expression();
     assert!(type_expression.is_some());
 
-    let expected = ["(", r#""a" |"#, r#""b""#, ")[]"].join(NewLineKind::LF.get_new_line_character());
+    let expected =
+        ["(", r#""a" |"#, r#""b""#, ")[]"].join(NewLineKind::LF.get_new_line_character());
     let tests = [
         ("original", type_expression.type_()),
         ("reparsed", type_alias.type_()),

@@ -121,12 +121,8 @@ fn get_token_at_position_unexported(
     let node_after_left: Cell<Node> = Cell::new(Node::NIL);
 
     let get_included_preceding_token = |subtree: Node| -> Node {
-        let child = find_preceding_token_ex(
-            source_file,
-            position,
-            subtree,
-            false, /*excludeJSDoc*/
-        );
+        let child =
+            find_preceding_token_ex(source_file, position, subtree, false /*excludeJSDoc*/);
         // PORT: Go calls this only when the callback is not nil.
         let include = include_preceding_token_at_end_position
             .expect("includePrecedingTokenAtEndPosition is nil");
