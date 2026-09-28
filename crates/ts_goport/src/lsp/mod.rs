@@ -2,7 +2,7 @@
 
 pub mod dynamic_queue;
 pub mod logger;
-pub mod lsproto;
+pub use goport_lsproto::lsp::lsproto;
 pub mod lspwatcher;
 pub mod progress;
 pub mod server;

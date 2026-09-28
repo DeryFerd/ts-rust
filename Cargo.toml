@@ -30,6 +30,8 @@ members = [
     "crates/ts_vfs",
     "crates/ts_watch",
     "crates/ts_goport",
+    "crates/ts_goport/parts/goport_lsproto",
+    "crates/ts_goport/parts/goport_util",
     "tools/ts_ast_codegen",
     "tools/ts_compare",
     "tools/ts_diagnostics_codegen",
