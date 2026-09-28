@@ -39,6 +39,19 @@ pub trait CompilerHost {
     fn prefetch_parses(&self) -> bool {
         true
     }
+
+    /// The names of the files that `get_source_file` gives now from the
+    /// host's own cache, with no read and no parse. The parse workers of
+    /// a program load do not parse these files (`FilesParser::parse`).
+    /// Only the `tsc -b` host has such a cache: it shares the parsed
+    /// `.d.ts` and `.json` files between the programs of a build.
+    // PORT: not in Go (see `prefetch_parses`). A name, not the full parse
+    // options: the workers only guess the options. A cached parse with
+    // other options is a cache miss, and the loader then parses the file
+    // itself, with the same result.
+    fn cached_source_file_names(&self) -> FxHashSet<String> {
+        FxHashSet::default()
+    }
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.

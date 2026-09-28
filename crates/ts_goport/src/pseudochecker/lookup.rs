@@ -42,11 +42,7 @@ impl PseudoChecker {
 
     // Go: pseudochecker/lookup.go:26 GetTypeOfAccessor
     pub fn get_type_of_accessor(&self, symbols: &SymbolArena, accessor: Node) -> Rc<PseudoType> {
-        let annotated = self.type_from_accessor(symbols, accessor);
-        if annotated.kind == PseudoTypeKind::NO_RESULT {
-            return self.infer_accessor_type(symbols, accessor);
-        }
-        annotated
+        self.type_from_accessor(symbols, accessor)
     }
 
     // Go: pseudochecker/lookup.go:34 GetTypeOfExpression
@@ -197,17 +193,27 @@ impl PseudoChecker {
             return new_pseudo_type_direct(accessor_type);
         }
         if accessor_declarations.get_accessor.is_some() {
-            return self.create_return_from_signature(symbols, accessor_declarations.get_accessor);
+            let mut res =
+                self.create_return_from_signature(symbols, accessor_declarations.get_accessor);
+            if res.kind == PseudoTypeKind::INFERRED
+                && res.as_pseudo_type_inferred().error_nodes.is_empty()
+            {
+                let mut error_nodes = vec![accessor_declarations.get_accessor];
+                if accessor_declarations.set_accessor.is_some() {
+                    error_nodes.push(accessor_declarations.set_accessor);
+                }
+                let inferred = res.as_pseudo_type_inferred();
+                let (expression, is_signature_return) =
+                    (inferred.expression, inferred.is_signature_return);
+                res = new_pseudo_type_inferred_with_errors(
+                    expression,
+                    is_signature_return,
+                    error_nodes,
+                ); // Move error up to the accessor
+            }
+            return res;
         }
         new_pseudo_type_no_result(accessor)
-    }
-
-    // Go: pseudochecker/lookup.go:162 inferAccessorType
-    fn infer_accessor_type(&self, symbols: &SymbolArena, node: Node) -> Rc<PseudoType> {
-        if node.kind() == SyntaxKind::GetAccessor {
-            return self.create_return_from_signature(symbols, node);
-        }
-        new_pseudo_type_no_result(node)
     }
 
     // Go: pseudochecker/lookup.go:169 getTypeAnnotationFromAllAccessorDeclarations
@@ -275,7 +281,7 @@ impl PseudoChecker {
         if fn_.is_some() && !node_is_missing(fn_.body()) {
             let flags = get_function_flags(fn_);
             if flags.intersects(FunctionFlags::ASYNC_GENERATOR) {
-                return new_pseudo_type_no_result(fn_);
+                return new_pseudo_type_inferred(fn_, true);
             }
 
             let body = fn_.body();
@@ -313,7 +319,7 @@ impl PseudoChecker {
                 return self.type_from_expression(symbols, candidate_expr);
             }
         }
-        new_pseudo_type_no_result(fn_)
+        new_pseudo_type_inferred(fn_, true)
     }
 
     // Go: pseudochecker/lookup.go:265 typeFromExpression
@@ -350,15 +356,18 @@ impl PseudoChecker {
             SyntaxKind::ObjectLiteralExpression => {
                 return self.type_from_object_literal(symbols, node);
             }
-            SyntaxKind::ClassExpression => return new_pseudo_type_inferred(node), // No possible annotation/directly mappable syntax
+            SyntaxKind::ClassExpression => {
+                // No possible annotation/directly mappable syntax
+                return new_pseudo_type_inferred_with_errors(node, false, vec![node]);
+            }
             SyntaxKind::TemplateExpression => {
                 // templateLitWithHoles as const, not supported
                 if is_in_const_context(node) {
-                    return new_pseudo_type_inferred(node);
+                    return new_pseudo_type_inferred(node, false);
                 }
                 return new_pseudo_type_maybe_const_location(
                     node,
-                    new_pseudo_type_inferred(node),
+                    new_pseudo_type_inferred(node, false),
                     pseudo_type_string(),
                 );
             }
@@ -406,7 +415,7 @@ impl PseudoChecker {
             }
             _ => {}
         }
-        new_pseudo_type_inferred(node)
+        new_pseudo_type_inferred(node, false)
     }
 
     // Go: pseudochecker/lookup.go:318 typeFromObjectLiteral
@@ -415,7 +424,7 @@ impl PseudoChecker {
         // PORT: Go tests `errorNodes != nil`; a non-nil result always has at
         // least one element, so a non-empty Vec is the same test.
         if !error_nodes.is_empty() {
-            return new_pseudo_type_inferred_with_errors(node, error_nodes);
+            return new_pseudo_type_inferred_with_errors(node, false, error_nodes);
         }
         // we are in a const context producing an object literal type, there are no shorthand or spread assignments
         let properties = node.property_list();
@@ -575,10 +584,10 @@ impl PseudoChecker {
         let error_nodes = self.can_get_type_from_array_literal(node);
         // PORT: Go tests `errorNodes != nil`; see typeFromObjectLiteral.
         if !error_nodes.is_empty() {
-            return new_pseudo_type_inferred_with_errors(node, error_nodes);
+            return new_pseudo_type_inferred_with_errors(node, false, error_nodes);
         }
         if is_in_const_context(node) && is_contextually_typed(node) {
-            return new_pseudo_type_inferred(node); // expr in an as const cast with a contextual type has variable readonly state, bail
+            return new_pseudo_type_inferred(node, false); // expr in an as const cast with a contextual type has variable readonly state, bail
         }
         // we are in a const context producing a tuple type, there are no spread elements
         let elements = node.elements();
@@ -654,10 +663,6 @@ impl PseudoChecker {
             return new_pseudo_type_direct(node.full_signature());
         }
         let return_type = self.create_return_from_signature(symbols, node);
-        if return_type.kind == PseudoTypeKind::NO_RESULT {
-            // no result for the return type can just be an inferred result for the whole expression
-            return new_pseudo_type_inferred(node);
-        }
         let type_parameters = self.clone_type_parameters(node.type_parameter_list());
         let parameters = self.clone_parameters(symbols, node.parameter_list());
         new_pseudo_type_single_call_signature(node, parameters, type_parameters, return_type)
@@ -726,7 +731,13 @@ impl PseudoChecker {
             && is_identifier(node.name())
             && !is_contextually_typed(node)
         {
-            let expr = self.type_from_expression(symbols, node.initializer());
+            let mut expr = self.type_from_expression(symbols, node.initializer());
+            if expr.kind == PseudoTypeKind::INFERRED
+                && expr.as_pseudo_type_inferred().error_nodes.is_empty()
+            {
+                let expression = expr.as_pseudo_type_inferred().expression;
+                expr = new_pseudo_type_inferred_with_errors(expression, false, vec![node]); // Move error up to the parameter
+            }
             if !self.strict_null_checks {
                 return expr;
             }

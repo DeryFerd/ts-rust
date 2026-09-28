@@ -1,5 +1,6 @@
 //! Port of Go `checker/checker.go` lines 2056-2967.
 
+use crate::gostd::Context;
 use crate::prelude::*;
 
 // Go: checker/checker.go:2056 isImmediatelyUsedInInitializerOfBlockScopedVariable
@@ -92,13 +93,13 @@ pub fn is_property_immediately_referenced_within_declaration(
 // method panics on type parameters, and fields.rs skips the clashing field name, so
 // the field is read from the ts_ast data directly.
 fn type_parameter_declaration_expression(node: Node) -> Node {
-    match ast_data_of(node) {
+    with_ast_data(node, |d| match d {
         ts_ast::NodeData::TypeParameterDeclaration(d) => match d.expression {
             Some(id) => Node::new(node.file_index(), id),
             None => Node::NIL,
         },
         _ => panic!("AsTypeParameterDeclaration on {:?}", node.kind()),
-    }
+    })
 }
 
 impl Checker {
@@ -223,10 +224,8 @@ impl Checker {
     }
 
     // Go: checker/checker.go:2180 checkSourceFile
-    // PORT: the Go `ctx context.Context` parameter and the `c.ctx` assignments are
-    // dropped (cancellation is concurrency plumbing). `is_canceled` is still called
-    // in the same places.
-    pub fn check_source_file(&mut self, source_file: Node, check_unused: bool) {
+    pub fn check_source_file(&mut self, ctx: &Context, source_file: Node, check_unused: bool) {
+        self.ctx = Some(ctx.clone());
         // Go `defer tr.Push(...)()` inside the block: the event ends when the
         // function returns.
         let mut _trace: Option<crate::tracing::Pop> = None;
@@ -273,6 +272,7 @@ impl Checker {
         if self.is_canceled() {
             self.was_canceled = true;
         }
+        self.ctx = None;
     }
 
     // Go: checker/checker.go:2218 checkSourceElements

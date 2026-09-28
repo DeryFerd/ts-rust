@@ -39,6 +39,12 @@ pub struct StdioServerOptions {
     // Async enables JSON-RPC protocol with async connection handling.
     // When false (default), uses MessagePack protocol with sync connection.
     pub async_: bool,
+    // CollectTiming enables per-request server processing-time measurement.
+    // When enabled, the server accumulates each request's processing time into
+    // running totals and a recent-request ring buffer. Response messages are
+    // left unchanged; the client folds this data into its own timing snapshot
+    // on demand via getServerTiming / resetServerTiming requests.
+    pub collect_timing: bool,
 }
 
 // Go: server.go:35 StdioServer
@@ -159,10 +165,14 @@ impl StdioServer {
         let conn: Rc<dyn Conn>;
         if self.options.async_ {
             let protocol = new_jsonrpc_protocol(rwc.clone());
-            conn = new_async_conn_with_protocol(rwc, Box::new(protocol), handler);
+            let async_conn = new_async_conn_with_protocol(rwc, Box::new(protocol), handler);
+            async_conn.set_collect_timing(self.options.collect_timing);
+            conn = async_conn;
         } else {
             let protocol = new_message_pack_protocol(rwc.clone());
-            conn = new_sync_conn(rwc, Box::new(protocol), handler);
+            let sync_conn = new_sync_conn(rwc, Box::new(protocol), handler);
+            sync_conn.set_collect_timing(self.options.collect_timing);
+            conn = sync_conn;
         }
 
         // If callbacks are enabled, set the connection on the FS

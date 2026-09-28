@@ -40,7 +40,7 @@ pub fn get_wildcard_directories(
     let mut recursive_keys: Vec<String> = Vec::new();
 
     for file in include {
-        let spec = normalize_slashes(&combine_paths(
+        let spec = normalize_path(&combine_paths(
             &compare_paths_options.current_directory,
             &[file.as_str()],
         ));

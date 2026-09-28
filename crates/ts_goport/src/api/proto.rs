@@ -224,6 +224,17 @@ pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
 
+    // MethodGetServerTiming retrieves the server's collected per-request
+    // processing-time totals and recent-request ring buffer. It is handled by
+    // the connection itself (not the session) and is not recorded in the timing
+    // it reports.
+    pub const GET_SERVER_TIMING: Method = Method(Cow::Borrowed("getServerTiming"));
+
+    // MethodResetServerTiming clears the server's collected timing totals and
+    // recent-request ring buffer. Like MethodGetServerTiming, it is handled by
+    // the connection itself and is not recorded.
+    pub const RESET_SERVER_TIMING: Method = Method(Cow::Borrowed("resetServerTiming"));
+
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
@@ -238,6 +249,8 @@ impl Method {
     pub const GET_DECLARED_TYPE_OF_SYMBOL: Method =
         Method(Cow::Borrowed("getDeclaredTypeOfSymbol"));
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
+    pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
+    pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
     pub const RESOLVE_NAME: Method = Method(Cow::Borrowed("resolveName"));
     pub const GET_SIGNATURES_OF_TYPE: Method = Method(Cow::Borrowed("getSignaturesOfType"));
     pub const GET_RESOLVED_SIGNATURE: Method = Method(Cow::Borrowed("getResolvedSignature"));
@@ -310,10 +323,33 @@ impl Method {
         Method(Cow::Borrowed("getTypePredicateOfSignature"));
     pub const GET_BASE_TYPES: Method = Method(Cow::Borrowed("getBaseTypes"));
     pub const GET_PROPERTIES_OF_TYPE: Method = Method(Cow::Borrowed("getPropertiesOfType"));
+    pub const GET_APPARENT_TYPE: Method = Method(Cow::Borrowed("getApparentType"));
+    pub const GET_PROPERTY_OF_TYPE: Method = Method(Cow::Borrowed("getPropertyOfType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
         Method(Cow::Borrowed("getConstraintOfTypeParameter"));
+    pub const GET_BASE_CONSTRAINT_OF_TYPE: Method =
+        Method(Cow::Borrowed("getBaseConstraintOfType"));
     pub const GET_TYPE_ARGUMENTS: Method = Method(Cow::Borrowed("getTypeArguments"));
+    pub const GET_TRUE_TYPE_OF_CONDITIONAL_TYPE: Method =
+        Method(Cow::Borrowed("getTrueTypeOfConditionalType"));
+    pub const GET_FALSE_TYPE_OF_CONDITIONAL_TYPE: Method =
+        Method(Cow::Borrowed("getFalseTypeOfConditionalType"));
+    pub const GET_CONSTANT_VALUE: Method = Method(Cow::Borrowed("getConstantValue"));
+    pub const GET_SIGNATURE_FROM_DECLARATION: Method =
+        Method(Cow::Borrowed("getSignatureFromDeclaration"));
+    pub const GET_EXPORT_SPECIFIER_LOCAL_TARGET: Method =
+        Method(Cow::Borrowed("getExportSpecifierLocalTargetSymbol"));
+    pub const GET_ALIASED_SYMBOL: Method = Method(Cow::Borrowed("getAliasedSymbol"));
+    pub const GET_IMMEDIATE_ALIASED_SYMBOL: Method =
+        Method(Cow::Borrowed("getImmediateAliasedSymbol"));
+    pub const GET_EXPORTS_OF_MODULE: Method = Method(Cow::Borrowed("getExportsOfModule"));
+    pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
+        Method(Cow::Borrowed("getMemberInModuleExports"));
+    pub const GET_JS_DOC_TAGS: Method = Method(Cow::Borrowed("getJsDocTags"));
+    pub const GET_DOCUMENTATION_COMMENT: Method = Method(Cow::Borrowed("getDocumentationComment"));
+    pub const IS_ARRAY_TYPE: Method = Method(Cow::Borrowed("isArrayType"));
+    pub const IS_TUPLE_TYPE: Method = Method(Cow::Borrowed("isTupleType"));
 
     // Reference methods
     pub const GET_REFERENCES_TO_SYMBOL_IN_FILE: Method =
@@ -328,11 +364,14 @@ impl Method {
 
     // Diagnostic methods
     pub const GET_SYNTACTIC_DIAGNOSTICS: Method = Method(Cow::Borrowed("getSyntacticDiagnostics"));
+    pub const GET_BIND_DIAGNOSTICS: Method = Method(Cow::Borrowed("getBindDiagnostics"));
     pub const GET_SEMANTIC_DIAGNOSTICS: Method = Method(Cow::Borrowed("getSemanticDiagnostics"));
     pub const GET_SUGGESTION_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getSuggestionDiagnostics"));
     pub const GET_DECLARATION_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getDeclarationDiagnostics"));
+    pub const GET_PROGRAM_DIAGNOSTICS: Method = Method(Cow::Borrowed("getProgramDiagnostics"));
+    pub const GET_GLOBAL_DIAGNOSTICS: Method = Method(Cow::Borrowed("getGlobalDiagnostics"));
     pub const GET_CONFIG_FILE_PARSING_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getConfigFileParsingDiagnostics"));
 
@@ -351,6 +390,9 @@ impl Method {
     pub const GET_UNKNOWN_TYPE: Method = Method(Cow::Borrowed("getUnknownType"));
     pub const GET_BIG_INT_TYPE: Method = Method(Cow::Borrowed("getBigIntType"));
     pub const GET_ES_SYMBOL_TYPE: Method = Method(Cow::Borrowed("getESSymbolType"));
+
+    // Well-known per-checker symbols
+    pub const GET_WELL_KNOWN_SYMBOLS: Method = Method(Cow::Borrowed("getWellKnownSymbols"));
 
     // Profiling methods
     pub const START_CPU_PROFILE: Method = Method(Cow::Borrowed("startCPUProfile"));
@@ -468,12 +510,18 @@ impl DocumentIdentifier {
         self.file_name.clone()
     }
 
-    // Go: proto.go:230 ToURI
-    pub fn to_uri(&self) -> lsproto::DocumentUri {
+    // Go: proto.go:268 ToURI
+    // ToURI returns the document URI for this identifier. An explicitly provided URI
+    // is returned as-is; a file name is first normalized to an absolute path against
+    // cwd before being converted to a URI.
+    pub fn to_uri(&self, cwd: &str) -> lsproto::DocumentUri {
         if !self.uri.0.is_empty() {
             return self.uri.clone();
         }
-        lsconv::file_name_to_document_uri(&self.file_name)
+        lsconv::file_name_to_document_uri(&tspath::get_normalized_absolute_path(
+            &self.file_name,
+            cwd,
+        ))
     }
 
     // Go: proto.go:237 ToAbsoluteFileName
@@ -536,18 +584,35 @@ proto_json!(both APIFileChanges {
 
 // UpdateSnapshotParams are the parameters for creating a new snapshot.
 // All fields are optional. With no fields set, the server adopts the latest LSP state.
-// Go: proto.go:270 UpdateSnapshotParams
+// Go: proto.go:308 UpdateSnapshotParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UpdateSnapshotParams {
-    // OpenProject is the path to a tsconfig.json file to open/load in the new snapshot.
-    pub open_project: String,
+    // OpenProjects lists tsconfig.json files to open/load in the new snapshot.
+    // Opens are ref-counted and persist across snapshots until closed.
+    pub open_projects: Vec<DocumentIdentifier>,
+    // CloseProjects lists tsconfig.json files to release in the new snapshot.
+    // A project is only unloaded once every API client that opened it closes it.
+    pub close_projects: Vec<DocumentIdentifier>,
     // FileChanges describes file system changes since the last snapshot.
     pub file_changes: Option<APIFileChanges>,
+    // OpenFiles lists files to keep open for the API client, mirroring LSP's
+    // textDocument/didOpen. For each file, ancestor directories are searched for a
+    // tsconfig that contains it; if found, that configured project is loaded and
+    // becomes the file's default project. Otherwise the file is loaded into the
+    // inferred project (e.g. a node_modules d.ts not in any project's import graph).
+    // Opens persist across snapshots until the file is closed.
+    pub open_files: Vec<DocumentIdentifier>,
+    // CloseFiles lists files to release in the new snapshot. A file is only fully
+    // closed once every API client that opened it closes it.
+    pub close_files: Vec<DocumentIdentifier>,
 }
 
 proto_json!(both UpdateSnapshotParams {
-    open_project: "openProject" omitempty,
+    open_projects: "openProjects" omitempty,
+    close_projects: "closeProjects" omitempty,
     file_changes: "fileChanges" omitempty,
+    open_files: "openFiles" omitempty,
+    close_files: "closeFiles" omitempty,
 });
 
 // ProjectFileChanges describes what source files changed within a single project.
@@ -667,6 +732,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_SOURCE_FILE,
+        unmarshaller_for::<GetSourceFileParams>,
+    );
+    m.insert(
+        Method::GET_SOURCE_FILE_NAMES,
+        unmarshaller_for::<GetSourceFileNamesParams>,
+    );
+    m.insert(
+        Method::GET_SOURCE_FILE_METADATA,
         unmarshaller_for::<GetSourceFileParams>,
     );
     m.insert(
@@ -804,6 +877,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         Method::GET_CONSTRAINT_OF_TYPE,
         unmarshaller_for::<GetTypePropertyParams>,
     );
+    m.insert(
+        Method::GET_TRUE_TYPE_OF_CONDITIONAL_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
+        Method::GET_FALSE_TYPE_OF_CONDITIONAL_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
 
     m.insert(
         Method::GET_TYPE_PARAMETERS_OF_SIGNATURE,
@@ -899,6 +980,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_APPARENT_TYPE,
+        unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
+        Method::GET_PROPERTY_OF_TYPE,
+        unmarshaller_for::<GetPropertyOfTypeParams>,
+    );
+    m.insert(
         Method::GET_INDEX_INFOS_OF_TYPE,
         unmarshaller_for::<CheckerTypeParams>,
     );
@@ -907,9 +996,51 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_BASE_CONSTRAINT_OF_TYPE,
+        unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
         Method::GET_TYPE_ARGUMENTS,
         unmarshaller_for::<CheckerTypeParams>,
     );
+    m.insert(
+        Method::GET_CONSTANT_VALUE,
+        unmarshaller_for::<CheckerNodeParams>,
+    );
+    m.insert(
+        Method::GET_SIGNATURE_FROM_DECLARATION,
+        unmarshaller_for::<CheckerNodeParams>,
+    );
+    m.insert(
+        Method::GET_EXPORT_SPECIFIER_LOCAL_TARGET,
+        unmarshaller_for::<CheckerNodeParams>,
+    );
+    m.insert(
+        Method::GET_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_IMMEDIATE_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_EXPORTS_OF_MODULE,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_MEMBER_IN_MODULE_EXPORTS,
+        unmarshaller_for::<GetMemberInModuleExportsParams>,
+    );
+    m.insert(
+        Method::GET_JS_DOC_TAGS,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_DOCUMENTATION_COMMENT,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(Method::IS_ARRAY_TYPE, unmarshaller_for::<CheckerTypeParams>);
+    m.insert(Method::IS_TUPLE_TYPE, unmarshaller_for::<CheckerTypeParams>);
     m.insert(
         Method::GET_REFERENCES_TO_SYMBOL_IN_FILE,
         unmarshaller_for::<GetReferencesToSymbolInFileParams>,
@@ -972,7 +1103,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetIntrinsicTypeParams>,
     );
     m.insert(
+        Method::GET_WELL_KNOWN_SYMBOLS,
+        unmarshaller_for::<GetIntrinsicTypeParams>,
+    );
+    m.insert(
         Method::GET_SYNTACTIC_DIAGNOSTICS,
+        unmarshaller_for::<GetDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_BIND_DIAGNOSTICS,
         unmarshaller_for::<GetDiagnosticsParams>,
     );
     m.insert(
@@ -986,6 +1125,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_DECLARATION_DIAGNOSTICS,
         unmarshaller_for::<GetDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_PROGRAM_DIAGNOSTICS,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_GLOBAL_DIAGNOSTICS,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
     );
     m.insert(
         Method::GET_CONFIG_FILE_PARSING_DIAGNOSTICS,
@@ -1104,11 +1251,9 @@ impl MarshalerTo for ProjectResponse {
 // PORT: Go shares the `*core.CompilerOptions` pointer; the response keeps
 // a copy (responses cross into `Box<dyn AnyValue>`, which is `Send`).
 pub fn new_project_response(p: &project::Project) -> ProjectResponse {
-    // Go dereferences a nil CommandLine in FileNames and panics.
-    let command_line = p
-        .command_line
-        .as_ref()
-        .expect("runtime error: invalid memory address or nil pointer dereference");
+    let Some(command_line) = p.command_line.as_ref() else {
+        panic!("NewProjectResponse called with unloaded project");
+    };
     ProjectResponse {
         id: project_handle(p),
         config_file_name: p.name(),
@@ -1181,6 +1326,7 @@ proto_json!(both GetSymbolsAtLocationsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SymbolResponse {
     pub id: SymbolID,
+    pub project: ProjectID,
     pub name: String,
     pub flags: u32,
     pub check_flags: u32,
@@ -1192,6 +1338,7 @@ pub struct SymbolResponse {
 
 proto_json!(marshal SymbolResponse {
     id: "id" plain,
+    project: "project" plain,
     name: "name" plain,
     flags: "flags" plain,
     check_flags: "checkFlags" plain,
@@ -1459,6 +1606,8 @@ pub fn literal_value_to_json(value: Option<&LiteralValue>) -> LspAny {
         Some(LiteralValue::String(v)) => LspAny::String(v.clone()),
         Some(LiteralValue::Number(v)) => LspAny::Number(v.0),
         Some(LiteralValue::Bool(v)) => LspAny::Bool(*v),
+        // Encode bigint literals as a signed decimal string (e.g. "-123"); the
+        // API client decodes this back into a real bigint. JSON has no bigint.
         Some(LiteralValue::PseudoBigInt(v)) => LspAny::String(v.to_string()),
         None => LspAny::Null,
     }
@@ -1500,6 +1649,38 @@ proto_json!(both GetSourceFileParams {
     file: "file" plain,
 });
 
+// Go: proto.go:770 GetSourceFileNamesParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSourceFileNamesParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+}
+
+proto_json!(both GetSourceFileNamesParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+});
+
+// SourceFileMetadata carries program-stored metadata about a single source file.
+// Go: proto.go:761 SourceFileMetadata
+// PORT: Go `core.ResolutionMode` marshals as its int32 value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceFileMetadata {
+    pub is_default_library: bool,
+    pub is_from_external_library: bool,
+    pub package_json_type: String,
+    pub package_json_directory: String,
+    pub implied_node_format: i32,
+}
+
+proto_json!(marshal SourceFileMetadata {
+    is_default_library: "isDefaultLibrary" plain,
+    is_from_external_library: "isFromExternalLibrary" plain,
+    package_json_type: "packageJsonType" plain,
+    package_json_directory: "packageJsonDirectory" plain,
+    implied_node_format: "impliedNodeFormat" plain,
+});
+
 // Go: proto.go:690 ResolveNameParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolveNameParams {
@@ -1529,11 +1710,13 @@ proto_json!(both ResolveNameParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypePropertyParams {
     pub snapshot: SnapshotID,
+    pub project: ProjectID,
     pub type_: TypeID,
 }
 
 proto_json!(both GetTypePropertyParams {
     snapshot: "snapshot" plain,
+    project: "project" plain,
     type_: "objectId" plain,
 });
 
@@ -1542,11 +1725,13 @@ proto_json!(both GetTypePropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolPropertyParams {
     pub snapshot: SnapshotID,
+    pub project: ProjectID,
     pub symbol: SymbolID,
 }
 
 proto_json!(both GetSymbolPropertyParams {
     snapshot: "snapshot" plain,
+    project: "project" plain,
     symbol: "objectId" plain,
 });
 
@@ -1555,11 +1740,13 @@ proto_json!(both GetSymbolPropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturePropertyParams {
     pub snapshot: SnapshotID,
+    pub project: ProjectID,
     pub signature: SignatureID,
 }
 
 proto_json!(both GetSignaturePropertyParams {
     snapshot: "snapshot" plain,
+    project: "project" plain,
     signature: "objectId" plain,
 });
 
@@ -1755,6 +1942,23 @@ pub struct GetIntrinsicTypeParams {
 proto_json!(both GetIntrinsicTypeParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
+});
+
+// WellKnownSymbolsResponse carries the handle ids of the per-checker singleton
+// symbols (unknown, undefined, arguments) so the client can identify them by id
+// without a round-trip on every check.
+// Go: proto.go:894 WellKnownSymbolsResponse
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WellKnownSymbolsResponse {
+    pub unknown: SymbolID,
+    pub undefined: SymbolID,
+    pub arguments: SymbolID,
+}
+
+proto_json!(marshal WellKnownSymbolsResponse {
+    unknown: "unknown" plain,
+    undefined: "undefined" plain,
+    arguments: "arguments" plain,
 });
 
 // GetBaseTypeOfLiteralTypeParams returns the base type of a literal type.
@@ -2026,6 +2230,84 @@ proto_json!(both CheckerTypeParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
     type_: "type" plain,
+});
+
+// GetPropertyOfTypeParams are parameters for getPropertyOfType (a named property of a type).
+// Go: proto.go:984 GetPropertyOfTypeParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetPropertyOfTypeParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub type_: TypeID,
+    pub name: String,
+}
+
+proto_json!(both GetPropertyOfTypeParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    type_: "type" plain,
+    name: "name" plain,
+});
+
+// CheckerNodeParams are parameters for checker methods that operate on a node location.
+// Go: proto.go:992 CheckerNodeParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CheckerNodeParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub location: NodeHandle,
+}
+
+proto_json!(both CheckerNodeParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    location: "location" plain,
+});
+
+// GetMemberInModuleExportsParams are parameters for getMemberInModuleExports.
+// Go: proto.go:1049 GetMemberInModuleExportsParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetMemberInModuleExportsParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub symbol: SymbolID,
+    pub name: String,
+}
+
+proto_json!(both GetMemberInModuleExportsParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    symbol: "symbol" plain,
+    name: "name" plain,
+});
+
+// CheckerSymbolParams are parameters for checker methods that operate on a symbol.
+// Go: proto.go:1064 CheckerSymbolParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CheckerSymbolParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub symbol: SymbolID,
+}
+
+proto_json!(both CheckerSymbolParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    symbol: "symbol" plain,
+});
+
+// JSDocTagInfo is a single JSDoc tag, mirroring Strada's JSDocTagInfo but with the tag text
+// rendered as a plain string rather than SymbolDisplayPart[].
+// Go: proto.go:1007 JSDocTagInfo
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct JSDocTagInfo {
+    pub name: String,
+    pub text: String,
+}
+
+proto_json!(marshal JSDocTagInfo {
+    name: "name" plain,
+    text: "text" omitempty,
 });
 
 // CheckerSignatureParams are parameters for checker methods that operate on a signature.

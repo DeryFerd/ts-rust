@@ -32,6 +32,20 @@ impl LanguageService {
     ) -> Result<lsproto::DocumentDiagnosticResponse, GoError> {
         let (program, file) = self.get_program_and_file(uri);
 
+        if self.user_preferences().enable_validation.is_false() {
+            return Ok(
+                lsproto::RelatedFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
+                    full_document_diagnostic_report: Some(
+                        lsproto::RelatedFullDocumentDiagnosticReport {
+                            items: Vec::new(),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
+
         let diagnostics = get_all_diagnostics(ctx, program, file);
 
         Ok(

@@ -6,39 +6,27 @@
 //!   exit status. With `--watch` the run builds, then stays in the watch
 //!   loop (Go `WatchManager.RunLoop`) until the process is killed: there is
 //!   no signal handling (plan D-W3), so the loop never ends by itself.
-//!   Output goes to stdout as it is written.
-//! - `goport_build --build-worker <config> [the -b command line...]`: the
-//!   build worker (plan D1). It compiles and emits one project the way the
-//!   Go build task does and prints one JSON result line (see
-//!   `execute::build::worker`). The orchestrator starts these itself.
-//!   Without a `-b` command line it runs with the default build options.
-//!   It reads the build's cached file system from stdin (empty input, or
-//!   a terminal, is an empty cache).
+//!   Output goes to stdout as it is written. Every project compiles in
+//!   this process, as in Go.
 //!
 //! Only build mode is ported. Other command lines (Go `tscCompilation`)
 //! exit with `EXIT_UNPORTED` (70).
 //!
 //! Unported Go code that a run reaches is listed on stderr as
-//! `unported: <name> <count>`. Such a run, a panic and a failed build
-//! worker exit with `EXIT_UNPORTED` (70), a code tsgo never returns (Go
-//! uses 0 to 5), like `goport` and `goport_emit`. A Go panic that the port
-//! keeps (`core::go_panic`), in the orchestrator or in a worker, ends the
-//! build as in Go: the output so far, `panic: <message>` on stderr and
-//! exit 2.
+//! `unported: <name> <count>`. Such a run and a panic exit with
+//! `EXIT_UNPORTED` (70), a code tsgo never returns (Go uses 0 to 5), like
+//! `goport` and `goport_emit`. A Go panic that the port keeps
+//! (`core::go_panic`) ends the build as in Go: the output so far,
+//! `panic: <message>` on stderr and exit 2.
 
 use std::any::Any;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use ts_goport::execute::build::worker::{
-    BUILD_WORKER_FLAG, compile_and_emit_worker, marshal_worker_compile_result,
-    marshal_worker_program_fs_cache, read_worker_fs_cache,
-};
 use ts_goport::execute::execute_tsc::tsc_build_compilation;
 use ts_goport::execute::tsc::compile::{
     EXIT_UNPORTED, ExitStatus, System, new_os_system, write_go_output,
 };
-use ts_goport::frontend::vfs::CachedFsState;
 use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
@@ -56,7 +44,7 @@ const STACK_SIZE: usize = 1 << 30;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Same as `goport.rs` `JEMALLOC_CONF`, so a build here uses the jemalloc
-/// settings of `tsgo -b` (its build workers inherit the tsgo value).
+/// settings of `tsgo -b`.
 /// `scripts/build-release.sh` reads it from this line for its BOLT runs.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
@@ -85,8 +73,7 @@ fn main() {
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
 /// values. jemalloc gets `JEMALLOC_CONF`. With glibc malloc, a build runs
 /// about 20 threads per program, so `arena_max` is 16 here
-/// (`ThreadBudget::WIDE`). Build workers inherit the variable, so they do
-/// not exec again.
+/// (`ThreadBudget::WIDE`). The variable stays set, so the exec runs once.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
@@ -118,11 +105,6 @@ fn run(args: &[String]) -> i32 {
         Ok(sys) => sys,
         Err(status) => return status.code(),
     };
-
-    if args.first().map(String::as_str) == Some(BUILD_WORKER_FLAG) {
-        let sys: Rc<dyn System> = Rc::new(sys);
-        return run_worker(&sys, &args[1..]);
-    }
 
     let sys: Rc<dyn System> = Rc::new(sys.with_writer(Rc::new(RefCell::new(StreamingStdout))));
 
@@ -172,76 +154,6 @@ impl Write for StreamingStdout {
 
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stdout().flush()
-    }
-}
-
-/// `--build-worker <config> [command line...]`
-fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
-    let Some(config) = args.first() else {
-        eprintln!("usage: goport_build {BUILD_WORKER_FLAG} <config> [-b command line...]");
-        return EXIT_UNPORTED;
-    };
-    let build_command_line = &args[1..];
-    let stdin = std::io::stdin();
-    let fs_cache = if stdin.is_terminal() {
-        Ok(CachedFsState::default())
-    } else {
-        read_worker_fs_cache(&mut stdin.lock())
-    };
-    let fs_cache = match fs_cache {
-        Ok(fs_cache) => fs_cache,
-        Err(message) => {
-            eprintln!("goport_build: build worker: cannot read the file system cache: {message}");
-            record_unported("build worker");
-            report_unported();
-            return EXIT_UNPORTED;
-        }
-    };
-    let mut report_program_fs_cache = |state: &CachedFsState| {
-        let line = marshal_worker_program_fs_cache(state);
-        let mut stdout = std::io::stdout().lock();
-        let _ = writeln!(stdout, "{line}");
-        let _ = stdout.flush();
-    };
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        compile_and_emit_worker(
-            sys.clone(),
-            config,
-            build_command_line,
-            &fs_cache,
-            &mut report_program_fs_cache,
-            None,
-        )
-    }));
-    match result {
-        Ok(result) => {
-            let line = marshal_worker_compile_result(&result);
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(stdout, "{line}");
-            let _ = stdout.flush();
-            // Exit `EXIT_UNPORTED` after the result line when the worker
-            // reached unported code, so the orchestrator marks its run too.
-            if report_unported() {
-                EXIT_UNPORTED
-            } else {
-                ExitStatus::Success.code()
-            }
-        }
-        // No result line. After a Go panic the orchestrator ends as Go does
-        // (see `WorkerLauncher::run`); after any other panic it reports the
-        // failed worker.
-        Err(payload) if print_go_panic(payload.as_ref()) => {
-            if report_unported() {
-                EXIT_UNPORTED
-            } else {
-                EXIT_GO_PANIC
-            }
-        }
-        Err(payload) => {
-            note_panic(payload.as_ref());
-            report_unported();
-            EXIT_UNPORTED
-        }
     }
 }
 

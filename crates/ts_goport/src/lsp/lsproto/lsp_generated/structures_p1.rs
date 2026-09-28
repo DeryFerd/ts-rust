@@ -6153,76 +6153,6 @@ impl IsZero for DocumentDiagnosticParams {
     }
 }
 
-// A partial result for a document diagnostic report.
-//
-// Since: 3.17.0
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DocumentDiagnosticReportPartialResult {
-    pub related_documents:
-        IndexMap<DocumentUri, FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport>,
-}
-
-impl UnmarshalerFrom for DocumentDiagnosticReportPartialResult {
-    // Go: (s *DocumentDiagnosticReportPartialResult) UnmarshalJSONFrom
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        const MISSING_RELATED_DOCUMENTS: u64 = 1 << 0;
-        const _MISSING_LAST: u64 = 1 << 1;
-        let mut missing = _MISSING_LAST - 1;
-
-        let k = dec.peek_kind();
-        if k != b'{' {
-            return Err(err_not_object(k));
-        }
-        dec.read_token()?;
-
-        while dec.peek_kind() != b'}' {
-            let name = dec.read_value()?;
-            match name {
-                b"\"relatedDocuments\"" => {
-                    missing &= !MISSING_RELATED_DOCUMENTS;
-                    if dec.peek_kind() == b'n' {
-                        return Err(err_null("relatedDocuments"));
-                    }
-                    json_unmarshal_decode(dec, &mut self.related_documents)?;
-                }
-                _ => {
-                    dec.skip_value()?;
-                }
-            }
-        }
-
-        dec.read_token()?;
-
-        if missing != 0 {
-            let mut missing_props: Vec<String> = Vec::new();
-            if missing & MISSING_RELATED_DOCUMENTS != 0 {
-                missing_props.push("relatedDocuments".to_string());
-            }
-            return Err(err_missing(&missing_props));
-        }
-
-        Ok(())
-    }
-}
-
-impl MarshalerTo for DocumentDiagnosticReportPartialResult {
-    // PORT: Go marshals DocumentDiagnosticReportPartialResult with the JSON v2 default struct arshaler.
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        write_object_start(enc);
-        let mut first = true;
-        marshal_field(enc, &mut first, "relatedDocuments", &self.related_documents)?;
-        write_object_end(enc);
-        Ok(())
-    }
-}
-
-impl IsZero for DocumentDiagnosticReportPartialResult {
-    // PORT: Go reflect.Value.IsZero (omitzero).
-    fn is_zero(&self) -> bool {
-        self.related_documents.is_empty()
-    }
-}
-
 // Cancellation data returned from a diagnostic request.
 //
 // Since: 3.17.0
@@ -9079,5 +9009,97 @@ impl IsZero for DidChangeWatchedFilesRegistrationOptions {
     // PORT: Go reflect.Value.IsZero (omitzero).
     fn is_zero(&self) -> bool {
         self.watchers.is_empty()
+    }
+}
+
+// The publish diagnostic notification's parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PublishDiagnosticsParams {
+    // The URI for which diagnostic information is reported.
+    pub uri: DocumentUri,
+
+    // Optional the version number of the document the diagnostics are published for.
+    //
+    // Since: 3.15.0
+    pub version: Option<i32>,
+
+    // An array of diagnostic information items.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl UnmarshalerFrom for PublishDiagnosticsParams {
+    // Go: (s *PublishDiagnosticsParams) UnmarshalJSONFrom
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        const MISSING_URI: u64 = 1 << 0;
+        const MISSING_DIAGNOSTICS: u64 = 1 << 1;
+        const _MISSING_LAST: u64 = 1 << 2;
+        let mut missing = _MISSING_LAST - 1;
+
+        let k = dec.peek_kind();
+        if k != b'{' {
+            return Err(err_not_object(k));
+        }
+        dec.read_token()?;
+
+        while dec.peek_kind() != b'}' {
+            let name = dec.read_value()?;
+            match name {
+                b"\"uri\"" => {
+                    missing &= !MISSING_URI;
+                    json_unmarshal_decode(dec, &mut self.uri)?;
+                }
+                b"\"version\"" => {
+                    if dec.peek_kind() == b'n' {
+                        return Err(err_null("version"));
+                    }
+                    json_unmarshal_decode(dec, &mut self.version)?;
+                }
+                b"\"diagnostics\"" => {
+                    missing &= !MISSING_DIAGNOSTICS;
+                    if dec.peek_kind() == b'n' {
+                        return Err(err_null("diagnostics"));
+                    }
+                    json_unmarshal_decode(dec, &mut self.diagnostics)?;
+                }
+                _ => {
+                    dec.skip_value()?;
+                }
+            }
+        }
+
+        dec.read_token()?;
+
+        if missing != 0 {
+            let mut missing_props: Vec<String> = Vec::new();
+            if missing & MISSING_URI != 0 {
+                missing_props.push("uri".to_string());
+            }
+            if missing & MISSING_DIAGNOSTICS != 0 {
+                missing_props.push("diagnostics".to_string());
+            }
+            return Err(err_missing(&missing_props));
+        }
+
+        Ok(())
+    }
+}
+
+impl MarshalerTo for PublishDiagnosticsParams {
+    // PORT: Go marshals PublishDiagnosticsParams with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "uri", &self.uri)?;
+        marshal_opt_field(enc, &mut first, "version", &self.version)?;
+        marshal_field(enc, &mut first, "diagnostics", &self.diagnostics)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl IsZero for PublishDiagnosticsParams {
+    // PORT: Go reflect.Value.IsZero (omitzero).
+    fn is_zero(&self) -> bool {
+        self.uri.0.is_empty() && self.version.is_none() && self.diagnostics.is_empty()
     }
 }

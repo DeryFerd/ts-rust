@@ -191,7 +191,11 @@ impl CommonJSModuleTransformer {
             // re-aliased or multi-exported names (where native destructuring cannot update all
             // targets) does `visitDestructuringAssignment` fall back to flattening.
             let assignment = convert_variable_declaration_to_assignment_expression(&ec, node);
-            return self.visit_destructuring_assignment(assignment, true /*valueIsDiscarded*/);
+            let grandparent_node = self.push_node(assignment);
+            let result =
+                self.visit_destructuring_assignment(assignment, true /*valueIsDiscarded*/);
+            self.pop_node(grandparent_node);
+            return result;
         }
         let property_access = f.new_property_access_expression(
             f.new_identifier("exports"),

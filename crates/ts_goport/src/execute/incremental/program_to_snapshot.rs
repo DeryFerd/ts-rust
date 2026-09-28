@@ -1,9 +1,10 @@
 //! Port of execute/incremental/programtosnapshot.go.
 //!
-//! PORT: Go `*compiler.Program` is the installed program (plan D1), read
+//! PORT: Go `*compiler.Program` is the current program (`prog()`), read
 //! through the `program.rs` free functions. Go runs the per-file work of
-//! `computeProgramFileChanges` on a work group; here it runs in file order.
-//! Checker calls run on the file's checker thread (`checker_access.rs`).
+//! `computeProgramFileChanges` on a work group; here the checker part of
+//! every file is sent to its checker thread first
+//! (`start_referenced_files_job`), and the rest runs in file order.
 
 use super::checker_access::*;
 use super::hash::FileInfo;
@@ -48,7 +49,7 @@ pub fn program_to_snapshot(
 }
 
 // Go: incremental/programtosnapshot.go:40 toProgramSnapshot
-// PORT: Go `program` is the installed program and is not a field.
+// PORT: Go `program` is the current program and is not a field.
 struct ToProgramSnapshot<'a> {
     old_program: Option<&'a Program>,
     snapshot: Snapshot,
@@ -76,6 +77,12 @@ impl ToProgramSnapshot<'_> {
             self.snapshot.build_info_emit_pending = old_snapshot.build_info_emit_pending;
             self.snapshot.has_errors_from_old_state = old_snapshot.has_errors;
             self.snapshot.has_semantic_errors_from_old_state = old_snapshot.has_semantic_errors;
+            self.snapshot.package_jsons_from_old_state =
+                old_snapshot.package_jsons.clone().unwrap_or_default();
+            self.snapshot.missing_package_jsons_from_old_state = old_snapshot
+                .missing_package_jsons
+                .clone()
+                .unwrap_or_default();
         } else {
             self.snapshot.build_info_emit_pending = self.snapshot.options.is_incremental();
         }
@@ -357,7 +364,7 @@ pub fn file_affects_global_scope(file: Node) -> bool {
 fn add_referenced_files_from_symbol(
     checker: &Checker,
     file: Node,
-    referenced_files: &mut IndexSet<Path>,
+    referenced_files: &mut ReferencedFileSet,
     symbol: SymbolId,
 ) {
     if symbol.is_nil() {
@@ -369,7 +376,7 @@ fn add_referenced_files_from_symbol(
             continue;
         }
         if file != file_of_decl {
-            referenced_files.insert(Path(source_file_info(file_of_decl).path.clone()));
+            referenced_files.add_file(file_of_decl);
         }
     }
 }
@@ -378,12 +385,34 @@ fn add_referenced_files_from_symbol(
 // Get the module source file and all augmenting files from the import name node from file
 fn add_referenced_files_from_import_literal(
     file: Node,
-    referenced_files: &mut IndexSet<Path>,
+    referenced_files: &mut ReferencedFileSet,
     checker: &mut Checker,
     import_name: Node,
 ) {
     let symbol = checker.get_symbol_at_location_exported(import_name);
     add_referenced_files_from_symbol(checker, file, referenced_files, symbol);
+}
+
+/// The Go `referencedFiles` set of `getReferencedFiles`, in Go order.
+// PORT: perf. Go inserts a path for every declaration of every ambient
+// module, and the set keeps the first. `add_file` skips a file that it
+// added before, without the path copy and the path hash (in Hono, about
+// 110 ambient module declarations for each file). The set and its order
+// are the same.
+#[derive(Default)]
+struct ReferencedFileSet {
+    paths: IndexSet<Path>,
+    /// The files that `add_file` added.
+    files: FxHashSet<Node>,
+}
+
+impl ReferencedFileSet {
+    /// Inserts the path of `file`.
+    fn add_file(&mut self, file: Node) {
+        if self.files.insert(file) {
+            self.paths.insert(Path(source_file_info(file).path.clone()));
+        }
+    }
 }
 
 // Go: incremental/programtosnapshot.go:249 addReferencedFileFromFileName
@@ -438,7 +467,7 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
     let module_augmentations = source_file_info(file).module_augmentations.clone();
     let file_name_paths = referenced_file_name_paths(file);
     send_type_checker_job_for_file(file, move |checker| {
-        let mut referenced_files: IndexSet<Path> = IndexSet::default();
+        let mut referenced_files = ReferencedFileSet::default();
         for import_name in imports {
             add_referenced_files_from_import_literal(
                 file,
@@ -447,7 +476,7 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
                 import_name,
             );
         }
-        referenced_files.extend(file_name_paths);
+        referenced_files.paths.extend(file_name_paths);
         // Add module augmentation as references
         for module_name in module_augmentations {
             if !is_string_literal(module_name) {
@@ -464,10 +493,10 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
         for ambient_module in checker.get_ambient_modules() {
             add_referenced_files_from_symbol(checker, file, &mut referenced_files, ambient_module);
         }
-        if referenced_files.is_empty() {
+        if referenced_files.paths.is_empty() {
             None
         } else {
-            Some(referenced_files)
+            Some(referenced_files.paths)
         }
     })
 }

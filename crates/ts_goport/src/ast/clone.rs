@@ -27,7 +27,7 @@ impl NodeFactory {
     /// Go `node.Clone(f)`: a new node with the same kind, children, flags and
     /// `Loc`. Children are shared, not cloned.
     pub fn clone_node(&self, node: Node) -> Node {
-        match ast_data_of(node) {
+        with_ast_data(node, |d| match d {
             D::Token(_) => self.clone_token(node),
             D::Identifier(_) => self.clone_identifier(node),
             D::PrivateIdentifier(_) => self.clone_private_identifier(node),
@@ -222,7 +222,7 @@ impl NodeFactory {
             D::JsDocTypeLiteral(_) => self.clone_js_doc_type_literal(node),
             D::JsDocParameterOrPropertyTag(_) => self.clone_js_doc_parameter_or_property_tag(node),
             D::SourceFile(_) => self.clone_source_file(node),
-        }
+        })
     }
 
     // Go: ast/ast.go:145 (list *NodeList) Clone
@@ -1465,10 +1465,7 @@ impl NodeFactory {
     fn clone_import_attributes(&self, node: Node) -> Node {
         // PORT: `Node::attributes` does not cover ImportAttributes, whose
         // `Attributes` field is a NodeList. The list is read from the data.
-        let D::ImportAttributes(d) = ast_data_of(node) else {
-            panic!("AsImportAttributes called on {:?}", node.kind());
-        };
-        let attributes = NodeList::from_ts(node.file_index(), Some(&d.attributes));
+        let attributes = import_attributes_list(node);
         clone_node_from(
             self.new_import_attributes(node.token(), attributes, node.multi_line()),
             node,
@@ -2141,35 +2138,34 @@ impl NodeFactory {
     fn clone_js_doc_text(&self, node: Node) -> Node {
         // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
         // parts are read from the data.
-        let D::JsDocText(d) = ast_data_of(node) else {
-            panic!("AsJSDocText called on {:?}", node.kind());
-        };
-        clone_node_from(self.new_js_doc_text(d.text.clone()), node, self.hooks())
+        let text = with_ast_data(node, |d| match d {
+            D::JsDocText(d) => d.text.clone(),
+            _ => panic!("AsJSDocText called on {:?}", node.kind()),
+        });
+        clone_node_from(self.new_js_doc_text(text), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8561 (node *JSDocLink) Clone
     fn clone_js_doc_link(&self, node: Node) -> Node {
         // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
         // parts are read from the data.
-        let D::JsDocLink(d) = ast_data_of(node) else {
-            panic!("AsJSDocLink called on {:?}", node.kind());
-        };
-        clone_node_from(
-            self.new_js_doc_link(node.name(), d.text.clone()),
-            node,
-            self.hooks(),
-        )
+        let text = with_ast_data(node, |d| match d {
+            D::JsDocLink(d) => d.text.clone(),
+            _ => panic!("AsJSDocLink called on {:?}", node.kind()),
+        });
+        clone_node_from(self.new_js_doc_link(node.name(), text), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8605 (node *JSDocLinkPlain) Clone
     fn clone_js_doc_link_plain(&self, node: Node) -> Node {
         // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
         // parts are read from the data.
-        let D::JsDocLinkPlain(d) = ast_data_of(node) else {
-            panic!("AsJSDocLinkPlain called on {:?}", node.kind());
-        };
+        let text = with_ast_data(node, |d| match d {
+            D::JsDocLinkPlain(d) => d.text.clone(),
+            _ => panic!("AsJSDocLinkPlain called on {:?}", node.kind()),
+        });
         clone_node_from(
-            self.new_js_doc_link_plain(node.name(), d.text.clone()),
+            self.new_js_doc_link_plain(node.name(), text),
             node,
             self.hooks(),
         )
@@ -2179,11 +2175,12 @@ impl NodeFactory {
     fn clone_js_doc_link_code(&self, node: Node) -> Node {
         // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
         // parts are read from the data.
-        let D::JsDocLinkCode(d) = ast_data_of(node) else {
-            panic!("AsJSDocLinkCode called on {:?}", node.kind());
-        };
+        let text = with_ast_data(node, |d| match d {
+            D::JsDocLinkCode(d) => d.text.clone(),
+            _ => panic!("AsJSDocLinkCode called on {:?}", node.kind()),
+        });
         clone_node_from(
-            self.new_js_doc_link_code(node.name(), d.text.clone()),
+            self.new_js_doc_link_code(node.name(), text),
             node,
             self.hooks(),
         )

@@ -1544,13 +1544,20 @@ impl Parser {
             || self.token == SyntaxKind::TemplateHead
     }
 
-    // Go: parser.go:5248 tryParseTypeArgumentsInExpression
+    // Go: parser.go:5247 tryParseTypeArgumentsInExpression
     pub fn try_parse_type_arguments_in_expression(&mut self) -> NodeList {
         // TypeArguments must not be parsed in JavaScript files to avoid ambiguity with binary operators.
-        let state = self.mark();
-        if !self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE)
-            && self.re_scan_less_than_token() == SyntaxKind::LessThanToken
+        // Check the cheap preconditions before saving the parser state: unless the current token is `<`
+        // (or `<<`, which reScanLessThanToken would split), there is nothing to speculatively parse and
+        // the mark/rewind would be a no-op.
+        if self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE)
+            || (self.token != SyntaxKind::LessThanToken
+                && self.token != SyntaxKind::LessThanLessThanToken)
         {
+            return NodeList::NIL;
+        }
+        let state = self.mark();
+        if self.re_scan_less_than_token() == SyntaxKind::LessThanToken {
             self.next_token();
             let type_arguments =
                 self.parse_delimited_list(ParsingContext::TypeArguments, Parser::parse_type);

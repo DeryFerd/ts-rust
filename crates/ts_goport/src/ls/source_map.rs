@@ -2,7 +2,7 @@
 
 use crate::ls::prelude::*;
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/source_map.go:12 getMappedLocation
     pub fn get_mapped_location(&self, file_name: &str, file_range: TextRange) -> lsproto::Location {
         let Some(start_pos) = self.try_get_source_position(file_name, file_range.pos()) else {
@@ -74,7 +74,7 @@ impl lsconv::Script for Option<Script> {
     }
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/source_map.go:52 getScript
     // PORT: Go returns `*script`; nil is `None`. Go passes the result as an
     // `lsconv.Script` even when it is nil, so `Option<Script>` implements
@@ -134,7 +134,11 @@ impl LanguageService {
         }
         Some(document_pos)
     }
+}
 
+// PORT: the generated position is read only by `getNonLocalDefinition`,
+// which runs on the dispatch thread, so these two stay on `NewProgram`.
+impl LanguageService {
     // Go: ls/source_map.go:92 tryGetGeneratedPosition
     pub fn try_get_generated_position(
         &self,

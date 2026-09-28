@@ -345,7 +345,7 @@ impl PackageJson {
 }
 
 // Go: core/version.go:8 version
-pub(crate) const TYPE_SCRIPT_VERSION: &str = "7.0.0-dev";
+pub(crate) const TYPE_SCRIPT_VERSION: &str = "7.1.0-dev";
 
 // Go: packagejson/cache.go:88 VersionPaths
 #[derive(Clone, Debug, Default)]

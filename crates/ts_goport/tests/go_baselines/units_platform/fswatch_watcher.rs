@@ -266,7 +266,7 @@ fn join(dir: &str, name: &str) -> String {
 
 // Go: watcher_test.go:137 newDirectWatcher
 fn new_direct_watcher(t: &T, dir: &str) -> Arc<DirWatch> {
-    let w = new_dir_watch(dir, new_debounce(), true);
+    let w = new_dir_watch(dir, dir, new_debounce(), true);
     let w2 = w.clone();
     t.cleanup(move || w2.destroy_debounce());
     w
@@ -1076,6 +1076,47 @@ fn test_subscribe_multiple_different_dirs() {
     });
 }
 
+// Go: watcher_test.go:1369 TestWatchDirectoriesBatch
+#[test]
+fn test_watch_directories_batch() {
+    run_for_each_watcher("TestWatchDirectoriesBatch", |t, wi| {
+        let dir1 = new_t_tmp_dir(t);
+        let dir2 = new_t_tmp_dir(t);
+        let r1 = Recorder::new(t);
+        let r2 = Recorder::new(t);
+
+        let opts1: Vec<Box<dyn WatchOption>> = vec![with_recursive()];
+        let opts2: Vec<Box<dyn WatchOption>> = vec![with_recursive()];
+        let watches = wi
+            .watch_directories(&[
+                fswatch::WatchDirectoryRequest {
+                    dir: dir1.clone(),
+                    callback: r1.callback(),
+                    options: &opts1,
+                },
+                fswatch::WatchDirectoryRequest {
+                    dir: dir2.clone(),
+                    callback: r2.callback(),
+                    options: &opts2,
+                },
+            ])
+            .unwrap_or_else(|e| fatal(e.error()));
+        t.cleanup(move || {
+            for watch in &watches {
+                let _ = watch.close();
+            }
+        });
+        std::thread::sleep(settle_sleep());
+
+        let f1 = sub_path(&dir1);
+        let f2 = sub_path(&dir2);
+        write_file(&f1, "a");
+        write_file(&f2, "b");
+        assert_event_sequence(&r1.next(r1.deadline()), &[w(UPDATE, &f1)]);
+        assert_event_sequence(&r2.next(r2.deadline()), &[w(UPDATE, &f2)]);
+    });
+}
+
 // ----- errors ------------------------------------------------------------
 
 // Go: watcher_test.go:1183 TestSubscribeMissingDirError
@@ -1511,7 +1552,7 @@ fn test_backend_run_returns_start_error() {
 // fresh dirWatch.
 #[test]
 fn test_dir_watch_error_implements_error() {
-    let dw = new_dir_watch("/unused", new_debounce(), false);
+    let dw = new_dir_watch("/unused", "/unused", new_debounce(), false);
     let err = DirWatchError {
         err: errors::new("boom"),
         dir_watch: dw.clone(),

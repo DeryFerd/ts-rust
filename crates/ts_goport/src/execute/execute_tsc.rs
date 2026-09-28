@@ -12,11 +12,12 @@
 //! orchestrator. Go `testing` is `TscCompilationHooks::testing` (`None`
 //! outside tests, see compile.rs).
 //!
-//! PORT: the program state is process-wide, so Go `compiler.NewProgram` is
-//! `crate::program::install_new_program`, as in build/worker.rs (see
+//! PORT: a plain `tsc` run has one program for the process, so Go
+//! `compiler.NewProgram` is `crate::program::install_new_program` (see
 //! PORTING.md "Program"). Call `tsc_compilation` once per process, on the
-//! thread that should own the program and the checker pool. Go catches no
-//! panic here; the bins guard unported code.
+//! thread that should own the program and the checker pool. A `-b` build
+//! makes one program version per project instead (build/build_task.rs). Go
+//! catches no panic here; the bins guard unported code.
 
 use crate::frontend::prelude::*;
 
@@ -27,7 +28,6 @@ use crate::emitter::program_emit::{WriteFile, WriteFileData};
 use crate::execute::build::command_line::parse_build_command_line;
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::build::orchestrator::{Options as OrchestratorOptions, new_orchestrator};
-use crate::execute::build::worker::{SystemParseConfigHost, WorkerLauncher};
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::incremental::incremental::{create_host, new_build_info_reader};
 use crate::execute::incremental::program::{
@@ -35,7 +35,7 @@ use crate::execute::incremental::program::{
 };
 use crate::execute::tsc::{
     CommandLineResult, CompileTimes, CompilerProgram, DiagnosticReporter, DiagnosticsReporter,
-    EmitInput, ExitStatus, ProgramLike, System, create_diagnostic_reporter,
+    EmitInput, ExitStatus, ProgramLike, System, SystemParseConfigHost, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, get_trace_with_writer_from_sys,
     print_build_help, print_help, print_version, write_config_file, write_str,
 };
@@ -53,8 +53,7 @@ use crate::execute::tsc::CommandLineTesting;
 // they allow.
 pub trait TscCompilationHooks {
     /// Whether a `-b` command line runs Go `tscBuildCompilation`. When
-    /// false, it is `unported!`: the build writes outputs, and its workers
-    /// re-run the bin.
+    /// false, it is `unported!`: the build writes outputs.
     fn build_mode(&self) -> bool {
         true
     }
@@ -148,8 +147,8 @@ fn stop_tracing(sys: &dyn System) {
 
 // Go: execute/tsc.go:52 CommandLine
 // PORT: Go parses the build command line here and passes it on; the port
-// passes the arguments, because the build workers get the same command line
-// (see `tsc_build_compilation`). `hooks.build_mode` and
+// passes the arguments, because `goport_build` calls
+// `tsc_build_compilation` with them too. `hooks.build_mode` and
 // `hooks.command_line_parsed` are the bin's steps (not in Go).
 pub fn command_line(
     ctx: &Context,
@@ -183,10 +182,9 @@ pub fn command_line(
 // Go: execute/tsc.go:90 tscBuildCompilation
 // PORT: Go `CommandLine` parses the build command line and passes it in;
 // here it is the first step, which runs in the same order.
-// `command_line_args` is the full command line (Go `commandLineArgs`),
-// which the build workers get too (build/worker.rs).
-// PORT: testing. A test's `build_worker_runner` replaces the build worker
-// process (see `BuildWorkerRunner`).
+// `command_line_args` is the full command line (Go `commandLineArgs`).
+// PORT: the orchestrator compiles every project in this process, on this
+// thread (build/build_task.rs).
 pub fn tsc_build_compilation(
     ctx: &Context,
     sys: Rc<dyn System>,
@@ -227,15 +225,9 @@ pub fn tsc_build_compilation(
         return result(ExitStatus::Success);
     }
 
-    let mut worker = WorkerLauncher::current(command_line_args.to_vec());
-    // PORT: testing
-    worker.runner = testing
-        .as_ref()
-        .and_then(|testing| testing.build_worker_runner());
     let orchestrator = Box::new(new_orchestrator(OrchestratorOptions {
         sys,
         command: Rc::new(build_command),
-        worker,
         testing,
     }));
     orchestrator.start(ctx)
@@ -711,9 +703,9 @@ fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &
 // runs on the checker threads, so the callback must be `Send` and cannot
 // hold the `Rc` file system. Both wrappers pass a write of a real path to
 // osvfs (cachedvfs.go:148 WriteFile), so this writes with the osvfs of the
-// calling thread, like `new_task_write_file` in build/worker.rs without the
-// build info tracking. There is no outDir or input guard: tsgo writes next
-// to the sources or into outDir, as Go does.
+// calling thread, like `new_task_write_file` in build/build_task.rs without
+// the build info tracking. There is no outDir or input guard: tsgo writes
+// next to the sources or into outDir, as Go does.
 pub(crate) fn os_write_file() -> WriteFile {
     Arc::new(
         |file_name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {

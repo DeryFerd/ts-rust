@@ -9,32 +9,33 @@
 //! `order` on up to `numRoutines` goroutines; each goroutine takes the next
 //! task in order, waits for its upstream tasks, builds, and then waits for
 //! the previous task to report before it reports. Tasks here are
-//! `Rc<RefCell<BuildTask>>` on one thread (see build_task.rs), and only the
-//! compile runs elsewhere, in a worker process (plan D1). `build_all_tasks`
-//! keeps the Go schedule: at most `numRoutines` tasks are taken and not yet
-//! reported, a task starts when its upstream tasks are done, workers run in
-//! parallel, and tasks report in `order`.
+//! `Rc<RefCell<BuildTask>>` on this thread, which makes, emits and releases
+//! the program of every task (see build_task.rs). `build_all_tasks` keeps
+//! the Go schedule: at most `numRoutines` tasks are taken and not yet
+//! reported, and tasks report in `order`. A taken task starts when its
+//! upstream tasks are done, and a task that compiles makes its program at
+//! once (`build_project_start`) and starts its check on the program's
+//! checker threads, so the checkers of the started tasks work at the same
+//! time, as the Go goroutines do. The started tasks emit one at a time, the
+//! first in `order` first (`build_project_finish`). So a task that runs
+//! beside others in Go reads the file system before they write their
+//! outputs. Every task uses `o.host` and its caches (parsed `.d.ts` and
+//! `.json` files, configs, the cached file system, the mtimes), as in Go.
+//! Each program is released when its task reports; its checker threads
+//! free it in the background.
 //!
-//! PORT: Go shares `o.host`'s cached file system with every task. Each
-//! worker gets the orchestrator's cache when it starts, and its additions
-//! are merged back when its program is made and when its result arrives
-//! (see shared_fs.rs, which also says what stays timing dependent).
+//! PORT: the task keeps its project statistics (see build_task.rs), and
+//! `report_task` adds them to the aggregate `--diagnostics` and
+//! `--extendedDiagnostics` statistics.
 //!
-//! PORT: a build worker sends its project statistics back in its result
-//! (see build_task.rs), and `report_task` adds them to the aggregate
-//! `--diagnostics` and `--extendedDiagnostics` statistics.
-//!
-//! PORT: testing. `opts.testing` is `None` outside tests. A test that runs
-//! the build workers itself (`CommandLineTesting::build_worker_runner`)
-//! gets them one at a time on this thread (see `build_all_tasks`).
+//! PORT: testing. `opts.testing` is `None` outside tests. A test compiles
+//! each started task to the end at once, in build order, so the one test
+//! file system and clock see one ordered sequence (see `build_all_tasks`).
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::BuildHost;
-use crate::execute::build::worker::{
-    WorkerLauncher, compare_paths_options_of_sys, marshal_worker_fs_cache,
-};
-use crate::execute::incremental::build_info::BuildInfo;
+use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::new_build_info_reader;
 use crate::execute::tsc::compile::{
     CommandLineResult, ExitStatus, System, Watcher, Writer, write_str,
@@ -49,15 +50,12 @@ use crate::frontend::prelude::*;
 use crate::gostd::Context;
 // PORT: testing
 use crate::execute::tsc::compile::CommandLineTesting;
-use std::sync::mpsc;
 use std::time::SystemTime;
 
 // Go: build/orchestrator.go:25 Options
-// PORT: `worker` starts the build worker processes (plan D1).
 pub struct Options {
     pub sys: Rc<dyn System>,
     pub command: Rc<ParsedBuildCommandLine>,
-    pub worker: WorkerLauncher,
     // PORT: testing. `None` outside tests.
     pub testing: Option<Rc<dyn CommandLineTesting>>,
 }
@@ -159,7 +157,7 @@ impl Orchestrator {
 
     // Go: build/orchestrator.go:91 (*Orchestrator).resolveBuildInfoFileName
     pub fn resolve_build_info_file_name(&self, file_name: &str, build_info_dir: &str) -> String {
-        if !file_name.starts_with('.') {
+        if is_build_info_file_name_default_library(file_name) {
             return combine_paths(
                 &CompilerHost::default_library_path(&*self.host),
                 &[file_name],
@@ -413,14 +411,8 @@ impl Orchestrator {
         enum State {
             NotTaken,
             Waiting,
-            Running,
+            Compiling,
             Done,
-        }
-        // A running worker sends its program's file system cache entries
-        // before its result (see shared_fs.rs).
-        enum WorkerMessage {
-            ProgramFsCache(CachedFsState),
-            Done(WorkerCompileResult),
         }
         let num_routines = self.num_routines();
         if num_routines <= 0 {
@@ -428,6 +420,8 @@ impl Orchestrator {
         }
         let num_routines = num_routines as usize;
         let clean = self.opts.command.build_options.clean.is_true();
+        // PORT: testing (see the top comment)
+        let testing = self.opts.testing.is_some();
         let paths: Vec<Path> = self.order.iter().map(|c| self.to_path(c)).collect();
         let index_of: FxHashMap<Path, usize> = paths
             .iter()
@@ -435,21 +429,17 @@ impl Orchestrator {
             .map(|(i, p)| (p.clone(), i))
             .collect();
         let mut states = vec![State::NotTaken; paths.len()];
-        let (tx, rx) = mpsc::channel::<(usize, WorkerMessage)>();
         let mut next_task = 0;
         let mut next_report = 0;
-        let mut taken = 0;
         while next_report < paths.len() {
-            let mut progressed = false;
             // Each free goroutine takes the next task in order.
-            while taken < num_routines && next_task < paths.len() {
+            while next_task - next_report < num_routines && next_task < paths.len() {
                 states[next_task] = State::Waiting;
                 next_task += 1;
-                taken += 1;
-                progressed = true;
             }
             // A taken task starts once its upstream tasks are done
-            // (Go `waitOnUpstream`; `cleanProject` does not wait).
+            // (Go `waitOnUpstream`; `cleanProject` does not wait). A task
+            // that compiles makes its program now.
             for index in next_report..next_task {
                 if states[index] != State::Waiting {
                     continue;
@@ -466,89 +456,45 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                progressed = true;
                 let mut task = task.borrow_mut();
                 task.result = Some(TaskResult::new(
                     self.create_task_builder_status_reporter(),
                     self.create_task_diagnostic_reporter(),
                 ));
-                if clean {
+                states[index] = if clean {
                     task.clean_project(self, &paths[index]);
-                    states[index] = State::Done;
-                } else if task.build_project_start(self, &paths[index]) {
-                    // PORT: testing. The test's worker runner runs here, on
-                    // this thread, one task at a time. Its messages apply in
-                    // the order of the channel path below: each program
-                    // cache, then the result.
-                    if self.opts.worker.runner.is_some() {
-                        let config = task.config.clone();
-                        let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
-                        let result = self.opts.worker.run(&config, &fs_cache, &mut |state| {
-                            self.host.cached_fs.load_state(&state);
-                        });
-                        self.host.cached_fs.load_state(&result.fs_cache);
-                        let emitted_files = result.emitted_files.clone();
-                        task.build_project_finish(self, &paths[index], result);
-                        self.on_worker_emitted_files(&emitted_files);
-                        states[index] = State::Done;
-                        continue;
-                    }
-                    let worker = self.opts.worker.clone();
-                    let config = task.config.clone();
-                    let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
-                    let tx = tx.clone();
-                    std::thread::spawn(move || {
-                        let result = worker.run(&config, &fs_cache, &mut |state| {
-                            let _ = tx.send((index, WorkerMessage::ProgramFsCache(state)));
-                        });
-                        let _ = tx.send((index, WorkerMessage::Done(result)));
-                    });
-                    states[index] = State::Running;
+                    State::Done
+                } else if !task.build_project_start(self, &paths[index]) {
+                    State::Done
+                } else if testing {
+                    task.build_project_finish(self, &paths[index]);
+                    State::Done
                 } else {
-                    states[index] = State::Done;
-                }
+                    State::Compiling
+                };
             }
             // Tasks report in order.
+            let mut reported = false;
             while next_report < next_task && states[next_report] == State::Done {
                 let task = self.get_task(&paths[next_report]);
                 self.report_task(&mut task.borrow_mut(), build_result);
                 next_report += 1;
-                taken -= 1;
-                progressed = true;
+                reported = true;
             }
-            if !progressed {
-                let (index, message) = rx.recv().expect("a build worker is running");
-                let result = match message {
-                    WorkerMessage::Done(result) => result,
-                    WorkerMessage::ProgramFsCache(program_fs_cache) => {
-                        self.host.cached_fs.load_state(&program_fs_cache);
-                        continue;
-                    }
-                };
-                self.host.cached_fs.load_state(&result.fs_cache);
-                let task = self.get_task(&paths[index]);
-                // PORT: testing
-                let emitted_files = self
-                    .opts
-                    .testing
-                    .as_ref()
-                    .map(|_| result.emitted_files.clone());
-                task.borrow_mut()
-                    .build_project_finish(self, &paths[index], result);
-                if let Some(emitted_files) = emitted_files {
-                    self.on_worker_emitted_files(&emitted_files);
-                }
-                states[index] = State::Done;
+            if reported {
+                continue;
             }
-        }
-    }
-
-    // PORT: testing. The orchestrator part of Go `OnEmittedFiles` for a
-    // worker's result: Go passes `TestingMTimesCache: orchestrator.host.mTimes`
-    // (buildtask.go:229-230). It runs after the result is applied.
-    fn on_worker_emitted_files(&self, emitted_files: &[String]) {
-        if let Some(testing) = &self.opts.testing {
-            testing.on_worker_emitted_files(emitted_files, &self.host.m_times);
+            // The first task that has not reported has its upstream tasks
+            // reported, so it has started. It is not done, so it compiles.
+            // It emits now, before the other started tasks.
+            assert!(
+                states[next_report] == State::Compiling,
+                "the first unreported build task has not started"
+            );
+            let task = self.get_task(&paths[next_report]);
+            task.borrow_mut()
+                .build_project_finish(self, &paths[next_report]);
+            states[next_report] = State::Done;
         }
     }
 
@@ -570,10 +516,11 @@ impl Orchestrator {
         // delete files that are no longer needed
         match result.build_kind {
             BuildKind::Program => {
-                // PORT: testing. Go `Testing.OnProgram(t.result.program)`
-                // (buildtask.go:109); the program is in the worker.
-                if let Some(testing) = &self.opts.testing {
-                    testing.on_build_task_program(&task.config);
+                // PORT: testing. The program is current for the call, as
+                // the test reads its files.
+                if let (Some(testing), Some(program)) = (&self.opts.testing, &result.program) {
+                    let _scope = crate::core::enter_program(Some(program.get_program()));
+                    testing.on_program(program);
                 }
                 build_result.statistics.projects_built += 1
             }
@@ -581,6 +528,10 @@ impl Orchestrator {
             BuildKind::None => {}
         }
         build_result.files_to_delete.extend(result.files_to_delete);
+        // Go drops `t.result` here (`t.result = nil`).
+        if let Some(program) = result.program {
+            release_task_program(program);
+        }
     }
 
     // Go: build/orchestrator.go:584 (*Orchestrator).getWriter with a nil task
@@ -692,15 +643,12 @@ impl BuildTaskOrchestrator for Orchestrator {
             .map(Rc::new)
     }
 
-    fn compile_and_emit_in_worker(&self, config: &str, _config_path: &Path) -> WorkerCompileResult {
-        let fs_cache = marshal_worker_fs_cache(&self.host.cached_fs.state());
-        let result = self.opts.worker.run(config, &fs_cache, &mut |state| {
-            self.host.cached_fs.load_state(&state);
-        });
-        self.host.cached_fs.load_state(&result.fs_cache);
-        // PORT: testing. The task applies the result after this returns.
-        self.on_worker_emitted_files(&result.emitted_files);
-        result
+    fn sys(&self) -> Rc<dyn System> {
+        self.opts.sys.clone()
+    }
+
+    fn host(&self) -> Rc<BuildHost> {
+        self.host.clone()
     }
 
     // PORT: testing
@@ -717,7 +665,11 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         opts.sys.writer(),
         Box::new(move |path: &str| fs.directory_exists(path)),
     );
-    let compare_paths_options = compare_paths_options_of_sys(&*opts.sys);
+    // Go: the `comparePathsOptions` field of the `Orchestrator` literal.
+    let compare_paths_options = ComparePathsOptions {
+        current_directory: opts.sys.get_current_directory(),
+        use_case_sensitive_file_names: opts.sys.fs().use_case_sensitive_file_names(),
+    };
     let host = Rc::new(BuildHost::new(
         opts.sys.clone(),
         opts.command.clone(),

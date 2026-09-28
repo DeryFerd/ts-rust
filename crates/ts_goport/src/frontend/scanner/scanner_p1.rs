@@ -543,7 +543,6 @@ pub struct Scanner {
     pub(crate) skip_trivia: bool,
     pub(crate) scanner_state: ScannerState,
 
-    pub(crate) contains_non_ascii: bool,
     // PORT: maps a token value to its interned `jsnum` string, so a hit
     // needs no second intern lookup.
     pub(crate) number_cache: FxHashMap<&'static str, &'static str>,
@@ -556,7 +555,7 @@ pub struct Scanner {
     pub(crate) comment_directives: Vec<CommentDirective>,
 }
 
-// Go: scanner/scanner.go:218 defaultScanner
+// Go: scanner/scanner.go:217 defaultScanner
 pub(crate) fn default_scanner() -> Scanner {
     // Using a function rather than a global is intentional; this function is
     // inlined as pure code (zeroing + moves), whereas a global requires write
@@ -569,7 +568,6 @@ pub(crate) fn default_scanner() -> Scanner {
         on_error: None,
         skip_trivia: true,
         scanner_state: ScannerState::default(),
-        contains_non_ascii: false,
         number_cache: FxHashMap::default(),
         hex_number_cache: FxHashMap::default(),
         hex_digit_cache: FxHashMap::default(),
@@ -718,14 +716,6 @@ impl Scanner {
         self.scanner_state
             .token_flags
             .intersects(TokenFlags::UNICODE_ESCAPE)
-    }
-
-    // Go: scanner/scanner.go:328 ContainsNonASCII
-    // ContainsNonASCII returns true if the scanner encountered any non-ASCII bytes
-    // during scanning. This is useful for determining whether UTF-8 byte offsets
-    // may differ from UTF-16 code unit offsets.
-    pub fn contains_non_ascii(&self) -> bool {
-        self.contains_non_ascii
     }
 
     // Go: scanner/scanner.go:332 HasExtendedUnicodeEscape
@@ -903,7 +893,7 @@ impl Scanner {
         -1
     }
 
-    // Go: scanner/scanner.go:449 charAndSize
+    // Go: scanner/scanner.go:441 charAndSize
     pub(crate) fn char_and_size(&mut self) -> (i32, i32) {
         // Fast path: a single ASCII byte. The vast majority of source bytes are
         // ASCII; handling them here avoids constructing a string slice header and
@@ -914,11 +904,7 @@ impl Scanner {
                 return (i32::from(b), 1);
             }
         }
-        let (r, size) = utf8_decode_rune_in_string(&self.text, self.scanner_state.pos as usize);
-        if size > 1 {
-            self.contains_non_ascii = true;
-        }
-        (r, size)
+        utf8_decode_rune_in_string(&self.text, self.scanner_state.pos as usize)
     }
 
     /// The position of the first `*/` at or after `pos`, and the position

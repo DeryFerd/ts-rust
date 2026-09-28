@@ -2195,6 +2195,15 @@ impl RegistryBuilder {
                 );
                 result.is_symlinked = true;
             }
+            // PORT: Go parses these files on goroutines, so a request never
+            // waits for them. Here they run on the dispatch thread, and the
+            // next request waits for this loop. So a canceled context stops it
+            // before each file. A canceled context discards the whole build
+            // (every bucket build then sets its error, and a canceled warm
+            // drops its clone), so returning early changes no result.
+            if ctx.err().is_some() {
+                return None;
+            }
             // Go: wg.Go(func() {...})
             let file = self
                 .host
@@ -2206,6 +2215,11 @@ impl RegistryBuilder {
         }
         // Go: wg.Wait()
         root_files.retain(|f| f.is_some());
+        // PORT: see the check in the loop above. `new_checker` also reads the
+        // files that the root files import.
+        if ctx.err().is_some() {
+            return None;
+        }
 
         let failed_targets = result.failed_ambient_module_lookup_targets.clone();
         let failed_sources = result.failed_ambient_module_lookup_sources.clone();

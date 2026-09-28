@@ -45,6 +45,13 @@ child_test! {
                 capabilities: Some(lsproto::ClientCapabilities {
                     text_document: Some(lsproto::TextDocumentClientCapabilities {
                         semantic_tokens: Some(lsproto::SemanticTokensClientCapabilities {
+                            requests: Some(lsproto::ClientSemanticTokensRequestOptions {
+                                full: Some(lsproto::BooleanOrClientSemanticTokensRequestFullDelta {
+                                    boolean: Some(true),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
                             token_types: strings(&[
                                 "namespace", "type", "class", "enum", "interface", "struct", "typeParameter",
                                 "parameter", "variable", "property", "enumMember", "event", "function", "method",

@@ -886,6 +886,7 @@ pub fn try_get_containing_jsx_element(context_token: Node, file: Node) -> Node {
         | SyntaxKind::SlashToken
         | SyntaxKind::Identifier
         | SyntaxKind::PropertyAccessExpression
+        | SyntaxKind::JsxNamespacedName
         | SyntaxKind::JsxAttributes
         | SyntaxKind::JsxAttribute
         | SyntaxKind::JsxSpreadAttribute => {
@@ -903,6 +904,13 @@ pub fn try_get_containing_jsx_element(context_token: Node, file: Node) -> Node {
                     }
                 }
                 return parent;
+            } else if parent.is_some()
+                && is_jsx_namespaced_name(parent)
+                && parent.parent().is_some()
+                && (parent.parent().kind() == SyntaxKind::JsxSelfClosingElement
+                    || parent.parent().kind() == SyntaxKind::JsxOpeningElement)
+            {
+                return parent.parent();
             } else if parent.is_some() && parent.kind() == SyntaxKind::JsxAttribute {
                 // Currently we parse JsxOpeningLikeElement as:
                 //      JsxOpeningLikeElement

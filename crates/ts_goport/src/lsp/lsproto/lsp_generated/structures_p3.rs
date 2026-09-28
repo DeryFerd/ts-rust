@@ -8,206 +8,6 @@ use crate::lsp::lsproto::prelude::*;
 
 // Structures
 
-// Diagnostic options.
-//
-// Since: 3.17.0
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct DiagnosticOptions {
-    pub work_done_progress: Option<bool>,
-
-    // An optional identifier under which the diagnostics are
-    // managed by the client.
-    pub identifier: Option<String>,
-
-    // Whether the language has inter file dependencies meaning that
-    // editing code in one file can result in a different diagnostic
-    // set in another file. Inter file dependencies are common for
-    // most programming languages and typically uncommon for linters.
-    pub inter_file_dependencies: bool,
-
-    // The server provides support for workspace diagnostics as well.
-    pub workspace_diagnostics: bool,
-}
-
-impl UnmarshalerFrom for DiagnosticOptions {
-    // Go: (s *DiagnosticOptions) UnmarshalJSONFrom
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        const MISSING_INTER_FILE_DEPENDENCIES: u64 = 1 << 0;
-        const MISSING_WORKSPACE_DIAGNOSTICS: u64 = 1 << 1;
-        const _MISSING_LAST: u64 = 1 << 2;
-        let mut missing = _MISSING_LAST - 1;
-
-        let k = dec.peek_kind();
-        if k != b'{' {
-            return Err(err_not_object(k));
-        }
-        dec.read_token()?;
-
-        while dec.peek_kind() != b'}' {
-            let name = dec.read_value()?;
-            match name {
-                b"\"workDoneProgress\"" => {
-                    if dec.peek_kind() == b'n' {
-                        return Err(err_null("workDoneProgress"));
-                    }
-                    json_unmarshal_decode(dec, &mut self.work_done_progress)?;
-                }
-                b"\"identifier\"" => {
-                    if dec.peek_kind() == b'n' {
-                        return Err(err_null("identifier"));
-                    }
-                    json_unmarshal_decode(dec, &mut self.identifier)?;
-                }
-                b"\"interFileDependencies\"" => {
-                    missing &= !MISSING_INTER_FILE_DEPENDENCIES;
-                    json_unmarshal_decode(dec, &mut self.inter_file_dependencies)?;
-                }
-                b"\"workspaceDiagnostics\"" => {
-                    missing &= !MISSING_WORKSPACE_DIAGNOSTICS;
-                    json_unmarshal_decode(dec, &mut self.workspace_diagnostics)?;
-                }
-                _ => {
-                    dec.skip_value()?;
-                }
-            }
-        }
-
-        dec.read_token()?;
-
-        if missing != 0 {
-            let mut missing_props: Vec<String> = Vec::new();
-            if missing & MISSING_INTER_FILE_DEPENDENCIES != 0 {
-                missing_props.push("interFileDependencies".to_string());
-            }
-            if missing & MISSING_WORKSPACE_DIAGNOSTICS != 0 {
-                missing_props.push("workspaceDiagnostics".to_string());
-            }
-            return Err(err_missing(&missing_props));
-        }
-
-        Ok(())
-    }
-}
-
-impl MarshalerTo for DiagnosticOptions {
-    // PORT: Go marshals DiagnosticOptions with the JSON v2 default struct arshaler.
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        write_object_start(enc);
-        let mut first = true;
-        marshal_opt_field(
-            enc,
-            &mut first,
-            "workDoneProgress",
-            &self.work_done_progress,
-        )?;
-        marshal_opt_field(enc, &mut first, "identifier", &self.identifier)?;
-        marshal_field(
-            enc,
-            &mut first,
-            "interFileDependencies",
-            &self.inter_file_dependencies,
-        )?;
-        marshal_field(
-            enc,
-            &mut first,
-            "workspaceDiagnostics",
-            &self.workspace_diagnostics,
-        )?;
-        write_object_end(enc);
-        Ok(())
-    }
-}
-
-impl IsZero for DiagnosticOptions {
-    // PORT: Go reflect.Value.IsZero (omitzero).
-    fn is_zero(&self) -> bool {
-        self.work_done_progress.is_none()
-            && self.identifier.is_none()
-            && !self.inter_file_dependencies
-            && !self.workspace_diagnostics
-    }
-}
-
-// A previous result id in a workspace pull request.
-//
-// Since: 3.17.0
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct PreviousResultId {
-    // The URI for which the client knowns a
-    // result id.
-    pub uri: DocumentUri,
-
-    // The value of the previous result id.
-    pub value: String,
-}
-
-impl UnmarshalerFrom for PreviousResultId {
-    // Go: (s *PreviousResultId) UnmarshalJSONFrom
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        const MISSING_URI: u64 = 1 << 0;
-        const MISSING_VALUE: u64 = 1 << 1;
-        const _MISSING_LAST: u64 = 1 << 2;
-        let mut missing = _MISSING_LAST - 1;
-
-        let k = dec.peek_kind();
-        if k != b'{' {
-            return Err(err_not_object(k));
-        }
-        dec.read_token()?;
-
-        while dec.peek_kind() != b'}' {
-            let name = dec.read_value()?;
-            match name {
-                b"\"uri\"" => {
-                    missing &= !MISSING_URI;
-                    json_unmarshal_decode(dec, &mut self.uri)?;
-                }
-                b"\"value\"" => {
-                    missing &= !MISSING_VALUE;
-                    json_unmarshal_decode(dec, &mut self.value)?;
-                }
-                _ => {
-                    dec.skip_value()?;
-                }
-            }
-        }
-
-        dec.read_token()?;
-
-        if missing != 0 {
-            let mut missing_props: Vec<String> = Vec::new();
-            if missing & MISSING_URI != 0 {
-                missing_props.push("uri".to_string());
-            }
-            if missing & MISSING_VALUE != 0 {
-                missing_props.push("value".to_string());
-            }
-            return Err(err_missing(&missing_props));
-        }
-
-        Ok(())
-    }
-}
-
-impl MarshalerTo for PreviousResultId {
-    // PORT: Go marshals PreviousResultId with the JSON v2 default struct arshaler.
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        write_object_start(enc);
-        let mut first = true;
-        marshal_field(enc, &mut first, "uri", &self.uri)?;
-        marshal_field(enc, &mut first, "value", &self.value)?;
-        write_object_end(enc);
-        Ok(())
-    }
-}
-
-impl IsZero for PreviousResultId {
-    // PORT: Go reflect.Value.IsZero (omitzero).
-    fn is_zero(&self) -> bool {
-        self.uri.0.is_empty() && self.value.is_empty()
-    }
-}
-
 // An item to transfer a text document from the client to the
 // server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -6503,6 +6303,184 @@ impl IsZero for FileOperationPattern {
     // PORT: Go reflect.Value.IsZero (omitzero).
     fn is_zero(&self) -> bool {
         self.glob.is_empty() && self.matches.is_none() && self.options.is_none()
+    }
+}
+
+// A diagnostic report with a full set of problems.
+//
+// Since: 3.17.0
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FullDocumentDiagnosticReport {
+    // A full document diagnostic report.
+    pub kind: StringLiteralFull,
+
+    // An optional result id. If provided it will
+    // be sent on the next diagnostic request for the
+    // same document.
+    pub result_id: Option<String>,
+
+    // The actual items.
+    pub items: Vec<Diagnostic>,
+}
+
+impl UnmarshalerFrom for FullDocumentDiagnosticReport {
+    // Go: (s *FullDocumentDiagnosticReport) UnmarshalJSONFrom
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        const MISSING_KIND: u64 = 1 << 0;
+        const MISSING_ITEMS: u64 = 1 << 1;
+        const _MISSING_LAST: u64 = 1 << 2;
+        let mut missing = _MISSING_LAST - 1;
+
+        let k = dec.peek_kind();
+        if k != b'{' {
+            return Err(err_not_object(k));
+        }
+        dec.read_token()?;
+
+        while dec.peek_kind() != b'}' {
+            let name = dec.read_value()?;
+            match name {
+                b"\"kind\"" => {
+                    missing &= !MISSING_KIND;
+                    json_unmarshal_decode(dec, &mut self.kind)?;
+                }
+                b"\"resultId\"" => {
+                    if dec.peek_kind() == b'n' {
+                        return Err(err_null("resultId"));
+                    }
+                    json_unmarshal_decode(dec, &mut self.result_id)?;
+                }
+                b"\"items\"" => {
+                    missing &= !MISSING_ITEMS;
+                    if dec.peek_kind() == b'n' {
+                        return Err(err_null("items"));
+                    }
+                    json_unmarshal_decode(dec, &mut self.items)?;
+                }
+                _ => {
+                    dec.skip_value()?;
+                }
+            }
+        }
+
+        dec.read_token()?;
+
+        if missing != 0 {
+            let mut missing_props: Vec<String> = Vec::new();
+            if missing & MISSING_KIND != 0 {
+                missing_props.push("kind".to_string());
+            }
+            if missing & MISSING_ITEMS != 0 {
+                missing_props.push("items".to_string());
+            }
+            return Err(err_missing(&missing_props));
+        }
+
+        Ok(())
+    }
+}
+
+impl MarshalerTo for FullDocumentDiagnosticReport {
+    // PORT: Go marshals FullDocumentDiagnosticReport with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "kind", &self.kind)?;
+        marshal_opt_field(enc, &mut first, "resultId", &self.result_id)?;
+        marshal_field(enc, &mut first, "items", &self.items)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl IsZero for FullDocumentDiagnosticReport {
+    // PORT: Go reflect.Value.IsZero (omitzero).
+    fn is_zero(&self) -> bool {
+        self.kind.is_zero() && self.result_id.is_none() && self.items.is_empty()
+    }
+}
+
+// A diagnostic report indicating that the last returned
+// report is still accurate.
+//
+// Since: 3.17.0
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct UnchangedDocumentDiagnosticReport {
+    // A document diagnostic report indicating
+    // no changes to the last result. A server can
+    // only return `unchanged` if result ids are
+    // provided.
+    pub kind: StringLiteralUnchanged,
+
+    // A result id which will be sent on the next
+    // diagnostic request for the same document.
+    pub result_id: String,
+}
+
+impl UnmarshalerFrom for UnchangedDocumentDiagnosticReport {
+    // Go: (s *UnchangedDocumentDiagnosticReport) UnmarshalJSONFrom
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        const MISSING_KIND: u64 = 1 << 0;
+        const MISSING_RESULT_ID: u64 = 1 << 1;
+        const _MISSING_LAST: u64 = 1 << 2;
+        let mut missing = _MISSING_LAST - 1;
+
+        let k = dec.peek_kind();
+        if k != b'{' {
+            return Err(err_not_object(k));
+        }
+        dec.read_token()?;
+
+        while dec.peek_kind() != b'}' {
+            let name = dec.read_value()?;
+            match name {
+                b"\"kind\"" => {
+                    missing &= !MISSING_KIND;
+                    json_unmarshal_decode(dec, &mut self.kind)?;
+                }
+                b"\"resultId\"" => {
+                    missing &= !MISSING_RESULT_ID;
+                    json_unmarshal_decode(dec, &mut self.result_id)?;
+                }
+                _ => {
+                    dec.skip_value()?;
+                }
+            }
+        }
+
+        dec.read_token()?;
+
+        if missing != 0 {
+            let mut missing_props: Vec<String> = Vec::new();
+            if missing & MISSING_KIND != 0 {
+                missing_props.push("kind".to_string());
+            }
+            if missing & MISSING_RESULT_ID != 0 {
+                missing_props.push("resultId".to_string());
+            }
+            return Err(err_missing(&missing_props));
+        }
+
+        Ok(())
+    }
+}
+
+impl MarshalerTo for UnchangedDocumentDiagnosticReport {
+    // PORT: Go marshals UnchangedDocumentDiagnosticReport with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "kind", &self.kind)?;
+        marshal_field(enc, &mut first, "resultId", &self.result_id)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl IsZero for UnchangedDocumentDiagnosticReport {
+    // PORT: Go reflect.Value.IsZero (omitzero).
+    fn is_zero(&self) -> bool {
+        self.kind.is_zero() && self.result_id.is_empty()
     }
 }
 

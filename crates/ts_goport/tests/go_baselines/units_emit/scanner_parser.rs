@@ -1,10 +1,13 @@
 //! Ports of internal/scanner/scanner_test.go and
-//! internal/parser/parser_test.go (TestJSDocImportTypeParentChain; the Go
-//! benchmark and fuzz target are not ported).
+//! internal/parser/parser_test.go (TestJSDocImportTypeParentChain and
+//! TestSourceFileContainsNonASCIIInStringLiteralFastPath; the Go benchmark
+//! and fuzz target are not ported).
 
 use super::childprog::in_child;
 use super::leak;
-use ts_goport::ast::{get_reparsed_node_for_node, get_source_file_of_node};
+use ts_goport::ast::{
+    get_reparsed_node_for_node, get_source_file_of_node, source_file_get_position_map,
+};
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::scanner::new_scanner;
 use ts_goport::frontend::tspath::Path;
@@ -98,4 +101,37 @@ test("", async function () {
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+// Go: parser/parser_test.go:212 TestSourceFileContainsNonASCIIInStringLiteralFastPath
+// PORT: `file.GetPositionMap()` of a file with no program reads the flag
+// from the node store (`source_file_get_position_map`).
+#[test]
+fn test_source_file_contains_non_ascii_in_string_literal_fast_path() {
+    let source_text = "const x = \"─\";
+
+namespace N {
+  export const y = x;
+}
+";
+    let opts = SourceFileParseOptions {
+        file_name: "/index.ts".to_string(),
+        path: Path("/index.ts".to_string()),
+        ..Default::default()
+    };
+
+    let file = parse_source_file(&opts, leak(source_text), ScriptKind::TS);
+
+    assert!(file.contains_non_ascii);
+    let position_map = source_file_get_position_map(file.root);
+    assert!(!position_map.is_ascii_only());
+    let after_box_drawing_character = (source_text.find('─').unwrap() + '─'.len_utf8()) as i32;
+    assert_eq!(
+        position_map.utf8_to_utf16(after_box_drawing_character),
+        after_box_drawing_character - 2
+    );
+    assert_eq!(
+        position_map.utf8_to_utf16(source_text.len() as i32),
+        source_text.len() as i32 - 2
+    );
 }

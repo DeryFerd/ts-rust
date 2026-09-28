@@ -1370,6 +1370,8 @@ pub struct BuildInfo {
     pub errors: bool,
     pub check_pending: bool,
     pub root: Option<Vec<BuildInfoRoot>>,
+    pub package_jsons: Option<Vec<String>>,
+    pub missing_package_jsons: Option<Vec<String>>,
 
     // IncrementalProgram info
     pub file_names: Option<Vec<String>>,
@@ -1396,6 +1398,8 @@ impl MarshalerTo for BuildInfo {
         w.bool_omitzero("errors", self.errors);
         w.bool_omitzero("checkPending", self.check_pending);
         w.slice_omitzero("root", self.root.as_ref())?;
+        w.slice_omitzero("packageJsons", self.package_jsons.as_ref())?;
+        w.slice_omitzero("missingPackageJsons", self.missing_package_jsons.as_ref())?;
         w.slice_omitzero("fileNames", self.file_names.as_ref())?;
         w.slice_omitzero("fileInfos", self.file_infos.as_ref())?;
         w.slice_omitzero("fileIdsList", self.file_ids_list.as_ref())?;
@@ -1444,6 +1448,10 @@ impl UnmarshalerFrom for BuildInfo {
                 "errors" => self.errors = unmarshal_bool(dec)?,
                 "checkPending" => self.check_pending = unmarshal_bool(dec)?,
                 "root" => self.root = unmarshal_slice(dec, unmarshal_elem)?,
+                "packageJsons" => self.package_jsons = unmarshal_slice(dec, unmarshal_string)?,
+                "missingPackageJsons" => {
+                    self.missing_package_jsons = unmarshal_slice(dec, unmarshal_string)?;
+                }
                 "fileNames" => self.file_names = unmarshal_slice(dec, unmarshal_string)?,
                 "fileInfos" => self.file_infos = unmarshal_slice(dec, unmarshal_elem)?,
                 "fileIdsList" => {
@@ -1496,16 +1504,26 @@ impl BuildInfo {
             .is_some_and(|names| !names.is_empty())
     }
 
-    // Go: incremental/buildInfo.go:500 fileName
+    // Go: incremental/buildInfo.go:502 fileName
+    // PORT: an id out of range gives "", as in Go.
     #[must_use]
     pub fn file_name(&self, file_id: BuildInfoFileId) -> &str {
-        &self.file_names.as_ref().expect("fileNames")[(file_id.0 - 1) as usize]
+        let file_names = self.file_names.as_deref().unwrap_or_default();
+        if file_id.0 < 1 || file_id.0 as usize > file_names.len() {
+            return "";
+        }
+        &file_names[(file_id.0 - 1) as usize]
     }
 
-    // Go: incremental/buildInfo.go:504 fileInfo
+    // Go: incremental/buildInfo.go:509 fileInfo
+    // PORT: an id out of range gives `None` (Go nil).
     #[must_use]
-    pub fn file_info(&self, file_id: BuildInfoFileId) -> &BuildInfoFileInfo {
-        &self.file_infos.as_ref().expect("fileInfos")[(file_id.0 - 1) as usize]
+    pub fn file_info(&self, file_id: BuildInfoFileId) -> Option<&BuildInfoFileInfo> {
+        let file_infos = self.file_infos.as_deref().unwrap_or_default();
+        if file_id.0 < 1 || file_id.0 as usize > file_infos.len() {
+            return None;
+        }
+        Some(&file_infos[(file_id.0 - 1) as usize])
     }
 
     // Go: incremental/buildInfo.go:508 GetCompilerOptions
@@ -1553,7 +1571,20 @@ impl BuildInfo {
         false
     }
 
-    // Go: incremental/buildInfo.go:537 GetBuildInfoRootInfoReader
+    // Go: incremental/buildInfo.go:544 GetPackageJsons
+    pub fn get_package_jsons(&self, build_info_directory: &str) -> impl Iterator<Item = String> {
+        get_normalized_paths(self.package_jsons.as_deref(), build_info_directory)
+    }
+
+    // Go: incremental/buildInfo.go:548 GetMissingPackageJsons
+    pub fn get_missing_package_jsons(
+        &self,
+        build_info_directory: &str,
+    ) -> impl Iterator<Item = String> {
+        get_normalized_paths(self.missing_package_jsons.as_deref(), build_info_directory)
+    }
+
+    // Go: incremental/buildInfo.go:562 GetBuildInfoRootInfoReader
     #[must_use]
     pub fn get_build_info_root_info_reader(
         &self,
@@ -1579,13 +1610,17 @@ impl BuildInfo {
 
         // Create map from resolvedRoot to Root
         for resolved in self.resolved_root.iter().flatten() {
-            resolved_to_root.insert(
-                to_path_fn(self.file_name(resolved.resolved)),
-                to_path_fn(self.file_name(resolved.root)),
-            );
+            let resolved_root = self.file_name(resolved.resolved);
+            let root = self.file_name(resolved.root);
+            if !resolved_root.is_empty() && !root.is_empty() {
+                resolved_to_root.insert(to_path_fn(resolved_root), to_path_fn(root));
+            }
         }
 
         let mut add_root = |resolved_root: &str, file_info: Option<&BuildInfoFileInfo>| {
+            if resolved_root.is_empty() {
+                return;
+            }
             let resolved_root_path = to_path_fn(resolved_root);
             if let Some(root_path) = resolved_to_root.get(&resolved_root_path) {
                 root_to_resolved.insert(root_path.clone(), resolved_root_path.clone());
@@ -1601,11 +1636,11 @@ impl BuildInfo {
             if !root.non_incremental.is_empty() {
                 add_root(&root.non_incremental, None);
             } else if root.end.0 == 0 {
-                add_root(self.file_name(root.start), Some(self.file_info(root.start)));
+                add_root(self.file_name(root.start), self.file_info(root.start));
             } else {
                 for i in root.start.0..=root.end.0 {
                     let i = BuildInfoFileId(i);
-                    add_root(self.file_name(i), Some(self.file_info(i)));
+                    add_root(self.file_name(i), self.file_info(i));
                 }
             }
         }
@@ -1617,7 +1652,26 @@ impl BuildInfo {
     }
 }
 
-// Go: incremental/buildInfo.go:579 BuildInfoRootInfoReader
+// Go: incremental/buildInfo.go:498 IsBuildInfoFileNameDefaultLibrary
+#[must_use]
+pub fn is_build_info_file_name_default_library(file_name: &str) -> bool {
+    !path_is_relative(file_name) && !path_is_absolute(file_name)
+}
+
+// Go: incremental/buildInfo.go:552 getNormalizedPaths
+// PORT: both lifetimes stay separate (edition 2024 captures both) so the
+// public getters can return this opaque type.
+fn get_normalized_paths(
+    paths: Option<&[String]>,
+    build_info_directory: &str,
+) -> impl Iterator<Item = String> {
+    paths
+        .unwrap_or_default()
+        .iter()
+        .map(move |path| get_normalized_absolute_path(path, build_info_directory))
+}
+
+// Go: incremental/buildInfo.go:613 BuildInfoRootInfoReader
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfoRootInfoReader {
     pub resolved_root_file_infos: FxHashMap<Path, BuildInfoFileInfo>,
@@ -1671,10 +1725,18 @@ mod tests {
             (BuildInfoFileId(2), BuildInfoFileId(3))
         );
         assert_eq!(root[2].non_incremental, "../x.ts");
-        assert!(info.file_info(BuildInfoFileId(1)).has_signature());
-        assert!(info.file_info(BuildInfoFileId(3)).no_signature.is_some());
+        assert!(info.file_info(BuildInfoFileId(1)).unwrap().has_signature());
+        assert!(
+            info.file_info(BuildInfoFileId(3))
+                .unwrap()
+                .no_signature
+                .is_some()
+        );
         assert_eq!(
-            info.file_info(BuildInfoFileId(4)).get_file_info().signature,
+            info.file_info(BuildInfoFileId(4))
+                .unwrap()
+                .get_file_info()
+                .signature,
             "v3"
         );
         let pending = info.affected_files_pending_emit.as_ref().unwrap();

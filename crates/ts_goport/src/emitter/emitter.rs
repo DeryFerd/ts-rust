@@ -623,7 +623,6 @@ pub fn get_script_transformers(
         || !options.get_isolated_modules()
         || options.emit_decorator_metadata.is_true()
     {
-        emit_resolver.mark_linked_references_recursively(source_file);
         Rc::new(EmitResolverReferenceResolver(emit_resolver.clone()))
     } else {
         Rc::new(new_binder_reference_resolver(

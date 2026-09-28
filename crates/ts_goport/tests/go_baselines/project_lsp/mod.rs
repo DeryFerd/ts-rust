@@ -1,7 +1,8 @@
 //! Rust port of the Go tests of `internal/project` (with `ata`,
 //! `background`, `dirty`, `logging`), `internal/lsp` and
 //! `internal/ls/autoimport`, and their helpers `projecttestutil`,
-//! `lsptestutil` and `autoimporttestutil`.
+//! `lsptestutil` and `autoimporttestutil`. The `internal/api` session tests
+//! that use `projecttestutil` are here too (`api_session_*_test`).
 //!
 //! PORT: each Go leaf subtest (`t.Run`) is one `#[test]`, so a port bug
 //! can be marked `#[ignore = "bug: S4-..."]` on the one subtest that shows
@@ -39,6 +40,8 @@ pub(crate) mod lsptestutil;
 pub(crate) mod projecttestutil;
 pub(crate) mod util;
 
+mod api_session_apistate_test;
+mod api_session_completion_test;
 mod ata_discovertypings_test;
 mod ata_installnpmpackages_test;
 mod ata_test;

@@ -67,7 +67,7 @@ impl Checker {
             return self.pseudo_type_checker_fallback_type_node(b, checker_type);
         } else if t.kind == PseudoTypeKind::DIRECT {
             let existing = t.as_pseudo_type_direct().type_node;
-            if !self.existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(b, existing, checker_type) {
+            if !self.can_reuse_existing_js_type_node(b, existing, checker_type) {
                 if !nb_ctx(b, |c| c.suppress_report_inference_fallback) {
                     tracker_report_inference_fallback(self, b, existing);
                 }
@@ -100,6 +100,10 @@ impl Checker {
                     tracker_report_inference_fallback(self, b, node.parent());
                 } else {
                     tracker_report_inference_fallback(self, b, node);
+                }
+                if inferred.is_signature_return {
+                    let signature = self.get_signature_from_declaration(node);
+                    return self.serialize_return_type_for_signature(b, signature, false);
                 }
                 // use symbol type from parent declaration to automatically handle expression type widening without duplicating logic
                 if is_return_statement(node.parent()) {
@@ -525,9 +529,12 @@ impl Checker {
         if type_from_pseudo == type_ {
             return true;
         }
+        let mut undefined_stripped = type_;
+        if is_optional_annotated {
+            undefined_stripped = self.get_type_with_facts(type_, TypeFacts::NE_UNDEFINED);
+        }
         if type_from_pseudo.is_some() && type_.is_some() {
             if is_optional_annotated {
-                let undefined_stripped = self.get_type_with_facts(type_, TypeFacts::NE_UNDEFINED);
                 if undefined_stripped == type_from_pseudo {
                     return true;
                 }
@@ -586,7 +593,7 @@ impl Checker {
                 if type_.is_nil() {
                     return false;
                 }
-                let target_props = self.get_properties_of_type(type_);
+                let target_props = self.get_properties_of_type(undefined_stripped);
                 // Count total declarations across all target prop symbols to handle getter/setter pairs,
                 // which are two elements in pt.Elements but only one symbol in targetProps.
                 let mut target_decl_count = 0usize;
@@ -601,7 +608,7 @@ impl Checker {
                     let elem_symbol = elem.name.parent().symbol();
                     if elem_symbol.is_some() {
                         let name = self.sym(elem_symbol).name.clone();
-                        target_prop = self.get_property_of_type(type_, &name);
+                        target_prop = self.get_property_of_type(undefined_stripped, &name);
                     }
                     if target_prop.is_nil() {
                         // Name lookup failed or returned no result; search target properties
@@ -749,19 +756,19 @@ impl Checker {
             }
             PseudoTypeKind::TUPLE => {
                 let pt = t.as_pseudo_type_tuple();
-                if type_.is_nil() || !self.is_tuple_type(type_) {
+                if undefined_stripped.is_nil() || !self.is_tuple_type(undefined_stripped) {
                     return false;
                 }
                 // Pseudo-tuples come from `as const` array literals, so they only ever have required elements.
                 // If the target tuple has optional, rest, or variadic elements, the structures can't match.
                 if self
-                    .target_tuple_type(type_)
+                    .target_tuple_type(undefined_stripped)
                     .combined_flags
                     .intersects(ElementFlags::NON_REQUIRED)
                 {
                     return false;
                 }
-                let element_types = self.get_type_arguments(type_);
+                let element_types = self.get_type_arguments(undefined_stripped);
                 if pt.elements.len() != element_types.len() {
                     return false;
                 }
@@ -779,7 +786,7 @@ impl Checker {
                 true
             }
             PseudoTypeKind::SINGLE_CALL_SIGNATURE => {
-                let target_sig = self.get_single_call_signature(type_);
+                let target_sig = self.get_single_call_signature(undefined_stripped);
                 if target_sig.is_nil() {
                     return false;
                 }
@@ -977,6 +984,10 @@ impl Checker {
             }
             PseudoTypeKind::INFERRED => {
                 let node = t.as_pseudo_type_inferred().expression;
+                if t.as_pseudo_type_inferred().is_signature_return {
+                    let signature = self.get_signature_from_declaration(node);
+                    return self.get_return_type_of_signature(signature);
+                }
                 let regular = self.get_regular_type_of_expression(node);
                 self.get_widened_type(regular)
             }

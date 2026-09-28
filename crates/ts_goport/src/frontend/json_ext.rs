@@ -28,7 +28,9 @@ use std::cell::RefCell;
 
 /// Go `any` holding a value that the LSP layer can marshal
 /// (`RequestMessage.Params`, `ResponseMessage.Result`, `Message.msg`).
-/// Read it with `downcast_ref::<HoverParams>()`.
+/// Read it with `downcast_ref::<T>()`. Inbound LSP params and results are a
+/// raw `JsonValue`; `lsproto::unmarshal_params` and `unmarshal_result`
+/// decode them.
 ///
 /// Never box a `Box<dyn AnyValue>` again: the blanket impl makes the box
 /// itself an `AnyValue`, and a downcast of the outer box fails.

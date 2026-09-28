@@ -33,9 +33,3 @@ mod units_platform;
 fn __tsctest_child() {
     support::child::command_child_entry();
 }
-
-/// Build worker entry of the tsc runner. Returns at once unless a child started it.
-#[test]
-fn __tsctest_build_worker() {
-    support::child::build_worker_entry();
-}

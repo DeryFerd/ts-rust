@@ -19,7 +19,7 @@ use ts_ast::NodeData as D;
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and
 /// stores it back.
 fn mutate(n: Node, f: impl FnOnce(&mut D)) {
-    let mut data = ast_data_of(n).clone();
+    let mut data = with_ast_data(n, Clone::clone);
     f(&mut data);
     replace_node_data(n, data);
 }
@@ -660,7 +660,7 @@ impl Parser {
         }
     }
 
-    // Go: parser/reparser.go:344 reparseHosted
+    // Go: parser/reparser.go:342 reparseHosted
     fn reparse_hosted(&mut self, tag: Node, parent: Node, js_doc: Node) {
         let mut parent = parent;
         match tag.kind() {
@@ -932,6 +932,20 @@ impl Parser {
             | SyntaxKind::JsDocOverrideTag => {
                 if parent.kind() == SyntaxKind::ExpressionStatement {
                     parent = parent.expression();
+                }
+                // In object literals these aren't class-like members, so JSDoc modifiers like @override
+                // or @readonly aren't real modifiers there; reparsing them produces spurious grammar errors (#4437).
+                // PORT: Go returns in the MethodDeclaration, GetAccessor and
+                // SetAccessor case and falls through to the shared body otherwise.
+                if matches!(
+                    parent.kind(),
+                    SyntaxKind::MethodDeclaration
+                        | SyntaxKind::GetAccessor
+                        | SyntaxKind::SetAccessor
+                ) && self.parsing_contexts & (1 << (ParsingContext::ObjectLiteralMembers as i32))
+                    != 0
+                {
+                    return;
                 }
                 match parent.kind() {
                     SyntaxKind::PropertyDeclaration

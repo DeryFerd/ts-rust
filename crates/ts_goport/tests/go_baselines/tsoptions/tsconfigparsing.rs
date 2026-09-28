@@ -901,6 +901,56 @@ fn parse_config_with_cache(
     )
 }
 
+// Go: tsconfigparsing_test.go:1535 TestExtendedConfigConfigDirPathsAreNotCached
+#[test]
+fn extended_config_config_dir_paths_are_not_cached() {
+    let files = file_map(&[
+        (
+            "/tsconfig.base.json",
+            "{\n  \"compilerOptions\": {\n    \"paths\": {\n      \"@pkg/*\": [\"${configDir}/src/*\"]\n    }\n  }\n}",
+        ),
+        (
+            "/packages/a/tsconfig.json",
+            "{\n  \"extends\": \"../../tsconfig.base.json\"\n}",
+        ),
+        (
+            "/packages/b/tsconfig.json",
+            "{\n  \"extends\": \"../../tsconfig.base.json\"\n}",
+        ),
+        ("/packages/a/index.ts", "export {}"),
+        ("/packages/b/index.ts", "export {}"),
+    ]);
+
+    let host = new_vfs_parse_config_host(&files, "/", true /*useCaseSensitiveFileNames*/);
+    let cache = MemoCache::default();
+
+    let parse_config = |config_file_name: &str| -> ParsedCommandLine {
+        let (parsed, errors) = tsoptions::get_parsed_command_line_of_config_file(
+            config_file_name,
+            None,
+            None,
+            &host,
+            Some(&cache),
+        );
+        assert!(
+            errors.is_empty(),
+            "unexpected errors parsing {config_file_name}: {} errors",
+            errors.len()
+        );
+        parsed.expect("parsed command line")
+    };
+
+    parse_config("/packages/a/tsconfig.json");
+    let parsed = parse_config("/packages/b/tsconfig.json");
+    let paths = parsed
+        .compiler_options()
+        .paths
+        .as_ref()
+        .and_then(|paths| paths.get("@pkg/*").cloned())
+        .flatten();
+    assert_eq!(paths, Some(vec!["/packages/b/src/*".to_string()]));
+}
+
 // ---------------------------------------------------------------------------
 // Test data, generated from the Go source (tsconfigparsing_test.go).
 // ---------------------------------------------------------------------------

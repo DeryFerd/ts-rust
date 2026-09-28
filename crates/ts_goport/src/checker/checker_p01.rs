@@ -9,6 +9,7 @@
 //! `TypeFacts`, `IterationUse`, `IterationTypeKind`) are generated in
 //! `crate::flags` and are not repeated here.
 
+use crate::gostd::Context;
 use crate::prelude::*;
 use std::sync::LazyLock;
 use ts_diagnostics::Message;
@@ -348,8 +349,10 @@ impl Default for InferenceContext {
 pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
-    /// Candidates in covariant positions
+    /// Candidates in covariant positions in decreasing depth order
     pub candidates: Vec<TypeId>,
+    /// Type argument depths of covariant inferences
+    pub candidate_depths: Vec<i32>,
     /// Candidates in contravariant positions
     pub contra_candidates: Vec<TypeId>,
     /// Cache for resolved inferred type
@@ -419,7 +422,10 @@ pub struct IterationTypesResolver {
 #[derive(Clone, Default)]
 pub struct WideningContext {
     /// Parent context
-    pub parent: Option<Rc<RefCell<WideningContext>>>,
+    // PORT: weak, so a parent and its `child_contexts` do not form an `Rc`
+    // cycle that leaks (Go's GC frees them). A child is only used while its
+    // parent is alive: the widening recursion holds the parent.
+    pub parent: Option<std::rc::Weak<RefCell<WideningContext>>>,
     /// Name of property in parent
     pub property_name: String,
     /// Types of siblings
@@ -677,10 +683,11 @@ impl FlatKey for TypeId {
 // - `symbolArena`, `signatureArena`, `indexInfoArena` are replaced by the
 //   arenas at the end (`symbols`, `types`, `signatures`, `index_infos`,
 //   `type_predicates`, `mappers`, `inference_contexts`), see `PORTING.md`.
-// - `regExpScanner` (Go scanner), `ctx` and `mu` are out of scope
-//   (scanner object, cancellation, concurrency) and are not fields.
-//   `tracer` is the last field (see `crate::tracing`). `emitResolver` plus `emitResolverOnce` is the
-//   `Option<Rc<EmitResolver>>` field `emit_resolver`.
+// - `regExpScanner` (Go scanner) and `mu` are out of scope (scanner object,
+//   concurrency) and are not fields. The nil-able Go `ctx` is
+//   `Option<Context>`. `tracer` is the last field (see `crate::tracing`).
+//   `emitResolver` plus `emitResolverOnce` is the `Option<Rc<EmitResolver>>`
+//   field `emit_resolver`.
 // - `sync.Once` fields become `bool` "done" flags.
 // - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
@@ -704,6 +711,7 @@ pub struct Checker {
     pub total_instantiation_count: u32,
     pub instantiation_count: u32,
     pub instantiation_depth: u32,
+    pub conditional_constraint_depth: u32,
     pub inline_level: i32,
     pub serialization_level: i32,
     pub current_node: Node,
@@ -997,6 +1005,7 @@ pub struct Checker {
     pub _jsx_namespace: String,
     pub _jsx_factory_entity: Node,
     pub skip_direct_inference_nodes: FxHashSet<Node>,
+    pub ctx: Option<Context>,
     pub packages_map: FxHashMap<String, bool>,
     pub active_mappers: Vec<MapperId>,
     pub active_type_mappers_caches: Vec<ActiveMapperCache>,
@@ -1157,6 +1166,7 @@ impl Checker {
             total_instantiation_count: 0,
             instantiation_count: 0,
             instantiation_depth: 0,
+            conditional_constraint_depth: 0,
             inline_level: 0,
             serialization_level: 0,
             current_node: Node::NIL,
@@ -1454,6 +1464,7 @@ impl Checker {
             _jsx_namespace: String::new(),
             _jsx_factory_entity: Node::NIL,
             skip_direct_inference_nodes: FxHashSet::default(),
+            ctx: None,
             packages_map: FxHashMap::default(),
             active_mappers: Vec::new(),
             active_type_mappers_caches: Vec::new(),

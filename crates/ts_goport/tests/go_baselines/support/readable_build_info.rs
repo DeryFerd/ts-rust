@@ -90,6 +90,8 @@ struct ReadableBuildInfo<'a> {
     errors: bool,
     check_pending: bool,
     root: Option<Vec<ReadableBuildInfoRoot<'a>>>,
+    package_jsons: Option<Vec<String>>,
+    missing_package_jsons: Option<Vec<String>>,
 
     // IncrementalProgram info
     file_names: Option<Vec<String>>,
@@ -118,6 +120,8 @@ impl MarshalerTo for ReadableBuildInfo<'_> {
         w.bool_omitzero("errors", self.errors);
         w.bool_omitzero("checkPending", self.check_pending);
         w.slice_omitzero("root", self.root.as_ref())?;
+        w.slice_omitzero("packageJsons", self.package_jsons.as_ref())?;
+        w.slice_omitzero("missingPackageJsons", self.missing_package_jsons.as_ref())?;
         w.slice_omitzero("fileNames", self.file_names.as_ref())?;
         w.slice_omitzero("fileInfos", self.file_infos.as_ref())?;
         w.slice_omitzero("fileIdsList", self.file_ids_list.as_ref())?;
@@ -371,6 +375,8 @@ pub fn to_readable_build_info(build_info: &BuildInfo, build_info_text: &str) -> 
         errors: build_info.errors,
         check_pending: build_info.check_pending,
         root: None,
+        package_jsons: build_info.package_jsons.clone(),
+        missing_package_jsons: build_info.missing_package_jsons.clone(),
         file_names: build_info.file_names.clone(),
         file_infos: None,
         file_ids_list: None,
@@ -402,8 +408,10 @@ pub fn to_readable_build_info(build_info: &BuildInfo, build_info_text: &str) -> 
 
 impl ReadableBuildInfo<'_> {
     // Go: tsctests/readablebuildinfo.go:236 toFilePath
+    // PORT: Go indexes `FileNames` and panics on an id out of range;
+    // `BuildInfo::file_name` gives "" there, so it is not used.
     fn to_file_path(&self, file_id: BuildInfoFileId) -> String {
-        self.build_info.file_name(file_id).to_string()
+        self.build_info.file_names.as_ref().expect("fileNames")[(file_id.0 - 1) as usize].clone()
     }
 
     // Go: tsctests/readablebuildinfo.go:240 toFilePathSet

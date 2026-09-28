@@ -546,6 +546,24 @@ fn program_updates_inputs() -> Vec<TscInput> {
             ..Default::default()
         },
         TscInput {
+            sub_scenario: "tsbuildinfo has fewer fileInfos than fileNames".into(),
+            files: file_map! {
+                "/user/username/projects/project/src/a.ts" => "export const a = 1;",
+                "/user/username/projects/project/src/b.ts" => "export const b = 2;",
+                "/user/username/projects/project/tsconfig.json" => r#"{"compilerOptions":{"composite":true,"outDir":"dist"},"files":["src/a.ts","src/b.ts"]}"#,
+                "/user/username/projects/project/dist/tsconfig.tsbuildinfo" => r#"{
+					"version": "FakeTSVersion",
+					"fileNames": ["lib.es2025.full.d.ts", "../src/a.ts", "../src/b.ts"],
+					"fileInfos": ["abc123"],
+					"options": {"composite": true, "outDir": "./"},
+					"root": [2, 3]
+				}"#,
+            },
+            cwd: "/user/username/projects/project".into(),
+            command_line_args: args!["--b", "-v"],
+            ..Default::default()
+        },
+        TscInput {
             sub_scenario: "when root is source from project reference".into(),
             files: file_map! {
                 "/home/src/workspaces/project/lib/tsconfig.json" => dedent(r#"

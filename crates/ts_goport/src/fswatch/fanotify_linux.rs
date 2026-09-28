@@ -183,6 +183,7 @@ pub fn make_fanotify_handle_key(
 /// fanotifySubscription mirrors inotifySubscription for the fanotify backend.
 pub struct FanotifySubscription {
     pub path: String,
+    pub watch_path: String,
     pub dir_watch: Arc<DirWatch>,
     pub key: FanotifyHandleKey,
 }
@@ -384,7 +385,7 @@ impl WatcherImpl for FanotifyBackend {
                         FANOTIFY_MARK_ADD_FLAGS,
                         FANOTIFY_MARK_MASK_RENAME,
                         unix::AT_FDCWD,
-                        &w.dir,
+                        &w.physical_dir,
                     );
                     match err {
                         Ok(()) => {
@@ -401,7 +402,7 @@ impl WatcherImpl for FanotifyBackend {
                                     unix::FAN_MARK_REMOVE | unix::FAN_MARK_ONLYDIR,
                                     FANOTIFY_MARK_MASK_RENAME,
                                     unix::AT_FDCWD,
-                                    &w.dir,
+                                    &w.physical_dir,
                                 );
                                 match rm_err {
                                     Ok(()) => break,
@@ -425,7 +426,7 @@ impl WatcherImpl for FanotifyBackend {
             }
         }
         if !w.recursive {
-            if let Err(err) = self.mark_dir(w, &w.dir) {
+            if let Err(err) = self.mark_dir(w, &w.dir, &w.physical_dir) {
                 return Err(DirWatchError {
                     err: errors::errorf(
                         format!("fanotify_mark on '{}' failed: {}", w.dir, err.error()),
@@ -438,13 +439,14 @@ impl WatcherImpl for FanotifyBackend {
             return Ok(());
         }
         if let Err(err) = walk_dir(
-            &w.dir,
+            &w.physical_dir,
             true,
-            Some(&mut |path: &str, is_dir: bool| -> Result<(), GoError> {
+            Some(&mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
                 if !is_dir {
                     return Ok(());
                 }
-                if let Err(err) = self.mark_dir(w, path) {
+                let path = &w.display_path(watch_path);
+                if let Err(err) = self.mark_dir(w, path, watch_path) {
                     return Err(DirWatchError {
                         err: errors::errorf(
                             format!("fanotify_mark on '{}' failed: {}", path, err.error()),
@@ -474,7 +476,7 @@ impl WatcherImpl for FanotifyBackend {
             list.retain(|s| {
                 if Arc::ptr_eq(&s.dir_watch, w) {
                     removed_any = true;
-                    removed_path = s.path.clone();
+                    removed_path = s.watch_path.clone();
                     return false;
                 }
                 true
@@ -531,7 +533,12 @@ impl FanotifyBackend {
     }
 
     // Go: fanotify_linux.go:345 fanotifyBackend.markDir
-    pub fn mark_dir(&self, w: &Arc<DirWatch>, path: &str) -> Result<(), GoError> {
+    pub fn mark_dir(
+        &self,
+        w: &Arc<DirWatch>,
+        path: &str,
+        mark_path: &str,
+    ) -> Result<(), GoError> {
         let (fanotify_fd, mark_mask) = {
             let l = self.locked.lock().unwrap();
             (l.fanotify_fd, l.mark_mask)
@@ -541,9 +548,9 @@ impl FanotifyBackend {
             FANOTIFY_MARK_ADD_FLAGS,
             mark_mask,
             unix::AT_FDCWD,
-            path,
+            mark_path,
         )?;
-        let handle = match unix::name_to_handle_at(unix::AT_FDCWD, path, 0) {
+        let handle = match unix::name_to_handle_at(unix::AT_FDCWD, mark_path, 0) {
             Ok((handle, _)) => handle,
             Err(err) => {
                 // Unmark since we can't track this directory without a handle.
@@ -552,7 +559,7 @@ impl FanotifyBackend {
                     unix::FAN_MARK_REMOVE | unix::FAN_MARK_ONLYDIR,
                     mark_mask,
                     unix::AT_FDCWD,
-                    path,
+                    mark_path,
                 );
                 return Err(errors::errorf(
                     format!("name_to_handle_at: {}", err.error()),
@@ -561,13 +568,13 @@ impl FanotifyBackend {
             }
         };
         let mut st = unix::Statfs_t::default();
-        if let Err(err) = unix::statfs(path, &mut st) {
+        if let Err(err) = unix::statfs(mark_path, &mut st) {
             let _ = unix::fanotify_mark(
                 fanotify_fd,
                 unix::FAN_MARK_REMOVE | unix::FAN_MARK_ONLYDIR,
                 mark_mask,
                 unix::AT_FDCWD,
-                path,
+                mark_path,
             );
             return Err(errors::errorf(
                 format!("statfs: {}", err.error()),
@@ -577,6 +584,7 @@ impl FanotifyBackend {
         let key = make_fanotify_handle_key(st.fsid.val, handle.type_(), handle.bytes());
         let sub = Arc::new(FanotifySubscription {
             path: path.to_string(),
+            watch_path: mark_path.to_string(),
             dir_watch: w.clone(),
             key: key.clone(),
         });
@@ -729,13 +737,13 @@ impl FanotifyBackend {
                     s.dir_watch.events.create(&new_path);
                     if is_dir && s.dir_watch.recursive {
                         let _ = walk_dir(
-                            &new_path,
+                            &s.dir_watch.physical_path(&new_path),
                             true,
                             Some(&mut |p: &str, p_is_dir: bool| -> Result<(), GoError> {
                                 if !p_is_dir {
                                     return Ok(());
                                 }
-                                let _ = self.mark_dir(&s.dir_watch, p);
+                                let _ = self.mark_dir(&s.dir_watch, &s.dir_watch.display_path(p), p);
                                 Ok(())
                             }),
                         );
@@ -869,13 +877,13 @@ impl FanotifyBackend {
             w.events.create(&path);
             if is_dir && w.recursive {
                 let _ = walk_dir(
-                    &path,
+                    &w.physical_path(&path),
                     true,
                     Some(&mut |p: &str, p_is_dir: bool| -> Result<(), GoError> {
                         if !p_is_dir {
                             return Ok(());
                         }
-                        let _ = self.mark_dir(w, p);
+                        let _ = self.mark_dir(w, &w.display_path(p), p);
                         Ok(())
                     }),
                 );

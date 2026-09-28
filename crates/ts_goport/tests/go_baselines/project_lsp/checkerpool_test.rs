@@ -7,13 +7,11 @@
 //! the timer tests in `synctest` bubbles; the idle-cleanup timer here is a
 //! `gostd::local` timer that only fires in `run_pending`, so the tests
 //! that wait for it (`IdleCleanup`, `FileAssociationCleanup`,
-//! `StaggeredIdleCleanup`, `RequestAssociationCleanupOn*`,
+//! `StaggeredIdleCleanup`, `RequestAssociationCleanupOnContextDone`,
 //! `DiagnosticsRecreatedAfterIdleDisposal`, `CrossReleaseAffinityWithContention`)
 //! are not ported, and the long fake sleeps of the other tests are left
 //! out. `DoubleReleaseSafe` can not be written: `Release::call` takes
-//! `self`. `CanceledCheckerDisposal` and `APICheckerDisposedOnCancel` are
-//! blocked by S4-002 (no context parameter for checker diagnostics).
-//! Go `synctest.Wait()` has nothing to wait for on one thread.
+//! `self`. Go `synctest.Wait()` has nothing to wait for on one thread.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -204,6 +202,63 @@ child_test! {
         // Zero idle timeout should default to 30s.
         let (_session, pool) = setup_checker_pool_session(opts(4, 0));
         assert_eq!(pool.opts.idle_timeout, Duration::from_secs(30));
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:303 TestCheckerPoolCanceledCheckerDisposal
+    fn canceled_checker_disposal() {
+        let (_session, pool) = test_pool(opts(2, 10), opts(4, 30));
+        let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
+        let _guard = ts_goport::program::ls_program::enter(pool.program);
+
+        // Acquire a query checker and cancel it.
+        let ctx = req(&bg(), "cancel-test", CheckerLifetime::TEMPORARY);
+        let (c, release) = pool.get_checker(&ctx, NIL);
+
+        let (canceled_ctx, cancel) = context::with_cancel(&bg());
+        cancel();
+        c.borrow_mut().get_diagnostics_exported(&canceled_ctx, source_file);
+        assert!(c.borrow().was_canceled());
+
+        // Release should dispose the canceled checker.
+        release.call();
+
+        // Next request should get a fresh checker.
+        let ctx2 = req(&bg(), "after-cancel", CheckerLifetime::TEMPORARY);
+        let (c2, release2) = pool.get_checker(&ctx2, NIL);
+        assert!(!same(&c2, &c), "should get a new checker, not the canceled one");
+        release2.call();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:339 TestCheckerPoolRequestAssociationCleanupOnDisposal
+    fn request_association_cleanup_on_disposal() {
+        let (_session, pool) = test_pool(opts(2, 10), opts(4, 5));
+        let _guard = ts_goport::program::ls_program::enter(pool.program);
+
+        // Create a query checker with a request association.
+        let (req_ctx, req_cancel) = context::with_cancel(&bg());
+        let ctx = req(&req_ctx, "assoc-cleanup-req", CheckerLifetime::TEMPORARY);
+        let (c, release) = pool.get_checker(&ctx, NIL);
+
+        // Cancel the checker to trigger disposal on release.
+        let (canceled_ctx, cancel) = context::with_cancel(&bg());
+        cancel();
+        let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
+        c.borrow_mut().get_diagnostics_exported(&canceled_ctx, source_file);
+        assert!(c.borrow().was_canceled());
+
+        release.call();
+
+        // Request association should be cleared after checker disposal.
+        assert!(
+            !pool.request_associations.borrow().contains_key("assoc-cleanup-req"),
+            "request association should be cleared after checker disposal"
+        );
+        // Go: defer reqCancel()
+        req_cancel();
     }
 }
 
@@ -575,8 +630,6 @@ child_test! {
 
 child_test! {
     // Go: checkerpool_test.go:1158 TestCheckerPoolTakeNewGlobalDiagnostics
-    // PORT: Go `c.GetDiagnostics(ctx, file)`; the Rust checker call has no
-    // context (S4-002).
     fn take_new_global_diagnostics() {
         let (_session, pool) = setup_checker_pool_session(opts(4, 10));
 
@@ -589,7 +642,7 @@ child_test! {
         {
             let _guard = ts_goport::program::ls_program::enter(pool.program);
             let (c, release) = pool.get_checker(&ctx, source_file);
-            c.borrow_mut().get_diagnostics(source_file, false);
+            c.borrow_mut().get_diagnostics_exported(&ctx, source_file);
             release.call();
         }
 
@@ -605,7 +658,7 @@ child_test! {
         {
             let _guard = ts_goport::program::ls_program::enter(pool.program);
             let (c2, release2) = pool.get_checker(&ctx2, source_file);
-            c2.borrow_mut().get_diagnostics(source_file, false);
+            c2.borrow_mut().get_diagnostics_exported(&ctx2, source_file);
             release2.call();
         }
 
@@ -613,6 +666,36 @@ child_test! {
             !pool.take_new_global_diagnostics(),
             "should not report new globals when checker state is unchanged"
         );
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:1195 TestCheckerPoolAPICheckerDisposedOnCancel
+    fn api_checker_disposed_on_cancel() {
+        let (_session, pool) = test_pool(opts(4, 10), opts(4, 30));
+        let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
+        let _guard = ts_goport::program::ls_program::enter(pool.program);
+
+        let ctx = core_context::with_checker_lifetime(&bg(), CheckerLifetime::API);
+        let (c, release) = pool.get_checker(&ctx, NIL);
+
+        // Cancel the API checker.
+        let (canceled_ctx, cancel) = context::with_cancel(&bg());
+        cancel();
+        c.borrow_mut().get_diagnostics_exported(&canceled_ctx, source_file);
+        assert!(c.borrow().was_canceled());
+
+        // Releasing a canceled API checker must drop it so it isn't reused.
+        release.call();
+        assert!(
+            pool.persistent_checker.borrow().is_none(),
+            "canceled API checker should be dropped on release"
+        );
+
+        // Next API acquisition gets a fresh, usable checker rather than panicking.
+        let (c2, release2) = pool.get_checker(&ctx, NIL);
+        assert!(!same(&c2, &c), "should get a fresh API checker after cancellation");
+        release2.call();
     }
 }
 

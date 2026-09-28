@@ -791,6 +791,7 @@ impl Parser {
         }
 
         remove_leading_newlines(&mut comments);
+        remove_trailing_whitespace(&mut comments);
         if !comments.is_empty() {
             let comment_start = if link_end > -1 {
                 link_end

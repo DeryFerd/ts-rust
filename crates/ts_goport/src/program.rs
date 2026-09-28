@@ -19,6 +19,7 @@
 //! checker pool of each version, by program id.
 
 use crate::execute::tsc::compile::CompileTimes;
+use crate::gostd::{Context, context};
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::ops::Deref;
@@ -260,61 +261,40 @@ struct CheckerPool {
 }
 
 impl CheckerPool {
-    /// Stops the workers: each drops its checker, then it closes their job
-    /// queues and waits for each thread to end, so the checkers are freed on
-    /// return.
+    /// Stops the workers: each drops its checker and frees its synthetic
+    /// nodes, then it closes their job queues and waits for each thread to
+    /// end, so the checkers and the nodes they made are freed on return.
     fn shut_down(self) {
-        // A pool that only ends with the process forgets its checkers (see
-        // `create_checkers`); a released program frees them here.
-        for worker in &self.workers {
-            let _ = worker.send(Box::new(|| {
-                drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
-                record_worker_arena_use();
-            }));
-        }
-        drop(self.workers);
-        for thread in self.threads {
+        for thread in self.stop() {
             // A job panic stays in its job result, so a worker ends normally.
             let _ = thread.join();
         }
     }
-}
 
-/// The AST arena bytes that each checker worker of the last released pool
-/// used, by worker index (see `worker_arena_start`).
-static WORKER_ARENA_USE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-/// Records the AST arena use of this checker worker. A released pool runs it
-/// on each worker after it drops the checker.
-fn record_worker_arena_use() {
-    let Some(index) = worker_index() else {
-        return;
-    };
-    let used = crate::ast::store::ast_arena_used();
-    let mut uses = WORKER_ARENA_USE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if uses.len() <= index {
-        uses.resize(index + 1, 0);
+    /// `shut_down` without the wait: the workers drop their checkers, free
+    /// their synthetic nodes and end while the caller goes on. Nothing waits
+    /// for them; at process exit a worker that is still freeing just stops.
+    fn shut_down_in_background(self) {
+        drop(self.stop());
     }
-    uses[index] = used;
-}
 
-/// The first AST arena chunk of checker worker `index`: what worker `index`
-/// of the last released pool used, plus a sixteenth, in whole pages. None
-/// (the 1 MiB default) before any pool is released, so a one-program
-/// process keeps the default. A released pool leaks its worker arenas (the
-/// nodes are `&'static`), so a 1 MiB chunk would leak about 1 MiB for each
-/// worker and program version while a Query core worker uses 25 to 80 KB.
-/// A worker checks the same files in each version, so its use changes
-/// little; when it needs more, the arena adds a chunk twice as large.
-fn worker_arena_start(index: usize) -> Option<usize> {
-    const PAGE: usize = 4096;
-    let uses = WORKER_ARENA_USE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let used = *uses.get(index)?;
-    Some((used + used / 16).div_ceil(PAGE) * PAGE)
+    /// Sends each worker the job that drops its checker and frees its
+    /// synthetic nodes, closes the job queues and returns the worker
+    /// threads.
+    fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
+        // A pool that only ends with the process forgets its checkers and
+        // synthetic nodes (see `create_checkers`); a released program frees
+        // them here.
+        for worker in &self.workers {
+            let _ = worker.send(Box::new(|| {
+                drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                free_synthetic_nodes();
+                WORKER_RELEASED.with(|released| released.set(true));
+            }));
+        }
+        drop(self.workers);
+        self.threads
+    }
 }
 
 /// Work for one checker worker. It runs on the worker thread, where
@@ -2529,9 +2509,9 @@ pub fn get_source_of_project_reference_if_output_included(file: Node) -> String 
         .map_or_else(|| info.file_name.clone(), str::to_string)
 }
 
-/// Go `compiler.NewProgram` for a config that is already parsed (the build
-/// worker). It installs the program for the process, so call it once.
-/// `opts.host` carries the trace writer.
+/// Go `compiler.NewProgram` for a config that is already parsed, in a
+/// one-program process (`tsc`, `goport`). It installs the program for the
+/// process, so call it once. `opts.host` carries the trace writer.
 pub fn install_new_program(
     opts: crate::frontend::compiler::ProgramOptions,
 ) -> Result<&'static GoProgram, String> {
@@ -2606,11 +2586,25 @@ pub fn bind_file_outside_program(file: Node) {
 }
 
 /// Frees what the loading thread keeps for `program`: it stops the checker
-/// pool (and waits for its workers), removes the frontend program from this
-/// thread and empties the declaration diagnostic cache. Do not use `program`
-/// after this. Its `GoProgram`, frontend program and file versions stay
-/// leaked. Panics when `program` is current on this thread.
+/// pool (and waits for its workers, which free their checkers and synthetic
+/// nodes), removes the frontend program from this thread and empties the
+/// declaration diagnostic cache. Do not use `program` after this. Its
+/// `GoProgram`, frontend program and file versions stay leaked. Panics when
+/// `program` is current on this thread.
 pub fn release_program(program: &'static GoProgram) {
+    release_program_with(program, CheckerPool::shut_down);
+}
+
+/// `release_program` that does not wait for the checker workers: they free
+/// their checkers and synthetic nodes on their own threads while the caller
+/// goes on (Go frees a program in the background GC). `tsc -b` uses it, so
+/// the next project does not wait for the free.
+pub fn release_program_in_background(program: &'static GoProgram) {
+    release_program_with(program, CheckerPool::shut_down_in_background);
+}
+
+/// `release_program` with the pool stop that `shut_down` names.
+fn release_program_with(program: &'static GoProgram, shut_down: fn(CheckerPool)) {
     assert!(
         !try_prog().is_some_and(|current| std::ptr::eq(current, program)),
         "program {} is released while it is current",
@@ -2618,7 +2612,7 @@ pub fn release_program(program: &'static GoProgram) {
     );
     let pool = POOLS.with(|pools| pools.borrow_mut().remove(&program.id));
     if let Some(pool) = pool {
-        pool.shut_down();
+        shut_down(pool);
     }
     FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
     if let Some(state) = program.state.get() {
@@ -3478,12 +3472,16 @@ thread_local! {
     static WORKER_CHECKER: RefCell<Option<Checker>> = const { RefCell::new(None) };
     /// The pool index of the checker of a worker thread.
     static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Set on a worker thread when `CheckerPool::stop` freed its checker and
+    /// synthetic nodes.
+    static WORKER_RELEASED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The thread-local state that a checker worker starts from: the current
 /// program, and the synthetic nodes, ids and lazy JSDoc of the loading
-/// thread when the pool is made.
-struct WorkerSeed {
+/// thread when the pool is made. The language server's cross-project search
+/// threads start from it too (`ls/search_thread.rs`).
+pub(crate) struct WorkerSeed {
     program: &'static GoProgram,
     synthetic: SyntheticSeed,
     ids: IdSeed,
@@ -3491,7 +3489,7 @@ struct WorkerSeed {
 }
 
 impl WorkerSeed {
-    fn take() -> Self {
+    pub(crate) fn take() -> Self {
         Self {
             program: prog(),
             synthetic: synthetic_seed(),
@@ -3500,7 +3498,7 @@ impl WorkerSeed {
         }
     }
 
-    fn install(self) {
+    pub(crate) fn install(self) {
         crate::core::set_thread_program(Some(self.program));
         install_synthetic_seed(self.synthetic);
         install_id_seed(self.ids);
@@ -3548,14 +3546,10 @@ fn create_checkers() -> CheckerPool {
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
             let seed = WorkerSeed::take();
-            let arena_start = worker_arena_start(index);
             let thread = std::thread::Builder::new()
                 .name(format!("checker-{index}"))
                 .stack_size(CHECKER_STACK_SIZE)
                 .spawn(move || {
-                    if let Some(bytes) = arena_start {
-                        crate::ast::store::set_ast_arena_start(bytes);
-                    }
                     seed.install();
                     let checker = Checker::new(index);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -3567,11 +3561,15 @@ fn create_checkers() -> CheckerPool {
                     // the loading thread ends, after every job sent its
                     // result, so this runs once per checker, at the end of
                     // the process. Like Go, which never frees a checker, the
-                    // checker is not dropped: freeing its arenas at thread
-                    // exit cost 0.83% of query CPU. `release_program` drops
-                    // the checker first (`CheckerPool::shut_down`), so a
-                    // released program does not leak it.
-                    std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                    // checker and the synthetic nodes are not dropped:
+                    // freeing the checker arenas at thread exit cost 0.83%
+                    // of query CPU. `release_program` frees both first
+                    // (`CheckerPool::stop`), so a released program does not
+                    // leak them.
+                    if !WORKER_RELEASED.with(std::cell::Cell::get) {
+                        std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                        forget_synthetic_nodes();
+                    }
                 })
                 .expect("cannot start a checker thread");
             (sender, thread)
@@ -3743,6 +3741,37 @@ fn for_each_checker_group_do(
     files: &[Node],
     cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
 ) -> Vec<Vec<Diagnostic>> {
+    start_checker_group_do(files, cb).wait()
+}
+
+/// `for_each_checker_group_do` whose jobs are sent and not waited for yet.
+// PORT: not in Go. A Go caller that does not wait runs the group on its
+// own goroutine. Here the loading thread sends the jobs and reads the
+// results later. Jobs for one checker run in the order they are sent, so
+// the results are the same as with an immediate wait.
+struct PendingCheckerGroup {
+    files: Arc<Vec<Node>>,
+    receivers: Vec<std::sync::mpsc::Receiver<JobResult<Vec<(usize, Vec<Diagnostic>)>>>>,
+}
+
+impl PendingCheckerGroup {
+    /// Waits for every checker and returns the results of `cb` by file
+    /// position (see `for_each_checker_group_do`).
+    fn wait(self) -> Vec<Vec<Diagnostic>> {
+        let mut diagnostics = vec![Vec::new(); self.files.len()];
+        for (i, result) in wait_jobs(self.receivers).into_iter().flatten() {
+            diagnostics[i] = result;
+        }
+        diagnostics
+    }
+}
+
+/// The first half of `for_each_checker_group_do`: sends one job to each
+/// checker of the current program and returns without waiting.
+fn start_checker_group_do(
+    files: &[Node],
+    cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
+) -> PendingCheckerGroup {
     let count = checker_count();
     let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
     let receivers = (0..count)
@@ -3763,11 +3792,7 @@ fn for_each_checker_group_do(
             })
         })
         .collect();
-    let mut diagnostics = vec![Vec::new(); files.len()];
-    for (i, result) in wait_jobs(receivers).into_iter().flatten() {
-        diagnostics[i] = result;
-    }
-    diagnostics
+    PendingCheckerGroup { files, receivers }
 }
 
 // ---------------------------------------------------------------------------
@@ -3885,28 +3910,62 @@ pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:654 GetSemanticDiagnostics
+// PORT: the compile path has no context; Go tsc passes context.Background()
+// (execute/tsc/emit.go:75). The same holds for the two functions below.
 pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, get_semantic_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, |c, f| {
+        get_semantic_diagnostics_with_checker(&context::background(), c, f)
+    })
 }
 
 // Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
 pub fn get_semantic_diagnostics_without_no_emit_filtering(
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
-    let all_diags = collect_checker_diagnostics_from_files(
-        source_files,
-        get_bind_and_check_diagnostics_with_checker,
-    );
-    source_files
-        .iter()
-        .zip(all_diags)
-        .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
-        .collect()
+    start_semantic_diagnostics_without_no_emit_filtering(source_files).wait()
+}
+
+/// A `get_semantic_diagnostics_without_no_emit_filtering` check that runs
+/// on the checker threads while the caller goes on.
+pub struct PendingSemanticDiagnostics(PendingCheckerGroup);
+
+impl PendingSemanticDiagnostics {
+    /// The files that are checked, in the order they were given.
+    #[must_use]
+    pub fn files(&self) -> &[Node] {
+        &self.0.files
+    }
+
+    /// Waits for the check. Same result as
+    /// `get_semantic_diagnostics_without_no_emit_filtering`.
+    #[must_use]
+    pub fn wait(self) -> FxHashMap<Node, Vec<Diagnostic>> {
+        let files = Arc::clone(&self.0.files);
+        files
+            .iter()
+            .zip(self.0.wait())
+            .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
+            .collect()
+    }
+}
+
+/// Sends the `get_semantic_diagnostics_without_no_emit_filtering` check of
+/// `source_files` to the checkers of the current program and returns
+/// without waiting (Go `collectCheckerDiagnosticsFromFiles` with
+/// `getBindAndCheckDiagnosticsForFile`).
+pub fn start_semantic_diagnostics_without_no_emit_filtering(
+    source_files: &[Node],
+) -> PendingSemanticDiagnostics {
+    PendingSemanticDiagnostics(start_checker_group_do(source_files, |c, f| {
+        get_bind_and_check_diagnostics_with_checker(&context::background(), c, f)
+    }))
 }
 
 // Go: compiler/program.go:667 GetSuggestionDiagnostics
 pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, get_suggestion_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, |c, f| {
+        get_suggestion_diagnostics_with_checker(&context::background(), c, f)
+    })
 }
 
 // Go: compiler/program.go:671 GetProgramDiagnostics
@@ -4271,11 +4330,12 @@ pub fn filter_no_emit_semantic_diagnostics(
 
 // Go: compiler/program.go:1315 getSemanticDiagnosticsWithChecker
 pub fn get_semantic_diagnostics_with_checker(
+    ctx: &Context,
     c: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags = filter_no_emit_semantic_diagnostics(
-        get_bind_and_check_diagnostics_with_checker(c, source_file),
+        get_bind_and_check_diagnostics_with_checker(ctx, c, source_file),
         &prog().options,
     );
     diags.extend(get_include_processor_diagnostics(source_file));
@@ -4284,6 +4344,7 @@ pub fn get_semantic_diagnostics_with_checker(
 
 // Go: compiler/program.go:1325 getBindAndCheckDiagnosticsWithChecker
 pub fn get_bind_and_check_diagnostics_with_checker(
+    ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -4294,7 +4355,7 @@ pub fn get_bind_and_check_diagnostics_with_checker(
     // Checker creation forces binding, so bind diagnostics will be populated.
     bind_all();
     let mut diags = file_bind_data(source_file).bind_diagnostics.clone();
-    diags.extend(file_checker.get_diagnostics_exported(source_file));
+    diags.extend(file_checker.get_diagnostics_exported(ctx, source_file));
 
     let is_plain_js = is_plain_js_file(source_file, compiler_options.check_js);
     if is_plain_js {
@@ -4375,6 +4436,7 @@ fn get_diagnostics_with_preceding_directives(
 
 // Go: compiler/program.go:1410 getSuggestionDiagnosticsWithChecker
 fn get_suggestion_diagnostics_with_checker(
+    ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -4386,7 +4448,7 @@ fn get_suggestion_diagnostics_with_checker(
     let mut diags = file_bind_data(source_file)
         .bind_suggestion_diagnostics
         .clone();
-    diags.extend(file_checker.get_suggestion_diagnostics(source_file));
+    diags.extend(file_checker.get_suggestion_diagnostics(ctx, source_file));
     diags
 }
 

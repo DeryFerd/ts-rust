@@ -1,12 +1,14 @@
 //! Port of execute/incremental/program.go, plus `ReadBuildInfoProgram`
 //! (incremental.go:43), which builds a `Program` from a snapshot.
 //!
-//! PORT: the process has one program (plan D1). Go `Program.program` is
-//! the installed `&'static GoProgram` (nil for a program read from build
-//! info), and its methods are the `program.rs` free functions. Go passes a
-//! context; the port has none. The `ProgramLike` methods take `&self`, so
-//! the snapshot is behind a `RefCell`; it is an `Rc` because Go
-//! `programToSnapshot` can reuse the old program's snapshot.
+//! PORT: Go `Program.program` is the current `&'static GoProgram`
+//! (`prog()`, nil for a program read from build info), and its methods are
+//! the `program.rs` free functions, which read `prog()`. A caller with
+//! several programs (the build task) makes the program current while it
+//! uses this one. Go passes a context; the port has none. The
+//! `ProgramLike` methods take `&self`, so the snapshot is behind a
+//! `RefCell`; it is an `Rc` because Go `programToSnapshot` can reuse the
+//! old program's snapshot.
 
 use super::build_info::*;
 use super::build_info_to_snapshot::build_info_to_snapshot;
@@ -41,10 +43,25 @@ pub struct Program {
 
     // Testing data
     pub(crate) testing_data: Option<RefCell<TestingData>>,
+
+    // PORT: not in Go. What `start_check` read and started (see there).
+    started: RefCell<StartedCheck>,
+}
+
+/// The work of `tsc.EmitFilesAndReportErrors` that `Program::start_check`
+/// did before the caller asks for it.
+#[derive(Default)]
+struct StartedCheck {
+    /// The first `GetGlobalDiagnostics` result. The next
+    /// `get_global_diagnostics` call takes it.
+    global_diagnostics: Option<Vec<Diagnostic>>,
+    /// The check of the affected files. `get_semantic_diagnostics` takes it.
+    check: Option<PendingSemanticDiagnostics>,
 }
 
 // Go: incremental/program.go:38 NewProgram
-// PORT: Go `program` is the installed program, so it is not a parameter.
+// PORT: Go `program` is the current program (`prog()`), so it is not a
+// parameter.
 #[must_use]
 pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: bool) -> Program {
     let mut incremental_program = Program {
@@ -52,6 +69,7 @@ pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: b
         program: Some(prog()),
         host: Some(host),
         testing_data: None,
+        started: RefCell::default(),
     };
 
     if testing {
@@ -98,6 +116,7 @@ pub fn read_build_info_program(
         program: None,
         host: None,
         testing_data: None,
+        started: RefCell::default(),
     })
 }
 
@@ -237,10 +256,64 @@ impl Program {
     }
 
     // Go: incremental/program.go:141 GetGlobalDiagnostics
+    // PORT: the first call returns what `start_check` read, if it ran.
     #[must_use]
     pub fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         self.panic_if_no_program("GetGlobalDiagnostics");
+        if let Some(diagnostics) = self.started.borrow_mut().global_diagnostics.take() {
+            return diagnostics;
+        }
         get_global_diagnostics()
+    }
+
+    /// PORT: not in Go. Starts the semantic check that
+    /// `tsc.EmitFilesAndReportErrors` asks for, and returns without waiting
+    /// for it. `tsc -b` calls it when the program is made: Go builds up to 4
+    /// projects on goroutines at the same time, and here each project's
+    /// checkers check while the loading thread makes the next program or
+    /// emits an earlier one.
+    ///
+    /// It does what `EmitFilesAndReportErrors` (through
+    /// `GetDiagnosticsOfAnyProgram`) does before the check, with the same
+    /// checker jobs in the same order. When the syntactic and program
+    /// diagnostics are empty (and not `--listFilesOnly` or `--noCheck`), it
+    /// reads the global diagnostics. When those are empty too, it handles
+    /// the affected files (`collectAllAffectedFiles`) and sends the check of
+    /// the files that `get_semantic_diagnostics` would check. The next
+    /// `get_global_diagnostics` call returns the global diagnostics read
+    /// here, and `get_semantic_diagnostics` waits for the check. The caller
+    /// must use this program only through those calls, in that order, as
+    /// `EmitFilesAndReportErrors` does (`start_check_used` checks it).
+    pub fn start_check(&self) {
+        self.panic_if_no_program("StartCheck");
+        if self.snapshot.borrow().options.no_check.is_true()
+            || options().list_files_only.is_true()
+            || !get_syntactic_diagnostics(Node::NIL).is_empty()
+            || !get_program_diagnostics().is_empty()
+        {
+            return;
+        }
+        let global_diagnostics = get_global_diagnostics();
+        let has_global_diagnostics = !global_diagnostics.is_empty();
+        self.started.borrow_mut().global_diagnostics = Some(global_diagnostics);
+        if has_global_diagnostics {
+            return;
+        }
+        if let Some(affected_files) = self.semantic_diagnostics_files_to_check(Node::NIL) {
+            self.started.borrow_mut().check = Some(
+                start_semantic_diagnostics_without_no_emit_filtering(&affected_files),
+            );
+        }
+    }
+
+    /// PORT: not in Go. True when the caller used everything that
+    /// `start_check` read and started. `tsc -b` asserts it after the emit:
+    /// a result left over means the calls did not follow
+    /// `EmitFilesAndReportErrors`.
+    #[must_use]
+    pub fn start_check_used(&self) -> bool {
+        let started = self.started.borrow();
+        started.global_diagnostics.is_none() && started.check.is_none()
     }
 
     // Go: incremental/program.go:147 GetSemanticDiagnostics
@@ -336,18 +409,43 @@ impl Program {
 
     // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles
     // Handle affected files and cache the semantic diagnostics for all of them or the file asked for
+    // PORT: split in two (`semantic_diagnostics_files_to_check` and
+    // `commit_semantic_diagnostics`), so `start_check` can send the check
+    // early. A check that `start_check` sent is committed here first.
     fn collect_semantic_diagnostics_of_affected_files(&self, file: Node) {
+        let started = self.started.borrow_mut().check.take();
+        if let Some(started) = started {
+            let affected_files = started.files().to_vec();
+            self.commit_semantic_diagnostics(&affected_files, started.wait());
+            if file.is_nil() {
+                return;
+            }
+        }
+        let Some(affected_files) = self.semantic_diagnostics_files_to_check(file) else {
+            return;
+        };
+
+        // Get their diagnostics and cache them
+        let diagnostics_per_file =
+            get_semantic_diagnostics_without_no_emit_filtering(&affected_files);
+        self.commit_semantic_diagnostics(&affected_files, diagnostics_per_file);
+    }
+
+    /// The first half of `collectSemanticDiagnosticsOfAffectedFiles`: it
+    /// handles the affected files and returns the files to check, or `None`
+    /// where Go returns before the check.
+    fn semantic_diagnostics_files_to_check(&self, file: Node) -> Option<Vec<Node>> {
         if self.snapshot.borrow().can_use_incremental_state() {
             // Get all affected files
             super::affected_files::collect_all_affected_files(self);
 
             if self.snapshot.borrow().semantic_diagnostics_per_file.len() == source_files().len() {
                 // If we have all the files,
-                return;
+                return None;
             }
         }
 
-        let affected_files: Vec<Node> = if file.is_some() {
+        if file.is_some() {
             let path = Path(source_file_info(file).path.clone());
             if self
                 .snapshot
@@ -355,11 +453,12 @@ impl Program {
                 .semantic_diagnostics_per_file
                 .contains_key(&path)
             {
-                return;
+                return None;
             }
-            vec![file]
-        } else {
-            let snapshot = self.snapshot.borrow();
+            return Some(vec![file]);
+        }
+        let snapshot = self.snapshot.borrow();
+        Some(
             source_files()
                 .into_iter()
                 .filter(|&file| {
@@ -367,16 +466,20 @@ impl Program {
                         .semantic_diagnostics_per_file
                         .contains_key(source_file_info(file).path.as_str())
                 })
-                .collect()
-        };
+                .collect(),
+        )
+    }
 
-        // Get their diagnostics and cache them
-        let mut diagnostics_per_file =
-            get_semantic_diagnostics_without_no_emit_filtering(&affected_files);
-
+    /// The second half of `collectSemanticDiagnosticsOfAffectedFiles`: it
+    /// caches the check result of `affected_files` in the snapshot.
+    fn commit_semantic_diagnostics(
+        &self,
+        affected_files: &[Node],
+        mut diagnostics_per_file: FxHashMap<Node, Vec<Diagnostic>>,
+    ) {
         // Commit changes to snapshot
         let mut snapshot = self.snapshot.borrow_mut();
-        for file in &affected_files {
+        for file in affected_files {
             if let Some(diagnostics) = diagnostics_per_file.remove(file) {
                 snapshot.semantic_diagnostics_per_file.insert(
                     Path(source_file_info(*file).path.clone()),
@@ -425,6 +528,20 @@ impl Program {
                 snapshot.build_info_emit_pending = true;
             }
         }
+        if self.snapshot.borrow().package_jsons.is_none() {
+            self.ensure_package_jsons_for_state();
+            let mut snapshot = self.snapshot.borrow_mut();
+            if snapshot.package_jsons.as_deref().unwrap_or_default()
+                != snapshot.package_jsons_from_old_state.as_slice()
+                || snapshot
+                    .missing_package_jsons
+                    .as_deref()
+                    .unwrap_or_default()
+                    != snapshot.missing_package_jsons_from_old_state.as_slice()
+            {
+                snapshot.build_info_emit_pending = true;
+            }
+        }
         if !self.snapshot.borrow().build_info_emit_pending {
             return None;
         }
@@ -467,7 +584,7 @@ impl Program {
     }
 
     // Go: incremental/program.go:320 ensureHasErrorsForState
-    // PORT: Go `program` is the installed program.
+    // PORT: Go `program` is the current program.
     fn ensure_has_errors_for_state(&self) {
         let files = source_files();
         let has_include_processing_diagnostics: Box<dyn Fn() -> bool>;
@@ -565,6 +682,69 @@ impl Program {
             snapshot.has_semantic_errors = !is_incremental;
         }
     }
+
+    // Go: incremental/program.go:402 ensurePackageJsonsForState
+    // PORT: Go appends to the snapshot slices inside the callback. The
+    // callback here fills local lists, so the snapshot is not borrowed while
+    // the file system runs.
+    fn ensure_package_jsons_for_state(&self) {
+        let (mut package_jsons, mut missing_package_jsons) = {
+            let mut snapshot = self.snapshot.borrow_mut();
+            (
+                snapshot.package_jsons.take().unwrap_or_default(),
+                snapshot.missing_package_jsons.take().unwrap_or_default(),
+            )
+        };
+        let config = get_directory_path(command_line().config_name());
+        if !config.is_empty() {
+            package_json_cache_entries(|_key, value| {
+                let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
+                if value.exists() || value.directory_exists {
+                    package_json = host().fs().realpath(&package_json);
+                }
+                if value.exists() {
+                    package_jsons.push(package_json);
+                } else if package_json.contains("/node_modules/") {
+                    missing_package_jsons.push(package_json);
+                }
+                true
+            });
+        }
+        let mut snapshot = self.snapshot.borrow_mut();
+        snapshot.package_jsons = Some(normalize_package_jsons(package_jsons));
+        snapshot.missing_package_jsons = Some(normalize_package_jsons(missing_package_jsons));
+    }
+
+    // Go: incremental/program.go:433 PackageJsonLookupPaths
+    #[must_use]
+    pub fn package_json_lookup_paths(&self) -> Vec<String> {
+        let config = get_directory_path(command_line().config_name());
+        if config.is_empty() {
+            return Vec::new();
+        }
+
+        let mut package_jsons = Vec::new();
+        package_json_cache_entries(|_key, value| {
+            let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
+            if value.exists() || value.directory_exists {
+                package_json = host().fs().realpath(&package_json);
+            }
+            package_jsons.push(package_json);
+            true
+        });
+        package_jsons.sort();
+        package_jsons.dedup();
+        package_jsons
+    }
+}
+
+// Go: incremental/program.go:425 normalizePackageJsons
+// PORT: Go returns a new empty slice for nil. The list is sorted, so
+// `dedup` gives the same result as Go `core.Deduplicate`.
+fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
+    package_jsons.sort();
+    package_jsons.dedup();
+    package_jsons
 }
 
 // Go: compiler/program.go:1728 HandleNoEmitOnError

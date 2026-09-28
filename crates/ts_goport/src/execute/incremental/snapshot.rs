@@ -2,12 +2,12 @@
 //! `emitSignature`, which is in `hash.rs`): the build info diagnostics with
 //! file names, the diagnostics repopulation, and the `snapshot` state.
 //!
-//! PORT: the process has one program (plan D1), so Go `*compiler.Program`
-//! parameters are dropped and the installed program is read through the
-//! `program.rs` free functions. Go `SyncMap` and `SyncSet` fields are
-//! `FxIndexMap` and `FxIndexSet` (see `reference_map.rs` for the order
-//! note); Go `atomic.Bool` and `sync.Once` become plain fields, because the
-//! snapshot is only used on the loading thread.
+//! PORT: Go `*compiler.Program` parameters are dropped and the current
+//! program (`prog()`) is read through the `program.rs` free functions. Go
+//! `SyncMap` and `SyncSet` fields are `FxIndexMap` and `FxIndexSet` (see
+//! `reference_map.rs` for the order note); Go `atomic.Bool` and `sync.Once`
+//! become plain fields, because the snapshot is only used on the loading
+//! thread.
 //!
 //! PERF: the map keys are long paths, so the maps use the Fx hasher instead
 //! of SipHash. The hasher does not change the order: it is insertion order.
@@ -335,6 +335,10 @@ pub struct Snapshot {
     pub has_semantic_errors: bool,
     // If semantic diagnostic check is pending
     pub check_pending: bool,
+    // Looked up package.json files from
+    // PORT: Go nil (not computed yet) is `None`.
+    pub package_jsons: Option<Vec<String>>,
+    pub missing_package_jsons: Option<Vec<String>>,
 
     // Additional fields that are not serialized but needed to track state
 
@@ -342,6 +346,10 @@ pub struct Snapshot {
     pub build_info_emit_pending: bool,
     pub has_errors_from_old_state: Tristate,
     pub has_semantic_errors_from_old_state: bool,
+    // PORT: Go reads these two only with `slices.Equal`, where a nil slice
+    // equals an empty one, so `None` is the empty `Vec`.
+    pub package_jsons_from_old_state: Vec<String>,
+    pub missing_package_jsons_from_old_state: Vec<String>,
     //  Cache of all files excluding default library file for the current program
     // PORT: Go `allFilesExcludingDefaultLibraryFile` plus its sync.Once.
     pub all_files_excluding_default_library_file: OnceCell<Vec<Node>>,
@@ -369,9 +377,13 @@ impl Snapshot {
             has_errors: Tristate::Unknown,
             has_semantic_errors: false,
             check_pending: false,
+            package_jsons: None,
+            missing_package_jsons: None,
             build_info_emit_pending: false,
             has_errors_from_old_state: Tristate::Unknown,
             has_semantic_errors_from_old_state: false,
+            package_jsons_from_old_state: Vec::new(),
+            missing_package_jsons_from_old_state: Vec::new(),
             all_files_excluding_default_library_file: OnceCell::new(),
             has_changed_dts_file: false,
             has_emit_diagnostics: false,

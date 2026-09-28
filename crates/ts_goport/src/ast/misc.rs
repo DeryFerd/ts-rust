@@ -108,6 +108,33 @@ pub fn escape_all_internal_symbol_names(name: &str) -> String {
     out
 }
 
+// Go: ast/symbol.go:84 EscapeInternalSymbolName
+// PORT: Go `strings.CutPrefix(name, "\xFE")` reads the first Go byte. The
+// byte 0xFE is the unit `INTERNAL_SYMBOL_NAME_PREFIX` in the port form.
+#[must_use]
+pub fn escape_internal_symbol_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX) {
+        return format!("__{rest}");
+    }
+    name.to_string()
+}
+
+// Go: ast/symbol.go:95 EscapeSymbolName
+// EscapeSymbolName converts a binder symbol name into its escaped "__String"
+// form. Internal names (prefixed with the "\xFE" sentinel) become "__"-prefixed,
+// and user names that already begin with "__" gain an extra leading underscore
+// so they can be distinguished from internal names.
+#[must_use]
+pub fn escape_symbol_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX) {
+        return format!("__{rest}");
+    }
+    if name.starts_with("__") {
+        return format!("_{name}");
+    }
+    name.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // diagnostic.go
 // ---------------------------------------------------------------------------
@@ -1111,25 +1138,33 @@ pub struct PositionMapEntry {
     pub delta: i32,    // cumulative (utf8 - utf16) offset difference after this character
 }
 
-// Go: ast/positionmap.go:37 ComputePositionMap
+// Go: ast/positionmap.go:40 ComputePositionMap
 // ComputePositionMap builds a PositionMap for the given text.
-// PORT: Go decodes invalid UTF-8 as one-byte runes; a Rust `&str` is always
-// valid UTF-8, so iterating chars is equivalent.
+// PORT: `text` is the port form of the Go text (see
+// `scanner_util::GO_STRING_MARKER`), and the "UTF-8" offsets are offsets in
+// it. `decode_go_js_string_rune` reads one Go `DecodeJSStringRune` rune and
+// gives its size in the port form, so each entry holds a port offset and the
+// UTF-16 length of the Go rune. An invalid byte and a WTF-8 lone surrogate
+// are each one UTF-16 unit, as in Go.
 #[must_use]
 pub fn compute_position_map(text: &str) -> PositionMap {
     let mut pm = PositionMap::default();
     let mut delta: i32 = 0;
-    for (i, r) in text.char_indices() {
-        let size = r.len_utf8() as i32;
-        if size == 1 {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] < 0x80 {
+            i += 1;
             continue;
         }
-        let utf16_size: i32 = if (r as u32) >= 0x10000 { 2 } else { 1 };
-        delta += size - utf16_size;
+        let (r, size, _) = decode_go_js_string_rune(&text[i..]);
+        let utf16_size: i32 = if r >= 0x10000 { 2 } else { 1 };
+        delta += size as i32 - utf16_size;
         pm.entries.push(PositionMapEntry {
-            utf8_pos: i as i32 + size,
+            utf8_pos: (i + size) as i32,
             delta,
         });
+        i += size;
     }
     pm.ascii_only = pm.entries.is_empty();
     pm

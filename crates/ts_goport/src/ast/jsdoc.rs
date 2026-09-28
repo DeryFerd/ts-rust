@@ -2064,6 +2064,7 @@ impl Parser {
         }
 
         remove_leading_newlines(&mut comments);
+        remove_trailing_whitespace(&mut comments);
         if !comments.is_empty() {
             let comment_start = if link_end > -1 {
                 link_end
@@ -5790,10 +5791,11 @@ impl Parser {
         loop {
             let span = self.parse_template_type_span();
             list.push(span);
-            let D::TemplateLiteralTypeSpan(d) = ast_data_of(span) else {
-                unreachable!()
-            };
-            if resolve_synthetic_id(d.literal).kind() != SyntaxKind::TemplateMiddle {
+            let literal = with_ast_data(span, |d| match d {
+                D::TemplateLiteralTypeSpan(d) => d.literal,
+                _ => unreachable!(),
+            });
+            if resolve_synthetic_id(literal).kind() != SyntaxKind::TemplateMiddle {
                 break;
             }
         }
@@ -6713,13 +6715,17 @@ impl Parser {
         self.finish_node(n, pos)
     }
 
-    // Go: parser.go:5248 tryParseTypeArgumentsInExpression
+    // Go: parser.go:5247 tryParseTypeArgumentsInExpression
     fn try_parse_type_arguments_in_expression(&mut self) -> NodeList {
+        if self.ctx.intersects(NodeFlags::JAVA_SCRIPT_FILE)
+            || (self.token != SyntaxKind::LessThanToken
+                && self.token != SyntaxKind::LessThanLessThanToken)
+        {
+            return NodeList::NIL;
+        }
         let state = self.mark();
-        if !self.ctx.intersects(NodeFlags::JAVA_SCRIPT_FILE) && {
-            self.token = self.sc.rescan_less_than_token();
-            self.token == SyntaxKind::LessThanToken
-        } {
+        self.token = self.sc.rescan_less_than_token();
+        if self.token == SyntaxKind::LessThanToken {
             self.next_token();
             let type_arguments =
                 self.parse_delimited_list(ParsingContext::TypeArguments, Self::parse_type);
@@ -6800,10 +6806,11 @@ impl Parser {
         loop {
             let span = self.parse_template_span(is_tagged_template);
             list.push(span);
-            let D::TemplateSpan(d) = ast_data_of(span) else {
-                unreachable!()
-            };
-            if resolve_synthetic_id(d.literal).kind() != SyntaxKind::TemplateMiddle {
+            let literal = with_ast_data(span, |d| match d {
+                D::TemplateSpan(d) => d.literal,
+                _ => unreachable!(),
+            });
+            if resolve_synthetic_id(literal).kind() != SyntaxKind::TemplateMiddle {
                 break;
             }
         }

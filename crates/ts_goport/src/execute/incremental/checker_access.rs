@@ -8,8 +8,9 @@
 //!   a time, which is what "exclusive" gives Go.
 //! - Methods that read the Go frontend program (`GetParseFileRedirect`,
 //!   `GetResolvedTypeReferenceDirectives`, `GetDefaultLibFile`,
-//!   `CommandLine`, `Host`). The frontend program is not thread-safe, so
-//!   these work on the loading thread only, like `program.rs`.
+//!   `CommandLine`, `Host`, `PackageJsonCacheEntries`). The frontend program
+//!   is not thread-safe, so these work on the loading thread only, like
+//!   `program.rs`.
 
 use crate::frontend::prelude::*;
 
@@ -61,4 +62,9 @@ pub fn command_line() -> &'static ParsedCommandLine {
 #[must_use]
 pub fn host() -> &'static Rc<dyn CompilerHost> {
     frontend_program().host()
+}
+
+// Go: compiler/program.go:156 PackageJsonCacheEntries
+pub fn package_json_cache_entries(f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+    frontend_program().package_json_cache_entries(f);
 }

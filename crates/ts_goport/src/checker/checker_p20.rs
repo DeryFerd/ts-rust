@@ -1205,8 +1205,9 @@ impl Checker {
 
 impl WideningContext {
     // Go: checker/checker.go:18357 WideningContext.getChildContext
-    // PORT: the child keeps an `Rc` to its parent, so this takes the parent's
-    // `Rc` instead of `&self`. Call as `WideningContext::get_child_context(&ctx, name)`.
+    // PORT: the child keeps a `Weak` to its parent, so this takes the
+    // parent's `Rc` instead of `&self`. Call as
+    // `WideningContext::get_child_context(&ctx, name)`.
     pub fn get_child_context(
         this: &Rc<RefCell<WideningContext>>,
         property_name: &str,
@@ -1215,7 +1216,7 @@ impl WideningContext {
             return cached.clone();
         }
         let result = Rc::new(RefCell::new(WideningContext {
-            parent: Some(this.clone()),
+            parent: Some(Rc::downgrade(this)),
             property_name: property_name.to_string(),
             ..Default::default()
         }));
@@ -1269,8 +1270,9 @@ impl Checker {
                 let ctx = context.borrow();
                 (
                     ctx.parent
-                        .clone()
-                        .expect("child widening context has a parent"),
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                        .expect("child widening context has a live parent"),
                     ctx.property_name.clone(),
                 )
             };

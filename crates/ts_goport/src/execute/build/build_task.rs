@@ -1,36 +1,48 @@
+use crate::emitter::program_emit::{WriteFile, WriteFileData};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
+use crate::execute::build::host::{BuildCompilerHost, BuildHost};
 use crate::execute::build::up_to_date_status::*;
+use crate::execute::incremental::build_info::is_build_info_file_name_default_library;
+use crate::execute::incremental::emit_files::fs_error_text;
+use crate::execute::incremental::incremental::{BuildInfoReader, Host as IncrementalHost};
+use crate::execute::incremental::program::{
+    Program as IncrementalProgram, new_program as new_incremental_program, read_build_info_program,
+};
 use crate::execute::incremental::{BuildInfo, compute_hash};
+use crate::execute::tsc::compile::{CompileTimes, System, Writer};
+use crate::execute::tsc::diagnostics::{
+    DiagnosticReporter, create_diagnostic_reporter, quiet_diagnostics_reporter,
+};
+use crate::execute::tsc::emit::{
+    EmitInput, emit_and_report_statistics, get_trace_with_writer_from_sys,
+};
 use crate::execute::tsc::{ExitStatus, Statistics};
 use crate::frontend::prelude::*;
 // PORT: testing
 use crate::execute::tsc::CommandLineTesting;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 // This file ports execute/build/buildtask.go.
 //
-// PORT: design decision D1 (build-mode plan): the program state is
-// process-wide, so the Go `compileAndEmit` body that needs a program
-// (ReadBuildInfoProgram, NewProgram, incremental.NewProgram,
-// EmitAndReportStatistics, writeFile) runs in a worker process. The
-// orchestrator side calls it through
-// `BuildTaskOrchestrator::compile_and_emit_in_worker` and applies the
-// returned `WorkerCompileResult` here, in the same order as Go.
-//
-// PORT: concurrency. `ParsedCommandLine` is not `Send`, so tasks are
-// `Rc<RefCell<BuildTask>>` and run on one thread. Go `done` and
-// `reportDone` channels, `prevReporter`, and the mutexes are dropped: the
-// orchestrator must run `build_project` in `order` (every upstream task is
-// done first) and call `report` in `order`. Workers can still run in
-// parallel by using `build_project_start` / `build_project_finish` around
-// `compile_and_emit_in_worker`.
+// PORT: concurrency. `ParsedCommandLine` and the frontend program are not
+// `Send`, so tasks are `Rc<RefCell<BuildTask>>` and run on one thread, the
+// orchestrator thread. It is the loading thread of every program of the
+// build. Go `done` and `reportDone` channels, `prevReporter`, and the
+// mutexes are dropped. `buildProject` is split where `compileAndEmit` has
+// made the program (`build_project_start`) and the rest
+// (`build_project_finish`). The orchestrator starts a task after its
+// upstream tasks are done, finishes it later, and calls `report` in
+// `order` (see orchestrator.rs). The work that Go does on the task
+// goroutines still runs at the same time: each program checks on its own
+// checker threads from `build_project_start` on (`start_check`), emits on
+// them, and frees them in the background (`release_task_program`).
 //
 // PORT: the watch-only `updateWatch` and `resetConfig` are in
 // orchestrator_watch.rs, with the orchestrator watch code.
 //
-// PORT: each worker reports its own project statistics
-// (`tsc.EmitAndReportStatistics`) and sends them back in its result, so
-// the task keeps them for the build aggregate. `opts.Testing` is
+// PORT: the task keeps the statistics of `tsc.EmitAndReportStatistics` for
+// the build aggregate, as Go does. `opts.Testing` is
 // `BuildTaskOrchestrator::testing` (`None` outside tests).
 //
 // PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero), as in
@@ -73,17 +85,19 @@ pub struct BuildInfoEntry {
 pub type TaskDiagnosticReporter = Box<dyn Fn(&mut String, &Diagnostic)>;
 
 // Go: build/buildtask.go:39 taskResult
-// PORT: Go `program *incremental.Program` is only read for
-// `HasChangedDtsFile()` (and `Testing.OnProgram`, which is
-// `CommandLineTesting::on_build_task_program`), so only that bool is
-// kept; the program lives in the worker. Go `*tsc.Statistics` is an
-// `Option` (nil = `None`).
+// PORT: Go `program *incremental.Program` is `program` (`None` = nil). The
+// task keeps it until it reports, for `Testing.OnProgram`, and the
+// orchestrator releases it there (`release_task_program`), where Go drops
+// `t.result`. `has_changed_dts_file` is its `HasChangedDtsFile()` after the
+// emit, which `updateDownstream` reads. Go `*tsc.Statistics` is an `Option`
+// (nil = `None`).
 pub struct TaskResult {
     pub builder: String,
     pub report_status: TaskDiagnosticReporter,
     pub diagnostic_reporter: TaskDiagnosticReporter,
     pub exit_status: ExitStatus,
     pub statistics: Option<Statistics>,
+    pub program: Option<IncrementalProgram>,
     pub has_changed_dts_file: bool,
     pub build_kind: BuildKind,
     pub files_to_delete: Vec<String>,
@@ -102,6 +116,7 @@ impl TaskResult {
             diagnostic_reporter,
             exit_status: ExitStatus::Success,
             statistics: None,
+            program: None,
             has_changed_dts_file: false,
             build_kind: BuildKind::None,
             files_to_delete: Vec::new(),
@@ -109,180 +124,16 @@ impl TaskResult {
     }
 }
 
-// The result of Go `compileAndEmit`'s program part, computed in a
-// `--build-worker` process (plan D1).
-// - `exit_status`: `result.Status` of `tsc.EmitAndReportStatistics`.
-// - `output`: everything the worker wrote to the task writer (diagnostics
-//   through the task diagnostic reporter, listFiles, traces), in order.
-// - `diagnostics`: `result.Diagnostics`, the diagnostics that went through
-//   Go `t.reportDiagnostic` (see `WorkerDiagnostic`).
-// - `diagnostic_file_texts`: the file name and text of each file that
-//   `diagnostics` names (with their message chains and related
-//   information), in first use order.
-// - `emitted_files`: `result.EmitResult.EmittedFiles`.
-// - `has_changed_dts_file`: `incremental.Program.HasChangedDtsFile()`.
-// - `build_info_emit`: the file name that `writeFile` wrote with
-//   `data.BuildInfo != nil` and the Go `Sys.Now()` of `onBuildInfoEmit`,
-//   taken at that write, or `None` when no build info was written.
-// - `statistics`: the statistics of `tsc.EmitAndReportStatistics` (`None`
-//   when Go returns nil).
-// - `output_time_stamps`: the files that `writeFile` wrote with
-//   `storeOutputTimeStamp` true, each with its Go `Sys.Now()` time
-//   (watch mode only).
-// - `fs_cache`: the cached file system entries the worker added (see
-//   shared_fs.rs). The orchestrator merges them into its cache.
-#[derive(Clone, Debug)]
-pub struct WorkerCompileResult {
-    pub exit_status: ExitStatus,
-    pub output: String,
-    pub diagnostics: Vec<WorkerDiagnostic>,
-    pub diagnostic_file_texts: Vec<(String, String)>,
-    pub emitted_files: Vec<String>,
-    pub has_changed_dts_file: bool,
-    pub build_info_emit: Option<(String, SystemTime)>,
-    pub statistics: Option<Statistics>,
-    pub output_time_stamps: Vec<(String, SystemTime)>,
-    pub fs_cache: CachedFsState,
-}
-
-// One diagnostic of the worker's `result.Diagnostics` (Go `*ast.Diagnostic`),
-// as it goes back to the orchestrator for Go `t.errors`.
-// - `file_name`: the file name of Go `File()`, or `None` when it is nil.
-// - `pos`, `end`, `code`, `category`, `message_args`: Go `Pos()`, `End()`,
-//   `Code()`, `Category()` and the message arguments.
-// - `message_chain`, `related_information`: Go `MessageChain()` and
-//   `RelatedInformation()`, in the same form.
-// PORT: `skippedOnNoEmit` and the repopulate information are not sent.
-// Go reads `t.errors` only for the error summary (`WriteErrorSummaryText`)
-// and in watch mode, where the diagnostic reporter prints `t.errors` again
-// for a task that it does not rebuild (`build_project_start`). Neither
-// reads them.
-#[derive(Clone, Debug)]
-pub struct WorkerDiagnostic {
-    pub file_name: Option<String>,
-    pub pos: i32,
-    pub end: i32,
-    pub code: i32,
-    pub category: ts_diagnostics::Category,
-    pub message_args: Vec<String>,
-    pub message_chain: Vec<WorkerDiagnostic>,
-    pub related_information: Vec<WorkerDiagnostic>,
-}
-
-thread_local! {
-    // The file node of each file name and text in the orchestrator's
-    // `t.errors` (see `error_file`).
-    static ERROR_FILES: RefCell<FxHashMap<(String, String), Node>> =
-        RefCell::new(FxHashMap::default());
-}
-
-// The one file node of `file_name` with `text` in the orchestrator's
-// `t.errors`: the first node that was seen for that name and text, else
-// `make()`.
-// PORT: Go keys the error summary by the file object, and a build shares
-// one object per file: the programs get their files from the build host's
-// parse cache, and a program's config diagnostics are those of `t.resolved`
-// and its cached extended configs, which the orchestrator also reports.
-// So errors of two projects in one file count as one file (for example,
-// the reference error in `lib/tsconfig.json` that the programs of `lib`
-// and `app` both report). The port's worker diagnostics come from another
-// process (`worker_errors`), so the orchestrator shares one node per file
-// name and text instead, for the worker diagnostics and its own
-// (`report_diagnostic`). Go parses a file again for a program with other
-// parse options, which then counts as another file; the port counts it as
-// the same file. In watch mode a changed file is a new Go object with the
-// new text, so the text is part of the key: watch mode prints `t.errors`
-// again, with the code of the file.
-fn error_file(file_name: &str, text: &str, make: impl FnOnce() -> Node) -> Node {
-    ERROR_FILES.with(|files| {
-        *files
-            .borrow_mut()
-            .entry((file_name.to_string(), text.to_string()))
-            .or_insert_with(make)
-    })
-}
-
-// The Go `t.errors` entries of the diagnostics that the worker reported
-// through `t.reportDiagnostic` (buildtask.go:86), in the same order.
-// PORT: the worker's source files are in the worker process. A file that
-// the orchestrator has no node for gets a node with the text that the
-// worker sent and no statements: the diagnostic writers read only the file
-// name, the text and the lines of the text (see `error_file`).
-fn worker_errors(
-    orchestrator: &dyn BuildTaskOrchestrator,
-    result: &WorkerCompileResult,
-) -> Vec<Diagnostic> {
-    // The node of each file that the diagnostics name, in first use order.
-    let files: FxHashMap<&str, Node> = result
-        .diagnostic_file_texts
-        .iter()
-        .map(|(file_name, text)| {
-            let file = error_file(file_name, text, || {
-                new_worker_diagnostic_file(orchestrator, file_name, text)
-            });
-            (file_name.as_str(), file)
-        })
-        .collect();
-    result
-        .diagnostics
-        .iter()
-        .map(|diagnostic| worker_error(&files, diagnostic))
-        .collect()
-}
-
-// One entry of `worker_errors`, with its message chain and related
-// information. `files` has the node of each file name.
-fn worker_error(files: &FxHashMap<&str, Node>, diagnostic: &WorkerDiagnostic) -> Diagnostic {
-    let file = match &diagnostic.file_name {
-        None => Node::NIL,
-        Some(file_name) => files[file_name.as_str()],
-    };
-    let message = ts_diagnostics::message_by_code(diagnostic.code as u32)
-        .unwrap_or_else(|| panic!("build worker: unknown diagnostic code {}", diagnostic.code));
-    let to_diagnostics = |diagnostics: &[WorkerDiagnostic]| -> Vec<Diagnostic> {
-        diagnostics
-            .iter()
-            .map(|diagnostic| worker_error(files, diagnostic))
-            .collect()
-    };
-    Diagnostic {
-        file,
-        pos: diagnostic.pos,
-        end: diagnostic.end,
-        code: diagnostic.code,
-        category: diagnostic.category,
-        message,
-        message_args: diagnostic.message_args.clone(),
-        message_chain: to_diagnostics(&diagnostic.message_chain),
-        related_information: to_diagnostics(&diagnostic.related_information),
-        reports_unnecessary: message.reports_unnecessary(),
-        reports_deprecated: message.reports_deprecated(),
-        skipped_on_no_emit: false,
-        repopulate_info: None,
-    }
-}
-
-// A source file node named `file_name` with `text` and no statements (see
-// `worker_errors`). It is made like the node of an empty config file
-// (tsoptions `getTsconfigSourceFile`).
-fn new_worker_diagnostic_file(
-    orchestrator: &dyn BuildTaskOrchestrator,
-    file_name: &str,
-    text: &str,
-) -> Node {
-    let file_name: &'static str = Box::leak(file_name.to_string().into_boxed_str());
-    let text: &'static str = Box::leak(text.to_string().into_boxed_str());
-    let factory = NodeFactory::for_file(new_file_store(file_name, text));
-    factory.new_parsed_source_file(
-        &SourceFileParseOptions {
-            file_name: file_name.to_string(),
-            path: orchestrator.to_path(file_name),
-            ..Default::default()
-        },
-        text,
-        factory.new_node_list(&[]),
-        factory.new_token(SyntaxKind::EndOfFile),
-    )
+/// Go drops `t.result` after `report`, and with it the task's program.
+/// This frees the checker pool and the frontend of the program. Its files
+/// stay published, so the diagnostics in `t.errors` can still be written.
+// PORT: Go frees the program in the background GC. The checker threads
+// free their checkers while the build goes on
+// (`program::release_program_in_background`).
+pub fn release_task_program(program: IncrementalProgram) {
+    let go_program = program.get_program();
+    drop(program);
+    crate::program::release_program_in_background(go_program);
 }
 
 // The parts of Go `*Orchestrator` (and its `host`) that a build task uses.
@@ -309,9 +160,10 @@ pub trait BuildTaskOrchestrator {
     // Go: `incremental.NewBuildInfoReader(o.host).ReadBuildInfo(config)`
     // (uncached read from disk).
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
-    // Runs the program part of Go `compileAndEmit` for `config` in a worker
-    // process and returns its result (plan D1).
-    fn compile_and_emit_in_worker(&self, config: &str, config_path: &Path) -> WorkerCompileResult;
+    // Go: `o.opts.Sys`
+    fn sys(&self) -> Rc<dyn System>;
+    // Go: `o.host`
+    fn host(&self) -> Rc<BuildHost>;
     // Go: `o.opts.Testing`
     // PORT: testing. `None` outside tests.
     fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
@@ -334,11 +186,31 @@ pub struct BuildTask {
     pub result: Option<TaskResult>,
 
     pub build_info_entry: Option<BuildInfoEntry>,
+    pub package_jsons: Vec<String>,
 
     pub errors: Vec<Diagnostic>,
     pub pending: bool,
     pub is_initial_cycle: bool,
     pub dirty: bool,
+
+    // PORT: not in Go. The compile between `build_project_start` and
+    // `build_project_finish`.
+    compile: Option<PendingCompile>,
+}
+
+// The state of Go `compileAndEmit` from `NewProgram` to
+// `EmitAndReportStatistics`: the program is made and not emitted yet.
+struct PendingCompile {
+    program: &'static GoProgram,
+    incremental_program: IncrementalProgram,
+    // Go `&t.result.builder` as the compile writer (see
+    // `compile_and_emit_start`).
+    builder: Rc<RefCell<Vec<u8>>>,
+    writer: Writer,
+    // Go `t.reportDiagnostic`, and what it appends to `t.errors`.
+    report_diagnostic: DiagnosticReporter,
+    errors: Rc<RefCell<Vec<Diagnostic>>>,
+    compile_times: Rc<RefCell<CompileTimes>>,
 }
 
 impl BuildTask {
@@ -353,10 +225,12 @@ impl BuildTask {
             status: None,
             result: None,
             build_info_entry: None,
+            package_jsons: Vec::new(),
             errors: Vec::new(),
             pending: true,
             is_initial_cycle,
             dirty: false,
+            compile: None,
         }
     }
 
@@ -379,8 +253,8 @@ impl BuildTask {
     }
 
     // Go: build/buildtask.go:73 (*BuildTask).waitOnUpstream
-    // PORT: no-op. The orchestrator runs tasks in build order on one thread,
-    // so every upstream task is done already (see top).
+    // PORT: no-op. The orchestrator starts a task only when its upstream
+    // tasks are done (see top).
     pub fn wait_on_upstream(&self) {}
 
     // Go: build/buildtask.go:79 (*BuildTask).unblockDownstream
@@ -390,15 +264,8 @@ impl BuildTask {
     }
 
     // Go: build/buildtask.go:85 (*BuildTask).reportDiagnostic
-    // PORT: the `t.errors` entry names the file node that the build's errors
-    // share for that file (see `error_file`).
     pub fn report_diagnostic(&mut self, err: Diagnostic) {
-        let mut error = err.clone();
-        if error.file.is_some() {
-            let file = error.file;
-            error.file = error_file(source_file_file_name(file), source_file_text(file), || file);
-        }
-        self.errors.push(error);
+        self.errors.push(err.clone());
         let result = self.result_mut();
         (result.diagnostic_reporter)(&mut result.builder, &err);
     }
@@ -419,18 +286,15 @@ impl BuildTask {
         (result, self.errors.clone())
     }
 
-    // Go: build/buildtask.go:119 (*BuildTask).buildProject
-    pub fn build_project(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
-        if self.build_project_start(orchestrator, path) {
-            let result = orchestrator.compile_and_emit_in_worker(&self.config, path);
-            self.build_project_finish(orchestrator, path, result);
-        }
-    }
-
-    // First part of Go `buildProject`, up to the worker call.
-    // Returns true when the project needs `compileAndEmit`: the caller must
-    // then run `compile_and_emit_in_worker` and call `build_project_finish`.
-    // When it returns false the task is done (downstream unblocked).
+    // Go: build/buildtask.go:119 (*BuildTask).buildProject, up to the
+    // program that `compileAndEmit` makes (`compile_and_emit_start`).
+    // PORT: Go runs up to `numRoutines` tasks at the same time, and a task
+    // that runs beside others makes its program before they write their
+    // outputs. The orchestrator keeps that order on one thread (see
+    // orchestrator.rs), so `buildProject` is split here. It returns true
+    // when the task compiles: then the caller must call
+    // `build_project_finish`. When it returns false the task is done
+    // (downstream unblocked).
     pub fn build_project_start(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -442,7 +306,7 @@ impl BuildTask {
             self.status = Some(self.get_up_to_date_status(orchestrator, path));
             self.report_up_to_date_status(orchestrator);
             if !self.handle_status_that_doesnt_require_build(orchestrator) {
-                self.compile_and_emit_start(orchestrator);
+                self.compile_and_emit_start(orchestrator, path);
                 return true;
             } else {
                 if let Some(resolved) = self.resolved.clone() {
@@ -466,14 +330,10 @@ impl BuildTask {
         false
     }
 
-    // Last part of Go `buildProject`, after the worker call.
-    pub fn build_project_finish(
-        &mut self,
-        orchestrator: &dyn BuildTaskOrchestrator,
-        path: &Path,
-        worker_result: WorkerCompileResult,
-    ) {
-        self.compile_and_emit_finish(orchestrator, worker_result);
+    // Go: build/buildtask.go:119 (*BuildTask).buildProject, from the emit
+    // of `compileAndEmit` on (see `build_project_start`).
+    pub fn build_project_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
+        self.compile_and_emit_finish(orchestrator);
         self.update_downstream(orchestrator, path);
         self.unblock_downstream();
     }
@@ -533,104 +393,238 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:179 (*BuildTask).compileAndEmit
-    // PORT: split into `compile_and_emit_start`, the worker call and
-    // `compile_and_emit_finish` (plan D1).
-    pub fn compile_and_emit(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
-        self.compile_and_emit_start(orchestrator);
-        let result = orchestrator.compile_and_emit_in_worker(&self.config, path);
-        self.compile_and_emit_finish(orchestrator, result);
-    }
-
-    // Go: build/buildtask.go:179 compileAndEmit, up to NewProgram.
-    pub fn compile_and_emit_start(&mut self, orchestrator: &dyn BuildTaskOrchestrator) {
+    // Go: build/buildtask.go:179 (*BuildTask).compileAndEmit, up to
+    // `incremental.NewProgram` (see `build_project_start`).
+    // PORT: the program is a program version of this multi-program process
+    // (`program::new_program_version`), made on this thread, the loading
+    // thread of every program of the build. It is current
+    // (`core::enter_program`) while it is used, because the `program.rs`
+    // functions read `prog()`.
+    // PORT: Go `EmitInput.Writer`, the trace writer and
+    // `t.result.diagnosticReporter` write to `&t.result.builder`. The task
+    // reporters take the builder per call (`TaskDiagnosticReporter`) and
+    // the tsc code takes a `Writer`, so the compile writes to its own
+    // buffer, which `compile_and_emit_finish` appends to the builder.
+    // Nothing else writes to the builder meanwhile, so the order is Go's.
+    pub fn compile_and_emit_start(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        path: &Path,
+    ) {
         self.errors = Vec::new();
-        if orchestrator.command().build_options.verbose.is_true() {
+        let command = orchestrator.command();
+        if command.build_options.verbose.is_true() {
             self.report_status(new_compiler_diagnostic(
                 diag::Building_project_0,
                 args![orchestrator.relative_file_name(&self.config)],
             ));
         }
 
+        let sys = orchestrator.sys();
+        let host = orchestrator.host();
+        let testing = orchestrator.testing();
+        let resolved = self.resolved().clone();
+        let builder: Rc<RefCell<Vec<u8>>> = Rc::default();
+        let writer: Writer = builder.clone();
+        // Go: build/buildtask.go:85 (*BuildTask).reportDiagnostic. The
+        // diagnostics go to `t.errors` in `compile_and_emit_finish`.
+        let errors: Rc<RefCell<Vec<Diagnostic>>> = Rc::default();
+        let report_diagnostic: DiagnosticReporter = {
+            let errors = errors.clone();
+            // Go `t.result.diagnosticReporter` (orchestrator.go:597
+            // createDiagnosticReporter(task)).
+            let report = create_diagnostic_reporter(
+                &*sys,
+                writer.clone(),
+                &command.locale(),
+                &command.compiler_options,
+            );
+            Rc::new(move |err: &Diagnostic| {
+                errors.borrow_mut().push(err.clone());
+                report(err);
+            })
+        };
+
         // Real build
-        // PORT: ReadBuildInfoProgram (skipped with --force), NewProgram,
-        // incremental.NewProgram and EmitAndReportStatistics run in the
-        // worker. The worker's `writeFile` writes the files; the build info
-        // part of `t.writeFile` (onBuildInfoEmit) runs in
-        // `compile_and_emit_finish`.
+        let compile_times = Rc::new(RefCell::new(CompileTimes::default()));
+        let config_time = host
+            .config_times
+            .borrow()
+            .get(path)
+            .copied()
+            .unwrap_or_default();
+        compile_times.borrow_mut().config_time = config_time;
+        let build_info_read_start = sys.now();
+        let mut old_program = None;
+        if !command.build_options.force.is_true() {
+            // Go: `ReadBuildInfoProgram(t.resolved, o.host, o.host)`. Its
+            // `o.host.ReadBuildInfo(t.resolved)` (build/host.go:77) is this
+            // task's `loadOrStoreBuildInfo`.
+            let config_path = orchestrator.to_path(resolved.config_name());
+            let (build_info, _) = self.load_or_store_build_info(
+                orchestrator,
+                &config_path,
+                &resolved.get_build_info_file_name(),
+            );
+            old_program = read_build_info_program(&resolved, &TaskBuildInfo(build_info), &*host);
+        }
+        compile_times.borrow_mut().build_info_read_time = elapsed(&*sys, build_info_read_start);
+        let parse_start = sys.now();
+        // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
+        let program = crate::execute::execute_tsc::new_program_version(
+            Rc::new(BuildCompilerHost {
+                host: host.clone(),
+                trace: get_trace_with_writer_from_sys(
+                    writer.clone(),
+                    command.locale(),
+                    testing.clone(),
+                ),
+            }),
+            resolved,
+        );
+        compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
+        let changes_compute_start = sys.now();
+        let incremental_program = {
+            let _scope = crate::core::enter_program(Some(program));
+            let incremental_program = new_incremental_program(
+                old_program.as_ref(),
+                host as Rc<dyn IncrementalHost>,
+                testing.is_some(),
+            );
+            compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
+            // PORT: Go checks this project on its goroutine while other
+            // tasks make their programs and emit. Here the check starts on
+            // this program's checker threads now, and the emit
+            // (`compile_and_emit_finish`) waits for it. The statistics'
+            // check time is the time of that wait.
+            incremental_program.start_check();
+            incremental_program
+        };
+        self.compile = Some(PendingCompile {
+            program,
+            incremental_program,
+            builder,
+            writer,
+            report_diagnostic,
+            errors,
+            compile_times,
+        });
     }
 
-    // Go: build/buildtask.go:179 compileAndEmit, from `t.result.exitStatus =
-    // result.Status` on.
-    // PORT: the worker wrote the reported diagnostics to `output`. The
-    // `t.errors` part of Go `t.reportDiagnostic` is done here, first, as
-    // Go appends them while `EmitAndReportStatistics` runs.
-    pub fn compile_and_emit_finish(
-        &mut self,
-        orchestrator: &dyn BuildTaskOrchestrator,
-        worker_result: WorkerCompileResult,
-    ) {
-        let errors = worker_errors(orchestrator, &worker_result);
-        self.errors.extend(errors);
+    // Go: build/buildtask.go:179 (*BuildTask).compileAndEmit, from
+    // `EmitAndReportStatistics` on (see `compile_and_emit_start`).
+    pub fn compile_and_emit_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator) {
+        let PendingCompile {
+            program,
+            incremental_program,
+            builder,
+            writer,
+            report_diagnostic,
+            errors,
+            compile_times,
+        } = self.compile.take().expect("compile_and_emit_start ran");
+        let sys = orchestrator.sys();
+        let host = orchestrator.host();
+        let resolved = self.resolved().clone();
+        let written_build_info: WrittenBuildInfo = Arc::default();
+        let write_file = new_task_write_file(
+            written_build_info.clone(),
+            self.store_output_time_stamp(orchestrator),
+            host.m_times.clone(),
+            orchestrator.compare_paths_options().clone(),
+        );
+        let (result, statistics) = {
+            let _scope = crate::core::enter_program(Some(program));
+            WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
+            let emitted = emit_and_report_statistics(&EmitInput {
+                sys: &*sys,
+                program_like: &incremental_program,
+                config: Some(&resolved),
+                report_diagnostic,
+                report_error_summary: quiet_diagnostics_reporter(),
+                writer,
+                write_file: Some(write_file),
+                compile_times,
+                testing: orchestrator.testing(),
+                testing_m_times_cache: Some(&*host.m_times),
+            });
+            WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
+            emitted
+        };
+        assert!(
+            incremental_program.start_check_used(),
+            "{}: the emit did not use the check that started with the program",
+            self.config
+        );
+        let has_changed_dts_file = incremental_program.has_changed_dts_file();
+        // Go appends to `t.errors` while `EmitAndReportStatistics` reports.
+        self.errors.extend(errors.take());
         {
-            let result = self.result_mut();
-            result.builder.push_str(&worker_result.output);
-            result.has_changed_dts_file = worker_result.has_changed_dts_file;
+            let task_result = self.result_mut();
+            task_result
+                .builder
+                .push_str(&String::from_utf8_lossy(&builder.borrow()));
+            task_result.has_changed_dts_file = has_changed_dts_file;
+            task_result.program = Some(incremental_program);
         }
-        // Go: build/buildtask.go:783 (*BuildTask).writeFile, the
-        // `storeOutputTimeStamp` branch.
-        // PORT: the worker records the times (worker.rs); they go into the
-        // orchestrator's mTimes cache here.
-        for (file_name, m_time) in &worker_result.output_time_stamps {
-            orchestrator.store_m_time(file_name, *m_time);
-        }
-        // Go: build/buildtask.go:785 (*BuildTask).writeFile, build info part.
-        // PORT: Go passes the in-memory BuildInfo that was just written; it
-        // is read back from the written file here, which has the same
-        // content. The worker took the `mTime` at the write.
-        if let Some((build_info_file_name, m_time)) = &worker_result.build_info_emit {
-            let build_info = orchestrator.read_build_info_file(self.resolved());
+        // Go: build/buildtask.go:785 (*BuildTask).writeFile, the build info
+        // part (`onBuildInfoEmit`), with the time of the write.
+        // PORT: it runs when the emit is done (see `new_task_write_file`).
+        // The build info is the last file that the emit writes, so
+        // `HasChangedDtsFile()` has its final value in Go too.
+        let written = written_build_info
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((build_info_file_name, build_info, m_time)) = written {
+            let build_info = Arc::try_unwrap(build_info).unwrap_or_else(|shared| (*shared).clone());
             self.on_build_info_emit(
                 orchestrator,
-                build_info_file_name,
-                build_info,
-                worker_result.has_changed_dts_file,
-                *m_time,
+                &build_info_file_name,
+                Some(Rc::new(build_info)),
+                has_changed_dts_file,
+                m_time,
             );
         }
 
-        self.result_mut().exit_status = worker_result.exit_status;
-        self.result_mut().statistics = worker_result.statistics;
-        if (!self
-            .resolved()
-            .compiler_options()
-            .no_emit_on_error
-            .is_true()
-            || worker_result.diagnostics.is_empty())
-            && (!worker_result.emitted_files.is_empty()
+        self.result_mut().exit_status = result.status;
+        self.result_mut().statistics = statistics;
+        // Go: build/buildtask.go:236 `t.packageJsons = t.result.program.PackageJsonLookupPaths()`.
+        // It reads `prog()`, so the task's program is current.
+        self.package_jsons = {
+            let _scope = crate::core::enter_program(Some(program));
+            self.result
+                .as_ref()
+                .and_then(|result| result.program.as_ref())
+                .expect("compile_and_emit_finish set the program")
+                .package_json_lookup_paths()
+        };
+        let emitted_files = &result.emit_result.emitted_files;
+        if (!resolved.compiler_options().no_emit_on_error.is_true()
+            || result.diagnostics.is_empty())
+            && (!emitted_files.is_empty()
                 || self.status().kind != UpToDateStatusType::OutOfDateBuildInfoWithErrors)
         {
             // Update time stamps for rest of the outputs
             self.update_time_stamps(
                 orchestrator,
-                &worker_result.emitted_files,
+                emitted_files,
                 diag::Updating_unchanged_output_timestamps_of_project_0,
             );
         }
         self.result_mut().build_kind = BuildKind::Program;
-        if worker_result.exit_status == ExitStatus::DiagnosticsPresentOutputsSkipped
-            || worker_result.exit_status == ExitStatus::DiagnosticsPresentOutputsGenerated
+        if result.status == ExitStatus::DiagnosticsPresentOutputsSkipped
+            || result.status == ExitStatus::DiagnosticsPresentOutputsGenerated
         {
             self.status = Some(UpToDateStatus::new(UpToDateStatusType::BuildErrors));
         } else {
-            let oldest_output_file_name = if !worker_result.emitted_files.is_empty() {
-                worker_result.emitted_files[0].clone()
-            } else {
-                self.resolved()
+            let oldest_output_file_name = match emitted_files.first() {
+                Some(first) => first.clone(),
+                None => resolved
                     .get_output_file_names()
                     .into_iter()
                     .next()
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             };
             self.status = Some(UpToDateStatus::with_data(
                 UpToDateStatusType::UpToDate,
@@ -927,6 +921,61 @@ impl BuildTask {
             }
         }
 
+        if build_info.is_incremental() {
+            let mut resolved_roots: FxHashSet<Path> = FxHashSet::default();
+            for root in reader.roots() {
+                let (_, resolved) = reader.get_build_info_file_info(root);
+                if !resolved.as_str().is_empty() {
+                    resolved_roots.insert(resolved);
+                }
+            }
+            let file_names = build_info.file_names.as_deref().unwrap_or_default();
+            for (index, build_info_file_info) in build_info.file_infos.iter().flatten().enumerate()
+            {
+                let build_info_file_name = &file_names[index];
+                // Lib files bundled with the compiler can change only with the version of the compiler,
+                // which is already verified with buildInfo.Version
+                if is_build_info_file_name_default_library(build_info_file_name) {
+                    continue;
+                }
+                let input_file =
+                    get_normalized_absolute_path(build_info_file_name, &build_info_directory);
+                let input_path = orchestrator.to_path(&input_file);
+                // Root files are already checked
+                if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
+                    continue;
+                }
+                let input_time = orchestrator.get_m_time(&input_file);
+                if input_time.is_none() {
+                    // Input file that was part of the program is missing (eg: dependency was removed)
+                    return UpToDateStatus::with_data(
+                        UpToDateStatusType::InputFileMissing,
+                        UpToDateStatusData::String(input_file),
+                    );
+                }
+                if input_time > oldest_output_file_and_time.time {
+                    let mut current_version = String::new();
+                    let version = build_info_file_info.get_file_info().version().to_string();
+                    if !version.is_empty() {
+                        let (text, ok) = orchestrator.fs().read_file(&input_file);
+                        if ok {
+                            current_version = compute_hash(&text, orchestrator.testing().is_some());
+                        }
+                    }
+                    if version.is_empty() || version != current_version {
+                        return UpToDateStatus::with_data(
+                            UpToDateStatusType::InputFileNewer,
+                            UpToDateStatusData::InputOutputName(InputOutputName {
+                                input: input_file,
+                                output: build_info_path,
+                            }),
+                        );
+                    }
+                    input_text_unchanged = true;
+                }
+            }
+        }
+
         if !options.is_incremental() {
             // Check output file stamps
             for output_file in resolved.get_output_file_names() {
@@ -1048,14 +1097,39 @@ impl BuildTask {
             }
         }
 
-        // !!! sheetal TODO : watch??
-        // // Check package file time
-        // const packageJsonLookups = state.lastCachedPackageJsonLookups.get(resolvedPath);
-        // const dependentPackageFileStatus = packageJsonLookups && forEachKey(
-        //     packageJsonLookups,
-        //     path => checkConfigFileUpToDateStatus(state, path, oldestOutputFileTime, oldestOutputFileName),
-        // );
-        // if (dependentPackageFileStatus) return dependentPackageFileStatus;
+        for package_json in build_info.get_package_jsons(&build_info_directory) {
+            let package_json_time = orchestrator.get_m_time(&package_json);
+            if package_json_time.is_none() {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileMissing,
+                    UpToDateStatusData::String(package_json),
+                );
+            }
+            if package_json_time > oldest_output_file_and_time.time {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileNewer,
+                    UpToDateStatusData::InputOutputName(InputOutputName {
+                        input: package_json,
+                        output: oldest_output_file_and_time.file.clone(),
+                    }),
+                );
+            }
+        }
+        for package_json in build_info.get_missing_package_jsons(&build_info_directory) {
+            if orchestrator.get_m_time(&package_json).is_some() {
+                return UpToDateStatus::with_data(
+                    UpToDateStatusType::InputFileNewer,
+                    UpToDateStatusData::InputOutputName(InputOutputName {
+                        input: package_json,
+                        output: oldest_output_file_and_time.file.clone(),
+                    }),
+                );
+            }
+        }
+        self.package_jsons = build_info
+            .get_package_jsons(&build_info_directory)
+            .chain(build_info.get_missing_package_jsons(&build_info_directory))
+            .collect();
 
         UpToDateStatus::with_data(
             if ref_dts_unchanged {
@@ -1324,10 +1398,9 @@ impl BuildTask {
 
     // Go: build/buildtask.go:741 (*BuildTask).onBuildInfoEmit
     // PORT: Go takes `mTime := orchestrator.opts.Sys.Now()` here, in the
-    // `writeFile` call of the build info. That write runs in the worker,
-    // which takes the time there (worker.rs `new_task_write_file`), before
-    // the test `OnEmittedFiles` stamps the emitted files. So the caller
-    // passes it as `m_time`.
+    // `writeFile` call of the build info, before the test `OnEmittedFiles`
+    // stamps the emitted files. `new_task_write_file` takes the time at
+    // that write, and the caller passes it as `m_time`.
     pub fn on_build_info_emit(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1395,9 +1468,91 @@ impl BuildTask {
     }
 
     // Go: build/buildtask.go:785 (*BuildTask).writeFile
-    // PORT: runs in the worker (plan D1). Its build info branch is
-    // `on_build_info_emit` in `compile_and_emit_finish`, with the time that
-    // the worker took at the write (`build_info_emit`); the worker records
-    // the watch-only `storeMTime` branch in `output_time_stamps`, which
-    // `compile_and_emit_finish` stores.
+    // PORT: see `new_task_write_file`.
+}
+
+/// The build info that the emit wrote: its file name, Go
+/// `WriteFileData.BuildInfo`, and the Go `Sys.Now()` of `onBuildInfoEmit`,
+/// taken at the write.
+type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>;
+
+// Go: build/buildtask.go:785 (*BuildTask).writeFile
+// PORT: emit writes the source outputs on the checker threads, so the
+// callback is `Send` and cannot hold the task, the `Rc` system or the `Rc`
+// file system. Go writes through `orchestrator.host.FS()` (cachedvfs over
+// bundled over osvfs); both wrappers pass a write of a real path to osvfs
+// (cachedvfs.go:148 WriteFile), so this writes with the osvfs of the
+// calling thread. The build info branch keeps what `onBuildInfoEmit` needs
+// in `written`, and `compile_and_emit_finish` calls it after the emit. The
+// watch-only `storeMTime` branch stores into the build host `m_times` at
+// once (Go `SyncMap`), before the test `OnEmittedFiles` reads it.
+fn new_task_write_file(
+    written: WrittenBuildInfo,
+    store_output_time_stamp: bool,
+    m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    compare_paths_options: ComparePathsOptions,
+) -> WriteFile {
+    Arc::new(
+        move |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
+            osvfs_fs()
+                .write_file(file_name, text)
+                .map_err(|err| fs_error_text(&err))?;
+            if let Some(build_info) = &data.build_info {
+                *written.lock().unwrap_or_else(PoisonError::into_inner) = Some((
+                    file_name.to_string(),
+                    build_info.clone(),
+                    task_write_file_now(),
+                ));
+            } else if store_output_time_stamp {
+                // Store time stamps
+                // Go: orchestrator.host.storeMTime(fileName, orchestrator.opts.Sys.Now())
+                let m_time = task_write_file_now();
+                let path = to_path(
+                    file_name,
+                    &compare_paths_options.current_directory,
+                    compare_paths_options.use_case_sensitive_file_names,
+                );
+                m_times
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(path, Some(m_time));
+            }
+            Ok(())
+        },
+    )
+}
+
+thread_local! {
+    // Go `orchestrator.opts.Sys` of the task `writeFile`: the orchestrator
+    // system, on the orchestrator thread, while a task emits (see
+    // `task_write_file_now`).
+    static WRITE_FILE_SYS: RefCell<Option<Rc<dyn System>>> = const { RefCell::new(None) };
+}
+
+// Go `orchestrator.opts.Sys.Now()` in the task `writeFile`.
+// PORT: emit writes the source files' outputs on the checker threads,
+// which cannot hold the `Rc` system; there it is the OS system's `Now`
+// (`SystemTime::now`). The build info write runs on the orchestrator thread
+// (incremental `emitBuildInfo`), so its time comes from the orchestrator
+// system, in the same order as Go with the test `OnEmittedFiles` times.
+fn task_write_file_now() -> SystemTime {
+    WRITE_FILE_SYS
+        .with(|sys| sys.borrow().as_ref().map(|sys| sys.now()))
+        .unwrap_or_else(SystemTime::now)
+}
+
+/// Go `o.host` as the `incremental.BuildInfoReader` of
+/// `ReadBuildInfoProgram`: its `ReadBuildInfo` (build/host.go:77) is the
+/// task's `loadOrStoreBuildInfo`, whose value this holds.
+struct TaskBuildInfo(Option<Rc<BuildInfo>>);
+
+impl BuildInfoReader for TaskBuildInfo {
+    fn read_build_info(&self, _config: &ParsedCommandLine) -> Option<BuildInfo> {
+        self.0.as_deref().cloned()
+    }
+}
+
+/// Go `o.opts.Sys.Now().Sub(start)`.
+fn elapsed(sys: &dyn System, start: SystemTime) -> std::time::Duration {
+    sys.now().duration_since(start).unwrap_or_default()
 }

@@ -952,7 +952,7 @@ impl Checker {
         if !self
             .ty(t)
             .object_flags
-            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::TUPLE)
         {
             return SharedList::default();
         }

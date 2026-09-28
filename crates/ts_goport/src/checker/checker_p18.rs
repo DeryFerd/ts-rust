@@ -979,6 +979,11 @@ impl Checker {
         }
         let deferred = self.deferred_symbol_links.get(symbol);
         let parent = deferred.parent;
+        if parent.is_nil() {
+            // Go reads `deferred.parent.flags`: a symbol of another checker
+            // has no links here.
+            go_nil_dereference();
+        }
         let constituents = deferred.constituents.clone();
         let resolved_type = if self.ty(parent).flags.intersects(TypeFlags::UNION) {
             self.get_union_type(&constituents)
@@ -1014,6 +1019,12 @@ impl Checker {
     // properties deriving from set accessors will either pre-compute or defer the union or
     // intersection of the writeTypes of their constituents.
     pub fn get_write_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
+        if symbol.is_nil() {
+            // Go reads `symbol.CheckFlags` and panics on nil, for example
+            // on the target of an instantiated symbol of another checker,
+            // which has no links here.
+            go_nil_dereference();
+        }
         let check_flags = self.sym(symbol).check_flags;
         let flags = self.sym(symbol).flags;
         if check_flags.intersects(CheckFlags::SYNTHETIC_PROPERTY) {
@@ -1100,6 +1111,12 @@ impl Checker {
 
     // Go: checker/checker.go:16400 getTypeOfSymbol
     pub fn get_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
+        if symbol.is_nil() {
+            // Go reads `symbol.CheckFlags` and panics on nil, for example
+            // on the target of an instantiated symbol of another checker,
+            // which has no links here.
+            go_nil_dereference();
+        }
         let s = self.sym(symbol);
         let (check_flags, flags) = (s.check_flags, s.flags);
         if check_flags.intersects(CheckFlags::DEFERRED_TYPE) {

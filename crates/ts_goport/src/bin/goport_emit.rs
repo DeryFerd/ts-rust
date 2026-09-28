@@ -263,8 +263,7 @@ struct EmitBin {
 
 impl TscCompilationHooks for EmitBin {
     // PORT: `-b` is unported here: the build writes outputs without the
-    // write guard, and the build workers re-run the bin. `goport_build` runs
-    // build mode.
+    // write guard. `goport_build` runs build mode.
     fn build_mode(&self) -> bool {
         false
     }
@@ -439,7 +438,11 @@ impl ProgramLike for GuardedProgram {
 /// on.
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
     match catch_unwind(AssertUnwindSafe(|| {
-        get_semantic_diagnostics_with_checker(checker, file)
+        get_semantic_diagnostics_with_checker(
+            &ts_goport::gostd::context::background(),
+            checker,
+            file,
+        )
     })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {

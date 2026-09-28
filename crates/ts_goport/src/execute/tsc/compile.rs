@@ -3,22 +3,21 @@
 //!
 //! PORT: Go `io.Writer` is `Writer` (a shared `std::io::Write`). The
 //! frontend file system is `Rc`, so the system and the writers are `Rc`
-//! too and stay on one thread. A build runs each project in its own worker
-//! process, so no writer is shared across threads.
+//! too and stay on one thread. A build compiles every project on the
+//! orchestrator thread, so no writer is shared across threads.
 
 use crate::prelude::*;
 
 use std::time::{Duration, SystemTime};
 
 use crate::emitter::program_emit::EmitResult;
+use crate::frontend::tsoptions::ParseConfigHost;
 use crate::frontend::vfs::Fs;
 // PORT: testing (`CommandLineTesting`)
-use crate::execute::build::build_task::WorkerCompileResult;
 use crate::frontend::compiler::TraceFn;
 use crate::frontend::tspath::Path;
-use crate::frontend::vfs::CachedFsState;
 use crate::locale::Locale;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Go `io.Writer`. A caller that wants the text back (Go `bytes.Buffer`)
 /// keeps its own `Rc<RefCell<Vec<u8>>>` and passes a clone as a `Writer`.
@@ -74,6 +73,21 @@ pub trait System {
     fn since_start(&self) -> Duration;
 }
 
+/// Go `tsc.System` as a `tsoptions.ParseConfigHost` (Go passes `sys`
+/// where a `ParseConfigHost` is needed; it has `FS()` and
+/// `GetCurrentDirectory()`).
+pub struct SystemParseConfigHost<'a>(pub &'a dyn System);
+
+impl ParseConfigHost for SystemParseConfigHost<'_> {
+    fn fs(&self) -> Rc<dyn Fs> {
+        self.0.fs()
+    }
+
+    fn get_current_directory(&self) -> String {
+        self.0.get_current_directory()
+    }
+}
+
 // Go: execute/tsc/compile.go:30 ExitStatus
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
@@ -93,8 +107,8 @@ impl ExitStatus {
         self as i32
     }
 
-    /// The status for an exit code, or `None` for an unknown code. The build
-    /// worker protocol uses it to read a status back.
+    /// The status for an exit code, or `None` for an unknown code. The Go
+    /// baseline runner uses it to read a child's status back.
     pub fn from_code(code: i32) -> Option<ExitStatus> {
         Some(match code {
             0 => ExitStatus::Success,
@@ -108,11 +122,10 @@ impl ExitStatus {
     }
 }
 
-/// The exit code of a goport bin that hit unported code, another panic or
-/// a failed worker. It is outside the Go `ExitStatus` range (0 to 5), so it
-/// never looks like a tsgo status. 70 is `EX_SOFTWARE` (internal software
-/// error). The build worker also exits with it after its result line when
-/// it reached unported code.
+/// The exit code of a goport bin that hit unported code or another panic,
+/// or whose work thread failed. It is outside the Go `ExitStatus` range (0
+/// to 5), so it never looks like a tsgo status. 70 is `EX_SOFTWARE`
+/// (internal software error).
 pub const EXIT_UNPORTED: i32 = 70;
 
 // Go: execute/tsc/compile.go:41 Watcher
@@ -134,10 +147,6 @@ pub struct CommandLineResult {
 // `io.Writer` is `Writer`. Go `*collections.SyncMap[tspath.Path,
 // time.Time]` is the build host `m_times`, a `Mutex` (`None` is the Go zero
 // time).
-// The last three methods have no Go equivalent and do nothing by default:
-// the port compiles each build project in a worker process
-// (build/worker.rs), so a test can run the worker itself and gets the
-// task's program and emitted files back on the orchestrator side.
 pub trait CommandLineTesting {
     // Ensure that all emitted files are timestamped in order to ensure they are deterministic for test baseline
     fn on_emitted_files(
@@ -155,37 +164,7 @@ pub trait CommandLineTesting {
     fn on_watch_status_report_end(&self);
     fn get_trace(&self, w: Writer, locale: Locale) -> TraceFn;
     fn on_program(&self, program: &crate::execute::incremental::program::Program);
-
-    /// PORT: testing, no Go equivalent. The runner that replaces the build
-    /// worker process (see `BuildWorkerRunner`). `None` keeps the process.
-    fn build_worker_runner(&self) -> Option<BuildWorkerRunner> {
-        None
-    }
-
-    /// PORT: testing. Go `Testing.OnProgram(t.result.program)` when the
-    /// build task of `config` reports (build/buildtask.go:109). The program
-    /// is in the worker, so the test keeps what its worker saw.
-    fn on_build_task_program(&self, _config: &str) {}
-
-    /// PORT: testing. The orchestrator part of Go `OnEmittedFiles` for a
-    /// build worker's `emitted_files`: Go updates the orchestrator host
-    /// `mTimes` (`TestingMTimesCache`, build/buildtask.go:230).
-    fn on_worker_emitted_files(
-        &self,
-        _emitted_files: &[String],
-        _m_times: &Mutex<FxHashMap<Path, Option<SystemTime>>>,
-    ) {
-    }
 }
-
-/// PORT: testing, no Go equivalent. Runs one build worker in place of the
-/// worker process (`WorkerLauncher::run`): it gets the task config, the
-/// orchestrator's cached file system as JSON (shared_fs.rs) and the
-/// callback for the program's cache entries, and returns the worker result.
-/// The orchestrator calls it on its own thread, one task at a time, so a
-/// test file system and clock see one ordered sequence.
-pub type BuildWorkerRunner =
-    Arc<dyn Fn(&str, &str, &mut dyn FnMut(CachedFsState)) -> WorkerCompileResult + Send + Sync>;
 
 // Go: execute/tsc/compile.go:66 CompileTimes
 // PORT: Go keeps `bindTime`, `checkTime`, `totalTime` and `emitTime`
@@ -245,8 +224,8 @@ pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
 }
 
 impl OsSystem {
-    /// The system with `writer` in place of stdout. The build worker writes
-    /// its report into a buffer this way.
+    /// The system with `writer` in place of stdout. A bin that keeps its
+    /// output in a buffer, or streams it, uses this.
     pub fn with_writer(mut self, writer: Writer) -> OsSystem {
         self.writer = writer;
         self

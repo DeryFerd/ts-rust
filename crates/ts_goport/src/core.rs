@@ -1537,7 +1537,8 @@ impl Table {
 
 /// Owns all symbols and symbol tables. The binder fills one arena. Each
 /// checker starts from a copy (`for_checker`), so binder ids stay valid and
-/// checker (transient) symbols stay private to that checker. The copy shares
+/// checker (transient) symbols stay private to that checker. The API can add
+/// a copy of a symbol of another checker (`push_shadow`). The copy shares
 /// the binder's symbol and table chunks; a checker copies a chunk only when
 /// it first writes to it. The binder writes without atomic operations and
 /// then shares what it wrote (`share_since`), so the copy copies nothing.
@@ -1564,35 +1565,54 @@ pub struct SymbolArena {
 struct SymbolIds {
     /// Symbols below this index have the shared id of their index.
     shared: u32,
+    /// Tables below this index are binder lineage tables, which every
+    /// checker copy of the lineage made after them has too.
+    shared_tables: u32,
     /// Keys the ids of the other symbols. 0 when every symbol is shared.
     key: u32,
+    /// The shadows in this arena (`SymbolArena::push_shadow`), if any.
+    shadows: Option<Box<Shadows>>,
+}
+
+/// The shadows of one checker arena: copies of symbols of other arenas.
+/// A shadow keeps its id in the slot of its origin.
+#[derive(Debug, Default)]
+struct Shadows {
+    /// The id slot of each shadow's origin, by shadow index.
+    origins: FxHashMap<u32, IdSlot>,
+    /// The shadow of each origin.
+    by_origin: FxHashMap<IdSlot, SymbolId>,
 }
 
 impl SymbolIds {
     /// Every symbol has the shared id of its index.
     const SHARED: SymbolIds = SymbolIds {
         shared: u32::MAX,
+        shared_tables: u32::MAX,
         key: 0,
+        shadows: None,
     };
 
     /// Symbols from index `shared` on have ids of their own.
-    fn own_from(shared: usize) -> SymbolIds {
+    fn own_from(shared: usize, shared_tables: usize) -> SymbolIds {
         static NEXT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         SymbolIds {
             shared: u32::try_from(shared).expect("symbol overflow"),
+            shared_tables: u32::try_from(shared_tables).expect("table overflow"),
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            shadows: None,
         }
     }
 }
 
 impl Clone for SymbolIds {
     /// A copy of a checker arena holds copies of its own symbols, which are
-    /// other symbols, so they get new ids.
+    /// other symbols, so they get new ids. Copies of shadows too.
     fn clone(&self) -> Self {
         if self.key == 0 {
             SymbolIds::SHARED
         } else {
-            SymbolIds::own_from(self.shared as usize)
+            SymbolIds::own_from(self.shared as usize, self.shared_tables as usize)
         }
     }
 }
@@ -1604,6 +1624,20 @@ impl Drop for SymbolIds {
             crate::ast::forget_own_symbol_ids(self.key);
         }
     }
+}
+
+/// Where `crate::ast::get_symbol_id` keeps the id of one symbol
+/// (`SymbolArena::id_slot`). Go keeps the id on the `*ast.Symbol`, so a
+/// slot stands for one Go symbol: two symbols with one slot, in any
+/// arenas, are the same Go symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IdSlot {
+    /// 0 for a binder lineage symbol, whose id every arena shares. Else the
+    /// key of the checker arena that made the symbol.
+    pub key: u32,
+    /// The lineage index (key 0), or the place of the symbol among the own
+    /// symbols of that arena.
+    pub place: u32,
 }
 
 impl Default for SymbolArena {
@@ -1641,19 +1675,83 @@ impl SymbolArena {
             symbols: self.symbols.clone(),
             tables: self.tables.clone(),
             private_names: self.private_names.clone(),
-            ids: SymbolIds::own_from(self.symbols.len()),
+            ids: SymbolIds::own_from(self.symbols.len(), self.tables.len()),
         }
     }
 
-    /// Where `crate::ast::get_symbol_id` keeps the id of `symbol`: None when
-    /// every arena shares it (a binder symbol), else the key of this arena's
-    /// own ids and the place of `symbol` among the symbols that have them.
+    /// Where `crate::ast::get_symbol_id` keeps the id of `symbol`: the
+    /// shared slot of its index for a binder symbol, else a slot of this
+    /// arena's own ids. A shadow (`push_shadow`) uses the slot of its
+    /// origin.
     #[inline]
     #[must_use]
-    pub fn own_symbol_id_slot(&self, symbol: SymbolId) -> Option<(u32, usize)> {
-        let shared = self.ids.shared as usize;
-        let index = symbol.index();
-        (index >= shared).then(|| (self.ids.key, index - shared))
+    pub fn id_slot(&self, symbol: SymbolId) -> IdSlot {
+        let shared = self.ids.shared;
+        if symbol.0 < shared {
+            return IdSlot {
+                key: 0,
+                place: symbol.0,
+            };
+        }
+        if self.ids.shadows.is_some() {
+            if let Some(origin) = self.shadow_origin(symbol) {
+                return origin;
+            }
+        }
+        IdSlot {
+            key: self.ids.key,
+            place: symbol.0 - shared,
+        }
+    }
+
+    /// The origin of `symbol` when it is a shadow.
+    #[cold]
+    #[inline(never)]
+    fn shadow_origin(&self, symbol: SymbolId) -> Option<IdSlot> {
+        let shadows = self.ids.shadows.as_ref()?;
+        shadows.origins.get(&symbol.0).copied()
+    }
+
+    /// The symbol of this arena whose id slot is `slot` (`id_slot`): the
+    /// symbol itself, or its shadow. None when this arena has neither.
+    #[must_use]
+    pub fn symbol_at_slot(&self, slot: IdSlot) -> Option<SymbolId> {
+        if slot.key == 0 && slot.place < self.ids.shared {
+            return Some(SymbolId(slot.place));
+        }
+        if slot.key != 0 && slot.key == self.ids.key {
+            return Some(SymbolId(self.ids.shared + slot.place));
+        }
+        let shadows = self.ids.shadows.as_ref()?;
+        shadows.by_origin.get(&slot).copied()
+    }
+
+    /// Pushes `symbol` as a shadow and returns it. A shadow is a copy of the
+    /// symbol of another arena whose id slot is `origin`. It stands for the
+    /// same Go symbol, so it keeps its id in `origin` (`id_slot`), and
+    /// `symbol_at_slot(origin)` finds it. Only a checker arena has shadows.
+    pub fn push_shadow(&mut self, symbol: Symbol, origin: IdSlot) -> SymbolId {
+        debug_assert!(self.ids.key != 0, "a shadow goes into a checker arena");
+        debug_assert!(
+            self.symbol_at_slot(origin).is_none(),
+            "one symbol per id slot"
+        );
+        let shadow = self.push_symbol(symbol);
+        let shadows = self.ids.shadows.get_or_insert_with(Box::default);
+        shadows.origins.insert(shadow.0, origin);
+        shadows.by_origin.insert(origin, shadow);
+        if origin.key != 0 {
+            crate::ast::keep_own_symbol_ids(origin.key);
+        }
+        shadow
+    }
+
+    /// The number of binder lineage tables in this checker arena: a table
+    /// below this index is the same table in every checker arena whose
+    /// count is above it.
+    #[must_use]
+    pub fn shared_table_count(&self) -> usize {
+        self.ids.shared_tables as usize
     }
 
     /// The number of symbols, with the nil symbol at index 0.
@@ -2822,6 +2920,16 @@ pub fn go_panic(message: String) -> ! {
     })
 }
 
+/// `go_panic` with the Go runtime text for a nil pointer dereference, at a
+/// site where the pinned Go dereferences nil on the same input. It is cold
+/// and out of line, so the nil check at a hot site is one compare.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn go_nil_dereference() -> ! {
+    go_panic("runtime error: invalid memory address or nil pointer dereference".to_string())
+}
+
 /// The Go runtime exit code after a panic that nothing recovers.
 pub const EXIT_GO_PANIC: i32 = 2;
 
@@ -3021,7 +3129,7 @@ pub fn prog() -> &'static GoProgram {
 // Go: core/version.go:8 version
 // PORT: Go keeps this in a var that ldflags can override. The pinned
 // reference build does not override it.
-const VERSION: &str = "7.0.0-dev";
+const VERSION: &str = "7.1.0-dev";
 
 // Go: core/version.go:10 Version
 pub fn version() -> &'static str {

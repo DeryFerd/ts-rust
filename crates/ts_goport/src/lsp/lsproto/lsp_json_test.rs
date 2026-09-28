@@ -1067,3 +1067,226 @@ fn test_enum_string_values_unknown_enum_value() {
         "should contain the numeric value, got: {s}"
     );
 }
+
+/// One `TestRoundTrip` case: marshal, unmarshal into a new value, marshal
+/// again; both texts must be equal.
+#[track_caller]
+fn check_round_trip<T: MarshalerTo + UnmarshalerFrom + Default>(name: &str, value: &T) {
+    let data = json_marshal(value, &[]);
+    assert_nil_error(name, &data);
+    let data = data.expect("checked");
+    let mut got = T::default();
+    let err = json_unmarshal(data.as_bytes(), &mut got, &[]);
+    assert_nil_error(name, &err);
+    let again = json_marshal(&got, &[]);
+    assert_nil_error(name, &again);
+    assert_eq!(data, again.expect("checked"), "{name}: re-marshal differs");
+}
+
+// Go: lsp_json_test.go:900 TestRoundTrip
+// TestRoundTrip locks the generated codecs: every value must survive
+// marshal -> unmarshal unchanged. This guards fidelity so codec changes
+// (e.g. pruning or table-driving them) cannot silently corrupt the wire
+// format. Cover a representative spread of shapes: required fields,
+// nullable/non-nullable optionals, enums, slices, nested objects, and
+// unions.
+// PORT: Go keeps the cases in one `[]any` table; the Rust cases have
+// different types, so each is one call.
+#[test]
+fn test_round_trip() {
+    check_round_trip(
+        "Range",
+        &Range {
+            start: Position {
+                line: 1,
+                character: 2,
+            },
+            end: Position {
+                line: 3,
+                character: 4,
+            },
+        },
+    );
+    check_round_trip(
+        "TextEdit",
+        &TextEdit {
+            range: Range {
+                start: Position {
+                    line: 1,
+                    character: 2,
+                },
+                end: Position {
+                    line: 3,
+                    character: 4,
+                },
+            },
+            new_text: "hello".to_string(),
+        },
+    );
+    check_round_trip(
+        "MarkupContent",
+        &MarkupContent {
+            kind: MarkupKind::MARKDOWN,
+            value: "**x**".to_string(),
+        },
+    );
+    let mut inner = IndexMap::new();
+    inner.insert("x".to_string(), LspAny::Number(1.0));
+    let mut settings = IndexMap::new();
+    settings.insert("js/ts".to_string(), LspAny::Object(inner));
+    check_round_trip(
+        "DidChangeConfigurationParams object",
+        &DidChangeConfigurationParams {
+            settings: LspAny::Object(settings),
+        },
+    );
+    check_round_trip(
+        "DidChangeConfigurationParams null",
+        &DidChangeConfigurationParams {
+            settings: LspAny::Null,
+        },
+    );
+    check_round_trip(
+        "CompletionItem",
+        &CompletionItem {
+            label: "pageXOffset".to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            sort_text: Some("15".to_string()),
+            insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+            ..Default::default()
+        },
+    );
+    // StringOrTuple union (string arm and tuple arm).
+    check_round_trip(
+        "ParameterInformation string label",
+        &ParameterInformation {
+            label: StringOrTuple {
+                string: Some("p: number".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    check_round_trip(
+        "ParameterInformation tuple label",
+        &ParameterInformation {
+            label: StringOrTuple {
+                tuple: Some([0, 4]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+}
+
+// Go: lsp_json_test.go:951 TestStrictnessMissingRequired
+// TestStrictnessMissingRequired confirms required fields are still enforced;
+// default reflective decoding would silently accept these.
+#[test]
+fn test_strictness_missing_required() {
+    assert_error_contains(
+        "TextEdit missing newText",
+        &json_unmarshal(
+            br#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}"#,
+            &mut TextEdit::default(),
+            &[],
+        ),
+        "missing required properties",
+    );
+    assert_error_contains(
+        "Range missing end",
+        &json_unmarshal(
+            br#"{"start":{"line":0,"character":0}}"#,
+            &mut Range::default(),
+            &[],
+        ),
+        "missing required properties",
+    );
+    assert_error_contains(
+        "Position missing character",
+        &json_unmarshal(br#"{"line":0}"#, &mut Position::default(), &[]),
+        "missing required properties",
+    );
+}
+
+// Go: lsp_json_test.go:973 TestStrictnessNotObject
+// TestStrictnessNotObject confirms a non-object where an object is required
+// is rejected rather than coerced.
+#[test]
+fn test_strictness_not_object() {
+    let err = json_unmarshal(br#""oops""#, &mut TextEdit::default(), &[]);
+    let Err(err) = err else {
+        panic!("expected an error");
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("object") || text.contains("cannot unmarshal"),
+        "got {text:?}"
+    );
+}
+
+/// A request whose raw params are `params` (`None` is absent).
+fn request_with_params(params: Option<&str>) -> RequestMessage {
+    RequestMessage {
+        params: params.map(|p| Box::new(JsonValue(p.as_bytes().to_vec())) as Box<dyn AnyValue>),
+        ..RequestMessage::default()
+    }
+}
+
+/// Go `assert.ErrorIs(t, err, ErrorCodeInvalidParams)`.
+fn is_invalid_params(err: &GoError) -> bool {
+    gostd::errors::is(err, &gostd::errors::from_value(ErrorCode::INVALID_PARAMS))
+}
+
+// Go: lsp_json_test.go:983 TestUnmarshalParamsRequiresParams
+// TestUnmarshalParamsRequiresParams verifies that a NoParams method must be
+// given no params while every other method must be given params, and that a
+// mismatch (including a null value either way) is an InvalidParams error.
+#[test]
+fn test_unmarshal_params_requires_params() {
+    // NoParams: only truly-absent/empty params are accepted; null and any
+    // present value are rejected.
+    for (name, params, want_err) in [
+        ("absent", None, false),
+        ("empty", Some(""), false),
+        ("null", Some("null"), true),
+        ("object", Some("{}"), true),
+    ] {
+        let result = unmarshal_params::<NoParams>(&request_with_params(params));
+        match result {
+            Err(err) => assert!(
+                want_err && is_invalid_params(&err),
+                "NoParams/{name}: unexpected error {}",
+                err.error()
+            ),
+            Ok(_) => assert!(!want_err, "NoParams/{name}: expected an error"),
+        }
+    }
+
+    // Required-params method: only an object or array is accepted; absent,
+    // empty, null, and other scalars are rejected.
+    for (name, params, want_err) in [
+        ("absent", None, true),
+        ("empty", Some(""), true),
+        ("null", Some("null"), true),
+        ("number", Some("5"), true),
+        ("string", Some(r#""x""#), true),
+        ("object", Some(r#"{"settings":{"x":1}}"#), false),
+    ] {
+        let result = unmarshal_params::<DidChangeConfigurationParams>(&request_with_params(params));
+        match result {
+            Err(err) => assert!(
+                want_err && is_invalid_params(&err),
+                "typed/{name}: unexpected error {}",
+                err.error()
+            ),
+            Ok(got) => {
+                assert!(!want_err, "typed/{name}: expected an error");
+                assert!(
+                    got.settings != LspAny::Null,
+                    "typed/{name}: settings is nil"
+                );
+            }
+        }
+    }
+}

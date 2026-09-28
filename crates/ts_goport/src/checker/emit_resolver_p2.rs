@@ -348,6 +348,9 @@ impl EmitResolver {
 
     // Go: checker/emitresolver.go:800 MarkLinkedReferencesRecursively
     pub fn mark_linked_references_recursively(&self, file: Node) {
+        if !is_parse_tree_node(file) {
+            return;
+        }
         self.with_checker(|c| {
             if file.is_some() {
                 file.for_each_child(|n: Node| mark_linked_references_recursively_visit(c, n));
@@ -460,7 +463,25 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:889 GetReferencedValueDeclarations
+    // Go: checker/emitresolver.go:889 GetReferencedValueDeclarationUnsafe
+    // PORT: Go takes no lock because its callers already hold it. The trait signature has
+    // no checker, so this borrows it. Callers that hold the checker use the `_worker` twin.
+    pub fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node {
+        self.with_checker(|c| self.get_referenced_value_declaration_unsafe_worker(c, node))
+    }
+
+    // Go: checker/emitresolver.go:889 GetReferencedValueDeclarationUnsafe
+    // PORT: body of Go `GetReferencedValueDeclarationUnsafe` with the checker passed in.
+    pub fn get_referenced_value_declaration_unsafe_worker(
+        &self,
+        c: &mut Checker,
+        node: Node,
+    ) -> Node {
+        self.get_reference_resolver(c)
+            .get_referenced_value_declaration(c, node)
+    }
+
+    // Go: checker/emitresolver.go:893 GetReferencedValueDeclarations
     pub fn get_referenced_value_declarations(&self, node: Node) -> Vec<Node> {
         if !is_parse_tree_node(node) {
             return Vec::new();
@@ -1098,32 +1119,57 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:1273 GetBaseDeclarationsForPropertyDeclaration
-    pub fn get_base_declarations_for_property_declaration(&self, node: Node) -> Vec<Node> {
+    // Go: checker/emitresolver.go:1284 IsThisPropertyAssignmentDeclarationRedundant
+    /// IsThisPropertyAssignmentDeclarationRedundant reports whether a JS `this.<name> = ...` expando
+    /// assignment should be omitted from declaration emit because the member it would synthesize is
+    /// already provided by an `extends` base type. This mirrors the skip condition in the checker's
+    /// serializePropertySymbol: an inherited member is redundant when it is identical to the assigned
+    /// one (same readonly-ness, optionality and type). Inherited accessors and methods are always
+    /// treated as redundant here, since accessors merge oddly with value assignments (and run via the
+    /// accessor at runtime), and `this`-expando props carry the ReplaceableByMethod contract, so a
+    /// rebind such as `this.method = this.method.bind(this)` must not override the base method.
+    ///
+    /// Only `extends` base types are considered. Members coming from `implements` clauses are not
+    /// inherited, so the class must redeclare them, and they are always emitted.
+    pub fn is_this_property_assignment_declaration_redundant(&self, node: Node) -> bool {
         if node.is_nil() {
-            return Vec::new();
+            return false;
         }
 
         self.with_checker(|c| {
             let s = c.get_symbol_of_declaration(node);
             if s.is_nil() || c.sym(s).parent.is_nil() {
-                return Vec::new();
+                return false;
             }
             let parent = c.sym(s).parent;
             let parent_type = c.get_declared_type_of_symbol(parent);
             if parent_type.is_nil() {
-                return Vec::new();
+                return false;
             }
             let name = c.sym(s).name.clone();
-            let bases = c.get_base_types(parent_type);
-            for b in bases {
-                let base_prop = c.get_property_of_object_type(b, &name);
-                if base_prop.is_some() {
-                    return c.sym(base_prop).declarations.to_vec();
-                    // TODO: return base declarations from all base types if any callers actually look at the list
+            for base in c.get_base_types(parent_type) {
+                let base_prop = c.get_property_of_type(base, &name);
+                if base_prop.is_nil() {
+                    continue;
+                }
+                if c.sym(base_prop)
+                    .flags
+                    .intersects(SymbolFlags::ACCESSOR | SymbolFlags::METHOD | SymbolFlags::FUNCTION)
+                {
+                    return true;
+                }
+                if c.is_readonly_symbol(base_prop) == c.is_readonly_symbol(s)
+                    && (c.sym(s).flags & SymbolFlags::OPTIONAL)
+                        == (c.sym(base_prop).flags & SymbolFlags::OPTIONAL)
+                {
+                    let s_type = c.get_type_of_symbol(s);
+                    let base_type = c.get_type_of_symbol(base_prop);
+                    if c.is_type_identical_to(s_type, base_type) {
+                        return true;
+                    }
                 }
             }
-            Vec::new()
+            false
         })
     }
 }

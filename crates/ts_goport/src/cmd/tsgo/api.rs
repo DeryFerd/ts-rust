@@ -25,6 +25,11 @@ pub fn run_api(args: &[String]) -> i32 {
         false,
         "use JSON-RPC protocol instead of MessagePack (for async API)",
     );
+    let timing = flag.bool(
+        "timing",
+        false,
+        "collect per-request server processing time, folded into the client's timing snapshot",
+    );
     if flag.parse(args).is_err() {
         return 2;
     }
@@ -48,6 +53,7 @@ pub fn run_api(args: &[String]) -> i32 {
         pipe_path: String::new(),
         callbacks: callbacks_list,
         async_: async_.get(),
+        collect_timing: timing.get(),
     };
     if !pipe_path.borrow().is_empty() {
         options.pipe_path = pipe_path.borrow().clone();

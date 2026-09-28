@@ -995,9 +995,9 @@ impl crate::printer::EmitResolver for EmitResolver {
         self.with_checker(|c| self.is_optional_parameter(c, node))
     }
 
-    // Go: checker/emitresolver.go:1273 EmitResolver.GetBaseDeclarationsForPropertyDeclaration
-    fn get_base_declarations_for_property_declaration(&self, node: Node) -> Vec<Node> {
-        EmitResolver::get_base_declarations_for_property_declaration(self, node)
+    // Go: checker/emitresolver.go:1284 EmitResolver.IsThisPropertyAssignmentDeclarationRedundant
+    fn is_this_property_assignment_declaration_redundant(&self, node: Node) -> bool {
+        EmitResolver::is_this_property_assignment_declaration_redundant(self, node)
     }
 
     // Go: checker/emitresolver.go:1249 EmitResolver.GetPropertiesOfContainerFunction
@@ -1024,6 +1024,13 @@ impl crate::printer::EmitResolver for EmitResolver {
                 enclosing_declaration,
             )
         })
+    }
+
+    // Go: checker/emitresolver.go:889 EmitResolver.GetReferencedValueDeclarationUnsafe
+    // PORT: see `requires_adding_implicit_undefined_unsafe`. Callers that
+    // hold the checker use `get_referenced_value_declaration_unsafe_worker`.
+    fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node {
+        EmitResolver::get_referenced_value_declaration_unsafe(self, node)
     }
 
     // Go: checker/emitresolver.go:959 EmitResolver.CreateTypeOfDeclaration

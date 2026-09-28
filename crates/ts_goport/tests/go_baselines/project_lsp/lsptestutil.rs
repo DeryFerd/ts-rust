@@ -3,10 +3,11 @@
 //! PORT: the Rust `lsp::Server` is `Rc` and runs its dispatch loop on the
 //! thread that calls `run`, so the server is made and run on a thread of
 //! its own ("lsp-server"). The pipes are channels of `lsproto::Message`.
-//! The server's `Writer` gets `&Message`, so each outgoing message is
-//! marshaled to JSON and unmarshaled again for the client (Go checks that
-//! the message marshals too, `MessageRouter`). Client messages reach the
-//! server as typed values, as in Go.
+//! Go (since tsgo#4471) connects client and server with JSON byte pipes, so
+//! every message makes a full marshal/unmarshal round trip. Here each
+//! message in either direction is marshaled to JSON and unmarshaled again
+//! (`json_round_trip`), so the receiver gets raw params and results, as in
+//! Go.
 //!
 //! Go `<-client.Server.InitComplete()` has no port: the Rust server runs
 //! the `initialized` handler to its end before it reads the next message.
@@ -18,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ts_goport::frontend::bundled;
+use ts_goport::frontend::json::UnmarshalerFrom;
 use ts_goport::frontend::json_ext::AnyValue;
 use ts_goport::gostd::{Context, GoError, context, errors};
 use ts_goport::jsonrpc::{self, ID, MessageKind, ResponseError};
@@ -41,6 +43,18 @@ impl lsp::Reader for LspReader {
     }
 }
 
+/// The message after a trip through its JSON form, as the Go byte pipes
+/// give it (see the module comment).
+fn json_round_trip(msg: &lsproto::Message) -> lsproto::Message {
+    let data = msg
+        .marshal_json()
+        .unwrap_or_else(|err| panic!("failed to encode message as JSON: {}", err.error()));
+    let mut copy = lsproto::Message::default();
+    copy.unmarshal_json(&data)
+        .unwrap_or_else(|err| panic!("failed to decode message JSON: {}", err.error()));
+    copy
+}
+
 // Go: lspclient.go:34 LSPWriter
 // LSPWriter writes LSP messages to a channel.
 // PORT: the message is copied through its JSON form (see the module comment).
@@ -50,14 +64,8 @@ struct LspWriter {
 
 impl lsp::Writer for LspWriter {
     fn write(&mut self, msg: &lsproto::Message) -> Result<(), GoError> {
-        let data = msg
-            .marshal_json()
-            .unwrap_or_else(|err| panic!("failed to encode message as JSON: {}", err.error()));
-        let mut copy = lsproto::Message::default();
-        copy.unmarshal_json(&data)
-            .unwrap_or_else(|err| panic!("failed to decode message JSON: {}", err.error()));
         // The client may be gone at shutdown; drop the message then.
-        let _ = self.c.send(Some(copy));
+        let _ = self.c.send(Some(json_round_trip(msg)));
         Ok(())
     }
 }
@@ -247,7 +255,9 @@ fn handle_server_request(
     }
 
     // Send response back to server
-    let _ = input_writer.send(Some(response.expect("response").message()));
+    let _ = input_writer.send(Some(json_round_trip(
+        &response.expect("response").message(),
+    )));
 }
 
 impl LspClient {
@@ -263,7 +273,7 @@ impl LspClient {
     // WriteMsg sends a message to the server.
     pub fn write_msg(&self, msg: lsproto::Message) {
         self.input_writer
-            .send(Some(msg))
+            .send(Some(json_round_trip(&msg)))
             .unwrap_or_else(|err| panic!("failed to write message: {err}"));
     }
 
@@ -271,7 +281,7 @@ impl LspClient {
     // SendRequest sends a typed request and waits for the response.
     // PORT: returns the response message and the typed result (`None` for
     // Go's `ok == false`).
-    pub fn send_request<P: AnyValue, R: 'static>(
+    pub fn send_request<P: AnyValue, R: UnmarshalerFrom + Default + 'static>(
         &self,
         info: &lsproto::RequestInfo<P, R>,
         params: P,
@@ -281,7 +291,7 @@ impl LspClient {
 
     // Go: lspclient.go:260 SendRequestAsync
     // SendRequestAsync sends a typed request and returns a waiter for its response.
-    pub fn send_request_async<P: AnyValue, R: 'static>(
+    pub fn send_request_async<P: AnyValue, R: UnmarshalerFrom + Default + 'static>(
         &self,
         info: &lsproto::RequestInfo<P, R>,
         params: P,

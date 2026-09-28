@@ -79,9 +79,16 @@ impl FileSource for AutoImportBuilderFS {
     }
 }
 
+/// The parse cache keys that auto-import registry clones acquired, one per
+/// path, kept after each clone. The session owns it
+/// (`Session::auto_import_parse_keys`). See
+/// `AutoImportRegistryCloneHost::dispose`.
+// PORT: no Go counterpart.
+pub type AutoImportParseKeys = RefCell<FxHashMap<tspath::Path, ParseCacheKey>>;
+
 // Go: project/autoimport.go:67 autoImportRegistryCloneHost
 // PORT: `filesMu` is dropped; `files` is written after sharing, so it is a
-// `RefCell`.
+// `RefCell`. `kept_files` has no Go counterpart (see `dispose`).
 pub struct AutoImportRegistryCloneHost {
     pub project_collection: Rc<ProjectCollection>,
     pub parse_cache: Rc<ParseCache>,
@@ -89,15 +96,18 @@ pub struct AutoImportRegistryCloneHost {
     pub current_directory: String,
 
     pub files: RefCell<Vec<ParseCacheKey>>,
+    pub kept_files: Rc<AutoImportParseKeys>,
 }
 
 // Go: project/autoimport.go:79 newAutoImportRegistryCloneHost
+// PORT: `kept_files` is the session's `auto_import_parse_keys`.
 pub fn new_auto_import_registry_clone_host(
     project_collection: Rc<ProjectCollection>,
     parse_cache: Rc<ParseCache>,
     snapshot_fs_builder: Rc<SnapshotFSBuilder>,
     current_directory: &str,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+    kept_files: Rc<AutoImportParseKeys>,
 ) -> Rc<AutoImportRegistryCloneHost> {
     Rc::new(AutoImportRegistryCloneHost {
         project_collection,
@@ -112,6 +122,7 @@ pub fn new_auto_import_registry_clone_host(
         ),
         current_directory: current_directory.to_string(),
         files: RefCell::new(Vec::new()),
+        kept_files,
     })
 }
 
@@ -219,10 +230,24 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
 
     // Go: project/autoimport.go:174 Dispose
     // Dispose implements autoimport.RegistryCloneHost.
+    // PORT: Go derefs every key, and its GC frees the parses. Here a file
+    // that the clone parsed is kept for good anyway: the alias resolver
+    // publishes it (`program::publish_parsed_files`) and binds it into the
+    // binder lineage. A released entry only makes the next clone parse, bind
+    // and keep the same file again. An idle warm that the next edit cancels
+    // then kept about 870 node_modules files (about 155 MiB) per edit. So the
+    // session keeps one reference per path, for the newest key, and a newer
+    // key for the same path releases the older one. A later clone gets the
+    // same parse from the cache. A parse depends only on its key, so no
+    // result changes.
     fn dispose(&self) {
         // Go: a.filesMu.Lock(); defer a.filesMu.Unlock() (PORT: no lock).
-        for key in self.files.borrow().iter() {
-            self.parse_cache.deref(key);
+        let mut kept = self.kept_files.borrow_mut();
+        for key in self.files.take() {
+            // For the same key, this releases the clone's extra reference.
+            if let Some(older) = kept.insert(key.path.clone(), key) {
+                self.parse_cache.deref(&older);
+            }
         }
     }
 }
