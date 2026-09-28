@@ -3,7 +3,8 @@
 
 Each session starts `tsgo --lsp --stdio` in a project directory, opens files as overlays (didOpen,
 didChange only; the project input is never written) and makes a fixed list of edits. After each edit
-the client sends a burst of requests and waits for all answers, as an editor does. Go runs first,
+the client sends a burst of requests and waits for all answers, as an editor does. Then it waits the
+think time (the pace; 0 by default) before the next edit, answering server requests. Go runs first,
 then each Rust binary, with the same messages (the plan is fixed before any server starts). On Linux
 each server is pinned with taskset. A server is killed if its RSS goes over --rss-cap-mib.
 
@@ -18,6 +19,13 @@ Scenarios (edits per session in brackets):
                  (missing-name error, quick fix, completion), add the import, remove both, remove
                  the export (5 edits per cycle); pull diagnostics for both files
   long     [200] all of the above interleaved: per 20 edits, 10 typing, 2 errfix, 5 imports, 3 mix
+  typing-paced, errfix-paced [40]
+                 typing and errfix with a 150 ms pause after each round's answers (editor think
+                 time). The Rust server starts idle work (the auto-import warm) after 50 ms with no
+                 message (IDLE_QUIET_PERIOD in lsp/server.rs), so only a pause lets it run. Default
+                 on query-core and hono; on effect only when named in --scenarios.
+--pace-ms sets the pause for the other scenarios (default 0). --sweep runs each scenario once per
+pause in its list (default 0,30,80,150,300 ms), by default typing and errfix, 20 edits, query-core.
 Projects: query-core, hono, effect (target/project-inputs/*/source, read-only).
 
 Per session: RSS after the open (edit 0) and after every edit, VmHWM, edit latency (didChange to the
@@ -37,8 +45,9 @@ is not always stable there (auto-import module specifiers).
 
 Usage:
   ls_edit_bench.py --rust [LABEL=]BIN [--rust ...] [--go BIN] [--projects query-core,hono,effect]
-                   [--scenarios typing,errfix,mix,imports,long] [--edits 40] [--long-edits 200]
-                   [--cpus 8,10,12,14] [--rss-cap-mib 12288] [--out DIR]
+                   [--scenarios typing,errfix,mix,imports,long,typing-paced,errfix-paced] [--edits 40]
+                   [--long-edits 200] [--pace-ms 0] [--cpus 8,10,12,14] [--rss-cap-mib 12288] [--out DIR]
+  ls_edit_bench.py --rust BIN --sweep [0,30,80,150,300]   pause sweep for diagnosis
   ls_edit_bench.py --recheck --out DIR    apply the current limits to DIR/result.json again
 Another upstream pin: GOPORT_PIN=<key> scripts/upstream/pin.py exec -- scripts/goport/ls_edit_bench.py ...
 (pin.py maps ~/.local/bin/tsgo-oracle to the pin's oracle; the result records the oracle sha256).
@@ -362,19 +371,25 @@ def gen_long(plan):
         i += 1
 
 
-# name: (generator, default edit count, dep file open, mix burst in the open round)
+# name: (generator, default edit count, dep file open, mix burst in the open round, pause in ms after
+# each round's answers; None takes --pace-ms)
 SCENARIOS = {
-    "typing": (gen_typing, 40, False, False),
-    "errfix": (gen_errfix, 40, False, False),
-    "mix": (gen_mix, 40, False, True),
-    "imports": (gen_imports, 40, True, False),
-    "long": (gen_long, 200, True, True),
+    "typing": (gen_typing, 40, False, False, None),
+    "errfix": (gen_errfix, 40, False, False, None),
+    "mix": (gen_mix, 40, False, True, None),
+    "imports": (gen_imports, 40, True, False, None),
+    "long": (gen_long, 200, True, True, None),
+    "typing-paced": (gen_typing, 40, False, False, 150),
+    "errfix-paced": (gen_errfix, 40, False, False, 150),
 }
+# Projects that run the paced scenarios by default (each paced session takes 6 s of pauses alone).
+PACED_PROJECTS = ("query-core", "hono")
+SWEEP_MS = [0, 30, 80, 150, 300]
 
 
 def build_plan(project, scenario, edits):
     """Rounds: round 0 opens the files, rounds 1..edits are the edits."""
-    gen, _, with_dep, open_mix = SCENARIOS[scenario]
+    gen, _, with_dep, open_mix, _ = SCENARIOS[scenario]
     plan = Plan(project)
     docs = [plan.main, plan.dep] if with_dep else [plan.main]
     reqs = mix_requests(plan.main, plan.main.marks["a2"]) if open_mix else [diag(plan.main)]
@@ -512,9 +527,7 @@ class Server:
             except queue.Empty:
                 raise ServerDied(f"timeout after {timeout:.0f} s") from None
             if msg is None:
-                self.inbox.put(None)
-                why = "RSS over the cap" if self.capped else f"exit {self.proc.poll()}"
-                raise ServerDied(f"server ended ({why}): {self.stderr[-3:]}")
+                raise self._ended()
             if "method" in msg:
                 if "id" in msg:
                     self.answer(msg)
@@ -522,6 +535,24 @@ class Server:
             if msg.get("id") in ids:
                 got[msg["id"]] = ((time.monotonic() - t0) * 1000, msg)
         return [got[i] for i in ids]
+
+    def pause(self, seconds):
+        """Think time: sends nothing for `seconds` except answers to server requests."""
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                msg = self.inbox.get(timeout=left)
+            except queue.Empty:
+                return
+            if msg is None:
+                raise self._ended()
+            if "method" in msg and "id" in msg:
+                self.answer(msg)
+
+    def _ended(self):
+        self.inbox.put(None)  # later reads see the end too
+        why = "RSS over the cap" if self.capped else f"exit {self.proc.poll()}"
+        return ServerDied(f"server ended ({why}): {self.stderr[-3:]}")
 
     def close(self):
         try:
@@ -601,8 +632,9 @@ def sha256_12(path):
     return h.hexdigest()[:12]
 
 
-def run_session(args, project, rounds, binary, extra_env=None):
-    """Runs one server through all rounds. Returns (session record, answers). answers[r][i] is the
+def run_session(args, project, rounds, binary, pace_ms, extra_env=None):
+    """Runs one server through all rounds, with a pause of `pace_ms` after each round's answers (RSS
+    is read before the pause). Returns (session record, answers). answers[r][i] is the
     zlib-compressed canonical normalized answer of request i in round r."""
     home = tempfile.mkdtemp(prefix="ls-edit-bench-")
     root = PROJECTS[project]["root"]
@@ -630,6 +662,8 @@ def run_session(args, project, rounds, binary, extra_env=None):
                 got.append(zlib.compress(canon(norm).encode(), 1))
             rows.append(row)
             answers.append(got)
+            if pace_ms:
+                server.pause(pace_ms / 1000)
     except ServerDied as e:
         error = str(e)
     finally:
@@ -729,6 +763,12 @@ def fmt(v, digits=1):
     return "-" if v is None else f"{v:.{digits}f}" if isinstance(v, float) else str(v)
 
 
+def session_name(s):
+    """Project, scenario and the pause when there is one (old results have no paceMs)."""
+    pace = s.get("paceMs", 0)
+    return f"{s['project']} {s['scenario']}" + (f" pace {pace} ms" if pace else "")
+
+
 def report_md(result):
     lines = ["# ls_edit_bench", "", f"Date {result['date']}, host {result['host']}, CPUs {result['cpus']}. "
              f"Go `{result['go']['binary']}` sha256 `{result['go']['sha256']}`"
@@ -740,9 +780,10 @@ def report_md(result):
     lines += ["", "Limits (Rust against Go):", ""] + [f"- {name}: {text}" for name, *_, text in LIMITS]
     lines += ["- answers: no Rust error, crash, timeout or RSS-cap kill where Go answered", "",
               "Edit latency: didChange to the diagnostics of the edited file. Round: didChange to the last answer.", "",
-              "| project | scenario | side | RSS 0/20/40/200 MiB | end | added | HWM | growth MiB/edit | edit median ms "
-              "| edit p95 ms | round median ms | answers same/differ | verdict |",
-              "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|"]
+              "Pace: the pause after each round's answers.", "",
+              "| project | scenario | pace ms | side | RSS 0/20/40/200 MiB | end | added | HWM | growth MiB/edit "
+              "| edit median ms | edit p95 ms | round median ms | answers same/differ | verdict |",
+              "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|"]
     for s in result["sessions"]:
         for side, v in [("go", s["go"])] + list(s["rust"].items()):
             sm = v["summary"]
@@ -754,17 +795,17 @@ def report_md(result):
                 eq = f"{sum(m['same'] for m in c.values())}/{sum(m['differ'] for m in c.values())}"
                 bad = [k for k, (ok, _) in v["limits"].items() if not ok]
                 verdict = "pass" if not bad else "FAIL " + ", ".join(bad)
-            lines.append(f"| {s['project']} | {s['scenario']} | {side} | {rss} | {fmt(sm['rssEnd'])} | {fmt(sm['rssAdded'])} | {fmt(sm['hwm'])} "
+            lines.append(f"| {s['project']} | {s['scenario']} | {s.get('paceMs', 0)} | {side} | {rss} | {fmt(sm['rssEnd'])} | {fmt(sm['rssAdded'])} | {fmt(sm['hwm'])} "
                          f"| {fmt(sm['growthMiBPerEdit'], 2)} | {fmt(sm['editMedianMs'])} | {fmt(sm['editP95Ms'])} "
                          f"| {fmt(sm['roundMedianMs'])} | {eq} | {verdict} |")
     lines += ["", "## Failed limits", ""]
     fails = [(s, side, k, text) for s in result["sessions"] for side, v in s["rust"].items()
              for k, (ok, text) in v["limits"].items() if not ok]
-    lines += [f"- {s['project']} {s['scenario']} {side}: {k} {text}" for s, side, k, text in fails] or ["None."]
+    lines += [f"- {session_name(s)} {side}: {k} {text}" for s, side, k, text in fails] or ["None."]
     lines += ["", "## Answer differences", ""]
     diffs = [(s, side, m, c) for s in result["sessions"] for side, v in s["rust"].items()
              for m, c in v["compare"].items() if c["differ"]]
-    lines += [f"- {s['project']} {s['scenario']} {side} `{m}`: {c['differ']} differ, first at "
+    lines += [f"- {session_name(s)} {side} `{m}`: {c['differ']} differ, first at "
               + ", ".join(f"edit {e['edit']} `{e['path']}` (Go `{e.get('go')}`, Rust `{e.get('rust')}`)"
                           for e in c["examples"]) for s, side, m, c in diffs] or ["None."]
     lines += ["", "## Median ms per method (Go / Rust)", ""]
@@ -773,7 +814,7 @@ def report_md(result):
         for m, g in s["go"]["summary"]["methods"].items():
             rs = " / ".join(fmt(v["summary"]["methods"].get(m, {}).get("medianMs")) for v in s["rust"].values())
             parts.append(f"{m.split('/')[-1]} {g['medianMs']} / {rs}")
-        lines.append(f"- {s['project']} {s['scenario']}: " + "; ".join(parts))
+        lines.append(f"- {session_name(s)}: " + "; ".join(parts))
     return "\n".join(lines) + "\n"
 
 
@@ -793,9 +834,9 @@ def status_of(result):
     return int(any(not ok for s in result["sessions"] for rec in s["rust"].values() for ok, _ in rec["limits"].values()))
 
 
-def print_line(project, scenario, label, rec):
+def print_line(sess, label, rec):
     sm = rec["summary"]
-    text = (f"{project} {scenario} {label}: RSS {sm['rssAt']} growth {sm['growthMiBPerEdit']} MiB/edit, edit median "
+    text = (f"{session_name(sess)} {label}: RSS {sm['rssAt']} growth {sm['growthMiBPerEdit']} MiB/edit, edit median "
             f"{fmt(sm['editMedianMs'])} p95 {fmt(sm['editP95Ms'])} ms, round median {fmt(sm['roundMedianMs'])} ms")
     if rec["error"]:
         text += f", ERROR {rec['error']}"
@@ -824,9 +865,15 @@ def main():
     ap.add_argument("--rust-env", action="append", default=[],
                     help="KEY=VAL for the Rust servers only, repeatable (for example _RJEM_MALLOC_CONF=narenas:48 "
                          "for jemalloc defaults on a 12-core Mac)")
-    ap.add_argument("--projects", default=",".join(PROJECTS))
-    ap.add_argument("--scenarios", default=",".join(SCENARIOS))
-    ap.add_argument("--edits", type=int, default=0, help="edits for the short scenarios (default 40)")
+    ap.add_argument("--projects", help="default query-core,hono,effect (--sweep: query-core)")
+    ap.add_argument("--scenarios", help="default all, the paced ones only on " + ",".join(PACED_PROJECTS)
+                    + " (--sweep: typing,errfix)")
+    ap.add_argument("--edits", type=int, default=0, help="edits for the short scenarios (default 40; --sweep 20)")
+    ap.add_argument("--pace-ms", type=int, default=0,
+                    help="pause after each round's answers, for the scenarios without their own (not *-paced)")
+    ap.add_argument("--sweep", nargs="?", const=SWEEP_MS, type=lambda v: [int(x) for x in v.split(",")],
+                    metavar="MS,...", help="run each scenario once per pause in the list (default "
+                    + ",".join(map(str, SWEEP_MS)) + "), in place of its own pause")
     ap.add_argument("--long-edits", type=int, default=0, help="edits for the long scenario (default 200)")
     ap.add_argument("--cpus", default="8,10,12,14")
     ap.add_argument("--rss-cap-mib", type=int, default=12288)
@@ -842,14 +889,19 @@ def main():
         for sess in result["sessions"]:
             evaluate(sess)
             for label, rec in sess["rust"].items():
-                print_line(sess["project"], sess["scenario"], label, rec)
+                print_line(sess, label, rec)
         with open(os.path.join(args.out, "result.json"), "w") as f:  # rows unchanged, verdicts updated
             json.dump(result, f)
     else:
         rust = parse_rust(args.rust)
         rust_env = dict(kv.split("=", 1) for kv in args.rust_env)
-        projects, scenarios = args.projects.split(","), args.scenarios.split(",")
-        bad = [p for p in projects if p not in PROJECTS] + [s for s in scenarios if s not in SCENARIOS]
+        if args.sweep:
+            args.projects = args.projects or "query-core"
+            args.scenarios = args.scenarios or "typing,errfix"
+            args.edits = args.edits or 20
+        projects = (args.projects or ",".join(PROJECTS)).split(",")
+        named = args.scenarios.split(",") if args.scenarios else []
+        bad = [p for p in projects if p not in PROJECTS] + [s for s in named if s not in SCENARIOS]
         missing = [b for b in [args.go, *rust.values()] if not os.access(b, os.X_OK)]
         if bad or missing or not rust:
             print(f"ls_edit_bench: need --rust; unknown {bad}; missing binaries {missing}", file=sys.stderr)
@@ -860,25 +912,29 @@ def main():
                   "go": {"binary": args.go, "sha256": sha256_12(args.go)},
                   "rust": {k: {"binary": v, "sha256": sha256_12(v)} for k, v in rust.items()},
                   "rustEnv": rust_env, "sessions": []}
+        plans = []  # (project, scenario, pace ms)
         for project in projects:
-            for scenario in scenarios:
-                edits = (args.long_edits if scenario == "long" else args.edits) or SCENARIOS[scenario][1]
-                rounds, digest = build_plan(project, scenario, edits)
-                sess = {"project": project, "scenario": scenario, "edits": edits, "plan": digest,
-                        "load": round(os.getloadavg()[0], 1), "rust": {}}
-                sess["go"], go_answers = run_session(args, project, rounds, args.go)
-                sess["go"]["summary"] = summarize(sess["go"], edits)
-                print_line(project, scenario, "go", sess["go"])
-                if sess["go"]["summary"]["complete"]:
-                    for label, binary in rust.items():
-                        rec, answers = run_session(args, project, rounds, binary, rust_env)
-                        rec["compare"] = compare(rounds, go_answers, answers)
-                        sess["rust"][label] = rec
-                        evaluate(sess)
-                        print_line(project, scenario, label, rec)
-                result["sessions"].append(sess)
-                with open(os.path.join(args.out, "result.json"), "w") as f:
-                    json.dump(result, f)
+            for scenario in named or [s for s, v in SCENARIOS.items() if v[4] is None or project in PACED_PROJECTS]:
+                own = SCENARIOS[scenario][4]
+                plans += [(project, scenario, pace) for pace in args.sweep or [args.pace_ms if own is None else own]]
+        for project, scenario, pace in plans:
+            edits = (args.long_edits if scenario == "long" else args.edits) or SCENARIOS[scenario][1]
+            rounds, digest = build_plan(project, scenario, edits)
+            sess = {"project": project, "scenario": scenario, "paceMs": pace, "edits": edits, "plan": digest,
+                    "load": round(os.getloadavg()[0], 1), "rust": {}}
+            sess["go"], go_answers = run_session(args, project, rounds, args.go, pace)
+            sess["go"]["summary"] = summarize(sess["go"], edits)
+            print_line(sess, "go", sess["go"])
+            if sess["go"]["summary"]["complete"]:
+                for label, binary in rust.items():
+                    rec, answers = run_session(args, project, rounds, binary, pace, rust_env)
+                    rec["compare"] = compare(rounds, go_answers, answers)
+                    sess["rust"][label] = rec
+                    evaluate(sess)
+                    print_line(sess, label, rec)
+            result["sessions"].append(sess)
+            with open(os.path.join(args.out, "result.json"), "w") as f:
+                json.dump(result, f)
     status = status_of(result)
     with open(os.path.join(args.out, "report.md"), "w") as f:
         f.write(report_md(result))

@@ -9,8 +9,9 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `perf.sh <bin> <label>`: median wall time and peak RSS on Query, Hono, zod and effect.
 - `fp.py <checkout>`: the source fingerprint recorded in the saved state.
 - `ls_edit_bench.py --rust BIN`: editor sessions (typing, error then fix, VS Code request mix, imports,
-  200-edit session) on Query core, Hono and effect against Go. RSS, edit latency and answers; exit 1
-  when Rust is over the limits in its docstring.
+  200-edit session, and typing and error then fix with a 150 ms pause between edits) on Query core,
+  Hono and effect against Go. RSS, edit latency and answers; exit 1 when Rust is over the limits in
+  its docstring.
 
 Revision bindings made before this move pin `/tmp/port/fp.py`. That copy is identical.
 
@@ -36,14 +37,31 @@ flock /tmp/goport-lsguard.lock scripts/goport/ls_edit_bench.py \
   Rust sides equally.
 - Other upstream pin: `GOPORT_PIN=<key> scripts/upstream/pin.py exec -- scripts/goport/ls_edit_bench.py ...`.
 - One pass is 3 projects (Query core, Hono, effect) x 5 scenarios (typing, errfix, mix, imports, and a
-  200-edit long session). With Go and two Rust builds it takes about 3 minutes, plus the wait for the lock.
+  200-edit long session), plus typing-paced and errfix-paced on Query core and Hono. With Go and two
+  Rust builds it takes about 4 to 5 minutes, plus the wait for the lock.
 - One session again: `--projects hono --scenarios long`. New limits on an old run: `--recheck --out DIR`.
+- Paced scenarios on effect: `--projects effect --scenarios typing-paced,errfix-paced` (not in the
+  default pass, to keep it short).
+
+Think time (pace): the pause after each edit's answers, before the next edit. The client sends
+nothing then, except answers to server requests. The Rust server runs idle work (the auto-import
+warm) only after 50 ms with no message (`IDLE_QUIET_PERIOD` in `lsp/server.rs`). Editors pause
+between keystrokes, so an edit can arrive while that work runs.
+
+- typing-paced and errfix-paced: typing and errfix with a 150 ms pause. They catch the leak that
+  editors hit: R123 on Query core goes to 6.4 GiB after 40 edits, with a 185 ms median edit (Go 266
+  MiB, 17 ms).
+- `--pace-ms N`: the same pause for the other scenarios (default 0).
+- `--sweep [MS,...]`: for diagnosis. It runs each scenario once per pause (default 0, 30, 80, 150 and
+  300 ms). Defaults: Query core, typing and errfix, 20 edits. `--projects`, `--scenarios` and
+  `--edits` change them. R123: 0 and 30 ms pass, 80 and 150 ms add about 155 MiB per edit, 300 ms
+  passes (the warm finishes before the next edit).
 
 How to read the result:
 
 - Exit 0: every limit passes. Exit 1: a limit failed. Exit 2: usage error, or a Go session failed.
-- `report.md` has one row per project, scenario and side, then "Failed limits" with the value and the
-  limit for each failure. `result.json` has every edit.
+- `report.md` has one row per project, scenario, pace and side, then "Failed limits" with the value
+  and the limit for each failure. `result.json` has every edit.
 - Limits (Rust against the Go of the same run):
 
   | limit | Rust must be at or below |
@@ -59,16 +77,10 @@ How to read the result:
   run that session again before you trust it.
 - Answer differences are listed but not judged. Hono completion `autoImport/moduleSpecifier`
   (Go `"."`, Rust `"./adapter/bun"`) also differs between two Go runs. Look at any other difference.
-- Known state on 2026-09-27: R122, R123 and the branches on R123 fail 5 sessions on memory:
+- Known state on 2026-09-27: R122, R123 and the branches on R123 fail 5 unpaced sessions on memory:
   imports on Query core and effect (rss), and long on all three projects (growth and rss).
-  Go against Go passes all 15.
-
-Not covered: think time. The Rust server runs idle work (the auto-import warm) only after 50 ms
-with no message (`IDLE_QUIET_PERIOD` in `lsp/server.rs`). This tool sends the next edit at once, so
-that work never runs. The leak that editors saw (R122 and R123 add about 155 MiB per edit with 60
-to 250 ms between edits, 6.3 to 6.5 GiB after 40 Query edits) does not show here. Until this tool
-has a pause between edits, also run the lsmem repro with the build added to its `CONFIGS`:
-`target/continuation-r97-goport/lsmem/repro/builds-allocator/repro.py --scenario append --pause-ms 150`.
+  Go against Go passes all 15. R123 also fails typing-paced and errfix-paced on Query core (rss and
+  all latency limits); it passes them on Hono. Go against Go passes all 4 paced sessions.
 
 ## Remote runners
 
