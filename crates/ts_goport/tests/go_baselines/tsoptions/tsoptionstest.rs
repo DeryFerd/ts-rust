@@ -672,6 +672,7 @@ pub const COMPILER_OPTIONS_JSON_FIELDS: &[(&str, &str)] = &[
     ("Build", "build"),
     ("Help", "help"),
     ("All", "all"),
+    ("RunExternalCode", "runExternalCode"),
     ("PprofDir", "pprofDir"),
     ("SingleThreaded", "singleThreaded"),
     ("Quiet", "quiet"),
@@ -856,6 +857,7 @@ impl MarshalerTo for CompilerOptionsJson<'_> {
         w.tristate("build", o.build)?;
         w.tristate("help", o.help)?;
         w.tristate("all", o.all)?;
+        w.tristate("runExternalCode", o.run_external_code)?;
         w.string("pprofDir", &o.pprof_dir)?;
         w.tristate("singleThreaded", o.single_threaded)?;
         w.tristate("quiet", o.quiet)?;
