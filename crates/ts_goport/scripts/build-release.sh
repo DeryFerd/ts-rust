@@ -26,6 +26,7 @@
 #      the floor (objdump -T).
 #   5. BOLT: record each bin with perf branch sampling on training runs,
 #      convert with perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
+#      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
 #   The binaries land in <out-dir>/bin, with BUILD.txt.
@@ -97,6 +98,16 @@
 #     The glibc tunables depend on the core count (ThreadBudget in
 #     program.rs), so glibc bins exec themselves under perf. The perf2bolt
 #     check below fails when the samples do not map to the bin.
+#   - The stack stays non-executable. Without a PT_GNU_STACK header, or with
+#     one that has E, glibc maps every thread stack PROT_EXEC, and glibc 2.41
+#     and later with glibc.rtld.execstack=0 refuses to start the bin. So BOLT
+#     runs without -use-gnu-stack (that option turns PT_GNU_STACK into the
+#     new text segment), and check_headers fails on a bin without a RW
+#     PT_GNU_STACK. BOLT then writes a new program header table at file
+#     offset = address, which adds 4 MB of zeros to each file (sparse on
+#     disk; they compress to nothing). Kernels before 5.18 find the table
+#     only there, so do not strip or objcopy the BOLT output (that moves the
+#     table). check_headers fails when it moved.
 #   - The bins must run on any x86-64 CPU. Step 4 scans the libc and jemalloc
 #     code for AVX and BMI, and step 6 runs tsgo in qemu-x86_64 with a CPU
 #     model without AVX (package qemu-user).
@@ -360,8 +371,8 @@ if [[ $bolt != 1 ]]; then
   for b in "${shipped[@]}"; do cp "$use/$b" "$out/bin/$b"; done
 fi
 
-# 5. BOLT.
-bolt_opts=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh -use-gnu-stack)
+# 5. BOLT. No -use-gnu-stack: it drops PT_GNU_STACK (see the rules above).
+bolt_opts=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh)
 p2b_opts=()
 if [[ $static == 1 ]]; then
   # The static libgcc unwinder has jump tables that point into ".cold" parts
@@ -447,6 +458,30 @@ if [[ $bolt == 1 ]]; then
   done
   unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
 fi
+
+# check_headers <bin>: fails unless the bin has one PT_GNU_STACK and it is RW
+# (no E), and unless the program header table is where both old and new
+# kernels look for it: at the first LOAD's address + e_phoff (kernels before
+# 5.18) and at the PT_PHDR address (5.18 and later).
+check_headers() {
+  local f=$1 hdrs stack phoff phdr load
+  hdrs="$(readelf -lW "$f")"
+  stack="$(awk '$1 == "GNU_STACK" { s = ""; for (i = 7; i < NF; i++) s = s $i; print s }' <<< "$hdrs")"
+  if [[ $stack != RW ]]; then
+    [[ -n $stack ]] && stack="PT_GNU_STACK flags ${stack//$'\n'/ and }" || stack="no PT_GNU_STACK"
+    echo "error: $f has $stack, not one RW PT_GNU_STACK. glibc then maps thread stacks executable." >&2
+    exit 1
+  fi
+  phoff="$(sed -n 's/.*starting at offset \([0-9]*\)$/\1/p' <<< "$hdrs")"
+  read -r -a phdr <<< "$(awk '$1 == "PHDR" { print $2, $3; exit }' <<< "$hdrs")"
+  read -r -a load <<< "$(awk '$1 == "LOAD" { print $2, $3; exit }' <<< "$hdrs")"
+  if ((${#phdr[@]} == 2 && phoff + load[1] - load[0] != phdr[1])); then
+    echo "error: $f has its program header table at file offset $(printf '%#x' "$phoff"), but PT_PHDR says address $(printf '%#x' "${phdr[1]}"). Kernels before 5.18 would read the wrong table (was the bin stripped?)." >&2
+    exit 1
+  fi
+}
+for b in "${shipped[@]}"; do check_headers "$out/bin/$b"; done
+echo "headers: all bins have a RW PT_GNU_STACK and a program header table that old kernels find"
 
 # 6. CPU check, part b: tsgo on query and hono in qemu with a CPU model
 # without AVX (qemu64). A dynamic tsgo loads the glibc 2.28 of the sysroot
