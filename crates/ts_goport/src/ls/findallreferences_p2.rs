@@ -728,7 +728,7 @@ impl<P: ProgramView> LanguageService<P> {
         source_files_set: &FxHashSet<String>,
         checker: &mut Checker,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
-        debug_assert!(checker.sym(symbol).value_declaration.is_some());
+        crate::go_assert!(checker.sym(symbol).value_declaration.is_some());
 
         let module_refs = find_module_references(program, source_files, symbol, checker);
         // core.MapNonNil
@@ -839,7 +839,7 @@ impl<P: ProgramView> LanguageService<P> {
                             SyntaxKind::ExportKeyword,
                             source_file,
                         );
-                        debug_assert!(node.is_some(), "Expected to find export keyword");
+                        crate::go_assert!(node.is_some(), "Expected to find export keyword");
                     } else {
                         let name = get_name_of_declaration(decl);
                         node = if name.is_nil() { decl } else { name };
@@ -875,7 +875,7 @@ pub fn get_special_search_kind(node: Node) -> &'static str {
         SyntaxKind::Constructor | SyntaxKind::ConstructorKeyword => "constructor",
         SyntaxKind::Identifier => {
             if is_class_like(node.parent()) {
-                debug_assert!(node.parent().name() == node);
+                crate::go_assert!(node.parent().name() == node);
                 return "class";
             }
             // fallthrough
@@ -1762,7 +1762,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
         add_references_here: bool,
         always_get_references: bool,
     ) {
-        debug_assert!(
+        crate::go_assert!(
             !always_get_references || self.options.use_aliases_for_rename,
             "If alwaysGetReferences is true, then prefix/suffix text must be enabled"
         );
@@ -1805,7 +1805,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
                 && self.mark_seen_re_export_rhs(name)
             {
                 let export_symbol = export_specifier.symbol();
-                debug_assert!(
+                crate::go_assert!(
                     export_symbol.is_some(),
                     "exportSpecifier.Symbol() should not be nil"
                 );
@@ -1824,7 +1824,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
                 export_kind = ExportKind::DEFAULT;
             }
             let export_symbol = export_specifier.symbol();
-            debug_assert!(
+            crate::go_assert!(
                 export_symbol.is_some(),
                 "exportSpecifier.Symbol() should not be nil"
             );
@@ -2264,7 +2264,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
             let (param_prop1, param_prop2) = self
                 .checker
                 .get_symbols_of_parameter_property_declaration(value_declaration, symbol_name);
-            debug_assert!(
+            crate::go_assert!(
                 self.checker
                     .sym(param_prop1)
                     .flags
@@ -2349,7 +2349,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
             );
         }
 
-        debug_assert!(is_for_rename_populate_search_symbol_set);
+        crate::go_assert!(is_for_rename_populate_search_symbol_set);
 
         // due to the above assert and the arguments at the uses of this function,
         // (onlyIncludeBindingElementAtReferenceLocation <=> !providePrefixAndSuffixTextForRename) holds

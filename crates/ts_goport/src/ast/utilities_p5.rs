@@ -674,8 +674,7 @@ pub fn import_from_module_specifier(node: Node) -> Node {
     if result.is_some() {
         return result;
     }
-    // Go: debug.FailBadSyntaxKind(node.Parent)
-    panic!("Unexpected node kind {:?}", node.parent().kind());
+    crate::gostd::debug::fail_bad_syntax_kind(node.parent().kind(), None)
 }
 
 // Go: ast/utilities.go:4141 TryGetImportFromModuleSpecifier

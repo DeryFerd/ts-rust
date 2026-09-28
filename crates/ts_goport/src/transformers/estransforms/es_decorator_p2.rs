@@ -549,7 +549,7 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:2197 esDecoratorTransformer.visitArrayAssignmentElement
     pub(super) fn visit_array_assignment_element(&mut self, node: Node) -> Node {
-        debug_assert!(is_array_binding_or_assignment_element(node));
+        go_assert!(is_array_binding_or_assignment_element(node));
         if is_spread_element(node) {
             return self.visit_assignment_rest_element(node);
         }
@@ -637,7 +637,7 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:2260 esDecoratorTransformer.visitObjectAssignmentElement
     pub(super) fn visit_object_assignment_element(&mut self, node: Node) -> Node {
-        debug_assert!(is_object_binding_or_assignment_element(node));
+        go_assert!(is_object_binding_or_assignment_element(node));
         if is_spread_assignment(node) {
             return self.visit_assignment_rest_property(node);
         }
@@ -738,7 +738,7 @@ impl EsDecoratorTransformer {
     // Go: transformers/estransforms/esdecorator.go:2348 esDecoratorTransformer.injectPendingExpressions
     pub(super) fn inject_pending_expressions(&mut self, expression: Node) -> Node {
         let result = self.prepend_expressions(&self.pending_expressions, expression);
-        debug_assert!(result.is_some());
+        go_assert!(result.is_some());
         if result != expression {
             self.pending_expressions = Vec::new();
         }

@@ -236,7 +236,7 @@ pub fn get_call_hierarchy_item_name(
             );
             return ("(anonymous)".to_string(), kw_pos, kw_pos + 5); // "class".length
         }
-        debug_assert!(
+        crate::go_assert!(
             decl_name.is_some(),
             "Expected call hierarchy item to have a name"
         );
@@ -1168,8 +1168,7 @@ pub fn collect_call_sites(
         }
 
         _ => {
-            // Go: debug.AssertNever(node)
-            panic!("Illegal value: {:?}", node.kind());
+            crate::gostd::debug::assert_never(&crate::gostd::debug::kind_string(node.kind()), None)
         }
     }
 

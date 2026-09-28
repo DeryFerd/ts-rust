@@ -103,6 +103,8 @@ fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
             }
             Node::NIL
         }
-        _ => panic!("AssertNever: {:?}", node.kind()),
+        _ => {
+            crate::gostd::debug::assert_never(&crate::gostd::debug::kind_string(node.kind()), None)
+        }
     }
 }

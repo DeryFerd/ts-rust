@@ -2,10 +2,11 @@
 //! (`context`, `errors`, `errgroup`, `slices`, `net/url`, `net/netip`,
 //! `strconv`, `time` timers, `unicode`, `regexp` with its `unicode` tables,
 //! `golang.org/x/text/collate` and `unicode/norm`, and the dispatch-thread
-//! `go` queue). See PORTING.md "Go runtime".
+//! `go` queue), and the `internal/debug` checks. See PORTING.md "Go runtime".
 
 pub mod collate;
 pub mod context;
+pub mod debug;
 pub mod errgroup;
 pub mod errors;
 pub mod local;

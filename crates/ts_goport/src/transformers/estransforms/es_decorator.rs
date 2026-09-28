@@ -263,14 +263,12 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:201 esDecoratorTransformer.exitClass
     pub(super) fn exit_class(&mut self) {
-        let top = self
-            .top
-            .take()
-            .expect("Incorrect value for top.kind. Expected top.kind to be 'class'");
-        debug_assert!(
+        // Go evaluates the message args first: a nil `tx.top` is a nil dereference.
+        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        go_assert!(
             top.kind == LexicalEntryKind::Class,
-            "Incorrect value for top.kind. Expected top.kind to be 'class' but got '{:?}' instead.",
-            top.kind
+            "Incorrect value for top.kind. Expected top.kind to be 'class' but got '{}' instead.",
+            top.kind as i32
         );
         let top = *top;
         self.pending_expressions = top.saved_pending_expressions;
@@ -280,11 +278,15 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:208 esDecoratorTransformer.enterClassElement
     pub(super) fn enter_class_element(&mut self, node: Node) {
-        debug_assert!(
-            self.top
-                .as_ref()
-                .is_some_and(|t| t.kind == LexicalEntryKind::Class),
-            "Incorrect value for top.kind. Expected top.kind to be 'class'"
+        let top_kind = self
+            .top
+            .as_ref()
+            .unwrap_or_else(|| go_nil_dereference())
+            .kind;
+        go_assert!(
+            top_kind == LexicalEntryKind::Class,
+            "Incorrect value for top.kind. Expected top.kind to be 'class' but got '{}' instead.",
+            top_kind as i32
         );
         let mut entry = LexicalEntry::new(LexicalEntryKind::ClassElement, self.top.take());
         if is_class_static_block_declaration(node)
@@ -302,20 +304,21 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:223 esDecoratorTransformer.exitClassElement
     pub(super) fn exit_class_element(&mut self) {
-        let top = self
-            .top
-            .take()
-            .expect("Incorrect value for top.kind. Expected top.kind to be 'class-element'");
-        debug_assert!(
+        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        go_assert!(
             top.kind == LexicalEntryKind::ClassElement,
-            "Incorrect value for top.kind. Expected top.kind to be 'class-element' but got '{:?}' instead.",
-            top.kind
+            "Incorrect value for top.kind. Expected top.kind to be 'class-element' but got '{}' instead.",
+            top.kind as i32
         );
-        debug_assert!(
-            top.next
-                .as_ref()
-                .is_some_and(|n| n.kind == LexicalEntryKind::Class),
-            "Incorrect value for top.next.kind. Expected top.next.kind to be 'class'"
+        let next_kind = top
+            .next
+            .as_ref()
+            .unwrap_or_else(|| go_nil_dereference())
+            .kind;
+        go_assert!(
+            next_kind == LexicalEntryKind::Class,
+            "Incorrect value for top.next.kind. Expected top.next.kind to be 'class' but got '{}' instead.",
+            next_kind as i32
         );
         self.top = top.next;
         self.update_state();
@@ -323,11 +326,15 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:230 esDecoratorTransformer.enterName
     pub(super) fn enter_name(&mut self) {
-        debug_assert!(
-            self.top
-                .as_ref()
-                .is_some_and(|t| t.kind == LexicalEntryKind::ClassElement),
-            "Incorrect value for top.kind. Expected top.kind to be 'class-element'"
+        let top_kind = self
+            .top
+            .as_ref()
+            .unwrap_or_else(|| go_nil_dereference())
+            .kind;
+        go_assert!(
+            top_kind == LexicalEntryKind::ClassElement,
+            "Incorrect value for top.kind. Expected top.kind to be 'class-element' but got '{}' instead.",
+            top_kind as i32
         );
         let entry = LexicalEntry::new(LexicalEntryKind::Name, self.top.take());
         self.top = Some(Box::new(entry));
@@ -336,14 +343,11 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:239 esDecoratorTransformer.exitName
     pub(super) fn exit_name(&mut self) {
-        let top = self
-            .top
-            .take()
-            .expect("Incorrect value for top.kind. Expected top.kind to be 'name'");
-        debug_assert!(
+        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        go_assert!(
             top.kind == LexicalEntryKind::Name,
-            "Incorrect value for top.kind. Expected top.kind to be 'name' but got '{:?}' instead.",
-            top.kind
+            "Incorrect value for top.kind. Expected top.kind to be 'name' but got '{}' instead.",
+            top.kind as i32
         );
         self.top = top.next;
         self.update_state();
@@ -354,7 +358,7 @@ impl EsDecoratorTransformer {
         if let Some(top) = self.top.as_mut()
             && top.kind == LexicalEntryKind::Other
         {
-            debug_assert!(self.pending_expressions.is_empty());
+            go_assert!(self.pending_expressions.is_empty());
             top.depth += 1;
         } else {
             let mut entry = LexicalEntry::new(LexicalEntryKind::Other, self.top.take());
@@ -366,15 +370,19 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:259 esDecoratorTransformer.exitOther
     pub(super) fn exit_other(&mut self) {
-        debug_assert!(
-            self.top
-                .as_ref()
-                .is_some_and(|t| t.kind == LexicalEntryKind::Other),
-            "Incorrect value for top.kind. Expected top.kind to be 'other'"
+        let top_kind = self
+            .top
+            .as_ref()
+            .unwrap_or_else(|| go_nil_dereference())
+            .kind;
+        go_assert!(
+            top_kind == LexicalEntryKind::Other,
+            "Incorrect value for top.kind. Expected top.kind to be 'other' but got '{}' instead.",
+            top_kind as i32
         );
         let top = self.top.as_mut().expect("top is nil");
         if top.depth > 0 {
-            debug_assert!(self.pending_expressions.is_empty());
+            go_assert!(self.pending_expressions.is_empty());
             top.depth -= 1;
         } else {
             let top = *self.top.take().expect("top is nil");
@@ -454,13 +462,9 @@ impl EsDecoratorTransformer {
             SyntaxKind::ClassExpression => self.visit_class_expression(node),
             SyntaxKind::Constructor
             | SyntaxKind::PropertyDeclaration
-            | SyntaxKind::ClassStaticBlockDeclaration => {
-                debug_assert!(
-                    false,
-                    "Not supported outside of a class. Use 'classElementVisitor' instead."
-                );
-                Node::NIL
-            }
+            | SyntaxKind::ClassStaticBlockDeclaration => crate::gostd::debug::fail(
+                "Not supported outside of a class. Use 'classElementVisitor' instead.",
+            ),
             SyntaxKind::Parameter => self.visit_parameter_declaration(node),
             // Support NamedEvaluation to ensure the correct class name for class expressions.
             SyntaxKind::BinaryExpression => {
@@ -798,7 +802,7 @@ impl EsDecoratorTransformer {
             self.transform_all_decorators_of_declaration(&node.decorators().to_vec());
         if !class_decorators.is_empty() {
             let mut c = ci.borrow_mut();
-            debug_assert!(c.class_this.is_some());
+            go_assert!(c.class_this.is_some());
 
             c.class_decorators_name =
                 f.new_unique_name_ex("_classDecorators", optimistic_file_level());
@@ -1391,7 +1395,7 @@ impl EsDecoratorTransformer {
                     statements.push(export_statement);
                 }
             } else {
-                debug_assert!(
+                go_assert!(
                     class_node.name().is_some(),
                     "A class declaration that is not a default export must have a name."
                 );
@@ -1694,8 +1698,7 @@ impl EsDecoratorTransformer {
             } else if is_property_declaration(member) {
                 "field"
             } else {
-                debug_assert!(false, "Unexpected class element kind.");
-                ""
+                crate::gostd::debug::fail("Unexpected class element kind.")
             };
 
             // Determine the property name for the context
@@ -1764,7 +1767,7 @@ impl EsDecoratorTransformer {
                 } else {
                     ci.borrow().instance_method_extra_initializers_name
                 };
-                debug_assert!(
+                go_assert!(
                     method_extra_initializers_name.is_some(),
                     "methodExtraInitializersName should be defined"
                 );
@@ -1887,7 +1890,7 @@ impl EsDecoratorTransformer {
                 ci.non_static_field_decoration_statements.push(stmt);
             }
         } else {
-            debug_assert!(false, "Unexpected class element kind.");
+            crate::gostd::debug::fail("Unexpected class element kind.");
         }
     }
 
@@ -2079,7 +2082,7 @@ impl EsDecoratorTransformer {
         // TODO(rbuckton): We support decorating `declare x` fields with legacyDecorators, but we currently don't
         //                 support them with esDecorators. We need to consider whether we will support them in the
         //                 future, and how. For now, these should be elided by the `ts` transform.
-        debug_assert!(
+        go_assert!(
             !has_syntactic_modifier(node, ModifierFlags::AMBIENT),
             "Not yet implemented."
         );

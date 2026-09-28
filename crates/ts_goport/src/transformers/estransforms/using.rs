@@ -169,7 +169,7 @@ impl UsingDeclarationTransformer {
                     Vec::with_capacity(self.export_binding_names.len());
                 for name in &self.export_binding_names {
                     let specifier = bindings.get(name).copied().unwrap_or(Node::NIL);
-                    debug_assert!(
+                    go_assert!(
                         specifier.is_some(),
                         "Missing export binding for hoisted export name"
                     );

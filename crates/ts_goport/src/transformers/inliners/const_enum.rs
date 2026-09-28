@@ -21,8 +21,7 @@ pub fn new_const_enum_inlining_transformer(opt: &TransformOptions) -> Option<Tra
     let compiler_options = opt.compiler_options;
     let emit_context = opt.context.clone();
     if compiler_options.get_isolated_modules() {
-        // PORT: Go `debug.Fail(...)`.
-        panic!("const enums are not inlined under isolated modules");
+        crate::gostd::debug::fail("const enums are not inlined under isolated modules");
     }
     let tx = ConstEnumInliningTransformer {
         emit_context,

@@ -270,7 +270,7 @@ impl Checker {
         let ctx = scopes_ctx(b);
         let enclosing_declaration = ctx.borrow().enclosing_declaration;
         // We only ever need to look two declarations upward.
-        assert!(enclosing_declaration.is_some());
+        go_assert!(enclosing_declaration.is_some());
         let mut existing_fake_scope = Node::NIL;
         if is_fake_scope_of_kind(b, enclosing_declaration, kind) {
             existing_fake_scope = enclosing_declaration;
@@ -281,7 +281,7 @@ impl Checker {
         {
             existing_fake_scope = enclosing_declaration.parent();
         }
-        assert!(existing_fake_scope.is_nil() || is_block(existing_fake_scope));
+        go_assert!(existing_fake_scope.is_nil() || is_block(existing_fake_scope));
 
         let mut locals = SymbolTable::NIL;
         if existing_fake_scope.is_some() {
