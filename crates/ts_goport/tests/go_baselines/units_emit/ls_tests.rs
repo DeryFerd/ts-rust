@@ -808,6 +808,7 @@ fn fill_non_zero_values() -> UserPreferences {
         },
         prefer_go_to_source_definition: true,
         exclude_library_symbols_in_nav_to: f,
+        workspace_symbols_scope: lsutil::WorkspaceSymbolsScope("test".into()),
         enable_formatting: f,
         enable_validation: f,
         disable_suggestions: f,
@@ -1100,4 +1101,27 @@ fn test_user_preferences_parse_ata() {
     );
 
     t.finish();
+}
+
+// Go: ls/lsutil/userpreferences_test.go:531 TestParseUserPreferencesEditorFormatting
+// PORT: Go writes the numbers as Go `int`; a JSON number is `LspAny::Number`.
+#[test]
+fn test_parse_user_preferences_editor_formatting() {
+    let prefs = parse_user_preferences(&items(&[(
+        "editor",
+        obj(&[
+            ("tabSize", LspAny::Number(2.0)),
+            ("insertSpaces", LspAny::Bool(false)),
+        ]),
+    )]));
+
+    let settings = &prefs.format_code_settings.editor_settings;
+    assert_equal(settings.tab_size, 2, "FormatCodeSettings.TabSize").unwrap();
+    assert_equal(settings.indent_size, 2, "FormatCodeSettings.IndentSize").unwrap();
+    assert_equal(
+        settings.convert_tabs_to_spaces,
+        Tristate::False,
+        "FormatCodeSettings.ConvertTabsToSpaces",
+    )
+    .unwrap();
 }

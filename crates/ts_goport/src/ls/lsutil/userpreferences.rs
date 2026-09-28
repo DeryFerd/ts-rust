@@ -7,6 +7,7 @@ use crate::frontend::json::{
 use crate::modulespecifiers::{
     ImportModuleSpecifierEndingPreference, ImportModuleSpecifierPreference,
 };
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 // Port of Go `ls/lsutil/userpreferences.go`.
@@ -43,6 +44,7 @@ pub fn new_default_user_preferences() -> UserPreferences {
         report_style_checks_as_warnings: Tristate::True,
 
         exclude_library_symbols_in_nav_to: Tristate::True,
+        workspace_symbols_scope: WorkspaceSymbolsScope::ALL_OPEN_PROJECTS,
         ..Default::default()
     }
 }
@@ -85,12 +87,12 @@ pub struct UserPreferences {
     // a whole declaration for the member.
     // E.g., `class A { f| }` could be completed to `class A { foo(): number {} }`, instead of
     // `class A { foo }`.
-    pub include_completions_with_class_member_snippets: Tristate, // !!!
+    pub include_completions_with_class_member_snippets: Tristate,
     // If enabled, object literal methods will have a method declaration completion entry in addition
     // to the regular completion entry containing just the method name.
     // E.g., `const objectLiteral: T = { f| }` could be completed to `const objectLiteral: T = { foo(): void {} }`,
     // in addition to `const objectLiteral: T = { foo }`.
-    pub include_completions_with_object_literal_method_snippets: Tristate, // !!!
+    pub include_completions_with_object_literal_method_snippets: Tristate,
     pub jsx_attribute_completion_style: JsxAttributeCompletionStyle,
     pub enable_auto_closing_tags: Tristate,
     pub enable_js_doc_completions: Tristate,
@@ -175,6 +177,7 @@ pub struct UserPreferences {
 
     // ------- Symbols -------
     pub exclude_library_symbols_in_nav_to: Tristate,
+    pub workspace_symbols_scope: WorkspaceSymbolsScope,
 
     // ------- Misc -------
     pub enable_formatting: Tristate,
@@ -250,6 +253,19 @@ impl QuotePreference {
     pub const SINGLE: QuotePreference = QuotePreference("single");
 }
 
+// Go: ls/lsutil/userpreferences.go:232 WorkspaceSymbolsScope
+// PORT: a Go string type. It has no entry in `typeParsers`, so Go sets any
+// string (`reflect.Value.SetString`); the value is a `Cow`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WorkspaceSymbolsScope(pub Cow<'static, str>);
+
+impl WorkspaceSymbolsScope {
+    pub const ALL_OPEN_PROJECTS: WorkspaceSymbolsScope =
+        WorkspaceSymbolsScope(Cow::Borrowed("allOpenProjects"));
+    pub const CURRENT_PROJECT: WorkspaceSymbolsScope =
+        WorkspaceSymbolsScope(Cow::Borrowed("currentProject"));
+}
+
 // Go: ls/lsutil/userpreferences.go:226 JsxAttributeCompletionStyle
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct JsxAttributeCompletionStyle(pub &'static str);
@@ -322,6 +338,7 @@ enum FieldType {
     OrganizeImportsTypeOrder,
     ImportModuleSpecifierPreference,
     ImportModuleSpecifierEndingPreference,
+    WorkspaceSymbolsScope,
     Int,
     String,
     Bool,
@@ -355,6 +372,7 @@ impl FieldType {
             | FieldType::IncludeInlayParameterNameHints
             | FieldType::ImportModuleSpecifierPreference
             | FieldType::ImportModuleSpecifierEndingPreference
+            | FieldType::WorkspaceSymbolsScope
             | FieldType::String => FieldKind::String,
             FieldType::StringSlice => FieldKind::Slice,
         }
@@ -377,6 +395,7 @@ enum FieldValue {
     OrganizeImportsTypeOrder(OrganizeImportsTypeOrder),
     ImportModuleSpecifierPreference(ImportModuleSpecifierPreference),
     ImportModuleSpecifierEndingPreference(ImportModuleSpecifierEndingPreference),
+    WorkspaceSymbolsScope(WorkspaceSymbolsScope),
     Int(i32),
     String(String),
     Bool(bool),
@@ -405,6 +424,7 @@ impl FieldValue {
             FieldValue::ImportModuleSpecifierEndingPreference(_) => {
                 FieldType::ImportModuleSpecifierEndingPreference
             }
+            FieldValue::WorkspaceSymbolsScope(_) => FieldType::WorkspaceSymbolsScope,
             FieldValue::Int(_) => FieldType::Int,
             FieldValue::String(_) => FieldType::String,
             FieldValue::Bool(_) => FieldType::Bool,
@@ -463,6 +483,7 @@ impl FieldValue {
                 ImportModuleSpecifierEndingPreference::Js => "js",
             }
             .to_string(),
+            FieldValue::WorkspaceSymbolsScope(v) => v.0.to_string(),
             FieldValue::String(v) => v.clone(),
             _ => format!("<{:?} Value>", self.type_()),
         }
@@ -488,6 +509,7 @@ impl FieldValue {
             FieldValue::ImportModuleSpecifierEndingPreference(v) => {
                 *v == ImportModuleSpecifierEndingPreference::None
             }
+            FieldValue::WorkspaceSymbolsScope(v) => v.0.is_empty(),
             FieldValue::Int(v) => *v == 0,
             FieldValue::String(v) => v.is_empty(),
             FieldValue::Bool(v) => !*v,
@@ -1407,6 +1429,13 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
         exclude_library_symbols_in_nav_to
     ),
     pref_field!(
+        "WorkspaceSymbolsScope",
+        "",
+        "workspaceSymbols.scope",
+        WorkspaceSymbolsScope,
+        workspace_symbols_scope
+    ),
+    pref_field!(
         "EnableFormatting",
         "formatEnabled",
         "format.enabled",
@@ -1744,7 +1773,15 @@ fn set_field_from_value(p: &mut UserPreferences, info: &FieldInfo, val: &LspAny)
         }
         FieldKind::String => {
             if let LspAny::String(s) = val {
-                (info.set)(p, FieldValue::String(s.clone()));
+                // PORT: Go `field.SetString(s)` keeps the field's string type.
+                // Only the string types with no parser reach this point.
+                let v = match field_type {
+                    FieldType::WorkspaceSymbolsScope => FieldValue::WorkspaceSymbolsScope(
+                        WorkspaceSymbolsScope(Cow::Owned(s.clone())),
+                    ),
+                    _ => FieldValue::String(s.clone()),
+                };
+                (info.set)(p, v);
             }
         }
         FieldKind::Slice => {
@@ -1928,11 +1965,19 @@ pub fn parse_user_preferences(items: &IndexMap<String, LspAny>) -> UserPreferenc
         && !matches!(editor_item, LspAny::Null)
         && let LspAny::Object(editor_settings) = editor_item
     {
+        let mut normalized_settings = editor_settings.clone();
+        if let Some(tab_size) = normalized_settings.get("tabSize").cloned() {
+            if !normalized_settings.contains_key("indentSize") {
+                normalized_settings.insert("indentSize".to_string(), tab_size);
+            }
+        }
+        if let Some(insert_spaces) = normalized_settings.get("insertSpaces").cloned() {
+            if !normalized_settings.contains_key("convertTabsToSpaces") {
+                normalized_settings.insert("convertTabsToSpaces".to_string(), insert_spaces);
+            }
+        }
         let mut config: IndexMap<String, LspAny> = IndexMap::new();
-        config.insert(
-            "unstable".to_string(),
-            LspAny::Object(editor_settings.clone()),
-        );
+        config.insert("unstable".to_string(), LspAny::Object(normalized_settings));
         prefs = prefs.with_config(&config);
     }
     // Apply javascript, then typescript, then js/ts (highest precedence).

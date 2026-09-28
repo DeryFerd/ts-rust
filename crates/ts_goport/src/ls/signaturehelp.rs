@@ -681,7 +681,10 @@ impl LanguageService {
         let mut documentation: Option<String> = None;
         let declaration = c.sig(candidate).declaration;
         if declaration.is_some() {
-            let doc = self.get_documentation_from_declaration(
+            let doc = get_documentation_from_declaration(
+                &|file_name: &str, file_range: TextRange| {
+                    self.get_mapped_location(file_name, file_range)
+                },
                 c,
                 SymbolId::NIL,
                 declaration,
@@ -1052,7 +1055,10 @@ impl LanguageService {
         let mut documentation: Option<lsproto::StringOrMarkupContent> = None;
         let value_declaration = c.sym(parameter).value_declaration;
         if value_declaration.is_some() {
-            let doc = self.get_documentation_from_declaration(
+            let doc = get_documentation_from_declaration(
+                &|file_name: &str, file_range: TextRange| {
+                    self.get_mapped_location(file_name, file_range)
+                },
                 c,
                 SymbolId::NIL,
                 value_declaration,

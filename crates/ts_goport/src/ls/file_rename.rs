@@ -19,6 +19,13 @@ pub struct ToImport {
     pub updated: bool,
 }
 
+// Go: ls/file_rename.go:27 movedFile
+#[derive(Clone, Debug, Default)]
+pub struct MovedFile {
+    pub source_file: Node,
+    pub new_file_name: String,
+}
+
 impl LanguageService {
     // Go: ls/file_rename.go:27 GetEditsForFileRename
     pub fn get_edits_for_file_rename(
@@ -378,6 +385,17 @@ impl LanguageService {
         let checker = &mut *checker_rc.borrow_mut();
         let module_specifier_preferences = self.user_preferences().module_specifier_preferences();
 
+        let mut moved_files: Vec<MovedFile> = Vec::new();
+        for &source_file in &all_files {
+            let (new_file_name, ok) = old_to_new(source_file_file_name(source_file));
+            if ok {
+                moved_files.push(MovedFile {
+                    source_file,
+                    new_file_name,
+                });
+            }
+        }
+
         for source_file in all_files {
             let old_file_name = source_file_file_name(source_file);
             let (new_from_old, file_moved) = old_to_new(source_file_file_name(source_file));
@@ -412,6 +430,7 @@ impl LanguageService {
                     source_file,
                     import_string_literal,
                     old_to_new,
+                    &moved_files,
                     &new_import_from_path,
                     file_moved,
                     &module_specifier_preferences,
@@ -441,6 +460,7 @@ impl LanguageService {
         source_file: Node, // old importing source file
         import_literal: Node,
         old_to_new: &PathUpdater<'_>,
+        moved_files: &[MovedFile],
         new_import_from_path: &str,
         importing_source_file_moved: bool,
         user_preferences: &modulespecifiers::UserPreferences,
@@ -453,12 +473,12 @@ impl LanguageService {
         let target = get_source_file_to_import(program, source_file, import_literal, old_to_new);
 
         let Some(target) = target else {
-            // First fall back: try every file in the program to see if any of them would match the import specifier, and if so, obtain the updated specifier for that file.
+            // First fall back: try every file affected by the rename to see if any of them would match the import specifier, and if so, obtain the updated specifier for that file.
             let updated = get_updated_import_specifier_from_moved_source_files(
                 program,
                 source_file,
                 import_literal,
-                old_to_new,
+                moved_files,
                 new_import_from_path,
                 user_preferences,
             );
@@ -535,7 +555,7 @@ pub fn get_source_file_to_import(
 }
 
 // Go: ls/file_rename.go:301 getUpdatedImportSpecifierFromMovedSourceFiles
-// As a fall back for unresolved modules, we'll check all files in the program to see if any of them would match
+// As a fall back for unresolved modules, we'll check every file affected by the rename to see if any of them would match
 // the import specifier, and if so, we'll obtain the updated specifier for that file.
 // PORT: Go passes the program as the `ModuleSpecifierGenerationHost`; here
 // that is `modulespecifiers::ProgramHost` (the installed program).
@@ -543,7 +563,7 @@ pub fn get_updated_import_specifier_from_moved_source_files(
     program: &'static compiler::NewProgram,
     source_file: Node,
     import_literal: Node,
-    old_to_new: &PathUpdater<'_>,
+    moved_files: &[MovedFile],
     importing_source_file_name: &str,
     user_preferences: &modulespecifiers::UserPreferences,
 ) -> String {
@@ -551,20 +571,14 @@ pub fn get_updated_import_specifier_from_moved_source_files(
         &autoimport::source_file_has_file_name(source_file),
         import_literal,
     );
-    for candidate in program.get_source_files() {
-        let candidate = candidate.root;
-        let (new_file_name, ok) = old_to_new(source_file_file_name(candidate));
-        if !ok {
-            continue;
-        }
-
+    for candidate in moved_files {
         let old_specifier = modulespecifiers::update_module_specifier(
             program.options(),
             &modulespecifiers::ProgramHost,
             source_file,
             importing_source_file_name,
             import_literal.text(),
-            source_file_file_name(candidate),
+            source_file_file_name(candidate.source_file),
             user_preferences,
             modulespecifiers::ModuleSpecifierOptions {
                 override_import_mode: resolution_mode,
@@ -580,7 +594,7 @@ pub fn get_updated_import_specifier_from_moved_source_files(
             source_file,
             importing_source_file_name,
             import_literal.text(),
-            &new_file_name,
+            &candidate.new_file_name,
             user_preferences,
             modulespecifiers::ModuleSpecifierOptions {
                 override_import_mode: resolution_mode,

@@ -604,7 +604,9 @@ impl SourceDefResolver<'_> {
                     ..Default::default()
                 },
                 text,
-                crate::frontend::core_ext::get_script_kind_from_file_name(file_name),
+                // A declaration map's `sources` entries are arbitrary strings, so the
+                // file name here may not have a recognized extension.
+                crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name),
             ));
             crate::program::note_parsed_source_file(&file);
             crate::program::publish_parsed_files(&self.ls.program.get_current_directory());
