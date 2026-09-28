@@ -23,7 +23,10 @@ bump A pin 52168999f3dc protocol 2, every later pin protocol 3. Protocol 2 (Go c
   - internal symbol names come escaped (ast.EscapeSymbolName): "__@iterator@<id>", not "\ufffd@...".
 Protocol 3 (bump B, 16c25522e123) adds to protocol 2:
   - the per-file diagnostics requests take files: [file] (tsgo#4552: GetDiagnosticsParams.Files). Go ignores
-    the old "file" field there and answers for the whole program.
+    the old "file" field there and answers for the whole program;
+  - getConstraintOfTypeParameter, getNonNullableType, getApparentType and getReturnTypeOfSignature take the
+    type or signature as objectId (tsgo#4689: GetTypePropertyParams, GetSignaturePropertyParams), not as
+    "type" or "signature". Go answers "empty type handle" to the old field.
   The other API changes up to 16c25522e123 keep the requests of `build`: new methods only (transpile*
   tsgo#4849, emit, getSymbolsInScope, ...), the language service methods keep their wire names (tsgo#4893
   moves them only in the TS client), and tsgo#4915 adds only generator comments and tags.
@@ -1920,6 +1923,11 @@ def glob_files(pdir, include, exclude):
     return sorted(out)
 
 
+# Methods that take their type or signature as "objectId" from protocol 3 on (tsgo#4689). The builders write
+# "type" or "signature"; TraceBuilder.req moves the value to "objectId" in a protocol 3 run.
+OBJECT_ID_METHODS = {"getConstraintOfTypeParameter", "getNonNullableType", "getApparentType", "getReturnTypeOfSignature"}
+
+
 class TraceBuilder:
     """Collects events. Helpers add the request chains of api/proto.go."""
 
@@ -1927,6 +1935,9 @@ class TraceBuilder:
         self.events = []
 
     def req(self, method, params=None, pf=None):
+        if PROTOCOL >= 3 and method in OBJECT_ID_METHODS and isinstance(pf, dict) \
+                and pf.get("into") in ("/type", "/signature"):
+            pf = {**pf, "into": "/objectId"}
         ev = {"kind": "request", "method": method}
         if params is not None:
             ev["params"] = params
