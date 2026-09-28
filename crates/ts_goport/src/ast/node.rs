@@ -5358,6 +5358,228 @@ pub fn source_file_text(file: Node) -> &'static str {
     &file.go_file().legacy_source().source_text
 }
 
+// ---------------------------------------------------------------------------
+// Content mapper info of a SourceFile (tsgo#4712)
+// ---------------------------------------------------------------------------
+
+// Go: ast/ast.go:2615 MappedDiagnosticDirectivePolicy
+crate::flags_macros::go_enum!(MappedDiagnosticDirectivePolicy, u8 {
+    IGNORE = 0; // MappedDiagnosticDirectivePolicyIgnore
+    EXPECT = 1; // MappedDiagnosticDirectivePolicyExpect
+});
+
+// Go: ast/ast.go:2622 MappedDiagnosticDirective
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MappedDiagnosticDirective {
+    pub original_range: TextRange,
+    pub virtual_range: TextRange,
+    pub policy: MappedDiagnosticDirectivePolicy,
+    pub unused_code: i32,
+    pub unused_message_text: String,
+    pub source: String,
+}
+
+// Go: ast/ast.go:2631 ContentMapperSourceFileInfo
+// PORT: Go `*SourceFile` is `Rc<ParsedSourceFile>` (the compiler host
+// type), and Go `*spanmap.SpanMap` is `Option<Arc<SpanMap>>`. Pass it to
+// `ParsedSourceFile::set_content_mapper_info`, which keeps it in two parts:
+// `ContentMapperFileInfo` for readers of the SourceFile node on any thread,
+// and the `Rc` links on this thread.
+#[derive(Clone, Debug, Default)]
+pub struct ContentMapperSourceFileInfo {
+    pub content_mapper: String,
+    pub transform_identity: String,
+    pub parse_options: crate::frontend::parser::SourceFileParseOptions,
+    pub virtual_file_name: String,
+    pub original_text: String,
+    pub span_map: Option<std::sync::Arc<crate::spanmap::SpanMap>>,
+    pub diagnostic_directives: Vec<MappedDiagnosticDirective>,
+    pub supplemental_source_files: Vec<Rc<crate::frontend::parser::source_file::ParsedSourceFile>>,
+    pub canonical_source_file: Option<Rc<crate::frontend::parser::source_file::ParsedSourceFile>>,
+}
+
+/// Go `SourceFile.contentMapperInfo` as the readers of a SourceFile node
+/// see it: `ContentMapperSourceFileInfo` with each linked file as its
+/// SourceFile node (`Node::NIL` for no canonical file).
+// PORT: Go keeps the info on the SourceFile and reads it on any goroutine
+// (the emitter, the diagnostic writer, the language service). A parsed
+// file's node data cannot hold it and `ParsedSourceFile` must stay `Send`
+// (a parse worker makes it), so the info lives in a process table by file
+// id, like the file stores. It is set once and never freed, as a published
+// file is never freed.
+#[derive(Debug)]
+pub struct ContentMapperFileInfo {
+    pub content_mapper: String,
+    pub transform_identity: String,
+    pub parse_options: crate::frontend::parser::SourceFileParseOptions,
+    pub virtual_file_name: String,
+    pub original_text: String,
+    pub span_map: Option<std::sync::Arc<crate::spanmap::SpanMap>>,
+    pub diagnostic_directives: Vec<MappedDiagnosticDirective>,
+    pub supplemental_source_files: Vec<Node>,
+    pub canonical_source_file: Node,
+}
+
+/// The content mapper info of each parsed file, by file id.
+static CONTENT_MAPPER_INFOS: std::sync::RwLock<FxHashMap<usize, &'static ContentMapperFileInfo>> =
+    std::sync::RwLock::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher));
+
+/// True once any file has content mapper info, so a program with no content
+/// mapper reads no table.
+static HAS_CONTENT_MAPPER_INFO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Go `SourceFileParseOptions{}`, which `ContentMapperParseOptions` returns
+/// for a file with no content mapper info.
+static EMPTY_PARSE_OPTIONS: crate::frontend::parser::SourceFileParseOptions =
+    crate::frontend::parser::SourceFileParseOptions {
+        file_name: String::new(),
+        path: crate::frontend::tspath::Path(String::new()),
+        external_module_indicator_options:
+            crate::frontend::parser::ExternalModuleIndicatorOptions {
+                jsx: false,
+                force: false,
+            },
+    };
+
+// Go: ast/ast.go:2652 (*SourceFile).SetContentMapperInfo, for the node side.
+/// Stores the content mapper info of the parsed SourceFile `file`.
+/// `ParsedSourceFile::set_content_mapper_info` calls it.
+// PORT: panics when the info is already set, as Go does.
+pub fn set_source_file_content_mapper_info(file: Node, info: ContentMapperFileInfo) {
+    let mut infos = CONTENT_MAPPER_INFOS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if infos.contains_key(&file.file_index()) {
+        panic!("content mapper source file info already set");
+    }
+    infos.insert(file.file_index(), Box::leak(Box::new(info)));
+    HAS_CONTENT_MAPPER_INFO.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Go `node.contentMapperInfo` of the SourceFile `file`: `None` for nil.
+/// A factory SourceFile has the info that `source_file_copy_from` copied.
+#[must_use]
+pub fn source_file_content_mapper_info(file: Node) -> Option<&'static ContentMapperFileInfo> {
+    if file.is_nil() || !HAS_CONTENT_MAPPER_INFO.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    if is_synthetic_node(file) {
+        return with_synthetic_source_file(file, |d| d.content_mapper_info);
+    }
+    CONTENT_MAPPER_INFOS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&file.file_index())
+        .copied()
+}
+
+// Go: ast/ast.go:2561 (*SourceFile).OriginalText
+// OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
+#[must_use]
+pub fn source_file_original_text(file: Node) -> &'static str {
+    match source_file_content_mapper_info(file) {
+        Some(info) if !info.content_mapper.is_empty() => &info.original_text,
+        _ => source_file_text(file),
+    }
+}
+
+// Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
+// OriginalFileName returns the canonical filename associated with a supplemental source file, or FileName() otherwise.
+#[must_use]
+pub fn source_file_original_file_name(file: Node) -> &'static str {
+    let canonical = source_file_canonical_source_file(file);
+    if canonical.is_some() {
+        return source_file_file_name(canonical);
+    }
+    source_file_file_name(file)
+}
+
+// Go: ast/ast.go:2579 (*SourceFile).SpanMap
+// SpanMap returns the span map that maps positions in this file's transformed Text() back to its
+// original, untransformed content, or nil if the file is not content-mapped (or is a failure stub).
+// The returned map is nil-safe: a nil map maps positions identically.
+// PORT: nil is `None`; the `SpanMap` methods take `Option<&SpanMap>`.
+#[must_use]
+pub fn source_file_span_map(file: Node) -> Option<&'static crate::spanmap::SpanMap> {
+    source_file_content_mapper_info(file)?.span_map.as_deref()
+}
+
+// Go: ast/ast.go:2588 (*SourceFile).ContentMapper
+// ContentMapper returns the identity of the content mapper that produced this file, or "" if the file
+// was not produced by a content mapper (or the mapper did not identify itself).
+#[must_use]
+pub fn source_file_content_mapper(file: Node) -> &'static str {
+    source_file_content_mapper_info(file).map_or("", |info| &info.content_mapper)
+}
+
+// Go: ast/ast.go:2597 (*SourceFile).IsContentMapperFailureStub
+// IsContentMapperFailureStub reports whether this file is the empty placeholder produced when a content
+// mapper's transform failed.
+#[must_use]
+pub fn source_file_is_content_mapper_failure_stub(file: Node) -> bool {
+    !source_file_content_mapper(file).is_empty() && source_file_span_map(file).is_none()
+}
+
+// Go: ast/ast.go:2601 (*SourceFile).ContentMapperTransformIdentity
+#[must_use]
+pub fn source_file_content_mapper_transform_identity(file: Node) -> &'static str {
+    source_file_content_mapper_info(file).map_or("", |info| &info.transform_identity)
+}
+
+// Go: ast/ast.go:2608 (*SourceFile).VirtualFileName
+#[must_use]
+pub fn source_file_virtual_file_name(file: Node) -> &'static str {
+    source_file_content_mapper_info(file).map_or("", |info| &info.virtual_file_name)
+}
+
+// Go: ast/ast.go:2644 (*SourceFile).ContentMapperParseOptions
+// ContentMapperParseOptions returns the parse options used to acquire this file from the mapped parse cache.
+// PORT: returns a reference; the zero value is `EMPTY_PARSE_OPTIONS`.
+#[must_use]
+pub fn source_file_content_mapper_parse_options(
+    file: Node,
+) -> &'static crate::frontend::parser::SourceFileParseOptions {
+    source_file_content_mapper_info(file).map_or(&EMPTY_PARSE_OPTIONS, |info| &info.parse_options)
+}
+
+// Go: ast/ast.go:2659 (*SourceFile).DiagnosticDirectives
+#[must_use]
+pub fn source_file_diagnostic_directives(file: Node) -> &'static [MappedDiagnosticDirective] {
+    match source_file_content_mapper_info(file) {
+        Some(info) => &info.diagnostic_directives,
+        None => &[],
+    }
+}
+
+// Go: ast/ast.go:2667 (*SourceFile).SupplementalSourceFiles
+// SupplementalSourceFiles returns the additional outputs produced from this canonical source file.
+// PORT: the files are their SourceFile nodes. `ParsedSourceFile` has the
+// `Rc` form.
+#[must_use]
+pub fn source_file_supplemental_source_files(file: Node) -> &'static [Node] {
+    match source_file_content_mapper_info(file) {
+        Some(info) => &info.supplemental_source_files,
+        None => &[],
+    }
+}
+
+// Go: ast/ast.go:2675 (*SourceFile).CanonicalSourceFile
+// CanonicalSourceFile returns the canonical output associated with this supplemental source file.
+// PORT: the file is its SourceFile node, or `Node::NIL`. `ParsedSourceFile`
+// has the `Rc` form.
+#[must_use]
+pub fn source_file_canonical_source_file(file: Node) -> Node {
+    source_file_content_mapper_info(file).map_or(Node::NIL, |info| info.canonical_source_file)
+}
+
+// Go: ast/ast.go:2683 (*SourceFile).IsContentMapperSupplemental
+// IsContentMapperSupplemental reports whether this is an unnamed supplemental mapper output.
+#[must_use]
+pub fn source_file_is_content_mapper_supplemental(file: Node) -> bool {
+    source_file_canonical_source_file(file).is_some()
+}
+
 // Go: ast.go:2687 (*SourceFile).HasIdentifier
 // PORT: Go `identifiersOnce` is a per-thread cache (`IDENTIFIER_SETS`) for a
 // parsed file, whose id is never reused. A factory SourceFile collects its

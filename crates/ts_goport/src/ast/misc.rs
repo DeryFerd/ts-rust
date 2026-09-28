@@ -206,7 +206,21 @@ impl Diagnostic {
         self.category
     }
 
+    // Go: ast/diagnostic.go:65 Source (tsgo#4712)
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    // Go: ast/diagnostic.go:66 MessageText (tsgo#4712)
+    #[must_use]
+    pub fn message_text(&self) -> &str {
+        &self.message_text
+    }
+
     // Go: ast/diagnostic.go:57 MessageKey
+    // PORT: a diagnostic with the Go nil message (`NIL_MESSAGE`) has the key
+    // "", as in Go.
     #[must_use]
     pub fn message_key(&self) -> &'static str {
         self.message.key()
@@ -280,6 +294,13 @@ impl Diagnostic {
         self.repopulate_info = info;
     }
 
+    // Go: ast/diagnostic.go:82 SetExternalData (tsgo#4712)
+    pub fn set_external_data(&mut self, source: &str, message_text: &str) -> &mut Self {
+        self.source = source.to_string();
+        self.message_text = message_text.to_string();
+        self
+    }
+
     // Go: ast/diagnostic.go:72 SetMessageChain
     // PORT: Go returns the receiver for chaining; this returns `&mut Self`.
     pub fn set_message_chain(&mut self, message_chain: Vec<Diagnostic>) -> &mut Self {
@@ -314,21 +335,109 @@ impl Diagnostic {
     // Go shares the slices between the copies, but no Go caller mutates them
     // in place after cloning, so a deep clone behaves the same.
 
-    // Go: ast/diagnostic.go:101 Localize
+    // Go: ast/diagnostic.go:117 Localize
     // PORT: the port resolves the message when it makes the diagnostic (see
-    // NewDiagnosticFromSerialized below), so the Go `d.messageKey` is never
-    // read and the key is "".
+    // NewDiagnosticFromSerialized below), so the Go `d.messageKey` is read
+    // only for the Go nil message (`NIL_MESSAGE`, key ""), and Go panics
+    // there as it does here.
+    // PORT: Go returns the message text when `d.message == nil`. Go sets the
+    // text only on a diagnostic with a nil message: `NewExternalDiagnostic`
+    // and `SetExternalData` on a serialized diagnostic. A serialized port
+    // diagnostic has its resolved message, so the text alone decides.
     #[must_use]
     pub fn localize(&self, locale: &crate::locale::Locale) -> String {
-        crate::diagnostics_loc::localize(locale, Some(self.message), "", &self.message_args)
+        if !self.message_text.is_empty() {
+            return self.message_text.clone();
+        }
+        let message = (!is_nil_message(self.message)).then_some(self.message);
+        crate::diagnostics_loc::localize(
+            locale,
+            message,
+            self.message_key(),
+            &self.display_message_args(),
+        )
     }
 
-    // Go: ast/diagnostic.go:106 String
+    // Go: ast/diagnostic.go:125 String
     // For debugging only.
+    // PORT: as `localize`, the text alone decides. For the Go nil message
+    // with no text, Go panics on the unknown key ""; this returns "".
     #[must_use]
     pub fn string(&self) -> String {
-        format_message(self.message, &self.message_args)
+        if !self.message_text.is_empty() {
+            return self.message_text.clone();
+        }
+        format_message(self.message, &self.display_message_args())
     }
+
+    // Go: ast/diagnostic.go:134 displayMessageArgs (tsgo#4712)
+    // displayMessageArgs substitutes the original text for a complete alias span when a diagnostic argument
+    // exactly matches the virtual alias. Stored arguments remain unchanged for code fixes and serialization.
+    // PORT: returns the stored arguments borrowed, or a changed copy. Go
+    // slices the texts at any byte; a range that does not fall on char
+    // boundaries here (the port form of a Go string) cannot equal an
+    // argument, so it gives the stored arguments.
+    fn display_message_args(&self) -> std::borrow::Cow<'_, [String]> {
+        use std::borrow::Cow;
+        if self.file.is_nil() || !self.source.is_empty() {
+            return Cow::Borrowed(self.message_args.as_slice());
+        }
+        let (segment, ok) = crate::spanmap::SpanMap::alias_for_virtual_span(
+            source_file_span_map(self.file),
+            self.loc(),
+        );
+        if !ok {
+            return Cow::Borrowed(self.message_args.as_slice());
+        }
+        let virtual_text = source_file_text(self.file);
+        let original_text = source_file_original_text(self.file);
+        if segment.virtual_start < 0
+            || segment.virtual_end > virtual_text.len() as i32
+            || segment.original_start < 0
+            || segment.original_end > original_text.len() as i32
+        {
+            return Cow::Borrowed(self.message_args.as_slice());
+        }
+        let (Some(virtual_name), Some(original_name)) = (
+            virtual_text.get(segment.virtual_start as usize..segment.virtual_end as usize),
+            original_text.get(segment.original_start as usize..segment.original_end as usize),
+        ) else {
+            return Cow::Borrowed(self.message_args.as_slice());
+        };
+        let mut result: Option<Vec<String>> = None;
+        for (i, arg) in self.message_args.iter().enumerate() {
+            if arg != virtual_name {
+                continue;
+            }
+            result.get_or_insert_with(|| self.message_args.clone())[i] = original_name.to_string();
+        }
+        match result {
+            Some(result) => Cow::Owned(result),
+            None => Cow::Borrowed(self.message_args.as_slice()),
+        }
+    }
+}
+
+/// The Go nil `*diagnostics.Message` of a diagnostic: `NewExternalDiagnostic`
+/// makes one (tsgo#4712), and so does `NewDiagnosticFromSerialized` with the
+/// key "" of a serialized external diagnostic.
+// PORT: `core::Diagnostic.message` is `&'static Message`, so the nil message
+// is this empty one. Its key is "" and its code 0; the diagnostic keeps its
+// own code and category.
+pub static NIL_MESSAGE: &ts_diagnostics::Message = &ts_diagnostics::Message::new(
+    0,
+    ts_diagnostics::Category::Error,
+    "",
+    "",
+    false,
+    false,
+    false,
+);
+
+/// True for the Go nil message (`NIL_MESSAGE`).
+#[must_use]
+pub fn is_nil_message(message: &'static ts_diagnostics::Message) -> bool {
+    std::ptr::eq(message, NIL_MESSAGE)
 }
 
 // Go: diagnostics/diagnostics.go:117 Format
@@ -356,10 +465,12 @@ pub fn format_message(message: &'static ts_diagnostics::Message, args: &[String]
     }
 }
 
-// Go: ast/diagnostic.go:110 NewDiagnosticFromSerialized
+// Go: ast/diagnostic.go:166 NewDiagnosticFromSerialized
 // PORT: Go keeps `message` nil and resolves the key lazily in `Localize`
 // (panicking on an unknown key). `core::Diagnostic` needs the message, so it
-// is resolved here with the same panic.
+// is resolved here with the same panic. The key "" of a serialized external
+// diagnostic (tsgo#4712: Go `SetExternalData` gives it its text next) is the
+// Go nil message, and `localize` panics on it without a text, as Go does.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn new_diagnostic_from_serialized(
@@ -379,6 +490,7 @@ pub fn new_diagnostic_from_serialized(
     // also knows the messages that are local to this crate.
     let message = match crate::diag::key_to_message(message_key) {
         Some(message) => message,
+        None if message_key.is_empty() => NIL_MESSAGE,
         None => panic!("Unknown diagnostic message: {message_key}"),
     };
     Diagnostic {
@@ -387,7 +499,9 @@ pub fn new_diagnostic_from_serialized(
         end: loc.end(),
         code,
         category,
+        source: String::new(),
         message,
+        message_text: String::new(),
         message_args,
         message_chain,
         related_information,
@@ -412,7 +526,9 @@ pub fn new_diagnostic(
         end: loc.end(),
         code: message.code() as i32,
         category: message.category(),
+        source: String::new(),
         message,
+        message_text: String::new(),
         message_args: args,
         message_chain: Vec::new(),
         related_information: Vec::new(),
@@ -449,6 +565,41 @@ pub fn new_compiler_diagnostic(
     args: Vec<String>,
 ) -> Diagnostic {
     new_diagnostic(Node::NIL, TextRange::new(-1, -1), message, args)
+}
+
+// Go: ast/diagnostic.go:223 NewExternalDiagnostic (tsgo#4712)
+// NewExternalDiagnostic creates a diagnostic reported by an external source such as a content mapper.
+// The message text is already localized (the external source owns localization) and the code is shown
+// with the given source prefix (e.g. "vue") instead of "TS". The location refers to the file's original,
+// untransformed content.
+// PORT: Go `file *SourceFile` is the SourceFile node (nil is `Node::NIL`).
+// The Go nil message is `NIL_MESSAGE`.
+#[must_use]
+pub fn new_external_diagnostic(
+    file: Node,
+    loc: TextRange,
+    source: &str,
+    category: ts_diagnostics::Category,
+    code: i32,
+    message_text: &str,
+) -> Diagnostic {
+    Diagnostic {
+        file,
+        pos: loc.pos(),
+        end: loc.end(),
+        code,
+        category,
+        source: source.to_string(),
+        message: NIL_MESSAGE,
+        message_text: message_text.to_string(),
+        message_args: Vec::new(),
+        message_chain: Vec::new(),
+        related_information: Vec::new(),
+        reports_unnecessary: false,
+        reports_deprecated: false,
+        skipped_on_no_emit: false,
+        repopulate_info: None,
+    }
 }
 
 /// Go `ast.DiagnosticsCollection`. The mutex is dropped (single thread).
@@ -649,7 +800,7 @@ pub fn equal_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> bool {
             .all(|(a, b)| equal_diagnostics(a, b))
 }
 
-// Go: ast/diagnostic.go:265 EqualDiagnosticsNoRelatedInfo
+// Go: ast/diagnostic.go:381 EqualDiagnosticsNoRelatedInfo
 #[must_use]
 pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bool {
     if std::ptr::eq(d1, d2) {
@@ -659,6 +810,9 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
         && d1.pos() == d2.pos()
         && d1.end() == d2.end()
         && d1.code() == d2.code()
+        // tsgo#4712
+        && d1.category() == d2.category()
+        && d1.source() == d2.source()
         // #4825
         && get_diagnostic_message_identity(d1) == get_diagnostic_message_identity(d2)
         && d1.message_args() == d2.message_args()
@@ -670,12 +824,15 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
             .all(|(a, b)| equal_message_chain(a, b))
 }
 
-// Go: ast/diagnostic.go:395 getDiagnosticMessageIdentity (#4825)
-// PORT: a port diagnostic always has its message (see
+// Go: ast/diagnostic.go:395 getDiagnosticMessageIdentity (#4825, tsgo#4712)
+// PORT: a port diagnostic has its message, or `NIL_MESSAGE` for the Go nil
+// message, whose text and key are both "" (see
 // `new_diagnostic_from_serialized`). Go `message.String()` is the message
-// text. Go also returns `MessageText()` first when it is set (external
-// diagnostics of tsgo#4712), which is not ported yet.
-fn get_diagnostic_message_identity(diagnostic: &Diagnostic) -> &'static str {
+// text.
+fn get_diagnostic_message_identity(diagnostic: &Diagnostic) -> &str {
+    if !diagnostic.message_text().is_empty() {
+        return diagnostic.message_text();
+    }
     if diagnostic.code() == -1 {
         return diagnostic.message.text();
     }
@@ -758,7 +915,7 @@ fn compare_related_info(r1: &[Diagnostic], r2: &[Diagnostic]) -> i32 {
     0
 }
 
-// Go: ast/diagnostic.go:329 CompareDiagnostics
+// Go: ast/diagnostic.go:458 CompareDiagnostics
 #[must_use]
 pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if std::ptr::eq(d1, d2) {
@@ -785,9 +942,19 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if c != 0 {
         return c;
     }
+    // tsgo#4712
+    c = d1.category() as i32 - d2.category() as i32;
+    if c != 0 {
+        return c;
+    }
+    // PORT: sources, keys and message texts are plain UTF-8 (not port
+    // forms: external sources and texts come from JSON, which Go decodes to
+    // valid UTF-8), so the `str` order is the Go byte order.
+    c = ordering_to_int(d1.source().cmp(d2.source()));
+    if c != 0 {
+        return c;
+    }
     // #4825
-    // PORT: keys and message texts are plain UTF-8 (not port forms), so the
-    // `str` order is the Go byte order.
     c = ordering_to_int(
         get_diagnostic_message_identity(d1).cmp(get_diagnostic_message_identity(d2)),
     );

@@ -767,6 +767,49 @@ fn test_diagnostics_collection_gets_diagnostics_for_equivalent_source_file() {
     );
 }
 
+// Go: ast/diagnostic_test.go:80 TestExternalDiagnosticIdentity (tsgo#4712)
+// PORT: Go makes a bare SourceFile with this name and path. Here the file is
+// an empty parse with that name. Go compares each diagnostic with the
+// pointer `first`; here `first` is the entry at index 0.
+#[test]
+fn test_external_diagnostic_identity() {
+    let file_name = "/src/file.vue";
+    let file = parse_source_file(
+        &SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path: Path(file_name.to_string()),
+            ..Default::default()
+        },
+        "",
+        ScriptKind::TS,
+    )
+    .root;
+    let loc = TextRange::new(1, 2);
+    let error = ts_diagnostics::Category::Error;
+    let first = new_external_diagnostic(file, loc, "mapper-a", error, 0, "first");
+    let diagnostics = [
+        first.clone(),
+        new_external_diagnostic(file, loc, "mapper-a", error, 0, "second"),
+        new_external_diagnostic(file, loc, "mapper-b", error, 0, "first"),
+        new_external_diagnostic(
+            file,
+            loc,
+            "mapper-a",
+            ts_diagnostics::Category::Warning,
+            0,
+            "first",
+        ),
+    ];
+
+    let mut collection = DiagnosticsCollection::default();
+    for (i, diagnostic) in diagnostics.iter().enumerate() {
+        assert!(!equal_diagnostics_no_related_info(&first, diagnostic) || i == 0);
+        assert!(compare_diagnostics(&first, diagnostic) != 0 || i == 0);
+        collection.add(diagnostic.clone());
+    }
+    assert_eq!(collection.get_diagnostics().len(), diagnostics.len());
+}
+
 // Go: ast/positionmap_test.go:11 TestPositionMapASCII
 #[test]
 fn test_position_map_ascii() {
