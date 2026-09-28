@@ -459,7 +459,9 @@ impl<P: ProgramView> LanguageService<P> {
         // Span should only be the last component of the path. + 1 to account for the quote character.
         // PORT: Go `strings.LastIndex(..) + 1` is 0 when "/" is absent.
         let index_after_last_slash = specifier.text().rfind('/').map_or(0, |i| i + 1);
-        let start = specifier.pos() + 1 + index_after_last_slash as i32;
+        let start = astnav::get_start_of_node(specifier, source_file, false /*includeJSDoc*/)
+            + 1
+            + index_after_last_slash as i32;
         let length = specifier.text().len() as i32 - index_after_last_slash as i32;
 
         (

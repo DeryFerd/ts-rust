@@ -26,7 +26,12 @@ use crate::emitter::program_emit::{
 };
 use crate::execute::tsc::emit::ProgramLike;
 use crate::frontend::prelude::*;
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// Go `func() time.Time`, the `nestedEmitNow` of `NewProgram` (`sys.Now`).
+pub type NestedEmitNow = Rc<dyn Fn() -> SystemTime>;
 
 // Go: incremental/program.go:20 SignatureUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -38,8 +43,11 @@ pub enum SignatureUpdateKind {
     UsedVersion = 2,
 }
 
-// Go: incremental/program.go:28 Program
-// PORT: Go `host` is nil for a program read from build info.
+// Go: incremental/program.go:31 Program
+// PORT: Go `host` is nil for a program read from build info. Go
+// `nestedEmitMu` guards the nested emit fields; the program is used on one
+// thread, so they are `Cell`s. Go `time.Time` is `Option<SystemTime>`
+// (`None` = zero).
 pub struct Program {
     pub(crate) snapshot: Rc<RefCell<Snapshot>>,
     pub(crate) program: Option<&'static GoProgram>,
@@ -47,6 +55,11 @@ pub struct Program {
 
     // Testing data
     pub(crate) testing_data: Option<RefCell<TestingData>>,
+
+    nested_emit_now: Option<NestedEmitNow>,
+    nested_emit_depth: Cell<i32>,
+    nested_emit_start: Cell<Option<SystemTime>>,
+    nested_emit_time: Cell<Duration>,
 
     // PORT: not in Go. What `start_check` read and started (see there).
     started: RefCell<StartedCheck>,
@@ -68,16 +81,25 @@ struct StartedCheck {
     emit: Option<StartedEmit>,
 }
 
-// Go: incremental/program.go:38 NewProgram
+// Go: incremental/program.go:48 NewProgram
 // PORT: Go `program` is the current program (`prog()`), so it is not a
 // parameter.
 #[must_use]
-pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: bool) -> Program {
+pub fn new_program(
+    old_program: Option<&Program>,
+    host: Rc<dyn Host>,
+    nested_emit_now: Option<NestedEmitNow>,
+    testing: bool,
+) -> Program {
     let mut incremental_program = Program {
         snapshot: program_to_snapshot(old_program, testing),
         program: Some(prog()),
         host: Some(host),
         testing_data: None,
+        nested_emit_now,
+        nested_emit_depth: Cell::new(0),
+        nested_emit_start: Cell::new(None),
+        nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
     };
 
@@ -102,7 +124,7 @@ pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: b
     incremental_program
 }
 
-// Go: incremental/incremental.go:43 ReadBuildInfoProgram
+// Go: incremental/incremental.go:44 ReadBuildInfoProgram
 #[must_use]
 pub fn read_build_info_program(
     config: &ParsedCommandLine,
@@ -125,6 +147,10 @@ pub fn read_build_info_program(
         program: None,
         host: None,
         testing_data: None,
+        nested_emit_now: None,
+        nested_emit_depth: Cell::new(0),
+        nested_emit_start: Cell::new(None),
+        nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
     })
 }
@@ -149,10 +175,46 @@ pub struct TestingData {
 }
 
 impl Program {
-    // Go: incremental/program.go:64 GetTestingData
+    // Go: incremental/program.go:75 GetTestingData
     #[must_use]
     pub fn get_testing_data(&self) -> Option<std::cell::Ref<'_, TestingData>> {
         self.testing_data.as_ref().map(RefCell::borrow)
+    }
+
+    // Go: incremental/program.go:79 beginNestedEmit
+    // PORT: Go returns the `done` func for `defer`; the caller calls the
+    // returned closure when the nested emit ends. A negative Go duration
+    // (the clock went back) is zero here.
+    pub(crate) fn begin_nested_emit(&self) -> impl FnOnce() + '_ {
+        let now = self.nested_emit_now.clone();
+        if let Some(now) = &now {
+            if self.nested_emit_depth.get() == 0 {
+                self.nested_emit_start.set(Some(now()));
+            }
+            self.nested_emit_depth.set(self.nested_emit_depth.get() + 1);
+        }
+
+        move || {
+            let Some(now) = now else {
+                return;
+            };
+            self.nested_emit_depth.set(self.nested_emit_depth.get() - 1);
+            if self.nested_emit_depth.get() == 0 {
+                let start = self
+                    .nested_emit_start
+                    .get()
+                    .expect("beginNestedEmit set the start");
+                let elapsed = now().duration_since(start).unwrap_or_default();
+                self.nested_emit_time
+                    .set(self.nested_emit_time.get() + elapsed);
+            }
+        }
+    }
+
+    // Go: incremental/program.go:102 TakeNestedEmitTime
+    #[must_use]
+    pub fn take_nested_emit_time(&self) -> Duration {
+        self.nested_emit_time.replace(Duration::ZERO)
     }
 
     // PORT: testing. Go `testingData.SemanticDiagnosticsPerFile.Load(path)`,
@@ -855,6 +917,9 @@ pub fn handle_no_emit_on_error(program: &dyn ProgramLike, file: Node) -> Option<
 impl ProgramLike for Program {
     fn options(&self) -> &'static CompilerOptions {
         Program::options(self)
+    }
+    fn as_incremental_program(&self) -> Option<&Program> {
+        Some(self)
     }
     fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         Program::get_bind_diagnostics(self, file)

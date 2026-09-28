@@ -29,7 +29,7 @@ use crate::execute::tsc::diagnostics::{
 };
 use crate::execute::tsc::emit::{EmitInput, emit_files_and_report_errors};
 use crate::execute::watchmanager::{
-    WatchBackend, WatchManager, can_watch_directory, is_dir_covered_by_watch, new_watch_manager,
+    WatchBackend, WatchManager, can_watch_directory, new_dir_watch_set, new_watch_manager,
 };
 use crate::frontend::prelude::*;
 use crate::frontend::vfs::trackingvfs;
@@ -121,7 +121,7 @@ impl CompilerHost for WatchCompilerHost {
     }
 }
 
-// Go: execute/watcher.go:57 Watcher
+// Go: execute/watcher.go:59 Watcher
 // PORT: Go `*tsoptions.ParsedCommandLine` is `Rc<ParsedCommandLine>`. Go
 // `*collections.OrderedMap[string, any]` is
 // `Option<IndexMap<String, CompilerOptionsValue>>` (as in build/host.rs).
@@ -151,12 +151,30 @@ pub struct Watcher {
     wm: Rc<RefCell<WatchManager>>,
     seen_files: FxHashSet<Path>, // all build dependencies (for event filtering)
     config_mtimes: FxHashMap<String, Option<SystemTime>>,
+    watch_set_dirty: bool,
+    // forceFullRebuild records a reason that requires a full NewProgram rebuild
+    // (e.g. an event overflow, a mid-cycle watch failure, a newly appeared
+    // project file, or a changed non-source dependency). Unlike watchSetDirty,
+    // which is only raised to recheck wildcard roots and may be cleared once the
+    // file set is confirmed unchanged, this flag is preserved until a full
+    // rebuild actually runs so the single-file fast path cannot silently reuse a
+    // stale program.
+    force_full_rebuild: bool,
+    program_ready: bool,
+
+    // Test-only observability of which build path was taken.
+    fast_path_builds: i32,
+    full_builds: i32,
 }
 
-// Go: execute/watcher.go:81 `var _ tsc.Watcher = (*Watcher)(nil)`
+// Go: execute/watcher.go:103 `var _ tsc.Watcher = (*Watcher)(nil)`
 impl crate::execute::tsc::Watcher for Watcher {
     fn do_cycle(&mut self) {
         Watcher::do_cycle(self);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -181,7 +199,7 @@ pub(crate) fn test_watch_backend() -> Option<Rc<dyn WatchBackend>> {
     TEST_WATCH_BACKEND.with(|slot| slot.borrow().clone())
 }
 
-// Go: execute/watcher.go:83 createWatcher
+// Go: execute/watcher.go:105 createWatcher
 pub fn create_watcher(
     sys: Rc<dyn System>,
     config_parse_result: Rc<ParsedCommandLine>,
@@ -225,6 +243,11 @@ pub fn create_watcher(
         wm: Rc::new(RefCell::new(wm)),
         seen_files: FxHashSet::default(),
         config_mtimes: FxHashMap::default(),
+        watch_set_dirty: false,
+        force_full_rebuild: false,
+        program_ready: false,
+        fast_path_builds: 0,
+        full_builds: 0,
     };
     if let Some(config_file) = &config_parse_result.config_file {
         w.config_file_name = source_file_file_name(config_file.source_file).to_string();
@@ -233,7 +256,7 @@ pub fn create_watcher(
 }
 
 impl Watcher {
-    // Go: execute/watcher.go:114 (*Watcher).start
+    // Go: execute/watcher.go:136 (*Watcher).start
     pub fn start(&mut self, ctx: &Context) {
         self.wm.borrow().lock();
         let extended_config_cache = Rc::new(TscExtendedConfigCache::default());
@@ -277,6 +300,7 @@ impl Watcher {
             diag::Starting_compilation_in_watch_mode,
             args![],
         ));
+        self.watch_set_dirty = true;
         if self.do_build().is_err() {
             self.wm.borrow().force_overflow();
         }
@@ -289,7 +313,7 @@ impl Watcher {
         }
     }
 
-    // Go: execute/watcher.go:143 (*Watcher).computeDesiredWatches
+    // Go: execute/watcher.go:207 (*Watcher).computeDesiredWatches
     // PORT: Go ranges over `WildcardDirectories()` (a map, random order).
     pub fn compute_desired_watches(&self, seen_file_paths: &[String]) -> FxHashMap<String, bool> {
         let cwd = self.sys.get_current_directory();
@@ -333,18 +357,21 @@ impl Watcher {
 
         // Add parent directories for seen files not covered by existing dir watches.
         // Resolve ancestor fallbacks first so coverage checks use final dirs.
-        let mut resolved_dirs = self.wm.borrow().resolve_desired_dirs(&desired_dirs);
+        let resolved_dirs = self.wm.borrow().resolve_desired_dirs(&desired_dirs);
 
-        let opts = self.compare_paths_options();
+        let mut coverage = new_dir_watch_set(self.compare_paths_options());
+        for (dir, recursive) in &resolved_dirs {
+            coverage.set(dir, *recursive);
+        }
         for file_path in seen_file_paths {
             let dir = get_directory_path(file_path);
-            if !is_dir_covered_by_watch(&resolved_dirs, &dir, &opts) && can_watch_directory(&dir) {
-                resolved_dirs.insert(dir, false);
+            if !coverage.covered(&dir) && can_watch_directory(&dir) {
+                coverage.set(&dir, false);
             }
         }
 
         // Re-resolve in case newly added dirs don't exist
-        self.wm.borrow().resolve_desired_dirs(&resolved_dirs)
+        self.wm.borrow().resolve_desired_dirs(coverage.dirs())
     }
 
     // Go: execute/watcher.go:201 (*Watcher).reconcileWatches
@@ -361,7 +388,7 @@ impl Watcher {
         }
     }
 
-    // Go: execute/watcher.go:213 (*Watcher).DoCycle
+    // Go: execute/watcher.go:278 (*Watcher).DoCycle
     // PORT: Go unlocks with `defer`; the port unlocks before each return.
     pub fn do_cycle(&mut self) {
         self.wm.borrow().lock();
@@ -378,6 +405,40 @@ impl Watcher {
             // Filter fswatch events against known dependencies
             if self.is_relevant_change(&changed_paths) {
                 self.evict_changed_source_files(&changed_paths);
+                let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
+                let cwd = self.sys.get_current_directory();
+                let program_files = self.get_program().files_by_path();
+                // PORT: Go ranges over a map (random order). Only flags are set.
+                for event_path in changed_paths.keys() {
+                    if self.sys.fs().directory_exists(event_path) {
+                        // A watched directory changed: the wildcard file set may have
+                        // changed, so reload file names on the next build.
+                        self.watch_set_dirty = true;
+                        continue;
+                    }
+                    let p = to_path(event_path, &cwd, case_sensitive);
+                    if self.config.config_file.is_some()
+                        && self.config.possibly_matches_file_name(event_path)
+                    {
+                        if !self.seen_files.contains(&p) {
+                            // A file that matches the project but was not previously
+                            // seen appeared: a structural change that requires a full
+                            // rebuild, not the single-file fast path.
+                            self.watch_set_dirty = true;
+                            self.force_full_rebuild = true;
+                            continue;
+                        }
+                    }
+                    if !program_files.contains_key(&p) && self.seen_files.contains(&p) {
+                        // A non-source build dependency changed. Such dependencies
+                        // (e.g. package.json or a previously-missing module path) are
+                        // tracked in seenFiles but are not program source files, so a
+                        // missing sourceFileCache entry would not account for them.
+                        // Module resolution may now differ, so the single-file fast
+                        // path is unsafe; force a full rebuild.
+                        self.force_full_rebuild = true;
+                    }
+                }
             } else {
                 if let Some(debug_log) = &self.wm.borrow().debug_log {
                     write_str(
@@ -393,8 +454,14 @@ impl Watcher {
                 return;
             }
         } else if overflow {
-            // Overflow: evict the entire source file cache to force re-build
+            // Overflow: evict the entire source file cache and force a full rebuild.
+            // The fast path must not run here: after clearing the cache a one-file
+            // program would present exactly one cache miss and be misread as a
+            // single-file content edit, silently reusing a stale (e.g. unresolved
+            // import) program instead of rediscovering the file graph.
             self.source_file_cache = Rc::new(RefCell::new(FxHashMap::default()));
+            self.watch_set_dirty = true;
+            self.force_full_rebuild = true;
         } else if !has_events && !self.config_modified {
             // No events and no config change
             if let Some(debug_log) = &self.wm.borrow().debug_log {
@@ -449,10 +516,93 @@ impl Watcher {
         false
     }
 
-    // Go: execute/watcher.go:282 (*Watcher).doBuild
+    // Go: execute/watcher.go:408 (*Watcher).doBuild
     pub fn do_build(&mut self) -> Result<(), GoError> {
         if self.config_modified {
             self.source_file_cache = Rc::new(RefCell::new(FxHashMap::default()));
+            self.watch_set_dirty = true;
+        }
+
+        let mut reloaded_file_names = false;
+        if self.watch_set_dirty {
+            if self.config.config_file.is_some() && !self.config.wildcard_directories().is_empty() {
+                let new_config = Rc::new(
+                    self.config
+                        .reload_file_names_of_parsed_command_line(&*self.sys.fs()),
+                );
+                reloaded_file_names = true;
+                if self.config.file_names() != new_config.file_names() {
+                    self.config = new_config;
+                } else {
+                    self.watch_set_dirty = false;
+                    self.config = new_config;
+                }
+            } else if !self.config_modified {
+                self.watch_set_dirty = false;
+            }
+        }
+
+        if self.program.is_some()
+            && self.program_ready
+            && !self.config_modified
+            && !self.watch_set_dirty
+            && !self.force_full_rebuild
+        {
+            let cached = cachedvfs_from(self.sys.fs());
+            let inner_host = new_compiler_host(
+                &self.sys.get_current_directory(),
+                cached.clone() as Rc<dyn Fs>,
+                &self.sys.default_library_path(),
+                self.extended_config_cache
+                    .clone()
+                    .map(|cache| cache as Rc<dyn ExtendedConfigCache>),
+                Some(get_trace_from_sys(
+                    &*self.sys,
+                    self.config.locale(),
+                    self.testing.clone(),
+                )),
+            );
+            let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
+                compiler_host: inner_host,
+                cache: self.source_file_cache.clone(),
+            });
+
+            if self.try_update_program(&host) {
+                self.fast_path_builds += 1;
+                // PORT: the reused program's version is current for the build,
+                // as in the full build below.
+                let _program =
+                    crate::core::enter_program(self.program.as_ref().and_then(|p| p.program));
+                let result = self.compile_and_emit();
+                cached.disable_and_clear_cache();
+
+                self.config_mtimes = FxHashMap::with_capacity_and_hasher(
+                    self.config_file_paths.len(),
+                    Default::default(),
+                );
+                for cfg_path in &self.config_file_paths {
+                    if let Some(s) = self.sys.fs().stat(cfg_path) {
+                        self.config_mtimes.insert(cfg_path.clone(), s.mod_time());
+                    }
+                }
+                self.config_modified = false;
+
+                let error_count = result.diagnostics.len();
+                if error_count == 1 {
+                    (self.report_watch_status)(&new_compiler_diagnostic(
+                        diag::Found_1_error_Watching_for_file_changes,
+                        args![],
+                    ));
+                } else {
+                    (self.report_watch_status)(&new_compiler_diagnostic(
+                        diag::Found_0_errors_Watching_for_file_changes,
+                        args![error_count],
+                    ));
+                }
+                self.on_program();
+                return Ok(());
+            }
+            cached.disable_and_clear_cache();
         }
 
         let cached = cachedvfs_from(self.sys.fs());
@@ -479,11 +629,13 @@ impl Watcher {
         });
 
         if self.config.config_file.is_some() {
-            let wildcard_dirs = self.config.wildcard_directories().clone();
-            for dir in wildcard_dirs.keys() {
+            for dir in self.config.wildcard_directories().keys() {
                 tfs.seen_files.borrow_mut().insert(dir.clone());
             }
-            if !wildcard_dirs.is_empty() {
+            if !reloaded_file_names
+                && !self.watch_set_dirty
+                && !self.config.wildcard_directories().is_empty()
+            {
                 self.config = Rc::new(
                     self.config
                         .reload_file_names_of_parsed_command_line(&*self.sys.fs()),
@@ -501,6 +653,7 @@ impl Watcher {
         let mut program = incremental::program::new_program(
             self.program.as_ref(),
             incremental::incremental::create_host(host),
+            Some(self.sys_now()),
             self.testing.is_some(),
         );
         // PORT: Go passes a nil incremental host. The Rust `new_program`
@@ -512,6 +665,8 @@ impl Watcher {
         if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
             crate::program::release_program(old);
         }
+        self.program_ready = true;
+        self.full_builds += 1;
 
         let result = self.compile_and_emit();
         cached.disable_and_clear_cache();
@@ -536,7 +691,9 @@ impl Watcher {
             write_str(&self.sys.writer(), &format!("{}\n", err.error()));
             return Err(err);
         }
+        self.watch_set_dirty = false;
         self.config_modified = false;
+        self.force_full_rebuild = false;
 
         // PORT: Go `w.program.GetProgram().FilesByPath()`. `FilesByPath` is on
         // the frontend program of the current program version.
@@ -564,6 +721,101 @@ impl Watcher {
         Ok(())
     }
 
+    // Go: execute/watcher.go:536 (*Watcher).tryUpdateProgram
+    // PORT: Go `w.program.GetProgram()` is `get_program`. The parses and the
+    // reuse run with no current program, as `program::update_program_version`
+    // does. A reused program gets a new program version that shares the
+    // unchanged frontend data of the old one; the old version is released as
+    // in `do_build`.
+    fn try_update_program(&mut self, host: &Rc<dyn CompilerHost>) -> bool {
+        let old_version = self
+            .program
+            .as_ref()
+            .and_then(|program| program.program)
+            .expect("the watch program has a program");
+        let old_program = self.get_program();
+
+        let mut changed_path: Option<&Path> = None;
+        let mut changed_count = 0;
+        // PORT: Go ranges over a map (random order); at most one path is kept.
+        for path in old_program.files_by_path().keys() {
+            if !self.source_file_cache.borrow().contains_key(path) {
+                changed_path = Some(path);
+                changed_count += 1;
+                if changed_count > 1 {
+                    return false;
+                }
+            }
+        }
+        let Some(changed_path) = changed_path else {
+            return false;
+        };
+
+        if let Some(old_file) = old_program.files_by_path().get(changed_path) {
+            if let Some(new_file) = host.get_source_file(old_file.parse_options()) {
+                if !equal_jsx_implicit_import(old_program.options(), old_file, &new_file) {
+                    return false;
+                }
+            }
+        }
+
+        // PORT: `reuse_program` is Go `Program.ReuseProgram` (tsgo#4399, the
+        // program part). The Rust frontend program has no checker pool, so
+        // Go's `createCheckerPool` argument (nil here) is dropped, as in
+        // `update_program`.
+        let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
+        if reused {
+            let np: &'static NewProgram = Box::leak(Box::new(
+                new_program.expect("ReuseProgram returns the reused program"),
+            ));
+            let version = crate::program::new_program_version(np, Some(old_version));
+            let _program = crate::core::enter_program(Some(version));
+            let mut program = incremental::program::new_program(
+                self.program.as_ref(),
+                incremental::incremental::create_host(host.clone()),
+                Some(self.sys_now()),
+                self.testing.is_some(),
+            );
+            // PORT: Go passes a nil incremental host (see `do_build`).
+            program.host = None;
+            if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
+                crate::program::release_program(old);
+            }
+        }
+        reused
+    }
+
+    // Go: execute/watcher.go:575 (*Watcher).FastPathBuilds
+    /// FastPathBuilds reports how many builds reused an existing program via the
+    /// UpdateProgram single-file fast path. It is intended for tests that need to
+    /// verify which build path was taken.
+    pub fn fast_path_builds(&self) -> i32 {
+        self.fast_path_builds
+    }
+
+    // Go: execute/watcher.go:579 (*Watcher).FullBuilds
+    /// FullBuilds reports how many builds constructed a full program via NewProgram.
+    /// It is intended for tests that need to verify which build path was taken.
+    pub fn full_builds(&self) -> i32 {
+        self.full_builds
+    }
+
+    /// Go `w.program.GetProgram()`: the frontend program of the watch
+    /// program's version.
+    // PORT: Go `GetProgram` returns the `*compiler.Program`. Its frontend
+    // part (`FilesByPath`, `ReuseProgram`) is the `NewProgram` of the version.
+    fn get_program(&self) -> &'static NewProgram {
+        let version = self.program.as_ref().and_then(|program| program.program);
+        let _program = crate::core::enter_program(version);
+        crate::program::go_frontend_program().expect("the watch build made a Go frontend program")
+    }
+
+    /// Go `w.sys.Now`, the method value.
+    fn sys_now(&self) -> incremental::program::NestedEmitNow {
+        let sys = self.sys.clone();
+        Rc::new(move || sys.now())
+    }
+
     /// Go `if w.testing != nil { w.testing.OnProgram(w.program) }`.
     // PORT: the test reads the program's files, so its version is current
     // for the call.
@@ -575,7 +827,7 @@ impl Watcher {
         testing.on_program(program);
     }
 
-    // Go: execute/watcher.go:356 (*Watcher).evictChangedSourceFiles
+    // Go: execute/watcher.go:593 (*Watcher).evictChangedSourceFiles
     pub fn evict_changed_source_files(
         &self,
         changed_paths: &FxHashMap<String, fswatch::EventKind>,
@@ -697,4 +949,35 @@ impl Watcher {
         self.extended_config_cache = Some(extended_config_cache);
         config_parse_result.map(Rc::new)
     }
+}
+
+// Go: execute/watcher.go:581 equalJSXImplicitImport
+// PORT: the files are frontend `ParsedSourceFile`s (the new one is not
+// published), so the base comes from the file loader's
+// `get_jsx_implicit_import_base_of_file`, Go `ast.GetJSXImplicitImportBase`
+// on the parser's pragmas.
+fn equal_jsx_implicit_import(
+    options: &CompilerOptions,
+    old_file: &ParsedSourceFile,
+    new_file: &ParsedSourceFile,
+) -> bool {
+    let is_jsx = |file: &ParsedSourceFile| {
+        file.script_kind == ScriptKind::JSX || file.script_kind == ScriptKind::TSX
+    };
+    if !is_jsx(old_file) && !is_jsx(new_file) {
+        return true;
+    }
+    let old_import = crate::ast::get_jsx_runtime_import(
+        &crate::frontend::compiler::file_loader::get_jsx_implicit_import_base_of_file(
+            options, old_file,
+        ),
+        options,
+    );
+    let new_import = crate::ast::get_jsx_runtime_import(
+        &crate::frontend::compiler::file_loader::get_jsx_implicit_import_base_of_file(
+            options, new_file,
+        ),
+        options,
+    );
+    old_import == new_import
 }

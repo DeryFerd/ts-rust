@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ts_goport::execute::watchmanager::{WatchBackend, WatchDirectoryRequest};
+use ts_goport::frontend::tspath;
 use ts_goport::fswatch::{self, Event, EventKind};
 use ts_goport::gostd::{GoError, errors};
 
 use crate::support::fsbaselineutil::FileChange;
 
-// Go: mock_watch_backend.go:21 MockWatchBackend
+// Go: mock_watch_backend.go:22 MockWatchBackend
 /// MockWatchBackend implements watchmanager.WatchBackend for testing. It
 /// records all WatchDirectory calls so tests can verify that
 /// the correct watches are registered.  Events can be delivered through
@@ -31,15 +32,17 @@ pub struct MockWatchBackend {
     pub dirs: Mutex<BTreeMap<String, Arc<MockWatch>>>,
     /// if set, WatchDirectory fails for non-existent dirs
     pub directory_exists: Option<Box<dyn Fn(&str) -> bool>>,
+    pub use_case_sensitive_file_names: bool,
 }
 
 impl MockWatchBackend {
-    // Go: mock_watch_backend.go:30 NewMockWatchBackend
+    // Go: mock_watch_backend.go:32 NewMockWatchBackend
     /// NewMockWatchBackend creates a ready-to-use mock backend.
     pub fn new() -> MockWatchBackend {
         MockWatchBackend {
             dirs: Mutex::new(BTreeMap::new()),
             directory_exists: None,
+            use_case_sensitive_file_names: false,
         }
     }
 
@@ -142,7 +145,7 @@ impl WatchBackend for MockWatchBackend {
 }
 
 impl MockWatchBackend {
-    // Go: mock_watch_backend.go:93 MockWatchBackend.SendEvents
+    // Go: mock_watch_backend.go:95 MockWatchBackend.SendEvents
     /// SendEvents routes events through the registered watch callbacks
     /// that match each event's path. Directory watches match if the event
     /// path is a child (or recursive descendant) of the watched directory.
@@ -170,7 +173,12 @@ impl MockWatchBackend {
                             continue;
                         }
                     }
-                    if !path_is_under(&e.path, &w.path, w.recursive) {
+                    if !path_is_under(
+                        &e.path,
+                        &w.path,
+                        w.recursive,
+                        self.use_case_sensitive_file_names,
+                    ) {
                         continue;
                     }
                     match targets.iter_mut().find(|(t, _)| Arc::ptr_eq(t, w)) {
@@ -184,6 +192,26 @@ impl MockWatchBackend {
 
         for (w, events) in targets {
             (w.callback)(events, None);
+        }
+    }
+
+    // Go: mock_watch_backend.go:134 MockWatchBackend.SendOverflow
+    /// SendOverflow simulates a kernel event-queue overflow by invoking every
+    /// active watch callback with fswatch.ErrOverflow. The watch manager treats
+    /// this as a signal that events were dropped and a full rebuild is required.
+    ///
+    /// PORT: Go ranges over the `Dirs` map (random order); the port visits
+    /// the watches in path order.
+    pub fn send_overflow(&self) {
+        let cbs: Vec<fswatch::WatchCallback> = {
+            let dirs = self.dirs.lock().unwrap();
+            dirs.values()
+                .filter(|w| !w.is_closed())
+                .map(|w| w.callback.clone())
+                .collect()
+        };
+        for cb in cbs {
+            cb(Vec::new(), Some(fswatch::ERR_OVERFLOW.clone()));
         }
     }
 
@@ -228,11 +256,24 @@ impl MockWatchBackend {
     }
 }
 
-// Go: mock_watch_backend.go:165 pathIsUnder
+// Go: mock_watch_backend.go:184 pathIsUnder
 /// pathIsUnder reports whether eventPath is inside dir. If recursive is
 /// false, only direct children match.
-fn path_is_under(event_path: &str, dir: &str, recursive: bool) -> bool {
-    let Some(rest) = event_path.strip_prefix(dir) else {
+fn path_is_under(
+    event_path: &str,
+    dir: &str,
+    recursive: bool,
+    use_case_sensitive_file_names: bool,
+) -> bool {
+    let (event_path, dir) = if use_case_sensitive_file_names {
+        (event_path.to_string(), dir.to_string())
+    } else {
+        (
+            tspath::get_canonical_file_name(event_path, false),
+            tspath::get_canonical_file_name(dir, false),
+        )
+    };
+    let Some(rest) = event_path.strip_prefix(dir.as_str()) else {
         return false;
     };
     if rest.is_empty() {

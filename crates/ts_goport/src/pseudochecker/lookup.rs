@@ -153,7 +153,7 @@ impl PseudoChecker {
             return new_pseudo_type_direct(t);
         }
         let init = declaration.initializer();
-        if init.is_some() {
+        if init.is_some() && declaration.symbol().is_some() {
             let declarations = &symbols.sym(declaration.symbol()).declarations;
             if declarations.len() == 1
                 || declarations

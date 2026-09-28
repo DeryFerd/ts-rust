@@ -70,8 +70,8 @@ pub const HEADER_OFFSET_STRUCTURED_DATA: usize = 36;
 pub const HEADER_OFFSET_NODES: usize = 40;
 pub const HEADER_SIZE: usize = 44;
 
-// Go: api/encoder/encoder.go:64 ProtocolVersion
-pub const PROTOCOL_VERSION: u8 = 5;
+// Go: api/encoder/encoder.go:66 ProtocolVersion
+pub const PROTOCOL_VERSION: u8 = 7;
 
 // Source File Binary Format
 // =========================
@@ -156,6 +156,13 @@ pub const PROTOCOL_VERSION: u8 = 5;
 // | 36-40       | uint32 | Byte offset of `moduleAugmentations` node index array         |
 // | 40-44       | uint32 | Byte offset of `ambientModuleNames` string array              |
 // | 44-48       | uint32 | Node index of `externalModuleIndicator` (0 = nil)             |
+// | 48-52       | uint32 | Index of `originalText` in the string offsets section         |
+// | 52-56       | uint32 | Byte offset of `spanMap` in structured data                    |
+// | 56-60       | uint32 | Byte offset of `supplementalSourceFileNames` in structured data |
+// | 60-64       | uint32 | Index of `canonicalSourceFileName`, or noStructuredData         |
+// | 64-68       | uint32 | Index of `contentMapper`, or noStructuredData                   |
+// | 68-72       | uint32 | Index of `virtualFileName`, or noStructuredData                 |
+// | 72-76       | uint32 | Byte offset of `diagnosticDirectives` in structured data       |
 //
 // Structured data (variable)
 // --------------------------
@@ -168,6 +175,14 @@ pub const PROTOCOL_VERSION: u8 = 5;
 // Node index arrays (imports, moduleAugmentations) are msgpack arrays of uint values, where each
 // value is a node index into the nodes section. String arrays (ambientModuleNames) are msgpack
 // arrays of string values.
+//
+// Span maps are msgpack arrays of tuples in UTF-16 coordinates:
+//
+//   [virtualStart: uint, virtualLength: uint, originalStart: uint, originalLength: uint, kind: uint, features?: uint]
+//
+// Diagnostic directives are msgpack arrays of normalized tuples in UTF-16 coordinates:
+//
+//   [originalStart: uint, originalLength: uint, virtualStart: uint, virtualLength: uint, policy: uint, unusedCode: uint]
 //
 // An offset of 0xFFFFFFFF indicates no data (empty array).
 //
@@ -1023,10 +1038,10 @@ pub fn get_node_data(
     }
 }
 
-// Go: api/encoder/encoder.go:642 noStructuredData
+// Go: api/encoder/encoder.go:659 noStructuredData
 const NO_STRUCTURED_DATA: u32 = 0xFFFFFFFF;
 
-// Go: api/encoder/encoder.go:644 recordExtendedData_SourceFile
+// Go: api/encoder/encoder.go:661 recordExtendedData_SourceFile
 pub fn record_extended_data_source_file(
     node: Node,
     strs: &mut StringTable,
@@ -1037,6 +1052,14 @@ pub fn record_extended_data_source_file(
     let sf = node;
     let fields = source_file_fields(sf);
     let text_index = strs.add(source_file_text(sf), sf.kind(), sf.pos(), sf.end());
+    // PORT: ts_goport source files have no content mapper info yet (the rest
+    // of tsgo#4712 is wave 3). Every file takes the Go path for a file without
+    // it: `OriginalText()` is `Text()`, so `originalTextIndex` is `textIndex`,
+    // and `SpanMap()`, `SupplementalSourceFiles()`, `CanonicalSourceFile()`,
+    // `ContentMapper()`, `VirtualFileName()` and `DiagnosticDirectives()` are
+    // empty, so their fields are `noStructuredData`. Go `encodeSpanMap` and
+    // `encodeDiagnosticDirectives` come with that wave.
+    let original_text_index = text_index;
     let file_name_index = strs.add(source_file_file_name(sf), SyntaxKind::Unknown, 0, 0);
     let path_index = strs.add(fields.path(), SyntaxKind::Unknown, 0, 0);
     let referenced_files_offset =
@@ -1068,6 +1091,13 @@ pub fn record_extended_data_source_file(
             NO_STRUCTURED_DATA,
             NO_STRUCTURED_DATA,
             0,
+            original_text_index,
+            NO_STRUCTURED_DATA, // spanMap
+            NO_STRUCTURED_DATA, // supplementalSourceFileNames
+            NO_STRUCTURED_DATA, // canonicalSourceFileName
+            NO_STRUCTURED_DATA, // contentMapper
+            NO_STRUCTURED_DATA, // virtualFileName
+            NO_STRUCTURED_DATA, // diagnosticDirectives
         ],
     );
 }

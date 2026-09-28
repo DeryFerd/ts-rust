@@ -375,7 +375,9 @@ pub fn new_diagnostic_from_serialized(
     reports_deprecated: bool,
     skipped_on_no_emit: bool,
 ) -> Diagnostic {
-    let message = match ts_diagnostics::message_by_key(message_key) {
+    // Go `Localize` resolves the key with the generated `keyToMessage`, which
+    // also knows the messages that are local to this crate.
+    let message = match crate::diag::key_to_message(message_key) {
         Some(message) => message,
         None => panic!("Unknown diagnostic message: {message_key}"),
     };
@@ -452,6 +454,10 @@ pub fn new_compiler_diagnostic(
 /// Go `ast.DiagnosticsCollection`. The mutex is dropped (single thread).
 /// PORT: `file_diagnostics` is an `IndexMap` so `get_diagnostics` sees a
 /// deterministic order before its sort. Go map order is random there.
+/// Go keys the file lists by `file.Path()` (tsgo#4901), so a replaced
+/// SourceFile of the same path shares its list. Here the key is the file
+/// name, which callers pass: one program has one file name per path, so the
+/// lists are the same.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsCollection {
     pub count: i32,

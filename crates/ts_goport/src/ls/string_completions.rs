@@ -164,7 +164,7 @@ impl LanguageService {
                 has_unresolved_auto_imports: false,
                 default_commit_characters: None,
             };
-            let (_, mut items) = self.get_completion_entries_from_symbols(
+            let (_, mut items) = match self.get_completion_entries_from_symbols(
                 ctx,
                 type_checker,
                 &data,
@@ -173,7 +173,10 @@ impl LanguageService {
                 file,
                 options,
                 include_symbols, /*includeSymbols*/
-            );
+            ) {
+                Ok(result) => result,
+                Err(err) => panic!("{}", err.error()),
+            };
             let default_commit_characters =
                 get_default_commit_characters(completion.has_index_signature);
             let item_defaults = self.set_item_defaults(
@@ -227,6 +230,7 @@ impl LanguageService {
                         false, /*preselect*/
                         "",    /*source*/
                         None,  /*autoImportEntryData*/
+                        None,  /*additionalTextEdits*/
                         None,  /*detail*/
                     );
                     CompletionItem {
@@ -303,6 +307,7 @@ impl LanguageService {
                     false, /*preselect*/
                     "",    /*source*/
                     None,  /*autoImportEntryData*/
+                    None,  /*additionalTextEdits*/
                     Some(detail),
                 );
                 CompletionItem {

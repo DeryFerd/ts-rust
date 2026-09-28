@@ -451,7 +451,7 @@ pub fn quote(file: Node, preferences: &lsutil::UserPreferences, text: &str) -> S
         crate::frontend::json::json_marshal_indent(text, "" /*prefix*/, "" /*indent*/)
             .unwrap_or_default();
     if quote_preference == lsutil::QuotePreference::SINGLE {
-        quoted = quote_replacer_replace(&strip_quotes(&quoted));
+        quoted = "'".to_string() + &quote_replacer_replace(&strip_quotes(&quoted)) + "'";
     }
     quoted
 }

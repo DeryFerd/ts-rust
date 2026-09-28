@@ -31,7 +31,7 @@ static ISOLATED_DECLARATIONS_FIX_ERROR_CODES: LazyLock<Vec<i32>> = LazyLock::new
         diag::Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations.code() as i32,
         diag::Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations.code() as i32,
         diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations.code() as i32,
-        diag::Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations.code() as i32,
+        diag::Binding_elements_with_initializers_can_t_be_exported_directly_with_isolatedDeclarations.code() as i32,
         diag::Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations.code() as i32,
         diag::Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedDeclarations.code() as i32,
         diag::Enum_member_initializers_must_be_computable_without_references_to_external_symbols_with_isolatedDeclarations.code() as i32,

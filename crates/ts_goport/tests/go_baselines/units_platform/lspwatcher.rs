@@ -783,3 +783,55 @@ fn test_watcher_watch_terminated_does_not_drop_events() {
         "events with watch-terminated error",
     );
 }
+
+// Go: lspwatcher_test.go:807 blockingBackend
+/// PORT: the Rust watcher lives on one thread, so Go's two goroutines
+/// (`WatchFiles` waits in `WatchDirectory` while the test calls `Close`)
+/// are one call chain here: `watch_directory` closes the watcher at the
+/// point where Go's backend waits for `release`.
+struct BlockingBackend {
+    watcher: Rc<RefCell<Option<Rc<Watcher>>>>,
+}
+
+impl WatcherBackend for BlockingBackend {
+    // Go: lspwatcher_test.go:812 blockingBackend.WatchDirectory
+    fn watch_directory(
+        &self,
+        _dir: &str,
+        _fn: LocalWatchCallback,
+        _opts: &[Box<dyn fswatch::WatchOption>],
+    ) -> Result<Box<dyn fswatch::Watch>, GoError> {
+        // Go: close(b.entered); <-b.release, while the test calls w.Close().
+        let watcher = self.watcher.borrow().clone();
+        if let Some(w) = watcher {
+            w.close();
+        }
+        // Go: fakeWatch{closeFn: func() error { return nil }}
+        Ok(Box::new(FakeWatch {
+            dir: String::new(),
+            closes: Arc::new(Mutex::new(Vec::new())),
+        }))
+    }
+}
+
+// Go: lspwatcher_test.go:822 TestWatcher_CloseWhileWatchFilesReconciles
+#[test]
+fn test_watcher_close_while_watch_files_reconciles() {
+    let (_guard, dir) = temp_dir();
+    let pattern = format!("{}/**/*", tspath::normalize_slashes(&dir));
+    let watcher: Rc<RefCell<Option<Rc<Watcher>>>> = Rc::new(RefCell::new(None));
+    let backend = BlockingBackend {
+        watcher: watcher.clone(),
+    };
+    let w = new_with_backend(wrapped_os_fs(), Box::new(backend), Box::new(|_| {}), None);
+    *watcher.borrow_mut() = Some(w.clone());
+
+    let done = w.watch_files("id", &[fsw(&pattern, None)]);
+    // PORT: break the watcher/backend cycle.
+    *watcher.borrow_mut() = None;
+
+    assert!(
+        done.is_err(),
+        "expected WatchFiles to report that the watcher was closed"
+    );
+}

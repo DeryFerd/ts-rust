@@ -954,18 +954,43 @@ impl<P: ProgramView> LanguageService<P> {
         let mut implementation_entries: Vec<Rc<RefCell<SymbolAndEntries>>> = Vec::new();
         let mut queue: VecDeque<Rc<RefCell<ReferenceEntry>>> = VecDeque::new();
         let mut seen_nodes: FxHashSet<Node> = FxHashSet::default();
+        let mut seen_definitions: FxHashSet<SymbolId> = FxHashSet::default();
         // Go: addToQueue
+        // PORT: the Go closure captures the locals; here they are parameters.
         let add_to_queue =
             |implementation_entries: &mut Vec<Rc<RefCell<SymbolAndEntries>>>,
              queue: &mut VecDeque<Rc<RefCell<ReferenceEntry>>>,
+             seen_nodes: &mut FxHashSet<Node>,
+             seen_definitions: &mut FxHashSet<SymbolId>,
              symbol_and_entries: Vec<Rc<RefCell<SymbolAndEntries>>>| {
-                implementation_entries.extend(symbol_and_entries.iter().cloned());
                 for s in &symbol_and_entries {
-                    queue.extend(s.borrow().references.iter().cloned());
+                    let s = s.borrow();
+                    let mut new_references: Vec<Rc<RefCell<ReferenceEntry>>> = Vec::new();
+                    for ref_ in &s.references {
+                        if seen_nodes.insert(ref_.borrow().node) {
+                            queue.push_back(ref_.clone());
+                            new_references.push(ref_.clone());
+                        }
+                    }
+                    if !new_references.is_empty()
+                        || s.definition.is_none()
+                        || seen_definitions.insert(s.definition.as_ref().unwrap().symbol)
+                    {
+                        implementation_entries.push(Rc::new(RefCell::new(SymbolAndEntries {
+                            definition: s.definition.clone(),
+                            references: new_references,
+                        })));
+                    }
                 }
             };
 
-        add_to_queue(&mut implementation_entries, &mut queue, entries);
+        add_to_queue(
+            &mut implementation_entries,
+            &mut queue,
+            &mut seen_nodes,
+            &mut seen_definitions,
+            entries,
+        );
         while let Some(entry) = queue.front().cloned() {
             if ctx.err().is_some() {
                 return (SymbolAndEntriesData::default(), false);
@@ -973,8 +998,7 @@ impl<P: ProgramView> LanguageService<P> {
 
             queue.pop_front();
             let entry_node = entry.borrow().node;
-            if entry_node.is_some() && !seen_nodes.contains(&entry_node) {
-                seen_nodes.insert(entry_node);
+            if entry_node.is_some() {
                 let found = self.get_symbol_and_entries(
                     ctx,
                     entry_node.pos(),
@@ -983,7 +1007,13 @@ impl<P: ProgramView> LanguageService<P> {
                     is_rename,
                     implementations,
                 );
-                add_to_queue(&mut implementation_entries, &mut queue, found);
+                add_to_queue(
+                    &mut implementation_entries,
+                    &mut queue,
+                    &mut seen_nodes,
+                    &mut seen_definitions,
+                    found,
+                );
             }
         }
         (

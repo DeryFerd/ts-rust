@@ -257,14 +257,31 @@ impl<'a> RegExpParser<'a> {
     // Go: scanner/regexp.go:155 scanDisjunction
     // Disjunction ::= Alternative ('|' Alternative)*
     fn scan_disjunction(&mut self, is_in_group: bool) {
+        // Names defined by any of this disjunction's alternatives. Since exactly one
+        // alternative is chosen at runtime, these names are unioned together (rather
+        // than intersected) and, when this disjunction is nested inside a group,
+        // bubbled up into the enclosing alternative's scope once the group closes.
+        // This ensures a name defined inside a nested group (e.g. `(?:(?<a>x))`) is
+        // still visible to a duplicate check for a sibling group later in the same
+        // enclosing alternative (e.g. `(?:(?<a>x))(?<a>z)`).
+        let mut disjunction_names: FxHashSet<String> = FxHashSet::default();
         loop {
             self.named_capturing_groups.push(FxHashMap::default());
             self.scan_alternative(is_in_group);
-            self.named_capturing_groups.pop();
+            let alternative_names = self
+                .named_capturing_groups
+                .pop()
+                .expect("scan_disjunction pushed a scope");
+            disjunction_names.extend(alternative_names.into_keys());
             if self.char() != '|' as i32 {
-                return;
+                break;
             }
             self.inc_pos(1);
+        }
+        if is_in_group && let Some(parent_scope) = self.named_capturing_groups.last_mut() {
+            for name in disjunction_names {
+                parent_scope.insert(name, true);
+            }
         }
     }
 
@@ -382,6 +399,18 @@ impl<'a> RegExpParser<'a> {
                                             vec![],
                                         );
                                     }
+                                }
+                                // Modifier characters were consumed, so this is `(?flags:` rather than a plain `(?:` group.
+                                if self.pos() != flags_start
+                                    && self.scanner.language_version() < ScriptTarget::ES2025
+                                {
+                                    let len = self.pos() - flags_start;
+                                    self.error(
+                                        diag::Regular_expression_pattern_modifiers_are_only_available_when_targeting_0_or_later,
+                                        flags_start,
+                                        len,
+                                        args![ScriptTarget::ES2025.string().to_lowercase()],
+                                    );
                                 }
                                 self.scan_expected_char(':' as i32);
                                 is_previous_term_quantifiable = true;
@@ -553,9 +582,9 @@ impl<'a> RegExpParser<'a> {
                     );
                 }
                 Some(flag) => {
+                    // Modifier syntax itself requires ES2025, which is later than any flag that can appear
+                    // here, so the group's own diagnostic already covers availability.
                     curr_flags |= flag;
-                    self.scanner
-                        .check_regular_expression_flag_availability(flag, pos, size);
                 }
             }
             self.inc_pos(size);
@@ -732,6 +761,24 @@ impl<'a> RegExpParser<'a> {
                 vec![],
             );
         } else {
+            // A previous definition can only have come from a mutually exclusive alternative.
+            // Below ES2018 the group itself is already reported, so don't stack a second error on it.
+            if self
+                .group_specifiers
+                .get(self.scanner.token_value())
+                .copied()
+                .unwrap_or(false)
+                && self.scanner.language_version() >= ScriptTarget::ES2018
+                && self.scanner.language_version() < ScriptTarget::ES2025
+            {
+                let len = self.pos() - token_start;
+                self.error(
+                    diag::Duplicate_named_capturing_groups_are_only_available_when_targeting_0_or_later,
+                    token_start,
+                    len,
+                    args![ScriptTarget::ES2025.string().to_lowercase()],
+                );
+            }
             let name = self.scanner.token_value().to_string();
             if let Some(last) = self.named_capturing_groups.last_mut() {
                 last.insert(name.clone(), true);
@@ -897,16 +944,6 @@ impl<'a> RegExpParser<'a> {
                     self.may_contain_strings =
                         !is_character_complement && expression_may_contain_strings;
                     return;
-                } else {
-                    // PORT: Go reports `string(ch)`, where `ch` is the
-                    // character read before the first operand.
-                    let pos = self.pos();
-                    self.error(
-                        diag::Unexpected_0_Did_you_mean_to_escape_it_with_backslash,
-                        pos,
-                        1,
-                        args![rune_to_string(ch)],
-                    );
                 }
             }
             _ => {
@@ -997,10 +1034,9 @@ impl<'a> RegExpParser<'a> {
                     }
                 }
                 Some('&') => {
-                    start = self.pos();
-                    self.inc_pos(1);
-                    if self.char() == '&' as i32 {
-                        self.inc_pos(1);
+                    if self.pos() + 1 < self.end && self.char_at(self.pos() + 1) == '&' as i32 {
+                        start = self.pos();
+                        self.inc_pos(2);
                         let pos = self.pos() - 2;
                         self.error(
                             diag::Operators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead,
@@ -1018,17 +1054,9 @@ impl<'a> RegExpParser<'a> {
                             );
                             self.inc_pos(1);
                         }
-                    } else {
-                        let pos = self.pos() - 1;
-                        self.error(
-                            diag::Unexpected_0_Did_you_mean_to_escape_it_with_backslash,
-                            pos,
-                            1,
-                            args![rune_to_string(ch)],
-                        );
+                        operand = self.text_bytes(start, self.pos());
+                        continue;
                     }
-                    operand = self.text_bytes(start, self.pos());
-                    continue;
                 }
                 _ => {}
             }
@@ -1054,6 +1082,17 @@ impl<'a> RegExpParser<'a> {
                 }
                 _ => {
                     operand = self.scan_class_set_operand();
+                    if is_character_complement && self.may_contain_strings {
+                        let len = self.pos() - start;
+                        self.error(
+                            diag::Anything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class,
+                            start,
+                            len,
+                            vec![],
+                        );
+                    }
+                    expression_may_contain_strings =
+                        expression_may_contain_strings || self.may_contain_strings;
                 }
             }
         }

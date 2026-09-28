@@ -263,6 +263,7 @@ fn add_changes(
             fix_context.source_file,
             Node::NIL, /*body*/
             PreserveOptionalFlags::ALL,
+            false, /*abstract*/
         );
         for member_node in member_nodes {
             insert_interface_member_node(

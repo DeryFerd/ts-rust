@@ -373,6 +373,23 @@ impl Checker {
         m2
     }
 
+    // Go: checker/mapper.go:54 mapTypeWithCompositeMapper
+    pub fn map_type_with_composite_mapper(
+        &mut self,
+        t: TypeId,
+        m1: MapperId,
+        m2: MapperId,
+    ) -> TypeId {
+        if m1.is_nil() {
+            return self.mapper_map(m2, t);
+        }
+        let t1 = self.mapper_map(m1, t);
+        if t1 != t {
+            return self.instantiate_type(t1, m2);
+        }
+        self.mapper_map(m2, t)
+    }
+
     // Go: checker/mapper.go:55 mergeTypeMappers
     pub fn merge_type_mappers(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         if m1.is_some() {

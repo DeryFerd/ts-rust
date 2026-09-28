@@ -21,6 +21,7 @@ pub struct ParseTask {
     pub loaded: bool,
     pub started_sub_tasks: bool,
     pub is_for_automatic_type_directive: bool,
+    pub failed_lookup: bool,
     pub include_reason: Option<Rc<FileIncludeReason>>,
     pub package_id: PackageId,
 
@@ -60,6 +61,11 @@ impl ParseTask {
         self.loaded = true;
         if self.is_for_automatic_type_directive {
             self.load_automatic_type_directives(loader);
+            return;
+        }
+        if self.failed_lookup {
+            // The root file name did not resolve to a supported extension; the task
+            // exists only to carry its processing diagnostic, so nothing is parsed.
             return;
         }
         let _trace = crate::tracing::get().map(|tr| {

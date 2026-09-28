@@ -1,6 +1,6 @@
 //! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
-//! package main needs and the crate does not have yet: `flag` (bool and
-//! string flags, `Parse`, the default usage text), `os.Getwd` and
+//! package main needs and the crate does not have yet: `flag` (bool, int
+//! and string flags, `Parse`, the default usage text), `os.Getwd` and
 //! `signal.NotifyContext`.
 
 use crate::cmd::tsgo::prelude::*;
@@ -22,8 +22,8 @@ use std::sync::{Arc, LazyLock};
 /// dispatch thread). Same as the goport worker thread.
 const STACK_SIZE: usize = 1 << 30;
 
-// Go: cmd/tsgo/main.go:17 runMain
-// PORT: `args` is Go `os.Args[1:]`. `None` means Go continues with
+// Go: cmd/tsgo/main.go:18 runMain
+// PORT: `args` is Go `osutil.Args()[1:]`. `None` means Go continues with
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT
 // override) becomes the 1 GiB stack of the thread that runs the command.
@@ -159,6 +159,11 @@ pub static ERR_HELP: LazyLock<GoError> = LazyLock::new(|| errors::new("flag: hel
 // It then gets wrapped through failf to provide more information.
 pub static ERR_PARSE: LazyLock<GoError> = LazyLock::new(|| errors::new("parse error"));
 
+// Go: flag.go:109 errRange
+// errRange is returned by Set if a flag's value is out of range.
+// It then gets wrapped through failf to provide more information.
+pub static ERR_RANGE: LazyLock<GoError> = LazyLock::new(|| errors::new("value out of range"));
+
 // Go: flag.go ErrorHandling
 // ErrorHandling defines how [FlagSet.Parse] behaves if the parse fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,17 +173,20 @@ pub enum ErrorHandling {
     PanicOnError,    // Call panic with a descriptive error.
 }
 
-// Go: flag.go boolValue and stringValue, the two `Value` kinds package
-// main defines. The value lives behind the pointer that `Bool` and
-// `String` return.
+// Go: flag.go boolValue, intValue and stringValue, the `Value` kinds
+// package main defines. The value lives behind the pointer that `Bool`,
+// `Int` and `String` return.
+// PORT: Go `int` is 64 bits on the release targets (`strconv.IntSize`), so
+// the int flag is `i64`.
 #[derive(Clone)]
 pub enum FlagValue {
     Bool(Rc<Cell<bool>>),
+    Int(Rc<Cell<i64>>),
     String(Rc<RefCell<String>>),
 }
 
 impl FlagValue {
-    // Go: flag.go:133 boolValue.Set and stringValue.Set
+    // Go: flag.go:133 boolValue.Set, intValue.Set and stringValue.Set
     pub fn set(&self, s: &str) -> Result<(), GoError> {
         match self {
             FlagValue::Bool(b) => {
@@ -189,6 +197,16 @@ impl FlagValue {
                 }
                 Ok(())
             }
+            FlagValue::Int(i) => {
+                // Go: strconv.ParseInt(s, 0, strconv.IntSize), then numError
+                let (v, err) = parse_int(s);
+                i.set(v);
+                match err {
+                    None => Ok(()),
+                    Some(NumError::Syntax) => Err(ERR_PARSE.clone()),
+                    Some(NumError::Range) => Err(ERR_RANGE.clone()),
+                }
+            }
             FlagValue::String(v) => {
                 *v.borrow_mut() = s.to_string();
                 Ok(())
@@ -196,10 +214,12 @@ impl FlagValue {
         }
     }
 
-    // Go: boolValue.String (strconv.FormatBool) and stringValue.String
+    // Go: boolValue.String (strconv.FormatBool), intValue.String
+    // (strconv.Itoa) and stringValue.String
     pub fn string(&self) -> String {
         match self {
             FlagValue::Bool(b) => b.get().to_string(),
+            FlagValue::Int(i) => i.get().to_string(),
             FlagValue::String(v) => v.borrow().clone(),
         }
     }
@@ -208,6 +228,186 @@ impl FlagValue {
     pub fn is_bool_flag(&self) -> bool {
         matches!(self, FlagValue::Bool(_))
     }
+}
+
+/// Go `strconv.ErrSyntax` and `strconv.ErrRange`, the `*NumError` causes
+/// that `numError` maps to `errParse` and `errRange`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumError {
+    Syntax,
+    Range,
+}
+
+// Go: internal/strconv/atoi.go:11 lower (go1.26.8)
+fn lower(c: u8) -> u8 {
+    c | (b'x' - b'X')
+}
+
+// Go: internal/strconv/atoi.go:171 ParseInt (go1.26.8), with base 0 and bitSize 64
+// PORT: only the cause of a Go `*NumError` is kept (see `NumError`).
+fn parse_int(s: &str) -> (i64, Option<NumError>) {
+    if s.is_empty() {
+        return (0, Some(NumError::Syntax));
+    }
+
+    // Pick off leading sign.
+    let mut rest = s;
+    let mut neg = false;
+    if rest.as_bytes()[0] == b'+' {
+        rest = &rest[1..];
+    } else if rest.as_bytes()[0] == b'-' {
+        neg = true;
+        rest = &rest[1..];
+    }
+
+    // Convert unsigned and check range.
+    let (un, err) = parse_uint(rest);
+    if err.is_some_and(|err| err != NumError::Range) {
+        return (0, err);
+    }
+
+    let cutoff: u64 = 1 << 63;
+    if !neg && un >= cutoff {
+        return ((cutoff - 1) as i64, Some(NumError::Range));
+    }
+    if neg && un > cutoff {
+        return (i64::MIN, Some(NumError::Range));
+    }
+    let mut n = un as i64;
+    if neg {
+        n = n.wrapping_neg();
+    }
+    (n, None)
+}
+
+// Go: internal/strconv/atoi.go:47 ParseUint (go1.26.8), with base 0 and bitSize 64
+fn parse_uint(s: &str) -> (u64, Option<NumError>) {
+    if s.is_empty() {
+        return (0, Some(NumError::Syntax));
+    }
+
+    let s0 = s;
+    let mut s = s.as_bytes();
+    // Look for octal, hex prefix.
+    let mut base: u8 = 10;
+    if s[0] == b'0' {
+        if s.len() >= 3 && lower(s[1]) == b'b' {
+            base = 2;
+            s = &s[2..];
+        } else if s.len() >= 3 && lower(s[1]) == b'o' {
+            base = 8;
+            s = &s[2..];
+        } else if s.len() >= 3 && lower(s[1]) == b'x' {
+            base = 16;
+            s = &s[2..];
+        } else {
+            base = 8;
+            s = &s[1..];
+        }
+    }
+
+    // Cutoff is the smallest number such that cutoff*base > maxUint64.
+    let cutoff = u64::MAX / u64::from(base) + 1;
+    let max_val = u64::MAX;
+
+    let mut underscores = false;
+    let mut n: u64 = 0;
+    for &c in s {
+        let d = if c == b'_' {
+            // base0 is always true here.
+            underscores = true;
+            continue;
+        } else if c.is_ascii_digit() {
+            c - b'0'
+        } else if (b'a'..=b'z').contains(&lower(c)) {
+            lower(c) - b'a' + 10
+        } else {
+            return (0, Some(NumError::Syntax));
+        };
+
+        if d >= base {
+            return (0, Some(NumError::Syntax));
+        }
+
+        if n >= cutoff {
+            // n*base overflows
+            return (max_val, Some(NumError::Range));
+        }
+        n *= u64::from(base);
+
+        // PORT: Go also checks `n1 > maxVal`, which cannot hold with
+        // bitSize 64 (maxVal is the largest uint64).
+        let (n1, overflow) = n.overflowing_add(u64::from(d));
+        if overflow {
+            // n+d overflows
+            return (max_val, Some(NumError::Range));
+        }
+        n = n1;
+    }
+
+    if underscores && !underscore_ok(s0) {
+        return (0, Some(NumError::Syntax));
+    }
+
+    (n, None)
+}
+
+// Go: internal/strconv/atoi.go:251 underscoreOK (go1.26.8)
+// underscoreOK reports whether the underscores in s are allowed.
+// Checking them in this one function lets all the parsers skip over them simply.
+// Underscore must appear only between digits or between a base prefix and a digit.
+fn underscore_ok(s: &str) -> bool {
+    // saw tracks the last character (class) we saw:
+    // ^ for beginning of number,
+    // 0 for a digit or base prefix,
+    // _ for an underscore,
+    // ! for none of the above.
+    let mut saw = b'^';
+    let mut i = 0;
+    let mut s = s.as_bytes();
+
+    // Optional sign.
+    if !s.is_empty() && (s[0] == b'-' || s[0] == b'+') {
+        s = &s[1..];
+    }
+
+    // Optional base prefix.
+    let mut hex = false;
+    if s.len() >= 2
+        && s[0] == b'0'
+        && (lower(s[1]) == b'b' || lower(s[1]) == b'o' || lower(s[1]) == b'x')
+    {
+        i = 2;
+        saw = b'0'; // base prefix counts as a digit for "underscore as digit separator"
+        hex = lower(s[1]) == b'x';
+    }
+
+    // Number proper.
+    while i < s.len() {
+        // Digits are always okay.
+        if s[i].is_ascii_digit() || (hex && (b'a'..=b'f').contains(&lower(s[i]))) {
+            saw = b'0';
+            i += 1;
+            continue;
+        }
+        // Underscore must follow digit.
+        if s[i] == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+            i += 1;
+            continue;
+        }
+        // Underscore must also be followed by digit.
+        if saw == b'_' {
+            return false;
+        }
+        // Saw non-digit, non-underscore.
+        saw = b'!';
+        i += 1;
+    }
+    saw != b'_'
 }
 
 // Go: strconv/atob.go ParseBool
@@ -266,6 +466,15 @@ impl FlagSet {
     pub fn bool(&mut self, name: &str, value: bool, usage: &str) -> Rc<Cell<bool>> {
         let p = Rc::new(Cell::new(value));
         self.var(FlagValue::Bool(p.clone()), name, usage);
+        p
+    }
+
+    // Go: flag.go FlagSet.Int
+    // Int defines an int flag with specified name, default value, and usage string.
+    // The return value is the address of an int variable that stores the value of the flag.
+    pub fn int(&mut self, name: &str, value: i64, usage: &str) -> Rc<Cell<i64>> {
+        let p = Rc::new(Cell::new(value));
+        self.var(FlagValue::Int(p.clone()), name, usage);
         p
     }
 
@@ -352,7 +561,7 @@ impl FlagSet {
     // Go: flag.go:607 FlagSet.PrintDefaults
     // PrintDefaults prints, to standard error unless configured otherwise, the
     // default values of all defined command-line flags in the set.
-    // PORT: `isZeroValue` cannot fail for the two value kinds here.
+    // PORT: `isZeroValue` cannot fail for the three value kinds here.
     pub fn print_defaults(&self) {
         // Go: VisitAll visits the flags in lexicographical order.
         let mut flags: Vec<&Flag> = self.formal.values().collect();
@@ -529,6 +738,7 @@ pub fn unquote_usage(flag: &Flag) -> (String, String) {
     // No explicit name, so use type if we can find one.
     let name = match flag.value {
         FlagValue::Bool(_) => "",
+        FlagValue::Int(_) => "int",
         FlagValue::String(_) => "string",
     };
     (name.to_string(), flag.usage.clone())
@@ -537,10 +747,11 @@ pub fn unquote_usage(flag: &Flag) -> (String, String) {
 // Go: flag.go:538 isZeroValue
 // isZeroValue determines whether the string represents the zero
 // value for a flag.
-// PORT: the zero values print as "false" (bool) and "" (string).
+// PORT: the zero values print as "false" (bool), "0" (int) and "" (string).
 pub fn is_zero_value(flag: &Flag, value: &str) -> bool {
     let zero = match flag.value {
         FlagValue::Bool(_) => "false",
+        FlagValue::Int(_) => "0",
         FlagValue::String(_) => "",
     };
     value == zero

@@ -263,6 +263,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
 
                 if let Some((original_path, resolved)) =
                     resolve_package_directory(&dep, &package_json_name)
+                    && !original_path.is_empty()
                 {
                     known_symlinks.process_resolution(
                         &tspath::combine_paths(&original_path, &["package.json"]),

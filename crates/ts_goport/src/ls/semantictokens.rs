@@ -349,10 +349,10 @@ impl SemanticTokenCollector<'_> {
                             token_modifier |= TokenModifier::LOCAL;
                         }
                         let decl_source_file = get_source_file_of_node(decl);
-                        // PORT: Go converts the file name to a `tspath.Path` (a cast).
+                        // PORT: Go `declSourceFile.Path()` is `source_file_info(file).path`.
                         if decl_source_file.is_some()
                             && self.program.is_source_file_default_library(&tspath::Path(
-                                source_file_file_name(decl_source_file).to_string(),
+                                source_file_info(decl_source_file).path.clone(),
                             ))
                         {
                             token_modifier |= TokenModifier::DEFAULT_LIBRARY;
@@ -364,7 +364,7 @@ impl SemanticTokenCollector<'_> {
                             let decl_source_file = get_source_file_of_node(decl);
                             if decl_source_file.is_some()
                                 && self.program.is_source_file_default_library(&tspath::Path(
-                                    source_file_file_name(decl_source_file).to_string(),
+                                    source_file_info(decl_source_file).path.clone(),
                                 ))
                             {
                                 token_modifier |= TokenModifier::DEFAULT_LIBRARY;

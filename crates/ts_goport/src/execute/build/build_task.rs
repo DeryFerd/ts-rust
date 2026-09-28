@@ -6,7 +6,8 @@ use crate::execute::incremental::build_info::is_build_info_file_name_default_lib
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::incremental::incremental::{BuildInfoReader, Host as IncrementalHost};
 use crate::execute::incremental::program::{
-    Program as IncrementalProgram, new_program as new_incremental_program, read_build_info_program,
+    NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
+    read_build_info_program,
 };
 use crate::execute::incremental::{BuildInfo, compute_hash};
 use crate::execute::tsc::compile::{CompileTimes, System, Writer};
@@ -393,7 +394,7 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:179 (*BuildTask).compileAndEmit, up to
+    // Go: build/buildtask.go:226 (*BuildTask).compileAndEmit, up to
     // `incremental.NewProgram` (see `build_project_start`).
     // PORT: the program is a program version of this multi-program process
     // (`program::new_program_version`), made on this thread, the loading
@@ -486,9 +487,15 @@ impl BuildTask {
         let changes_compute_start = sys.now();
         let incremental_program = {
             let _scope = crate::core::enter_program(Some(program));
+            // Go: orchestrator.opts.Sys.Now
+            let nested_emit_now: NestedEmitNow = {
+                let sys = sys.clone();
+                Rc::new(move || sys.now())
+            };
             let incremental_program = new_incremental_program(
                 old_program.as_ref(),
                 host as Rc<dyn IncrementalHost>,
+                Some(nested_emit_now),
                 testing.is_some(),
             );
             compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
@@ -511,7 +518,7 @@ impl BuildTask {
         });
     }
 
-    // Go: build/buildtask.go:179 (*BuildTask).compileAndEmit, from
+    // Go: build/buildtask.go:226 (*BuildTask).compileAndEmit, from
     // `EmitAndReportStatistics` on (see `compile_and_emit_start`).
     pub fn compile_and_emit_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator) {
         let PendingCompile {

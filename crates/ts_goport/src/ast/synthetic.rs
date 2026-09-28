@@ -107,9 +107,7 @@ struct SyntheticNode {
 // PORT: a parsed SourceFile keeps these fields in `SourceFileInfo`. ts_ast
 // node data cannot hold them, so a factory SourceFile keeps them in its slot.
 // Go `parseOptions` is kept as its file name and path; the external module
-// indicator options are only read by the parser. `ContainsNonASCII` and
-// `Identifiers` are not in `SourceFileInfo`, so `copyFrom` cannot copy them
-// from a parsed file and they are not kept.
+// indicator options are only read by the parser.
 #[derive(Clone, Debug, Default)]
 pub struct SyntheticSourceFileData {
     // Fields set by NewSourceFile

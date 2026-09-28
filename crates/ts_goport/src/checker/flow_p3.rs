@@ -884,6 +884,11 @@ impl Checker {
         if !self.ty(source).flags.intersects(TypeFlags::UNION) {
             return self.is_type_assignable_to(source, target);
         }
+        // Quick exit when source union contains the target type
+        if self.contains_type(self.ty(source).types(), target) {
+            return true;
+        }
+        // Otherwise, check if any constituent type of the source union is assignable to the target type
         for t in self.ty(source).types_list() {
             if self.is_type_assignable_to(t, target) {
                 return true;
@@ -1031,7 +1036,7 @@ impl Checker {
             let flow_data = flow.get_flow();
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
-                if !no_cache_check {
+                if !no_cache_check && f.borrow().reduce_labels.is_empty() {
                     if let Some(&reachable) = self.flow_node_reachable.get(&flow) {
                         return reachable;
                     }

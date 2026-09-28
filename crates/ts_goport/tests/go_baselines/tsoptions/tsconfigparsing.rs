@@ -121,6 +121,192 @@ fn parse_json_config_file_content() {
     t.finish();
 }
 
+/// A Go `*collections.OrderedMap[string, any]` literal.
+fn json_object(entries: Vec<(&str, CompilerOptionsValue)>) -> CompilerOptionsValue {
+    CompilerOptionsValue::Map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+/// Go `tsoptions.ParseJsonConfigFileContent(json, host, "/project", nil,
+/// "/project/tsconfig.json", nil, nil, nil)`, as the tests below call it.
+fn parse_project_json(json: &CompilerOptionsValue, host: &VfsParseConfigHost) -> ParsedCommandLine {
+    tsoptions::parse_json_config_file_content(
+        json,
+        host,
+        "/project",
+        None,
+        "/project/tsconfig.json",
+        /*resolutionStack*/ &[],
+        /*extraFileExtensions*/ &[],
+        /*extendedConfigCache*/ None,
+    )
+}
+
+// Go: tsconfigparsing_test.go:835 TestParseJsonConfigFileContentAcceptsJsonRepresentations
+// PORT: `CompilerOptionsValue` has no form for a Go `map[string]any`, so the
+// "plain map" and "typed slices" cases are ordered maps in the sorted key
+// order that Go `normalizeJsonValue` gives them, and a Go `[]string` is
+// `StringList`. Go runs the cases in map order; here they run in source
+// order.
+#[test]
+fn parse_json_config_file_content_accepts_json_representations() {
+    let host = new_vfs_parse_config_host(
+        &file_map(&[("/project/index.ts", "export {};")]),
+        "/project",
+        true, /*useCaseSensitiveFileNames*/
+    );
+
+    let (ordered_map, parse_errors) = tsoptions::parse_config_file_text_to_json(
+        "/project/tsconfig.json",
+        Path("/project/tsconfig.json".to_string()),
+        r#"{"compilerOptions":{"strict":true},"files":["index.ts"]}"#,
+    );
+    assert_eq!(parse_errors.len(), 0);
+
+    let strict = || json_object(vec![("strict", CompilerOptionsValue::Bool(true))]);
+    let ordered_map_with_typed_slices = json_object(vec![
+        ("compilerOptions", strict()),
+        (
+            "files",
+            CompilerOptionsValue::StringList(vec!["index.ts".to_string()]),
+        ),
+    ]);
+
+    let tests: Vec<(&str, CompilerOptionsValue)> = vec![
+        ("ordered map", ordered_map),
+        (
+            "ordered map with typed slices",
+            ordered_map_with_typed_slices,
+        ),
+        (
+            "plain map",
+            json_object(vec![
+                ("compilerOptions", strict()),
+                (
+                    "files",
+                    CompilerOptionsValue::List(vec![CompilerOptionsValue::String(
+                        "index.ts".to_string(),
+                    )]),
+                ),
+            ]),
+        ),
+        (
+            "typed slices",
+            json_object(vec![
+                ("compilerOptions", strict()),
+                (
+                    "files",
+                    CompilerOptionsValue::StringList(vec!["index.ts".to_string()]),
+                ),
+            ]),
+        ),
+    ];
+    let mut t = Subtests::new("TestParseJsonConfigFileContentAcceptsJsonRepresentations");
+    for (name, json) in &tests {
+        t.run(name, || {
+            let parsed = parse_project_json(json, &host);
+            assert_eq!(parsed.file_names(), ["/project/index.ts".to_string()]);
+            assert!(parsed.compiler_options().strict.is_true());
+            assert_eq!(parsed.errors.len(), 0);
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:884 TestParseJsonConfigFileContentPreservesRaw
+// PORT: the Go `map[string]any` input is an ordered map in its sorted key
+// order (see above).
+#[test]
+fn parse_json_config_file_content_preserves_raw() {
+    let host = new_vfs_parse_config_host(
+        &file_map(&[("/project/index.ts", "export {};")]),
+        "/project",
+        true, /*useCaseSensitiveFileNames*/
+    );
+
+    let parsed = parse_project_json(
+        &json_object(vec![
+            ("compileOnSave", CompilerOptionsValue::Bool(true)),
+            (
+                "customSetting",
+                json_object(vec![("enabled", CompilerOptionsValue::Bool(true))]),
+            ),
+            (
+                "files",
+                CompilerOptionsValue::List(vec![CompilerOptionsValue::String(
+                    "index.ts".to_string(),
+                )]),
+            ),
+        ]),
+        &host,
+    );
+
+    assert_eq!(parsed.errors.len(), 0);
+    assert!(parsed.compile_on_save == Some(true));
+
+    let CompilerOptionsValue::Map(raw) = &parsed.raw else {
+        panic!("raw should be an ordered map");
+    };
+    assert_eq!(
+        raw.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["compileOnSave", "customSetting", "files"]
+    );
+    assert!(raw.contains_key("customSetting"));
+}
+
+// Go: tsconfigparsing_test.go:913 TestParseJsonConfigFileContentHandlesNullArrayElements
+#[test]
+fn parse_json_config_file_content_handles_null_array_elements() {
+    let host = new_vfs_parse_config_host(
+        &file_map(&[("/project/index.ts", "export {};")]),
+        "/project",
+        true, /*useCaseSensitiveFileNames*/
+    );
+    let mut t = Subtests::new("TestParseJsonConfigFileContentHandlesNullArrayElements");
+    for property in ["files", "include", "exclude"] {
+        t.run(property, || {
+            let parsed = parse_project_json(
+                &json_object(vec![(
+                    property,
+                    CompilerOptionsValue::List(vec![CompilerOptionsValue::Nil]),
+                )]),
+                &host,
+            );
+            assert!(!parsed.errors.is_empty());
+            assert_eq!(
+                parsed.errors[0].code,
+                diag::Compiler_option_0_requires_a_value_of_type_1.code() as i32
+            );
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:937 TestParseJsonConfigFileContentDefaultsCompileOnSaveToFalse
+#[test]
+fn parse_json_config_file_content_defaults_compile_on_save_to_false() {
+    let host = new_vfs_parse_config_host(
+        &file_map(&[("/project/index.ts", "export {};")]),
+        "/project",
+        true, /*useCaseSensitiveFileNames*/
+    );
+    let parsed = parse_project_json(
+        &json_object(vec![(
+            "files",
+            CompilerOptionsValue::List(vec![CompilerOptionsValue::String("index.ts".to_string())]),
+        )]),
+        &host,
+    );
+    assert!(parsed.compile_on_save.is_some());
+    assert_eq!(parsed.compile_on_save, Some(false));
+}
+
 // Go: tsconfigparsing_test.go:818 getParsedWithJsonApi
 fn get_parsed_with_json_api(
     config: &TestConfig,
@@ -1425,6 +1611,20 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 json_text: r#"{
 			    "compilerOptions": {
 				"unknown": true
+			    }
+			}"#,
+                config_file_name: "tsconfig.json",
+                base_path: "/",
+                all_file_list: file_map(&[("/app.ts", "")]),
+            }],
+        },
+        ParseJsonConfigTestCase {
+            title: "reports spelling suggestion for an unknown option",
+            no_submodule_baseline: false,
+            input: vec![TestConfig {
+                json_text: r#"{
+			    "compilerOptions": {
+				"targt": 1
 			    }
 			}"#,
                 config_file_name: "tsconfig.json",

@@ -437,6 +437,7 @@ impl Checker {
             } else if self.module_kind == ModuleKind::PRESERVE
                 && !is_import_equals_declaration(node)
                 && !is_variable_declaration(node)
+                && !is_binding_element(node)
                 && get_emit_module_format_of_file(get_source_file_of_node(node))
                     == ModuleKind::COMMON_JS
             {

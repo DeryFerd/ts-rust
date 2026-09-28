@@ -20,6 +20,30 @@ pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> 
     Node::NIL
 }
 
+// Go: ast/utilities.go:921 FindManyAncestors
+/// Walks up the parents of `node` once. Slot `i` of the result is the nearest
+/// ancestor that `callbacks[i]` matches, or nil. A node fills at most one
+/// slot: the first callback that matches it and whose slot is still empty.
+#[must_use]
+pub fn find_many_ancestors(mut node: Node, callbacks: &[fn(Node) -> bool]) -> Vec<Node> {
+    let mut ancestors = vec![Node::NIL; callbacks.len()];
+    let mut found = 0;
+    while node.is_some() {
+        for (i, callback) in callbacks.iter().enumerate() {
+            if ancestors[i].is_nil() && callback(node) {
+                ancestors[i] = node;
+                found += 1;
+                if found == callbacks.len() {
+                    return ancestors;
+                }
+                break;
+            }
+        }
+        node = node.parent();
+    }
+    ancestors
+}
+
 /// `find_ancestor(node, |n| callback(n, n.kind()))`: the callback also gets
 /// the node's Go `Kind`.
 // PERF: U4 (CH7). The steps inside a tier 0 store read its kind and header
@@ -358,22 +382,20 @@ pub fn get_root_declaration(mut node: Node) -> Node {
     node
 }
 
-// Go: ast/utilities.go:1161 getCombinedFlags
+// Go: ast/utilities.go:1180 GetCombinedModifierFlags
 // PERF: `get_root_declaration` is inlined here and each node kind is read
 // once (it was read in `get_root_declaration` and again for the
 // VariableDeclaration test, each read with the store bounds checks). The
-// walk and the `get_flags` calls are the same as Go. A nil node fails the
-// Go `node != nil` tests, so it returns early.
-fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
-    mut node: Node,
-    get_flags: impl Fn(Node) -> T,
-) -> T {
+// walk and the flag reads are the same as Go. A nil node fails the Go
+// `node != nil` tests, so it returns early. The same holds for
+// `get_combined_node_flags` and `get_combined_parser_flags`.
+pub fn get_combined_modifier_flags(mut node: Node) -> ModifierFlags {
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
         kind = node.kind();
     }
-    let mut flags = get_flags(node);
+    let mut flags = node.modifier_flags();
     if kind == SyntaxKind::VariableDeclaration {
         node = node.parent();
         if node.is_nil() {
@@ -382,7 +404,7 @@ fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
         kind = node.kind();
     }
     if kind == SyntaxKind::VariableDeclarationList {
-        flags |= get_flags(node);
+        flags |= node.modifier_flags();
         node = node.parent();
         if node.is_nil() {
             return flags;
@@ -390,24 +412,38 @@ fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
         kind = node.kind();
     }
     if kind == SyntaxKind::VariableStatement {
-        flags |= get_flags(node);
+        flags |= node.modifier_flags();
     }
     flags
 }
 
-// Go: ast/utilities.go:1177 GetCombinedModifierFlags
-pub fn get_combined_modifier_flags(node: Node) -> ModifierFlags {
-    get_combined_flags(node, |n: Node| n.modifier_flags())
-}
-
-// Go: ast/utilities.go:1181 GetCombinedNodeFlags
-pub fn get_combined_node_flags(node: Node) -> NodeFlags {
-    get_combined_flags(node, get_node_flags)
-}
-
-// Go: ast/utilities.go:1185 getNodeFlags
-fn get_node_flags(node: Node) -> NodeFlags {
-    node.flags()
+// Go: ast/utilities.go:1196 GetCombinedNodeFlags
+pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
+    let mut kind = node.kind();
+    while kind == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+        kind = node.kind();
+    }
+    let mut flags = node.flags();
+    if kind == SyntaxKind::VariableDeclaration {
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableDeclarationList {
+        flags |= node.flags();
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableStatement {
+        flags |= node.flags();
+    }
+    flags
 }
 
 /// Go `GetCombinedNodeFlags(node) & mask` for a `mask` without a binder bit
@@ -415,8 +451,32 @@ fn get_node_flags(node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
-    get_combined_flags(node, |n: Node| n.parser_flags(mask))
+fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+    let mut kind = node.kind();
+    while kind == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+        kind = node.kind();
+    }
+    let mut flags = node.parser_flags(mask);
+    if kind == SyntaxKind::VariableDeclaration {
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableDeclarationList {
+        flags |= node.parser_flags(mask);
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableStatement {
+        flags |= node.parser_flags(mask);
+    }
+    flags
 }
 
 // Go: ast/utilities.go:1190 IsVarAwaitUsing

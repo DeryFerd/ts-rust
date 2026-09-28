@@ -424,34 +424,163 @@ impl Checker {
                 self.mark_decorator_alias_referenced(location);
             }
             ReferenceHint::UNSPECIFIED => {
+                if location.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
+                    // We cannot answer semantic questions within a with block, do not proceed any further
+                    return;
+                }
                 if is_jsx_tag_name(location) && is_jsx_intrinsic_tag_name(location) {
                     return; // builtin JSX tag names aren't real type refs by most metrics, but are expressions, so must be filtered
                 }
-                if find_ancestor(location, is_meta_property).is_some() {
-                    return; // identifiers in meta properties shouldn't be resolved, but are expressions, so must be filtered
-                }
-                // Identifiers in expression contexts are emitted, so we need to follow their referenced aliases and mark them as used
-                // Some non-expression identifiers are also treated as expression identifiers for this purpose, eg, `a` in `b = {a}` or `q` in `import r = q`
-                // This is the exception, rather than the rule - most non-expression identifiers are declaration names.
-                if is_identifier(location)
-                    && (is_expression_node(location)
-                        || is_shorthand_property_assignment(location.parent())
-                        || (is_import_equals_declaration(location.parent())
-                            && location.parent().module_reference() == location))
-                    && should_mark_identifier_alias_referenced(location)
-                {
-                    if is_property_access_or_qualified_name(location.parent()) {
-                        let left = if is_property_access_expression(location.parent()) {
-                            location.parent().expression()
-                        } else {
-                            location.parent().left()
-                        };
-                        if left != location {
-                            return; // Only mark the LHS (the RHS is a property lookup)
+                if is_identifier(location) {
+                    // A shorthand property with an object-assignment-initializer (e.g. `{ s = 5 }`) is only valid inside a
+                    // destructuring assignment target. When it appears in an ordinary object literal expression, the checker
+                    // checks the initializer and never resolves the property name, so resolving it here would report a spurious
+                    // "No value exists in scope for the shorthand property" diagnostic. Skip such names to match checking.
+                    let parent = location.parent();
+                    if is_shorthand_property_assignment(parent)
+                        && parent.name() == location
+                        && parent.object_assignment_initializer().is_some()
+                        && !is_assignment_target(parent.parent())
+                    {
+                        return;
+                    }
+                    let res = find_many_ancestors(
+                        location,
+                        &[
+                            is_meta_property,
+                            is_decorator,
+                            is_yield_expression,
+                            is_for_in_or_of_statement,
+                            is_computed_property_name,
+                            is_heritage_clause,
+                            is_export_assignment,
+                            is_return_statement,
+                        ],
+                    );
+                    let meta_property = res[0];
+                    let decorator = res[1];
+                    let yield_expr = res[2];
+                    let for_node = res[3];
+                    let computed_name = res[4];
+                    let heritage_clause = res[5];
+                    let export_assignment = res[6];
+                    let return_statement = res[7];
+                    if meta_property.is_some() {
+                        return; // identifiers in meta properties shouldn't be resolved, but are expressions, so must be filtered
+                    }
+                    if decorator.is_some() {
+                        // Decorators on nodes that cannot be decorated (e.g. class expressions, static blocks,
+                        // `this` parameters) are never resolved during normal checking, so resolving them here would
+                        // report spurious diagnostics. Only bail out for such invalid-position decorators; valid
+                        // decorator expressions must still be resolved and marked for emit.
+                        let decorated = decorator.parent();
+                        if decorated.is_some()
+                            && !node_can_be_decorated(
+                                self.legacy_decorators,
+                                decorated,
+                                decorated.parent(),
+                                decorated.parent().parent(),
+                            )
+                        {
+                            return;
                         }
                     }
-                    self.mark_identifier_alias_referenced(location);
-                    return;
+                    // The operand of a 'yield' expression is only checked when the containing function is a
+                    // generator. Outside a generator (or outside any function), checkYieldExpression returns
+                    // early and never checks the operand, so resolving identifiers in it here would report a
+                    // spurious "Cannot find name" diagnostic.
+                    if yield_expr.is_some() {
+                        let func = get_containing_function(yield_expr);
+                        if func.is_nil()
+                            || !get_function_flags(func).intersects(FunctionFlags::GENERATOR)
+                        {
+                            return;
+                        }
+                    }
+                    // The right-hand side of a 'for-in'/'for-of' statement whose initializer is an empty variable
+                    // declaration list (a grammar error, e.g. `for (var of X)`) is never checked, because the RHS
+                    // is only checked while inferring the type of a variable declaration and there is none here.
+                    // Resolving identifiers in the RHS here would report spurious diagnostics.
+                    if for_node.is_some() {
+                        let initializer = for_node.initializer();
+                        let expression = for_node.expression();
+                        if is_variable_declaration_list(initializer)
+                            && initializer.declarations().nodes().len() == 0
+                            && expression.is_some()
+                            && (location == expression
+                                || is_node_descendant_of(location, expression))
+                        {
+                            return;
+                        }
+                    }
+                    // Computed property names on enum members are a grammar error and are never checked
+                    // (checkEnumMember only checks the member initializer, not the name), so resolving
+                    // identifiers in them here would report a spurious "Cannot find name" diagnostic.
+                    if computed_name.is_some() {
+                        if is_enum_member(computed_name.parent()) {
+                            return;
+                        }
+                        if is_invalid_computed_property_name(computed_name) {
+                            return;
+                        }
+                    }
+                    if heritage_clause.is_some() {
+                        // extends heritage clauses on interfaces are not expressions and are unchecked if they are
+                        if is_interface_declaration(heritage_clause.parent()) {
+                            return;
+                        }
+                        // On a class, only the first `extends` type is resolved as a value (the base class); any
+                        // additional `extends` types are grammar errors (e.g. `class C extends A extends B` or
+                        // `class C extends A, B`) and are never resolved during checking.
+                        if is_class_like(heritage_clause.parent())
+                            && heritage_clause.token() == SyntaxKind::ExtendsKeyword
+                        {
+                            let first_extends =
+                                get_extends_heritage_clause_element(heritage_clause.parent());
+                            if first_extends.is_some()
+                                && location != first_extends
+                                && !is_node_descendant_of(location, first_extends)
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    // An `export =` / `export default` inside a namespace/module block is a grammar error;
+                    // checkExportAssignment reports it and returns without resolving the expression, so
+                    // resolving identifiers in it here would report a spurious "Cannot find name" diagnostic.
+                    if export_assignment.is_some() && is_contained_by_namespace(export_assignment) {
+                        return;
+                    }
+                    // A `return` statement outside of any function body (or inside a class static block) is a
+                    // grammar error; checkReturnStatement reports it and returns without checking the return
+                    // expression, so resolving identifiers in it here would report a spurious diagnostic.
+                    if return_statement.is_some() {
+                        let container =
+                            get_containing_function_or_class_static_block(return_statement);
+                        if container.is_nil() || is_class_static_block_declaration(container) {
+                            return;
+                        }
+                    }
+                    // Identifiers in expression contexts are emitted, so we need to follow their referenced aliases and mark them as used
+                    // Some non-expression identifiers are also treated as expression identifiers for this purpose, eg, `a` in `b = {a}` or `q` in `import r = q`
+                    // This is the exception, rather than the rule - most non-expression identifiers are declaration names.
+                    if (is_expression_node(location)
+                        || is_shorthand_property_assignment(location.parent()))
+                        && should_mark_identifier_alias_referenced(location)
+                    {
+                        if is_property_access_or_qualified_name(location.parent()) {
+                            let left = if is_property_access_expression(location.parent()) {
+                                location.parent().expression()
+                            } else {
+                                location.parent().left()
+                            };
+                            if left != location {
+                                return; // Only mark the LHS (the RHS is a property lookup)
+                            }
+                        }
+                        self.mark_identifier_alias_referenced(location);
+                        return;
+                    }
                 }
                 if is_property_access_or_qualified_name(location) {
                     let mut top_prop = location;
@@ -567,12 +696,11 @@ fn is_internal_module_import_equals_declaration_p31(node: Node) -> bool {
 impl Checker {
     // Go: checker/checker.go:28152 markIdentifierAliasReferenced
     pub fn mark_identifier_alias_referenced(&mut self, location: Node) {
+        if is_this_in_type_query(location) {
+            return;
+        }
         let symbol = self.get_resolved_symbol(location);
-        if symbol.is_some()
-            && symbol != self.arguments_symbol
-            && symbol != self.unknown_symbol
-            && !is_this_in_type_query(location)
-        {
+        if symbol.is_some() && symbol != self.arguments_symbol && symbol != self.unknown_symbol {
             self.mark_alias_referenced(symbol, location);
         }
     }

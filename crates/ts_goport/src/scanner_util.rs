@@ -1309,15 +1309,47 @@ pub fn utf16_len(s: &str) -> i32 {
 pub fn get_spelling_suggestion<T: Clone + Default, S: AsRef<str>>(
     name: &str,
     candidates: impl IntoIterator<Item = T>,
+    get_name: impl FnMut(&T) -> S,
+    compare: impl FnMut(&T, &T) -> i32,
+) -> T {
+    get_spelling_suggestion_unexported(
+        name, candidates, get_name, compare, 0, /*maxCandidates*/
+    )
+}
+
+// Go: core/core.go:588 GetSpellingSuggestionWithMaxCandidateCount
+pub fn get_spelling_suggestion_with_max_candidate_count<T: Clone + Default, S: AsRef<str>>(
+    name: &str,
+    candidates: impl IntoIterator<Item = T>,
+    get_name: impl FnMut(&T) -> S,
+    compare: impl FnMut(&T, &T) -> i32,
+    max_candidates: i32,
+) -> T {
+    get_spelling_suggestion_unexported(name, candidates, get_name, compare, max_candidates)
+}
+
+// Go: core/core.go:592 getSpellingSuggestion
+// PORT: Go `getSpellingSuggestion` has the same snake name as the exported
+// `GetSpellingSuggestion`, which keeps the plain name because other packages
+// call it; this private one gets the `_unexported` suffix.
+fn get_spelling_suggestion_unexported<T: Clone + Default, S: AsRef<str>>(
+    name: &str,
+    candidates: impl IntoIterator<Item = T>,
     mut get_name: impl FnMut(&T) -> S,
     mut compare: impl FnMut(&T, &T) -> i32,
+    max_candidates: i32,
 ) -> T {
     let rune_name: Vec<char> = go_runes(name);
     let maximum_length_difference = 2i64.max((rune_name.len() as f64 * 0.34) as i64);
     let mut best_distance = (rune_name.len() as f64 * 0.4).floor() + 0.9; // If the best result is worse than this, don't bother.
     let mut best_candidate = T::default();
     let mut has_best = false;
+    let mut checked_candidates = 0;
     for candidate in candidates {
+        checked_candidates += 1;
+        if max_candidates > 0 && checked_candidates > max_candidates {
+            return T::default();
+        }
         let candidate_name = get_name(&candidate);
         let candidate_name: &str = candidate_name.as_ref();
         // PORT: Go compares the candidate byte length with the name rune count.
@@ -2633,6 +2665,59 @@ pub fn get_source_text_of_node_from_source_file(
     get_text_of_node_from_source_text(source_file_text(source_file), node, include_trivia)
 }
 
+// Go: scanner/utilities.go:26 isJSDocTypeExpressionOrChild
+fn is_js_doc_type_expression_or_child(node: Node) -> bool {
+    if is_js_doc_type_expression(node) {
+        return true;
+    }
+    if !node
+        .flags()
+        .intersects(NodeFlags::JS_DOC | NodeFlags::REPARSED)
+    {
+        return false;
+    }
+    let mut current = node;
+    while current.is_some() {
+        if is_type_node(current) {
+            return true;
+        }
+        current = current.parent();
+    }
+    false
+}
+
+// Go: scanner/utilities.go:41 normalizeJSDocTypeSourceText
+fn normalize_js_doc_type_source_text(text: &str) -> String {
+    let line_starts = compute_ecma_line_starts(text);
+    if line_starts.len() == 1 {
+        return strip_leading_js_doc_comment(text).to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let new_line = NewLineKind::LF.get_new_line_character();
+    for (i, &line_start) in line_starts.iter().enumerate() {
+        if i > 0 {
+            result.push_str(new_line);
+        }
+        let mut line_end = text.len();
+        if i + 1 < line_starts.len() {
+            line_end = line_starts[i + 1] as usize;
+        }
+        let line = text[line_start as usize..line_end].trim_end_matches(is_line_break);
+        result.push_str(strip_leading_js_doc_comment(line));
+    }
+    result
+}
+
+// Go: scanner/utilities.go:64 stripLeadingJSDocComment
+fn strip_leading_js_doc_comment(line: &str) -> &str {
+    let mut line = line.trim_start_matches(is_white_space_like);
+    if let Some(rest) = line.strip_prefix('*') {
+        line = rest;
+    }
+    line.trim_start_matches(is_white_space_like)
+}
+
 // Go: scanner/utilities.go:25 GetTextOfNodeFromSourceText
 pub fn get_text_of_node_from_source_text(
     source_text: &str,
@@ -2646,7 +2731,10 @@ pub fn get_text_of_node_from_source_text(
     if !include_trivia {
         pos = skip_trivia(source_text, pos);
     }
-    let text = &source_text[pos as usize..node.end() as usize];
+    let mut text: Cow<'_, str> = Cow::Borrowed(&source_text[pos as usize..node.end() as usize]);
+    if is_js_doc_type_expression_or_child(node) {
+        text = Cow::Owned(normalize_js_doc_type_source_text(&text));
+    }
     if node
         .flags()
         .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
@@ -2669,11 +2757,7 @@ pub fn get_text_of_node_from_source_text(
             node.kind()
         );
     }
-    // if (isJSDocTypeExpressionOrChild(node)) {
-    //     // strip space + asterisk at line start
-    //     text = text.split(/\r\n|\n|\r/).map(line => line.replace(/^\s*\*/, "").trimStart()).join("\n");
-    // }
-    text.to_string()
+    text.into_owned()
 }
 
 // Go: scanner/utilities.go:56 GetTextOfNode

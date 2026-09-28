@@ -309,7 +309,15 @@ pub fn deprecate_sort_text(original: &str) -> SortText {
     format!("z{original}")
 }
 
-// Go: ls/completions.go:217 sortBelow
+// Go: ls/completions.go:219 ObjectLiteralPropertySortText
+pub fn object_literal_property_sort_text(
+    preset_sort_text: &str,
+    symbol_display_name: &str,
+) -> SortText {
+    format!("{preset_sort_text}\x00{symbol_display_name}\x00")
+}
+
+// Go: ls/completions.go:223 SortBelow
 pub fn sort_below(original: &str) -> SortText {
     format!("{original}1")
 }
@@ -816,14 +824,16 @@ impl LanguageService {
                     import_statement_completion_info.is_new_identifier_location;
             }
             // Bail out if this is a known invalid completion location.
-            if is_completion_list_blocker(
-                context_token,
-                previous_token,
-                location,
-                file,
-                position,
-                type_checker,
-            ) {
+            if import_statement_completion_info.replacement_span.is_none()
+                && is_completion_list_blocker(
+                    context_token,
+                    previous_token,
+                    location,
+                    file,
+                    position,
+                    type_checker,
+                )
+            {
                 if keyword_filters != KeywordCompletionFilters::NONE {
                     let (is_new_identifier_location, _) =
                         compute_commit_characters_and_is_new_identifier(
@@ -888,8 +898,7 @@ impl LanguageService {
                         return Ok(None);
                     }
                 }
-            } else {
-                // !!! else if (!importStatementCompletion)
+            } else if import_statement_completion.is_none() {
                 // <UI.Test /* completion position */ />
                 // If the tagname is a property access expression, we will then walk up to the top most of property access expression.
                 // Then, try to get a JSX container and its associated attributes type.
@@ -1772,12 +1781,7 @@ impl GetCompletionDataState<'_> {
             self.symbols.extend(filtered_members.iter().copied());
 
             // Set sort texts.
-            let transform_object_literal_members = self
-                .preferences
-                .include_completions_with_object_literal_method_snippets
-                .is_true()
-                && object_like_container.kind() == SyntaxKind::ObjectLiteralExpression;
-            for member in filtered_members {
+            for &member in &filtered_members {
                 let symbol_id = get_symbol_id(&self.type_checker.symbols, member);
                 if spread_member_names.contains(self.type_checker.sym(member).name.as_str()) {
                     self.symbol_to_sort_text_map.insert(
@@ -1796,8 +1800,50 @@ impl GetCompletionDataState<'_> {
                             .insert(symbol_id, SORT_TEXT_OPTIONAL_MEMBER.to_string());
                     }
                 }
-                if transform_object_literal_members {
-                    // !!! object literal member snippet completions
+                if object_like_container.kind() == SyntaxKind::ObjectLiteralExpression
+                    && self
+                        .preferences
+                        .include_completions_with_object_literal_method_snippets
+                        .is_true()
+                {
+                    let (display_name, _) = get_completion_entry_display_name_for_symbol(
+                        &self.type_checker.symbols,
+                        member,
+                        None, /*origin*/
+                        CompletionKind::OBJECT_PROPERTY_DECLARATION,
+                        false, /*isJsxIdentifierExpected*/
+                    );
+                    if !display_name.is_empty() {
+                        // Go: core.OrElse(symbolToSortTextMap[symbolId], SortTextLocationPriority)
+                        let original_sort_text = match self.symbol_to_sort_text_map.get(&symbol_id)
+                        {
+                            Some(sort_text) if !sort_text.is_empty() => sort_text.clone(),
+                            _ => SORT_TEXT_LOCATION_PRIORITY.to_string(),
+                        };
+                        self.symbol_to_sort_text_map.insert(
+                            symbol_id,
+                            object_literal_property_sort_text(&original_sort_text, &display_name),
+                        );
+                    }
+                }
+            }
+
+            if object_like_container.kind() == SyntaxKind::ObjectLiteralExpression
+                && self
+                    .preferences
+                    .include_completions_with_object_literal_method_snippets
+                    .is_true()
+            {
+                for entry in self.l.collect_object_literal_method_symbols(
+                    self.ctx,
+                    self.type_checker,
+                    &filtered_members,
+                    object_like_container,
+                    self.file,
+                ) {
+                    self.symbol_to_origin_info_map
+                        .insert(self.symbols.len() as i32, entry.origin);
+                    self.symbols.push(entry.symbol);
                 }
             }
         }

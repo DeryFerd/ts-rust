@@ -833,34 +833,45 @@ impl Checker {
         &mut self,
         symbol: SymbolId,
     ) -> Vec<TypeId> {
-        let mut declaration = self.sym(symbol).value_declaration;
-        if !self
-            .sym(symbol)
-            .flags
-            .intersects(SymbolFlags::CLASS | SymbolFlags::FUNCTION)
-        {
-            declaration = self
-                .sym(symbol)
-                .declarations
-                .iter()
-                .copied()
-                .find(|&d| {
-                    if is_interface_declaration(d) {
-                        return true;
-                    }
-                    if !is_variable_declaration(d) {
-                        return false;
-                    }
-                    let initializer = d.initializer();
-                    initializer.is_some() && is_function_expression_or_arrow_function(initializer)
-                })
-                .unwrap_or_default();
-        }
+        let declaration = self.get_class_or_interface_like_declaration(symbol);
         debug_assert!(
             declaration.is_some(),
             "Class was missing valueDeclaration -OR- non-class had no interface declarations"
         );
         self.get_outer_type_parameters(declaration, false /*includeThisTypes*/)
+    }
+
+    // Go: checker/checker.go:23760 getClassOrInterfaceLikeDeclaration
+    // Returns the declaration used to obtain a class, interface, or function symbol's outer type parameters.
+    pub fn get_class_or_interface_like_declaration(&self, symbol: SymbolId) -> Node {
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::CLASS | SymbolFlags::FUNCTION)
+        {
+            return self.sym(symbol).value_declaration;
+        }
+        self.sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&d| {
+                if is_interface_declaration(d) {
+                    return true;
+                }
+                if !is_variable_declaration(d) {
+                    return false;
+                }
+                let initializer = d.initializer();
+                initializer.is_some() && is_function_expression_or_arrow_function(initializer)
+            })
+            .unwrap_or_default()
+    }
+
+    // Go: checker/checker.go:23776 canGetTypeParametersOfClassOrInterface
+    pub fn can_get_type_parameters_of_class_or_interface(&self, symbol: SymbolId) -> bool {
+        self.get_class_or_interface_like_declaration(symbol)
+            .is_some()
     }
 
     // Return the outer type parameters of a node or undefined if the node has no outer type parameters.
@@ -1101,7 +1112,7 @@ impl Checker {
             for &declaration in self.sym(symbol).declarations.clone().iter() {
                 if declaration.kind() == SyntaxKind::EnumDeclaration {
                     for member in declaration.members().to_vec() {
-                        if self.has_bindable_name(member) {
+                        if !has_dynamic_name(member) {
                             let member_symbol = self.get_symbol_of_declaration(member);
                             let value = self.get_enum_member_value(member).value;
                             let member_type = if let Some(value) = value {

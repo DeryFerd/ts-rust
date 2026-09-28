@@ -367,7 +367,10 @@ impl DeclarationTransformer {
         }
         // PORT: Go keys `expandoHosts` by `ast.NodeId`; it is keyed by `Node`.
         let original = ec.most_original(input);
-        if self.expando_hosts.contains_key(&original) {
+        let is_expando_host = self.expando_hosts.contains_key(&original);
+        let has_deferred_expando_assignments =
+            self.deferred_expando_assignments.contains_key(&original);
+        if is_expando_host || has_deferred_expando_assignments {
             return self.create_full_expando_block(original);
         }
 
@@ -376,7 +379,7 @@ impl DeclarationTransformer {
             self.enclosing_declaration = input;
         }
 
-        let can_prodice_diagnostic = can_produce_diagnostics(input);
+        let can_produce_diagnostic = can_produce_diagnostics(input);
         let (old_diag, old_name) = {
             let state = self.state.borrow();
             (
@@ -384,7 +387,7 @@ impl DeclarationTransformer {
                 state.error_name_node,
             )
         };
-        if can_prodice_diagnostic {
+        if can_produce_diagnostic {
             self.state.borrow_mut().get_symbol_accessibility_diagnostic =
                 Some(create_get_symbol_accessibility_diagnostic_for_node(input));
         }

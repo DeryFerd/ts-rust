@@ -486,6 +486,7 @@ impl NewProgram {
                             RESOLUTION_MODE_COMMON_JS,
                             None,
                         ) && package_resolution.is_resolved()
+                            && !package_resolution.original_path.is_empty()
                         {
                             known_symlinks.process_resolution(
                                 &combine_paths(

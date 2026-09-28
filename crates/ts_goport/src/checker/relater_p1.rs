@@ -694,9 +694,9 @@ impl Checker {
             head_message,
             IntersectionState::NONE,
         );
-        let (overflow, relation_count, has_error_chain) = {
+        let (overflow, has_error_chain) = {
             let rb = r.borrow();
-            (rb.overflow, rb.relation_count, rb.error_chain.is_some())
+            (rb.overflow, rb.error_chain.is_some())
         };
         if overflow {
             // Record this relation as having failed such that we don't attempt the overflowing operation again.
@@ -710,12 +710,7 @@ impl Checker {
             );
             relation.borrow_mut().set(
                 id,
-                RelationComparisonResult::FAILED
-                    | if relation_count <= 0 {
-                        RelationComparisonResult::COMPLEXITY_OVERFLOW
-                    } else {
-                        RelationComparisonResult::STACK_DEPTH_OVERFLOW
-                    },
+                RelationComparisonResult::FAILED | RelationComparisonResult::COMPLEXITY_OVERFLOW,
             );
             if let Some(tr) = self.tracer {
                 let (depth, target_depth) = {
@@ -733,18 +728,16 @@ impl Checker {
                     ],
                 );
             }
-            let message = if relation_count <= 0 {
-                diag::Excessive_complexity_comparing_types_0_and_1
-            } else {
-                diag::Excessive_stack_depth_comparing_types_0_and_1
-            };
             if error_node.is_nil() {
                 error_node = self.current_node;
             }
             let source_string = self.type_to_string(source);
             let target_string = self.type_to_string(target);
-            let diagnostic =
-                new_diagnostic_for_node(error_node, message, args![source_string, target_string]);
+            let diagnostic = new_diagnostic_for_node(
+                error_node,
+                diag::Excessive_complexity_comparing_types_0_and_1,
+                args![source_string, target_string],
+            );
             self.report_diagnostic(diagnostic, diagnostic_output);
         } else if has_error_chain {
             // Check if we should issue an extra diagnostic to produce a quickfix for a slightly incorrect import statement
@@ -1674,37 +1667,31 @@ impl Checker {
     // instantiations is not infinitely expanding. Effectively, we will generate a false positive when two types are
     // structurally equal to at least maxDepth levels, but unequal at some level beyond that.
     pub fn is_deeply_nested_type(&mut self, t: TypeId, stack: &[TypeId], max_depth: i32) -> bool {
-        let mut t = t;
         if stack.len() as i32 >= max_depth {
-            if self
-                .ty(t)
-                .object_flags
-                .contains(ObjectFlags::INSTANTIATED_MAPPED)
-            {
-                t = self.get_mapped_target_with_symbol(t);
-            }
-            if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                for i in 0..self.ty(t).types().len() {
-                    if self.is_deeply_nested_type(self.type_at(t, i), stack, max_depth) {
+            let target = self.get_recursion_identity_target(t);
+            if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) {
+                for i in 0..self.ty(target).types().len() {
+                    if self.is_deeply_nested_type(self.type_at(target, i), stack, max_depth) {
                         return true;
                     }
                 }
-            }
-            let identity = self.get_recursion_identity(t);
-            let mut count: i32 = 0;
-            let mut last_type_id = TypeId(0);
-            for &t in stack {
-                if self.has_matching_recursion_identity(t, identity) {
-                    // We only count occurrences with a higher type id than the previous occurrence, since higher
-                    // type ids are an indicator of newer instantiations caused by recursion.
-                    let id = t;
-                    if id >= last_type_id {
-                        count += 1;
-                        if count >= max_depth {
-                            return true;
+            } else {
+                let identity = self.get_recursion_identity_from_target(target);
+                let mut count: i32 = 0;
+                let mut last_type_id = TypeId(0);
+                for &t in stack {
+                    if self.has_matching_recursion_identity(t, identity) {
+                        // We only count occurrences with a higher type id than the previous occurrence, since higher
+                        // type ids are an indicator of newer instantiations caused by recursion.
+                        let id = t;
+                        if id >= last_type_id {
+                            count += 1;
+                            if count >= max_depth {
+                                return true;
+                            }
                         }
+                        last_type_id = id;
                     }
-                    last_type_id = id;
                 }
             }
         }
@@ -1715,18 +1702,21 @@ impl Checker {
     // stacks (`invoke_once`) and the relater stacks
     // (`is_deeply_nested_relater_type`). `None` marks an entry that still needs
     // `has_matching_recursion_identity`: an instantiated mapped type (its
-    // mapped target can make types) or an intersection (its parts can be
-    // mapped types). For any other type that function is
-    // `get_recursion_identity(t) == identity`, and `get_recursion_identity`
+    // mapped target can make types), an indexed access (its object type can
+    // be a mapped type) or an intersection (its parts can be mapped types).
+    // Any other type is its own `get_recursion_identity_target`, so that
+    // function is `get_recursion_identity_from_target(t) == identity`, which
     // reads only type data that is fixed at type creation.
     pub fn stack_recursion_id(&self, t: TypeId) -> Option<RecursionId> {
         let ty = self.ty(t);
         if ty.object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED)
-            || ty.flags.intersects(TypeFlags::INTERSECTION)
+            || ty
+                .flags
+                .intersects(TypeFlags::INTERSECTION | TypeFlags::INDEXED_ACCESS)
         {
             return None;
         }
-        Some(self.get_recursion_identity(t))
+        Some(self.get_recursion_identity_from_target(t))
     }
 
     // PORT: perf. `is_deeply_nested_type` for stacks that keep recursion
@@ -1734,10 +1724,10 @@ impl Checker {
     // `is_deeply_nested_relater_type`, the relater stacks). `ids[i]` is
     // `stack_recursion_id(stack[i])`. An entry with an id is compared
     // directly. `probe_id` is `stack_recursion_id(t)` when the caller has it,
-    // else `None`. A probe with an id is not an instantiated mapped type or
-    // an intersection, so the Go code would only compute that same id. The
-    // other probes and the `None` entries run the Go code, so
-    // `get_mapped_target_with_symbol` runs for the same types in Go order.
+    // else `None`. A probe with an id is its own recursion identity target
+    // and not an intersection, so the Go code would only compute that same
+    // id. The other probes and the `None` entries run the Go code, so
+    // `get_recursion_identity_target` runs for the same types in Go order.
     // `ids` holds `Option<RecursionId>` (relater stacks) or `RecursionKey`
     // (inference stacks, which convert to the same `Option<RecursionId>`).
     // Go: checker/relater.go:773 isDeeplyNestedType
@@ -1755,18 +1745,11 @@ impl Checker {
             let identity = match probe_id {
                 Some(id) => id,
                 None => {
-                    let mut t = t;
-                    if self
-                        .ty(t)
-                        .object_flags
-                        .contains(ObjectFlags::INSTANTIATED_MAPPED)
-                    {
-                        t = self.get_mapped_target_with_symbol(t);
-                    }
-                    if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                        for i in 0..self.ty(t).types().len() {
+                    let target = self.get_recursion_identity_target(t);
+                    if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) {
+                        for i in 0..self.ty(target).types().len() {
                             if self.is_deeply_nested_type_with_ids(
-                                self.type_at(t, i),
+                                self.type_at(target, i),
                                 None,
                                 stack,
                                 ids,
@@ -1775,8 +1758,9 @@ impl Checker {
                                 return true;
                             }
                         }
+                        return false;
                     }
-                    self.get_recursion_identity(t)
+                    self.get_recursion_identity_from_target(target)
                 }
             };
             let mut count: i32 = 0;
@@ -1832,67 +1816,70 @@ impl Checker {
         self.is_deeply_nested_type_with_ids(t, probe_id, stack, ids, max_depth)
     }
 
-    // Go: checker/relater.go:807 getMappedTargetWithSymbol
-    // Unwrap nested homomorphic mapped types and return the deepest target type that has a symbol. This better
-    // preserves unique type identities for mapped types applied to explicitly written object literals. For example
-    // in `Mapped<{ x: Mapped<{ x: Mapped<{ x: string }>}>}>`, each of the mapped type applications will have a
-    // unique recursion identity (that of their target object type literal) and thus avoid appearing deeply nested.
-    pub fn get_mapped_target_with_symbol(&mut self, t: TypeId) -> TypeId {
-        let mut t = t;
-        loop {
-            if self
-                .ty(t)
-                .object_flags
-                .contains(ObjectFlags::INSTANTIATED_MAPPED)
-            {
-                let target = self.get_modifiers_type_from_mapped_type(t);
-                if target.is_some()
-                    && (self.ty(target).symbol.is_some()
-                        || self.ty(target).flags.intersects(TypeFlags::INTERSECTION)
-                            && self
-                                .ty(target)
-                                .types()
-                                .iter()
-                                .any(|&t| self.ty(t).symbol.is_some()))
-                {
-                    t = target;
-                    continue;
-                }
-            }
-            return t;
-        }
-    }
-
-    // Go: checker/relater.go:821 hasMatchingRecursionIdentity
+    // Go: checker/relater.go:800 hasMatchingRecursionIdentity
+    // PORT: Go package functions `hasMatchingRecursionIdentity`,
+    // `getRecursionIdentity` and `getRecursionIdentityTarget` reach the
+    // checker through `t.checker`, so they are Checker methods here.
     pub fn has_matching_recursion_identity(&mut self, t: TypeId, identity: RecursionId) -> bool {
-        let mut t = t;
-        if self
-            .ty(t)
-            .object_flags
-            .contains(ObjectFlags::INSTANTIATED_MAPPED)
-        {
-            t = self.get_mapped_target_with_symbol(t);
-        }
-        if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            for i in 0..self.ty(t).types().len() {
-                if self.has_matching_recursion_identity(self.type_at(t, i), identity) {
+        let target = self.get_recursion_identity_target(t);
+        if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) {
+            for i in 0..self.ty(target).types().len() {
+                if self.has_matching_recursion_identity(self.type_at(target, i), identity) {
                     return true;
                 }
             }
             return false;
         }
-        self.get_recursion_identity(t) == identity
+        self.get_recursion_identity_from_target(target) == identity
     }
 
-    // Go: checker/relater.go:842 getRecursionIdentity
+    // Go: checker/relater.go:813 getRecursionIdentity
+    pub fn get_recursion_identity(&mut self, t: TypeId) -> RecursionId {
+        let target = self.get_recursion_identity_target(t);
+        self.get_recursion_identity_from_target(target)
+    }
+
+    // Go: checker/relater.go:823 getRecursionIdentityTarget
+    // Get the recursion identity target type from a type. Recursively (a) obtain the target object type of an
+    // indexed access (i.e. the T in T[K]), and (b) unwrap nested homomorphic mapped types and return the deepest
+    // target type that has a symbol. The unwrapping better preserves unique type identities for mapped types applied
+    // to explicitly written object literals. For example in `Mapped<{ x: Mapped<{ x: Mapped<{ x: string }>}>}>`,
+    // each of the mapped type applications will have a unique recursion identity (that of their target object type
+    // literal) and thus avoid appearing deeply nested.
+    pub fn get_recursion_identity_target(&mut self, t: TypeId) -> TypeId {
+        if self.ty(t).flags.intersects(TypeFlags::INDEXED_ACCESS) {
+            let object_type = self.ty(t).as_indexed_access_type().object_type;
+            return self.get_recursion_identity_target(object_type);
+        }
+        if self
+            .ty(t)
+            .object_flags
+            .contains(ObjectFlags::INSTANTIATED_MAPPED)
+        {
+            let target = self.get_modifiers_type_from_mapped_type(t);
+            if target.is_some()
+                && (self.ty(target).symbol.is_some()
+                    || self.ty(target).flags.intersects(TypeFlags::INTERSECTION)
+                        && self
+                            .ty(target)
+                            .types()
+                            .iter()
+                            .any(|&t| self.ty(t).symbol.is_some()))
+            {
+                return self.get_recursion_identity_target(target);
+            }
+        }
+        t
+    }
+
+    // Go: checker/relater.go:840 getRecursionIdentityFromTarget
     // The recursion identity of a type is an object identity that is shared among multiple instantiations of the type.
     // We track recursion identities in order to identify deeply nested and possibly infinite type instantiations with
     // the same origin. For example, when type parameters are in scope in an object type such as { x: T }, all
     // instantiations of that type have the same recursion identity. The default recursion identity is the object
     // identity of the type, meaning that every type is unique. Generally, types with constituents that could circularly
     // reference the type have a recursion identity that differs from the object identity.
-    pub fn get_recursion_identity(&self, t: TypeId) -> RecursionId {
-        let mut t = t;
+    pub fn get_recursion_identity_from_target(&self, t: TypeId) -> RecursionId {
         let flags = self.ty(t).flags;
         let object_flags = self.ty(t).object_flags;
         let symbol = self.ty(t).symbol;
@@ -1925,14 +1912,6 @@ impl Checker {
             // We use the symbol of the type parameter such that all "fresh" instantiations of that type parameter
             // have the same recursion identity.
             return as_recursion_id(symbol);
-        }
-        if flags.intersects(TypeFlags::INDEXED_ACCESS) {
-            // Identity is the leftmost object type in a chain of indexed accesses, eg, in A[P1][P2][P3] it is A.
-            t = self.ty(t).as_indexed_access_type().object_type;
-            while self.ty(t).flags.intersects(TypeFlags::INDEXED_ACCESS) {
-                t = self.ty(t).as_indexed_access_type().object_type;
-            }
-            return as_recursion_id(t);
         }
         if flags.intersects(TypeFlags::CONDITIONAL) {
             // The root object represents the origin of the conditional type

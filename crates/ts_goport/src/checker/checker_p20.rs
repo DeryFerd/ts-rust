@@ -978,11 +978,20 @@ impl Checker {
                 if !self.no_implicit_any {
                     diagnostic = diag::X_0_implicitly_has_an_1_return_type_but_a_better_type_may_be_inferred_from_usage;
                 } else if declaration.flags().intersects(NodeFlags::REPARSED) {
-                    self.error(
-                        declaration,
-                        diag::This_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation,
-                        args![type_as_string],
-                    );
+                    let name = declaration_name_to_string(get_name_of_declaration(declaration));
+                    if !name.is_empty() {
+                        self.error(
+                            declaration,
+                            diag::X_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type,
+                            args![name, type_as_string],
+                        );
+                    } else {
+                        self.error(
+                            declaration,
+                            diag::This_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation,
+                            args![type_as_string],
+                        );
+                    }
                     return;
                 } else if widening_kind == WideningKind::GENERATOR_YIELD {
                     diagnostic =

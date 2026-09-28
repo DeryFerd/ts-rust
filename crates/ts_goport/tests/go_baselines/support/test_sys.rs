@@ -510,11 +510,14 @@ impl TestSys {
             shared.written_files.clone(),
         );
         // Go: sys.go:136 `NewMockWatchBackend()` with `DirectoryExists` of
-        // the map file system (`sys.fs.FS`).
+        // the map file system (`sys.fs.FS`), and (sys.go:138)
+        // `UseCaseSensitiveFileNames = !tscInput.ignoreCase`, which is the
+        // map file system's value.
         let mut mock_watch_backend = MockWatchBackend::new();
         let map_view = shared.map_fs.fs();
         mock_watch_backend.directory_exists =
             Some(Box::new(move |path: &str| map_view.directory_exists(path)));
+        mock_watch_backend.use_case_sensitive_file_names = use_case_sensitive_file_names;
         TestSys {
             current_write,
             writer,

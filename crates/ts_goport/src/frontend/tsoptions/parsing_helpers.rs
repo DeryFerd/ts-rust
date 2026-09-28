@@ -73,29 +73,38 @@ pub fn parse_number(value: &CompilerOptionsValue) -> Option<i32> {
     None
 }
 
-// Go: tsoptions/parsinghelpers.go:73 parseProjectReference
-// PORT: Go `[]*core.ProjectReference` is `Vec<ProjectReference>`. Go
-// `v.(string)` and `v.(bool)` panic on a wrong type; the Rust port panics
-// with the same meaning. Option validation makes both unreachable.
-pub fn parse_project_reference(json: &CompilerOptionsValue) -> Vec<ProjectReference> {
-    let mut result = Vec::new();
+// Go: tsoptions/parsinghelpers.go:75 projectReferenceParseResult
+#[derive(Clone, Debug, Default)]
+pub struct ProjectReferenceParseResult {
+    pub reference: ProjectReference,
+    pub has_path: bool,
+    pub path_valid: bool,
+    pub has_circular: bool,
+    pub circular_valid: bool,
+}
+
+// Go: tsoptions/parsinghelpers.go:83 parseProjectReference
+// PORT: Go returns a nilable pointer; that is `Option`.
+pub fn parse_project_reference(json: &CompilerOptionsValue) -> Option<ProjectReferenceParseResult> {
     if let CompilerOptionsValue::Map(v) = json {
-        let mut reference = ProjectReference::default();
-        if let Some(v) = v.get("path") {
-            reference.path = match v {
-                CompilerOptionsValue::String(s) => s.clone(),
-                _ => panic!("interface conversion: reference path is not string"),
-            };
+        let mut result = ProjectReferenceParseResult::default();
+        if let Some(value) = v.get("path") {
+            result.has_path = true;
+            if let CompilerOptionsValue::String(path) = value {
+                result.reference.path = path.clone();
+                result.path_valid = true;
+            }
         }
-        if let Some(v) = v.get("circular") {
-            reference.circular = match v {
-                CompilerOptionsValue::Bool(b) => *b,
-                _ => panic!("interface conversion: reference circular is not bool"),
-            };
+        if let Some(value) = v.get("circular") {
+            result.has_circular = true;
+            if let CompilerOptionsValue::Bool(circular) = value {
+                result.reference.circular = *circular;
+                result.circular_valid = true;
+            }
         }
-        result.push(reference);
+        return Some(result);
     }
-    result
+    None
 }
 
 // Go: tsoptions/parsinghelpers.go:88 parseJsonToStringKey

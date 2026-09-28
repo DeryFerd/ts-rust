@@ -115,6 +115,7 @@ impl<'a> AffectedFilesHandler<'a> {
     // PORT: emit runs `WriteFile` on the file's checker thread, so the
     // signature comes back through a shared cell.
     fn compute_dts_signature(&self, file: Node) -> String {
+        let done = self.program.begin_nested_emit();
         let signature = Arc::new(Mutex::new(String::new()));
         let hash_with_text = self.program.snapshot.borrow().hash_with_text;
         let result_cell = Arc::clone(&signature);
@@ -134,6 +135,8 @@ impl<'a> AffectedFilesHandler<'a> {
             write_file: Some(write_file),
         });
         let result = signature.lock().expect("signature lock").clone();
+        // Go: defer done()
+        done();
         result
     }
 
@@ -169,7 +172,7 @@ impl<'a> AffectedFilesHandler<'a> {
         changed
     }
 
-    // Go: incremental/affectedfileshandler.go:111 getFilesAffectedBy
+    // Go: incremental/affectedfileshandler.go:112 getFilesAffectedBy
     fn get_files_affected_by(&mut self, path: &Path) -> Vec<Node> {
         let file = get_source_file_by_path(path);
         if file.is_nil() {
@@ -190,11 +193,12 @@ impl<'a> AffectedFilesHandler<'a> {
             .affects_global_scope;
         if affects_global_scope {
             self.has_all_files_excluding_default_library_file = true;
-            let _ = self
+            return self
                 .program
                 .snapshot
                 .borrow()
-                .get_all_files_excluding_default_library_file(file);
+                .get_all_files_excluding_default_library_file(file)
+                .to_vec();
         }
 
         if self

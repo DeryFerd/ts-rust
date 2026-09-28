@@ -120,12 +120,29 @@ fn get_token_at_position_unexported(
     // When scanning in between nodes for token, we should only scan up to the start of `nodeAfterLeft`.
     let node_after_left: Cell<Node> = Cell::new(Node::NIL);
 
+    let get_included_preceding_token = |subtree: Node| -> Node {
+        let child =
+            find_preceding_token_ex(source_file, position, subtree, false /*excludeJSDoc*/);
+        // PORT: Go calls this only when the callback is not nil.
+        let include = include_preceding_token_at_end_position
+            .expect("includePrecedingTokenAtEndPosition is nil");
+        if child.is_some() && child.end() == position && include(child) {
+            return child;
+        }
+        Node::NIL
+    };
+
     let test_node = |node: Node| -> i32 {
         if node.kind() != SyntaxKind::EndOfFile
             && node.end() == position
             && include_preceding_token_at_end_position.is_some()
             && !node.flags().intersects(NodeFlags::REPARSED)
         {
+            if prev_subtree.get().is_some()
+                && get_included_preceding_token(prev_subtree.get()).is_some()
+            {
+                return 0;
+            }
             prev_subtree.set(node);
         }
 
@@ -278,16 +295,8 @@ fn get_token_at_position_unexported(
         // Check if the rightmost token of prevSubtree should be returned based on the
         // `includePrecedingTokenAtEndPosition` callback.
         if prev_subtree.get().is_some() {
-            let child = find_preceding_token_ex(
-                source_file,
-                position,
-                prev_subtree.get(),
-                false, /*excludeJSDoc*/
-            );
-            // PORT: `prevSubtree` is only set when the callback is not nil.
-            let include = include_preceding_token_at_end_position
-                .expect("includePrecedingTokenAtEndPosition is nil");
-            if child.is_some() && child.end() == position && include(child) {
+            let child = get_included_preceding_token(prev_subtree.get());
+            if child.is_some() {
                 // Optimization: includePrecedingTokenAtEndPosition only ever returns true
                 // for real AST nodes, so we don't run the scanner here.
                 return child;
@@ -752,7 +761,7 @@ fn find_rightmost_valid_token(
                 while start_pos < visited_node.pos().min(position) {
                     let token = scan_navigation_token(&mut scanner, n);
                     let token_start = scanner.token_start();
-                    if token_start >= position {
+                    if token_start >= visited_node.pos().min(position) {
                         break;
                     }
                     let token_full_start = scanner.token_full_start();
@@ -777,7 +786,7 @@ fn find_rightmost_valid_token(
             while start_pos < end_pos.min(position) {
                 let token = scan_navigation_token(&mut scanner, n);
                 let token_start = scanner.token_start();
-                if token_start >= position {
+                if token_start >= end_pos.min(position) {
                     break;
                 }
                 let token_full_start = scanner.token_full_start();

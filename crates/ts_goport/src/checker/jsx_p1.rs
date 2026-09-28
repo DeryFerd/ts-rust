@@ -15,6 +15,7 @@ pub struct JsxElementLinks {
     pub resolved_jsx_element_attributes_type: TypeId, // Resolved element attributes type of a JSX opening-like element
     pub jsx_namespace: SymbolId,                      // Resolved JSX namespace symbol for this node
     pub jsx_implicit_import_container: SymbolId, // Resolved module symbol the implicit JSX import of this file should refer to
+    pub first_jsx_tag_in_file: Node,             // The first JSX tag in the file
 }
 
 // Go: checker/jsx.go:41 JsxNames

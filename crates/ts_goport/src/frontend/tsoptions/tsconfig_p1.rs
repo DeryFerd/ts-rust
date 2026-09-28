@@ -19,8 +19,6 @@ fn leak_option(o: CommandLineOption) -> &'static CommandLineOption {
 #[derive(Clone, Debug, Default)]
 pub struct ExtendsResult {
     pub options: CompilerOptions,
-    // watchOptions        compiler.WatchOptions
-    pub watch_options_copied: bool,
     pub include: Option<Vec<CompilerOptionsValue>>,
     pub exclude: Option<Vec<CompilerOptionsValue>>,
     pub files: Option<Vec<CompilerOptionsValue>>,
@@ -74,7 +72,6 @@ pub static TSCONFIG_ROOT_OPTIONS_MAP: LazyLock<&'static CommandLineOption> = Laz
         kind: CommandLineOptionKind::OBJECT,
         element_options: command_line_options_to_map(&[
             *COMPILER_OPTIONS_DECLARATION,
-            // watchOptionsDeclaration,
             *TYPE_ACQUISITION_DECLARATION,
             *EXTENDS_OPTION_DECLARATION,
             leak_option(CommandLineOption {
@@ -255,7 +252,6 @@ impl ExtendedConfigCacheEntry {
 pub struct ParsedTsconfig {
     pub raw: CompilerOptionsValue,
     pub options: Option<CompilerOptions>,
-    // watchOptions *core.WatchOptions
     pub type_acquisition: Option<TypeAcquisition>,
     // Note that the case of the config path has not yet been normalized, as no files have been imported into the project yet
     pub extended_config_path: Option<Vec<String>>,
@@ -270,7 +266,6 @@ pub fn parse_own_config_of_json_source_file(
 ) -> (ParsedTsconfig, Vec<Diagnostic>) {
     let mut compiler_options = get_default_compiler_options(config_file_name);
     let mut type_acquisition = get_default_type_acquisition(config_file_name);
-    // var watchOptions *compiler.WatchOptions
     let mut extended_config_path: Option<Vec<String>> = None;
     let mut root_compiler_options: Vec<Node> = Vec::new();
     let mut errors: Vec<Diagnostic> = Vec::new();
@@ -320,7 +315,12 @@ pub fn parse_own_config_of_json_source_file(
                 && let Some(unknown_name_diag) = extra_key_diagnostics(parent_option.name)
             {
                 if !parent_option.element_options.is_nil() {
-                    let possible_option = parent_option.element_options.get(key_text);
+                    let mut possible_option = parent_option.element_options.get(key_text);
+                    if possible_option.is_none() {
+                        possible_option = parent_option
+                            .element_options
+                            .get_spelling_suggestion(key_text);
+                    }
                     if let Some(possible_option) = possible_option
                         && possible_option.name != key_text
                     {
@@ -339,6 +339,8 @@ pub fn parse_own_config_of_json_source_file(
                             property_assignment.name(),
                             source_file,
                             None, /*alternateMode*/
+                            None, /*unknownDidYouMeanDiagnostic*/
+                            None, /*optionsNameMap*/
                         ));
                     }
                 } else {
@@ -367,7 +369,7 @@ pub fn parse_own_config_of_json_source_file(
                         args![],
                     ));
                 }
-                if OPTIONS_DECLARATIONS
+                if OPTIONS_FOR_COMPILER
                     .iter()
                     .any(|option| option.name == key_text)
                 {
@@ -386,15 +388,21 @@ pub fn parse_own_config_of_json_source_file(
         convert_config_file_to_object(source_file, Some(&mut notifier))
     };
     errors.extend(err);
-    // if len(rootCompilerOptions) != 0  && json != nil && json.CompilerOptions != nil {
-    //    errors = append(errors, ast.NewDiagnostic(sourceFile, rootCompilerOptions[0], diagnostics.X_0_should_be_set_inside_the_compilerOptions_object_of_the_config_json_file))
-    // }
-    let _ = root_compiler_options;
+    if let CompilerOptionsValue::Map(json_object) = &json
+        && !root_compiler_options.is_empty()
+        && !json_object.contains_key("compilerOptions")
+    {
+        errors.push(create_diagnostic_for_node_in_source_file(
+            source_file,
+            root_compiler_options[0],
+            diag::X_0_should_be_set_inside_the_compilerOptions_object_of_the_config_json_file,
+            args![get_text_of_property_name(root_compiler_options[0])],
+        ));
+    }
     (
         ParsedTsconfig {
             raw: json,
             options: Some(compiler_options),
-            // watchOptions:    watchOptions,
             type_acquisition: Some(type_acquisition),
             extended_config_path,
         },
@@ -486,7 +494,9 @@ pub fn convert_config_file_to_object(
         if get_base_file_name(source_file_file_name(source_file)) == "jsconfig.json" {
             base_file_name = "jsconfig.json";
         }
-        let errors = vec![new_compiler_diagnostic(
+        let errors = vec![create_diagnostic_for_node_in_source_file(
+            source_file,
+            root_expression,
             diag::The_root_value_of_a_0_file_must_be_an_object,
             args![base_file_name],
         )];
@@ -989,6 +999,27 @@ impl CommandLineOptionNameMap {
         }
     }
 
+    // Go: tsoptions/tsconfigparsing.go:606 CommandLineOptionNameMap.GetSpellingSuggestion
+    // PORT: Go map order is random. The result does not depend on it: the
+    // closest name wins and a tie goes to the smaller name (`compare`).
+    #[must_use]
+    pub fn get_spelling_suggestion(&self, name: &str) -> Option<&'static CommandLineOption> {
+        get_spelling_suggestion(
+            name,
+            self.0.values().map(|option| Some(*option)),
+            |option: &Option<&'static CommandLineOption>| option.map_or("", |option| option.name),
+            |a: &Option<&'static CommandLineOption>, b: &Option<&'static CommandLineOption>| {
+                let a = a.map_or("", |option| option.name);
+                let b = b.map_or("", |option| option.name);
+                match a.cmp(b) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            },
+        )
+    }
+
     /// Go `m == nil`.
     #[must_use]
     pub fn is_nil(&self) -> bool {
@@ -1064,43 +1095,23 @@ pub fn convert_options_from_json<O: OptionParser>(
                 Node::NIL,
                 Node::NIL,
                 None,
+                Some(result.unknown_did_you_mean_diagnostic()),
+                Some(options_name_map),
             ));
             continue;
         };
 
-        let command_line_option_enum_map_val = opt.enum_map();
-        if let Some(command_line_option_enum_map_val) = command_line_option_enum_map_val {
-            if let CompilerOptionsValue::String(value) = value {
-                if let Some(val) = command_line_option_enum_map_val.get(&value.to_lowercase()) {
-                    // Go assigns (not appends) here, dropping earlier errors.
-                    errors = result.parse_option(key, val.clone());
-                }
-            } else {
-                let (convert_json, err) = convert_json_option(
-                    opt,
-                    value.clone(),
-                    base_path,
-                    Node::NIL,
-                    Node::NIL,
-                    Node::NIL,
-                );
-                errors.extend(err);
-                let compiler_options_err = result.parse_option(key, convert_json);
-                errors.extend(compiler_options_err);
-            }
-        } else {
-            let (convert_json, err) = convert_json_option(
-                opt,
-                value.clone(),
-                base_path,
-                Node::NIL,
-                Node::NIL,
-                Node::NIL,
-            );
-            errors.extend(err);
-            let compiler_options_err = result.parse_option(key, convert_json);
-            errors.extend(compiler_options_err);
-        }
+        let (convert_json, err) = convert_json_option(
+            opt,
+            value.clone(),
+            base_path,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        errors.extend(err);
+        let compiler_options_err = result.parse_option(key, convert_json);
+        errors.extend(compiler_options_err);
     }
     (result, errors)
 }
@@ -1473,8 +1484,15 @@ pub fn parse_json_config_file_content(
     extra_file_extensions: &[FileExtensionInfo],
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ParsedCommandLine {
+    // PORT: Go changes a caller's ordered map in place; the port normalizes a
+    // copy.
+    let normalized = normalize_json_value(json.clone());
+    let json_object = match normalized {
+        CompilerOptionsValue::Map(json_object) => json_object,
+        _ => IndexMap::new(),
+    };
     parse_json_config_file_content_worker(
-        parse_json_to_string_key(json),
+        Some(json_object),
         None, /*sourceFile*/
         host,
         base_path,
@@ -1485,6 +1503,32 @@ pub fn parse_json_config_file_content(
         extra_file_extensions,
         extended_config_cache,
     )
+}
+
+// Go: tsoptions/tsconfigparsing.go:882 normalizeJsonValue
+// PORT: `CompilerOptionsValue` has no form for a Go `map[string]any` (Go
+// sorts its keys into an ordered map), so only the ordered map case is
+// ported. A Go typed slice (`reflect` case) is `StringList`; it cannot be
+// nil.
+fn normalize_json_value(value: CompilerOptionsValue) -> CompilerOptionsValue {
+    match value {
+        CompilerOptionsValue::Map(mut value) => {
+            for child in value.values_mut() {
+                *child = normalize_json_value(std::mem::take(child));
+            }
+            CompilerOptionsValue::Map(value)
+        }
+        CompilerOptionsValue::List(value) => {
+            CompilerOptionsValue::List(value.into_iter().map(normalize_json_value).collect())
+        }
+        CompilerOptionsValue::StringList(value) => CompilerOptionsValue::List(
+            value
+                .into_iter()
+                .map(|child| normalize_json_value(CompilerOptionsValue::String(child)))
+                .collect(),
+        ),
+        value => value,
+    }
 }
 
 // convertToObject converts the json syntax tree into the json value

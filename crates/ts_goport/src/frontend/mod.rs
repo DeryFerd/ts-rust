@@ -9,6 +9,7 @@ pub mod core_ext;
 pub mod json;
 pub mod module;
 pub mod nativepath;
+pub mod osutil;
 pub mod outputpaths;
 pub mod packagejson;
 pub mod parser;

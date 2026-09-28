@@ -1194,6 +1194,7 @@ impl LanguageService {
             "",    /*source*/
             None,  /*autoImportEntryData*/
             // !!! jsx autoimports
+            None, /*additionalTextEdits*/
             None, /*detail*/
         );
         let item = CompletionItem {
@@ -1233,12 +1234,13 @@ impl LanguageService {
         label_details: Option<lsproto::CompletionItemLabelDetails>,
         file: Node,
         position: i32,
-        _is_member_completion: bool,
+        is_member_completion: bool,
         is_snippet: bool,
         has_action: bool,
         preselect: bool,
         source: &str,
         auto_import_fix: Option<lsproto::AutoImportFix>,
+        additional_text_edits: Option<Vec<lsproto::TextEdit>>,
         detail: Option<String>,
     ) -> lsproto::CompletionItem {
         let mut name = name.to_string();
@@ -1252,6 +1254,7 @@ impl LanguageService {
             source: source.to_string(),
             name: name.clone(),
             auto_import: auto_import_fix,
+            ..Default::default()
         };
 
         // Text edit
@@ -1289,11 +1292,13 @@ impl LanguageService {
         // Adjustements based on kind modifiers.
         let mut tags: Option<Vec<lsproto::CompletionItemTag>> = None;
         // Copied from vscode ts extension: `MyCompletionItem.constructor`.
-        if kind_modifiers.intersects(lsutil::ScriptElementKindModifier::OPTIONAL) {
+        if is_member_completion
+            && kind_modifiers.intersects(lsutil::ScriptElementKindModifier::OPTIONAL)
+        {
             if insert_text.is_empty() {
                 insert_text = name.clone();
             }
-            if filter_text.is_empty() {
+            if filter_text.is_empty() || is_snippet {
                 filter_text = name.clone();
             }
             name = name + "?";
@@ -1325,6 +1330,7 @@ impl LanguageService {
             insert_text_format,
             text_edit,
             commit_characters,
+            additional_text_edits,
             data: Some(data),
             ..Default::default()
         }
@@ -1399,6 +1405,7 @@ impl LanguageService {
                         false, /*preselect*/
                         "",    /*source*/
                         None,  /*autoImportEntryData*/
+                        None,  /*additionalTextEdits*/
                         None,  /*detail*/
                     );
                     items.push(CompletionItem {

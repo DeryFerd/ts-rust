@@ -10,6 +10,7 @@
 //! Only the TS path is ported. JS files parse JSDoc lazily and reparse it;
 //! that stays unported.
 
+use crate::frontend::parser::should_consume_binary_operator;
 use crate::prelude::*;
 use ts_ast::NodeData as D;
 
@@ -3588,14 +3589,14 @@ impl Parser {
     // Go: parser.go:2898 parseTypeReference
     fn parse_type_reference(&mut self) -> Node {
         let pos = self.node_pos();
-        let name = self.parse_entity_name(true);
+        let name = self.parse_entity_name(true, false);
         let args = self.parse_type_arguments_of_type_reference();
         let n = self.factory.new_type_reference_node(name, args);
         self.finish_node(n, pos)
     }
 
     // Go: parser.go:2907 parseEntityName
-    fn parse_entity_name(&mut self, allow_reserved_words: bool) -> Node {
+    fn parse_entity_name(&mut self, allow_reserved_words: bool, allow_private_name: bool) -> Node {
         let pos = self.node_pos();
         let mut entity = if allow_reserved_words {
             self.parse_identifier_name()
@@ -3606,7 +3607,7 @@ impl Parser {
             if self.token == SyntaxKind::LessThanToken {
                 break;
             }
-            let right = self.parse_right_side_of_dot(allow_reserved_words, false);
+            let right = self.parse_right_side_of_dot(allow_reserved_words, allow_private_name);
             let q = self.factory.new_qualified_name(entity, right);
             entity = self.finish_node(q, pos);
         }
@@ -3671,7 +3672,7 @@ impl Parser {
     fn parse_type_query(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::TypeOfKeyword);
-        let entity_name = self.parse_entity_name(true);
+        let entity_name = self.parse_entity_name(true, true);
         let type_arguments = if !self.has_preceding_line_break() {
             self.parse_type_arguments()
         } else {
@@ -4921,12 +4922,7 @@ impl Parser {
         loop {
             let operator = self.rescan_greater_than_token();
             let new_precedence = get_binary_operator_precedence(operator);
-            let consume_current_operator = if operator == SyntaxKind::AsteriskAsteriskToken {
-                new_precedence >= precedence
-            } else {
-                new_precedence > precedence
-            };
-            if !consume_current_operator {
+            if !should_consume_binary_operator(operator, new_precedence, precedence) {
                 break;
             }
             if operator == SyntaxKind::InKeyword && self.in_disallow_in_context() {
@@ -4948,9 +4944,9 @@ impl Parser {
                 } else {
                     self.make_as_expression(left_operand, type_node)
                 };
-                if get_binary_operator_precedence(self.rescan_greater_than_token())
-                    > last_precedence
-                {
+                let next_operator = self.rescan_greater_than_token();
+                let next_precedence = get_binary_operator_precedence(next_operator);
+                if should_consume_binary_operator(next_operator, next_precedence, last_precedence) {
                     break;
                 }
                 continue;
@@ -5292,20 +5288,19 @@ impl Parser {
     }
 
     // Go: parser.go:5436 parseElementAccessExpressionRest
-    // PORT: Go interns the literal argument text; the text is the same.
     fn parse_element_access_expression_rest(
         &mut self,
         pos: i32,
         expression: Node,
         question_dot_token: Node,
     ) -> Node {
-        let argument_expression = if self.token == SyntaxKind::CloseBracketToken {
+        let mut argument_expression = self.create_missing_identifier();
+        if self.token == SyntaxKind::CloseBracketToken {
             let p = self.node_pos();
             self.parse_error_at(p, p);
-            self.create_missing_identifier()
         } else {
-            self.parse_expression_allow_in()
-        };
+            argument_expression = self.parse_expression_allow_in();
+        }
         self.parse_expected(SyntaxKind::CloseBracketToken);
         let is_optional_chain =
             !question_dot_token.is_nil() || self.try_reparse_optional_chain(expression);
@@ -5631,7 +5626,7 @@ impl Parser {
         let mut qualifier = Node::NIL;
         if self.parse_optional(SyntaxKind::DotToken) {
             // Go: parser.go:2903 parseEntityNameOfTypeReference
-            qualifier = self.parse_entity_name(true);
+            qualifier = self.parse_entity_name(true, false);
         }
         let type_arguments = self.parse_type_arguments_of_type_reference();
         let n = self.factory.new_import_type_node(
@@ -6606,13 +6601,12 @@ impl Parser {
             if self.has_preceding_line_break() || self.token == SyntaxKind::EqualsGreaterThanToken {
                 return false;
             }
-            let expr = self.parse_binary_expression_or_higher(OperatorPrecedence::LOWEST);
-            if !self.has_preceding_line_break()
-                && expr.kind() == SyntaxKind::Identifier
-                && self.token == SyntaxKind::EqualsGreaterThanToken
-            {
-                return true;
+            if !self.is_identifier() {
+                return false;
             }
+            self.next_token_without_check();
+            return !self.has_preceding_line_break()
+                && self.token == SyntaxKind::EqualsGreaterThanToken;
         }
         false
     }
@@ -7120,6 +7114,11 @@ impl Parser {
         self.parse_expected(SyntaxKind::ClassKeyword);
         let name = self.parse_name_of_class_declaration_or_expression();
         let type_parameters = self.parse_type_parameters();
+        // PORT: Go also checks `p.parsingContexts` here (tsgo#4823: a
+        // `SourceElements` parse outside `BlockStatements` and
+        // `SwitchClauseStatements`). This parser does not track parsing
+        // contexts, and it reaches a class only as a decorated class
+        // expression inside a JSDoc comment, so it keeps the modifier check.
         if !modifiers.is_nil()
             && modifiers
                 .nodes()

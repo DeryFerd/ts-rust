@@ -190,8 +190,8 @@ impl Tracker {
     }
 }
 
-// Go: ls/change/trackerimpl.go:114 getFormatCodeSettingsForWriting
-fn get_format_code_settings_for_writing(
+// Go: ls/change/trackerimpl.go:114 GetFormatCodeSettingsForWriting
+pub fn get_format_code_settings_for_writing(
     options: lsutil::FormatCodeSettings,
     source_file: Node,
 ) -> lsutil::FormatCodeSettings {
@@ -211,60 +211,23 @@ fn get_format_code_settings_for_writing(
 impl Tracker {
     // Go: ls/change/trackerimpl.go:124 getNonformattedText
     fn get_nonformatted_text(&self, node: Node, source_file: Node) -> (String, Node) {
-        // PORT: the printer writes through `Rc<RefCell<dyn EmitTextWriter>>`,
-        // so the writer is shared. The print handlers are taken first; they
-        // share the writer's positions (see `ChangeTrackerWriter`).
-        let writer = Rc::new(RefCell::new(new_change_tracker_writer(
+        let (text, node_out) = print_and_position_node(
+            self.node_factory(),
+            node,
+            source_file,
             &self.new_line,
             self.format_settings.editor_settings.indent_size,
-        )));
-        let print_handlers = writer.borrow().get_print_handlers();
-        let emit_text_writer: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-        new_printer(
-            PrinterOptions {
-                new_line: get_new_line_kind(&self.new_line),
-                never_ascii_escape: true,
-                preserve_source_newlines: true,
-                terminate_unterminated_literals: true,
-                ..PrinterOptions::default()
-            },
-            print_handlers,
             Some(Rc::clone(&self.emit_context)),
-        )
-        .write_exported(node, source_file, emit_text_writer, None);
-
-        let text = writer.borrow().string();
-        let text = text
-            .strip_suffix(self.new_line.as_str())
-            .unwrap_or(&text)
-            .to_string();
-
-        let node_out = writer
-            .borrow()
-            .assign_positions_to_node(node, self.node_factory());
-        let factory = self.emit_context.factory();
-        let eof_token = factory.new_token(SyntaxKind::EndOfFile);
-        // PORT: Go sets `nodeList.Loc` after `NewNodeList`. A list `Loc` is
-        // fixed when the list is made, so it is made with the loc.
-        let node_list = factory.new_node_list_with_loc(&[node_out], node_out.loc());
-        set_node_loc(eof_token, TextRange::new(node_out.end(), node_out.end()));
-        // PORT: a factory SourceFile keeps `&'static` text, like the leaked
-        // synthetic nodes, so the printed text is leaked.
-        let source_file_like_text: &'static str = Box::leak(text.clone().into_boxed_str());
-        let source_file_like = factory.new_source_file(
+        );
+        // PORT: Go passes `ast.SourceFileParseOptions{FileName, Path}`; the
+        // Rust function takes the file name and path (see its PORT note).
+        let source_file_like = create_synthetic_source_file(
+            self.node_factory(),
+            node_out,
+            &text,
             source_file_file_name(source_file),
             &source_file_info(source_file).path,
-            source_file_like_text,
-            node_list,
-            eof_token,
         );
-        // Go returns true from this callback, which stops ForEachChild after
-        // the first child. Kept as Go.
-        source_file_like.for_each_child(|child| {
-            set_node_parent(child, source_file_like);
-            true
-        });
-        set_node_loc(source_file_like, node_out.loc());
         (text, source_file_like)
     }
 

@@ -1,8 +1,14 @@
 //! Ports of internal/scanner/scanner_test.go and
-//! internal/parser/parser_test.go (TestJSDocImportTypeParentChain and
-//! TestSourceFileContainsNonASCIIInStringLiteralFastPath; the Go benchmark
-//! and fuzz target are not ported).
+//! internal/parser/parser_test.go (TestJSDocImportTypeParentChain,
+//! TestJSDocTypeSourceSurvivesReparse,
+//! TestJSDocTypeSourcePropagatesToConstructedReparse and
+//! TestSourceFilePositionMapWithNonASCIIStringLiteral; the Go benchmark and
+//! fuzz target are not ported). TestNormalizeJSDocTypeSourceText,
+//! TestIsJSDocTypeExpressionOrChild and
+//! TestGetTextOfNodeFromJSDocTypePreservesAsteriskType are blocked: they
+//! call private scanner functions or build bare Go nodes.
 
+use super::Subtests;
 use super::childprog::in_child;
 use super::leak;
 use ts_goport::ast::{
@@ -103,11 +109,121 @@ test("", async function () {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-// Go: parser/parser_test.go:212 TestSourceFileContainsNonASCIIInStringLiteralFastPath
-// PORT: `file.GetPositionMap()` of a file with no program reads the flag
-// from the node store (`source_file_get_position_map`).
+// Go: parser/parser_test.go:244 TestJSDocTypeSourceSurvivesReparse
+// PORT: `GetTextOfNode` reads the source file of the node, which exists once
+// its node store is published, so the test runs in a child process (see
+// `test_js_doc_import_type_parent_chain`).
 #[test]
-fn test_source_file_contains_non_ascii_in_string_literal_fast_path() {
+fn test_js_doc_type_source_survives_reparse() {
+    in_child(
+        module_path!(),
+        "test_js_doc_type_source_survives_reparse",
+        js_doc_type_source_survives_reparse,
+    );
+}
+
+fn js_doc_type_source_survives_reparse() {
+    let source_text = r#"/**
+ * @typedef {(
+ *   "a" |
+ *   "b"
+ * )[]} T
+ */
+const value = 0;"#;
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+
+    let file = Rc::new(parse_source_file(&opts, leak(source_text), ScriptKind::JS));
+    note_parsed_source_file(&file);
+    publish_parsed_files("/");
+    let mut type_alias = Node::NIL;
+    for statement in file.statements().nodes().iter() {
+        if is_js_type_alias_declaration(statement) {
+            type_alias = statement;
+            break;
+        }
+    }
+    assert!(type_alias.is_some());
+
+    let js_docs = type_alias.js_doc(file.root);
+    assert_eq!(js_docs.len(), 1);
+    let tags = js_docs.get(0).tags();
+    assert!(tags.is_some());
+    assert_eq!(tags.nodes().len(), 1);
+
+    let type_expression = tags.nodes().get(0).type_expression();
+    assert!(type_expression.is_some());
+
+    let expected =
+        ["(", r#""a" |"#, r#""b""#, ")[]"].join(NewLineKind::LF.get_new_line_character());
+    let tests = [
+        ("original", type_expression.type_()),
+        ("reparsed", type_alias.type_()),
+    ];
+    let mut t = Subtests::new("TestJSDocTypeSourceSurvivesReparse");
+    for (name, node) in tests {
+        t.run(name, || {
+            let text = get_text_of_node(node);
+            if text != expected {
+                return Err(format!("assertion failed: {text:?} != {expected:?}"));
+            }
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: parser/parser_test.go:292 TestJSDocTypeSourcePropagatesToConstructedReparse
+#[test]
+fn test_js_doc_type_source_propagates_to_constructed_reparse() {
+    in_child(
+        module_path!(),
+        "test_js_doc_type_source_propagates_to_constructed_reparse",
+        js_doc_type_source_propagates_to_constructed_reparse,
+    );
+}
+
+fn js_doc_type_source_propagates_to_constructed_reparse() {
+    let source_text = r#"/**
+ * @param {{
+ *   value: string
+ * }} options
+ */
+function foo(options) {}"#;
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+
+    let file = Rc::new(parse_source_file(&opts, leak(source_text), ScriptKind::JS));
+    note_parsed_source_file(&file);
+    publish_parsed_files("/");
+    let function = file.statements().nodes().get(0);
+    assert!(is_function_declaration(function));
+    assert_eq!(function.parameters().len(), 1);
+
+    let type_node = function.parameters().get(0).type_();
+    assert!(type_node.is_some());
+    assert!(type_node.flags().intersects(NodeFlags::REPARSED));
+
+    let expected = ["{", "value: string", "}"].join(NewLineKind::LF.get_new_line_character());
+    assert_eq!(get_text_of_node(type_node), expected);
+    assert_eq!(
+        get_token_pos_of_node(type_node, file.root, false /*includeJSDoc*/),
+        (source_text.find("{{").unwrap() + 1) as i32
+    );
+}
+
+// Go: parser/parser_test.go:319 TestSourceFilePositionMapWithNonASCIIStringLiteral
+// PORT: renamed from TestSourceFileContainsNonASCIIInStringLiteralFastPath
+// (old Rust name `test_source_file_contains_non_ascii_in_string_literal_fast_path`)
+// by tsgo#4776, which also dropped the `ContainsNonASCII` assert.
+#[test]
+fn test_source_file_position_map_with_non_ascii_string_literal() {
     let source_text = "const x = \"─\";
 
 namespace N {
@@ -122,7 +238,6 @@ namespace N {
 
     let file = parse_source_file(&opts, leak(source_text), ScriptKind::TS);
 
-    assert!(file.contains_non_ascii);
     let position_map = source_file_get_position_map(file.root);
     assert!(!position_map.is_ascii_only());
     let after_box_drawing_character = (source_text.find('─').unwrap() + '─'.len_utf8()) as i32;

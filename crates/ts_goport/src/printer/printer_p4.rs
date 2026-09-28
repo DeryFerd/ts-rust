@@ -657,6 +657,11 @@ impl Printer {
 
     // Go: printer.go:4140 emitStatement
     pub(crate) fn emit_statement(&mut self, node: Node) {
+        if let Some(snippet_element) = self.emit_context.snippet_element(node) {
+            self.emit_snippet_node(node, &snippet_element);
+            return;
+        }
+
         match node.kind() {
             // Statements
             SyntaxKind::Block => self.emit_block(node),

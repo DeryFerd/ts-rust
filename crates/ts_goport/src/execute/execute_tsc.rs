@@ -31,7 +31,8 @@ use crate::execute::build::orchestrator::{Options as OrchestratorOptions, new_or
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::incremental::incremental::{create_host, new_build_info_reader};
 use crate::execute::incremental::program::{
-    Program as IncrementalProgram, new_program as new_incremental_program, read_build_info_program,
+    NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
+    read_build_info_program,
 };
 use crate::execute::tsc::{
     CommandLineResult, CompileTimes, CompilerProgram, DiagnosticReporter, DiagnosticsReporter,
@@ -450,7 +451,7 @@ pub fn tsc_compilation(
         };
     } else if config_for_compilation.compiler_options().is_incremental() {
         return perform_incremental_compilation(
-            &*sys,
+            &sys,
             config_for_compilation,
             report_diagnostic,
             report_error_summary,
@@ -540,7 +541,7 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
     }
 }
 
-// Go: execute/tsc.go:284 performIncrementalCompilation
+// Go: execute/tsc.go:287 performIncrementalCompilation
 // PORT: the incremental program reads back the installed program. A bin
 // that replaces the program (`TscCompilationHooks::program_like`) skips
 // `incremental.ReadBuildInfoProgram` and `incremental.NewProgram`: `goport`
@@ -555,8 +556,10 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // then emits when its own check ends. `EmitAndReportStatistics` makes the
 // same calls as in Go and waits for that work. Its check time is the wait
 // for the check, and its emit time the wait for the rest of the emit.
+// PORT: `sys_rc` is the `Rc` so that the incremental program can keep
+// `sys.Now` (Go passes the method value). The body uses `sys: &dyn System`.
 fn perform_incremental_compilation(
-    sys: &dyn System,
+    sys_rc: &Rc<dyn System>,
     config: ParsedCommandLine,
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
@@ -565,6 +568,7 @@ fn perform_incremental_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
@@ -588,11 +592,17 @@ fn perform_incremental_compilation(
     install_program(host.clone(), config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
     let changes_compute_start = sys.now();
+    // Go: sys.Now
+    let nested_emit_now: NestedEmitNow = {
+        let sys = sys_rc.clone();
+        Rc::new(move || sys.now())
+    };
     let incremental_program = match replacement {
         Some(_) => None,
         None => Some(new_incremental_program(
             old_program.as_ref(),
             create_host(host),
+            Some(nested_emit_now),
             testing.is_some(),
         )),
     };

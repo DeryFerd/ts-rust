@@ -1476,9 +1476,9 @@ impl Checker {
         }
 
         let equals_greater_than_token = node.equals_greater_than_token();
-        let start_line = get_ecma_line_of_position(file, equals_greater_than_token.pos());
-        let end_line = get_ecma_line_of_position(file, equals_greater_than_token.end());
-        start_line != end_line
+        let arrow_full_text = &source_file_text(file)
+            [equals_greater_than_token.pos() as usize..equals_greater_than_token.end() as usize];
+        arrow_full_text.chars().any(is_line_break)
             && self.grammar_error_on_node(
                 equals_greater_than_token,
                 diag::Line_terminator_not_permitted_before_arrow,
@@ -1678,7 +1678,7 @@ impl Checker {
     pub fn check_grammar_class_declaration_heritage_clauses(
         &mut self,
         node: Node,
-        file: Node,
+        _file: Node,
     ) -> bool {
         let mut seen_extends_clause = false;
         let mut seen_implements_clause = false;
@@ -1716,40 +1716,6 @@ impl Checker {
                         );
                     }
 
-                    if type_nodes.len() > 0 {
-                        for j in node.eager_js_doc(file).to_vec() {
-                            let tags = j.tags();
-                            if tags.is_nil() {
-                                continue;
-                            }
-                            for tag in tags.nodes().to_vec() {
-                                if tag.kind() == SyntaxKind::JsDocAugmentsTag {
-                                    let target = type_nodes.get(0);
-                                    let source = tag.class_name();
-                                    let target_name = get_identifier_from_entity_name_expression(
-                                        target.expression(),
-                                    );
-                                    let source_name = get_identifier_from_entity_name_expression(
-                                        source.expression(),
-                                    );
-                                    if target_name.is_some()
-                                        && source_name.is_some()
-                                        && target_name.text() != source_name.text()
-                                    {
-                                        return self.grammar_error_on_node(
-                                            source_name,
-                                            diag::JSDoc_0_1_does_not_match_the_extends_2_clause,
-                                            args![
-                                                tag.tag_name().text(),
-                                                source_name.text(),
-                                                target_name.text()
-                                            ],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                     seen_extends_clause = true;
                 } else {
                     if heritage_clause.token() != SyntaxKind::ImplementsKeyword {

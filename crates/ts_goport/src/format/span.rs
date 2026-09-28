@@ -51,7 +51,13 @@ pub fn get_scan_start_position(
         return start;
     }
 
-    let preceding_token = astnav::find_preceding_token(source_file, original_range.pos());
+    // exclude JSDoc so the scan never starts inside a JSDoc comment
+    let preceding_token = astnav::find_preceding_token_ex(
+        source_file,
+        original_range.pos(),
+        Node::NIL, /*startNode*/
+        true,      /*excludeJSDoc*/
+    );
     if preceding_token.is_nil() {
         // no preceding token found - start from the beginning of enclosing node
         return enclosing_node.pos();
@@ -500,13 +506,9 @@ impl FormatSpanWorker {
     ) -> i32 {
         debug_assert!(!node_is_synthesized(child));
 
-        if node_is_missing(child)
-            || is_grammar_error(parent, child)
-            || child.flags().intersects(NodeFlags::REPARSED)
-        {
+        if node_is_missing(child) || child.flags().intersects(NodeFlags::REPARSED) {
             return inherited_indentation;
         }
-
         let child_start_pos = get_token_pos_of_node(child, self.source_file, false);
         let child_start_line = get_ecma_line_of_position(self.source_file, child_start_pos);
 
@@ -518,10 +520,15 @@ impl FormatSpanWorker {
             );
         }
 
+        let is_error_member_list_element = child.flags().intersects(NodeFlags::THIS_NODE_HAS_ERROR)
+            && is_member_list_element(parent, child);
         // if child is a list item - try to get its indentation, only if parent is within the original range.
         let mut child_indentation_amount = -1;
 
-        if is_list_item && parent.loc().contained_by(self.original_range) {
+        if !is_error_member_list_element
+            && is_list_item
+            && parent.loc().contained_by(self.original_range)
+        {
             child_indentation_amount = self.try_compute_indentation_for_list_item(
                 child_start_pos,
                 child.end(),
@@ -603,14 +610,20 @@ impl FormatSpanWorker {
         if child.kind() == SyntaxKind::Decorator {
             effective_parent_start_line = child_start_line;
         }
-        let (child_indentation, delta) = self.compute_indentation(
-            child,
-            child_start_line,
-            child_indentation_amount,
-            node,
-            parent_dynamic_indentation,
-            effective_parent_start_line,
-        );
+        let mut child_indentation = 0;
+        let mut delta = 0;
+        if is_error_member_list_element {
+            child_indentation = self.get_current_indentation_at_position(child_start_pos);
+        } else {
+            (child_indentation, delta) = self.compute_indentation(
+                child,
+                child_start_line,
+                child_indentation_amount,
+                node,
+                parent_dynamic_indentation,
+                effective_parent_start_line,
+            );
+        }
 
         let child_context_node = self.child_context_node;
         self.process_node(
@@ -699,14 +712,8 @@ impl FormatSpanWorker {
                         // }: {};
                         indentation_on_list_start_token = self.indentation_on_last_indented_line;
                     } else {
-                        let start_line_position =
-                            get_line_start_position_for_position(token_pos, self.source_file);
-                        indentation_on_list_start_token = find_first_non_whitespace_column(
-                            start_line_position,
-                            token_pos,
-                            self.source_file,
-                            self.options(),
-                        );
+                        indentation_on_list_start_token =
+                            self.get_current_indentation_at_position(token_pos);
                     }
 
                     let indent_size = self.options().editor_settings.indent_size;
@@ -816,7 +823,13 @@ impl FormatSpanWorker {
         self.visiting_undecorated_node_start_line = old_undecorated_start;
     }
 
-    // Go: format/span.go:538 computeIndentation
+    // Go: format/span.go:544 getCurrentIndentationAtPosition
+    pub fn get_current_indentation_at_position(&self, pos: i32) -> i32 {
+        let start_line_position = get_line_start_position_for_position(pos, self.source_file);
+        find_first_non_whitespace_column(start_line_position, pos, self.source_file, self.options())
+    }
+
+    // Go: format/span.go:549 computeIndentation
     pub fn compute_indentation(
         &mut self,
         node: Node,
@@ -909,14 +922,7 @@ impl FormatSpanWorker {
             }
         } else {
             let start_line = get_ecma_line_of_position(self.source_file, start_pos);
-            let start_line_position =
-                get_line_start_position_for_position(start_pos, self.source_file);
-            let column = find_first_non_whitespace_column(
-                start_line_position,
-                start_pos,
-                self.source_file,
-                self.options(),
-            );
+            let column = self.get_current_indentation_at_position(start_pos);
             if start_line != parent_start_line || start_pos == column {
                 // Use the base indent size if it is greater than
                 // the indentation of the inherited predecessor.
