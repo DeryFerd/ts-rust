@@ -1,6 +1,7 @@
 //! Go: internal/testutil/tsbaseline: error_baseline.go, js_emit_baseline.go,
 //! sourcemap_baseline.go, sourcemap_record_baseline.go,
-//! module_resolution_baseline.go, util.go and the `testing` wrappers of
+//! module_resolution_baseline.go, contentmapper_baseline.go (tsgo#4712),
+//! util.go and the `testing` wrappers of
 //! type_symbol_baseline.go (`DoTypeAndSymbolBaseline`, `checkBaselines`,
 //! `isTypeBaselineNodeReuseLine`). The walker itself is
 //! `ts_goport::baseline::type_symbol`.
@@ -10,11 +11,13 @@
 //! `assert.Check` failures (the error baseline counts) are collected in
 //! `checks` and fail the subtest after the comparison, as in Go.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ts_goport::baseline::type_symbol::{TestFile, generate_baseline, new_type_writer_walker};
 use ts_goport::baseline::util::{is_default_library_file, remove_test_path_prefixes};
+use ts_goport::contentmapper::Mapper;
 use ts_goport::execute::tsc::compile::{Writer, write_str};
 use ts_goport::execute::tsc::diagnostics::{
     FormattingOptions, write_error_summary_text, write_flattened_diagnostic_message, write_location,
@@ -23,6 +26,7 @@ use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::prelude::*;
 use ts_goport::sourcemap::generator::RawSourceMap;
+use ts_goport::spanmap::SpanMap;
 
 use super::go_regex;
 use super::harness::{CompilationResult, HarnessOptions, TestConfiguration, compile_files_ex};
@@ -415,10 +419,28 @@ fn iterate_error_baseline(
         .iter()
         .filter(|d| diagnostic_file_name(d).is_some_and(|name| is_ts_config_file(&name)))
         .count() as i64;
+    // Go: error_baseline.go:255 (tsgo#4712)
+    let mut content_mapper_supplemental_file_names: HashSet<String> = HashSet::new();
+    for diagnostic in &diagnostics {
+        if diagnostic_file_is_source_file(diagnostic)
+            && ts_goport::ast::source_file_is_content_mapper_supplemental(diagnostic.file)
+        {
+            content_mapper_supplemental_file_names
+                .insert(source_file_file_name(diagnostic.file).to_string());
+        }
+    }
+    let num_content_mapper_supplemental_diagnostics = diagnostics
+        .iter()
+        .filter(|d| {
+            diagnostic_file_name(d)
+                .is_some_and(|name| content_mapper_supplemental_file_names.contains(&name))
+        })
+        .count() as i64;
     // Verify we didn't miss any errors in total
     let total = total_errors_reported_in_non_library_non_tsconfig_files
         + num_library_diagnostics
-        + num_tsconfig_diagnostics;
+        + num_tsconfig_diagnostics
+        + num_content_mapper_supplemental_diagnostics;
     if total != diagnostics.len() as i64 {
         checks.push(format!(
             "assertion failed: {total} (int) != {} (int): total number of errors",
@@ -427,6 +449,137 @@ fn iterate_error_baseline(
     }
 
     result
+}
+
+/// Go `diagnostic.File().(*ast.SourceFile)` is ok for the wrapped
+/// diagnostic (`diagnosticwriter.WrapASTDiagnostics`, tsgo#4712).
+// Go: diagnosticwriter/diagnosticwriter.go:57 ASTDiagnostic.File and :90
+// ASTDiagnostic.resolve. `File()` is the `*ast.SourceFile` unless the
+// location renders against the original text (`useOriginal`): a diagnostic
+// with a source (a mapper's own), or one whose location a span map maps
+// back. A location in synthesized code (`FidelityNone`) keeps the file.
+// PORT: the port writes diagnostics without the wrapper, so this is the
+// part of `resolve` that the Go type assertion reads.
+fn diagnostic_file_is_source_file(diagnostic: &Diagnostic) -> bool {
+    if !diagnostic.file.is_some() {
+        return false;
+    }
+    if !diagnostic.source().is_empty() {
+        return false;
+    }
+    match ts_goport::ast::source_file_span_map(diagnostic.file) {
+        Some(span_map) => {
+            let (_, fidelity) = SpanMap::virtual_to_original_span(
+                Some(span_map),
+                TextRange::new(diagnostic.pos, diagnostic.end),
+            );
+            fidelity.is_none()
+        }
+        None => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// contentmapper_baseline.go (tsgo#4712)
+// ---------------------------------------------------------------------------
+
+// Go: contentmapper_baseline.go:18 contentMapperFormatOpts
+fn content_mapper_format_opts() -> FormattingOptions {
+    FormattingOptions {
+        new_line: "\n".to_string(),
+        ..FormattingOptions::default()
+    }
+}
+
+// Go: contentmapper_baseline.go:26 DoContentMapperBaseline
+// DoContentMapperBaseline writes a baseline for content-mapped files that shows the original source, the
+// transformed source the compiler actually checks, and the file's diagnostics. Diagnostics are rendered
+// with the standard diagnostic writer, which maps each one to the text it belongs to: mapper-produced
+// diagnostics render against the original source, compiler diagnostics on mappable code render against the
+// original source, and compiler diagnostics on synthesized code render against the transformed source. If
+// the program has no content-mapped files, no baseline is written.
+// PORT: Go takes the `compiler.ProgramLike`; here it is the compilation
+// result that holds the program.
+pub fn do_content_mapper_baseline(
+    baseline_path: &str,
+    program: &CompilationResult,
+    diagnostics: &[Diagnostic],
+    opts: &Options,
+) -> Result<(), String> {
+    let content = get_content_mapper_baseline(program, diagnostics);
+    if content.is_empty() {
+        return Ok(());
+    }
+    baseline::run(
+        &go_regex::replace_ts_extension(baseline_path, ".contentmapper"),
+        &content,
+        opts,
+    )
+}
+
+// Go: contentmapper_baseline.go:40 getContentMapperBaseline
+fn get_content_mapper_baseline(program: &CompilationResult, diagnostics: &[Diagnostic]) -> String {
+    let files = program.content_mapped_source_files();
+    if files.is_empty() {
+        return String::new();
+    }
+    let mapped: HashMap<String, Rc<Mapper>> = files
+        .iter()
+        .map(|(file, mapper)| (source_file_file_name(*file).to_string(), mapper.clone()))
+        .collect();
+
+    let mut b = String::new();
+    for (file, mapper) in &files {
+        // Go `%s` of `file.ScriptKind` and `%v` of the `[]string` extensions.
+        let _ = writeln!(
+            b,
+            "//// [{}] (ScriptKind: {}, ContentMapper: [{}])",
+            remove_test_path_prefixes(source_file_file_name(*file), false),
+            source_file_info(*file).script_kind,
+            mapper.definition.extensions.join(" ")
+        );
+        b.push_str("--- Original ---\n");
+        b.push_str(&ensure_trailing_newline(
+            ts_goport::ast::source_file_original_text(*file),
+        ));
+        b.push_str("--- Transformed ---\n");
+        b.push_str(&ensure_trailing_newline(source_file_text(*file)));
+        b.push('\n');
+    }
+
+    let file_diagnostics: Vec<Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| diagnostic_file_name(d).is_some_and(|name| mapped.contains_key(&name)))
+        .cloned()
+        .collect();
+
+    b.push_str("=== Diagnostics ===\n\n");
+    if file_diagnostics.is_empty() {
+        b.push_str(NO_CONTENT);
+        b.push('\n');
+        return b;
+    }
+    // Go `FormatDiagnosticsWithColorAndContext` of
+    // `ToDiagnostics(WrapASTDiagnostics(fileDiagnostics))`.
+    let mut rendered = String::new();
+    format_diagnostics_with_color_and_context(
+        &mut rendered,
+        &file_diagnostics,
+        &content_mapper_format_opts(),
+    );
+    b.push_str(&remove_test_path_prefixes(
+        &go_regex::replace_ansi_escapes(&rendered),
+        false,
+    ));
+    b
+}
+
+// Go: contentmapper_baseline.go:87 ensureTrailingNewline
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.is_empty() || s.ends_with('\n') {
+        return s.to_string();
+    }
+    format!("{s}\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +787,7 @@ struct DeclarationCompilationContext {
     harness_settings: HarnessOptions,
     options: CompilerOptions,
     current_directory: String,
-    config_file: Option<std::rc::Rc<TsConfigSourceFile>>,
+    config: Rc<ParsedCommandLine>,
 }
 
 // Go: js_emit_baseline.go:171 prepareDeclarationCompilationContext
@@ -657,7 +810,9 @@ fn prepare_declaration_compilation_context(
                     "Expected at least one declaration file to be emitted when emitDeclarationOnly:true and no errors were generated"
                 );
             }
-        } else if result.dts.len() != result.get_number_of_js_files(false /*includeJson*/) {
+        } else if !result.has_content_mapped_source_files()
+            && result.dts.len() != result.get_number_of_js_files(false /*includeJson*/)
+        {
             panic!(
                 "There were no errors and declFiles generated did not match number of js files generated"
             );
@@ -686,11 +841,7 @@ fn prepare_declaration_compilation_context(
             source_file_name
         };
 
-        let d_ts_file_name = format!(
-            "{}{}",
-            remove_file_extension(&source_file_name),
-            get_declaration_emit_extension_for_path(&source_file_name)
-        );
+        let d_ts_file_name = result.change_to_declaration_extension(&source_file_name);
         result.dts.get(&d_ts_file_name).cloned()
     };
 
@@ -700,8 +851,10 @@ fn prepare_declaration_compilation_context(
                         decl_other_files: &[TestFile]| {
         if is_declaration_file_name(&file.unit_name) || has_json_file_extension(&file.unit_name) {
             dts_files.push(file.clone());
-        } else if has_ts_file_extension(&file.unit_name)
-            || (has_js_file_extension(&file.unit_name) && options.get_allow_js())
+        } else if let Some(content_mapper) = result.source_file_content_mapper(&file.unit_name)
+            && (has_ts_file_extension(&file.unit_name)
+                || (has_js_file_extension(&file.unit_name) && options.get_allow_js())
+                || !content_mapper.is_empty())
         {
             let decl_file = find_result_code_file(&file.unit_name);
             if let Some(decl_file) = decl_file
@@ -744,7 +897,7 @@ fn prepare_declaration_compilation_context(
             } else {
                 harness_settings.current_directory.clone()
             },
-            config_file: result.command_line.config_file.clone(),
+            config: result.command_line.clone(),
         });
     }
     None
@@ -763,13 +916,16 @@ fn compile_declaration_files(
     symlinks: &BTreeMap<String, String>,
 ) -> Option<DeclarationCompilationResult> {
     let mut context = context?;
-    let tsconfig = context
-        .config_file
-        .clone()
-        .map(|config_file| super::harness::TsConfigPart {
-            config_file: Some(config_file),
-            errors: Vec::new(),
-        });
+    let tsconfig =
+        context
+            .config
+            .config_file
+            .clone()
+            .map(|config_file| super::harness::TsConfigPart {
+                config_file: Some(config_file),
+                errors: Vec::new(),
+                content_mappers: context.config.content_mappers().to_vec(),
+            });
     let decl_file_compilation_result = compile_files_ex(
         &context.decl_input_files,
         &context.decl_other_files,

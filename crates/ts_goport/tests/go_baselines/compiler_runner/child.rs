@@ -15,7 +15,8 @@
 //!
 //! and `done` last. For the compiler runner, `kind` is `compile` (the Go
 //! test around `newCompilerTest`), `config` (a skipped configuration),
-//! `error`, `output`, `sourcemap`, `sourcemaprecord`, `types`, `symbols`,
+//! `error`, `contentmapper` (Go "content mapper", tsgo#4712), `output`,
+//! `sourcemap`, `sourcemaprecord`, `types`, `symbols`,
 //! `moduleresolution`, `unionordering` or `parentpointers`. For the
 //! transpile runner (transpile_runner.rs), it is `options`, `js` or `dts`.
 //! For both, `test` is a panic between the subtests. A child that ends

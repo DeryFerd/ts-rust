@@ -1,8 +1,9 @@
 //! Rust port of the pinned typescript-go compiler runner
 //! (`internal/testrunner`): `TestLocal` and `TestSubmodule` compare the
-//! `.errors.txt`, `.js`, `.js.map`, `.sourcemap.txt`, `.types`, `.symbols`
-//! and `.trace.json` baselines of every compiler and conformance case with
-//! `testdata/baselines/reference` of the Go checkout, byte for byte.
+//! `.errors.txt`, `.contentmapper` (tsgo#4712), `.js`, `.js.map`,
+//! `.sourcemap.txt`, `.types`, `.symbols` and `.trace.json` baselines of
+//! every compiler and conformance case with `testdata/baselines/reference`
+//! of the Go checkout, byte for byte.
 //!
 //! Files:
 //! - `runner.rs`: compiler_runner.go (the runner, the test cases, the
@@ -12,8 +13,9 @@
 //!   not have (`CompileFiles`, options, configurations) and recorderfs.go.
 //! - `sourcemap_recorder.rs`: sourcemap_recorder.go and
 //!   `GetSourceMapRecord`.
-//! - `tsbaseline.rs`: testutil/tsbaseline (error, js emit, source map,
-//!   source map record, module resolution, the type and symbol wrappers).
+//! - `tsbaseline.rs`: testutil/tsbaseline (error, content mapper, js emit,
+//!   source map, source map record, module resolution, the type and symbol
+//!   wrappers). The test content mappers are `support::contentmappertest`.
 //! - `go_regex.rs`: the Go regular expressions as plain matchers.
 //! - `child.rs`: each test configuration runs in a child process; the
 //!   environment variables and `known_failures.txt` are described there.
