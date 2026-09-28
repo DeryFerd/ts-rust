@@ -288,13 +288,16 @@ impl Checker {
                     let fb = f.borrow();
                     (fb.reference, fb.flow_container, fb.initial_type)
                 };
-                if container.is_some()
-                    && container != flow_container
-                    && !is_property_access_expression(reference)
-                    && !is_element_access_expression(reference)
-                    && !(reference.kind() == SyntaxKind::ThisKeyword
-                        && !is_arrow_function(container))
-                {
+                // PERF: Go `IsPropertyAccessExpression`,
+                // `IsElementAccessExpression` and the `KindThisKeyword` test
+                // on one read of the reference kind.
+                if container.is_some() && container != flow_container && {
+                    let reference_kind = reference.kind();
+                    reference_kind != SyntaxKind::PropertyAccessExpression
+                        && reference_kind != SyntaxKind::ElementAccessExpression
+                        && !(reference_kind == SyntaxKind::ThisKeyword
+                            && !is_arrow_function(container))
+                } {
                     flow = container.flow_node();
                     continue;
                 }

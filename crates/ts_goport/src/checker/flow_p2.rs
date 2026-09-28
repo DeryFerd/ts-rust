@@ -1038,6 +1038,44 @@ impl Checker {
         ));
     }
 
+    /// Go `c.getResolvedSymbol(source)`, from the memo when it holds
+    /// `source`.
+    fn memo_resolved_symbol(&mut self, source: Node) -> SymbolId {
+        let memo = &self.matching_reference_memo;
+        if memo.node == source && memo.resolved.is_some() {
+            return memo.resolved;
+        }
+        let resolved = self.get_resolved_symbol(source);
+        // The first resolution can check other code, which can put another
+        // identifier in the memo. Then the answer is not stored.
+        let memo = &mut self.matching_reference_memo;
+        if memo.node == source {
+            memo.resolved = resolved;
+        }
+        resolved
+    }
+
+    /// Go `c.getExportSymbolOfValueSymbolIfExported(c.getResolvedSymbol(source))`,
+    /// from the memo when it holds `source` and no merge came after it.
+    fn memo_export_symbol(&mut self, source: Node) -> SymbolId {
+        let memo = &self.matching_reference_memo;
+        if memo.node == source
+            && memo.export.is_some()
+            && memo.export_merge_version == self.merge_version
+        {
+            return memo.export;
+        }
+        let resolved = self.memo_resolved_symbol(source);
+        let export = self.get_export_symbol_of_value_symbol_if_exported(resolved);
+        let merge_version = self.merge_version;
+        let memo = &mut self.matching_reference_memo;
+        if memo.node == source {
+            memo.export = export;
+            memo.export_merge_version = merge_version;
+        }
+        export
+    }
+
     // Go: checker/flow.go:1576 isMatchingReference
     // PERF: the kind of `target` is read once (`target_kind`). This runs
     // about 2.2M times on effect, mostly with an identifier `source`.
@@ -1075,11 +1113,21 @@ impl Checker {
                 ) {
                     return false;
                 }
-                if is_this_in_type_query(source) {
+                // PERF: the reads of `source` come from the memo (see
+                // `MatchingReferenceMemo`). Each one is made at the same
+                // point as in Go the first time.
+                if self.matching_reference_memo.node != source {
+                    self.matching_reference_memo = MatchingReferenceMemo {
+                        node: source,
+                        this_in_type_query: is_this_in_type_query(source),
+                        ..MatchingReferenceMemo::default()
+                    };
+                }
+                if self.matching_reference_memo.this_in_type_query {
                     return target_kind == SyntaxKind::ThisKeyword;
                 }
                 if target_kind == SyntaxKind::Identifier {
-                    let source_symbol = self.get_resolved_symbol(source);
+                    let source_symbol = self.memo_resolved_symbol(source);
                     if source_symbol == self.get_resolved_symbol(target) {
                         return true;
                     }
@@ -1087,9 +1135,7 @@ impl Checker {
                 if target_kind == SyntaxKind::VariableDeclaration
                     || target_kind == SyntaxKind::BindingElement
                 {
-                    let resolved = self.get_resolved_symbol(source);
-                    let export_symbol =
-                        self.get_export_symbol_of_value_symbol_if_exported(resolved);
+                    let export_symbol = self.memo_export_symbol(source);
                     return export_symbol == self.get_symbol_of_declaration(target);
                 }
                 return false;
@@ -1104,6 +1150,19 @@ impl Checker {
             | SyntaxKind::ParenthesizedExpression
             | SyntaxKind::SatisfiesExpression => {
                 return self.is_matching_reference(source.expression(), target);
+            }
+            // PERF: for a property access `source` and a target that is not
+            // an access expression, every Go test below is false, and the
+            // Go `getAccessedPropertyName(source)` only reads the name. An
+            // element access `source` keeps the Go path: its name lookup can
+            // resolve symbols and types.
+            SyntaxKind::PropertyAccessExpression
+                if !matches!(
+                    target_kind,
+                    SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+                ) =>
+            {
+                return false;
             }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                 let (source_property_name, ok) = self.get_accessed_property_name(source);
@@ -1153,6 +1212,31 @@ impl Checker {
         }
         false
     }
+}
+
+/// PERF: not in Go. What `is_matching_reference` read about its last
+/// identifier `source`. Flow analysis compares one reference with each flow
+/// node on its path, so the same `source` comes again and again.
+///
+/// Each value is stable once read: `is_this_in_type_query` only reads the
+/// tree, and `get_resolved_symbol` stores its answer in the node links, which
+/// nothing overwrites later. The export symbol depends on the merged symbol
+/// table and on the flags a merge can add, so it is read again after any
+/// merge (`Checker::merge_version`). A nested `is_matching_reference` call
+/// (during the first resolution of `node`) can replace the memo, so a value
+/// is stored only while the memo still holds its node.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MatchingReferenceMemo {
+    /// The identifier; nil when the memo is empty.
+    pub node: Node,
+    /// Go `ast.IsThisInTypeQuery(node)`.
+    pub this_in_type_query: bool,
+    /// Go `c.getResolvedSymbol(node)`; nil until read.
+    pub resolved: SymbolId,
+    /// Go `c.getExportSymbolOfValueSymbolIfExported(resolved)`; nil until read.
+    pub export: SymbolId,
+    /// `Checker::merge_version` when `export` was read.
+    pub export_merge_version: u64,
 }
 
 // Go: checker/flow.go:1634 nonDottedNameCacheKey
