@@ -9,7 +9,7 @@
 //! `latestChangedDtsFiles` SyncMaps) goes to `EmitFilesShared` behind a
 //! mutex. Go `ctx` is dropped. `start_emit_files` and `finish_emit_files`
 //! split the emit of all affected files at the wait for the emit jobs, so
-//! `Program::start_check_and_emit` can send them behind the check.
+//! `Program::start_emit` can send them behind the check.
 
 use super::affected_files::collect_all_affected_files;
 use super::hash::FileInfo;
@@ -622,7 +622,7 @@ pub(crate) struct StartedEmit {
 }
 
 /// PORT: not in Go (perf). The first half of `emit_files(program, options,
-/// false)` for `Program::start_check_and_emit`: pass 1 of
+/// false)` for `Program::start_emit`: pass 1 of
 /// `emit_files_incremental`, then the emit jobs are sent without a wait.
 /// Each checker thread runs them after the jobs sent to it before (the
 /// check and the second global diagnostics read). The caller has the

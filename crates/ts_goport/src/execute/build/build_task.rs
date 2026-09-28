@@ -1,4 +1,4 @@
-use crate::emitter::program_emit::{WriteFile, WriteFileData};
+use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost};
 use crate::execute::build::up_to_date_status::*;
@@ -533,6 +533,15 @@ impl BuildTask {
         let (result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
+            // PORT: perf. Each checker emits when its own check ends, as in
+            // `tsc -p` (`Program::start_check_and_emit`), with the options of
+            // the emit call in `EmitFilesAndReportErrors` (the same
+            // `WriteFile`). `EmitAndReportStatistics` makes the same calls
+            // as in Go and waits for that work.
+            incremental_program.start_emit(EmitOptions {
+                write_file: Some(write_file.clone()),
+                ..EmitOptions::default()
+            });
             let emitted = emit_and_report_statistics(&EmitInput {
                 sys: &*sys,
                 program_like: &incremental_program,

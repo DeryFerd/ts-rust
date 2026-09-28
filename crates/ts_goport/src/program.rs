@@ -987,7 +987,7 @@ fn trace_bind_source_file(file: Node) -> Option<crate::tracing::Pop> {
 /// The state of this thread that binding must not change: synthetic nodes,
 /// ids and lazy JSDoc. A bind thread starts from a copy of the loading
 /// thread's state, so anything it adds would be lost. The early emit
-/// (`execute::incremental::Program::start_check_and_emit`) also reads it:
+/// (`execute::incremental::Program::start_emit`) also reads it:
 /// an emit pool starts from a copy of the same state.
 pub(crate) fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     (
