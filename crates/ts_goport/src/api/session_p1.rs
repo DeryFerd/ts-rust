@@ -16,9 +16,10 @@ use crate::api::prelude::*;
 //   `new_*_response` borrows the checker again to read the result.
 // - A handle from the registry is used with the setup checker only through
 //   `checker_symbol`, `checker_type` and `checker_signature`. Go can hand a
-//   pointer of one checker to another checker; the port can do that only for
-//   binder symbols (same index in every checker of the program). Any other
-//   case calls `unported!`.
+//   pointer of one checker to another checker. For a symbol, the port uses
+//   the same symbol when both arenas have it, else a shadow: a copy in the
+//   setup checker's arena with the same id and no links (`import_symbol`).
+//   A type or signature of another checker calls `unported!`.
 // - Go `defer setup.done()`: `CheckerSetup::done` is a `Release` guard. It
 //   releases the checker when `setup` drops at the end of the handler.
 // - Current program: node handles (`node_handle_from`, `resolve_node_handle`)
@@ -166,21 +167,17 @@ impl SnapshotData {
         if symbol.is_nil() {
             return SymbolID(0);
         }
-        let id = symbol_handle(&checker.borrow().symbols, symbol);
+        let (id, slot) = {
+            let c = checker.borrow();
+            (symbol_handle(&c.symbols, symbol), c.symbols.id_slot(symbol))
+        };
         let mut registry = self.symbol_registry.borrow_mut();
         if let Some(existing) = registry.get(&id) {
-            // PORT: Go compares `*ast.Symbol` pointers. The symbol id is
-            // keyed by arena index, so `existing.1 == symbol` here. A binder
-            // symbol is the same symbol in every checker of the program; a
-            // checker-made (transient) symbol is the same only in the same
-            // checker. See notes/w6-api-session.md (symbol ids).
-            let same = existing.1 == symbol
-                && (Rc::ptr_eq(&existing.0, checker)
-                    || !checker
-                        .borrow()
-                        .sym(symbol)
-                        .flags
-                        .intersects(SymbolFlags::TRANSIENT));
+            // PORT: Go compares `*ast.Symbol` pointers. The id slot stands
+            // for the Go symbol (`SymbolArena::id_slot`): a binder symbol has
+            // one slot in every checker that has it, and a shadow has the
+            // slot of its origin (`import_symbol`).
+            let same = existing.0.borrow().symbols.id_slot(existing.1) == slot;
             if !same {
                 panic!("duplicate symbol");
             }
@@ -381,30 +378,100 @@ impl SnapshotData {
 }
 
 /// PORT: Go hands a `*ast.Symbol` of any checker to `setup.checker`. A Rust
-/// symbol handle indexes the arena of `owner`. A binder symbol has the same
-/// index in every checker of the program, so it can be used with `checker`;
-/// a checker-made (transient) symbol of another checker can not.
+/// symbol handle indexes the arena of `owner`. This returns the symbol of
+/// `checker`'s arena that is the same Go symbol (`import_symbol`).
 pub fn checker_symbol(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,
     symbol: SymbolId,
 ) -> SymbolId {
-    if !Rc::ptr_eq(checker, owner)
-        && symbol.is_some()
-        && owner
-            .borrow()
-            .sym(symbol)
-            .flags
-            .intersects(SymbolFlags::TRANSIENT)
-    {
-        unported!("api: transient symbol of another checker");
+    if Rc::ptr_eq(checker, owner) || symbol.is_nil() {
+        return symbol;
     }
-    symbol
+    let owner = owner.borrow();
+    let mut checker = checker.borrow_mut();
+    import_symbol(&owner.symbols, &mut checker.symbols, symbol)
+}
+
+/// The symbol of arena `to` that is Go symbol `symbol` of arena `from`: the
+/// same symbol when `to` has it, else a shadow in `to`
+/// (`SymbolArena::push_shadow`): a copy with the same id. The checker of
+/// `to` has no links for a shadow, as a Go checker has none for the symbol
+/// of another checker, so it computes the type from the declarations or
+/// dereferences nil (an instantiated symbol has no target). The symbol and
+/// table fields of a shadow point into `to` in the same way. Nodes and
+/// names are global and stay.
+// PORT: Go shares the object, so a later write to its fields is seen by
+// both checkers. Checkers write those fields almost only while they make or
+// merge the symbol. A work list, not recursion: parents and members form
+// cycles and long chains.
+fn import_symbol(from: &SymbolArena, to: &mut SymbolArena, symbol: SymbolId) -> SymbolId {
+    let mut work = Vec::new();
+    let result = shadow_of(from, to, symbol, &mut work);
+    while let Some((shadow, origin)) = work.pop() {
+        let s = from.sym(origin);
+        let (parent, export_symbol, members, exports) =
+            (s.parent, s.export_symbol, s.members, s.exports);
+        let parent = shadow_of(from, to, parent, &mut work);
+        let export_symbol = shadow_of(from, to, export_symbol, &mut work);
+        let members = import_table(from, to, members, &mut work);
+        let exports = import_table(from, to, exports, &mut work);
+        let s = to.sym_mut(shadow);
+        s.parent = parent;
+        s.export_symbol = export_symbol;
+        s.members = members;
+        s.exports = exports;
+    }
+    result
+}
+
+/// `symbol` of `from` in `to`: the same symbol, or its shadow. A new shadow
+/// still holds the symbol and table fields of `from`, so it goes on `work`
+/// with its origin, and `import_symbol` maps them.
+fn shadow_of(
+    from: &SymbolArena,
+    to: &mut SymbolArena,
+    symbol: SymbolId,
+    work: &mut Vec<(SymbolId, SymbolId)>,
+) -> SymbolId {
+    if symbol.is_nil() {
+        return symbol;
+    }
+    let origin = from.id_slot(symbol);
+    if let Some(found) = to.symbol_at_slot(origin) {
+        return found;
+    }
+    let shadow = to.push_shadow(from.sym(symbol).clone(), origin);
+    work.push((shadow, symbol));
+    shadow
+}
+
+/// `table` of `from` in `to`: the same table when both arenas copied it from
+/// the binder lineage, else a new table in `to` with the same entries in the
+/// same order, each symbol in `to` (`shadow_of`).
+fn import_table(
+    from: &SymbolArena,
+    to: &mut SymbolArena,
+    table: SymbolTable,
+    work: &mut Vec<(SymbolId, SymbolId)>,
+) -> SymbolTable {
+    if table.is_nil() || table.index() < from.shared_table_count().min(to.shared_table_count()) {
+        return table;
+    }
+    let entries: Vec<_> = from
+        .iter_names(table)
+        .map(|(name, symbol)| (name, shadow_of(from, to, symbol, work)))
+        .collect();
+    to.push_table_from_entries(entries.into_iter())
 }
 
 /// PORT: as `checker_symbol`, for a type. Every type belongs to one checker.
 /// Go can mix types of two checkers (a canceled persistent checker, a second
-/// project); the port can not.
+/// project); the port can not. A copy, as for a symbol, does not give Go's
+/// answers: Go's checkers write lazy results (resolved members, return
+/// types) into the shared type and read each other's results, and they
+/// number types each from 1, so ids collide (`duplicate type`). Only one
+/// object heap for all checkers would match that.
 pub fn checker_type(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,
@@ -416,7 +483,7 @@ pub fn checker_type(
     t
 }
 
-/// PORT: as `checker_type`, for a signature.
+/// PORT: as `checker_type`, for a signature, for the same reason.
 pub fn checker_signature(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,

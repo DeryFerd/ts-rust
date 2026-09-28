@@ -146,6 +146,11 @@ impl Checker {
         target: TypeId,
         constraint: TypeId,
     ) -> TypeId {
+        if source.is_nil() || target.is_nil() || constraint.is_nil() {
+            // Go reads `source.id`, `target.id` and `constraint.id`: a
+            // reverse mapped symbol of another checker has no links here.
+            go_nil_dereference();
+        }
         let key = ReverseMappedTypeKey {
             source_id: source,
             target_id: target,
