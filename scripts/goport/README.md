@@ -27,9 +27,48 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   Hono and effect against Go. RSS, edit latency and answers; exit 1 when Rust is over the limits in
   its docstring.
 
+- `buildbench.sh`, `buildbench-plan.sh`, `buildbench-remote.sh`: timed `ts_goport` builds on a quiet
+  host under its lock (see "Build toolchain" below). `bin-identity.sh <out> <bins-a> <bins-b>`:
+  byte-for-byte output of two bin dirs (`tsgo -p` with emit and `goport -p`) on Query core, Hono,
+  zod and effect.
+
 Revision bindings made before this move pin `/tmp/port/fp.py`. That copy is identical.
 `tmp-port.sh restore` puts back the legacy `/tmp/port` files and the cargo pool runner after a
 reboot or a tmpfiles cleanup (a login does it too). Put new tools here, never in `/tmp`.
+
+## Build toolchain
+
+`scripts/run-cargo-capped.sh` runs edit-loop commands (`build`, `check`, `test`, `run`, `bench`)
+with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8), and builds
+`ts_goport` incrementally. Release `-p ts_goport --bins` on dbook-lan, 16 jobs, sccache off
+(`target/continuation-r97-goport/buildspeed/bench.md`):
+
+| build | 1.93.0 (before) | nightly -Zthreads=8 | + incremental ts_goport (default) |
+|---|---|---|---|
+| clean | 215 s | 84 s | 84 s |
+| touch one file | 75 s | 43 s | 7 s |
+| one-line edit | 75 s | 43 s | 32 s |
+
+- Incremental is the edit-loop gain: a one-line edit also takes 32 s on 1.93.0 with it. The nightly
+  gains are in clean builds, large edits (merges, rebases, branch switches), `check` and `test`.
+- Output does not change. `tsgo -p` with emit and `goport -p` on Query core, Hono, zod and effect
+  are byte-equal to 1.93.0 bins, the quick gate is equal item for item, and `perf.sh` run time is
+  equal within 1%.
+- 1.93.0 stays for `--profile goport` (shipped and timing bins: `build-release.sh`, `build-pgo.sh`),
+  `fmt`, `clippy`, any command with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the protected
+  cargo roster (its pool runner calls cargo directly). For timing, build every side with the same
+  toolchain.
+- `TS_CARGO_NIGHTLY=0` uses the default toolchain. `TS_CARGO_INCREMENTAL=0` turns incremental off;
+  `1` turns it on for every workspace crate. After an internal compiler error, build again with both
+  set to 0 and report the error.
+- A host without the toolchain uses the default one and prints a note. Install it with
+  `rustup toolchain install nightly-2026-06-17 --profile minimal`.
+- The first build in each target dir after the switch rebuilds every crate once. The incremental
+  cache of ts_goport takes about 1.7 GB per target dir. sccache does not cache an incremental crate, so only
+  `ts_goport` is incremental: sccache still caches every other crate.
+- To measure a build change, run the `buildbench-plan.sh` session `defaults` before and after it on
+  one host: `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup`
+  session copies its source to the host first). `buildbench-report.py <runs-dir>...` makes the table.
 
 ## Editor sessions: `ls_edit_bench.py`
 

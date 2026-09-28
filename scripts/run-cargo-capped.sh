@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# One brace group: bash reads the whole script before it runs it, so a run that
+# waits for the lock keeps its own text when this file changes on disk.
+{
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
@@ -87,7 +90,6 @@ flock 9
 ulimit -v "$virtual_memory_limit_kib"
 ulimit -c 0
 export CARGO_BUILD_JOBS="$jobs"
-export CARGO_INCREMENTAL=0
 export RUST_TEST_THREADS=1
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
@@ -98,7 +100,76 @@ thread_flags=""
 if ((jobs == 1)); then
   thread_flags=" -C llvm-args=--threads=1 -C link-arg=-Wl,--threads=1"
 fi
+
+# Edit-loop builds (build, check, test, run, bench) use a pinned nightly with the
+# parallel frontend, and build ts_goport incrementally. On dbook-lan a ts_goport
+# rebuild took 75 s on 1.93.0 and 43 s on the nightly with -Zthreads=8, and a
+# one-line edit 32 s with incremental. Program output and the quick gate were
+# equal (target/continuation-r97-goport/buildspeed/bench.md).
+# - TS_CARGO_NIGHTLY=0 keeps the default toolchain. `--profile goport` (shipped
+#   and timing bins: build-release.sh, build-pgo.sh), RUSTUP_TOOLCHAIN and a
+#   `+toolchain` argument keep it too. -Zthreads is the job count, at most 8.
+# - TS_CARGO_INCREMENTAL unset: incremental ts_goport in edit-loop builds only.
+#   Other crates stay non-incremental, so sccache still caches them. 0 turns it
+#   off, 1 turns it on for every workspace crate.
+goport_profile=0
+previous_arg=""
+for arg in "$@"; do
+  [[ "$arg" != -- ]] || break
+  if [[ "$arg" == --profile=goport || ("$previous_arg" == --profile && "$arg" == goport) ]]; then
+    goport_profile=1
+  fi
+  previous_arg="$arg"
+done
+edit_loop=0
+case "${1:-}" in
+  build | b | check | c | test | t | run | r | bench) ((goport_profile)) || edit_loop=1 ;;
+esac
+
+cargo_args=()
+nightly="${TS_CARGO_NIGHTLY:-1}"
+nightly_toolchain="${TS_CARGO_NIGHTLY_TOOLCHAIN:-nightly-2026-06-17}"
+if [[ "$nightly" != 0 && "$nightly" != 1 ]]; then
+  echo "TS_CARGO_NIGHTLY must be 0 or 1" >&2
+  exit 2
+fi
+if ((edit_loop && nightly)) && [[ -z "${RUSTUP_TOOLCHAIN:-}" ]]; then
+  if rustup toolchain list 2>/dev/null | grep -q "^${nightly_toolchain}-"; then
+    cargo_args+=("+${nightly_toolchain}")
+    if ((jobs > 1)); then
+      thread_flags+=" -Zthreads=$((jobs < 8 ? jobs : 8))"
+    fi
+  else
+    echo "run-cargo-capped.sh: ${nightly_toolchain} is not installed; using the default toolchain." >&2
+    echo "  Install it with: rustup toolchain install ${nightly_toolchain} --profile minimal" >&2
+  fi
+fi
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0${thread_flags}"
+
+incremental="${TS_CARGO_INCREMENTAL:-}"
+if [[ -z "$incremental" ]]; then
+  incremental=0
+  if ((edit_loop)); then
+    incremental=ts_goport
+  fi
+fi
+case "$incremental" in
+  0 | 1) export CARGO_INCREMENTAL="$incremental" ;;
+  ts_goport)
+    # CARGO_INCREMENTAL would beat the per-package setting, and dev builds
+    # every workspace crate incrementally by default.
+    unset CARGO_INCREMENTAL
+    export CARGO_PROFILE_DEV_INCREMENTAL=false
+    cargo_args+=(
+      --config profile.dev.package.ts_goport.incremental=true
+      --config profile.release.package.ts_goport.incremental=true
+    )
+    ;;
+  *)
+    echo "TS_CARGO_INCREMENTAL must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 # sccache shares compiled crates across worktrees. Its server runs inside this
 # capped scope on a private socket, without the lock descriptor, and stops with
@@ -109,8 +180,9 @@ if [[ "${TS_CARGO_SCCACHE:-1}" == 1 ]] && command -v sccache >/dev/null; then
   export SCCACHE_IDLE_TIMEOUT=120
   sccache --start-server >/dev/null 9>&-
   trap 'sccache --stop-server >/dev/null 2>&1 || true' EXIT
-  cargo "$@"
+  cargo "${cargo_args[@]}" "$@"
   exit
 fi
 
-exec cargo "$@"
+exec cargo "${cargo_args[@]}" "$@"
+}
