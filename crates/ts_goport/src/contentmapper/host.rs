@@ -317,9 +317,7 @@ impl std::fmt::Display for InitializeError {
 // PORT: the name shadows `std::result::Result` in this package; package
 // files write `std::result::Result` in full. Go `*spanmap.SpanMap` is
 // `Option<Arc<SpanMap>>` (the source files and checker threads share it).
-// Go `*ast.Diagnostic` is `crate::core::Diagnostic`; until the syntax lane
-// gives it free message text and a source, it is the wave 3 prep stand-in
-// `ExternalDiagnostic`.
+// Go `*ast.Diagnostic` is `crate::core::Diagnostic`.
 #[derive(Clone, Default)]
 pub struct Result {
     // Text is the virtual TypeScript source text that is parsed into the program.
@@ -327,7 +325,7 @@ pub struct Result {
     // VirtualExtension determines how Text is parsed.
     pub virtual_extension: String,
     // Diagnostics are syntax errors in the original content.
-    pub diagnostics: Vec<ExternalDiagnostic>,
+    pub diagnostics: Vec<crate::core::Diagnostic>,
     // Mappings maps positions in Text back to the original content, so that diagnostics the compiler
     // produces against the virtual text can be reported at their original locations. A successful
     // transform must return a non-nil map; an empty map describes fully synthesized output.

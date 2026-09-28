@@ -14,10 +14,6 @@
 
 use crate::contentmapper::prelude::*;
 
-use crate::api::proto::{CompilerOptionsJSON, marshal_field_omitempty};
-use crate::contentmapper::prep::ipc::{
-    Conn as _, Handler as _, Protocol as _, ReadWriteCloser as _,
-};
 use crate::flags_macros::go_enum;
 use crate::frontend::json_ext::{
     AnyValue, marshal_field, unmarshal_string_as, unmarshal_struct_fields, unmarshal_uint_as,
@@ -26,7 +22,9 @@ use crate::frontend::json_ext::{
 use crate::frontend::stringutil_ls::equate_string_case_insensitive;
 use crate::gostd::context::{self, AfterFuncStop, CancelFunc};
 use crate::gostd::slices::sort_func;
+use crate::ipc::{Conn as _, Handler as _, Protocol as _, ReadWriteCloser as _};
 use crate::locale::Locale;
+use crate::options_json::{CompilerOptionsJSON, marshal_field_omitempty};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::Write;
@@ -1855,7 +1853,7 @@ impl Host for HostImpl {
 
     // Go: contentmapper/hostimpl.go:571 host.SetLocale
     fn set_locale(&self, diagnostic_locale: Locale) {
-        if locale_string(&self.diagnostic_locale.borrow()) == locale_string(&diagnostic_locale) {
+        if self.diagnostic_locale.borrow().string() == diagnostic_locale.string() {
             return;
         }
         *self.diagnostic_locale.borrow_mut() = diagnostic_locale;
@@ -2387,7 +2385,7 @@ fn handshake(
         METHOD_INITIALIZE,
         Some(Box::new(InitializeParams {
             protocol_version: PROTOCOL_VERSION,
-            locale: locale_string(&diagnostic_locale),
+            locale: diagnostic_locale.string(),
             position_encodings: vec![PositionEncoding::UTF8, PositionEncoding::UTF16],
         })),
     )?;
@@ -2855,8 +2853,8 @@ mod tests {
     // and the mapper side runs on its own thread: the handler is `Send`
     // (`MapperHandler`), and the thread makes its own connection around it.
     use super::*;
-    use crate::contentmapper::prep::ipc::{Protocol as _, ReadWriteCloser as _};
     use crate::gostd::context::background;
+    use crate::ipc::{Protocol as _, ReadWriteCloser as _};
     use std::io::Read;
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;

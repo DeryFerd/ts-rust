@@ -10,7 +10,6 @@
 pub mod contentmapper;
 pub mod host;
 pub mod hostimpl;
-pub mod prep;
 pub mod transform;
 
 pub use contentmapper::*;
@@ -25,13 +24,10 @@ pub mod prelude {
     // prelude's `Diagnostic` (Go `ast.Diagnostic`), as in Go. Write
     // `crate::core::Diagnostic` for the AST diagnostic.
     pub use super::hostimpl::Diagnostic;
-    // Go `ast.MappedDiagnosticDirective` (tsgo#4712, syntax lane) has the
+    // Go `ast.MappedDiagnosticDirective` (tsgo#4712) has the
     // same name; the package's own wire type wins. Write
     // `ast::MappedDiagnosticDirective` for the AST one.
     pub use super::hostimpl::MappedDiagnosticDirective;
-    // PORT: bump B wave 3 prep. `ast` and `ipc` are the stand-ins in
-    // `prep`; wave 3 uses `crate::ast` and `crate::ipc`.
-    pub use super::prep::{ExternalDiagnostic, ast, ipc, locale_string};
     pub use crate::frontend::json::{
         JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_marshal,
         json_unmarshal, json_unmarshal_decode,
@@ -40,5 +36,5 @@ pub mod prelude {
     pub use crate::frontend::{parser, tspath};
     pub use crate::gostd::{self, Context, GoError, errors};
     pub use crate::prelude::*;
-    pub use crate::{jsonrpc, locale, spanmap};
+    pub use crate::{ast, ipc, jsonrpc, locale, spanmap};
 }

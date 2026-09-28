@@ -14,10 +14,10 @@
 
 use crate::contentmapper::prelude::*;
 
-use crate::api::proto::{CompilerOptionsJSON, marshal_field_omitempty};
 use crate::frontend::json_ext::{
     marshal_field, unmarshal_struct_fields, write_object_end, write_object_start,
 };
+use crate::options_json::{CompilerOptionsJSON, marshal_field_omitempty};
 // PORT: the package's `Result` (host.go) comes with the glob import; this
 // file uses only `std::result::Result`, so the explicit import picks it.
 use std::result::Result;
@@ -257,7 +257,7 @@ impl Mapper {
 // compilerOptionFields maps each CompilerOptions option name (its json tag) to its struct field index.
 // PORT: Go reads the `json` tags by reflection and marshals each set field
 // by itself. The port has no reflection: it marshals the whole options with
-// the Go v2 struct marshaler (`api::CompilerOptionsJSON`, every member
+// the Go v2 struct marshaler (`options_json::CompilerOptionsJSON`, every member
 // `omitzero`) and returns each written member's raw JSON by its tag name.
 // A zero field writes no member, so it is absent here, as Go skips it with
 // `field.IsZero()`. Each member value is the same JSON that Go's

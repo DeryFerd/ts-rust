@@ -1,9 +1,10 @@
 //! Port of Go `internal/contentmapper/transform.go` (tsgo#4712).
 //!
 //! PORT: Go `*ast.SourceFile` is `Rc<ParsedSourceFile>` here, as in the
-//! compiler host (`frontend/compiler/host.rs`). The content mapper fields of
-//! a source file (Go `SetContentMapperInfo`, `ContentMapperSourceFileInfo`)
-//! are tsgo#4712's syntax lane part; this file calls them as Go does.
+//! compiler host (`frontend/compiler/host.rs`). Go `SetContentMapperInfo` is
+//! `ParsedSourceFile::set_content_mapper_info`. The canonical file holds its
+//! supplemental files as `Rc`, and each supplemental file points back with a
+//! `Weak`, so the two links make no `Rc` cycle (see that method).
 
 use crate::contentmapper::prelude::*;
 
@@ -54,11 +55,6 @@ pub fn transform_and_parse(
 
 // Go: contentmapper/transform.go:47 ParseResult
 // ParseResult validates and parses one mapper result and all its supplemental outputs.
-// PORT: bump B wave 3 prep. The mapper diagnostics (Go `SetDiagnostics`) and
-// the content mapper info (Go `SetContentMapperInfo`) need the syntax lane
-// parts, so they are under `cfg(goport_wave3)` (see `prep`). Without them
-// the parsed files carry no mapper diagnostics and no content mapper info.
-#[allow(unexpected_cfgs)]
 pub fn parse_result(
     parse_options: &SourceFileParseOptions,
     content: &str,
@@ -90,7 +86,6 @@ pub fn parse_result(
         text,
         get_script_kind_from_file_name(&virtual_file_name),
     );
-    #[cfg(goport_wave3)]
     if !result.diagnostics.is_empty() {
         // The runner produces diagnostics without a source file (it doesn't have one yet); associate
         // them with the file now so they are reported against it.
@@ -109,9 +104,6 @@ pub fn parse_result(
             diagnostics,
         );
     }
-    // PORT: bump B wave 3 prep: only the gated code reads these.
-    #[cfg(not(goport_wave3))]
-    let _ = (mapper, transform_identity, &mut source_file);
     let source_file = Rc::new(source_file);
     let mut files = SourceFiles {
         canonical: Some(source_file.clone()),
@@ -146,9 +138,7 @@ pub fn parse_result(
 
         files.supplemental.push(Rc::new(file));
     }
-    #[cfg(goport_wave3)]
     let mapper_identity = mapper.identity();
-    #[cfg(goport_wave3)]
     source_file.set_content_mapper_info(ast::ContentMapperSourceFileInfo {
         content_mapper: mapper_identity.clone(),
         transform_identity: transform_identity.to_string(),
@@ -160,7 +150,6 @@ pub fn parse_result(
         supplemental_source_files: files.supplemental.clone(),
         canonical_source_file: None,
     });
-    #[cfg(goport_wave3)]
     for (i, file) in files.supplemental.iter().enumerate() {
         let supplemental = &result.supplemental[i];
         file.set_content_mapper_info(ast::ContentMapperSourceFileInfo {
@@ -220,10 +209,7 @@ mod tests {
     }
 
     // Go: transform_test.go:14 TestParseResultSupplementalFileExtensions
-    // PORT: bump B wave 3 prep. The content mapper info checks are under
-    // `cfg(goport_wave3)`, as in `parse_result`.
     #[test]
-    #[allow(unexpected_cfgs)]
     fn test_parse_result_supplemental_file_extensions() {
         let mappings = Some(Arc::new(spanmap::new(&[])));
         let mapped = |extension: &str| MappedResult {
@@ -264,16 +250,12 @@ mod tests {
             result,
         )
         .expect("parse result");
-        #[cfg(goport_wave3)]
         let canonical = files.canonical.clone().expect("canonical file");
-        #[cfg(goport_wave3)]
         assert_eq!(
             canonical.content_mapper_transform_identity(),
             "transform-identity"
         );
-        #[cfg(goport_wave3)]
         let canonical_supplementals = canonical.supplemental_source_files();
-        #[cfg(goport_wave3)]
         assert_eq!(canonical_supplementals.len(), files.supplemental.len());
 
         let expected: [(&str, ScriptKind); 7] = [
@@ -291,16 +273,13 @@ mod tests {
             assert_eq!(file.file_name(), *file_name);
             assert_eq!(*file.path(), Path((*file_name).to_string()));
             assert_eq!(file.script_kind, *script_kind);
-            #[cfg(goport_wave3)]
-            {
-                assert_eq!(
-                    file.content_mapper_transform_identity(),
-                    "transform-identity"
-                );
-                assert!(Rc::ptr_eq(&canonical_supplementals[i], file));
-                let file_canonical = file.canonical_source_file().expect("canonical source file");
-                assert!(Rc::ptr_eq(&file_canonical, &canonical));
-            }
+            assert_eq!(
+                file.content_mapper_transform_identity(),
+                "transform-identity"
+            );
+            assert!(Rc::ptr_eq(&canonical_supplementals[i], file));
+            let file_canonical = file.canonical_source_file().expect("canonical source file");
+            assert!(Rc::ptr_eq(&file_canonical, &canonical));
         }
     }
 
