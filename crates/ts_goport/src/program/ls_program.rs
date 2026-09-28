@@ -239,10 +239,29 @@ pub fn program_version(p: &'static NewProgram) -> &'static GoProgram {
 /// on this thread, and so does such a file after a publish that gave it no
 /// program.
 pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
-    let Some(go_file) = crate::ast::try_go_file(file.file_index()) else {
+    if !crate::ast::is_published(file.file_index()) {
         return super::go_frontend::unpublished_parsed_source_file(file.file_index())
             .filter(|parsed| parsed.root == file);
-    };
+    }
+    program_parsed_source_file(file)
+        // PORT: bump B 2c config hand-off (api ext battery,
+        // `getConfigSourceFile` event 3): the root config that the project
+        // system parsed (Go `tsoptions.NewTsconfigSourceFileFromFilePath`).
+        .or_else(|| {
+            super::go_frontend::published_outside_parsed_source_file(file.file_index())
+                .filter(|parsed| parsed.root == file)
+        })
+}
+
+/// `parsed_source_file` for a file of a program made here that is not
+/// released: None for a file that no such program has, also when this
+/// thread has its parse from outside a program.
+// PORT: Go sets `SourceFile.Hash` only for the files of the language
+// server programs (project/parsecache.go `NewParseCache`,
+// project/compilerhost.go `GetContentMappedSourceFiles`). The api encoder
+// (`source_file_content_hash`) uses this to write Hash 0 for other parses.
+pub fn program_parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
+    let go_file = crate::ast::try_go_file(file.file_index())?;
     let path = tspath::Path(go_file.info.path.clone());
     let programs: Vec<&'static NewProgram> = PROGRAM_CHECKERS.with(|programs| {
         programs
@@ -251,18 +270,10 @@ pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
             .map(|checkers| checkers.program)
             .collect()
     });
-    programs
-        .into_iter()
-        .find_map(|p| {
-            p.get_source_file_by_path(&path)
-                .filter(|parsed| parsed.root == file)
-        })
-        // PORT: bump B 2c config hand-off (api ext battery,
-        // `getConfigSourceFile` event 3).
-        .or_else(|| {
-            super::go_frontend::published_outside_parsed_source_file(file.file_index())
-                .filter(|parsed| parsed.root == file)
-        })
+    programs.into_iter().find_map(|p| {
+        p.get_source_file_by_path(&path)
+            .filter(|parsed| parsed.root == file)
+    })
 }
 
 // ---------------------------------------------------------------------------
