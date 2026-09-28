@@ -105,9 +105,9 @@ pub fn word_indices(s: &str) -> Vec<i32> {
             continue;
         }
         if unicode::is_upper(rune_value)
-            && (unicode_is_lower(rune_of(utf8_decode_last_rune_in_string(s, byte_index).0))
+            && (unicode::is_lower(rune_of(utf8_decode_last_rune_in_string(s, byte_index).0))
                 || (byte_index + 1 < s.len()
-                    && unicode_is_lower(rune_of(utf8_decode_rune_in_string(s, byte_index + 1).0))))
+                    && unicode::is_lower(rune_of(utf8_decode_rune_in_string(s, byte_index + 1).0))))
         {
             indices.push(byte_index as i32);
         }
@@ -118,46 +118,6 @@ pub fn word_indices(s: &str) -> Vec<i32> {
 /// A decoded Go rune as a `char` (`utf8.RuneError` is U+FFFD).
 fn rune_of(r: i32) -> char {
     char::from_u32(r as u32).unwrap_or(char::REPLACEMENT_CHARACTER)
-}
-
-/// Go `unicode.IsLower`: general category Ll.
-// PORT: the Rust `Lowercase` property is Ll plus `Other_Lowercase`; the
-// `Other_Lowercase` ranges are removed so the result is Go's category test.
-fn unicode_is_lower(c: char) -> bool {
-    if !c.is_lowercase() {
-        return false;
-    }
-    !matches!(
-        c as u32,
-        0x00AA
-            | 0x00BA
-            | 0x02B0..=0x02B8
-            | 0x02C0..=0x02C1
-            | 0x02E0..=0x02E4
-            | 0x0345
-            | 0x037A
-            | 0x10FC
-            | 0x1D2C..=0x1D6A
-            | 0x1D78
-            | 0x1D9B..=0x1DBF
-            | 0x2071
-            | 0x207F
-            | 0x2090..=0x209C
-            | 0x2170..=0x217F
-            | 0x24D0..=0x24E9
-            | 0x2C7C..=0x2C7D
-            | 0xA69C..=0xA69D
-            | 0xA770
-            | 0xA7F2..=0xA7F4
-            | 0xA7F8..=0xA7F9
-            | 0xAB5C..=0xAB5F
-            | 0xAB69
-            | 0x10780
-            | 0x10783..=0x10785
-            | 0x10787..=0x107B0
-            | 0x107B2..=0x107BA
-            | 0x1E030..=0x1E06D
-    )
 }
 
 // Go: ls/autoimport/util.go:88 getPackageNamesInNodeModules

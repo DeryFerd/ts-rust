@@ -329,14 +329,11 @@ fn unicode_is(range_tab: &RangeTable, r: u32) -> bool {
     false
 }
 
-// PORT: Go `strings.ToLower` maps each rune with the simple (one rune)
-// `unicode.ToLower`. The first char of Rust `char::to_lowercase` is that
-// mapping (U+0130 is the only multi-char case, and it starts with 'i'). Rust
-// `str::to_lowercase` also applies the final-sigma rule, which Go does not.
+// PORT: Go `strings.ToLower` maps each rune with `unicode.ToLower`. Rust
+// `str::to_lowercase` uses the full mapping of a newer Unicode and the
+// final-sigma rule, which Go does not.
 fn strings_to_lower(s: &str) -> String {
-    s.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+    s.chars().map(unicode::to_lower).collect()
 }
 
 // Go: ls/lsutil/organizeimports.go:248 getOrganizeImportsPresetStringComparer
