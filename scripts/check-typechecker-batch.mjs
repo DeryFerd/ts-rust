@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadState, verifyAppendOnly } from "./state.mjs";
 
@@ -13,17 +15,18 @@ export const CARRY_FORWARD_RULE = "goport-only-roster-carry-forward";
 // Theo's standing rule (2026-09-28) that makes goport's own tests the protected set for a
 // batch with protectedSet "goport". See checkGoport.
 export const GOPORT_RULE = "goport-protected-set";
+// The first goport test baseline (docs/goport-protected/tests-r131.json). The rule must name it.
+export const GOPORT_BASELINE_SHA256 = "99b160efe18f29badaf861b83bebc4f64dc94c25ed1680d667e1984343c61e1d";
+// Unit test suites of the kept legacy crates. A name map may remove their tests when goport's Go
+// port replaces a crate (legacy removal stages 5 and 6); other removals need a Go pin change.
+const KEPT_CRATE_SUITE = /^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$/;
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
 const SCOPE = "Original 6055 and later 6330 PASS names only. Later added passes and corpus parity need independent review.";
-const GOPORT_SCOPE = "goport protected set: every base ok test name and every base gate item, plus bound runs, LSP oracle and quality. "
-  + "Name maps, gate noise and allow-list conditions need independent review.";
+const GOPORT_SCOPE = "goport protected set: every base ok test name and every base gate item, plus bound runs, LSP and API oracles "
+  + "and quality. Name maps, gate noise and allow-list conditions need independent review.";
 const TEST_STATUSES = new Set(["ok", "failed", "ignored", "unrun"]);
-const GATE_STATUSES = new Set(["MATCH", "ALLOWED", "FAIL"]);
-// Gate items of the open editor-long-growth defect. They may stay FAIL while the batch keeps
-// that open defect record. gate-compare.py applies the noise rule to them.
-const LONG_GROWTH = /^editor\/[^/]+\/long$/;
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -33,8 +36,9 @@ function text(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+// An ISO date (2026-09-28) or date-time (2026-09-28T20:57:30Z).
 function isoDate(value) {
-  return text(value) && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
+  return text(value) && /^\d{4}-\d{2}-\d{2}(T|$)/.test(value) && Number.isFinite(Date.parse(value));
 }
 
 // Two abbreviated or full git hashes (commits, Go pins) name the same object.
@@ -127,7 +131,8 @@ function standingRule(state, id, label) {
   const rules = Array.isArray(state.acceptanceRuleChanges) ? state.acceptanceRuleChanges : [];
   const rule = rules.find(item => item?.id === id && item.batchId === "*");
   requireValue(rule?.standing === true && rule.approvedBy === "Theo" && text(rule.instruction) && text(rule.scope) && isoDate(rule.date),
-    `${label} needs Theo's standing ${id} rule with batchId "*", instruction, scope and ISO date.`);
+    `${label} needs Theo's standing ${id} rule with batchId "*", standing true, approvedBy Theo, instruction, scope and `
+    + "an ISO date (2026-09-28 or 2026-09-28T20:57:30Z).");
   return rule;
 }
 
@@ -141,6 +146,8 @@ function goportRule(state) {
   const rule = standingRule(state, GOPORT_RULE, "The goport protected set");
   requireValue(rule.protectedSet === "goport" && text(rule.baseline?.path) && HASH.test(rule.baseline?.sha256),
     `${GOPORT_RULE} needs protectedSet "goport" and a baseline path and SHA-256.`);
+  requireValue(rule.baseline.sha256 === GOPORT_BASELINE_SHA256,
+    `${GOPORT_RULE} baseline must be the pinned first goport baseline (sha256 ${GOPORT_BASELINE_SHA256}).`);
   requireValue(text(rule.approvalNote) && state[rule.approvalNote] != null, `${GOPORT_RULE} must cite a saved approval note.`);
   requireValue(rule.unboundRevisions === undefined || (Array.isArray(rule.unboundRevisions) && rule.unboundRevisions.every(Number.isInteger)),
     `${GOPORT_RULE} unboundRevisions must be a list of revision numbers.`);
@@ -148,7 +155,8 @@ function goportRule(state) {
 }
 
 // goport is the goport-protected-set rule for a goport batch, else null. A goport batch has
-// no full result: its current history row and verdicts carry goportTestsSha256 and gateSha256.
+// no full result: its current history row and verdicts carry goportTestsSha256, gateSha256 and
+// nameMapSha256 (the goportTests name map sha256; absent or null when the batch has no map).
 function validateBatch(state, goport = null) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
   const continuation = state.phase === "recovery-continuation";
@@ -190,17 +198,19 @@ function validateBatch(state, goport = null) {
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
-  // A goport row and verdict bind to the goport test results and the gate manifest instead.
+  // A goport row and verdict bind to the goport test results, the gate manifest and the name map instead.
   const evidence = item => goport ? item.goportTestsSha256 === batch.goportTests?.sha256 && item.gateSha256 === batch.gate?.sha256
+    && (item.nameMapSha256 ?? null) === (batch.goportTests?.nameMap?.sha256 ?? null)
     : item.fullResultSha256 === batch.fullResult.sha256;
+  const bound = goport ? "goport test, gate and name map hashes" : "full result";
   requireValue(last.hypothesis === batch.hypothesis && last.sourceFingerprint === batch.sourceFingerprint && evidence(last),
-    `Current history row does not match the batch source, hypothesis, and ${goport ? "goport test and gate hashes" : "full result"}.`);
+    `Current history row does not match the batch source, hypothesis, and ${bound}.`);
   const verdicts = [batch.auditor, batch.reviewer];
   requireValue(batch.auditor?.role === "audit_accepted_roster", "Missing audit_accepted_roster verdict.");
   for (const verdict of verdicts) {
     requireValue(text(verdict?.role) && text(verdict?.agent) && verdict.verdict === "PASS", "Missing independent PASS verdict. STOP is the default.");
     requireValue(verdict.batchId === batch.id && verdict.sourceFingerprint === batch.sourceFingerprint && evidence(verdict),
-      `Verdict is not bound to this batch, source, and ${goport ? "goport test and gate hashes" : "full result"}.`);
+      `Verdict is not bound to this batch, source, and ${bound}.`);
     requireValue(verdict.agent !== batch.implementer && verdict.role !== batch.implementer, "The implementer cannot supply an independent verdict.");
   }
   requireValue(batch.auditor.agent !== batch.reviewer.agent && batch.auditor.role !== batch.reviewer.role, "Auditor and reviewer must have distinct roles and agent identities.");
@@ -297,19 +307,21 @@ function losses(baseline, current) {
   });
 }
 
-// Name map TSV (compare-tests.py --name-map): oldSuite, oldName, newSuite, newName per line;
-// more columns (the evidence) are ignored. "-" in both new columns marks a base name that the
-// change removed. Blank lines, "#" lines and a header row that starts with "oldSuite" are
-// skipped. Returns Map(old key -> [suite, name] | null).
+// Name map TSV (compare-tests.py --name-map): oldSuite, oldName, newSuite, newName and evidence
+// per line. The evidence cell (Go evidence at the new pin, or why a test moved) must not be
+// empty; more tab cells belong to it. "-" in both new columns marks a removed base name.
+// Blank lines, "#" lines and a header row that starts with "oldSuite" are skipped. Returns
+// Map(old key -> {line, to: [suite, name] | null, evidence}).
 function parseNameMap(source) {
   const map = new Map();
   for (const [index, line] of source.split("\n").entries()) {
-    const cells = line.replace(/\r$/, "").split("\t").slice(0, 4);
+    const cells = line.replace(/\r$/, "").split("\t");
     if (!line.trim() || line.startsWith("#") || (index === 0 && cells[0] === "oldSuite")) continue;
-    requireValue(cells.length === 4 && cells.every(text), `Name map line ${index + 1} needs oldSuite, oldName, newSuite and newName.`);
+    requireValue(cells.length >= 5 && cells.slice(0, 5).every(text),
+      `Name map line ${index + 1} needs oldSuite, oldName, newSuite, newName and evidence.`);
     const id = JSON.stringify(cells.slice(0, 2));
     requireValue(!map.has(id), `Name map line ${index + 1} maps ${cells[0]} ${cells[1]} twice.`);
-    map.set(id, cells[2] === "-" && cells[3] === "-" ? null : cells.slice(2));
+    map.set(id, { line: index + 1, to: cells[2] === "-" && cells[3] === "-" ? null : cells.slice(2, 4), evidence: cells.slice(4).join("\t") });
   }
   return map;
 }
@@ -329,28 +341,42 @@ function testSuites(results, label) {
 
 // Every base "ok" name must be "ok" at its own name or its mapped name. As in
 // compare-tests.py: failed or ignored is lost; unrun, or a name missing from a missing or
-// incomplete suite, is unrun; a name missing from a complete suite is absent.
+// incomplete suite, is unrun; a name missing from a complete suite is absent. A map line that
+// moves or removes a name needs the old name gone from the new results, and a new name that is
+// not a base name (so a map cannot swap a lost name for a passing one). A removal needs a Go
+// pin change between the base and new results, or a kept-crate suite.
 function compareTests(baseResults, newResults, map) {
   const before = testSuites(baseResults, "Base goport results"), after = testSuites(newResults, "goportTests results");
   requireValue(newResults.incomplete === undefined || (Array.isArray(newResults.incomplete) && newResults.incomplete.every(text)),
     "goportTests results: incomplete must be a list of suites.");
   const incomplete = new Set(newResults.incomplete ?? []);
-  const result = { baseOk: 0, retained: 0, recovered: 0, removedByMap: 0, newNames: 0, lost: [], absent: [], unrun: [] };
+  const has = (suites, suite, name) => Object.hasOwn(suites, suite) && Object.hasOwn(suites[suite], name);
+  const pinChanged = text(baseResults.pin) && text(newResults.pin) && !sameHash(baseResults.pin, newResults.pin);
+  for (const [id, { line, to }] of map ?? []) {
+    const [suite, name] = JSON.parse(id);
+    if (to && to[0] === suite && to[1] === name) continue;
+    requireValue(!has(after, suite, name), `Name map line ${line}: ${suite} ${name} is still in the new results.`);
+    requireValue(!to || !has(before, ...to), `Name map line ${line}: the new name ${to?.[0]} ${to?.[1]} is a base name.`);
+    requireValue(to || pinChanged || KEPT_CRATE_SUITE.test(suite),
+      `Name map line ${line} removes ${suite} ${name}, but the Go pin did not change and ${suite} is not a kept-crate suite.`);
+  }
+  const result = { baseOk: 0, retained: 0, recovered: 0, newNames: 0, removed: [], lost: [], absent: [], unrun: [] };
   const targets = new Set();
   for (const [suite, names] of Object.entries(before)) {
     for (const [name, status] of Object.entries(names)) {
       const id = JSON.stringify([suite, name]);
-      const target = map?.has(id) ? map.get(id) : [suite, name];
+      const entry = map?.get(id);
+      const target = entry ? entry.to : [suite, name];
       if (status === "ok") result.baseOk++;
       if (target === null) {
-        if (status === "ok") result.removedByMap++;
+        if (status === "ok") result.removed.push({ suite, name, evidence: entry.evidence });
         continue;
       }
       const targetId = JSON.stringify(target);
       requireValue(!targets.has(targetId), `Two base names map to ${target[0]} ${target[1]}.`);
       targets.add(targetId);
       const [toSuite, toName] = target;
-      const now = Object.hasOwn(after, toSuite) && Object.hasOwn(after[toSuite], toName) ? after[toSuite][toName]
+      const now = has(after, toSuite, toName) ? after[toSuite][toName]
         : !Object.hasOwn(after, toSuite) || incomplete.has(toSuite) ? "unrun" : "absent";
       if (status !== "ok") {
         if (now === "ok") result.recovered++;
@@ -368,33 +394,125 @@ function compareTests(baseResults, newResults, map) {
   return result;
 }
 
-// Gate manifest items by id. Every base item must be in the new run; a base MATCH must stay
-// MATCH; a new FAIL is a regression unless the base item already failed, it is an editor
-// long-growth item, and the batch keeps the open editor-long-growth defect record.
-function compareGate(baseManifest, newManifest, openDefects) {
-  const items = (manifest, label) => {
-    requireValue(Array.isArray(manifest?.results), `${label}: missing results.`);
-    const byId = new Map();
-    for (const item of manifest.results) {
-      requireValue(text(item?.id) && GATE_STATUSES.has(item.status), `${label}: item without id or MATCH, ALLOWED or FAIL status.`);
-      requireValue(!byId.has(item.id), `${label}: duplicate item ${item.id}.`);
-      byId.set(item.id, item.status);
-    }
-    return byId;
-  };
-  const before = items(baseManifest, "Base gate manifest"), after = items(newManifest, "Gate manifest");
-  const open = Array.isArray(openDefects) && openDefects.some(item => item?.id === "editor-long-growth" && /^open\b/.test(item.status ?? ""));
-  const regressions = [], knownOpen = [];
-  for (const [id, base] of before) {
-    const now = after.get(id) ?? "REMOVED";
-    if (now === "REMOVED" || (base === "MATCH" && now !== "MATCH")) regressions.push({ id, base, now });
-    else if (now === "FAIL") (base === "FAIL" && LONG_GROWTH.test(id) && open ? knownOpen : regressions).push({ id, base, now });
+// Runs python3 scripts/goport/<script> <args>. Exit 0 (pass) and exit 1 (a loss or regression)
+// print one JSON object. Any other exit is bad input, which is STOP.
+function runPython(script, args) {
+  const run = spawnSync("python3", [resolve(ROOT, "scripts/goport", script), ...args], { encoding: "utf8", maxBuffer: 256 << 20 });
+  const last = (run.stderr ?? "").trim().split("\n").at(-1);
+  requireValue(run.status === 0 || run.status === 1, `${script} failed (exit ${run.status ?? run.error?.code}): ${last}`);
+  try {
+    return { exit: run.status, output: JSON.parse(run.stdout) };
+  } catch {
+    throw new Error(`${script} exit ${run.status} printed no JSON: ${last}`);
   }
-  for (const [id, now] of after) if (!before.has(id) && now === "FAIL") regressions.push({ id, base: "NEW", now });
-  return { baseItems: before.size, items: after.size, regressions, knownOpen };
 }
 
-// The Query core and Hono bound runs, LSP oracle and quality record of the batch source.
+// Runs scripts/goport/gate-compare.py, the one implementation of the gate item rules (removed
+// ids, MATCH stays MATCH, ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth
+// noise rule), on two gate manifest files (absolute paths, already hash-checked) and the
+// batch's openDefects. It reads files next to the base manifest (runs/editor/result.json), so
+// it gets the real paths.
+function runGateCompare(basePath, newPath, openDefects) {
+  const dir = mkdtempSync(join(tmpdir(), "check-gate-"));
+  try {
+    const state = join(dir, "state.json");
+    writeFileSync(state, JSON.stringify({ batch: { openDefects: openDefects ?? [] } }));
+    const { exit, output } = runPython("gate-compare.py", [basePath, newPath, "--state", state]);
+    requireValue(Array.isArray(output?.regressions) && Array.isArray(output.knownOpen) && (exit === 1) === (output.regressions.length > 0),
+      "gate-compare.py output lacks its regressions and knownOpen lists.");
+    return output;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Runs scripts/goport/oracle-compare.py on two LSP or API oracle results dirs (absolute paths):
+// every protected base request (same or oracle_error_same) must be protected again.
+function runOracleCompare(baseDir, newDir) {
+  const { exit, output } = runPython("oracle-compare.py", [baseDir, newDir]);
+  const total = output?.total;
+  requireValue(total && ["lost", "unrun", "absent"].every(field => Number.isInteger(total[field]))
+    && (exit === 1) === (total.lost + total.unrun + total.absent > 0), "oracle-compare.py output lacks its totals.");
+  return output;
+}
+
+// The committed build inputs of a commit: its crates tree and its Cargo.toml and Cargo.lock
+// blobs (the committed part of candidate.sh's evidence key). candidate.sh reuses test and gate
+// evidence across commits with the same inputs, so the check compares inputs, not commits.
+function gitInputs(commit) {
+  requireValue(typeof commit === "string" && /^[0-9a-f]{7,40}$/i.test(commit), `Not a commit hash: ${JSON.stringify(commit)}.`);
+  const run = spawnSync("git", ["-C", ROOT, "rev-parse", ...["crates", "Cargo.toml", "Cargo.lock"].map(path => `${commit}:${path}`)],
+    { encoding: "utf8" });
+  const [crates, toml, lock] = run.status === 0 ? run.stdout.trim().split("\n") : [];
+  requireValue(crates && toml && lock, `git has no crates tree, Cargo.toml and Cargo.lock for commit ${commit}.`);
+  return { crates, toml, lock };
+}
+
+// The external tools of the goport check. Tests may replace them.
+export const TOOLS = { gitInputs, gateCompare: runGateCompare, oracleCompare: runOracleCompare };
+
+function sameInputs(a, b) {
+  return a.crates === b.crates && a.toml === b.toml && a.lock === b.lock;
+}
+
+// {label, dir} of the LSP or API oracle run that a batch field or the rule's apiBaseline names,
+// as open_revision.py oracle_base does: its dir, or the dir of an older record's summary path.
+function oracleRun(record) {
+  const dir = text(record?.dir) ? record.dir : text(record?.summary) ? dirname(record.summary) : null;
+  return dir ? { label: text(record.label) ? record.label : basename(dir), dir } : null;
+}
+
+function sameRun(a, b) {
+  return (a == null && b == null) || samePath(a?.dir, b?.dir);
+}
+
+// An LSP or API oracle record of accept_revision.py ({label, dir, base {label, dir}, compare,
+// output {path, sha256}}). Its base is the base batch's run. Its pinned oracle-compare.py output
+// compares that base with its dir and shows no lost, unrun or absent request. The check also
+// runs oracle-compare.py again on both dirs. Returns the new totals.
+function checkOracle(field, record, baseRun, tools, readEvidence, reasons) {
+  requireValue(baseRun, `${field}: the base batch names no oracle run to compare with.`);
+  requireValue(text(record?.dir) && samePath(record.base?.dir, baseRun.dir), `${field} needs its results dir and the base run ${baseRun.dir}.`);
+  const output = readEvidence(record.output);
+  requireValue(samePath(output?.base?.dir, baseRun.dir) && samePath(output.new?.dir, record.dir),
+    `${field}.output must be the oracle-compare.py output of ${baseRun.dir} and ${record.dir}.`);
+  const saved = ["lost", "unrun", "absent"]
+    .filter(name => size(record.compare?.[name], `${field}.compare.${name}`) > 0 || size(output.total?.[name], `${field}.output total ${name}`) > 0);
+  if (saved.length) reasons.push(`${field} compare reports ${saved.join(", ")} requests.`);
+  const again = tools.oracleCompare(resolve(ROOT, baseRun.dir), resolve(ROOT, record.dir)), total = again.total;
+  const lost = ["lost", "unrun", "absent"].filter(name => total[name] > 0);
+  if (lost.length) reasons.push(`${field}: ${lost.map(name => `${total[name]} ${name}`).join(", ")} protected base requests.`);
+  // The dirs are not pinned. The same counts as the pinned output show that they did not change.
+  const counts = run => ({ ...run.total, base: [run.base?.traces, run.base?.requests], new: [run.new?.traces, run.new?.requests] });
+  requireValue(JSON.stringify(counts(again)) === JSON.stringify(counts(output)),
+    `${field}: oracle-compare.py gives other counts now than its pinned output ${record.output.path}. A results dir changed.`);
+  return { label: record.label, base: baseRun.label, traces: again.new.traces, requests: again.new.requests, ...total };
+}
+
+// The LSP run's summary.json (lsp_oracle.py, in its dir): it has the traces and requests that
+// the compare counted (checked is checkOracle's result), ran the gate's tsgo, and has 0 diff,
+// goport_error, timeout and crash (crash includes crash exits).
+function checkLspClean(record, checked, gateManifest, readEvidence, reasons) {
+  const summary = readEvidence({ path: join(record.dir, "summary.json") }, { pinned: false });
+  requireValue(summary?.format === "goport-lsp-summary/1" && summary.batteries && typeof summary.batteries === "object",
+    `${record.dir}/summary.json is not an lsp_oracle.py summary.`);
+  const sum = name => Object.values(summary.batteries).reduce((total, battery) => total + (battery?.[name] ?? 0), 0);
+  requireValue(sum("traces") === checked.traces && sum("requests") === checked.requests,
+    `${record.dir}/summary.json counts other traces or requests than the oracle compare.`);
+  const tsgo = gateManifest.binaries?.tsgo?.sha256;
+  requireValue(HASH.test(tsgo) && Array.isArray(summary.goport) && summary.goport.length > 0 && summary.goport.every(bin => bin?.sha256 === tsgo),
+    "languageServerOracle ran another goport binary than the gate's tsgo.");
+  const classes = {};
+  for (const battery of Object.values(summary.batteries)) {
+    for (const [name, count] of Object.entries({ ...battery.classes, crash: (battery.classes?.crash ?? 0) + (battery.crashExits ?? 0) })) {
+      classes[name] = (classes[name] ?? 0) + count;
+    }
+  }
+  const bad = ["diff", "goport_error", "timeout", "crash"].filter(name => classes[name] > 0);
+  if (bad.length) reasons.push(`LSP oracle has ${bad.map(name => `${classes[name]} ${name}`).join(", ")}.`);
+}
+
+// The Query core and Hono bound runs and the quality record of the batch source.
 function checkRunEvidence(batch, readEvidence) {
   for (const label of ["ordinaryQuery", "latestHono"]) {
     const run = batch[label];
@@ -406,43 +524,53 @@ function checkRunEvidence(batch, readEvidence) {
         `${label}: bound run ${ref.manifest} names another source.`);
     }
   }
-  const lsp = batch.languageServerOracle;
-  requireValue(text(lsp?.summary) && /\b0 diffs?\b/.test(lsp.result ?? "") && /\b0 crash(es)?\b/.test(lsp.result ?? ""),
-    "languageServerOracle needs a summary and a result with 0 diff and 0 crash.");
-  readEvidence({ path: lsp.summary }, { pinned: false, json: false });
   requireValue(text(batch.quality?.record) && batch.qualityEvidence?.sourceFingerprint === batch.sourceFingerprint,
     "Quality needs a record and qualityEvidence for the batch source.");
   const quality = readEvidence({ path: batch.quality.record }, { pinned: false });
   requireValue(quality.sourceFingerprint === batch.sourceFingerprint && quality.rustfmtExit === 0 && quality.clippyExit === 0
-    && quality.fingerprintUnchanged === true, "Quality record is for another source or has rustfmt or clippy findings.");
+    && quality.tsGoportWarnings === 0 && (quality.keptCrateWarnings ?? 0) === 0 && quality.fingerprintUnchanged === true,
+  "Quality record is for another source or has rustfmt, clippy or ts_goport warning findings.");
 }
 
-// Theo's goport protected set (rule goport-protected-set, 2026-09-28). The base is the
-// accepted previous batch: its goportTests results when it was a goport batch, else the
-// rule's pinned baseline (docs/goport-protected/tests-r131.json); the gate base is always its
-// gate manifest. The check recomputes the test and gate comparison from the pinned files and
-// also requires the saved compare and gateCompare records to show no loss or regression.
-function checkGoport(state, rule, readEvidence) {
+// Theo's goport protected set (rule goport-protected-set, 2026-09-28). The base is the last
+// accepted batch: its goportTests results when it was a goport batch, else the rule's pinned
+// baseline (docs/goport-protected/tests-r131.json); the gate base is always its gate manifest;
+// the oracle bases are its LSP and API runs (the rule's apiBaseline after a legacy batch). The
+// check recomputes the test comparison and runs gate-compare.py and oracle-compare.py itself,
+// and also requires the saved compare records to show no loss or regression.
+function checkGoport(state, rule, readEvidence, tools) {
   const batch = validateBatch(state, rule);
   requireValue(batch.rosterCarryForward == null, "A goport batch has no roster carry-forward.");
   requireValue(text(batch.commit), "A goport batch needs its commit.");
   const pin = batch.upstreamPin?.to;
-  const previous = readEvidence(batch.previousBatch?.archive);
+  // open_revision.py --new-batch archives the accepted batch as the last batchRecords entry and
+  // names that entry, so an older accepted batch can never be the base.
+  const archive = batch.previousBatch?.archive;
+  const last = Array.isArray(state.batchRecords) ? state.batchRecords.at(-1) : undefined;
+  requireValue(samePath(archive?.path, last?.path) && archive.sha256 === last.sha256,
+    "previousBatch.archive must be the last saved batch record (batchRecords.at(-1)).");
+  const previous = readEvidence(archive);
   requireValue(previous?.id === batch.previousBatch.id && previous.compilerAccepted === true,
     "previousBatch.archive is not the saved record of an accepted batch.");
   const previousGoport = previous.protectedSet === "goport";
   const baseRef = previousGoport ? { path: previous.goportTests?.results, sha256: previous.goportTests?.sha256 } : rule.baseline;
+  // The oracle base runs. A legacy base batch had no API run: the rule's apiBaseline is its base.
+  const lspBase = oracleRun(previous.languageServerOracle);
+  const apiBase = oracleRun(previousGoport ? previous.apiOracle : rule.apiBaseline);
   // open_revision.py saves the same base as batch.protectedBase when it opens the batch.
   const saved = batch.protectedBase;
   requireValue(saved == null || (saved.batch === previous.id && samePath(saved.tests?.path, baseRef.path) && saved.tests.sha256 === baseRef.sha256
-    && samePath(saved.gate?.path, previous.gate?.manifest) && saved.gate.sha256 === previous.gate.sha256),
+    && samePath(saved.gate?.path, previous.gate?.manifest) && saved.gate.sha256 === previous.gate.sha256
+    && sameRun(saved.lsp, lspBase) && sameRun(saved.api, apiBase)),
   `batch.protectedBase differs from the base that accepted batch ${previous.id} gives.`);
   const tests = batch.goportTests;
   requireValue(samePath(tests?.base, baseRef.path) && tests.baseSha256 === baseRef.sha256,
     previousGoport ? `goportTests base must be the results of accepted batch ${previous.id}.`
       : `goportTests base must be the protected baseline ${rule.baseline.path}.`);
+  const inputs = tools.gitInputs(batch.commit);
   const results = readEvidence({ path: tests.results, sha256: tests.sha256 });
-  requireValue(sameHash(results.source?.commit, batch.commit), "goportTests results come from another commit than the batch.");
+  requireValue(sameInputs(tools.gitInputs(results.source?.commit), inputs) && sameHash(results.source?.tree, inputs.crates),
+    `goportTests results come from commit ${results.source?.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
   requireValue(!pin || sameHash(results.pin, pin), `goportTests results are not at the batch Go pin ${pin}.`);
   const map = tests.nameMap == null ? null : parseNameMap(readEvidence(tests.nameMap, { json: false }));
   const compared = compareTests(readEvidence(baseRef), results, map);
@@ -460,28 +588,40 @@ function checkGoport(state, rule, readEvidence) {
   requireValue(samePath(gateCompare.new, batch.gate?.manifest) && gateCompare.sha256 === batch.gate.sha256,
     "gateCompare new and sha256 must be batch.gate.");
   const newGate = readEvidence({ path: gateCompare.new, sha256: gateCompare.sha256 });
-  requireValue(sameHash(newGate.commit, batch.commit), "Gate manifest comes from another commit than the batch.");
+  requireValue(sameInputs(tools.gitInputs(newGate.commit), inputs),
+    `Gate manifest comes from commit ${newGate.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
   requireValue(!pin || sameHash(newGate.upstreamPin, pin), `Gate manifest is not at the batch Go pin ${pin}.`);
-  const gate = compareGate(readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 }), newGate, batch.openDefects);
-  if (size(gateCompare.regressions, "gateCompare.regressions") > 0) reasons.push("gateCompare reports gate regressions.");
+  readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 });
+  const gate = tools.gateCompare(resolve(ROOT, previous.gate.manifest), resolve(ROOT, gateCompare.new), batch.openDefects);
+  const output = readEvidence(gateCompare.output);
+  requireValue(output?.base?.sha256 === previous.gate.sha256 && output.new?.sha256 === batch.gate.sha256,
+    "gateCompare.output must be the gate-compare.py output for the base gate and batch.gate.");
+  if (size(gateCompare.regressions, "gateCompare.regressions") > 0 || !Array.isArray(output.regressions) || output.regressions.length) {
+    reasons.push("gateCompare reports gate regressions.");
+  }
   if (gate.regressions.length) reasons.push(`${gate.regressions.length} gate items regressed against ${previous.gate.manifest}.`);
 
   checkRunEvidence(batch, readEvidence);
-  const { lost, absent, unrun, ...counts } = compared;
+  const lsp = checkOracle("languageServerOracle", batch.languageServerOracle, lspBase, tools, readEvidence, reasons);
+  checkLspClean(batch.languageServerOracle, lsp, newGate, readEvidence, reasons);
+  const api = checkOracle("apiOracle", batch.apiOracle, apiBase, tools, readEvidence, reasons);
+  const { lost, absent, unrun, removed, ...counts } = compared;
   return { verdict: reasons.length ? "STOP" : "PASS", scope: GOPORT_SCOPE, protectedSet: "goport", rule: GOPORT_RULE, reasons,
     base: { batch: previous.id, tests: baseRef.path, gate: previous.gate.manifest },
-    counts: { goportTests: { ...counts, lost: lost.length, absent: absent.length, unrun: unrun.length },
-      gate: { baseItems: gate.baseItems, items: gate.items, regressions: gate.regressions.length, knownOpen: gate.knownOpen.length } },
+    counts: { goportTests: { ...counts, removedByMap: removed.length, lost: lost.length, absent: absent.length, unrun: unrun.length },
+      gate: { baseItems: gate.counts?.baseItems, items: gate.counts?.items, regressions: gate.regressions.length, knownOpen: gate.knownOpen.length } },
+    oracles: { lsp, api },
     knownOpenGateItems: gate.knownOpen,
-    losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions } };
+    nameMapRemoved: removed,
+    losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions.map(item => ({ id: item.id, base: item.base, now: item.new, why: item.why })) } };
 }
 
-// Tests may supply parsed synthetic evidence and a synthetic pin. The CLI always uses
-// readEvidence and INHERITED_PIN.
-export function checkBatch(state, readEvidence = readEvidenceFile, inheritedPin = INHERITED_PIN) {
+// Tests may supply parsed synthetic evidence, a synthetic pin and a synthetic gitInputs. The
+// CLI always uses readEvidence, INHERITED_PIN and TOOLS.
+export function checkBatch(state, readEvidence = readEvidenceFile, inheritedPin = INHERITED_PIN, tools = TOOLS) {
   try {
     const goport = goportRule(state);
-    if (goport) return checkGoport(state, goport, readEvidence);
+    if (goport) return checkGoport(state, goport, readEvidence, { ...TOOLS, ...tools });
     const batch = validateBatch(state);
     const carry = rosterCarry(state, batch);
     requireValue(state.acceptedBaseline?.sha256 === CHECKPOINT_SHA256, "Accepted checkpoint identity changed.");
@@ -591,43 +731,72 @@ ${SCOPE}
 
 Goport protected set (batch.protectedSet "goport"):
 The state needs Theo's standing rule ${GOPORT_RULE}: batchId "*", standing
-true, approvedBy Theo, instruction, scope, ISO date, protectedSet "goport",
-baseline {path, sha256} (the first goport test baseline,
-docs/goport-protected/tests-r131.json), and approvalNote, the key of a saved
-note that holds Theo's approval. Optional unboundRevisions lists history rows
-that may keep a null source (as unbound-history-rows does, for every batch).
-The batch has no fullResult, corpus, roster baselines or rosterCarryForward.
-The history rules above still apply. The current history row and both verdicts
-(PASS, batchId, sourceFingerprint) carry goportTestsSha256 = goportTests.sha256
-and gateSha256 = gate.sha256 instead of fullResultSha256.
+true, approvedBy Theo, instruction, scope, an ISO date (2026-09-28 or
+2026-09-28T20:57:30Z), protectedSet "goport", baseline {path, sha256} (the
+first goport test baseline, docs/goport-protected/tests-r131.json; its sha256
+must be ${GOPORT_BASELINE_SHA256}),
+approvalNote, the key of a saved note that holds Theo's approval, and
+apiBaseline {label?, dir} (the API oracle run that is the API base after a
+legacy base batch, which had no API run). Optional unboundRevisions lists
+history rows that may keep a null source (as unbound-history-rows does, for
+every batch). The batch has no fullResult, corpus, roster baselines or
+rosterCarryForward. The history rules above still apply. The current history
+row and both verdicts (PASS, batchId, sourceFingerprint) carry
+goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256 and
+nameMapSha256 = goportTests.nameMap.sha256 (absent or null without a map)
+instead of fullResultSha256.
 
 The base is batch.previousBatch.archive {path, sha256}, the saved record of the
-accepted previous batch. When it is a goport batch, the test base is its
-goportTests results; else it is the rule baseline. The gate base is its gate.
+last accepted batch: it must be the last batchRecords entry (open_revision.py
+--new-batch writes it so) and an accepted batch. When it is a goport batch,
+the test base is its goportTests results; else it is the rule baseline. The
+gate base is its gate.
+batch.commit is the batch commit. Evidence from another commit counts when
+that commit has the same build inputs (git crates tree, Cargo.toml and
+Cargo.lock), as candidate.sh reuses it by that key.
 - goportTests {results, sha256, base, baseSha256, compare, nameMap?}: results
   is the results.json of scripts/goport/goport-tests.sh
   ({source {commit, tree, testbinSha256}, pin, suites {suite {name: ok |
-  failed | ignored | unrun}}, incomplete [suite]}). Its source.commit must be
-  batch.commit and its pin batch.upstreamPin.to. compare.lost, absent and
-  unrun (counts or lists) must be 0. The check also compares the files itself,
-  as compare-tests.py does: each base ok name must be ok. failed or ignored is
-  lost; unrun, or missing from a missing or incomplete suite, is unrun; missing
-  from a complete suite is absent. nameMap {path, sha256} is a TSV of
-  oldSuite, oldName, newSuite, newName (more columns ignored; "-" "-" for a
-  removed name) for pin bumps and moved tests.
-- gateCompare {base, baseSha256?, new, sha256, regressions}: base is the
-  previous gate manifest, new and sha256 equal batch.gate {manifest, sha256}, regressions
-  (count or list) is 0. The new manifest must have batch.commit and the batch
-  pin. The check compares items itself: a base item is removed, a base MATCH
-  is not MATCH, or an item is FAIL. A base FAIL editor/<project>/long item may
-  stay FAIL while batch.openDefects has an open editor-long-growth record
-  (gate-compare.py applies the noise rule). Those items are in knownOpenGateItems.
+  failed | ignored | unrun}}, incomplete [suite]}). Its source.commit has the
+  build inputs of batch.commit, source.tree is that crates tree, and its pin is
+  batch.upstreamPin.to. compare.lost, absent and unrun (counts or lists) must
+  be 0. The check also compares the files itself, as compare-tests.py does:
+  each base ok name must be ok. failed or ignored is lost; unrun, or missing
+  from a missing or incomplete suite, is unrun; missing from a complete suite
+  is absent.
+- nameMap {path, sha256}: a TSV of oldSuite, oldName, newSuite, newName and a
+  non-empty evidence cell, for pin bumps and moved tests. A mapped old name
+  must be gone from the new results, and a new name must not be a base name.
+  "-" "-" removes a name: only when the base and new results have different
+  Go pins, or for a kept-crate suite (ts_scanner, ts_ast, ts_diagnostics,
+  ts_path, ts_core, ts_jsnum). The output lists the removed names with their
+  evidence in nameMapRemoved for the reviewer.
+- gateCompare {base, baseSha256?, new, sha256, regressions, output}: base is
+  the previous gate manifest, new and sha256 equal batch.gate {manifest,
+  sha256}, regressions (count or list) is 0, and output {path, sha256} is the
+  gate-compare.py output for those two manifests, with no regressions. The new
+  manifest has the build inputs of batch.commit and the batch pin. The check
+  runs scripts/goport/gate-compare.py itself on the pinned manifests and
+  batch.openDefects, so the gate rules (removed ids, MATCH stays MATCH,
+  ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth noise rule)
+  have one implementation. Its known-open items are in knownOpenGateItems.
 - ordinaryQuery and latestHono: complete, exitCode 0, matchesOracle, the batch
   sourceFingerprint, and runs [{manifest, sha256}] whose manifests name it.
-- languageServerOracle {summary, result}: the summary exists and result says
-  0 diff and 0 crash.
+- languageServerOracle and apiOracle {label, dir, base {label, dir}, compare,
+  output {path, sha256}} (accept_revision.py): dir is the results dir of
+  lsp_oracle.py or api_oracle.py check. The base run is the base batch's run
+  (its dir, or the dir of its summary path); after a legacy base batch the
+  API base is the rule's apiBaseline {label?, dir}. base.dir is that run,
+  output is the oracle-compare.py output of the base and new dirs, and
+  compare and output show 0 lost, unrun and absent requests. The check runs
+  oracle-compare.py again on both dirs: every base same or oracle_error_same
+  request must be so again, and the counts must equal the pinned output. The
+  LSP run's summary.json has the traces and requests of that compare, the gate
+  manifest's tsgo and 0 diff, goport_error, timeout and crash.
 - quality {record} and qualityEvidence {sourceFingerprint}: the record names
-  the batch source, rustfmtExit 0, clippyExit 0, fingerprintUnchanged true.
+  the batch source, rustfmtExit 0, clippyExit 0, tsGoportWarnings 0,
+  keptCrateWarnings 0 or absent, fingerprintUnchanged true.
+
 ${GOPORT_SCOPE}
 
 Independent review must compare retained history against saved batchRecords.
@@ -648,9 +817,9 @@ This check cannot prevent arbitrary direct commands or edits to state history.`)
   } catch (error) {
     result = { verdict: "STOP", scope: SCOPE, reasons: [`Missing or invalid state: ${error.message}`] };
   }
-  if (result.losses) {
-    result.losses = Object.fromEntries(Object.entries(result.losses).map(([name, rows]) => [name, { total: rows.length, first20: rows.slice(0, 20) }]));
-  }
+  const first20 = rows => ({ total: rows.length, first20: rows.slice(0, 20) });
+  if (result.losses) result.losses = Object.fromEntries(Object.entries(result.losses).map(([name, rows]) => [name, first20(rows)]));
+  if (result.nameMapRemoved) result.nameMapRemoved = first20(result.nameMapRemoved);
   console.log(JSON.stringify(result, null, 2));
   process.exitCode = result.verdict === "PASS" ? 0 : 1;
   }
