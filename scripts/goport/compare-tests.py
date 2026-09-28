@@ -10,28 +10,36 @@ Every base name with status "ok" is protected. For each one, in its base suite:
   absent     missing from a complete new suite
 A base name that is not ok and is ok in new is recovered. A new name is one that no base name maps to.
 
---name-map TSV: one line per moved or renamed test, `<old suite>\t<old name>\t<new suite>\t<new name>`,
-with more tab columns (the evidence) ignored. "-" as the new suite and name means the test was removed
-(a pin bump that deletes a Go test); it is reported as removedByMap and does not block. Blank lines, lines
-that start with # and a first line that starts with "oldSuite" (a header) are skipped. Two base names may
-not map to one new name. The reviewer checks each entry against its evidence. check-typechecker-batch.mjs
-reads the same format.
+--name-map TSV: one line per moved, renamed or removed test,
+`<old suite>\t<old name>\t<new suite>\t<new name>\t<evidence>` (more tab cells belong to the evidence,
+which must not be empty). "-" as the new suite and name means the test was removed; it is reported as
+removedByMap and does not block. Blank lines, lines that start with # and a first line whose first cell
+is "oldSuite" (a header) are skipped. Two base names may not map to one new name (exit 2). A map line
+that is not an identity is rejected (mapRejected, exit 1) when:
+  - its old name is still in the new results (a moved or removed test leaves no copy behind),
+  - its new name is a base name (so a map cannot swap a lost name for a passing one, or chain), or
+  - it removes a name, the Go pin did not change and the suite is not a kept-crate suite.
+The reviewer checks each entry against its evidence. check-typechecker-batch.mjs applies the same
+format and rules.
 
 Output: JSON with "base", "new" and "nameMap" (path, sha256), then per suite and in "total":
   retained, recovered, newNames: counts
   lost, absent, unrun: lists (in "total" each entry is "<suite>: <name>")
   removedByMap: base ok names that the map removes; list per suite, count in total
   recoveredNames, newFailed: lists per suite (newFailed: new names that fail), counts in total
-and "mapUnused" (map lines whose old name is not in base) and "verdict" (PASS or FAIL). With --out the
-JSON goes to FILE and stdout gets one summary line. Exit 1 when any protected name is lost, absent or
-unrun; exit 2 on bad input.
+and "mapRejected" ("line <n>: <reason>"), "mapUnused" (map lines whose old name is not in base) and
+"verdict" (PASS or FAIL). With --out the JSON goes to FILE and stdout gets one summary line. Exit 1 when
+any protected name is lost, absent or unrun or a map line is rejected; exit 2 on bad input.
 """
 import argparse
 import hashlib
 import json
+import re
 import sys
 
 LISTS = ('lost', 'absent', 'unrun')
+# Suites of the kept crates: stages 5 and 6 move or delete their tests without a Go pin change.
+KEPT_CRATE_SUITE = re.compile(r'^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$')
 
 
 def die(msg):
@@ -51,6 +59,7 @@ def load(path):
 
 
 def load_map(path):
+    """{(old suite, old name): (line, (new suite, new name) or None)} and the sha256 of the file."""
     try:
         raw = open(path, 'rb').read()
         lines = raw.decode('utf-8').splitlines()
@@ -58,15 +67,43 @@ def load_map(path):
         die(f'{path}: {err}')
     entries = {}
     for i, line in enumerate(lines, 1):
-        if not line.strip() or line.startswith('#') or (i == 1 and line.startswith('oldSuite')):
-            continue
         f = line.split('\t')
-        if len(f) < 4 or not all(f[:4]):
-            die(f'{path}:{i}: need 4 tab columns (old suite, old name, new suite, new name)')
+        if not line.strip() or line.startswith('#') or (i == 1 and f[0] == 'oldSuite'):
+            continue
+        if len(f) < 5 or not all(c.strip() for c in f[:5]):
+            die(f'{path}:{i}: need old suite, old name, new suite, new name and evidence (5 tab columns)')
         if (f[0], f[1]) in entries:
             die(f'{path}:{i}: {f[0]} {f[1]} is mapped twice')
-        entries[(f[0], f[1])] = None if f[2] == '-' and f[3] == '-' else (f[2], f[3])
+        entries[(f[0], f[1])] = (i, None if f[2] == '-' and f[3] == '-' else (f[2], f[3]))
     return entries, hashlib.sha256(raw).hexdigest()
+
+
+def same_hash(a, b):
+    """Two abbreviated or full git hashes name the same object (check-typechecker-batch.mjs sameHash)."""
+    hex_re = re.compile(r'^[0-9a-f]{7,64}$')
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    x, y = a.lower(), b.lower()
+    return bool(hex_re.match(x) and hex_re.match(y)) and (x.startswith(y) or y.startswith(x))
+
+
+def rejected_map_lines(base, new, name_map):
+    """The map lines that could hide a lost name, as "line <n>: <reason>"."""
+    before, after = base['suites'], new['suites']
+    text = lambda v: isinstance(v, str) and bool(v.strip())
+    pin_changed = text(base.get('pin')) and text(new.get('pin')) and not same_hash(base['pin'], new['pin'])
+    out = []
+    for (suite, name), (line, to) in sorted(name_map.items(), key=lambda e: e[1][0]):
+        if to == (suite, name):
+            continue
+        if name in after.get(suite, {}):
+            out.append(f'line {line}: {suite} {name} is still in the new results')
+        if to and to[1] in before.get(to[0], {}):
+            out.append(f'line {line}: the new name {to[0]} {to[1]} is a base name')
+        if to is None and not pin_changed and not KEPT_CRATE_SUITE.match(suite):
+            out.append(f'line {line}: removes {suite} {name}, but the Go pin did not change and {suite} '
+                       'is not a kept-crate suite')
+    return out
 
 
 def compare(base, new, name_map):
@@ -77,11 +114,12 @@ def compare(base, new, name_map):
         r = {'retained': 0, 'recovered': 0, 'lost': [], 'absent': [], 'unrun': [], 'removedByMap': [],
              'recoveredNames': []}
         for name, was in sorted(names.items()):
-            if (suite, name) in name_map and name_map[(suite, name)] is None:
+            to = name_map[(suite, name)][1] if (suite, name) in name_map else (suite, name)
+            if to is None:
                 if was == 'ok':
                     r['removedByMap'].append(name)
                 continue
-            to_suite, to_name = name_map.get((suite, name), (suite, name))
+            to_suite, to_name = to
             if (to_suite, to_name) in claimed:
                 die(f'two base names map to {to_suite} {to_name}')
             claimed.add((to_suite, to_name))
@@ -131,7 +169,8 @@ def main():
     new, new_sha = load(a.new)
     name_map, map_sha = load_map(a.name_map) if a.name_map else ({}, None)
     suites, total, unused = compare(base, new, name_map)
-    bad = sum(len(total[k]) for k in LISTS)
+    rejected = rejected_map_lines(base, new, name_map)
+    bad = sum(len(total[k]) for k in LISTS) + len(rejected)
     doc = {
         'base': {'path': a.base, 'sha256': base_sha, 'source': base.get('source'), 'pin': base.get('pin')},
         'new': {'path': a.new, 'sha256': new_sha, 'source': new.get('source'), 'pin': new.get('pin'),
@@ -139,6 +178,7 @@ def main():
         'nameMap': {'path': a.name_map, 'sha256': map_sha, 'entries': len(name_map)} if a.name_map else None,
         'suites': suites,
         'total': total,
+        'mapRejected': rejected,
         'mapUnused': unused,
         'verdict': 'FAIL' if bad else 'PASS',
     }
@@ -149,7 +189,8 @@ def main():
         t = total
         print(f"{doc['verdict']}: retained {t['retained']}, recovered {t['recovered']}, lost {len(t['lost'])}, "
               f"absent {len(t['absent'])}, unrun {len(t['unrun'])}, removedByMap {t['removedByMap']}, "
-              f"new names {t['newNames']} ({t['newFailed']} failed), map unused {len(unused)} ({a.out})")
+              f"new names {t['newNames']} ({t['newFailed']} failed), map rejected {len(rejected)}, "
+              f"map unused {len(unused)} ({a.out})")
     else:
         sys.stdout.write(text)
     sys.exit(1 if bad else 0)

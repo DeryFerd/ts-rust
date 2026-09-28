@@ -3,31 +3,42 @@
 #
 # usage: scripts/goport/goport-tests.sh <testbin-dir> <out-dir> [--pin PIN]
 #
-# <testbin-dir> is a dir from build-goport-tests.sh: the test binaries, relbin/, COMMIT, BUILD_ROOT,
-# BUILD_TARGET and bins.sha256 (checked first). PIN (default: GOPORT_PIN, else the saved state's
-# batch.upstreamPin.to, else UPSTREAM.json current) selects the Go checkout (TS_GO_REPO) and runs every
-# binary under `pin.py exec`. One test thread (RUST_TEST_THREADS=1) everywhere, as the project runs them.
+# <testbin-dir> is a dir from build-goport-tests.sh: the test binaries, SUITES, relbin/, COMMIT,
+# BUILD_ROOT, BUILD_TARGET and bins.sha256 (checked first; it must cover SUITES). Every test binary
+# of the dir must be in SUITES and each one runs, in its crate dir (as cargo test runs it). PIN
+# (default: GOPORT_PIN, else the saved state's batch.upstreamPin.to, else UPSTREAM.json current)
+# selects the Go checkout (TS_GO_REPO) and runs every binary under `pin.py exec`. One test thread
+# (RUST_TEST_THREADS=1) everywhere, as the project runs them.
 #
-# The test binaries have their build paths compiled in (fixtures under BUILD_ROOT/crates/ts_goport,
-# release bins under BUILD_TARGET/release). So each binary runs in a bwrap that binds a git archive of
+# The script runs in a clean environment: it starts itself again under `env -i` with only PATH, HOME,
+# USER, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS and LANG=C.UTF-8. So no setting of the caller
+# (GOPORT_*, TSCTEST_FILTER, TS_GOPORT_BASELINE_*, S2_*, COMPILER_RUNNER_*, NODE_OPTIONS, ...)
+# changes what a test runs.
+#
+# The test binaries have their build paths compiled in (fixtures under BUILD_ROOT/crates, release
+# bins under BUILD_TARGET/release). So each binary runs in a bwrap that binds a git archive of
 # COMMIT's crates/ over BUILD_ROOT/crates and relbin/ over BUILD_TARGET/release. The checkout and the
 # shared target do not change the run, and the run does not change them.
 #
-# Suites (results.json "suites" keys), in run order:
+# Suites (results.json "suites" keys):
 #   lib_snapshot                  ts_goport_lib snapshot_matches_live (the 2 lib snapshot tests, first)
-#   ts_goport_lib, goport_util_lib, goport_lsproto_lib
-#   go_baselines                  the default set (TestLocal, units, tsctests, project_lsp, ...)
+#   <suite>                       each test binary of SUITES, by name (ts_goport_lib, goport_util_lib,
+#                                 go_baselines (the default set), multi_program, ts_scanner_lib, ...)
 #   go_baselines_local            TestLocal subtests, "<kind> <key>" (COMPILER_RUNNER_RESULTS rows)
 #   go_baselines_transpile        TestTranspile subtests, "<kind> <key>" (TRANSPILE_RUNNER_RESULTS rows;
 #                                 only when go_baselines has compiler_runner::test_transpile, from bump B)
 #   go_baselines_submodule_shards TestSubmodule in 4 shards (COMPILER_RUNNER_JOBS=8), "<test> <i>/4"
 #   go_baselines_submodule        TestSubmodule subtests, "<kind> <key>"
-#   go_baselines_reference        each Go reference baseline file (testdata/baselines/reference,
-#                                 without .diff): ok = compared and its subtest passed, failed =
-#                                 compared and its subtest failed, ignored = not compared or skipped
-#   multi_program, emit_pool, early_emit, fswatch_linux
-#   ts_scanner_lib, ts_ast_lib, ts_diagnostics_lib, ts_path_lib, ts_core_lib, ts_jsnum_lib
-# A test binary that the dir lacks is skipped, and its suite is missing from results.json.
+#   go_baselines_reference        each file under the Go testdata/baselines/reference, by its path:
+#                                 - compared by a compiler runner (a "baseline" row): the status of its
+#                                   subtest (the path with submoduleAccepted/ and submoduleTriaged/ read
+#                                   as submodule/, and .diff and the kind extension dropped);
+#                                 - else compared by another go_baselines test (TS_GOPORT_BASELINE_TRACK
+#                                   of the default run: tsc, tsbuild, tsoptions, config, astnav, ...) or
+#                                   by a runner with no subtest of its kind: ok when no go_baselines
+#                                   test and no TestSubmodule shard failed or is unrun, else failed
+#                                   (the track file does not say which test compared a file);
+#                                 - else ignored (not compared).
 #
 # Output in <out-dir> (it must not have results.json or logs/):
 #   results.json  {"source": {"commit", "tree", "testbinSha256"}, "pin",
@@ -40,6 +51,7 @@
 #                 <suite>.results (libtest --logfile)
 #   *.tsv         the compiler runner results (COMPILER_RUNNER_RESULTS, TRANSPILE_RUNNER_RESULTS) of
 #                 TestLocal, TestTranspile and each TestSubmodule shard
+#   go_baselines.track  the reference paths that the default go_baselines run compared
 # Last stdout line: DONE (every suite ran and results.json is written; test failures are in
 # results.json) or FAIL rc=<N>. Compare two results with compare-tests.py.
 set -uo pipefail
@@ -49,10 +61,22 @@ set -uo pipefail
 {
 fail() { echo "goport-tests.sh: $2" >&2; echo "FAIL rc=$1"; exit "$1"; }
 usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d'; echo "FAIL rc=2"; exit 2; }
+
+# The clean environment (see the header). GOPORT_PIN of the caller becomes --pin, before the
+# arguments, so an explicit --pin wins.
+allow='PATH|HOME|LANG|USER|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|GOPORT_TESTS_CLEAN|PWD|OLDPWD|SHLVL|_'
+if compgen -e | grep -qvxE "$allow"; then
+  [[ -z ${GOPORT_TESTS_CLEAN:-} ]] || fail 2 "GOPORT_TESTS_CLEAN is set, but the environment has $(compgen -e | grep -vxE "$allow" | tr '\n' ' ')"
+  keep=(GOPORT_TESTS_CLEAN=1 PATH="$PATH" HOME="$HOME")
+  for v in USER XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do [[ -z ${!v:-} ]] || keep+=("$v=${!v}"); done
+  exec env -i "${keep[@]}" "$BASH" "${BASH_SOURCE[0]}" ${GOPORT_PIN:+--pin "$GOPORT_PIN"} "$@"
+fi
+export LANG=C.UTF-8
+
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 
-pin=${GOPORT_PIN:-}
+pin=
 args=()
 while (($#)); do
   case $1 in
@@ -68,8 +92,9 @@ TB=$(realpath -- "${args[0]}") || fail 2 "no test bin dir ${args[0]}"
 O=$(realpath -m -- "${args[1]}")
 [[ ! -e $O/results.json && ! -e $O/logs ]] || fail 2 "$O has results.json or logs/ (results are never replaced)"
 
-for f in COMMIT BUILD_ROOT BUILD_TARGET bins.sha256; do [[ -s $TB/$f ]] || fail 3 "$TB has no $f"; done
+for f in COMMIT BUILD_ROOT BUILD_TARGET SUITES bins.sha256; do [[ -s $TB/$f ]] || fail 3 "$TB has no $f"; done
 (cd "$TB" && sha256sum -c --quiet bins.sha256) || fail 3 "$TB/bins.sha256 does not match"
+grep -q '  SUITES$' "$TB/bins.sha256" || fail 3 "$TB/bins.sha256 does not cover SUITES"
 COMMIT=$(cat "$TB/COMMIT") BUILD_ROOT=$(cat "$TB/BUILD_ROOT") BUILD_TARGET=$(cat "$TB/BUILD_TARGET")
 tree=$(git -C "$ROOT" rev-parse --verify --quiet "$COMMIT:crates") || fail 3 "no commit $COMMIT"
 [[ -d $BUILD_ROOT/crates && -d $BUILD_TARGET/release && -d $TB/relbin ]] ||
@@ -77,29 +102,45 @@ tree=$(git -C "$ROOT" rev-parse --verify --quiet "$COMMIT:crates") || fail 3 "no
 GO=$(python3 "$ROOT/scripts/upstream/pin.py" path goCheckout "$pin") || fail 3 "unknown pin $pin"
 [[ -d $GO/testdata/baselines/reference ]] || fail 3 "no Go checkout at $GO"
 
+# SUITES: "<suite>\t<crate dir>". Each crate dir is under crates/ (the archived tree), each suite is
+# a test binary of the dir, and each test binary of the dir is a suite.
+declare -A crate_dir
+suites=()
+while IFS=$'\t' read -r s d; do
+  case $s in
+  lib_snapshot | go_baselines_local | go_baselines_transpile | go_baselines_submodule | \
+    go_baselines_submodule_shards | go_baselines_submodule-* | go_baselines_reference)
+    fail 3 "SUITES: $s is the name of a derived suite" ;;
+  esac
+  [[ -f $TB/$s && -x $TB/$s ]] || fail 3 "SUITES: no test binary $TB/$s"
+  [[ $d == crates/* ]] || fail 3 "SUITES: $s runs in $d, which is not under crates/"
+  crate_dir[$s]=$d
+  suites+=("$s")
+done < "$TB/SUITES"
+for f in "$TB"/*; do
+  [[ ! -f $f || ! -x $f || -n ${crate_dir[${f##*/}]+x} ]] || fail 3 "test binary ${f##*/} is not in SUITES"
+done
+
 mkdir -p "$O/logs" "$O/tmp" || fail 4 "cannot make $O"
 rm -rf "$O/src" && mkdir -p "$O/src" || fail 4 "cannot make $O/src"
 git -C "$ROOT" archive "$COMMIT" crates | tar -x -C "$O/src" || fail 4 "git archive of $COMMIT failed"
 
-# A clean environment: no goport, compiler runner or test harness settings of the caller.
-while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(GOPORT_|COMPILER_RUNNER_|TRANSPILE_RUNNER_|TS_TEST_|RUST_TEST_)')
-export GOPORT_PIN=$pin TS_GO_REPO=$GO RUST_TEST_THREADS=1 CARGO_MANIFEST_DIR=$BUILD_ROOT/crates/ts_goport
+export GOPORT_PIN=$pin TS_GO_REPO=$GO RUST_TEST_THREADS=1
 cap=(systemd-run --user --scope --quiet --collect -p MemoryMax=24000000K -p MemorySwapMax=0 nice -n 10)
 pinwrap=(python3 "$ROOT/scripts/upstream/pin.py" exec --)
 state() { echo "$1 $(date -u +%FT%TZ) Go $(git -C "$GO" rev-parse --short=12 HEAD) Go-dirty $(git -C "$GO" status --porcelain | wc -l) load $(cut -d' ' -f1-3 /proc/loadavg)"; }
 
-# suite <name> <binary> <crate dir> <timeout s> [test args...]: lists, then runs one test binary.
+# suite <name> <binary> <timeout s> [test args...]: lists, then runs one test binary in its crate dir.
 # The caller sets extra environment on the call.
 suite() {
-  local name=$1 bin=$TB/$2 dir=$BUILD_ROOT/crates/$3 secs=$4 rc
-  shift 4
-  if [[ ! -x $bin ]]; then echo "skip $name: no binary $bin"; return; fi
+  local name=$1 bin=$TB/$2 dir=$BUILD_ROOT/${crate_dir[$2]} secs=$3 rc
+  shift 3
   local box=(bwrap --dev-bind / / --bind "$O/src/crates" "$BUILD_ROOT/crates"
     --ro-bind "$TB/relbin" "$BUILD_TARGET/release" --chdir "$dir" --)
   rm -f "$O/logs/$name.results"
-  "${cap[@]}" "${pinwrap[@]}" "${box[@]}" "$bin" "$@" --list > "$O/logs/$name.list" 2>&1
-  timeout "$secs" "${cap[@]}" "${pinwrap[@]}" "${box[@]}" "$bin" "$@" --logfile "$O/logs/$name.results" \
-    > "$O/logs/$name.log" 2>&1
+  CARGO_MANIFEST_DIR=$dir "${cap[@]}" "${pinwrap[@]}" "${box[@]}" "$bin" "$@" --list > "$O/logs/$name.list" 2>&1
+  CARGO_MANIFEST_DIR=$dir timeout "$secs" "${cap[@]}" "${pinwrap[@]}" "${box[@]}" "$bin" "$@" \
+    --logfile "$O/logs/$name.results" > "$O/logs/$name.log" 2>&1
   rc=$?
   echo "exit=$rc" >> "$O/logs/$name.log"
   echo "$name exit=$rc $(grep -m1 '^test result:' "$O/logs/$name.log") $(date -u +%FT%TZ)"
@@ -107,29 +148,30 @@ suite() {
 
 echo "== goport tests: $TB (${COMMIT:0:9}, crates tree ${tree:0:12}), pin $pin, Go $GO, out $O"
 state before
-suite lib_snapshot ts_goport_lib ts_goport 1200 snapshot_matches_live
-suite ts_goport_lib ts_goport_lib ts_goport 1800
-suite goport_util_lib goport_util_lib ts_goport 1200
-suite goport_lsproto_lib goport_lsproto_lib ts_goport 1200
-mkdir -p "$O/tmp/local"
-COMPILER_RUNNER_TMP=$O/tmp/local COMPILER_RUNNER_RESULTS=$O/go_baselines_local.tsv \
-  TRANSPILE_RUNNER_RESULTS=$O/go_baselines_transpile.tsv suite go_baselines go_baselines ts_goport 3600
-for i in 0 1 2 3; do
-  mkdir -p "$O/tmp/sub$i"
-  COMPILER_RUNNER_TMP=$O/tmp/sub$i COMPILER_RUNNER_SHARD=$i/4 COMPILER_RUNNER_JOBS=8 \
-    COMPILER_RUNNER_RESULTS=$O/go_baselines_submodule-$i.tsv \
-    suite "go_baselines_submodule-$i" go_baselines ts_goport 3600 --exact compiler_runner::test_submodule --include-ignored
-done
-for t in multi_program emit_pool early_emit fswatch_linux; do suite "$t" "$t" ts_goport 1200; done
-for c in ts_scanner ts_ast ts_diagnostics ts_path ts_core ts_jsnum; do
-  if [[ -d $O/src/crates/$c ]]; then suite "${c}_lib" "${c}_lib" "$c" 600; else echo "skip ${c}_lib: no crates/$c"; fi
+[[ -z ${crate_dir[ts_goport_lib]+x} ]] || suite lib_snapshot ts_goport_lib 1200 snapshot_matches_live
+for s in "${suites[@]}"; do
+  if [[ $s != go_baselines ]]; then
+    suite "$s" "$s" 1800
+    continue
+  fi
+  mkdir -p "$O/tmp/local"
+  COMPILER_RUNNER_TMP=$O/tmp/local COMPILER_RUNNER_RESULTS=$O/go_baselines_local.tsv \
+    TRANSPILE_RUNNER_RESULTS=$O/go_baselines_transpile.tsv TS_GOPORT_BASELINE_TRACK=$O/go_baselines.track \
+    suite go_baselines go_baselines 3600
+  for i in 0 1 2 3; do
+    mkdir -p "$O/tmp/sub$i"
+    COMPILER_RUNNER_TMP=$O/tmp/sub$i COMPILER_RUNNER_SHARD=$i/4 COMPILER_RUNNER_JOBS=8 \
+      COMPILER_RUNNER_RESULTS=$O/go_baselines_submodule-$i.tsv \
+      suite "go_baselines_submodule-$i" go_baselines 3600 --exact compiler_runner::test_submodule --include-ignored
+  done
 done
 state after
 
-# results.json from the --list, --logfile and compiler runner files.
-python3 - "$O" "$TB" "$COMMIT" "$tree" "$pin" "$GO/testdata/baselines/reference" << 'PY' || fail 5 "results.json not written"
+# results.json from the --list, --logfile, compiler runner and track files.
+python3 - "$O" "$TB" "$COMMIT" "$tree" "$pin" "$GO/testdata/baselines/reference" "${suites[@]}" << 'PY' || fail 5 "results.json not written"
 import hashlib, json, os, sys
-out, tb, commit, tree, pin, ref_root = sys.argv[1:]
+out, tb, commit, tree, pin, ref_root = sys.argv[1:7]
+binaries = sys.argv[7:]
 logs = os.path.join(out, 'logs')
 LIBTEST = {'ok': 'ok', 'failed': 'failed', 'ignored': 'ignored'}
 RUNNER = {'pass': 'ok', 'fail': 'failed', 'skip': 'ignored'}
@@ -156,9 +198,7 @@ def libtest(name):
 def ran(name):
     return os.path.exists(os.path.join(logs, name + '.list'))
 
-for name in ['lib_snapshot', 'ts_goport_lib', 'goport_util_lib', 'goport_lsproto_lib', 'go_baselines',
-             'multi_program', 'emit_pool', 'early_emit', 'fswatch_linux'] + \
-            [c + '_lib' for c in ('ts_scanner', 'ts_ast', 'ts_diagnostics', 'ts_path', 'ts_core', 'ts_jsnum')]:
+for name in ['lib_snapshot'] + binaries:
     if ran(name):
         suites[name], complete = libtest(name)
         if not complete:
@@ -195,7 +235,7 @@ if ran('go_baselines'):
     parent = status_of_parent('go_baselines', 'compiler_runner::test_transpile')
     if parent is not None:
         transpile = {}
-        dups = runner_rows([os.path.join(out, 'go_baselines_transpile.tsv')], transpile, set())
+        dups = runner_rows([os.path.join(out, 'go_baselines_transpile.tsv')], transpile, compared)
         suites['go_baselines_transpile'] = transpile
         if parent not in ('ok', 'failed'):
             incomplete.add('go_baselines_transpile')
@@ -218,15 +258,17 @@ if shards:
     if dups:
         print(f'go_baselines_submodule: {dups} repeated subtests (the worst status is kept)')
 
-# Reference files, as upstream/bumpB/wave3/r1/tools/coverage.py: a reference file (without .diff) is
-# matched when its subtest passed, differs when it failed, and not compared when no run compared it.
+# Reference files (see the header). The subtest of a runner file: as
+# upstream/bumpB/wave3/r1/tools/coverage.py, with the .diff files and the submoduleAccepted/ and
+# submoduleTriaged/ copies too.
 KIND_OF_EXT = {'.errors.txt': 'error', '.js': 'output', '.js.map': 'sourcemap', '.sourcemap.txt': 'sourcemaprecord',
                '.types': 'types', '.symbols': 'symbols', '.trace.json': 'moduleresolution',
                '.contentmapper': 'contentmapper'}
 EXTS = sorted(KIND_OF_EXT, key=len, reverse=True)
-if 'go_baselines_local' in suites or 'go_baselines_submodule' in suites:
+RUNNER_SUITES = ('go_baselines_local', 'go_baselines_submodule', 'go_baselines_transpile')
+if ran('go_baselines'):
     by_stem = {}
-    for s in ('go_baselines_local', 'go_baselines_submodule'):
+    for s in RUNNER_SUITES:
         for n, st in suites.get(s, {}).items():
             kind, key = n.split(' ', 1)
             if key.count('/') < 2:
@@ -237,25 +279,37 @@ if 'go_baselines_local' in suites or 'go_baselines_submodule' in suites:
                     cname = cname[:-len(ext)]
                     break
             by_stem[(('submodule/' if where == 'submodule' else '') + f'{suite}/{cname}', kind)] = st
-    ref, unknown = {}, 0
-    for top in ('compiler', 'conformance', 'submodule/compiler', 'submodule/conformance'):
-        d = os.path.join(ref_root, top)
-        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-            if f.endswith('.diff'):
-                continue
-            rel = f'{top}/{f}'
-            ext = next((e for e in EXTS if f.endswith(e)), None)
-            if ext is None:
-                unknown += 1
-                continue
-            st = by_stem.get((rel[:-len(ext)], KIND_OF_EXT[ext])) if rel in compared else None
-            ref[rel] = st if st in ('ok', 'failed') else 'ignored'
+
+    def subtest_of(rel):
+        r = rel[:-len('.diff')] if rel.endswith('.diff') else rel
+        for copy in ('submoduleAccepted/', 'submoduleTriaged/'):
+            if r.startswith(copy):
+                r = 'submodule/' + r[len(copy):]
+        ext = next((e for e in EXTS if r.endswith(e)), None)
+        return by_stem.get((r[:-len(ext)], KIND_OF_EXT[ext])) if ext else None
+
+    track = os.path.join(out, 'go_baselines.track')
+    tracked = set(open(track, encoding='utf-8', errors='surrogateescape').read().split('\n')) - {''} \
+        if os.path.exists(track) else set()
+    runs = [suites.get('go_baselines', {}), suites.get('go_baselines_submodule_shards', {})]
+    other = 'failed' if any(st in ('failed', 'unrun') for r in runs for st in r.values()) else 'ok'
+    ref, files = {}, set()
+    for d, dirs, names in os.walk(ref_root):
+        dirs.sort()
+        for f in sorted(names):
+            rel = os.path.relpath(os.path.join(d, f), ref_root)
+            files.add(rel)
+            st = subtest_of(rel) if rel in compared else None
+            if st is not None:
+                ref[rel] = st if st in ('ok', 'failed') else 'ignored'
+            else:
+                ref[rel] = other if rel in compared or rel in tracked else 'ignored'
     suites['go_baselines_reference'] = ref
-    if {'go_baselines_local', 'go_baselines_submodule'} & incomplete or \
+    if {'go_baselines', 'go_baselines_local', 'go_baselines_submodule', 'go_baselines_transpile'} & incomplete or \
             not {'go_baselines_local', 'go_baselines_submodule'} <= suites.keys():
         incomplete.add('go_baselines_reference')
-    if unknown:
-        print(f'go_baselines_reference: {unknown} reference files of no known kind are not listed')
+    print(f'go_baselines_reference: {len(tracked)} tracked paths, {len(tracked - files)} of them not reference '
+          'files (TS submodule paths, or a compare with no file)')
 
 sha = hashlib.sha256(open(os.path.join(tb, 'bins.sha256'), 'rb').read()).hexdigest()
 doc = {'source': {'commit': commit, 'tree': tree, 'testbinSha256': sha}, 'pin': pin,
