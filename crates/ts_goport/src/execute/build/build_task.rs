@@ -1,4 +1,4 @@
-use crate::emitter::program_emit::{WriteFile, WriteFileData};
+use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost};
 use crate::execute::build::up_to_date_status::*;
@@ -454,6 +454,17 @@ impl BuildTask {
             .copied()
             .unwrap_or_default();
         compile_times.borrow_mut().config_time = config_time;
+        // PORT: perf, as `tsc -p` does: the parse of the default lib files
+        // starts before the build info read and the program load. Only for
+        // a program that loads while the build host caches no parse (the
+        // first one of a build cycle): later programs take the lib files
+        // from that cache, and the workers would parse them for nothing.
+        let mut host_has_parses = false;
+        host.source_files
+            .for_each_stored(|_| host_has_parses = true);
+        if !host_has_parses {
+            crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
+        }
         let build_info_read_start = sys.now();
         let mut old_program = None;
         if !command.build_options.force.is_true() {
@@ -536,6 +547,15 @@ impl BuildTask {
         let (result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
+            // PORT: perf. Each checker emits when its own check ends, as in
+            // `tsc -p` (`Program::start_check_and_emit`), with the options of
+            // the emit call in `EmitFilesAndReportErrors` (the same
+            // `WriteFile`). `EmitAndReportStatistics` makes the same calls
+            // as in Go and waits for that work.
+            incremental_program.start_emit(EmitOptions {
+                write_file: Some(write_file.clone()),
+                ..EmitOptions::default()
+            });
             let emitted = emit_and_report_statistics(&EmitInput {
                 sys: &*sys,
                 program_like: &incremental_program,

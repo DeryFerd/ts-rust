@@ -1,0 +1,7 @@
+[env]
+# The jemalloc settings of the goport bins, built into jemalloc
+# (tikv-jemalloc-sys `--with-malloc-conf`). It must equal `JEMALLOC_CONF` in
+# crates/ts_goport/src/bin/{tsgo,goport,goport_build}.rs. A bin whose value
+# matches this one does not exec itself at start to set `_RJEM_MALLOC_CONF`
+# (`set_malloc_tunables`); `_RJEM_MALLOC_CONF` still overrides it at run time.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:4,thp:always,metadata_thp:always"
