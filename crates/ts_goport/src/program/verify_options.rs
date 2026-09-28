@@ -105,14 +105,15 @@ pub(super) fn verify_compiler_options() -> Vec<Diagnostic> {
 // one, `global` builds the diagnostic that Go reports when the tsconfig has
 // no matching property.
 fn option_diagnostic(code: i32, global: impl FnOnce() -> Diagnostic) -> Diagnostic {
-    let state = state();
-    state
-        .config_diagnostics
-        .iter()
-        .chain(&state.program_diagnostics)
-        .find(|d| d.code() == code)
-        .cloned()
-        .unwrap_or_else(global)
+    with_tables(|tables| {
+        tables
+            .config_diagnostics
+            .iter()
+            .chain(&tables.program_diagnostics)
+            .find(|d| d.code() == code)
+            .cloned()
+    })
+    .unwrap_or_else(global)
 }
 
 // Go: outputpaths/commonsourcedirectory.go:51 GetComputedCommonSourceDirectory

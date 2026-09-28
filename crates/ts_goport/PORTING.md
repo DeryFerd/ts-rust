@@ -241,11 +241,28 @@ The batch that adds it is not accepted until Theo approves.
   from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
-- `program::release_program` frees the checker pool, the emit pool and the
-  frontend of a version. Each checker worker frees its checker and the
-  synthetic nodes it made (`free_synthetic_nodes`), and each emit thread
-  frees its synthetic nodes. The program shell and the file versions stay
-  leaked for now. A one-program process forgets its checkers and the
+- The per-version program tables (files by path, file metadata,
+  diagnostics, checker file associations, the declaration diagnostic cache
+  and the Go frontend copies in `GoSharedState`) are in
+  `program::VersionTables`, behind an `Arc` in the leaked `ProgramState`.
+  Read them with `with_tables(|tables| ..)`, which caches the current
+  version's `Arc` in a thread-local, so a hit costs no atomic operation.
+  A closure must not enter another program. An accessor that returned a
+  `&'static` borrow of the tables returns an `Arc` clone
+  (`get_redirect_for_resolution`, `get_project_reference_from_source`,
+  `get_go_symlink_cache`, ...). The program of a one-program process
+  leaks its tables and reads them with no lock or thread-local.
+- `program::release_program` frees the checker pool, the emit pool, the
+  frontend and the tables of a version. Each checker worker frees its
+  checker and the synthetic nodes it made (`free_synthetic_nodes`), and
+  each emit thread frees its synthetic nodes. A worker, bind, emit or
+  search thread gets a copy of the tables `Arc` in its `WorkerSeed` and
+  keeps it until it ends, so a thread can finish its work after the
+  release, as a Go goroutine that holds the program does. A read of a
+  released version's tables on a thread with no copy panics ("program
+  version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
+  runs and a field fallback). The program shell and the file versions
+  stay leaked for now. A one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
@@ -660,8 +677,9 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   snapshot `programCounter.Deref`). It frees the checker pools of `p`, its
   program version and the synthetic nodes that the dispatch thread made
   while the version was current, now or when the last guard of `p` drops.
-  The `NewProgram`, the `GoProgram` shell and the file versions stay leaked
-  (multi-program M2, M3). A compiler host drops its data
+  The version's tables go with it (see "Program"). The `NewProgram`, the
+  `GoProgram` shell and the file versions stay leaked (multi-program M2,
+  M3). A compiler host drops its data
   (`CompilerHost::release`, not in Go) when no live program uses it. A
   program uses its own host and the host of the load that made its files:
   a clone shares the old program's processed files (Go `UpdateProgram`),

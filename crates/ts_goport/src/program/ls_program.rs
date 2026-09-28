@@ -21,8 +21,9 @@
 //!
 //! Release: Go frees a program when no snapshot and no request uses it.
 //! `release_program` is the snapshot part (Go `programCounter.Deref`); the
-//! release waits until no guard of the program is alive. The program shell
-//! and its file versions stay leaked (see `program::release_program`). A
+//! release waits until no guard of the program is alive. It frees the
+//! version's program tables; the program shell and its file versions stay
+//! leaked (see `program::release_program`). A
 //! compiler host whose last live program is released drops its data
 //! (`CompilerHost::release`).
 //!
