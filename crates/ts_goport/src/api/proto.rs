@@ -237,6 +237,9 @@ impl Method {
 
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
+    pub const PARSE_COMMAND_LINE: Method = Method(Cow::Borrowed("parseCommandLine"));
+    pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
+    pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
     pub const GET_DEFAULT_PROJECT_FOR_FILE: Method =
         Method(Cow::Borrowed("getDefaultProjectForFile"));
@@ -244,6 +247,9 @@ impl Method {
     pub const GET_SYMBOLS_AT_POSITIONS: Method = Method(Cow::Borrowed("getSymbolsAtPositions"));
     pub const GET_SYMBOL_AT_LOCATION: Method = Method(Cow::Borrowed("getSymbolAtLocation"));
     pub const GET_SYMBOLS_AT_LOCATIONS: Method = Method(Cow::Borrowed("getSymbolsAtLocations"));
+    pub const GET_SYMBOL_OF_SOURCE_FILE: Method = Method(Cow::Borrowed("getSymbolOfSourceFile"));
+    pub const GET_SYMBOLS_OF_SOURCE_FILES: Method =
+        Method(Cow::Borrowed("getSymbolsOfSourceFiles"));
     pub const GET_TYPE_OF_SYMBOL: Method = Method(Cow::Borrowed("getTypeOfSymbol"));
     pub const GET_TYPES_OF_SYMBOLS: Method = Method(Cow::Borrowed("getTypesOfSymbols"));
     pub const GET_DECLARED_TYPE_OF_SYMBOL: Method =
@@ -251,7 +257,10 @@ impl Method {
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
     pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
+    pub const GET_CONFIG_FILE_NAMES: Method = Method(Cow::Borrowed("getConfigFileNames"));
+    pub const GET_CONFIG_SOURCE_FILE: Method = Method(Cow::Borrowed("getConfigSourceFile"));
     pub const RESOLVE_NAME: Method = Method(Cow::Borrowed("resolveName"));
+    pub const GET_SYMBOLS_IN_SCOPE: Method = Method(Cow::Borrowed("getSymbolsInScope"));
     pub const GET_SIGNATURES_OF_TYPE: Method = Method(Cow::Borrowed("getSignaturesOfType"));
     pub const GET_RESOLVED_SIGNATURE: Method = Method(Cow::Borrowed("getResolvedSignature"));
     pub const GET_TYPE_AT_LOCATION: Method = Method(Cow::Borrowed("getTypeAtLocation"));
@@ -305,6 +314,8 @@ impl Method {
     pub const GET_TYPE_FROM_TYPE_NODE: Method = Method(Cow::Borrowed("getTypeFromTypeNode"));
     pub const GET_WIDENED_TYPE: Method = Method(Cow::Borrowed("getWidenedType"));
     pub const GET_PARAMETER_TYPE: Method = Method(Cow::Borrowed("getParameterType"));
+    pub const GET_TYPE_PARAMETER_AT_POSITION: Method =
+        Method(Cow::Borrowed("getTypeParameterAtPosition"));
     pub const IS_ARRAY_LIKE_TYPE: Method = Method(Cow::Borrowed("isArrayLikeType"));
     pub const IS_TYPE_ASSIGNABLE_TO: Method = Method(Cow::Borrowed("isTypeAssignableTo"));
     pub const GET_SHORTHAND_ASSIGNMENT_VALUE_SYMBOL: Method =
@@ -323,11 +334,15 @@ impl Method {
         Method(Cow::Borrowed("getTypePredicateOfSignature"));
     pub const GET_BASE_TYPES: Method = Method(Cow::Borrowed("getBaseTypes"));
     pub const GET_PROPERTIES_OF_TYPE: Method = Method(Cow::Borrowed("getPropertiesOfType"));
+    pub const GET_APPARENT_PROPERTIES_OF_TYPE: Method =
+        Method(Cow::Borrowed("getApparentPropertiesOfType"));
     pub const GET_APPARENT_TYPE: Method = Method(Cow::Borrowed("getApparentType"));
     pub const GET_PROPERTY_OF_TYPE: Method = Method(Cow::Borrowed("getPropertyOfType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
         Method(Cow::Borrowed("getConstraintOfTypeParameter"));
+    pub const GET_DEFAULT_FROM_TYPE_PARAMETER: Method =
+        Method(Cow::Borrowed("getDefaultFromTypeParameter"));
     pub const GET_BASE_CONSTRAINT_OF_TYPE: Method =
         Method(Cow::Borrowed("getBaseConstraintOfType"));
     pub const GET_TYPE_ARGUMENTS: Method = Method(Cow::Borrowed("getTypeArguments"));
@@ -343,6 +358,7 @@ impl Method {
     pub const GET_ALIASED_SYMBOL: Method = Method(Cow::Borrowed("getAliasedSymbol"));
     pub const GET_IMMEDIATE_ALIASED_SYMBOL: Method =
         Method(Cow::Borrowed("getImmediateAliasedSymbol"));
+    pub const GET_FULLY_QUALIFIED_NAME: Method = Method(Cow::Borrowed("getFullyQualifiedName"));
     pub const GET_EXPORTS_OF_MODULE: Method = Method(Cow::Borrowed("getExportsOfModule"));
     pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
         Method(Cow::Borrowed("getMemberInModuleExports"));
@@ -377,6 +393,7 @@ impl Method {
 
     // Emitter methods
     pub const PRINT_NODE: Method = Method(Cow::Borrowed("printNode"));
+    pub const FORMAT_NODE_FOR_INSERTION: Method = Method(Cow::Borrowed("formatNodeForInsertion"));
 
     // Intrinsic type getters
     pub const GET_ANY_TYPE: Method = Method(Cow::Borrowed("getAnyType"));
@@ -390,9 +407,13 @@ impl Method {
     pub const GET_UNKNOWN_TYPE: Method = Method(Cow::Borrowed("getUnknownType"));
     pub const GET_BIG_INT_TYPE: Method = Method(Cow::Borrowed("getBigIntType"));
     pub const GET_ES_SYMBOL_TYPE: Method = Method(Cow::Borrowed("getESSymbolType"));
+    pub const GET_NON_PRIMITIVE_TYPE: Method = Method(Cow::Borrowed("getNonPrimitiveType"));
 
     // Well-known per-checker symbols
     pub const GET_WELL_KNOWN_SYMBOLS: Method = Method(Cow::Borrowed("getWellKnownSymbols"));
+
+    // Well-known per-checker signatures
+    pub const GET_WELL_KNOWN_SIGNATURES: Method = Method(Cow::Borrowed("getWellKnownSignatures"));
 
     // Profiling methods
     pub const START_CPU_PROFILE: Method = Method(Cow::Borrowed("startCPUProfile"));
@@ -723,6 +744,18 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<UpdateSnapshotParams>,
     );
     m.insert(
+        Method::PARSE_COMMAND_LINE,
+        unmarshaller_for::<ParseCommandLineParams>,
+    );
+    m.insert(
+        Method::READ_CONFIG_FILE,
+        unmarshaller_for::<ReadConfigFileParams>,
+    );
+    m.insert(
+        Method::PARSE_JSON_CONFIG_FILE,
+        unmarshaller_for::<ParseJsonConfigFileContentParams>,
+    );
+    m.insert(
         Method::PARSE_CONFIG_FILE,
         unmarshaller_for::<ParseConfigFileParams>,
     );
@@ -743,6 +776,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetSourceFileParams>,
     );
     m.insert(
+        Method::GET_CONFIG_FILE_NAMES,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_CONFIG_SOURCE_FILE,
+        unmarshaller_for::<GetSourceFileParams>,
+    );
+    m.insert(
         Method::GET_SYMBOL_AT_POSITION,
         unmarshaller_for::<GetSymbolAtPositionParams>,
     );
@@ -759,6 +800,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetSymbolsAtLocationsParams>,
     );
     m.insert(
+        Method::GET_SYMBOL_OF_SOURCE_FILE,
+        unmarshaller_for::<GetSymbolOfSourceFileParams>,
+    );
+    m.insert(
+        Method::GET_SYMBOLS_OF_SOURCE_FILES,
+        unmarshaller_for::<GetSymbolsOfSourceFilesParams>,
+    );
+    m.insert(
         Method::GET_TYPE_OF_SYMBOL,
         unmarshaller_for::<GetTypeOfSymbolParams>,
     );
@@ -771,6 +820,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetTypeOfSymbolParams>,
     );
     m.insert(Method::RESOLVE_NAME, unmarshaller_for::<ResolveNameParams>);
+    m.insert(
+        Method::GET_SYMBOLS_IN_SCOPE,
+        unmarshaller_for::<GetSymbolsInScopeParams>,
+    );
     m.insert(
         Method::GET_SIGNATURES_OF_TYPE,
         unmarshaller_for::<GetSignaturesOfTypeParams>,
@@ -913,7 +966,7 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_NON_NULLABLE_TYPE,
-        unmarshaller_for::<GetNonNullableTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_TYPE_FROM_TYPE_NODE,
@@ -925,6 +978,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_PARAMETER_TYPE,
+        unmarshaller_for::<GetParameterTypeParams>,
+    );
+    m.insert(
+        Method::GET_TYPE_PARAMETER_AT_POSITION,
         unmarshaller_for::<GetParameterTypeParams>,
     );
     m.insert(
@@ -961,7 +1018,7 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_RETURN_TYPE_OF_SIGNATURE,
-        unmarshaller_for::<CheckerSignatureParams>,
+        unmarshaller_for::<GetSignaturePropertyParams>,
     );
     m.insert(
         Method::GET_REST_TYPE_OF_SIGNATURE,
@@ -980,8 +1037,12 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_APPARENT_PROPERTIES_OF_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
         Method::GET_APPARENT_TYPE,
-        unmarshaller_for::<CheckerTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_PROPERTY_OF_TYPE,
@@ -993,11 +1054,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_CONSTRAINT_OF_TYPE_PARAMETER,
-        unmarshaller_for::<CheckerTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_BASE_CONSTRAINT_OF_TYPE,
         unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
+        Method::GET_DEFAULT_FROM_TYPE_PARAMETER,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_TYPE_ARGUMENTS,
@@ -1021,6 +1086,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_IMMEDIATE_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_FULLY_QUALIFIED_NAME,
         unmarshaller_for::<CheckerSymbolParams>,
     );
     m.insert(
@@ -1058,6 +1127,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetCompletionsAtPositionParams>,
     );
     m.insert(Method::PRINT_NODE, unmarshaller_for::<PrintNodeParams>);
+    m.insert(
+        Method::FORMAT_NODE_FOR_INSERTION,
+        unmarshaller_for::<FormatNodeForInsertionParams>,
+    );
     m.insert(
         Method::GET_ANY_TYPE,
         unmarshaller_for::<GetIntrinsicTypeParams>,
@@ -1103,7 +1176,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetIntrinsicTypeParams>,
     );
     m.insert(
+        Method::GET_NON_PRIMITIVE_TYPE,
+        unmarshaller_for::<GetIntrinsicTypeParams>,
+    );
+    m.insert(
         Method::GET_WELL_KNOWN_SYMBOLS,
+        unmarshaller_for::<GetIntrinsicTypeParams>,
+    );
+    m.insert(
+        Method::GET_WELL_KNOWN_SIGNATURES,
         unmarshaller_for::<GetIntrinsicTypeParams>,
     );
     m.insert(
@@ -1154,6 +1235,73 @@ proto_json!(both ParseConfigFileParams {
     file: "file" plain,
 });
 
+// Go: proto.go:550 ParseCommandLineParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseCommandLineParams {
+    pub command_line: Vec<String>,
+}
+
+proto_json!(both ParseCommandLineParams {
+    command_line: "commandLine" plain,
+});
+
+// Go: proto.go:554 ReadConfigFileParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReadConfigFileParams {
+    pub file: DocumentIdentifier,
+}
+
+proto_json!(both ReadConfigFileParams {
+    file: "file" plain,
+});
+
+// Go: proto.go:558 ParseJsonConfigFileContentParams
+// PORT: Go `JSON packagejson.JSONValue` is `LspAny`. A decoded request value
+// must be `Send` (`AnyValue`), and `packagejson::JSONValue` holds `Rc`.
+// Both decode a JSON value to the same tree: null, bool, float64, string,
+// array, and an object that keeps its member order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseJsonConfigFileContentParams {
+    pub json: LspAny,
+    pub config_directory: Option<String>,
+    pub config_file_name: Option<DocumentIdentifier>,
+}
+
+proto_json!(both ParseJsonConfigFileContentParams {
+    json: "json" plain,
+    config_directory: "configDirectory" omitempty,
+    config_file_name: "configFileName" omitempty,
+});
+
+// Go: proto.go:564 jsonValueToAny
+// PORT: Go `any` from the tsoptions JSON code is `CompilerOptionsValue`
+// (nil, string, float64, bool, `[]any`, `*collections.OrderedMap`). The
+// input is the `LspAny` that stands for `packagejson.JSONValue` (see
+// `ParseJsonConfigFileContentParams`); Go's "not present" is `Null` there.
+pub fn json_value_to_any(value: &LspAny) -> tsoptions::CompilerOptionsValue {
+    use crate::frontend::tsoptions::CompilerOptionsValue;
+    match value {
+        LspAny::Null => CompilerOptionsValue::Nil,
+        LspAny::String(value) => CompilerOptionsValue::String(value.clone()),
+        LspAny::Number(value) => CompilerOptionsValue::Number(*value),
+        LspAny::Bool(value) => CompilerOptionsValue::Bool(*value),
+        LspAny::Array(array) => {
+            let mut result = Vec::with_capacity(array.len());
+            for child in array {
+                result.push(json_value_to_any(child));
+            }
+            CompilerOptionsValue::List(result)
+        }
+        LspAny::Object(object) => {
+            let mut result = IndexMap::with_capacity(object.len());
+            for (key, child) in object {
+                result.insert(key.clone(), json_value_to_any(child));
+            }
+            CompilerOptionsValue::Map(result)
+        }
+    }
+}
+
 // ReleaseParams are the parameters for the release method.
 // Go: proto.go:410 ReleaseParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1190,6 +1338,11 @@ proto_json!(marshal ProfileResult {
 pub struct ConfigFileResponse {
     pub file_names: Vec<String>,
     pub options: Option<CompilerOptions>,
+    pub project_references: Vec<crate::frontend::core_ext::ProjectReference>,
+    pub type_acquisition: Option<crate::frontend::core_ext::TypeAcquisition>,
+    pub compile_on_save: Option<bool>,
+    pub raw: tsoptions::CompilerOptionsValue,
+    pub errors: Vec<DiagnosticResponse>,
 }
 
 impl MarshalerTo for ConfigFileResponse {
@@ -1203,8 +1356,52 @@ impl MarshalerTo for ConfigFileResponse {
             "options",
             &self.options.as_ref().map(CompilerOptionsJSON),
         )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "projectReferences",
+            &self.project_references,
+        )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "typeAcquisition",
+            &self.type_acquisition.as_ref().map(TypeAcquisitionJSON),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "compileOnSave", &self.compile_on_save)?;
+        marshal_field_omitempty(enc, &mut first, "raw", &AnyJSON(&self.raw))?;
+        marshal_field(enc, &mut first, "errors", &self.errors)?;
         write_object_end(enc);
         Ok(())
+    }
+}
+
+// Go: proto.go:634 ReadConfigFileResponse
+// PORT: Go `Config any` is `CompilerOptionsValue` (see `json_value_to_any`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadConfigFileResponse {
+    pub config: tsoptions::CompilerOptionsValue,
+    pub error: Option<DiagnosticResponse>,
+}
+
+impl MarshalerTo for ReadConfigFileResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "config", &AnyJSON(&self.config))?;
+        marshal_field_omitempty(enc, &mut first, "error", &self.error)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+/// Go `any` that holds a tsoptions JSON value: the v2 marshaler of its
+/// dynamic type (`build_info::marshal_any`).
+pub struct AnyJSON<'a>(pub &'a tsoptions::CompilerOptionsValue);
+
+impl MarshalerTo for AnyJSON<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        crate::execute::incremental::build_info::marshal_any(enc, self.0)
     }
 }
 
@@ -1225,6 +1422,7 @@ proto_json!(both GetDefaultProjectForFileParams {
 pub struct ProjectResponse {
     pub id: ProjectID,
     pub config_file_name: String,
+    pub parsed_command_line: Option<ConfigFileResponse>,
     pub root_files: Vec<String>,
     pub compiler_options: Option<CompilerOptions>,
 }
@@ -1235,6 +1433,12 @@ impl MarshalerTo for ProjectResponse {
         let mut first = true;
         marshal_field(enc, &mut first, "id", &self.id)?;
         marshal_field(enc, &mut first, "configFileName", &self.config_file_name)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "parsedCommandLine",
+            &self.parsed_command_line,
+        )?;
         marshal_field(enc, &mut first, "rootFiles", &self.root_files)?;
         marshal_field(
             enc,
@@ -1247,7 +1451,64 @@ impl MarshalerTo for ProjectResponse {
     }
 }
 
-// Go: proto.go:439 NewProjectResponse
+// Go: proto.go:654 NewConfigFileResponse
+// PORT: Go shares the `*core.CompilerOptions`, `*core.TypeAcquisition` and
+// project reference pointers; the response keeps copies (see
+// `new_project_response`). Go `Raw.(*collections.OrderedMap[string, any])`
+// is `CompilerOptionsValue::Map`.
+pub fn new_config_file_response(
+    parsed_command_line: Option<&tsoptions::ParsedCommandLine>,
+) -> Option<ConfigFileResponse> {
+    let parsed_command_line = parsed_command_line?;
+    let mut compile_on_save = parsed_command_line.compile_on_save;
+    if compile_on_save.is_none()
+        && let tsoptions::CompilerOptionsValue::Map(raw_config) = &parsed_command_line.raw
+        && let Some(tsoptions::CompilerOptionsValue::Bool(value)) = raw_config.get("compileOnSave")
+    {
+        compile_on_save = Some(*value);
+    }
+    let compiler_options = parsed_command_line.compiler_options();
+    // PORT: Go replaces a nil slice with an empty one; a `Vec` is never nil.
+    let errors = new_diagnostic_responses(&parsed_command_line.errors);
+    Some(ConfigFileResponse {
+        file_names: parsed_command_line.file_names().to_vec(),
+        options: Some((**compiler_options).clone()),
+        project_references: parsed_command_line.project_references().to_vec(),
+        type_acquisition: parsed_command_line.type_acquisition().cloned(),
+        compile_on_save,
+        raw: to_protocol_json_value(&parsed_command_line.raw),
+        errors,
+    })
+}
+
+// Go: proto.go:682 toProtocolJSONValue
+pub fn to_protocol_json_value(
+    value: &tsoptions::CompilerOptionsValue,
+) -> tsoptions::CompilerOptionsValue {
+    use crate::frontend::tsoptions::CompilerOptionsValue;
+    match value {
+        CompilerOptionsValue::WatchFileKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::WatchDirectoryKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::PollingKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::Map(value) => {
+            let mut result = IndexMap::with_capacity(value.len());
+            for (key, child) in value {
+                result.insert(key.clone(), to_protocol_json_value(child));
+            }
+            CompilerOptionsValue::Map(result)
+        }
+        CompilerOptionsValue::List(value) => {
+            let mut result = Vec::with_capacity(value.len());
+            for child in value {
+                result.push(to_protocol_json_value(child));
+            }
+            CompilerOptionsValue::List(result)
+        }
+        value => value.clone(),
+    }
+}
+
+// Go: proto.go:707 NewProjectResponse
 // PORT: Go shares the `*core.CompilerOptions` pointer; the response keeps
 // a copy (responses cross into `Box<dyn AnyValue>`, which is `Send`).
 pub fn new_project_response(p: &project::Project) -> ProjectResponse {
@@ -1257,6 +1518,7 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
     ProjectResponse {
         id: project_handle(p),
         config_file_name: p.name(),
+        parsed_command_line: new_config_file_response(Some(command_line)),
         root_files: command_line.file_names().to_vec(),
         compiler_options: Some((**command_line.compiler_options()).clone()),
     }
@@ -1292,6 +1554,34 @@ proto_json!(both GetSymbolsAtPositionsParams {
     project: "project" plain,
     file: "file" plain,
     positions: "positions" plain,
+});
+
+// Go: proto.go:734 GetSymbolOfSourceFileParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolOfSourceFileParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+}
+
+proto_json!(both GetSymbolOfSourceFileParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+});
+
+// Go: proto.go:740 GetSymbolsOfSourceFilesParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolsOfSourceFilesParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub files: Vec<DocumentIdentifier>,
+}
+
+proto_json!(both GetSymbolsOfSourceFilesParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    files: "files" plain,
 });
 
 // Go: proto.go:462 GetSymbolAtLocationParams
@@ -1705,6 +1995,28 @@ proto_json!(both ResolveNameParams {
     exclude_globals: "excludeGlobals" omitempty,
 });
 
+// GetSymbolsInScopeParams are parameters for getSymbolsInScope, which returns
+// all symbols visible at a given location.
+// Go: proto.go:1007 GetSymbolsInScopeParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolsInScopeParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub location: NodeHandle, // Optional: node handle for location context
+    pub file: Option<DocumentIdentifier>, // Optional: file for location context (alternative to Location)
+    pub position: Option<u32>, // Optional: position in file for location context (with File)
+    pub meaning: u32,          // SymbolFlags for what kind of symbols to find
+}
+
+proto_json!(both GetSymbolsInScopeParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    location: "location" omitempty,
+    file: "file" omitempty,
+    position: "position" omitempty,
+    meaning: "meaning" plain,
+});
+
 // GetTypePropertyParams is used for all type sub-property endpoints.
 // Go: proto.go:702 GetTypePropertyParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1959,6 +2271,19 @@ proto_json!(marshal WellKnownSymbolsResponse {
     unknown: "unknown" plain,
     undefined: "undefined" plain,
     arguments: "arguments" plain,
+});
+
+// WellKnownSignaturesResponse carries the handle id of the per-checker singleton
+// unknown signature (the signature the checker yields when a call cannot be
+// resolved) so the client can identify it by id without a round-trip on every check.
+// Go: proto.go:1140 WellKnownSignaturesResponse
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WellKnownSignaturesResponse {
+    pub unknown: SignatureID,
+}
+
+proto_json!(marshal WellKnownSignaturesResponse {
+    unknown: "unknown" plain,
 });
 
 // GetBaseTypeOfLiteralTypeParams returns the base type of a literal type.
@@ -2217,6 +2542,25 @@ proto_json!(both PrintNodeParams {
     terminate_unterminated_literals: "terminateUnterminatedLiterals" omitempty,
 });
 
+// FormatNodeForInsertionParams are the parameters for the formatNodeForInsertion method.
+// Go: proto.go:1317 FormatNodeForInsertionParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FormatNodeForInsertionParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier, // target file where the node will be inserted
+    pub position: u32, // UTF-16 code-unit offset of the insertion position in the target file
+    pub data: String,  // base64-encoded binary AST data for the synthesized node
+}
+
+proto_json!(both FormatNodeForInsertionParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    position: "position" plain,
+    data: "data" plain,
+});
+
 // CheckerTypeParams are parameters for checker methods that operate on a type.
 // Go: proto.go:928 CheckerTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2374,16 +2718,19 @@ proto_json!(marshal SourceFileResponse {
 // GetDiagnosticsParams are parameters for per-file diagnostic methods.
 // Go: proto.go:964 GetDiagnosticsParams
 #[derive(Clone, Debug, Default, PartialEq)]
+// PORT: Go `Files []DocumentIdentifier` is `Option`: `None` is a nil slice
+// (no `files`, or `null`) and `Some(vec![])` is `[]`. `getDiagnostics`
+// tells them apart.
 pub struct GetDiagnosticsParams {
     pub snapshot: SnapshotID,
     pub project: ProjectID,
-    pub file: Option<DocumentIdentifier>,
+    pub files: Option<Vec<DocumentIdentifier>>,
 }
 
 proto_json!(both GetDiagnosticsParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
-    file: "file" omitempty,
+    files: "files" omitempty,
 });
 
 // GetProjectDiagnosticsParams are parameters for project-wide diagnostic methods.
@@ -2594,6 +2941,37 @@ fn marshal_tristate_omitzero(
     enc.push(':');
     enc.push_str(std::str::from_utf8(value.marshal_json()).expect("Tristate JSON is ASCII"));
     Ok(())
+}
+
+// Go JSON v2 struct marshaler for `core.TypeAcquisition` (tags `enable`,
+// `include`, `exclude` and `disableFilenameBasedTypeAcquisition`, all
+// `omitzero`).
+// PORT: a Go nil `Include` or `Exclude` is omitted and a non-nil empty one
+// is written as `[]`. The Rust `Vec` has no nil, so an empty list is
+// omitted.
+pub struct TypeAcquisitionJSON<'a>(pub &'a crate::frontend::core_ext::TypeAcquisition);
+
+impl MarshalerTo for TypeAcquisitionJSON<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        let ta = self.0;
+        let first = &mut true;
+        write_object_start(enc);
+        marshal_tristate_omitzero(enc, first, "enable", ta.enable)?;
+        if !ta.include.is_empty() {
+            marshal_field(enc, first, "include", &ta.include)?;
+        }
+        if !ta.exclude.is_empty() {
+            marshal_field(enc, first, "exclude", &ta.exclude)?;
+        }
+        marshal_tristate_omitzero(
+            enc,
+            first,
+            "disableFilenameBasedTypeAcquisition",
+            ta.disable_filename_based_type_acquisition,
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
 }
 
 // Go `collections.OrderedMap[string, []string]` MarshalJSONTo.

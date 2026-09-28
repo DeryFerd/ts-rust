@@ -765,6 +765,41 @@ impl CheckerSetup {
     ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
         self.sd.resolve_signature_handle(&self.project_id, id)
     }
+
+    // Go: api/session.go:525 checkerSetup.resolveLocation
+    // resolveLocation resolves an optional location, given either as a node handle or as a
+    // file and position. Returns nil when neither is provided.
+    pub fn resolve_location(
+        &self,
+        handle: &NodeHandle,
+        file: Option<&DocumentIdentifier>,
+        position: Option<u32>,
+    ) -> Result<Node, GoError> {
+        if !handle.0.is_empty() {
+            return self.sd.resolve_node_handle(self.program, handle);
+        }
+        if let (Some(file), Some(position)) = (file, position) {
+            let source_file = self
+                .program
+                .get_source_file(&file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            return Ok(astnav::get_touching_property_name(
+                source_file,
+                source_file_get_position_map(source_file).utf16_to_utf8(position as i32),
+            ));
+        }
+        Ok(Node::NIL)
+    }
 }
 
 /// PORT: Go returns a typed handler result as `any`. A typed nil pointer or
@@ -923,6 +958,15 @@ impl Handler for Session {
             m if m == Method::UPDATE_SNAPSHOT.0 => self
                 .handle_update_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::PARSE_COMMAND_LINE.0 => self
+                .handle_parse_command_line(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::READ_CONFIG_FILE.0 => self
+                .handle_read_config_file(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::PARSE_JSON_CONFIG_FILE.0 => self
+                .handle_parse_json_config_file_content(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::PARSE_CONFIG_FILE.0 => self
                 .handle_parse_config_file(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -938,6 +982,12 @@ impl Handler for Session {
             m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
                 .handle_get_source_file_metadata(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_CONFIG_FILE_NAMES.0 => self
+                .handle_get_config_file_names(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_CONFIG_SOURCE_FILE.0 => {
+                self.handle_get_config_source_file(ctx, assert_params(&parsed))
+            }
             m if m == Method::GET_SYMBOL_AT_POSITION.0 => self
                 .handle_get_symbol_at_position(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -950,6 +1000,12 @@ impl Handler for Session {
             m if m == Method::GET_SYMBOLS_AT_LOCATIONS.0 => self
                 .handle_get_symbols_at_locations(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_SYMBOL_OF_SOURCE_FILE.0 => self
+                .handle_get_symbol_of_source_file(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_SYMBOLS_OF_SOURCE_FILES.0 => self
+                .handle_get_symbols_of_source_files(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TYPE_OF_SYMBOL.0 => self
                 .handle_get_type_of_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -961,6 +1017,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::RESOLVE_NAME.0 => self
                 .handle_resolve_name(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_SYMBOLS_IN_SCOPE.0 => self
+                .handle_get_symbols_in_scope(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_SIGNATURES_OF_TYPE.0 => self
                 .handle_get_signatures_of_type(ctx, assert_params(&parsed))
@@ -1076,6 +1135,9 @@ impl Handler for Session {
             m if m == Method::GET_PARAMETER_TYPE.0 => self
                 .handle_get_parameter_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_TYPE_PARAMETER_AT_POSITION.0 => self
+                .handle_get_type_parameter_at_position(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::IS_ARRAY_LIKE_TYPE.0 => self
                 .handle_is_array_like_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1100,6 +1162,9 @@ impl Handler for Session {
             m if m == Method::PRINT_NODE.0 => self
                 .handle_print_node(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::FORMAT_NODE_FOR_INSERTION.0 => self
+                .handle_format_node_for_insertion(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::IS_CONTEXT_SENSITIVE.0 => self
                 .handle_is_context_sensitive(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1118,6 +1183,9 @@ impl Handler for Session {
             m if m == Method::GET_PROPERTIES_OF_TYPE.0 => self
                 .handle_get_properties_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_APPARENT_PROPERTIES_OF_TYPE.0 => self
+                .handle_get_apparent_properties_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_APPARENT_TYPE.0 => self
                 .handle_get_apparent_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1132,6 +1200,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_BASE_CONSTRAINT_OF_TYPE.0 => self
                 .handle_get_base_constraint_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_DEFAULT_FROM_TYPE_PARAMETER.0 => self
+                .handle_get_default_from_type_parameter(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_TYPE_ARGUMENTS.0 => self
                 .handle_get_type_arguments(ctx, assert_params(&parsed))
@@ -1150,6 +1221,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
                 .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_FULLY_QUALIFIED_NAME.0 => self
+                .handle_get_fully_qualified_name(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_EXPORTS_OF_MODULE.0 => self
                 .handle_get_exports_of_module(ctx, assert_params(&parsed))
@@ -1202,8 +1276,18 @@ impl Handler for Session {
             m if m == Method::GET_ES_SYMBOL_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_es_symbol_type)
                 .map(to_any),
+            m if m == Method::GET_NON_PRIMITIVE_TYPE.0 => self
+                .handle_get_intrinsic_type(
+                    ctx,
+                    assert_params(&parsed),
+                    Checker::get_non_primitive_type,
+                )
+                .map(to_any),
             m if m == Method::GET_WELL_KNOWN_SYMBOLS.0 => self
                 .handle_get_well_known_symbols(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_WELL_KNOWN_SIGNATURES.0 => self
+                .handle_get_well_known_signatures(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_SYNTACTIC_DIAGNOSTICS.0 => self
                 .handle_get_syntactic_diagnostics(ctx, assert_params(&parsed))
@@ -1569,6 +1653,100 @@ impl Session {
         Ok(Some(new_project_response(&proj.borrow())))
     }
 
+    // Go: api/session.go:1161 handleParseCommandLine
+    // handleParseCommandLine parses command-line arguments.
+    pub fn handle_parse_command_line(
+        &self,
+        _ctx: &Context,
+        params: &ParseCommandLineParams,
+    ) -> Result<Option<ConfigFileResponse>, GoError> {
+        Ok(new_config_file_response(Some(
+            &tsoptions::parse_command_line(&params.command_line, &*self.project_session),
+        )))
+    }
+
+    // Go: api/session.go:1166 handleReadConfigFile
+    // handleReadConfigFile reads and parses a JSON configuration file.
+    pub fn handle_read_config_file(
+        &self,
+        _ctx: &Context,
+        params: &ReadConfigFileParams,
+    ) -> Result<ReadConfigFileResponse, GoError> {
+        let config_file_name = params
+            .file
+            .to_absolute_file_name(&self.project_session.get_current_directory());
+        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+        if !ok {
+            return Ok(ReadConfigFileResponse {
+                config: tsoptions::CompilerOptionsValue::Map(IndexMap::new()),
+                error: Some(new_diagnostic_response(&new_compiler_diagnostic(
+                    diag::Cannot_read_file_0,
+                    args![config_file_name],
+                ))),
+            });
+        }
+
+        let (config, parse_errors) = tsoptions::parse_config_file_text_to_json(
+            &config_file_name,
+            self.to_path(&config_file_name),
+            &config_file_content,
+        );
+        let mut response = ReadConfigFileResponse {
+            config,
+            error: None,
+        };
+        if !parse_errors.is_empty() {
+            response.error = Some(new_diagnostic_response(&parse_errors[0]));
+        }
+        Ok(response)
+    }
+
+    // Go: api/session.go:1189 handleParseJsonConfigFileContent
+    // handleParseJsonConfigFileContent parses an in-memory JSON configuration.
+    pub fn handle_parse_json_config_file_content(
+        &self,
+        _ctx: &Context,
+        params: &ParseJsonConfigFileContentParams,
+    ) -> Result<Option<ConfigFileResponse>, GoError> {
+        if params.config_directory.is_none() == params.config_file_name.is_none() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: exactly one of configDirectory or configFileName is required",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let base_path;
+        let mut config_file_name = String::new();
+        if let Some(config_directory) = &params.config_directory {
+            base_path = tspath::get_normalized_absolute_path(
+                config_directory,
+                &self.project_session.get_current_directory(),
+            );
+        } else {
+            config_file_name = params
+                .config_file_name
+                .as_ref()
+                .expect("configFileName is set")
+                .to_absolute_file_name(&self.project_session.get_current_directory());
+            base_path = tspath::get_directory_path(&config_file_name);
+        }
+
+        let parsed_command_line = tsoptions::parse_json_config_file_content(
+            &json_value_to_any(&params.json),
+            &*self.project_session,
+            &base_path,
+            None, /*existingOptions*/
+            &config_file_name,
+            &[],  /*resolutionStack*/
+            &[],  /*extraFileExtensions*/
+            None, /*extendedConfigCache*/
+        );
+        Ok(new_config_file_response(Some(&parsed_command_line)))
+    }
+
     // Go: api/session.go:737 handleParseConfigFile
     // handleParseConfigFile parses a tsconfig.json file and returns its contents.
     pub fn handle_parse_config_file(
@@ -1609,12 +1787,9 @@ impl Session {
             None, /*extendedConfigCache*/
         );
 
-        // PORT: Go shares the `*core.CompilerOptions`; the response holds a
-        // copy (a response value must be `Send`).
-        Ok(ConfigFileResponse {
-            file_names: parsed_command_line.file_names().to_vec(),
-            options: Some((**parsed_command_line.compiler_options()).clone()),
-        })
+        // PORT: Go returns a `*ConfigFileResponse` that is never nil here.
+        Ok(new_config_file_response(Some(&parsed_command_line))
+            .expect("NewConfigFileResponse of a parsed command line"))
     }
 
     // Go: api/session.go:769 handleGetSourceFile
@@ -1630,9 +1805,104 @@ impl Session {
         // The encoder reads lazy JSDoc (file header, "Current program").
         let _program = ls_program::enter(program);
 
-        let source_file = program
-            .get_source_file(&params.file.to_file_name())
-            .map_or(Node::NIL, |f| f.root);
+        self.encode_source_file_response(
+            program
+                .get_source_file(&params.file.to_file_name())
+                .map_or(Node::NIL, |f| f.root),
+        )
+    }
+
+    // Go: api/session.go:1301 handleGetConfigFileNames
+    // handleGetConfigFileNames returns tsconfig file names associated with the project's command line.
+    // PORT: Go `program.CommandLine()` is never nil in the port.
+    pub fn handle_get_config_file_names(
+        &self,
+        _ctx: &Context,
+        params: &GetProjectDiagnosticsParams,
+    ) -> Result<Vec<String>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let command_line = program.command_line();
+        let Some(config_file) = command_line
+            .config_file
+            .as_ref()
+            .filter(|f| f.source_file.is_some())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let extended_files = command_line.extended_source_files();
+        let mut config_files = Vec::with_capacity(extended_files.len() + 1);
+        config_files.push(config_file.file_name.clone());
+        config_files.extend(extended_files.iter().cloned());
+        Ok(config_files)
+    }
+
+    // Go: api/session.go:1327 handleGetConfigSourceFile
+    // handleGetConfigSourceFile returns a tsconfig source file associated with the project's command line.
+    pub fn handle_get_config_source_file(
+        &self,
+        _ctx: &Context,
+        params: &GetSourceFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+        // The encoder reads lazy JSDoc (file header, "Current program").
+        let _program = ls_program::enter(program);
+
+        let command_line = program.command_line();
+        let Some(root_config_source_file) = command_line
+            .config_file
+            .as_ref()
+            .filter(|f| f.source_file.is_some())
+        else {
+            return self.encode_source_file_response(Node::NIL);
+        };
+
+        let requested_path = tspath::to_path(
+            &params.file.to_file_name(),
+            &program.get_current_directory(),
+            program.use_case_sensitive_file_names(),
+        );
+        if root_config_source_file.path == requested_path {
+            return self.encode_source_file_response(root_config_source_file.source_file);
+        }
+
+        for config_file_name in command_line.extended_source_files() {
+            if tspath::to_path(
+                config_file_name,
+                &program.get_current_directory(),
+                program.use_case_sensitive_file_names(),
+            ) != requested_path
+            {
+                continue;
+            }
+
+            let (config_file_content, ok) = sd.snapshot.read_file(config_file_name);
+            if !ok {
+                return self.encode_source_file_response(Node::NIL);
+            }
+
+            let config_source_file = tsoptions::new_tsconfig_source_file_from_file_path(
+                config_file_name,
+                requested_path,
+                &config_file_content,
+            );
+            return self.encode_source_file_response(config_source_file.source_file);
+        }
+
+        self.encode_source_file_response(Node::NIL)
+    }
+
+    // Go: api/session.go:1366 encodeSourceFileResponse
+    // PORT: Go `*ast.SourceFile` is the root node; `Node::NIL` is nil.
+    pub fn encode_source_file_response(
+        &self,
+        source_file: Node,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         if source_file.is_nil() {
             if self.use_binary_responses {
                 return Ok(to_any(RawBinary(Vec::new())));
@@ -1651,7 +1921,6 @@ impl Session {
             }
         };
 
-        // Return raw binary for msgpack protocol, or base64 for JSON
         if self.use_binary_responses {
             return Ok(to_any(RawBinary(data)));
         }
@@ -1747,6 +2016,78 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1468 handleGetSymbolOfSourceFile
+    // handleGetSymbolOfSourceFile returns the module symbol for a source file, if any.
+    // For non-module (script) files, returns nil.
+    pub fn handle_get_symbol_of_source_file(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolOfSourceFileParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let source_file = setup
+            .program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    params.file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let symbol = setup
+            .checker
+            .borrow_mut()
+            .get_symbol_at_location_exported(source_file);
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1488 handleGetSymbolsOfSourceFiles
+    // handleGetSymbolsOfSourceFiles returns the module symbols for multiple source files.
+    pub fn handle_get_symbols_of_source_files(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolsOfSourceFilesParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let mut results: Vec<Option<SymbolResponse>> =
+            (0..params.files.len()).map(|_| None).collect();
+        for (i, file) in params.files.iter().enumerate() {
+            let source_file = setup
+                .program
+                .get_source_file(&file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            let symbol = setup
+                .checker
+                .borrow_mut()
+                .get_symbol_at_location_exported(source_file);
+            if symbol.is_some() {
+                results[i] = setup.new_symbol_response(symbol);
+            }
+        }
+        Ok(results)
     }
 
     // Go: api/session.go:831 handleGetSymbolsAtPositions
@@ -1861,19 +2202,12 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
-        if symbol.is_nil() {
-            return Ok(None);
-        }
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
         let t = setup
             .checker
             .borrow_mut()
             .get_type_of_symbol_exported(symbol);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -1890,17 +2224,14 @@ impl Session {
             (0..params.symbols.len()).map(|_| None).collect();
         for (i, &sym_handle) in params.symbols.iter().enumerate() {
             let (owner, symbol) = setup.resolve_symbol_handle(sym_handle)?;
-            if symbol.is_nil() {
-                continue;
-            }
             let symbol = checker_symbol(&setup.checker, &owner, symbol);
+            // resolveSymbolHandle errors on an unresolvable handle and GetTypeOfSymbol
+            // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup
                 .checker
                 .borrow_mut()
                 .get_type_of_symbol_exported(symbol);
-            if t.is_some() {
-                results[i] = setup.new_type_response(t);
-            }
+            results[i] = setup.new_type_response(t);
         }
 
         Ok(results)
@@ -1916,19 +2247,12 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
-        if symbol.is_nil() {
-            return Ok(None);
-        }
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
         let t = setup
             .checker
             .borrow_mut()
             .get_declared_type_of_symbol_exported(symbol);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -1942,31 +2266,8 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         // Resolve location node - either from node handle or from fileName+position
-        let mut location = Node::NIL;
-        if !params.location.0.is_empty() {
-            location = setup
-                .sd
-                .resolve_node_handle(setup.program, &params.location)?;
-        } else if let (Some(file), Some(position)) = (&params.file, params.position) {
-            let source_file = setup
-                .program
-                .get_source_file(&file.to_file_name())
-                .map_or(Node::NIL, |f| f.root);
-            if source_file.is_nil() {
-                return Err(errors::errorf(
-                    format!(
-                        "{}: source file not found: {}",
-                        *ERR_CLIENT_ERROR,
-                        file.string()
-                    ),
-                    vec![ERR_CLIENT_ERROR.clone()],
-                ));
-            }
-            location = astnav::get_touching_property_name(
-                source_file,
-                source_file_get_position_map(source_file).utf16_to_utf8(position as i32),
-            );
-        }
+        let location =
+            setup.resolve_location(&params.location, params.file.as_ref(), params.position)?;
 
         let symbol = setup.checker.borrow_mut().resolve_name_exported(
             &params.name,
@@ -1979,6 +2280,41 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1667 handleGetSymbolsInScope
+    // handleGetSymbolsInScope returns all symbols with the given meaning that are visible at a location.
+    // PORT: Go builds the list from Go maps, so its order is random; the
+    // port's order is stable (`Checker::get_symbols_in_scope`).
+    pub fn handle_get_symbols_in_scope(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolsInScopeParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let location =
+            setup.resolve_location(&params.location, params.file.as_ref(), params.position)?;
+        if location.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: getSymbolsInScope requires a location",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let symbols = setup
+            .checker
+            .borrow_mut()
+            .get_symbols_in_scope_exported(location, SymbolFlags(params.meaning));
+        let mut results = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            results.push(setup.new_symbol_response(symbol));
+        }
+
+        Ok(results)
     }
 
     // Go: api/session.go:1015 handleGetSignaturesOfType
@@ -2017,9 +2353,6 @@ impl Session {
         let node = setup
             .sd
             .resolve_node_handle(setup.program, &params.location)?;
-        if node.is_nil() {
-            return Ok(None);
-        }
 
         let sig = setup
             .checker
@@ -2040,15 +2373,8 @@ impl Session {
         let node = setup
             .sd
             .resolve_node_handle(setup.program, &params.location)?;
-        if node.is_nil() {
-            return Ok(None);
-        }
 
         let t = setup.checker.borrow_mut().get_type_at_location(node);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -2065,13 +2391,10 @@ impl Session {
             (0..params.locations.len()).map(|_| None).collect();
         for (i, loc) in params.locations.iter().enumerate() {
             let node = setup.sd.resolve_node_handle(setup.program, loc)?;
-            if node.is_nil() {
-                continue;
-            }
+            // resolveNodeHandle errors on an unresolvable handle and GetTypeAtLocation
+            // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup.checker.borrow_mut().get_type_at_location(node);
-            if t.is_some() {
-                results[i] = setup.new_type_response(t);
-            }
+            results[i] = setup.new_type_response(t);
         }
 
         Ok(results)
@@ -2378,6 +2701,8 @@ impl Session {
     }
 
     // Go: api/session.go:1252 handleGetConstraintOfType
+    // handleGetConstraintOfType returns the constraint of a substitution type.
+    // Type parameter constraints are handled by handleGetConstraintOfTypeParameter.
     pub fn handle_get_constraint_of_type(
         &self,
         _ctx: &Context,
