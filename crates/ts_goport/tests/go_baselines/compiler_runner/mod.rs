@@ -17,11 +17,13 @@
 //! - `go_regex.rs`: the Go regular expressions as plain matchers.
 //! - `child.rs`: each test configuration runs in a child process; the
 //!   environment variables and `known_failures.txt` are described there.
+//! - `transpile_runner.rs`: transpile_runner.go (`TestTranspile`, #4849):
+//!   the `submodule/transpile` baselines of `ts_goport::transpile`.
 //!
 //! Run: `scripts/run-cargo-capped.sh test --release -p ts_goport --test
-//! go_baselines -- compiler_runner` (TestLocal). TestSubmodule is ignored
-//! (long): run it with `--include-ignored compiler_runner::test_submodule`
-//! and `COMPILER_RUNNER_SHARD=<i>/<n>`.
+//! go_baselines -- compiler_runner` (TestLocal and TestTranspile).
+//! TestSubmodule is ignored (long): run it with `--include-ignored
+//! compiler_runner::test_submodule` and `COMPILER_RUNNER_SHARD=<i>/<n>`.
 
 mod child;
 mod go_regex;
@@ -29,6 +31,7 @@ mod harness;
 mod runner;
 mod sourcemap_recorder;
 mod test_case_parser;
+mod transpile_runner;
 mod tsbaseline;
 
 // Go: compiler_runner_test.go:14 TestLocal
@@ -45,6 +48,12 @@ fn test_local() {
 #[ignore = "long: about 15,000 child processes; run in shards (COMPILER_RUNNER_SHARD)"]
 fn test_submodule() {
     child::run_compiler_tests(true);
+}
+
+// Go: transpile_runner_test.go:5 TestTranspile
+#[test]
+fn test_transpile() {
+    transpile_runner::run_transpile_tests();
 }
 
 /// Child process entry of the compiler runner. Returns at once unless the

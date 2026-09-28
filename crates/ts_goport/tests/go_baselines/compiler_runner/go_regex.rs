@@ -197,6 +197,20 @@ pub fn has_ts_or_tsx_suffix(s: &str) -> bool {
     s.ends_with(".ts") || s.ends_with(".tsx")
 }
 
+// Go: transpile_runner.go:23 transpileBaselineRegex
+/// Go `regexp.MustCompile(`\.[cm]?[tj]sx?$`).MatchString(s)`.
+pub fn has_transpile_test_suffix(s: &str) -> bool {
+    let s = s.strip_suffix('x').unwrap_or(s);
+    let Some(s) = s.strip_suffix("ts").or_else(|| s.strip_suffix("js")) else {
+        return false;
+    };
+    let s = s
+        .strip_suffix('c')
+        .or_else(|| s.strip_suffix('m'))
+        .unwrap_or(s);
+    s.ends_with('.')
+}
+
 /// Go `tsExtension.ReplaceAllString(path, replacement)` with `\.tsx?$`.
 pub fn replace_ts_extension(path: &str, replacement: &str) -> String {
     if let Some(stem) = path.strip_suffix(".tsx") {
@@ -410,6 +424,16 @@ mod tests {
             Some(("/a/b ", "/c/d"))
         );
         assert_eq!(match_link_line("// @link: /a/b"), None);
+    }
+
+    #[test]
+    fn transpile_test_suffix() {
+        for name in ["a.ts", "a.tsx", "a.js", "a.jsx", "a.cts", "a.mjs", "a.c.ts"] {
+            assert!(has_transpile_test_suffix(name), "{name}");
+        }
+        for name in ["a.d", "a.xts", "a.mcts", "a.tsxx", "a.ts.map", "ats", "a.x"] {
+            assert!(!has_transpile_test_suffix(name), "{name}");
+        }
     }
 
     #[test]

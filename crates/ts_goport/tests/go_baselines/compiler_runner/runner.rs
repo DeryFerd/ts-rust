@@ -87,6 +87,7 @@ impl CompilerBaselineRunner {
                 go_regex::has_ts_or_tsx_suffix,
                 true, /*recursive*/
             )
+            .unwrap_or_else(|err| panic!("Could not read compiler test files: {err}"))
         })
     }
 }
@@ -440,7 +441,7 @@ pub fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Go `t.Run(name, ...)` with `defer testutil.RecoverAndFail(t, message)`:
 /// a panic fails the subtest, `skip` skips it.
-fn run_subtest(
+pub fn run_subtest(
     report: Report<'_>,
     kind: &str,
     message: &str,

@@ -1101,12 +1101,13 @@ fn test_program_is_single_threaded() -> bool {
 }
 
 // Go: harnessutil.go:944 EnumerateFiles
-pub fn enumerate_files(folder: &str, test_regex: fn(&str) -> bool, recursive: bool) -> Vec<String> {
-    list_files_worker(test_regex, recursive, folder)
-        .unwrap_or_else(|err| panic!("Could not read compiler test files: {err}"))
-        .iter()
-        .map(|path| normalize_slashes(path))
-        .collect()
+pub fn enumerate_files(
+    folder: &str,
+    test_regex: fn(&str) -> bool,
+    recursive: bool,
+) -> std::io::Result<Vec<String>> {
+    let files = list_files_worker(test_regex, recursive, folder)?;
+    Ok(files.iter().map(|path| normalize_slashes(path)).collect())
 }
 
 // Go: harnessutil.go:956 listFilesWorker

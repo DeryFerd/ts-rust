@@ -105,7 +105,7 @@ pub fn do_error_baseline(
 }
 
 /// Joins a comparison result with the Go `assert.Check` failures.
-fn finish_checks(result: Result<(), String>, checks: Vec<String>) -> Result<(), String> {
+pub fn finish_checks(result: Result<(), String>, checks: Vec<String>) -> Result<(), String> {
     if checks.is_empty() {
         return result;
     }
@@ -164,7 +164,7 @@ fn format_location(file: Node, pos: i32, format_opts: &FormattingOptions) -> Str
 }
 
 /// Go `diag.File().FileName()` for a diagnostic with a file.
-fn diagnostic_file_name(diagnostic: &Diagnostic) -> Option<String> {
+pub fn diagnostic_file_name(diagnostic: &Diagnostic) -> Option<String> {
     diagnostic
         .file
         .is_some()
