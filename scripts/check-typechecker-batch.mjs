@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { loadState, verifyAppendOnly } from "./state.mjs";
 
 // This checks saved evidence. It does not run Cargo or authenticate agent identities.
@@ -15,11 +16,18 @@ export const CARRY_FORWARD_RULE = "goport-only-roster-carry-forward";
 // Theo's standing rule (2026-09-28) that makes goport's own tests the protected set for a
 // batch with protectedSet "goport". See checkGoport.
 export const GOPORT_RULE = "goport-protected-set";
-// The first goport test baseline (docs/goport-protected/tests-r131.json). The rule must name it.
-export const GOPORT_BASELINE_SHA256 = "99b160efe18f29badaf861b83bebc4f64dc94c25ed1680d667e1984343c61e1d";
+// The first goport test baseline (docs/goport-protected/tests-r131.json.gz, the sha256 of the
+// stored gzip bytes). The rule must name it.
+export const GOPORT_BASELINE_SHA256 = "d1b90114690033ea0d3450182b7340c7f87df27d7e3c45af07192506a2476b7a";
 // Unit test suites of the kept legacy crates. A name map may remove their tests when goport's Go
 // port replaces a crate (legacy removal stages 5 and 6); other removals need a Go pin change.
 const KEPT_CRATE_SUITE = /^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$/;
+// R131 is the last revision accepted under the legacy cargo roster (rule goport-protected-set).
+// A later revision needs protectedSet "goport": the legacy check, and with it the roster
+// carry-forward, is only for revisions up to this one.
+export const LAST_LEGACY_REVISION = 131;
+// A Go pin (commit hash) as upstreamPin.to names it: 7 to 64 hex characters.
+const GO_PIN = /^[0-9a-f]{7,64}$/i;
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
@@ -93,7 +101,8 @@ function matchCounts(actual, claimed, label) {
 
 // Reads an evidence file {path, sha256} relative to the repository root. The hash must match
 // unless the caller passes pinned false (for records the state saves without a hash, such as
-// the quality record). json false returns the text.
+// the quality record). A path that ends in .gz is gzip: the hash is of the stored bytes. json
+// false returns the text.
 export function readEvidenceFile(reference, { pinned = true, json = true } = {}) {
   requireValue(text(reference?.path) && (!pinned || HASH.test(reference?.sha256)), "Missing evidence path or SHA-256.");
   let bytes;
@@ -104,6 +113,13 @@ export function readEvidenceFile(reference, { pinned = true, json = true } = {})
   }
   requireValue(!pinned || createHash("sha256").update(bytes).digest("hex") === reference.sha256,
     `Evidence hash mismatch: ${reference.path}.`);
+  if (reference.path.endsWith(".gz")) {
+    try {
+      bytes = gunzipSync(bytes);
+    } catch {
+      throw new Error(`Invalid gzip evidence: ${reference.path}.`);
+    }
+  }
   if (!json) return bytes.toString("utf8");
   try {
     return JSON.parse(bytes.toString("utf8"));
@@ -344,14 +360,13 @@ function testSuites(results, label) {
 // incomplete suite, is unrun; a name missing from a complete suite is absent. A map line that
 // moves or removes a name needs the old name gone from the new results, and a new name that is
 // not a base name (so a map cannot swap a lost name for a passing one). A removal needs a Go
-// pin change between the base and new results, or a kept-crate suite.
-function compareTests(baseResults, newResults, map) {
+// pin change (pinChanged: the base batch pin differs from batch.upstreamPin.to), or a kept-crate suite.
+function compareTests(baseResults, newResults, map, pinChanged) {
   const before = testSuites(baseResults, "Base goport results"), after = testSuites(newResults, "goportTests results");
   requireValue(newResults.incomplete === undefined || (Array.isArray(newResults.incomplete) && newResults.incomplete.every(text)),
     "goportTests results: incomplete must be a list of suites.");
   const incomplete = new Set(newResults.incomplete ?? []);
   const has = (suites, suite, name) => Object.hasOwn(suites, suite) && Object.hasOwn(suites[suite], name);
-  const pinChanged = text(baseResults.pin) && text(newResults.pin) && !sameHash(baseResults.pin, newResults.pin);
   for (const [id, { line, to }] of map ?? []) {
     const [suite, name] = JSON.parse(id);
     if (to && to[0] === suite && to[1] === name) continue;
@@ -512,6 +527,25 @@ function checkLspClean(record, checked, gateManifest, readEvidence, reasons) {
   if (bad.length) reasons.push(`LSP oracle has ${bad.map(name => `${classes[name]} ${name}`).join(", ")}.`);
 }
 
+// The API run's manifest.json (api_oracle.py check, in its dir) names the goport binary
+// (goportSha) of each battery it ran. Every battery ran the gate manifest's tsgo, and the run has
+// every battery of the base run's manifest.json.
+function checkApiRun(record, baseRun, gateManifest, readEvidence, reasons) {
+  const batteries = run => {
+    const manifest = readEvidence({ path: join(run.dir, "manifest.json") }, { pinned: false });
+    requireValue(manifest?.batteries && typeof manifest.batteries === "object" && !Array.isArray(manifest.batteries),
+      `${run.dir}/manifest.json is not an api_oracle.py manifest.`);
+    return manifest.batteries;
+  };
+  const tsgo = gateManifest.binaries?.tsgo?.sha256;
+  const now = batteries(record);
+  const other = Object.keys(now).filter(name => now[name]?.goportSha !== tsgo);
+  requireValue(HASH.test(tsgo) && Object.keys(now).length > 0 && other.length === 0,
+    `apiOracle ran another goport binary than the gate's tsgo${other.length ? ` (batteries ${other.join(", ")})` : ""}.`);
+  const missing = Object.keys(batteries(baseRun)).filter(name => !Object.hasOwn(now, name));
+  if (missing.length) reasons.push(`apiOracle did not run the base batteries ${missing.join(", ")}.`);
+}
+
 // The Query core and Hono bound runs and the quality record of the batch source.
 function checkRunEvidence(batch, readEvidence) {
   for (const label of ["ordinaryQuery", "latestHono"]) {
@@ -534,7 +568,7 @@ function checkRunEvidence(batch, readEvidence) {
 
 // Theo's goport protected set (rule goport-protected-set, 2026-09-28). The base is the last
 // accepted batch: its goportTests results when it was a goport batch, else the rule's pinned
-// baseline (docs/goport-protected/tests-r131.json); the gate base is always its gate manifest;
+// baseline (docs/goport-protected/tests-r131.json.gz); the gate base is always its gate manifest;
 // the oracle bases are its LSP and API runs (the rule's apiBaseline after a legacy batch). The
 // check recomputes the test comparison and runs gate-compare.py and oracle-compare.py itself,
 // and also requires the saved compare records to show no loss or regression.
@@ -542,7 +576,10 @@ function checkGoport(state, rule, readEvidence, tools) {
   const batch = validateBatch(state, rule);
   requireValue(batch.rosterCarryForward == null, "A goport batch has no roster carry-forward.");
   requireValue(text(batch.commit), "A goport batch needs its commit.");
+  // The Go pin of the batch. The results, the gate and the pin change of a name map removal use it.
   const pin = batch.upstreamPin?.to;
+  requireValue(typeof pin === "string" && GO_PIN.test(pin),
+    `A goport batch needs its Go pin: upstreamPin.to of 7 to 64 hex characters, not ${JSON.stringify(pin)}.`);
   // open_revision.py --new-batch archives the accepted batch as the last batchRecords entry and
   // names that entry, so an older accepted batch can never be the base.
   const archive = batch.previousBatch?.archive;
@@ -554,6 +591,9 @@ function checkGoport(state, rule, readEvidence, tools) {
     "previousBatch.archive is not the saved record of an accepted batch.");
   const previousGoport = previous.protectedSet === "goport";
   const baseRef = previousGoport ? { path: previous.goportTests?.results, sha256: previous.goportTests?.sha256 } : rule.baseline;
+  const basePin = previous.upstreamPin?.to;
+  requireValue(typeof basePin === "string" && GO_PIN.test(basePin),
+    `Accepted batch ${previous.id} needs its Go pin: upstreamPin.to of 7 to 64 hex characters.`);
   // The oracle base runs. A legacy base batch had no API run: the rule's apiBaseline is its base.
   const lspBase = oracleRun(previous.languageServerOracle);
   const apiBase = oracleRun(previousGoport ? previous.apiOracle : rule.apiBaseline);
@@ -571,9 +611,11 @@ function checkGoport(state, rule, readEvidence, tools) {
   const results = readEvidence({ path: tests.results, sha256: tests.sha256 });
   requireValue(sameInputs(tools.gitInputs(results.source?.commit), inputs) && sameHash(results.source?.tree, inputs.crates),
     `goportTests results come from commit ${results.source?.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
-  requireValue(!pin || sameHash(results.pin, pin), `goportTests results are not at the batch Go pin ${pin}.`);
+  requireValue(sameHash(results.pin, pin), `goportTests results are not at the batch Go pin ${pin}.`);
+  const baseResults = readEvidence(baseRef);
+  requireValue(sameHash(baseResults.pin, basePin), `The base goport results are not at the Go pin ${basePin} of accepted batch ${previous.id}.`);
   const map = tests.nameMap == null ? null : parseNameMap(readEvidence(tests.nameMap, { json: false }));
-  const compared = compareTests(readEvidence(baseRef), results, map);
+  const compared = compareTests(baseResults, results, map, !sameHash(basePin, pin));
   const reasons = [];
   const recorded = ["lost", "absent", "unrun"].filter(field => size(tests.compare?.[field], `goportTests.compare.${field}`) > 0);
   if (recorded.length) reasons.push(`goportTests.compare reports ${recorded.join(", ")} names.`);
@@ -590,7 +632,7 @@ function checkGoport(state, rule, readEvidence, tools) {
   const newGate = readEvidence({ path: gateCompare.new, sha256: gateCompare.sha256 });
   requireValue(sameInputs(tools.gitInputs(newGate.commit), inputs),
     `Gate manifest comes from commit ${newGate.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
-  requireValue(!pin || sameHash(newGate.upstreamPin, pin), `Gate manifest is not at the batch Go pin ${pin}.`);
+  requireValue(sameHash(newGate.upstreamPin, pin), `Gate manifest is not at the batch Go pin ${pin}.`);
   readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 });
   const gate = tools.gateCompare(resolve(ROOT, previous.gate.manifest), resolve(ROOT, gateCompare.new), batch.openDefects);
   const output = readEvidence(gateCompare.output);
@@ -605,6 +647,7 @@ function checkGoport(state, rule, readEvidence, tools) {
   const lsp = checkOracle("languageServerOracle", batch.languageServerOracle, lspBase, tools, readEvidence, reasons);
   checkLspClean(batch.languageServerOracle, lsp, newGate, readEvidence, reasons);
   const api = checkOracle("apiOracle", batch.apiOracle, apiBase, tools, readEvidence, reasons);
+  checkApiRun(batch.apiOracle, apiBase, newGate, readEvidence, reasons);
   const { lost, absent, unrun, removed, ...counts } = compared;
   return { verdict: reasons.length ? "STOP" : "PASS", scope: GOPORT_SCOPE, protectedSet: "goport", rule: GOPORT_RULE, reasons,
     base: { batch: previous.id, tests: baseRef.path, gate: previous.gate.manifest },
@@ -623,6 +666,9 @@ export function checkBatch(state, readEvidence = readEvidenceFile, inheritedPin 
     const goport = goportRule(state);
     if (goport) return checkGoport(state, goport, readEvidence, { ...TOOLS, ...tools });
     const batch = validateBatch(state);
+    requireValue(batch.recoveryRevision <= LAST_LEGACY_REVISION,
+      `R${batch.recoveryRevision} is after R${LAST_LEGACY_REVISION}, the last revision under the legacy cargo roster. `
+      + `It needs protectedSet "goport" (rule ${GOPORT_RULE}).`);
     const carry = rosterCarry(state, batch);
     requireValue(state.acceptedBaseline?.sha256 === CHECKPOINT_SHA256, "Accepted checkpoint identity changed.");
     requireValue(state.originalAccepted?.sha256 === BASELINE_SHA256 && state.originalAccepted.expectedNames === 6055,
@@ -686,8 +732,10 @@ Read-only pre-acceptance check. Exit 0 means the protected-name and review
 prerequisites pass. Exit 1 means STOP. This is not a Cargo wrapper.
 
 batch.protectedSet selects the protected set. Without it the batch uses the
-legacy cargo roster (below). protectedSet "goport" uses goport's own tests and
-gate (see "Goport protected set" at the end).
+legacy cargo roster (below). R${LAST_LEGACY_REVISION} is the last revision under it:
+a legacy batch with a later recoveryRevision is STOP, with or without the
+roster carry-forward. protectedSet "goport" uses goport's own tests and gate
+(see "Goport protected set" at the end).
 
 State requires schemaVersion 1, phase initial-recovery or recovery-continuation, status ready,
 decision REVIEW or PASS, goalAuthorization, and a preserved candidate hash.
@@ -733,7 +781,7 @@ Goport protected set (batch.protectedSet "goport"):
 The state needs Theo's standing rule ${GOPORT_RULE}: batchId "*", standing
 true, approvedBy Theo, instruction, scope, an ISO date (2026-09-28 or
 2026-09-28T20:57:30Z), protectedSet "goport", baseline {path, sha256} (the
-first goport test baseline, docs/goport-protected/tests-r131.json; its sha256
+first goport test baseline, docs/goport-protected/tests-r131.json.gz; its sha256
 must be ${GOPORT_BASELINE_SHA256}),
 approvalNote, the key of a saved note that holds Theo's approval, and
 apiBaseline {label?, dir} (the API oracle run that is the API base after a
@@ -751,9 +799,11 @@ last accepted batch: it must be the last batchRecords entry (open_revision.py
 --new-batch writes it so) and an accepted batch. When it is a goport batch,
 the test base is its goportTests results; else it is the rule baseline. The
 gate base is its gate.
-batch.commit is the batch commit. Evidence from another commit counts when
-that commit has the same build inputs (git crates tree, Cargo.toml and
-Cargo.lock), as candidate.sh reuses it by that key.
+batch.upstreamPin.to is the batch Go pin (7 to 64 hex characters). The
+upstreamPin.to of the base batch record is the base pin, and the base goport
+results must be at it. batch.commit is the batch commit. Evidence from
+another commit counts when that commit has the same build inputs (git crates
+tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
 - goportTests {results, sha256, base, baseSha256, compare, nameMap?}: results
   is the results.json of scripts/goport/goport-tests.sh
   ({source {commit, tree, testbinSha256}, pin, suites {suite {name: ok |
@@ -767,10 +817,11 @@ Cargo.lock), as candidate.sh reuses it by that key.
 - nameMap {path, sha256}: a TSV of oldSuite, oldName, newSuite, newName and a
   non-empty evidence cell, for pin bumps and moved tests. A mapped old name
   must be gone from the new results, and a new name must not be a base name.
-  "-" "-" removes a name: only when the base and new results have different
-  Go pins, or for a kept-crate suite (ts_scanner, ts_ast, ts_diagnostics,
-  ts_path, ts_core, ts_jsnum). The output lists the removed names with their
-  evidence in nameMapRemoved for the reviewer.
+  "-" "-" removes a name: only when the base pin and batch.upstreamPin.to
+  differ (the pins in the results files do not count), or for a kept-crate
+  suite (ts_scanner, ts_ast, ts_diagnostics, ts_path, ts_core, ts_jsnum). The
+  output lists the removed names with their evidence in nameMapRemoved for the
+  reviewer.
 - gateCompare {base, baseSha256?, new, sha256, regressions, output}: base is
   the previous gate manifest, new and sha256 equal batch.gate {manifest,
   sha256}, regressions (count or list) is 0, and output {path, sha256} is the
@@ -792,7 +843,9 @@ Cargo.lock), as candidate.sh reuses it by that key.
   oracle-compare.py again on both dirs: every base same or oracle_error_same
   request must be so again, and the counts must equal the pinned output. The
   LSP run's summary.json has the traces and requests of that compare, the gate
-  manifest's tsgo and 0 diff, goport_error, timeout and crash.
+  manifest's tsgo and 0 diff, goport_error, timeout and crash. The API run's
+  manifest.json gives the gate manifest's tsgo as the goportSha of every
+  battery, and has every battery of the base run's manifest.json.
 - quality {record} and qualityEvidence {sourceFingerprint}: the record names
   the batch source, rustfmtExit 0, clippyExit 0, tsGoportWarnings 0,
   keptCrateWarnings 0 or absent, fingerprintUnchanged true.

@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, GOPORT_BASELINE_SHA256, GOPORT_RULE, INHERITED_PIN, TOOLS,
-  checkBatch, readEvidenceFile } from "./check-typechecker-batch.mjs";
+import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, GOPORT_BASELINE_SHA256, GOPORT_RULE, INHERITED_PIN, LAST_LEGACY_REVISION,
+  TOOLS, checkBatch, readEvidenceFile } from "./check-typechecker-batch.mjs";
 
 const SOURCE = "a".repeat(64);
 const RESULT = "b".repeat(64);
@@ -425,6 +425,27 @@ test("only the carry-forward rule may use batchId *", () => {
   assert.match(checkBatch(f.state, f.read, PIN).reasons.join(" "), /original accepted PASS names are FAIL or ABSENT\./);
 });
 
+// Adds measured rows before the current row, so the current row becomes revision n.
+function atRevision(f, n) {
+  const { batch } = f.state, current = batch.recoveryHistory.pop();
+  while (batch.recoveryHistory.length < n - 1) {
+    const revision = batch.recoveryHistory.length + 1;
+    batch.recoveryHistory.push({ revision, hypothesis: "hypothesis-3", sourceFingerprint: revision.toString(16).padStart(64, "0"), fullResultSha256: null });
+  }
+  batch.recoveryHistory.push({ ...current, revision: n });
+  batch.recoveryRevision = n;
+  return f;
+}
+
+test("the legacy roster check, with or without the carry-forward, ends at R131", () => {
+  assert.equal(LAST_LEGACY_REVISION, 131);
+  for (const make of [continuationFixture, carryFixture]) {
+    assert.equal(checkBatch(atRevision(make(), 131).state, make().read).verdict, "PASS");
+    const f = atRevision(make(), 132);
+    stopped(f, /R132 is after R131, the last revision under the legacy cargo roster\. It needs protectedSet "goport"/);
+  }
+});
+
 // A goport batch (protectedSet "goport") after an accepted legacy batch-0. The test base is the
 // rule baseline, the gate base is batch-0's gate, the LSP base is batch-0's lsp-r131 run (an
 // older record with only its summary path) and the API base is the rule's apiBaseline api-r131.
@@ -433,7 +454,7 @@ test("only the carry-forward rule may use batchId *", () => {
 const GO_PIN = "52168999f3dc", NEW_PIN = "16c25522e123", COMMIT = "0123456789abcdef0123456789abcdef01234567";
 const SAME_INPUTS = "50b0593b54de8a2e44eccd0261670e3ada289887", OTHER_INPUTS = "fedcba9876543210fedcba9876543210fedcba98";
 const NOTE = "legacy-removal-rule-approval-2026-09-28";
-const BASELINE_PATH = "docs/goport-protected/tests-r131.json";
+const BASELINE_PATH = "docs/goport-protected/tests-r131.json.gz";
 const TSGO = "0".repeat(64);
 const INPUTS = { crates: "a4aae8d62022eac88cee7fbdbdaa2fcd7c9e56e0", toml: "1".repeat(40), lock: "2".repeat(40) };
 const COMMITS = { [COMMIT]: INPUTS, [SAME_INPUTS]: INPUTS, [OTHER_INPUTS]: { ...INPUTS, lock: "3".repeat(40) } };
@@ -571,7 +592,7 @@ function goportFixture() {
   const gateOutput = { base: { sha256: previousGate.sha256 }, new: { sha256: gate.sha256 }, regressions: [], knownOpen: [] };
   const output = put("gate-compare.json", "d", gateOutput);
   const archive = put("docs/typechecker-batches/batch-0.json", "3", { id: "batch-0", compilerAccepted: true,
-    gate: { manifest: previousGate.path, sha256: previousGate.sha256 },
+    upstreamPin: { from: GO_PIN, to: GO_PIN }, gate: { manifest: previousGate.path, sha256: previousGate.sha256 },
     languageServerOracle: { summary: "lsp/lsp-r131/summary.md", result: "0 diff, 0 crash" } });
   const oracle = {
     "lsp/lsp-r131": [trace("b1", "t1", ["same", "same", "not_run"]), trace("b1", "t2", ["same", "oracle_error_same"])],
@@ -580,6 +601,9 @@ function goportFixture() {
     "api/api-r131": [trace("qc", "a1", ["same", "diff"])],
     "api/api-r132": [trace("qc", "a1", ["same", "same"])],
   };
+  // api_oracle.py manifest.json of each API run: the goport binary of each battery. The base ran R131's tsgo.
+  put("api/api-r131/manifest.json", "0", { batteries: { qc: { goportSha: "b".repeat(64), traces: 1 } } });
+  put("api/api-r132/manifest.json", "0", { batteries: { qc: { goportSha: TSGO, traces: 1 } } });
   state.batchRecords = ["docs/typechecker-batches/old.json", { ...archive, bytes: 1 }];
   const lspBase = { label: "lsp-r131", dir: "lsp/lsp-r131" }, apiBase = { label: "api-r131", dir: "api/api-r131" };
   Object.assign(batch, { protectedSet: "goport", commit: COMMIT.slice(0, 9), upstreamPin: { from: GO_PIN, to: GO_PIN },
@@ -625,6 +649,7 @@ function goportPrevious(f) {
   archive.languageServerOracle = { label: "lsp-r131", dir: "lsp/lsp-r131" };
   archive.apiOracle = { label: "api-r131b", dir: "api/api-r131b" };
   f.oracle["api/api-r131b"] = [trace("qc", "a1", ["same", "same"])];
+  f.put("api/api-r131b/manifest.json", "0", { batteries: { qc: { goportSha: "c".repeat(64), traces: 1 } } });
   const { batch } = f.state;
   batch.protectedBase.tests = { path: "tests-prev.json", sha256: "a".repeat(64) };
   batch.protectedBase.api = { label: "api-r131b", dir: "api/api-r131b" };
@@ -658,8 +683,11 @@ test("goport batch passes on its own tests, gate and oracles, without roster evi
   assert.match(result.scope, /goport protected set/);
 });
 
-test("the committed goport baseline has the pinned sha256", () => {
-  readEvidenceFile({ path: BASELINE_PATH, sha256: GOPORT_BASELINE_SHA256 }, { json: false });
+test("the committed goport baseline has the pinned sha256 and reads as gzip JSON", () => {
+  const baseline = readEvidenceFile({ path: BASELINE_PATH, sha256: GOPORT_BASELINE_SHA256 });
+  const names = Object.values(baseline.suites).flatMap(Object.values);
+  assert.deepEqual([baseline.pin, Object.keys(baseline.suites).length, names.length, names.filter(status => status === "ok").length],
+    ["52168999f3dc", 19, 169555, 165544]);
 });
 
 test("a legacy batch ignores the goport rule and keeps the roster check", () => {
@@ -854,6 +882,29 @@ test("the API oracle is required and keeps every base same request", () => {
   ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
 });
 
+test("the API run used the gate's tsgo for every battery and ran every base battery", () => {
+  const manifest = (f, dir = "api/api-r132") => f.files[`${dir}/manifest.json`].value;
+  for (const [change, pattern] of [
+    [f => { manifest(f).batteries.qc.goportSha = "e".repeat(64); }, /apiOracle ran another goport binary than the gate's tsgo \(batteries qc\)/],
+    [f => { delete manifest(f).batteries.qc.goportSha; }, /apiOracle ran another goport binary than the gate's tsgo \(batteries qc\)/],
+    [f => { manifest(f).batteries.zod = { goportSha: "e".repeat(64), traces: 0 }; }, /another goport binary than the gate's tsgo \(batteries zod\)/],
+    [f => { manifest(f).batteries = {}; }, /apiOracle ran another goport binary than the gate's tsgo\./],
+    [f => { delete f.files["api/api-r132/manifest.json"]; }, /Missing evidence: api\/api-r132\/manifest.json/],
+    [f => { delete f.files["api/api-r131/manifest.json"]; }, /Missing evidence: api\/api-r131\/manifest.json/],
+    [f => { f.files["api/api-r132/manifest.json"].value = { qc: {} }; }, /api\/api-r132\/manifest.json is not an api_oracle.py manifest/],
+    [f => { Object.assign(manifest(f, "api/api-r131").batteries, { zod: { traces: 3 }, hono: { traces: 2 } }); },
+      /apiOracle did not run the base batteries zod, hono\./],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+  // More batteries than the base is fine when they ran the gate's tsgo.
+  const f = goportFixture();
+  manifest(f).batteries.zod = { goportSha: TSGO, traces: 0 };
+  assert.equal(check(f).verdict, "PASS");
+  // After a goport base batch, the base batteries come from its API run.
+  goportPrevious(f);
+  manifest(f, "api/api-r131b").batteries.effect = { traces: 1 };
+  stopped(f, /apiOracle did not run the base batteries effect\./);
+});
+
 test("the LSP oracle is clean, run with the gate's tsgo and keeps every base same request", () => {
   const b1 = f => f.files["lsp/lsp-r132/summary.json"].value.batteries.b1;
   for (const [change, pattern] of [
@@ -966,6 +1017,39 @@ test("goport results and gate come from the batch build inputs and Go pin", () =
   f.results.source.commit = SAME_INPUTS;
   f.gateNew.commit = SAME_INPUTS.slice(0, 9);
   assert.equal(check(f).verdict, "PASS");
+});
+
+test("a goport batch needs a hex Go pin, and a removal needs a change of the batch pins", () => {
+  for (const [change, pattern] of [
+    [f => { delete f.state.batch.upstreamPin; }, /A goport batch needs its Go pin: upstreamPin.to of 7 to 64 hex characters, not undefined/],
+    [f => { f.state.batch.upstreamPin.to = null; }, /needs its Go pin/],
+    [f => { f.state.batch.upstreamPin.to = "main"; }, /needs its Go pin: upstreamPin.to of 7 to 64 hex characters, not "main"/],
+    [f => { f.state.batch.upstreamPin.to = "521689"; }, /needs its Go pin/],
+    [f => { f.state.batch.upstreamPin.to = `${GO_PIN}x`; }, /needs its Go pin/],
+    [f => { delete f.files["docs/typechecker-batches/batch-0.json"].value.upstreamPin; }, /Accepted batch batch-0 needs its Go pin/],
+    [f => { f.files["docs/typechecker-batches/batch-0.json"].value.upstreamPin.to = "HEAD"; }, /Accepted batch batch-0 needs its Go pin/],
+    [f => { f.files[BASELINE_PATH].value.pin = NEW_PIN; }, /The base goport results are not at the Go pin 52168999f3dc of accepted batch batch-0/],
+    [f => { delete f.files[BASELINE_PATH].value.pin; }, /The base goport results are not at the Go pin/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+  // An abbreviated pin names the same commit.
+  let f = goportFixture();
+  f.state.batch.upstreamPin.to = GO_PIN.slice(0, 7);
+  assert.equal(check(f).verdict, "PASS");
+  // A fake results pin cannot claim a pin change: the results must be at upstreamPin.to.
+  f = goportFixture();
+  delete f.results.suites.go_baselines["b::one"];
+  f.results.pin = NEW_PIN;
+  withMap(f, "go_baselines\tb::one\t-\t-\tfake pin bump\n");
+  stopped(f, /goportTests results are not at the batch Go pin 52168999f3dc/);
+  // Without a batch pin, the fake results pin is not trusted either.
+  delete f.state.batch.upstreamPin;
+  stopped(f, /A goport batch needs its Go pin/);
+  // upstreamPin.from does not count: the base pin is the accepted batch's upstreamPin.to.
+  f = goportFixture();
+  delete f.results.suites.go_baselines["b::one"];
+  f.state.batch.upstreamPin.from = NEW_PIN;
+  withMap(f, "go_baselines\tb::one\t-\t-\tfake pin bump\n");
+  stopped(f, /removes go_baselines b::one, but the Go pin did not change/);
 });
 
 test("goport batch needs bound runs, quality and bound verdicts", () => {
