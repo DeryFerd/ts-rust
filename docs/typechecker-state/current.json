@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-09-28T15:07:50.145883+00:00",
-  "reason": "R128 withdrawn (release script defect); R129 opens with the complete int13 source.",
+  "updated": "2026-09-28T15:23:14.030238+00:00",
+  "reason": "R129 bound in batch recovery-continuation-go-checker-port-15.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -603,12 +603,12 @@
       "rule": null,
       "note": "same pin as recovery-continuation-go-checker-port-14"
     },
-    "recoveryRevision": 128,
-    "hypothesis": "Perf round 11 (query 2x cells, tsc -b early emit and lib prefetch), 17 new Go test ports, and compat fixes (ATA typings location, Go Unicode 15 case tables, API string table WTF-8 bytes, go_assert! with Go debug.Assert text). Byte-identical to tsgo at 52168999f3dc on every gated suite; no protected loss (roster carried forward from R125).",
-    "sourceFingerprint": "0035a0a1ac3cc14f0ba7171723732e79890259f3143ea4af4bca2d99cec8bf90",
-    "beforeEditingSourceFingerprint": "9733673761a376e1a99cb31630263fb1fbe66b7277d3b0267cc36d1c548755e0",
+    "recoveryRevision": 129,
+    "hypothesis": "R128 plus the build-release.sh JEMALLOC_SYS_WITH_MALLOC_CONF export and comment fixes. Perf round 11, 17 Go test ports, compat fixes; byte-identical to tsgo at 52168999f3dc; no protected loss (roster carried forward from R125).",
+    "sourceFingerprint": "1a3fbde300f55ea3c409406a37580bc28e3a25332002244c012fd2cd21e6423c",
+    "beforeEditingSourceFingerprint": "0035a0a1ac3cc14f0ba7171723732e79890259f3143ea4af4bca2d99cec8bf90",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "708b99732",
+    "commit": "4cb15b778",
     "rosterFingerprint": "e0e05da6684ba748087917d478ee00cbae7bf3349d95b57a6356fe61d20a5cb1",
     "fullResult": null,
     "fullOutcome": null,
@@ -627,7 +627,7 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R128 pipeline."
+    "nextPermittedAction": "Run the R129 pipeline."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
