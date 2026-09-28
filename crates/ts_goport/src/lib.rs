@@ -16,6 +16,8 @@ pub mod baseline;
 pub mod binder;
 pub mod checker;
 pub mod cmd;
+// Go `internal/contentmapper` and `internal/spanmap` (tsgo#4712).
+pub mod contentmapper;
 pub mod core;
 pub mod declarations;
 pub mod diag;
@@ -36,6 +38,7 @@ pub mod program;
 pub mod pseudochecker;
 pub mod scanner_util;
 pub mod sourcemap;
+pub mod spanmap;
 pub mod tracing;
 pub mod transformers;
 pub mod transpile;
