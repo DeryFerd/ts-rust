@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-09-28T05:51:29.413541+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-12 accepted at R123. Batch recovery-continuation-go-checker-port-13 opened at R124.",
+  "updated": "2026-09-28T06:36:50.685709+00:00",
+  "reason": "R125 bound in batch recovery-continuation-go-checker-port-13.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -160,9 +160,9 @@
     "normalSourceFingerprint": "777b177a454dec432c77c467839bb3d61deee7be976fab039fa0e00bb01955d3"
   },
   "lastFullResult": {
-    "path": "target/continuation-r123-full-result.json",
-    "sha256": "0b4d668a6ed79a1e7c558514cce72b326ec608ccfbfe776cdc3179bec4486452",
-    "sourceFingerprint": "e6ac3734524e068c03a0eb027c9fcc7de16ca8720b0cb0ee40ef1221dd97715b",
+    "path": "target/continuation-r124-full-result.json",
+    "sha256": "6fd4f3c0bb182b342111854f129d874b01d292bb714f324e180d416674bf8114",
+    "sourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
     "pass": 6383,
     "fail": 447,
     "currentSource": true,
@@ -576,17 +576,55 @@
     "runtimeAuthorized": true,
     "expectedCompilerRecoveries": [],
     "expectationUpdates": [],
-    "verdictHistory": [],
-    "focusedResults": [],
+    "verdictHistory": [
+      {
+        "revision": 124,
+        "role": "audit_accepted_roster",
+        "agent": "aae6dbb734c07335a",
+        "verdict": "PASS",
+        "sourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
+        "note": "0 lost; notes R114 rustfmt precedent"
+      },
+      {
+        "revision": 124,
+        "role": "independent_reviewer",
+        "agent": "a0bc38f3370585da3",
+        "verdict": "PASS",
+        "sourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
+        "note": "rustfmt non-blocking; fix next"
+      }
+    ],
+    "focusedResults": [
+      {
+        "path": "target/continuation-r124-parser-lib-result.json",
+        "sha256": "497e618a4918d5097223560ed28e54e6aaf7972afae74cf6040f03d55836e32b",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r124-binder-lib-result.json",
+        "sha256": "983c3180614ce576d74e1191653d728a5ec375703164e2ece392b392c5da136c",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r124-array-control-result.json",
+        "sha256": "87e984648534a6d0c55327f3c6cce1f13817e6392dffbb93cff4be37d460ed12",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r124-annotation-control-result.json",
+        "sha256": "79935f7a4482b9aef1db1286ba1d1e9f63731cf585ad084a79de1b8240b62c77",
+        "scope": "focused"
+      }
+    ],
     "runtimeToolHandles": [],
     "commands": [],
     "interruptedRuns": [],
-    "recoveryRevision": 124,
-    "hypothesis": "First pin-bump batch: Go pin dc37b5249 to 52168999f3dc (bump A), plus parallel references, compat 4 and 5, multiprog M2a-1 to M7, the editor memory fix and checker cancellation. Byte-identical to tsgo at 52168999f3dc on every gated suite; LSP, edit and API oracles unchanged or better; no protected loss.",
-    "sourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
-    "beforeEditingSourceFingerprint": "e6ac3734524e068c03a0eb027c9fcc7de16ca8720b0cb0ee40ef1221dd97715b",
+    "recoveryRevision": 125,
+    "hypothesis": "R124 plus rustfmt of 4 fswatch and lspwatcher files (format only). Same results as R124 at Go pin 52168999f3dc; rustfmt clean; no protected loss.",
+    "sourceFingerprint": "6b56a8d25e151b6ca5349e6060193e076373dbaab87fd594450b74a422fd475f",
+    "beforeEditingSourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "7ded222e5",
+    "commit": "b4f3f0e5a",
     "fullResult": null,
     "fullOutcome": null,
     "corpus": null,
@@ -604,7 +642,7 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R124 pipeline.",
+    "nextPermittedAction": "Run the R125 pipeline.",
     "upstreamPin": {
       "rule": "pin-bump-batch",
       "from": "dc37b5249ab6",
@@ -618,8 +656,8 @@
     "runtime": {
       "status": "running",
       "stage": "prebuild",
-      "sourceFingerprint": "a2fbf4a95e133bb5d0dac4d5016d0b68b9222b0f23db602671efb9a3dcbc475a",
-      "startedUtc": "2026-09-28T05:51:44.291319+00:00"
+      "sourceFingerprint": "6b56a8d25e151b6ca5349e6060193e076373dbaab87fd594450b74a422fd475f",
+      "startedUtc": "2026-09-28T06:36:52.570492+00:00"
     }
   },
   "parallelModelPreference": {
