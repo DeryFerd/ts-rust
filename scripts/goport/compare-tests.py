@@ -3,6 +3,10 @@
 
 usage: compare-tests.py <base results.json> <new results.json> [--name-map TSV] [--out FILE]
 
+A results file that ends in .gz is read as gzip (docs/goport-protected/tests-r131.json.gz). Its
+sha256 in the output is the sha256 of the file as stored. Each file must have a "pin" of 7 to 64 hex
+characters (the Go pin that goport-tests.sh ran at), or the tool exits 2.
+
 Every base name with status "ok" is protected. For each one, in its base suite:
   retained   ok in new
   lost       failed or ignored in new
@@ -32,12 +36,15 @@ and "mapRejected" ("line <n>: <reason>"), "mapUnused" (map lines whose old name 
 any protected name is lost, absent or unrun or a map line is rejected; exit 2 on bad input.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import re
 import sys
+import zlib
 
 LISTS = ('lost', 'absent', 'unrun')
+HEX_HASH = re.compile(r'[0-9a-fA-F]{7,64}')  # use fullmatch
 # Suites of the kept crates: stages 5 and 6 move or delete their tests without a Go pin change.
 KEPT_CRATE_SUITE = re.compile(r'^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$')
 
@@ -48,12 +55,16 @@ def die(msg):
 
 
 def load(path):
+    """The results doc of a .json or .json.gz file and the sha256 of the file bytes."""
     try:
         raw = open(path, 'rb').read()
-        doc = json.loads(raw)
-        if not isinstance(doc.get('suites'), dict):
+        doc = json.loads(gzip.decompress(raw) if path.endswith('.gz') else raw)
+        if not isinstance(doc, dict) or not isinstance(doc.get('suites'), dict):
             raise ValueError('no "suites" object')
-    except (OSError, ValueError) as err:
+        # A pin that is not a hash would count as a pin change and let a map line remove a name.
+        if not isinstance(doc.get('pin'), str) or not HEX_HASH.fullmatch(doc['pin']):
+            raise ValueError(f'"pin" must be 7 to 64 hex characters, not {doc.get("pin")!r}')
+    except (OSError, EOFError, ValueError, zlib.error) as err:
         die(f'{path}: {err}')
     return doc, hashlib.sha256(raw).hexdigest()
 
@@ -80,18 +91,16 @@ def load_map(path):
 
 def same_hash(a, b):
     """Two abbreviated or full git hashes name the same object (check-typechecker-batch.mjs sameHash)."""
-    hex_re = re.compile(r'^[0-9a-f]{7,64}$')
     if not isinstance(a, str) or not isinstance(b, str):
         return False
     x, y = a.lower(), b.lower()
-    return bool(hex_re.match(x) and hex_re.match(y)) and (x.startswith(y) or y.startswith(x))
+    return bool(HEX_HASH.fullmatch(x) and HEX_HASH.fullmatch(y)) and (x.startswith(y) or y.startswith(x))
 
 
 def rejected_map_lines(base, new, name_map):
     """The map lines that could hide a lost name, as "line <n>: <reason>"."""
     before, after = base['suites'], new['suites']
-    text = lambda v: isinstance(v, str) and bool(v.strip())
-    pin_changed = text(base.get('pin')) and text(new.get('pin')) and not same_hash(base['pin'], new['pin'])
+    pin_changed = not same_hash(base['pin'], new['pin'])  # load() checked that both pins are hashes
     out = []
     for (suite, name), (line, to) in sorted(name_map.items(), key=lambda e: e[1][0]):
         if to == (suite, name):

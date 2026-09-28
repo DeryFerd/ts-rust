@@ -6,17 +6,27 @@ The protected goport test set replaces the legacy cargo roster (legacy removal s
 
 | File | What it is | sha256 |
 |---|---|---|
-| `tests-r131.json` | `results.json` of `scripts/goport/goport-tests.sh` on the R131 test bins, pin 52168999f3dc | `99b160efe18f29badaf861b83bebc4f64dc94c25ed1680d667e1984343c61e1d` |
+| `tests-r131.json.gz` | `results.json` of `scripts/goport/goport-tests.sh` on the R131 test bins, pin 52168999f3dc, as compact JSON with sorted keys in gzip | `d1b90114690033ea0d3450182b7340c7f87df27d7e3c45af07192506a2476b7a` |
 
-`tests-r131.json` is the base of the first candidate after R131. After that, each accepted revision writes its `results.json` to its evidence cache, and the base of a candidate is the `results.json` of the last accepted revision.
+`tests-r131.json.gz` is the base of the first candidate after R131. After that, each accepted revision writes its `results.json` to its evidence cache, and the base of a candidate is the `results.json` of the last accepted revision.
 
-Format: `{"source": {"commit", "tree", "testbinSha256"}, "pin", "suites": {"<suite>": {"<test name>": "ok" | "failed" | "ignored" | "unrun"}}, "incomplete": [<suite>...]}`. `tree` is the crates tree of `commit`. `testbinSha256` is the sha256 of the test bin dir's `bins.sha256`. The file is 13.2 MB (1.2 MB gzip), because it holds every compiler runner subtest and reference file.
+Format: `{"source": {"commit", "tree", "testbinSha256"}, "pin", "suites": {"<suite>": {"<test name>": "ok" | "failed" | "ignored" | "unrun"}}, "incomplete": [<suite>...]}`. `tree` is the crates tree of `commit`. `testbinSha256` is the sha256 of the test bin dir's `bins.sha256`. The JSON is 12.4 MB, because it holds every compiler runner subtest and reference file. So the repository keeps it in gzip (1.1 MB).
+
+The gzip file has deterministic bytes. To make it again from a `results.json`:
+
+```
+jq -cS . results.json | gzip -n -9 > docs/goport-protected/tests-r131.json.gz
+```
+
+`jq -cS` writes compact JSON with sorted keys and one final newline (Python `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"` gives the same bytes). `gzip -n` writes no name and no time. With jq 1.8.2 and gzip 1.15: the JSON sha256 is `e6e301b42ebbb635a9d9801de6933a096d5a70a7322a72d1a527c1235084bb0a` and the gzip sha256 is the one in the table. The parsed JSON is equal to the pretty-printed `results.json` of the run (`target/continuation-r97-goport/legacy-removal/t1/tests-r131-v2/results.json`, sha256 `99b160efe18f29badaf861b83bebc4f64dc94c25ed1680d667e1984343c61e1d`, 13.2 MB), which was committed as `tests-r131.json` before this file replaced it.
+
+The readers take `.json` or `.json.gz`: a path that ends in `.gz` is read as gzip. The sha256 that a batch, `compare-tests.py` and `check-typechecker-batch.mjs` use is the sha256 of the file as stored (the gzip bytes).
 
 ## Tools
 
 - `scripts/goport/build-goport-tests.sh <checkout> <testbin-dir>`: builds the test binaries at a checkout (release, `--locked`, the default toolchain (1.93.0 now), no incremental, the shared candidate target) and copies them with `SUITES`, `relbin/`, `COMMIT`, `TREE`, `BUILD_ROOT`, `BUILD_TARGET`, `TOOLCHAIN` and `bins.sha256`. It reads `cargo metadata`: every workspace member that is not in its `NOT_PROTECTED` list (the legacy crates and the tools) gives its lib tests and each of its `[[test]]` targets. So a new crate or a new `tests/*.rs` joins the set without an edit. `SUITES` gives the crate dir of each binary. About 9 minutes on zbook.
 - `scripts/goport/goport-tests.sh <testbin-dir> <out-dir> [--pin PIN]`: runs every binary of `SUITES` in its crate dir (one test thread) and writes `<out-dir>/results.json`. About 5 minutes on zbook. It starts itself again under `env -i` with only `PATH`, `HOME`, `USER`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `LANG=C.UTF-8`, so a caller's `TSCTEST_FILTER`, `TS_GOPORT_BASELINE_*`, `S2_*` or `GOPORT_*` does not change a run. Each binary runs in a bwrap that binds a git archive of `COMMIT`'s `crates/` and the saved `relbin/` over the compiled-in paths, so a later edit or build of the checkout does not change the run. A test binary that is not in `SUITES` stops the run.
-- `scripts/goport/compare-tests.py <base> <new> [--name-map TSV] [--out FILE]`: per-name compare. Exit 1 when a base `ok` name is lost, absent or unrun, or a map line is rejected. The name map has one line per moved, renamed or removed test: `<old suite>\t<old name>\t<new suite>\t<new name>\t<evidence>`. `-\t-` as the new suite and name marks a removed test. A map line is rejected when its old name is still in the new results, when its new name is a base name (no swaps or chains), or when it removes a name with no Go pin change outside a kept-crate suite. `check-typechecker-batch.mjs` applies the same rules. The reviewer checks each map line against its evidence. Tests: `node --test scripts/goport/compare-tests.test.mjs`.
+- `scripts/goport/compare-tests.py <base> <new> [--name-map TSV] [--out FILE]`: per-name compare. Each input is a `.json` or `.json.gz` file. Exit 1 when a base `ok` name is lost, absent or unrun, or a map line is rejected. Exit 2 on bad input, which includes a `pin` that is not 7 to 64 hex characters (a spoofed pin would count as a pin change and allow a removal). The name map has one line per moved, renamed or removed test: `<old suite>\t<old name>\t<new suite>\t<new name>\t<evidence>`. `-\t-` as the new suite and name marks a removed test. A map line is rejected when its old name is still in the new results, when its new name is a base name (no swaps or chains), or when it removes a name with no Go pin change outside a kept-crate suite. `check-typechecker-batch.mjs` applies the same rules. The reviewer checks each map line against its evidence. Tests: `node --test scripts/goport/compare-tests.test.mjs`.
 
 ## Suites at R131
 
@@ -63,7 +73,7 @@ Test bin dir `target/continuation-r97-goport/legacy-removal/t1/testbin-r131-v2` 
 - `relbin/` is a copy of `buildspeed/split1/bin-r131`, the release bins of the same build.
 - The 6 kept crate test binaries come from `build-goport-tests.sh` of `goport-legacy1` (crates tree a4aae8d62022, the same as R131; rustc 1.93.0). These crates read no files.
 
-Command: `scripts/goport/goport-tests.sh target/continuation-r97-goport/legacy-removal/t1/testbin-r131-v2 target/continuation-r97-goport/legacy-removal/t1/tests-r131-v2`, with `GOPORT_PIN=52168999f3dc`, `TSCTEST_FILTER=planted-no-match` and `TS_GOPORT_BASELINE_LOCAL=/nonexistent/planted` in the caller's environment (the clean environment drops them: every tsc file is tracked and every test passes).
+Command: `scripts/goport/goport-tests.sh target/continuation-r97-goport/legacy-removal/t1/testbin-r131-v2 target/continuation-r97-goport/legacy-removal/t1/tests-r131-v2`, with `GOPORT_PIN=52168999f3dc`, `TSCTEST_FILTER=planted-no-match` and `TS_GOPORT_BASELINE_LOCAL=/nonexistent/planted` in the caller's environment (the clean environment drops them: every tsc file is tracked and every test passes). Then `jq -cS . results.json | gzip -n -9` made `tests-r131.json.gz` (see Files).
 
 Checks:
 

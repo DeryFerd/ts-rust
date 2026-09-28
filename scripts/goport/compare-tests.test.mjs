@@ -2,11 +2,13 @@
 // Run: node --test scripts/goport/compare-tests.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 
 const TOOL = join(dirname(fileURLToPath(import.meta.url)), "compare-tests.py");
 const PIN = "52168999f3dc";
@@ -23,15 +25,16 @@ const base = () => ({
 });
 
 // Runs the tool on base() and the new results that `edit` makes from base(), with the map lines
-// (arrays of cells). Returns the exit code and the JSON output.
-function compare(edit, mapLines) {
+// (arrays of cells). gzip writes the base as base.json.gz. Returns the exit code and the JSON output.
+function compare(edit, mapLines, { gzip = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "compare-tests-"));
   try {
     const next = base();
     edit?.(next);
-    writeFileSync(join(dir, "base.json"), JSON.stringify(base()));
+    const baseFile = join(dir, gzip ? "base.json.gz" : "base.json");
+    writeFileSync(baseFile, gzip ? gzipSync(JSON.stringify(base())) : JSON.stringify(base()));
     writeFileSync(join(dir, "new.json"), JSON.stringify(next));
-    const args = [TOOL, join(dir, "base.json"), join(dir, "new.json")];
+    const args = [TOOL, baseFile, join(dir, "new.json")];
     if (mapLines) {
       writeFileSync(join(dir, "map.tsv"), mapLines.map(cells => cells.join("\t")).join("\n") + "\n");
       args.push("--name-map", join(dir, "map.tsv"));
@@ -107,4 +110,25 @@ test("a removal needs a pin change or a kept-crate suite", () => {
 test("an identity line is not rejected, and a line without evidence is bad input", () => {
   assert.equal(compare(undefined, [["ts_goport_lib", "a::ok", "ts_goport_lib", "a::ok", "same"]]).rc, 0);
   assert.equal(compare(undefined, [["ts_goport_lib", "a::ok", "ts_goport_lib", "a::ok"]]).rc, 2);
+});
+
+test("a pin that is not 7 to 64 hex characters is bad input", () => {
+  // A spoofed or missing pin must not count as a pin change that allows a removal.
+  const line = [["ts_goport_lib", "a::ok", "-", "-", "deleted"]];
+  for (const pin of [`v${PIN}`, "abc123", "g".repeat(12), "a".repeat(65), `${PIN}\n`, "", null, 7]) {
+    const run = compare(next => { next.pin = pin; delete lib(next)["a::ok"]; }, line);
+    assert.equal(run.rc, 2, JSON.stringify(pin));
+    assert.match(run.stderr, /"pin" must be 7 to 64 hex characters/);
+  }
+  assert.equal(compare(next => { delete next.pin; }).rc, 2);
+  assert.equal(compare(next => { next.pin = PIN.toUpperCase(); }).rc, 0);
+});
+
+test("a .json.gz base reads as its JSON, and its sha256 is the file's", () => {
+  const { rc, out } = compare(next => { lib(next)["a::ok"] = "failed"; }, undefined, { gzip: true });
+  assert.equal(rc, 1);
+  assert.deepEqual(out.total.lost, ["ts_goport_lib: a::ok"]);
+  assert.match(out.base.path, /base\.json\.gz$/);
+  assert.equal(out.base.sha256, createHash("sha256").update(gzipSync(JSON.stringify(base()))).digest("hex"));
+  assert.equal(compare(undefined, undefined, { gzip: true }).rc, 0);
 });
