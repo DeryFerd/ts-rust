@@ -383,8 +383,11 @@ PY
       local fpa fpb fmt=0 cl=0 warn
       fpb=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
       (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files 'crates/ts_goport/**/*.rs') > "$C/rustfmt.log" 2>&1) || fmt=$?
+      # After split step 1 (R131), goport_util and goport_lsproto are workspace crates built from ts_goport files.
+      local pkgs=(-p ts_goport) p
+      for p in goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
       (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \
-        "$ROOT/scripts/run-cargo-capped.sh" clippy --locked -p ts_goport --all-targets > "$C/clippy.log" 2>&1) || cl=$?
+        "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
       fpa=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
       warn=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -c -- '--> crates/ts_goport' || true)
       jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" \
