@@ -448,7 +448,8 @@ impl NewProgram {
             return (None, new_file, false);
         }
 
-        if !can_replace_file_in_program(&old_file, new_file.as_deref()) {
+        // #4792: `canReplaceFileInProgram` is a program method.
+        if !self.can_replace_file_in_program(&old_file, new_file.as_deref()) {
             return (None, new_file, false);
         }
         let new_file = new_file.expect("checked by can_replace_file_in_program");
@@ -505,46 +506,50 @@ impl NewProgram {
             panic!("Program must finish processing files before initializing checker pool");
         }
     }
-}
 
-// Go: program.go:354 canReplaceFileInProgram
-pub fn can_replace_file_in_program(
-    file1: &ParsedSourceFile,
-    file2: Option<&ParsedSourceFile>,
-) -> bool {
-    let Some(file2) = file2 else {
-        return false;
-    };
-    file1.parse_options() == file2.parse_options()
-        && file1.uses_uri_style_node_core_modules == file2.uses_uri_style_node_core_modules
-        && slices_equal_func(&file1.imports, &file2.imports, |n1, n2| {
-            equal_module_specifiers(*n1, *n2)
-        })
-        && slices_equal_func(
-            &file1.module_augmentations,
-            &file2.module_augmentations,
-            |n1, n2| equal_module_augmentation_names(*n1, *n2),
-        )
-        && file1.ambient_module_names == file2.ambient_module_names
-        && slices_equal_func(
-            &file1.referenced_files,
-            &file2.referenced_files,
-            equal_file_references,
-        )
-        && slices_equal_func(
-            &file1.type_reference_directives,
-            &file2.type_reference_directives,
-            equal_file_references,
-        )
-        && slices_equal_func(
-            &file1.lib_reference_directives,
-            &file2.lib_reference_directives,
-            equal_file_references,
-        )
-        && equal_check_js_directives(
-            file1.check_js_directive.as_ref(),
-            file2.check_js_directive.as_ref(),
-        )
+    // Go: program.go:434 (*Program).canReplaceFileInProgram
+    // #4792: a method, so each import also compares its resolution mode.
+    pub fn can_replace_file_in_program(
+        &self,
+        file1: &ParsedSourceFile,
+        file2: Option<&ParsedSourceFile>,
+    ) -> bool {
+        let Some(file2) = file2 else {
+            return false;
+        };
+        file1.parse_options() == file2.parse_options()
+            && file1.uses_uri_style_node_core_modules == file2.uses_uri_style_node_core_modules
+            && slices_equal_func(&file1.imports, &file2.imports, |n1, n2| {
+                equal_module_specifiers(*n1, *n2)
+                    && self.get_mode_for_usage_location(file1, *n1)
+                        == self.get_mode_for_usage_location(file2, *n2)
+            })
+            && slices_equal_func(
+                &file1.module_augmentations,
+                &file2.module_augmentations,
+                |n1, n2| equal_module_augmentation_names(*n1, *n2),
+            )
+            && file1.ambient_module_names == file2.ambient_module_names
+            && slices_equal_func(
+                &file1.referenced_files,
+                &file2.referenced_files,
+                equal_file_references,
+            )
+            && slices_equal_func(
+                &file1.type_reference_directives,
+                &file2.type_reference_directives,
+                equal_file_references,
+            )
+            && slices_equal_func(
+                &file1.lib_reference_directives,
+                &file2.lib_reference_directives,
+                equal_file_references,
+            )
+            && equal_check_js_directives(
+                file1.check_js_directive.as_ref(),
+                file2.check_js_directive.as_ref(),
+            )
+    }
 }
 
 /// Go `slices.EqualFunc`.

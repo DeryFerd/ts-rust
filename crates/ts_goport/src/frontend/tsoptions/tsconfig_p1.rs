@@ -435,12 +435,18 @@ pub fn tsconfig_to_source_file(tsconfig_source_file: Option<&TsConfigSourceFile>
 // Go: tsoptions/tsconfigparsing.go:290 NewTsconfigSourceFileFromFilePath
 // PORT: Go returns a pointer to a new value; this returns the value. The
 // parser keeps source text for the program, so the text is leaked.
+// PORT: Go keeps the parser fields (`ParseOptions()`) on the returned
+// `*ast.SourceFile`. The port keeps them in the parse, so the parse is
+// recorded (`program::note_parsed_source_file`), as for other parses
+// outside a program. Then the API encoder finds them for the config file
+// (`getConfigSourceFile`), and a program version that publishes the file's
+// store gives it its parser fields.
 pub fn new_tsconfig_source_file_from_file_path(
     config_file_name: &str,
     config_path: Path,
     config_source_text: &str,
 ) -> TsConfigSourceFile {
-    let source_file = parse_source_file(
+    let source_file = Rc::new(parse_source_file(
         &SourceFileParseOptions {
             file_name: config_file_name.to_string(),
             path: config_path,
@@ -448,7 +454,8 @@ pub fn new_tsconfig_source_file_from_file_path(
         },
         Box::leak(config_source_text.to_string().into_boxed_str()),
         ScriptKind::JSON,
-    );
+    ));
+    crate::program::note_parsed_source_file(&source_file);
     TsConfigSourceFile {
         source_file: source_file.root,
         path: source_file.path().clone(),
