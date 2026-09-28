@@ -6,7 +6,11 @@ usage: scripts/goport/gate-compare.py <base manifest.json> <new manifest.json> [
 Rules (docs/typechecker-accountability.md, "Protected set"; the same as compareGate in
 scripts/check-typechecker-batch.mjs, plus the noise rule and the allow-list check):
 - Every base id must be in the new run. A removed id is a regression.
-- A base MATCH item must be MATCH. MATCH to ALLOWED is a regression too.
+- A base MATCH item must be MATCH, or ALLOWED by an allow entry (same id and condition) that the base
+  manifest's allow list has too. The single-threaded-equal entries exist because the oracle's trace order
+  changes with threads, so those items change between MATCH and ALLOWED on the same bins
+  (corpus-diag/04640: r130-full ALLOWED, r131-full MATCH, r131-full-2 ALLOWED, the last two on one bins
+  dir). MATCH to ALLOWED by an entry the base did not have is a regression.
 - An ALLOWED item in the new run must carry allowedBy: the gate verified its gate-allow.txt
   condition again in this run.
 - A FAIL in the new run is a regression, except an item of an open defect below.
@@ -15,10 +19,13 @@ scripts/check-typechecker-batch.mjs, plus the noise rule and the allow-list chec
 Open defect editor-long-growth (items editor/<project>/long). A FAIL passes only when
 - the batch in --state (default docs/typechecker-state/current.json) has an openDefects record
   with that id and a status that starts with "open",
-- the base item is FAIL too (a base MATCH that now fails is worse than base), and
-- noise rule: the judged failures are growth only (no rss, no answers), and the growth is at most
-  the base growth + 0.15 MiB/edit. 0.15 is the spread of query-core/long growth over the R126 to
-  R131 gates (1.32 to 1.44 MiB/edit).
+- the new failure is growth only (no rss, no answers), and
+- noise rule: the Rust growth is at most the base's Rust growth + 0.15 MiB/edit, whatever the base
+  status. The limit follows Go's slope in that run, so the same bins can be MATCH or FAIL
+  (editor/hono/long on b2b7dca1f: MATCH in r131-full at limit 1.88, FAIL in r131-full-2 at limit 1.00,
+  both 1.13 MiB/edit). A base MATCH item has its growth in the base gate's runs/editor/result.json.
+  0.15 covers the spread of the Rust growth over the R126 to R131 and bump B gates on good builds:
+  query-core 1.32 to 1.43, hono 1.05 to 1.13 MiB/edit.
 
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
@@ -28,7 +35,8 @@ import argparse, fnmatch, hashlib, json, os, re, sys
 ROOT = '/home/theo/Code/sandbox/ts-rust'
 NOISE = 0.15  # MiB/edit
 OPEN_DEFECTS = {'editor-long-growth': 'editor/*/long'}
-GROWTH = re.compile(r'^growth ([0-9.]+) MiB/edit \(limit ([0-9.]+)')
+GROWTH = re.compile(r'^growth (-?[0-9.]+) MiB/edit \(limit ([0-9.]+)')
+RUST_GROWTH = re.compile(r'^(-?[0-9.]+) MiB/edit')
 
 
 def fail(msg):
@@ -71,6 +79,29 @@ def growth(item):
     return None
 
 
+def run_growth(manifest_path, manifest, item):
+    """Rust growth in MiB/edit of an editor/<project>/long item: from its FAIL detail, or else from the
+    gate's own editor run (runs/editor/result.json next to the manifest), which records it for a MATCH
+    item too. None when neither has it or the run used other bins than the manifest."""
+    g = growth(item)
+    if g is not None:
+        return g
+    try:
+        run = json.load(open(os.path.join(os.path.dirname(os.path.abspath(manifest_path)), 'runs', 'editor', 'result.json')))
+    except (OSError, ValueError):
+        return None
+    project, scenario = item['id'].split('/')[1:3]
+    for s in run.get('sessions') or []:
+        cand = (s.get('rust') or {}).get('cand') or {}
+        if s.get('project') != project or s.get('scenario') != scenario:
+            continue
+        if os.path.dirname(cand.get('binary') or '') != os.path.normpath(manifest.get('binsDir') or ''):
+            return None
+        m = RUST_GROWTH.match(str((cand.get('limits') or {}).get('growth', [None, ''])[1]))
+        return float(m.group(1)) if m else None
+    return None
+
+
 def open_defects(state_path):
     try:
         batch = json.load(open(state_path))['batch']
@@ -89,7 +120,9 @@ def main():
     bm, base, bhead = load(a.base)
     nm, new, nhead = load(a.new)
     defects = open_defects(a.state)
-    regressions, fixed, known_open = [], [], []
+    # Allow entries of the base allow list, by (entry id, condition).
+    base_allow = {(e['id'], e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])}
+    regressions, fixed, known_open, reallowed = [], [], [], []
 
     def regress(i, b, n, why):
         regressions.append({'id': i, 'base': b['status'] if b else 'NEW', 'new': n['status'] if n else 'REMOVED', 'why': why,
@@ -97,48 +130,56 @@ def main():
 
     for i, n in new.items():
         b = base.get(i)
-        if n['status'] == 'ALLOWED' and not n.get('allowedBy'):
-            regress(i, b, n, 'ALLOWED without a verified allow-list condition')
-        elif b is None:
-            if n['status'] == 'FAIL':
-                regress(i, b, n, 'new id is FAIL')
-        elif b['status'] == 'MATCH' and n['status'] != 'MATCH':
-            regress(i, b, n, 'base MATCH is not MATCH')
+        if n['status'] == 'ALLOWED':
+            entries = n.get('allowedBy') or []
+            fresh = [f"{e.get('id')} ({e.get('condition')})" for e in entries if (e.get('id'), e.get('condition')) not in base_allow]
+            if not entries:
+                regress(i, b, n, 'ALLOWED without a verified allow-list condition')
+            elif b is not None and b['status'] == 'MATCH':
+                if fresh:
+                    regress(i, b, n, 'base MATCH is ALLOWED by an allow entry the base did not have: ' + ', '.join(fresh))
+                else:
+                    reallowed.append({'id': i, 'conditions': sorted({e.get('condition') for e in entries})})
+            elif b is not None and b['status'] == 'FAIL':
+                fixed.append(i)
         elif n['status'] == 'FAIL':
             defect = next((d for d, pat in OPEN_DEFECTS.items() if fnmatch.fnmatchcase(i, pat)), None)
-            g, bg = growth(n), growth(b)
-            only_growth = g is not None and all(x.startswith('growth ') for x in judged(n['detail']))
-            if defect is None:
-                regress(i, b, n, 'FAIL')
+            if b is None:
+                regress(i, b, n, 'new id is FAIL')
+            elif defect is None:
+                regress(i, b, n, 'base MATCH is not MATCH' if b['status'] == 'MATCH' else 'FAIL')
             elif defect not in defects:
                 regress(i, b, n, f'open defect record {defect} is missing or not open')
-            elif b['status'] != 'FAIL' or bg is None:
-                regress(i, b, n, 'base item did not fail on growth')
-            elif not only_growth:
+            elif growth(n) is None or not all(x.startswith('growth ') for x in judged(n['detail'])):
                 regress(i, b, n, 'fails on more than growth')
-            elif g > bg + NOISE + 1e-9:
-                regress(i, b, n, f'growth {g:.2f} > base {bg:.2f} + noise {NOISE}')
             else:
-                known_open.append({'id': i, 'defect': defect, 'growth': g, 'baseGrowth': bg, 'detail': n['detail']})
-        elif b['status'] == 'FAIL':
+                g, bg = growth(n), run_growth(a.base, bm, b)
+                if bg is None:
+                    regress(i, b, n, 'base growth unknown (no growth FAIL detail and no runs/editor/result.json of these bins)')
+                elif g > bg + NOISE + 1e-9:
+                    regress(i, b, n, f'growth {g:.2f} > base {bg:.2f} + noise {NOISE}')
+                else:
+                    known_open.append({'id': i, 'defect': defect, 'growth': g, 'baseGrowth': bg, 'baseStatus': b['status'],
+                                       'detail': n['detail']})
+        elif b is not None and b['status'] == 'FAIL':
             fixed.append(i)
     for i, b in base.items():
         if i not in new:
             regress(i, b, None, 'removed id')
 
     # Allow entries the new run used that the base allow list did not have. The reviewer checks them.
-    base_allow = {(e['id'], e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])}
     used = {(e['id'], e['condition']) for r in new.values() for e in r.get('allowedBy') or []}
     out = {'base': bhead, 'new': nhead,
-           'noiseRule': f'editor/*/long FAIL passes while openDefects has editor-long-growth (status open), the base item '
-                        f'failed on growth too, the new failure is growth only and growth <= base growth + {NOISE} MiB/edit',
+           'noiseRule': f'editor/*/long FAIL passes while openDefects has editor-long-growth (status open), the new failure is '
+                        f'growth only and its Rust growth <= the base Rust growth + {NOISE} MiB/edit (base MATCH or FAIL; a base '
+                        f'MATCH growth comes from the base runs/editor/result.json)',
            'pinChanged': bhead['upstreamPin'] != nhead['upstreamPin'], 'modeChanged': bhead['mode'] != nhead['mode'],
            'allowListChanged': (nm.get('allowList') or {}).get('sha256') != (bm.get('allowList') or {}).get('sha256'),
            'newAllowEntries': [{'id': i, 'condition': c} for i, c in sorted(used - base_allow)],
-           'regressions': regressions, 'knownOpen': known_open, 'fixed': sorted(fixed),
+           'regressions': regressions, 'knownOpen': known_open, 'reallowed': reallowed, 'fixed': sorted(fixed),
            'newIds': sorted(i for i in new if i not in base),
            'counts': {'baseItems': len(base), 'items': len(new), 'regressions': len(regressions),
-                      'knownOpen': len(known_open), 'fixed': len(fixed)}}
+                      'knownOpen': len(known_open), 'reallowed': len(reallowed), 'fixed': len(fixed)}}
     text = json.dumps(out, indent=1)
     if a.out:
         with open(a.out, 'w') as f:

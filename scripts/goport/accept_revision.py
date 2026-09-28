@@ -4,8 +4,9 @@ goport batch (protectedSet "goport", docs/typechecker-accountability.md "Protect
 
 Run after `candidate.sh side` finished (SIDE DONE) and both independent agents returned PASS on the
 verdict request. It reads the side evidence in --evidence (the cache dir that `candidate.sh
-verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, lsp.json and
-quality.json. It sets the state to ready/PASS, runs the local check, and records the acceptance only
+verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, lsp.json, api.json
+and quality.json. The LSP and API records must compare with the base results of protectedBase and
+show no lost, unrun or absent request. It sets the state to ready/PASS, runs the local check, and records the acceptance only
 when the check passes.
 
 Usage:
@@ -62,11 +63,11 @@ def main():
         sys.exit(f'batch {b["id"]} is not a goport batch (protectedSet "goport"); the legacy roster is retired')
     fp, rev, C = b['sourceFingerprint'], f'r{a.revision}', os.path.abspath(a.evidence)
     ev = {}
-    for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'quality'):
+    for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'api', 'quality'):
         if not os.path.exists(f'{C}/{k}.json'):
             sys.exit(f'missing {C}/{k}.json: run candidate.sh side to SIDE DONE first')
         ev[k] = json.load(open(f'{C}/{k}.json'))
-    tests, gate, gc, bound, lsp, quality = (ev[k] for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'quality'))
+    tests, gate, gc, bound, lsp, api, quality = (ev[k] for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'api', 'quality'))
     base = b['protectedBase']
     problems = []
     if os.path.realpath(tests['base']) != os.path.realpath(base['tests']['path']) or tests['baseSha256'] != base['tests']['sha256']:
@@ -75,6 +76,13 @@ def main():
         problems.append(f"gate-compare base {gc['base']['manifest']} is not the protected base {base['gate']['path']}")
     if any(tests['compare'][k] for k in ('lost', 'absent', 'unrun')) or gc['counts']['regressions']:
         problems.append('tests.json or gate-compare.json reports a loss or a regression')
+    for name, x, ref in (('lsp', lsp, base.get('lsp')), ('api', api, base.get('api'))):
+        if not ref or os.path.realpath(x['base']['dir']) != os.path.realpath(ref['dir']):
+            problems.append(f"{name}.json base {x['base']['dir']} is not the protected base {(ref or {}).get('dir')}")
+        if any(x['compare'][k] for k in ('lost', 'absent', 'unrun')):
+            problems.append(f'{name}.json reports lost, unrun or absent requests')
+    if quality.get('keptCrateWarnings', 0) or quality['tsGoportWarnings']:
+        problems.append('quality.json reports clippy warnings')
     if bound.get('sourceFingerprint') != fp or quality.get('sourceFingerprint') != fp:
         problems.append(f'bound runs or quality record another source than {fp[:12]}')
     for k, c in (('tests', tests['commit']), ('gate', gate['commit'])):
@@ -100,12 +108,16 @@ def main():
                         'output': {'path': rel(f'{C}/gate-compare.json'), 'sha256': sha(f'{C}/gate-compare.json')}}
     b['gateVerdict'] = {'label': gate['label'], 'verdict': gate['verdict'], 'host': gate['host'], 'counts': gate['counts'],
                         'failing': [f"{f['id']} {f['detail']}" for f in gate['failing']]}
-    b['languageServerOracle'] = {'label': lsp['label'], 'summary': rel(lsp['summary']), 'host': lsp.get('host'),
-                                 'result': f"{lsp['requests']:,} requests: {lsp['diff']} diff, {lsp['crash']} crash, "
-                                           f"{lsp['timeout']} timeout, {lsp['goportError']} goport_error"}
+    oracle = lambda x: {'label': x['label'], 'summary': rel(x['summary']), 'dir': rel(x['resultsDir']), 'host': x.get('host'),
+                        'result': f"{x['requests']:,} requests: {x['same']:,} same, {x['diff']} diff, {x['crash']} crash, "
+                                  f"{x['timeout']} timeout, {x['goportError']} goport_error",
+                        'base': {'label': x['base']['label'], 'dir': rel(x['base']['dir'])}, 'compare': x['compare'],
+                        'output': {'path': rel(x['compareOutput']), 'sha256': sha(x['compareOutput'])}}
+    b['languageServerOracle'], b['apiOracle'] = oracle(lsp), oracle(api)
     b['quality'] = {'record': rel(f'{C}/quality.json'),
                     'result': f"rustfmt {quality['rustfmtExit']}, clippy {quality['clippyExit']}, {quality['tsGoportWarnings']} "
-                              f"ts_goport warnings, fingerprint unchanged {quality['fingerprintUnchanged']}"}
+                              f"ts_goport warnings, {quality.get('keptCrateWarnings', 0)} kept crate warnings, "
+                              f"fingerprint unchanged {quality['fingerprintUnchanged']}"}
     b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': rel(C)}
     if a.extra:
         b.update(json.load(open(a.extra)))

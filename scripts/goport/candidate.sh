@@ -5,7 +5,9 @@
 # usage: scripts/goport/candidate.sh <command> ... [--dry-run]
 #   check <branch>         Scope of the <branch> diff against the allowedChangedFiles of the revision (the
 #                          batch's, or a new goport batch's when the batch is accepted or with --new-batch),
-#                          and rustfmt --edition 2024 on each changed .rs file. Exit 1 on any problem.
+#                          no change of a protected path (open_revision.py --protected) since the branch's
+#                          merge base with main, and rustfmt --edition 2024 on each changed .rs file. Exit 1
+#                          on any problem.
 #   open <rev> <branch> --hypothesis TEXT --change TEXT [--message TEXT] [--new-batch ID --origin TEXT]
 #                          check, apply <branch> to the checkout (paths in scope, one commit), fp.py, and
 #                          open_revision.py last (the only state write). A new batch has protectedSet goport.
@@ -15,11 +17,16 @@
 #                          shared target runtime/cargo-target; goport tests (build-goport-tests.sh,
 #                          goport-tests.sh, compare-tests.py against the base results; --name-map for moved
 #                          or renamed tests); two bound runs; the full gate and gate-compare.py against the
-#                          base gate manifest; the LSP oracle (default host dbook-lan); rustfmt and clippy.
-#                          The base is the last accepted revision (open_revision.py --base). Each step is
-#                          cached by source under evidence-cache/<key>/ and reused.
+#                          base gate manifest; the LSP and API oracles, each compared per request with the
+#                          base results (oracle-compare.py); rustfmt and clippy on ts_goport and the kept
+#                          crates. The gate and the oracles run on --gate-host (default dbook-lan). The base
+#                          is the last accepted revision (open_revision.py --base). Each step is cached by
+#                          source under evidence-cache/<key>/ and reused.
 #   verdict-request <rev>  The request text for the auditor and the reviewer, then the accept command.
 # --dry-run prints each command that writes and runs only the read-only checks.
+# The state, target/ and the host commands (gate.sh, lsp_oracle.py, api_oracle.py, which remote.sh sync-scripts
+# copies from the main checkout) use the main checkout ROOT. The local helpers run from the checkout of this
+# script (TOOLS), so a worktree copy can be tried before its merge; root runs the main checkout's copy.
 #
 # A monitor of side greps only for the last log line. It is exactly one of
 #   SIDE DONE | SIDE FAIL rc=<N>
@@ -29,11 +36,18 @@ set -euo pipefail
 
 ROOT=/home/theo/Code/sandbox/ts-rust
 R=$ROOT/target/continuation-r97-goport
-SELF=$ROOT/scripts/goport/candidate.sh
+SELF=$(realpath "${BASH_SOURCE[0]}")
+TOOLS=$(dirname "$(dirname "$(dirname "$SELF")")")  # the checkout of this script
+G=$TOOLS/scripts/goport
 EVIDENCE=${CANDIDATE_EVIDENCE:-$R/evidence-cache}  # tests point this at a copy
 TARGET=$R/runtime/cargo-target                     # one warm target for candidate bins (gate.sh's default)
 BINS=(goport goport_emit goport_typesyms goport_build tsgo)
 LSP_BATTERIES=b1-inline,b1-query-core,b2-query-core,b1-hono,b2-hono,fourslash
+# The API oracle batteries at pin 52168999f3dc (bumpA4 verify: 10 batteries). A pin that adds batteries
+# (bump B: qc-ext, hono-ext, zod-ext) adds them here.
+API_BATTERIES=(effect hono hono-xchecker qc qc-callbacks qc-lsp qc-proto qc-xchecker tsp-lsp zod)
+# The kept crates (not legacy): protected unit tests, and rustfmt and clippy in the quality step.
+KEPT_CRATES=(ts_scanner ts_ast ts_diagnostics ts_path ts_core ts_jsnum)
 CHECKER_PORT=$ROOT/target/worktrees/checker-port
 cd "$ROOT"
 
@@ -59,12 +73,19 @@ scope() {
   local p
   local -a all
   if [[ -n $NEW_BATCH || $(st .batch.compilerAccepted) == true ]]; then
-    mapfile -t all < <(python3 scripts/goport/open_revision.py --allowed)
+    mapfile -t all < <(python3 "$G/open_revision.py" --allowed)
   else
     mapfile -t all < <(st '.batch.allowedChangedFiles[]')
   fi
   POS=() NEG=()
   for p in "${all[@]}"; do if [[ $p == '!'* ]]; then NEG+=("${p#!}"); else POS+=("$p"); fi; done
+}
+# in_list <path> [entries...]: true when the path is one of the entries, as text.
+in_list() {
+  local path=$1 e
+  shift
+  for e in "$@"; do if [[ $path == "$e" ]]; then return 0; fi; done
+  return 1
 }
 # in_scope <path> [globs...]: true when the path matches a glob. Globs match like fnmatch (* crosses /).
 in_scope() {
@@ -97,8 +118,8 @@ fmt_clean() {
 # that an exclude glob names (the saved state, target/) are skipped: open does not apply them. Prints each
 # problem and returns 1 when there is one.
 check_branch() {
-  local branch=$1 wt base sha status path n=0 nrs=0 skipped=0
-  local -a problems=()
+  local branch=$1 wt base sha status path mb n=0 nrs=0 skipped=0
+  local -a problems=() protected
   wt=$ROOT/$(st .batch.checkout)
   base=$(git -C "$wt" rev-parse HEAD)
   sha=$(git rev-parse --verify --quiet "$branch^{commit}") || die "unknown branch or commit: $branch"
@@ -114,6 +135,15 @@ check_branch() {
     fi
   done < <(git diff --no-renames --name-status -z "$base" "$sha")
   ((skipped == 0)) || echo "   $skipped changed path(s) under the excluded globs are not applied"
+  # Protected paths the branch itself changed (from its merge base with main, so paths that only main changed
+  # since do not count). A batch that must change one lists the exact path and no exclude glob names it.
+  mapfile -t protected < <(python3 "$G/open_revision.py" --protected)
+  mb=$(git merge-base main "$sha")
+  while IFS= read -r -d '' path; do
+    in_scope "$path" "${protected[@]}" || continue
+    if in_list "$path" "${POS[@]}" && ! in_scope "$path" "${NEG[@]}"; then continue; fi
+    problems+=("changes protected path $path (it judges the protected set; a batch that must change it lists the exact path in allowedChangedFiles, with Theo's approval)")
+  done < <(git diff --no-renames --name-only -z "$mb" "$sha")
   if ((${#problems[@]})); then
     printf '   PROBLEM %s\n' "${problems[@]}"
     echo "check FAIL: ${#problems[@]} problem(s) in $n changed path(s)"
@@ -156,11 +186,11 @@ cmd_open() {
   else
     git -C "$wt" diff --quiet "$sha" HEAD -- "${specs[@]}" || die "$wt differs from $branch in scope"
     commit=$(git -C "$wt" rev-parse --short=9 HEAD)
-    fp=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
+    fp=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
   fi
   say "R$rev commit $commit, source fingerprint $fp"
 
-  orv=(python3 scripts/goport/open_revision.py --revision "$rev" --fingerprint "$fp" --commit "$commit"
+  orv=(python3 "$G/open_revision.py" --revision "$rev" --fingerprint "$fp" --commit "$commit"
     --hypothesis "$HYP" --change "$CHANGE")
   [[ -z $NEW_BATCH ]] || orv+=(--new-batch "$NEW_BATCH" --origin "$ORIGIN")
   if [[ $fp != '<'* ]]; then
@@ -197,8 +227,8 @@ cmd_side() {
   wt=$(realpath "${CHECKOUT:-$ROOT/$(st .batch.checkout)}")
   pin=$(st '.batch.upstreamPin.to // empty')
   unit=ts-rust-side-$label log=$R/quality-$label-side.log
-  [[ ! -e $log ]] || die "$log exists; rename it first (finished steps stay cached)"
-  ! systemctl --user is-active -q "$unit" || die "$unit is running"
+  [[ ! -e $log ]] || need "$log exists; rename it first (finished steps stay cached)"
+  ! systemctl --user is-active -q "$unit" || need "$unit is running"
   local -a env=(--setenv=PATH="$PATH" --setenv=HOME="$HOME")
   [[ -z ${SSH_AUTH_SOCK:-} ]] || env+=(--setenv=SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
   say "side $label in unit $unit, log $log"
@@ -213,13 +243,15 @@ free_name() { local n=$2 i=2; while [[ -e $1/$n ]]; do n=$2-$i i=$((i + 1)); don
 
 # side_unit <label> <checkout> <pin|-> <host|local> <name map|->: body of the side unit. Each finished step
 # is a file in the cache dir (bins/, testbin/, tests-run/, tests.json, bound.json, gate.json,
-# gate-compare.json, lsp.json, quality.json) and is reused. A failed compare writes tests-fail.json or
-# gate-compare-fail.json instead; the gate record then moves to gate-fail.json, so the next run runs the
-# gate again (move it back to gate.json to compare the same gate again). The other steps still run, so the
-# verdict request has all the evidence. Last log line: SIDE DONE or SIDE FAIL rc=<N>.
+# gate-compare.json, lsp.json, api.json, quality.json) and is reused. A failed compare writes tests-fail.json,
+# gate-compare-fail.json, lsp-fail.json or api-fail.json instead. The gate record then moves to
+# gate-fail.json, so the next run runs the gate again (move it back to gate.json to compare the same gate
+# again). The test run (tests-run/) and the oracle runs (lsp-run, api-run: the label) stay, so the next run
+# only compares them again. The other steps still run, so the verdict request has all the evidence. Last
+# log line: SIDE DONE or SIDE FAIL rc=<N>.
 side_unit() {
-  local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll rc oracle lock synced=0 g l fails='' base
-  local bt bts bg bgs
+  local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll al rc oracle lock synced=0 g l fails='' base
+  local bt bts bg bgs bl ba
   local -a pinexec=()
   [[ $DRY == 1 ]] || trap 'rc=$?; if ((rc)); then echo "SIDE FAIL rc=$rc"; else echo "SIDE DONE"; fi' EXIT
   [[ -z $pin ]] || pinexec=(env GOPORT_PIN="$pin" python3 "$ROOT/scripts/upstream/pin.py" exec --)
@@ -227,14 +259,16 @@ side_unit() {
   commit=$(git -C "$wt" rev-parse HEAD) lock=/tmp/goport-remote-${host%-lan}.lock
   say "$(date -u +%FT%TZ) side $label: $wt ${commit:0:9}, crates tree $(git -C "$wt" rev-parse HEAD:crates | cut -c1-12), pin ${pin:-current}, evidence $C"
   # The base: the last accepted revision's goport test results and gate manifest, pinned by sha256.
-  if base=$(python3 scripts/goport/open_revision.py --base); then
+  # The base LSP and API results are results dirs (bl, ba), compared per request.
+  if base=$(python3 "$G/open_revision.py" --base); then
     bt=$(jq -r .tests.path <<< "$base") bts=$(jq -r .tests.sha256 <<< "$base")
     bg=$(jq -r .gate.path <<< "$base") bgs=$(jq -r .gate.sha256 <<< "$base")
+    bl=$(jq -r '.lsp.dir // empty' <<< "$base") ba=$(jq -r '.api.dir // empty' <<< "$base")
     [[ $(sha "$bt") == "$bts" && $(sha "$bg") == "$bgs" ]] || die "the base files differ from their sha256: $base"
-    say "base $(jq -r '"\(.batch) R\(.revision)"' <<< "$base"): tests $bt, gate $bg"
+    say "base $(jq -r '"\(.batch) R\(.revision)"' <<< "$base"): tests $bt, gate $bg, LSP ${bl:-none}, API ${ba:-none}"
   else
     need "no protected base (open_revision.py --base)"
-    bt='<base results.json>' bg='<base gate manifest>'
+    bt='<base results.json>' bg='<base gate manifest>' bl='<base LSP results>' ba='<base API results>'
   fi
   run mkdir -p "$C"
 
@@ -260,12 +294,12 @@ side_unit() {
   if [[ -f $C/tests.json ]]; then say "reuse goport tests $(jq -c .compare "$C/tests.json")"; else
     if [[ -f $C/testbin/bins.sha256 ]]; then say "reuse test bins $C/testbin (built from $(cat "$C/testbin/COMMIT"))"; else
       say "$(date -u +%FT%TZ) build test bins"
-      run_sh "scripts/goport/build-goport-tests.sh $wt $C/testbin > $C/testbin-build.log 2>&1" || die "test bin build failed (log $C/testbin-build.log)"
+      run_sh "$G/build-goport-tests.sh $wt $C/testbin > $C/testbin-build.log 2>&1" || die "test bin build failed (log $C/testbin-build.log)"
     fi
     if [[ -f $C/tests-run/results.json ]]; then say "reuse test run $C/tests-run"; else
       say "$(date -u +%FT%TZ) goport tests"
       rc=0
-      run_sh "rm -rf $C/tests-run.new && mkdir $C/tests-run.new && scripts/goport/goport-tests.sh $C/testbin $C/tests-run.new ${pin:+--pin $pin} > $C/tests-run.log 2>&1" || rc=$?
+      run_sh "rm -rf $C/tests-run.new && mkdir $C/tests-run.new && $G/goport-tests.sh $C/testbin $C/tests-run.new ${pin:+--pin $pin} > $C/tests-run.log 2>&1" || rc=$?
       if [[ $DRY == 0 ]]; then
         [[ $rc == 0 && $(tail -n 1 "$C/tests-run.log") == DONE && -f $C/tests-run.new/results.json ]] ||
           die "goport tests rc $rc, last line '$(tail -n 1 "$C/tests-run.log")' (log $C/tests-run.log)"
@@ -274,7 +308,7 @@ side_unit() {
     fi
     say "$(date -u +%FT%TZ) compare goport tests with the base"
     rc=0
-    run_sh "python3 scripts/goport/compare-tests.py $bt $C/tests-run/results.json ${map:+--name-map $map }--out $C/tests-compare.json" || rc=$?
+    run_sh "python3 $G/compare-tests.py $bt $C/tests-run/results.json ${map:+--name-map $map }--out $C/tests-compare.json" || rc=$?
     if [[ $DRY == 0 ]]; then
       g=$C/tests.json; ((rc == 0)) || { g=$C/tests-fail.json; fails+="${fails:+; }goport tests: compare-tests.py rc $rc ($C/tests-compare.json)"; }
       jq --arg r "$C/tests-run/results.json" --arg s "$(sha "$C/tests-run/results.json")" --arg b "$(realpath "$bt")" --arg bs "$bts" \
@@ -290,7 +324,7 @@ side_unit() {
 
   # Bound runs. bound2.sh measures only the checker-port checkout and records its commit and fingerprint.
   if [[ $wt != "$CHECKER_PORT" ]]; then say "skip bound runs: bound2.sh measures only $CHECKER_PORT"; else
-    fp=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
+    fp=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
     if [[ -f $C/bound.json && $(jq -r .sourceFingerprint "$C/bound.json") == "$fp" ]]; then
       say "reuse bound runs $(jq -r '.rounds | join(" ")' "$C/bound.json")"
     else
@@ -299,7 +333,7 @@ side_unit() {
       n=r$((n + 1))
       for r in "$n" "${n}b"; do
         say "$(date -u +%FT%TZ) bound run $r"
-        run_sh "GOPORT_REL=$B ${pinexec[*]} bash scripts/goport/bound2.sh $r > $C/bound-$r.log 2>&1"
+        run_sh "GOPORT_REL=$B ${pinexec[*]} bash $G/bound2.sh $r > $C/bound-$r.log 2>&1"
       done
       if [[ $DRY == 0 ]]; then
         ! grep -HE 'DIFF|INCOMPLETE' "$R/measure/$n"/summary-*.txt "$R/measure/${n}b"/summary-*.txt || die "bound runs $n, ${n}b: not all MATCH"
@@ -350,7 +384,7 @@ side_unit() {
   if [[ -f $C/gate-compare.json ]]; then say "reuse gate compare $(jq -c .counts "$C/gate-compare.json")"; else
     say "gate compare with the base"
     rc=0
-    run_sh "python3 scripts/goport/gate-compare.py $bg \$(jq -r .manifest $C/gate.json) --out $C/gate-compare.json > /dev/null" || rc=$?
+    run_sh "python3 $G/gate-compare.py $bg \$(jq -r .manifest $C/gate.json) --out $C/gate-compare.json > /dev/null" || rc=$?
     if [[ $DRY == 0 ]] && ((rc == 0)); then rm -f "$C/gate-compare-fail.json"; fi
     if [[ $DRY == 0 ]] && ((rc)); then
       mv "$C/gate-compare.json" "$C/gate-compare-fail.json"
@@ -359,55 +393,116 @@ side_unit() {
     fi
   fi
 
+  # oracle_json <kind> <out-root> <label> <base results dir> <record>: compares the results of <label> with the
+  # base per request (oracle-compare.py) and writes <record>.json, or <record>-fail.json on a loss or without a
+  # base. The finished run's label stays in <record>-run, so a rerun only compares again.
+  oracle_json() {
+    local kind=$1 root=$2 lab=$3 base=$4 rec=$5 rc=0 out
+    [[ $DRY == 1 ]] || echo "$lab" > "$C/$rec-run"
+    if [[ -z $base ]]; then
+      # The other steps still run. The first goport batch needs the rule's apiBaseline (an API run of the R131 bins).
+      echo "   no base $kind results (open_revision.py --base .$rec.dir); $lab is kept, a rerun compares it"
+      fails+="${fails:+; }$kind oracle: no base results ($lab ran; a rerun compares it once the base exists)"
+      return 0
+    fi
+    say "$(date -u +%FT%TZ) $kind compare with the base $base"
+    run_sh "python3 $G/oracle-compare.py $base $root/results/$lab --out $C/$rec-compare.json > /dev/null" || rc=$?
+    [[ $DRY == 0 ]] || return 0
+    [[ -f $C/$rec-compare.json ]] || die "$kind compare rc $rc and no $C/$rec-compare.json"
+    out=$C/$rec.json
+    ((rc == 0)) || { out=$C/$rec-fail.json; fails+="${fails:+; }$kind oracle: oracle-compare.py rc $rc ($C/$rec-compare.json)"; }
+    python3 - "$kind" "$root/results/$lab" "$lab" "$host" "$base" "$C/$rec-compare.json" > "$out" <<'PY'
+import collections, json, sys
+kind, rdir, label, host, base, cmp_path = sys.argv[1:]
+s, c = json.load(open(f'{rdir}/summary.json')), json.load(open(cmp_path))
+classes = collections.Counter()
+if kind == 'LSP':
+    for x in s['batteries'].values():
+        classes.update(x['classes'])
+    requests = sum(x['requests'] for x in s['batteries'].values())
+    crash = classes['crash'] + sum(x['crashExits'] for x in s['batteries'].values())
+else:
+    classes.update(s['total'])
+    requests, crash = sum(classes.values()), classes['crash']
+print(json.dumps({'label': label, 'host': host, 'resultsDir': rdir, 'summary': f'{rdir}/summary.md', 'requests': requests,
+                  'same': classes['same'], 'diff': classes['diff'], 'goportError': classes['goport_error'], 'crash': crash,
+                  'timeout': classes['timeout'], 'classes': dict(classes), 'base': {'label': c['base']['label'], 'dir': base},
+                  'compareOutput': cmp_path, 'compare': c['total']}))
+PY
+    ((rc)) || rm -f "$C/$rec-fail.json"
+  }
+
   # LSP oracle (the batteries of the R121 to R125 side scripts).
-  if [[ -f $C/lsp.json ]]; then say "reuse LSP oracle $(jq -r .label "$C/lsp.json")"; else
+  if [[ -f $C/lsp.json ]] && jq -e .compare "$C/lsp.json" > /dev/null; then say "reuse LSP oracle $(jq -r .label "$C/lsp.json")"
+  elif [[ -f $C/lsp-run ]]; then say "reuse LSP run $(cat "$C/lsp-run")"; oracle_json LSP "$R/ls-oracle/battery" "$(cat "$C/lsp-run")" "$bl" lsp
+  else
     ll=$(free_name "$R/ls-oracle/battery/results" "lsp-$label") rc=0
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
     remote_sync
     # The goldens of this oracle (golden/<oracle sha256 prefix>) are not in every host mirror (R131: cup2).
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh push $host $R/ls-oracle/battery/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
     say "$(date -u +%FT%TZ) LSP oracle $ll on $host"
-    l="cd target/worktrees/goport-int7 && python3 scripts/goport/lsp_oracle.py check --out-root $R/ls-oracle/battery"
+    l="python3 scripts/goport/lsp_oracle.py check --out-root $R/ls-oracle/battery"
     l+=" --battery $LSP_BATTERIES --goport $B/tsgo --oracle $oracle --label $ll --jobs 12"
     on_host "" "$l" "$C/lsp-$ll.log" || rc=$?  # the oracle path carries the pin
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/ls-oracle/battery/results/$ll >> $C/sync.log 2>&1"
-    if [[ $DRY == 0 ]]; then
-      ((rc == 0)) || die "LSP oracle $ll rc $rc (log $C/lsp-$ll.log)"
-      python3 - "$R/ls-oracle/battery/results/$ll/summary.json" "$ll" "$host" > "$C/lsp.json" <<'PY'
-import json, sys
-b = json.load(open(sys.argv[1]))['batteries'].values()
-count = lambda k: sum(x['classes'].get(k, 0) for x in b)
-print(json.dumps({'label': sys.argv[2], 'host': sys.argv[3], 'summary': sys.argv[1].replace('.json', '.md'),
-                  'requests': sum(x['requests'] for x in b), 'diff': count('diff'), 'goportError': count('goport_error'),
-                  'crash': count('crash') + sum(x['crashExits'] for x in b), 'timeout': count('timeout')}))
-PY
+    [[ $DRY == 1 || $rc == 0 ]] || die "LSP oracle $ll rc $rc (log $C/lsp-$ll.log)"
+    oracle_json LSP "$R/ls-oracle/battery" "$ll" "$bl" lsp
+  fi
+
+  # API oracle (api_oracle.py, the 10 batteries of the bumpA4 verify run): one check per battery. GOPORT_PIN
+  # selects the pin's traces (a pin cache); the goldens are golden/<oracle sha256 prefix>.
+  if [[ -f $C/api.json ]] && jq -e .compare "$C/api.json" > /dev/null; then say "reuse API oracle $(jq -r .label "$C/api.json")"
+  elif [[ -f $C/api-run ]]; then say "reuse API run $(cat "$C/api-run")"; oracle_json API "$R/tests2/api" "$(cat "$C/api-run")" "$ba" api
+  else
+    al=$(free_name "$R/tests2/api/results" "api-$label") rc=0
+    oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
+    remote_sync
+    if [[ $host != local ]]; then
+      run_sh "scripts/goport/remote.sh push $host $R/tests2/api/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
+      [[ -n $pin ]] || run_sh "scripts/goport/remote.sh push $host $R/tests2/api/traces >> $C/sync.log 2>&1"
     fi
+    say "$(date -u +%FT%TZ) API oracle $al on $host"
+    l="set -e; for b in ${API_BATTERIES[*]}; do python3 scripts/goport/api_oracle.py check --battery \$b"
+    l+=" --goport $B/tsgo --oracle $oracle --label $al --jobs 12; done"
+    on_host "$pin" "$l" "$C/api-$al.log" || rc=$?
+    [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/tests2/api/results/$al >> $C/sync.log 2>&1"
+    [[ $DRY == 1 || $rc == 0 ]] || die "API oracle $al rc $rc (log $C/api-$al.log)"
+    oracle_json API "$R/tests2/api" "$al" "$ba" api
   fi
 
   # Quality on the checkout: rustfmt and clippy (R114 and R124 were refused for quality alone).
   # Fingerprint before and after.
-  if [[ -f $C/quality.json ]]; then say "reuse quality $(jq -c . "$C/quality.json")"; else
+  # A record without .crates predates the kept crate check (R131 and older), so it runs again.
+  if [[ -f $C/quality.json ]] && jq -e .crates "$C/quality.json" > /dev/null; then say "reuse quality $(jq -c . "$C/quality.json")"; else
     say "$(date -u +%FT%TZ) quality: rustfmt and clippy"
     if [[ $DRY == 0 ]]; then
       local fpa fpb fmt=0 cl=0 warn
-      fpb=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
-      (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files 'crates/ts_goport/**/*.rs') > "$C/rustfmt.log" 2>&1) || fmt=$?
+      fpb=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
       # After split step 1 (R131), goport_util and goport_lsproto are workspace crates built from ts_goport files.
-      local pkgs=(-p ts_goport) p
+      # The kept crates that are still workspace members (stages 5 and 6 move some into goport) count too.
+      local pkgs=(-p ts_goport) dirs=(crates/ts_goport) p
       for p in goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
+      for p in "${KEPT_CRATES[@]}"; do grep -q "\"crates/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p") dirs+=("crates/$p"); done
+      (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files "${dirs[@]/%//**/*.rs}") > "$C/rustfmt.log" 2>&1) || fmt=$?
       (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \
         "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
-      fpa=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
+      fpa=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
+      local kept
       warn=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -c -- '--> crates/ts_goport' || true)
-      jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" \
-        '{sourceFingerprint: $fp, rustfmtExit: $fmt, clippyExit: $cl, tsGoportWarnings: $w, fingerprintUnchanged: $same}' > "$C/quality.json"
-      [[ $fmt == 0 && $cl == 0 && $warn == 0 && $fpa == "$fpb" ]] || fails+="${fails:+; }quality: rustfmt $fmt, clippy $cl, warnings $warn"
+      kept=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -cE -- "--> crates/($(IFS='|'; echo "${KEPT_CRATES[*]}"))/" || true)
+      jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson k "$kept" \
+        --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" --arg dirs "${dirs[*]}" \
+        '{sourceFingerprint: $fp, rustfmtExit: $fmt, clippyExit: $cl, tsGoportWarnings: $w, keptCrateWarnings: $k,
+          fingerprintUnchanged: $same, crates: ($dirs | split(" "))}' > "$C/quality.json"
+      [[ $fmt == 0 && $cl == 0 && $warn == 0 && $kept == 0 && $fpa == "$fpb" ]] ||
+        fails+="${fails:+; }quality: rustfmt $fmt, clippy $cl, warnings $warn ts_goport, $kept kept crates"
     fi
   fi
 
   say "$(date -u +%FT%TZ) evidence $C"
-  for g in tests tests-fail bound gate gate-fail gate-compare gate-compare-fail lsp quality; do
-    if [[ -f $C/$g.json ]]; then echo "   $g: $(jq -c 'del(.manifests, .failing, .knownOpen, .newAllowEntries, .regressions, .newIds, .fixed, .base, .new)' "$C/$g.json")"; fi
+  for g in tests tests-fail bound gate gate-fail gate-compare gate-compare-fail lsp lsp-fail api api-fail quality; do
+    if [[ -f $C/$g.json ]]; then echo "   $g: $(jq -c 'del(.manifests, .failing, .knownOpen, .reallowed, .newAllowEntries, .regressions, .newIds, .fixed, .base, .new, .classes)' "$C/$g.json")"; fi
   done
   [[ -z $fails ]] || die "$fails"
 }
@@ -476,16 +571,25 @@ if gc:
         missing.append('gate compare without a regression')
 else:
     missing.append('gate compare (candidate.sh side)')
-lsp = load('lsp')
-if lsp:
-    ev.append(f"LSP oracle {lsp['label']} ({rel(lsp['summary'])}): {lsp['requests']:,} requests, {lsp['diff']} diff, {lsp['goportError']} goport_error, "
-              f"{lsp['crash']} crash, {lsp['timeout']} timeout.")
-else:
-    missing.append('LSP oracle (candidate.sh side)')
+for name, k in (('LSP', 'lsp'), ('API', 'api')):
+    x = load(k) or load(f'{k}-fail')
+    if not x:
+        missing.append(f'{name} oracle compared with the base (candidate.sh side)')
+        continue
+    c = x['compare']
+    ev.append(f"{name} oracle {x['label']}{' FAILED' if not load(k) else ''} ({rel(x['summary'])}, {x['host']}): {x['requests']:,} requests, "
+              f"{x['same']:,} same, {x['diff']} diff, {x['goportError']} goport_error, {x['crash']} crash, {x['timeout']} timeout. "
+              f"Per request against base {x['base']['label']} ({rel(x['base']['dir'])}): retained {c['retained']:,}, recovered {c['recovered']}, "
+              f"lost {c['lost']}, unrun {c['unrun']}, absent {c['absent']}, new {c['newRequests']} ({rel(x['compareOutput'])}).")
+    if not load(k):
+        first = json.load(open(x['compareOutput']))['lostFirst'][:10]
+        ev.append(f'{name} losses: ' + '; '.join(f"{f['battery']}/{f['trace']}#{f['event']} {f['method']} {f['base']} -> {f['new']}" for f in first) + '.')
+        missing.append(f'{name} oracle without a loss')
 quality = load('quality')
 if quality:
-    ev.append(f"Quality on the source: rustfmt exit {quality['rustfmtExit']}, clippy exit {quality['clippyExit']}, "
-              f"{quality['tsGoportWarnings']} ts_goport warnings, fingerprint unchanged {quality['fingerprintUnchanged']}.")
+    ev.append(f"Quality on the source ({', '.join(quality.get('crates') or ['crates/ts_goport'])}): rustfmt exit {quality['rustfmtExit']}, "
+              f"clippy exit {quality['clippyExit']}, {quality['tsGoportWarnings']} ts_goport warnings, "
+              f"{quality.get('keptCrateWarnings', 0)} kept crate warnings, fingerprint unchanged {quality['fingerprintUnchanged']}.")
 else:
     missing.append('quality: rustfmt and clippy (candidate.sh side)')
 pin = (b.get('upstreamPin') or {}).get('to')

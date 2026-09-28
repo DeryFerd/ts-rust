@@ -33,19 +33,25 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 
 Revision bindings made before this move pin `/tmp/port/fp.py`. That copy is identical.
 `tmp-port.sh restore` puts back the legacy `/tmp/port` files after a reboot or a tmpfiles cleanup
-(a login does it too). The oracle sweeps and `scripts/upstream/rerecord.sh` still use `/tmp/port`.
-Put new tools here, never in `/tmp`.
+(a login does it too). It stays after the legacy roster: the sweep step of `scripts/upstream/rerecord.sh`
+runs it first (the oracle sweeps write their build info under `/tmp/port`), and the runners in
+`compat/p5-corpus` and `typesyms/scale` call `/tmp/port/treehash.py`. Put new tools here, never in `/tmp`.
 
 ## Revision pipeline
 
 The protected set is goport's own tests and the gate items (`docs/typechecker-accountability.md`,
 "Protected set"). The base of a candidate is the last accepted revision: its goport test results
-(for the first goport batch, `docs/goport-protected/tests-r131.json`) and its gate manifest.
-`open_revision.py --base` prints it. The legacy roster drive is retired.
+(for the first goport batch, `docs/goport-protected/tests-r131.json`), its gate manifest and its LSP
+and API oracle results (for the first goport batch, the R131 LSP run `lsp-r131` and the rule's
+`apiBaseline`, an API run of the R131 bins). `open_revision.py --base` prints it. The legacy roster
+drive is retired.
 
 1. `candidate.sh check <branch>`: scope and rustfmt of the branch against the checkout
    `target/worktrees/checker-port`. A goport batch may change every path except
-   `docs/typechecker-state`, `docs/typechecker-batches` and `target/`.
+   `docs/typechecker-state`, `docs/typechecker-batches`, `target/` and the protected paths
+   (`open_revision.py --protected`: the tools, runners, oracles, baseline and rules that judge the
+   protected set). The check fails when the branch changes a protected path since its merge base
+   with `main`, unless the batch lists that exact path (with Theo's approval).
 2. `candidate.sh open <rev> <branch> --hypothesis TEXT --change TEXT --new-batch <id> --origin TEXT`:
    applies the branch to the checkout in one commit and records the revision (`open_revision.py`,
    the only state write). Leave out `--new-batch` for a later revision of an open batch. Then commit
@@ -53,7 +59,9 @@ The protected set is goport's own tests and the gate items (`docs/typechecker-ac
 3. `candidate.sh side <rev> [--gate-host HOST] [--name-map TSV]`: in a systemd unit, the release
    bins, the goport tests (`build-goport-tests.sh`, `goport-tests.sh`, then `compare-tests.py`
    against the base results), two bound runs, the full gate and `gate-compare.py` against the base
-   gate manifest, the LSP oracle, and rustfmt and clippy. Wait for `SIDE DONE`. A pin bump that
+   gate manifest, the LSP oracle (`lsp_oracle.py`) and the API oracle (`api_oracle.py`, 10
+   batteries) each compared per request with the base results (`oracle-compare.py`), and rustfmt
+   and clippy on `ts_goport` and the kept crates. Wait for `SIDE DONE`. A pin bump that
    renames Go tests, or a moved test, needs `--name-map` (old suite, old name, new suite, new name,
    then the evidence).
 4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, then the
@@ -63,9 +71,21 @@ The protected set is goport's own tests and the gate items (`docs/typechecker-ac
    and records the acceptance only when the check passes.
 
 `gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
-MATCH, an ALLOWED item needs a verified allow condition, and a removed id or a new FAIL is a
-regression. The open editor long-growth items (`editor/*/long`) may stay FAIL while the batch has
-the open defect `editor-long-growth` and the growth is at most the base growth + 0.15 MiB/edit.
+MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
+single-threaded-equal items change between MATCH and ALLOWED on the same bins). An ALLOWED item needs
+a verified allow condition, and a removed id or a new FAIL is a regression. The open editor
+long-growth items (`editor/*/long`) may FAIL while the batch has the open defect `editor-long-growth`
+and the Rust growth is at most the base's Rust growth + 0.15 MiB/edit, whether the base item was
+MATCH or FAIL (the limit follows Go's slope, so the same bins can give either; a base MATCH item's
+growth is in the base gate's `runs/editor/result.json`).
+
+`oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
+request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,
+unrun or absent request.
+
+`candidate.sh` runs its local helpers from its own checkout, so a worktree copy can be tried with
+`--dry-run` before its merge. The state, `target/` and the host commands (`gate.sh` and the oracles,
+which `remote.sh sync-scripts` copies from the main checkout) always use the main checkout.
 
 ## Build toolchain
 

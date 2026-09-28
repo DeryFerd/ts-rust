@@ -6,7 +6,7 @@ adds it to batchRecords and opens the new batch with protectedSet "goport": gopo
 the gate items are the protected set (docs/typechecker-accountability.md, "Protected set"). That needs
 Theo's standing rule goport-protected-set (batchId "*") in acceptanceRuleChanges. Nothing is extended
 per batch. The new batch records protectedBase: the accepted batch whose goport test results and gate
-manifest the candidate is compared with (see protected_base).
+manifest (and LSP and API oracle results) the candidate is compared with (see protected_base).
 Without --new-batch it adds the revision to the current goport batch (refused when that batch is
 already accepted).
 
@@ -18,6 +18,8 @@ Usage:
   scripts/goport/open_revision.py --revision 132 --fingerprint <sha256> --commit <sha>
       --hypothesis "<text>" --change "<text>" [--new-batch <batch-id> --origin "<text>"] [--dry-run]
   scripts/goport/open_revision.py --base      prints protected_base of the saved state as JSON
+  scripts/goport/open_revision.py --allowed   prints the allowedChangedFiles of a new goport batch
+  scripts/goport/open_revision.py --protected prints the protected paths (globs) of PROTECTED
 Writes through scripts/state (export, then import). --dry-run runs the checks and prints the new
 history row, but writes nothing. Run from the repository root.
 """
@@ -25,12 +27,25 @@ import argparse, copy, datetime, hashlib, json, os, subprocess, sys
 
 GOPORT_RULE = 'goport-protected-set'
 KEEP = ['checkout', 'writerOutputDirectory', 'phase', 'implementer', 'carryForward', 'openDefects']
-# Scope of a goport batch: the whole repository except the saved state and target/. candidate.sh
-# check and open read it through --allowed. "!" entries exclude.
-ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '!target/**']
+# Paths that judge the protected set: the check and state tools, the pipeline, the runners, the
+# compare tools, the gate and its allow list, the oracles, the baseline and the rules. A candidate that
+# edits one would be judged by the edited copy after its merge, so a loss could pass in two steps.
+# candidate.sh check fails when the candidate branch changes one (git diff from its merge base with
+# main), unless the batch's allowedChangedFiles lists that exact path (a batch that must change a
+# tool, with Theo's approval).
+PROTECTED = ['AGENTS.md', 'docs/typechecker-accountability.md', 'docs/goport-protected/**',
+             'scripts/check-typechecker-batch.mjs', 'scripts/state.mjs', 'scripts/state', 'scripts/upstream/pin.py',
+             *(f'scripts/goport/{f}' for f in ('candidate.sh', 'open_revision.py', 'accept_revision.py', 'fp.py',
+                                               'build-goport-tests.sh', 'goport-tests.sh', 'compare-tests.py',
+                                               'gate.sh', 'gate-allow.txt', 'gate-compare.py', 'ls_edit_bench.py',
+                                               'bound2.sh', 'lsp_oracle.py', 'api_oracle.py', 'oracle-compare.py',
+                                               'np-suite.sh'))]
+# Scope of a goport batch: the whole repository except the saved state, target/ and PROTECTED.
+# candidate.sh check and open read it through --allowed. "!" entries exclude.
+ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '!target/**', *(f'!{p}' for p in PROTECTED)]
 # Evidence of one revision. open clears it, so a new revision never shows the last one's evidence.
-EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateVerdict', 'languageServerOracle', 'quality', 'qualityEvidence',
-            'ordinaryQuery', 'localCheck', 'acceptance']
+EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateVerdict', 'languageServerOracle', 'apiOracle', 'quality',
+            'qualityEvidence', 'ordinaryQuery', 'localCheck', 'acceptance']
 AUDITOR = {'role': 'audit_accepted_roster', 'agent': 'aae6dbb734c07335a', 'verdict': 'PENDING'}
 REVIEWER = {'role': 'independent_reviewer', 'agent': 'a0bc38f3370585da3', 'verdict': 'PENDING'}
 
@@ -55,19 +70,32 @@ def goport_rule(state):
     return rule
 
 
+def oracle_base(record):
+    """{label, dir} of the LSP or API oracle results that a batch field (languageServerOracle, apiOracle)
+    or the rule's apiBaseline names. An older record has only the summary path results/<label>/summary.md."""
+    if not record:
+        return None
+    d = record.get('dir') or (os.path.dirname(record['summary']) if record.get('summary') else None)
+    return {'label': record.get('label') or os.path.basename(d), 'dir': d} if d else None
+
+
 def protected_base(state):
     """The base of the next candidate: the last accepted batch, with {path, sha256} of its goport test
-    results (the rule's baseline when that batch used the legacy roster) and of its gate manifest.
-    An open goport batch keeps the base that open recorded."""
+    results (the rule's baseline when that batch used the legacy roster) and of its gate manifest, and
+    {label, dir} of its LSP and API oracle results (the rule's apiBaseline for a legacy batch, which
+    had no API run). An open goport batch keeps the base that open recorded."""
     b = state['batch']
     if b.get('compilerAccepted') is not True:
         if not b.get('protectedBase'):
             sys.exit(f'batch {b["id"]} is not accepted and has no protectedBase')
         return b['protectedBase']
-    tests = ({'path': b['goportTests']['results'], 'sha256': b['goportTests']['sha256']} if b.get('protectedSet') == 'goport'
+    goport = b.get('protectedSet') == 'goport'
+    tests = ({'path': b['goportTests']['results'], 'sha256': b['goportTests']['sha256']} if goport
              else {k: goport_rule(state)['baseline'][k] for k in ('path', 'sha256')})
     return {'batch': b['id'], 'revision': b['recoveryRevision'], 'tests': tests,
-            'gate': {'path': b['gate']['manifest'], 'sha256': b['gate']['sha256']}}
+            'gate': {'path': b['gate']['manifest'], 'sha256': b['gate']['sha256']},
+            'lsp': oracle_base(b.get('languageServerOracle')),
+            'api': oracle_base(b.get('apiOracle') if goport else goport_rule(state).get('apiBaseline'))}
 
 
 def unformatted(checkout, base):
@@ -89,6 +117,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--base', action='store_true', help='print the protected base of the saved state and exit')
     p.add_argument('--allowed', action='store_true', help='print the allowedChangedFiles of a new goport batch and exit')
+    p.add_argument('--protected', action='store_true', help='print the protected paths (globs) and exit')
     p.add_argument('--revision', type=int)
     p.add_argument('--fingerprint')
     p.add_argument('--commit')
@@ -98,8 +127,8 @@ def main():
     p.add_argument('--origin', default='')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
-    if a.allowed:
-        print('\n'.join(ALLOWED))
+    if a.allowed or a.protected:
+        print('\n'.join(ALLOWED if a.allowed else PROTECTED))
         return
     s = export()
     if a.base:
