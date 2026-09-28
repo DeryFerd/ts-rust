@@ -1043,10 +1043,16 @@ impl Checker {
     pub fn get_type_of_mapped_symbol(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             let mapped_type = self.value_symbol_links.get(symbol).containing_type;
-            if !self.push_type_resolution(
+            let pushed = self.push_type_resolution(
                 TypeSystemEntity::Symbol(symbol),
                 TypeSystemPropertyName::TYPE,
-            ) {
+            );
+            if mapped_type.is_nil() {
+                // Go reads `mappedType.AsMappedType()` on both branches: a
+                // symbol of another checker has no links here.
+                go_nil_dereference();
+            }
+            if !pushed {
                 self.ty_mut(mapped_type).as_mapped_type_mut().contains_error = true;
                 return self.error_type;
             }

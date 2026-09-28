@@ -13,9 +13,9 @@ thread_local! {
     static NEXT_NODE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NEXT_SYMBOL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NODE_IDS: RefCell<FxHashMap<Node, u64>> = RefCell::new(FxHashMap::default());
-    // Dense: indexed by `SymbolId::index()`; 0 means no id yet (Go ids start
-    // at 1). Binder symbols only: every arena gives an index the same binder
-    // symbol (`SymbolArena::own_symbol_id_slot`).
+    // Dense: indexed by the lineage index of a binder symbol; 0 means no id
+    // yet (Go ids start at 1). Binder symbols only: every arena gives an
+    // index the same binder symbol (`SymbolArena::id_slot`, key 0).
     static SYMBOL_IDS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     // The ids of the symbols that checker arenas add, by arena.
     static OWN_SYMBOL_IDS: RefCell<OwnSymbolIds> = const { RefCell::new(OwnSymbolIds::new()) };
@@ -33,6 +33,9 @@ struct OwnSymbolIds {
     ids: Vec<u64>,
     /// The ids of the other arenas.
     others: FxHashMap<u32, Vec<u64>>,
+    /// The arenas whose ids stay after the arena drops
+    /// (`keep_own_symbol_ids`).
+    kept: Vec<u32>,
 }
 
 impl OwnSymbolIds {
@@ -41,6 +44,7 @@ impl OwnSymbolIds {
             key: 0,
             ids: Vec::new(),
             others: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+            kept: Vec::new(),
         }
     }
 
@@ -59,16 +63,32 @@ impl OwnSymbolIds {
 }
 
 /// Frees this thread's ids of the own symbols of arena `key`. A checker
-/// arena calls it when it drops.
+/// arena calls it when it drops. The ids of a kept arena stay.
 pub(crate) fn forget_own_symbol_ids(key: u32) {
     // The thread may be ending, after its thread-locals.
     let _ = OWN_SYMBOL_IDS.try_with(|own| {
         let mut own = own.borrow_mut();
+        if own.kept.contains(&key) {
+            return;
+        }
         if own.key == key {
             own.key = 0;
             own.ids = Vec::new();
         } else {
             own.others.remove(&key);
+        }
+    });
+}
+
+/// Keeps this thread's ids of the own symbols of arena `key` after the
+/// arena drops. A shadow of one of those symbols in another arena
+/// (`SymbolArena::push_shadow`) keeps its id there, as Go keeps the id on
+/// the symbol for as long as any checker holds it.
+pub(crate) fn keep_own_symbol_ids(key: u32) {
+    OWN_SYMBOL_IDS.with(|own| {
+        let mut own = own.borrow_mut();
+        if !own.kept.contains(&key) {
+            own.kept.push(key);
         }
     });
 }
@@ -157,14 +177,15 @@ pub fn get_node_id(node: Node) -> u64 {
 
 // Go: ast/utilities.go:34 GetSymbolId
 // PORT: Go `ast.SymbolId` is a `uint64`; returned here as `u64`. A symbol
-// handle is an index into `symbols`, which keys where the id is kept (see
-// `SymbolArena::own_symbol_id_slot`).
+// handle is an index into `symbols`, which gives the slot where the id is
+// kept (see `SymbolArena::id_slot`).
 pub fn get_symbol_id(symbols: &SymbolArena, symbol: SymbolId) -> u64 {
-    match symbols.own_symbol_id_slot(symbol) {
-        None => SYMBOL_IDS.with(|ids| symbol_id_at(&mut ids.borrow_mut(), symbol.index())),
-        Some((key, place)) => {
-            OWN_SYMBOL_IDS.with(|own| symbol_id_at(own.borrow_mut().ids_of(key), place))
-        }
+    let slot = symbols.id_slot(symbol);
+    let place = slot.place as usize;
+    if slot.key == 0 {
+        SYMBOL_IDS.with(|ids| symbol_id_at(&mut ids.borrow_mut(), place))
+    } else {
+        OWN_SYMBOL_IDS.with(|own| symbol_id_at(own.borrow_mut().ids_of(slot.key), place))
     }
 }
 
@@ -1371,13 +1392,44 @@ mod symbol_id_tests {
         assert_eq!(get_symbol_id(&second, own_second), id_own_second);
 
         // A dropped checker arena frees its ids on this thread.
-        let (key, _) = first
-            .own_symbol_id_slot(own_first)
-            .expect("a checker symbol has an id of its own");
+        let key = first.id_slot(own_first).key;
+        assert_ne!(key, 0, "a checker symbol has an id of its own");
         drop(first);
         OWN_SYMBOL_IDS.with(|own| {
             let own = own.borrow();
             assert!(own.key != key && !own.others.contains_key(&key));
         });
+    }
+
+    /// A shadow (`SymbolArena::push_shadow`) is the same Go symbol as its
+    /// origin: one id, given on first use through either, and kept after
+    /// the arena of the origin drops.
+    #[test]
+    fn shadows_have_the_id_of_their_origin() {
+        let mut binder = SymbolArena::new();
+        let mut first = binder.for_checker();
+        // A later program binds a symbol that `first` does not have.
+        let later = binder.new_symbol(SymbolFlags::NONE, "later");
+        let mut second = binder.for_checker();
+        let own = first.new_symbol(SymbolFlags::TRANSIENT, "own");
+
+        let origin = first.id_slot(own);
+        let shadow = second.push_shadow(first.sym(own).clone(), origin);
+        assert_eq!(second.symbol_at_slot(origin), Some(shadow));
+        assert_eq!(first.symbol_at_slot(second.id_slot(shadow)), Some(own));
+        let id = get_symbol_id(&second, shadow);
+        assert_eq!(get_symbol_id(&first, own), id);
+
+        let lineage = second.id_slot(later);
+        assert_eq!(lineage.key, 0, "a binder symbol has the shared slot");
+        assert_eq!(first.symbol_at_slot(lineage), None);
+        let shadow_later = first.push_shadow(second.sym(later).clone(), lineage);
+        assert_eq!(
+            get_symbol_id(&first, shadow_later),
+            get_symbol_id(&binder, later)
+        );
+
+        drop(first);
+        assert_eq!(get_symbol_id(&second, shadow), id);
     }
 }
