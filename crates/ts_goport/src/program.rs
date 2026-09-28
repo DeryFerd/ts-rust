@@ -800,7 +800,7 @@ pub trait AliasResolverProgram {
         file: Node,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> ResolvedModule;
+    ) -> Arc<ResolvedModule>;
 }
 
 thread_local! {
@@ -3122,9 +3122,10 @@ pub fn release_program(program: &'static GoProgram) {
 
 /// `release_program` that frees the frontend program and the tables only
 /// when the result drops. Watch mode keeps the result until it reports the
-/// new build, so these frees are not in the rebuild time. The checker pool
-/// stops at once, as in `release_program`, so the old checkers do not add
-/// to the memory of the new build.
+/// new build, so these frees are not in the rebuild time, and the language
+/// server until it has sent the answer (`ls_program::release_now`). The
+/// checker pool stops at once, as in `release_program`, so the old checkers
+/// do not add to the memory of the new build.
 pub fn release_program_later(program: &'static GoProgram) -> ReleasedProgram {
     release_program_with(program, CheckerPool::shut_down)
 }
@@ -3231,11 +3232,7 @@ pub fn get_resolved_module(
 ) -> Option<Arc<ResolvedModule>> {
     // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule (never nil)
     if let Some(resolver) = alias_resolver() {
-        return Some(Arc::new(resolver.resolved_module(
-            file,
-            module_reference,
-            mode,
-        )));
+        return Some(resolver.resolved_module(file, module_reference, mode));
     }
     if let Some(resolved) = with_tables(|tables| {
         let go = tables.go.as_ref()?;

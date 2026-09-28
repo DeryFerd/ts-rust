@@ -29,17 +29,14 @@ use ts_diagnostics::Message;
 /// Built once on the loading thread, before any checker exists.
 // PORT: Go shares the frontend program between checker goroutines. The
 // Rust frontend uses `Rc` and `RefCell`, so the values the checker asks for
-// are copied here instead.
+// are copied here instead. The module resolutions are the exception: the
+// frontend keeps them behind `Arc`, so they are shared.
 pub(super) struct GoSharedState {
-    /// Go `processedFiles.resolvedModules`, by file path, then by module
-    /// name. Each name holds its (mode, resolution) pairs. Shared with the
-    /// version this one was updated from when the frontend shares the map.
-    // PERF: keyed by name, not by `ModeAwareCacheKey`, so a lookup borrows
-    // the specifier text instead of copying it into an owned key. The
-    // frontend program is freed with its last holder, so the map owns its
-    // copies. A resolution that the frontend shares between files (one
-    // `Rc`) is copied once.
-    resolved_modules: Arc<ResolvedModules>,
+    /// Go `processedFiles.resolvedModules`: the frontend map itself, which
+    /// clones of the frontend program share too.
+    // PERF: no copy. A lookup borrows the specifier text
+    // (`ModeAwareKey`).
+    resolved_modules: Arc<FrontendResolutions>,
     /// Go `processedFiles.jsxRuntimeImportSpecifiers`, by file path.
     jsx_runtime_import_specifiers: FxHashMap<String, (String, Node)>,
     /// Go `processedFiles.importHelpersImportSpecifiers`, by file path.
@@ -87,8 +84,8 @@ pub(super) struct GoSharedState {
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
 
 /// `GoSharedState::resolved_modules`.
-type ResolvedModules =
-    FxHashMap<String, FxHashMap<String, Vec<(ResolutionMode, Arc<ResolvedModule>)>>>;
+type FrontendResolutions =
+    FxHashMap<GoPath, crate::frontend::module::ModeAwareCache<Arc<ResolvedModule>>>;
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
@@ -798,7 +795,7 @@ impl GoSharedState {
         // references with the old program and keeps every file path, so
         // equal pointers mean equal copies.
         let same_resolutions = previous.filter(|(old, _)| {
-            Rc::ptr_eq(
+            Arc::ptr_eq(
                 &files.resolved_modules,
                 &old.processed_files.resolved_modules,
             ) && match (
@@ -809,40 +806,7 @@ impl GoSharedState {
                 (mapper, old_mapper) => mapper.is_none() && old_mapper.is_none(),
             }
         });
-        let resolved_modules = match same_resolutions {
-            Some((_, old)) => Arc::clone(&old.resolved_modules),
-            None => {
-                // One copy of each frontend resolution, by its `Rc` address.
-                let mut copies: FxHashMap<*const ResolvedModule, Arc<ResolvedModule>> =
-                    FxHashMap::default();
-                Arc::new(
-                    files
-                        .resolved_modules
-                        .iter()
-                        .map(|(path, cache)| {
-                            let mut by_name: FxHashMap<
-                                String,
-                                Vec<(ResolutionMode, Arc<ResolvedModule>)>,
-                            > = FxHashMap::default();
-                            for (key, resolved) in cache {
-                                let copy = copies
-                                    .entry(Rc::as_ptr(resolved))
-                                    .or_insert_with(|| Arc::new((**resolved).clone()));
-                                if let Some(entries) = by_name.get_mut(key.name.as_str()) {
-                                    entries.push((key.mode, Arc::clone(copy)));
-                                } else {
-                                    by_name.insert(
-                                        key.name.clone(),
-                                        vec![(key.mode, Arc::clone(copy))],
-                                    );
-                                }
-                            }
-                            (path.0.clone(), by_name)
-                        })
-                        .collect(),
-                )
-            }
-        };
+        let resolved_modules = Arc::clone(&files.resolved_modules);
         let jsx_runtime_import_specifiers = files
             .jsx_runtime_import_specifiers
             .iter()
@@ -1106,10 +1070,7 @@ impl GoSharedState {
         let path = source_file_info(file).path.as_str();
         self.resolved_modules
             .get(path)?
-            .get(module_reference)?
-            .iter()
-            .find(|(entry_mode, _)| *entry_mode == mode)
-            .map(|(_, resolved)| resolved)
+            .get(&(module_reference, mode) as &dyn crate::frontend::module::ModeAwareKey)
     }
 
     // Go: compiler/program.go:516 GetResolvedModules (ranged over: every
@@ -1120,9 +1081,8 @@ impl GoSharedState {
     pub(super) fn resolved_modules(&self) -> impl Iterator<Item = &ResolvedModule> + '_ {
         self.resolved_modules
             .values()
-            .flat_map(|by_name| by_name.values())
-            .flatten()
-            .map(|(_, resolved)| &**resolved)
+            .flat_map(|cache| cache.values())
+            .map(|resolved| &**resolved)
     }
 
     // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier

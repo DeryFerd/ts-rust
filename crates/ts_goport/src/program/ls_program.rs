@@ -25,7 +25,9 @@
 //! `release_program` is the snapshot part (Go `programCounter.Deref`); the
 //! release waits until no guard of the program is alive. It frees the
 //! version's program tables, and the registry drops its `Rc`, so the
-//! `NewProgram` is freed with its last holder. The `GoProgram` shell and the
+//! `NewProgram` is freed with its last holder. On the dispatch thread of
+//! the LSP server both frees wait until the answer is sent
+//! (`gostd::local::drop_later`). The `GoProgram` shell and the
 //! file versions stay leaked (see `program::release_program`). A compiler
 //! host whose last live program is released drops its data
 //! (`CompilerHost::release`), even when a stale holder keeps the program.
@@ -430,13 +432,18 @@ pub fn release_program(p: &NewProgram) {
 /// registry's `Rc` of the program goes, and its checker pools go once no
 /// project holds them. It releases the program version and each host of
 /// the program that no live program uses now, and frees the synthetic
-/// nodes that this thread made while the version was current.
+/// nodes that this thread made while the version was current. The program
+/// tables and the frontend program are freed after the answer
+/// (`gostd::local::drop_later`), as Go's garbage collector frees them in
+/// the background.
 fn release_now(key: usize) {
     let Some(checkers) = PROGRAM_CHECKERS.with(|programs| programs.borrow_mut().remove(&key))
     else {
         return;
     };
-    crate::program::release_program(checkers.version);
+    crate::gostd::local::drop_later(Box::new(crate::program::release_program_later(
+        checkers.version,
+    )));
     release_hosts(&checkers);
     let version = checkers.version;
     drop(checkers);

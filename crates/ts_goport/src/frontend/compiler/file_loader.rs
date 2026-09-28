@@ -11,7 +11,7 @@ use std::sync::Arc;
 // Go: fileloader.go:21 libResolution
 pub struct LibResolution {
     pub library_name: String,
-    pub resolution: Rc<ResolvedModule>,
+    pub resolution: Arc<ResolvedModule>,
     pub trace: Vec<DiagAndArgs>,
 }
 
@@ -99,9 +99,10 @@ impl RedirectsFile {
 // PORT: Go nil maps that stay nil until first use are `Option`. Go
 // `*includeProcessor` is owned by value. Go `UpdateProgram` copies this
 // struct and so shares its maps with the old program. The maps that stay
-// the same after loading are behind `Rc`, so a clone shares them too: a
-// program version leaks its frontend program, and a deep copy leaked the
-// maps once per edit.
+// the same after loading are behind `Rc`, so a clone shares them too; a
+// deep copy would cost time and memory once per edit. The module
+// resolutions are behind `Arc`, because checker threads read the same map
+// (`GoSharedState`) with no copy.
 #[derive(Clone)]
 pub struct ProcessedFiles {
     pub resolver: Option<Rc<Resolver>>,
@@ -115,7 +116,7 @@ pub struct ProcessedFiles {
     pub files_by_path: FxHashMap<Path, Rc<ParsedSourceFile>>,
     pub project_reference_file_mapper: Option<Rc<RefCell<ProjectReferenceFileMapper>>>,
     pub missing_files: Vec<String>,
-    pub resolved_modules: Rc<FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>>,
+    pub resolved_modules: Arc<FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>>,
     pub type_resolutions_in_file:
         Rc<FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>>,
     pub source_file_meta_datas: Rc<FxHashMap<Path, SourceFileMetaData>>,
@@ -941,7 +942,7 @@ impl FileLoader {
         }
 
         if !module_names.is_empty() {
-            let mut resolutions_in_file: ModeAwareCache<Rc<ResolvedModule>> =
+            let mut resolutions_in_file: ModeAwareCache<Arc<ResolvedModule>> =
                 ModeAwareCache::default();
             resolutions_in_file.reserve(module_names.len());
             let mut resolutions_trace: Vec<DiagAndArgs> = Vec::new();
@@ -1112,7 +1113,7 @@ impl FileLoader {
         &self,
         library_name: &str,
         resolve_from: &str,
-    ) -> (Rc<ResolvedModule>, Vec<DiagAndArgs>) {
+    ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>) {
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
                 crate::tracing::Phase::Program,

@@ -12,6 +12,7 @@
 //! in `src/modulespecifiers/symlinks.rs` are private).
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ts_goport::frontend::prelude::{
     ParsedSourceFile, ResolutionCallback, ResolutionMode, ResolvedModule,
@@ -138,10 +139,10 @@ fn test_set_symlinks_from_resolutions() {
     let file_path = tspath::to_path("/test/source.ts", "/test/dir", true);
 
     let for_each_resolved_module =
-        |callback: &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+        |callback: &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
          _file: Option<&ParsedSourceFile>| {
             for (original_path, resolved_path, module_name) in resolved_modules {
-                let resolution = Rc::new(ResolvedModule {
+                let resolution = Arc::new(ResolvedModule {
                     original_path: original_path.to_string(),
                     resolved_file_name: resolved_path.to_string(),
                     ..Default::default()

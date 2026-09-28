@@ -256,8 +256,10 @@ The batch that adds it is not accepted until Theo approves.
   frontend and the tables of a version. The frontend `NewProgram` goes
   with its last `Rc` holder. Its parses stay: the publish that gives a
   file its `GoFile` keeps that file's parse, because the `GoFile` borrows
-  it. `GoSharedState` owns its copies of the frontend data (the
-  resolutions are `Arc<ResolvedModule>`, one per frontend resolution). Each checker worker frees its
+  it. `GoSharedState` owns its copies of the frontend data. The module
+  resolutions are not copied: the frontend keeps them in an `Arc` map of
+  `Arc<ResolvedModule>`, and `GoSharedState` shares that map (a lookup
+  borrows the name through `module::ModeAwareKey`). Each checker worker frees its
   checker and the synthetic nodes it made (`free_synthetic_nodes`), and
   each emit thread frees its synthetic nodes. A worker, bind, emit or
   search thread gets a copy of the tables `Arc` in its `WorkerSeed` and
@@ -276,6 +278,13 @@ The batch that adds it is not accepted until Theo approves.
   cycle when files import each other, so the `FilesParser` drop takes
   those links out. A one-program process forgets the loader
   (`with_loader_state_forgotten`), so it does not pay for the free.
+- Go's garbage collector frees old data in the background, never in a
+  request. On the dispatch thread of the LSP server, the large frees
+  wait until the answer is sent (`gostd::local::drop_later`): the tables
+  and frontend program of a released version (`ls_program::release_now`)
+  and the parse tasks of a load. The dispatch loop drops them after each
+  message, while no message waits (`drop_garbage`); more than 16 are
+  dropped even when messages wait. Other threads drop them at once.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
