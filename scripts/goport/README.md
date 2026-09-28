@@ -110,9 +110,9 @@ host whose lock is free and whose load is low, and holds that lock for the run. 
   dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
   name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
 - mini-743d (Ryzen 7 8845HS) and mini-abf9 (ssh alias `mini-abf9-1`, Ryzen 7 255): LAN minis with
-  16 threads and 28 GB RAM each. They run gates and checks. mini-abf9 is wired (2.5 Gb/s), so it is
-  also good for quiet timing and the editor benchmark (`ls_edit_bench.py`, every side on the same
-  host). mini-743d is on 2.4 GHz Wi-Fi (about 8 MB/s), so large syncs to it are slow. Every job
+  16 threads and 28 GB RAM each. They run gates and checks. Both are wired since 2026-09-28
+  (mini-743d about 215 MB/s over ssh), so both are also good for quiet timing and the editor
+  benchmark (`ls_edit_bench.py`, every side on the same host). Every job
   takes the host's own lock on zbook, timing included:
   `flock /tmp/goport-remote-mini-743d.lock scripts/goport/remote.sh run mini-743d <command>`, and
   `/tmp/goport-remote-mini-abf9.lock` with `run mini-abf9`. `remote.sh` always reaches them by the
