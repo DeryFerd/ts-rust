@@ -213,8 +213,10 @@ methods reach the AST through it.
   `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
   inline, tier 1 (every later publish), so the nodes of a later program
   (`tsc -b`, an edited file) read the same columns as the nodes of the
-  first program. A new column gets a `Frozen` table and a reader that
-  calls `frozen_of` with that table.
+  first program. The tier 1 part is a cold block, so it adds no code to
+  the hot path of a one-program process; keep new tier 1 work after
+  `later_publish_path()`. A new column gets a `Frozen` table and a reader
+  that calls `frozen_of` with that table.
 
 ## Program (owned by program.rs)
 
