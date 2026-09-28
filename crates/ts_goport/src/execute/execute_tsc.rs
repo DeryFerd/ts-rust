@@ -24,6 +24,10 @@ use crate::frontend::prelude::*;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::contentmapper::{
+    Host as ContentMapperHost, Project as ContentMapperProject,
+    ProjectSpec as ContentMapperProjectSpec,
+};
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::parse_build_command_line;
 use crate::execute::build::host::TscExtendedConfigCache;
@@ -570,12 +574,16 @@ fn perform_incremental_compilation(
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
+    let content_mapper_host = new_content_mapper_host();
+    let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
+    let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
         Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
+        content_mapper_project,
     );
     let config = Rc::new(config);
     let replacement = hooks.program_like();
@@ -607,6 +615,8 @@ fn perform_incremental_compilation(
         )),
     };
     compile_times.borrow_mut().changes_compute_time = since(sys, changes_compute_start);
+    // Go: compileTimes.ContentMapperTimes = contentMapperHost.Timings()
+    // PORT: missing, see `new_content_mapper_host`.
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -664,12 +674,16 @@ fn perform_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     start_lib_prefetch(sys, &config, testing.is_some());
+    let content_mapper_host = new_content_mapper_host();
+    let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
+    let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
         Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
+        content_mapper_project,
     );
     let config = Rc::new(config);
 
@@ -678,6 +692,8 @@ fn perform_compilation(
     let parse_start = sys.now();
     install_program(host, config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
+    // Go: compileTimes.ContentMapperTimes = contentMapperHost.Timings()
+    // PORT: missing, see `new_content_mapper_host`.
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -718,6 +734,46 @@ pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, t
         sys.fs().use_case_sensitive_file_names(),
         &sys.default_library_path(),
     );
+}
+
+/// Go `tsc.NewContentMapperHost(ctx, sys, config.CompilerOptions())`
+/// (execute/tsc/compile.go:89, tsgo#4712).
+// PORT: the execute/tsc port has no `NewContentMapperHost` yet. It needs
+// `System.Spawn` and the content mapper stderr logger. Until then the host
+// is Go's value without `--runExternalCode`: nil. There is then no content
+// mapper project and no `CompileTimes.ContentMapperTimes`, and a
+// content-mapped file fails its transform with `ErrProjectUnavailable`, as
+// in Go without that option.
+fn new_content_mapper_host() -> Option<Rc<dyn ContentMapperHost>> {
+    None
+}
+
+/// Go `defer contentMapperProject.Close()`: closes the project when the
+/// compile function returns.
+struct CloseContentMapperProject(Option<Rc<dyn ContentMapperProject>>);
+
+impl Drop for CloseContentMapperProject {
+    fn drop(&mut self) {
+        if let Some(project) = &self.0 {
+            let _ = project.close();
+        }
+    }
+}
+
+// Go: execute/tsc.go:394 getContentMapperProject (tsgo#4712)
+fn get_content_mapper_project(
+    host: Option<&Rc<dyn ContentMapperHost>>,
+    config: &ParsedCommandLine,
+) -> Option<Rc<dyn ContentMapperProject>> {
+    let host = host?;
+    if config.content_mappers().is_empty() {
+        return None;
+    }
+    host.project(ContentMapperProjectSpec {
+        config_file_name: config.config_name().to_string(),
+        mappers: config.content_mappers().to_vec(),
+        compiler_options: Some(config.compiler_options().clone()),
+    })
 }
 
 // Go: execute/tsc.go:373 showConfig

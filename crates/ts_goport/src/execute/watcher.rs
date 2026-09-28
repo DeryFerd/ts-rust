@@ -17,6 +17,7 @@
 //! are shared with the last version. The last version is released when the
 //! next build has read it (Go drops the old program there).
 
+use crate::contentmapper::{self, Mapper, SourceFiles};
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_write_file};
 use crate::execute::incremental;
@@ -101,6 +102,20 @@ impl CompilerHost for WatchCompilerHost {
         file
     }
 
+    // PORT: Go embeds the inner host, so these two go to it (tsgo#4712).
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &SourceFileParseOptions,
+        mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError> {
+        self.compiler_host
+            .get_content_mapped_source_files(parse_options, mapper)
+    }
+
+    fn content_mapper_project(&self) -> Option<Rc<dyn contentmapper::Project>> {
+        self.compiler_host.content_mapper_project()
+    }
+
     fn get_resolved_project_reference(
         &self,
         file_name: &str,
@@ -139,6 +154,13 @@ pub struct Watcher {
     report_error_summary: DiagnosticsReporter,
     report_watch_status: DiagnosticReporter,
     testing: Option<Rc<dyn CommandLineTesting>>,
+
+    // contentMapperHost transforms content-mapped files; it is created once per watch session (when
+    // enabled) and reused across cycles. It closes itself when the session context is cancelled (see
+    // contentmapper.New).
+    // PORT: Go nil interfaces are `None`.
+    content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    content_mapper_project: Option<Rc<dyn contentmapper::Project>>,
 
     program: Option<incremental::program::Program>,
     extended_config_cache: Option<Rc<TscExtendedConfigCache>>,
@@ -234,6 +256,8 @@ pub fn create_watcher(
             testing.clone(),
         ),
         testing,
+        content_mapper_host: None,
+        content_mapper_project: None,
         program: None,
         extended_config_cache: None,
         config_modified: false,
@@ -258,6 +282,15 @@ pub fn create_watcher(
 impl Watcher {
     // Go: execute/watcher.go:136 (*Watcher).start
     pub fn start(&mut self, ctx: &Context) {
+        // Go: w.contentMapperHost = tsc.NewContentMapperHost(ctx, w.sys, w.config.CompilerOptions())
+        // PORT: the port's `tsc::System` has no `Spawn` and there is no
+        // `tsc::new_content_mapper_host` yet (tsgo#4712, tsc/compile.go).
+        // The watcher has no host: Go's value without `runExternalCode`.
+        // A content-mapped file then fails its transform with
+        // `ErrProjectUnavailable`, as in Go without that option.
+        self.content_mapper_host = None;
+        let config = self.config.clone();
+        self.replace_content_mapper_project(&config);
         self.wm.borrow().lock();
         let extended_config_cache = Rc::new(TscExtendedConfigCache::default());
         self.extended_config_cache = Some(extended_config_cache.clone());
@@ -271,6 +304,7 @@ impl Watcher {
                 self.config.locale(),
                 self.testing.clone(),
             )),
+            self.content_mapper_project.clone(),
         );
         self.program = incremental::program::read_build_info_program(
             &self.config,
@@ -307,10 +341,66 @@ impl Watcher {
         self.wm.borrow().unlock();
 
         if self.testing.is_none() {
+            // The content mapper host closes itself when ctx is cancelled (see contentmapper.New).
             // PORT: Go passes the method value `w.DoCycle`.
             let wm = Rc::clone(&self.wm);
             wm.borrow().run_loop(ctx, &mut || self.do_cycle());
         }
+
+        // Go: if w.contentMapperHost != nil && w.testing == nil { defer w.contentMapperHost.Close() }
+        // PORT: `start` has no early return, so the deferred close runs here.
+        if self.testing.is_none() {
+            if let Some(host) = &self.content_mapper_host {
+                let _ = host.close();
+            }
+        }
+    }
+
+    // Go: execute/watcher.go:172 (*Watcher).replaceContentMapperProject
+    fn replace_content_mapper_project(&mut self, config: &ParsedCommandLine) {
+        let Some(host) = &self.content_mapper_host else {
+            return;
+        };
+        let project = host.project(contentmapper::ProjectSpec {
+            config_file_name: config.config_name().to_string(),
+            mappers: config.content_mappers().to_vec(),
+            compiler_options: Some(config.compiler_options().clone()),
+        });
+        if let Some(old) = &self.content_mapper_project {
+            let _ = old.close();
+        }
+        self.content_mapper_project = project;
+    }
+
+    // Go: execute/watcher.go:187 (*Watcher).contentMapperWatchedFiles
+    fn content_mapper_watched_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        for mapper in self.config.content_mappers() {
+            if !mapper.package_directory.is_empty() && mapper.contribution_id.is_empty() {
+                files.push(combine_paths(&mapper.package_directory, &["package.json"]));
+            }
+        }
+        if let Some(project) = &self.content_mapper_project {
+            match project.watched_files() {
+                Ok(dynamic_files) => files.extend(dynamic_files),
+                Err(err) => {
+                    (self.report_diagnostic)(&content_mapper_project_diagnostic(&err));
+                    return files;
+                }
+            }
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// The paths of `content_mapper_watched_files`, as a set (Go
+    /// `collections.NewSetFromItems(core.Map(..., tspath.ToPath))`).
+    fn content_mapper_watched_paths(&self, cwd: &str, case_sensitive: bool) -> FxHashSet<Path> {
+        self.content_mapper_watched_files()
+            .iter()
+            .map(|file_name| to_path(file_name, cwd, case_sensitive))
+            .collect()
     }
 
     // Go: execute/watcher.go:207 (*Watcher).computeDesiredWatches
@@ -396,7 +486,7 @@ impl Watcher {
         let (changed_paths, overflow) = self.wm.borrow().drain_events();
         let has_events = !changed_paths.is_empty() || overflow;
 
-        if self.recheck_ts_config() {
+        if self.recheck_ts_config(self.content_mapper_manifest_changed(&changed_paths)) {
             self.wm.borrow().unlock();
             return;
         }
@@ -408,6 +498,9 @@ impl Watcher {
                 let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
                 let cwd = self.sys.get_current_directory();
                 let program_files = self.get_program().files_by_path();
+                let content_mapper_watched_files =
+                    self.content_mapper_watched_paths(&cwd, case_sensitive);
+                let mut content_mapper_config_changed = false;
                 // PORT: Go ranges over a map (random order). Only flags are set.
                 for event_path in changed_paths.keys() {
                     if self.sys.fs().directory_exists(event_path) {
@@ -417,6 +510,10 @@ impl Watcher {
                         continue;
                     }
                     let p = to_path(event_path, &cwd, case_sensitive);
+                    if content_mapper_watched_files.contains(&p) {
+                        content_mapper_config_changed = true;
+                        self.force_full_rebuild = true;
+                    }
                     if self.config.config_file.is_some()
                         && self.config.possibly_matches_file_name(event_path)
                     {
@@ -429,7 +526,14 @@ impl Watcher {
                             continue;
                         }
                     }
-                    if !program_files.contains_key(&p) && self.seen_files.contains(&p) {
+                    if program_files
+                        .get(&p)
+                        .is_some_and(|source_file| !source_file.content_mapper().is_empty())
+                    {
+                        // Canonical mapped files must be transformed again, and supplemental paths are failed
+                        // physical lookups reserved for virtual files. Neither can use single-file AST reuse.
+                        self.force_full_rebuild = true;
+                    } else if !program_files.contains_key(&p) && self.seen_files.contains(&p) {
                         // A non-source build dependency changed. Such dependencies
                         // (e.g. package.json or a previously-missing module path) are
                         // tracked in seenFiles but are not program source files, so a
@@ -437,6 +541,18 @@ impl Watcher {
                         // Module resolution may now differ, so the single-file fast
                         // path is unsafe; force a full rebuild.
                         self.force_full_rebuild = true;
+                    }
+                }
+                if content_mapper_config_changed {
+                    if let Some(project) = &self.content_mapper_project {
+                        if project.refresh().is_err() {
+                            (self.report_diagnostic)(&new_compiler_diagnostic(
+                                diag::The_content_mapper_process_could_not_be_started_or_initialized,
+                                args![],
+                            ));
+                            self.wm.borrow().unlock();
+                            return;
+                        }
                     }
                 }
             } else {
@@ -483,7 +599,7 @@ impl Watcher {
         self.wm.borrow().unlock();
     }
 
-    // Go: execute/watcher.go:258 (*Watcher).isRelevantChange
+    // Go: execute/watcher.go:378 (*Watcher).isRelevantChange
     // PORT: Go map iteration order is random; `changed_paths` is an
     // `FxHashMap`. The result does not depend on the order.
     pub fn is_relevant_change(
@@ -493,8 +609,12 @@ impl Watcher {
         let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
         let cwd = self.sys.get_current_directory();
         let opts = self.compare_paths_options();
+        let content_mapper_watched_files = self.content_mapper_watched_paths(&cwd, case_sensitive);
         for event_path in changed_paths.keys() {
             let p = to_path(event_path, &cwd, case_sensitive);
+            if content_mapper_watched_files.contains(&p) {
+                return true;
+            }
             if self.seen_files.contains(&p) {
                 return true;
             }
@@ -561,6 +681,7 @@ impl Watcher {
                     self.config.locale(),
                     self.testing.clone(),
                 )),
+                self.content_mapper_project.clone(),
             );
             let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
                 compiler_host: inner_host,
@@ -622,6 +743,7 @@ impl Watcher {
                 self.config.locale(),
                 self.testing.clone(),
             )),
+            self.content_mapper_project.clone(),
         );
         let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
@@ -644,6 +766,9 @@ impl Watcher {
         }
         for path in &self.config_file_paths {
             tfs.seen_files.borrow_mut().insert(path.clone());
+        }
+        for path in self.content_mapper_watched_files() {
+            tfs.seen_files.borrow_mut().insert(path);
         }
 
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
@@ -738,7 +863,10 @@ impl Watcher {
         let mut changed_path: Option<&Path> = None;
         let mut changed_count = 0;
         // PORT: Go ranges over a map (random order); at most one path is kept.
-        for path in old_program.files_by_path().keys() {
+        for (path, file) in old_program.files_by_path() {
+            if !file.content_mapper().is_empty() {
+                continue;
+            }
             if !self.source_file_cache.borrow().contains_key(path) {
                 changed_path = Some(path);
                 changed_count += 1;
@@ -868,13 +996,35 @@ impl Watcher {
         })
     }
 
-    // Go: execute/watcher.go:384 (*Watcher).recheckTsConfig
-    pub fn recheck_ts_config(&mut self) -> bool {
+    // Go: execute/watcher.go:621 (*Watcher).contentMapperManifestChanged
+    // PORT: Go looks up the map by key; the order does not matter.
+    fn content_mapper_manifest_changed(
+        &self,
+        changed_paths: &FxHashMap<String, fswatch::EventKind>,
+    ) -> bool {
+        for mapper in self.config.content_mappers() {
+            if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
+                continue;
+            }
+            if changed_paths.contains_key(
+                &self
+                    .sys
+                    .fs()
+                    .realpath(&combine_paths(&mapper.package_directory, &["package.json"])),
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: execute/watcher.go:633 (*Watcher).recheckTsConfig
+    pub fn recheck_ts_config(&mut self, force: bool) -> bool {
         if self.config_file_name.is_empty() {
             return false;
         }
 
-        if !self.config_has_errors && !self.config_file_paths.is_empty() {
+        if !force && !self.config_has_errors && !self.config_file_paths.is_empty() {
             let mut changed = false;
             for path in &self.config_file_paths {
                 let old_mtime = self.config_mtimes.get(path);
@@ -913,6 +1063,7 @@ impl Watcher {
         if self.config.parsed_config != config_parse_result.parsed_config {
             self.config_modified = true;
         }
+        self.replace_content_mapper_project(&config_parse_result);
         self.config = config_parse_result;
         false
     }
