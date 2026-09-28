@@ -3,11 +3,30 @@
 //! PORT notes for the whole file:
 //! - Go runs the per-project searches on a parallel `core.WorkGroup` and
 //!   shares `results`, `defaultDefinition`, `err` and `panicsOccured` under
-//!   mutexes. Language-service state lives on the dispatch thread, so the
-//!   searches run serially in Go start order (queue order), and the shared
-//!   locals are `RefCell` fields of one `CrossProjectState` value. The Go
-//!   closures `canSearchProject`, `enqueueItem` and the queued function are
-//!   methods of that value.
+//!   mutexes. The shared locals are `RefCell` fields of one
+//!   `CrossProjectState` value on the dispatch thread. The Go closures
+//!   `canSearchProject`, `enqueueItem` and the queued function are its
+//!   methods.
+//! - The queued function of an item runs in 3 phases:
+//!   1. open (dispatch thread): the item's language service, Go
+//!      `GetLanguageServiceForProjectWithFile`;
+//!   2. search: `provideSymbolsAndEntries`, the original definition locations
+//!      and `symbolAndEntriesToResp`, with no session call. Item 0 (the
+//!      default project, with the caller's language service and the default
+//!      definition) runs it on the dispatch thread. So does every item of a
+//!      request that passes no `search` function (VS references, incoming
+//!      calls). The other items of references, implementations and rename
+//!      run it on the search thread of their program (`search_thread.rs`),
+//!      in parallel, as Go runs them on goroutines;
+//!   3. commit (dispatch thread): for each location in search order, Go
+//!      `GetProjectsForFile` and `enqueueItem`; then the response, or the
+//!      first error.
+//!   Items get their number when they leave the queue, and commit strictly
+//!   in that order. So the enqueue calls, `results` (keys, order, winning
+//!   positions) and the first error are those of a serial run in Go start
+//!   order, whatever order the searches end in. An item that runs on the
+//!   dispatch thread opens only after every earlier item committed, so a
+//!   request with no `search` function runs as before, one item at a time.
 //! - Go `collections.SyncMap.Range` order is random. `results` is an
 //!   `IndexMap` in insertion order. Multi-project result order can differ
 //!   from Go; the oracle compares it without order.
@@ -21,10 +40,12 @@ use crate::ls::prelude::*;
 use crate::frontend::compiler;
 use crate::frontend::tspath;
 use crate::gostd::{Context, GoError};
+use crate::ls::search_thread;
 use crate::lsp::lsproto;
 use crate::lsp::lsproto::{HasLocation, HasLocations, HasTextDocumentPosition, HasTextDocumentURI};
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::mpsc;
 
 /// Go runtime panic text for a nil pointer dereference.
 const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
@@ -93,17 +114,39 @@ pub type SymbolAndEntriesToResp<Req, Resp> = fn(
     SymbolEntryTransformOptions,
 ) -> Result<Resp, GoError>;
 
+/// A request whose searches in other projects run on search threads
+/// (references, implementations, rename). `to_resp` is the request's Go
+/// `symbolAndEntriesToResp` for any program view.
+/// `search_thread::start_search::<K>` is the `search` argument of
+/// `handle_cross_project` for it.
+pub trait CrossProjectSearch: 'static {
+    type Req: HasTextDocumentPosition + Clone + Send + 'static;
+    type Resp: Clone + Default + Send + 'static;
+
+    fn to_resp<P: ProgramView>(
+        ls: &LanguageService<P>,
+        ctx: &Context,
+        params: &Self::Req,
+        data: SymbolAndEntriesData,
+        options: SymbolEntryTransformOptions,
+    ) -> Result<Self::Resp, GoError>;
+}
+
 // Go: ls/crossproject.go:45 handleCrossProject
 // PORT: Go `params Req` is a pointer type: `&Req`. Go `orchestrator` can be
 // nil: `Option<&dyn CrossProjectOrchestrator>`. Go
 // `combineResults func(iter.Seq[Resp]) Resp` takes the yielded values as a
-// slice (see the file header).
+// slice (see the file header). `search` starts phase 2 of an item on a
+// search thread (`search_thread::start_search::<K>`); with `None`, every item
+// runs on the dispatch thread.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_cross_project<Req, Resp>(
     default_ls: &LanguageService,
     ctx: &Context,
     params: &Req,
     orchestrator: Option<&dyn CrossProjectOrchestrator>,
     symbol_and_entries_to_resp: SymbolAndEntriesToResp<Req, Resp>,
+    search: Option<search_thread::StartSearch<Req, Resp>>,
     combine_results: fn(&[Resp]) -> Resp,
     is_rename: bool,
     implementations: bool,
@@ -134,6 +177,7 @@ where
         params,
         orchestrator,
         symbol_and_entries_to_resp,
+        search,
         is_rename,
         implementations,
         options,
@@ -187,7 +231,7 @@ where
         }
 
         // Go: wg = core.NewWorkGroup(false)
-        // PORT: the serial queue is empty after `run_and_wait`.
+        // PORT: the queue is empty after `run_and_wait`.
         let mut has_more_work = false;
         if state.default_definition.borrow().is_some() {
             let mut requested_project_trees: FxHashSet<tspath::Path> = FxHashSet::default();
@@ -280,12 +324,77 @@ where
     Ok(resp)
 }
 
+// Go: ls/crossproject.go:96 steps 3 to 5 of the queued function
+// Phase 2 of an item (see the file header): the search, the original
+// definition locations of each entry (collected into `locations` for the
+// commit, where Go makes the session calls in its callback) and the
+// response. `on_entry` runs first for each entry (the default definition of
+// item 0). Returns None where Go returns early because the request was
+// canceled.
+#[allow(clippy::too_many_arguments)]
+pub fn search_item<P: ProgramView, Req, Resp>(
+    ls: &LanguageService<P>,
+    ctx: &Context,
+    params: &Req,
+    uri: &lsproto::DocumentUri,
+    position: lsproto::Position,
+    is_rename: bool,
+    implementations: bool,
+    options: SymbolEntryTransformOptions,
+    to_resp: impl FnOnce(
+        &LanguageService<P>,
+        &Context,
+        &Req,
+        SymbolAndEntriesData,
+        SymbolEntryTransformOptions,
+    ) -> Result<Resp, GoError>,
+    on_entry: &mut dyn FnMut(&Rc<RefCell<SymbolAndEntries>>),
+    locations: &mut Vec<(lsproto::DocumentUri, lsproto::Position)>,
+) -> Option<Result<Resp, GoError>> {
+    let (data, ok) = ls.provide_symbols_and_entries(ctx, uri, position, is_rename, implementations);
+    if ctx.err().is_some() {
+        return None;
+    }
+    if ok {
+        for entry in &data.symbols_and_entries {
+            on_entry(entry);
+            ls.for_each_original_definition_location(ctx, entry, &mut |uri, position| {
+                locations.push((uri, position));
+            });
+        }
+    }
+    Some(to_resp(ls, ctx, params, data, options))
+}
+
+/// Go `fmt.Sprintf("panic handling request: %v\n%s", r, debug.Stack())`, the
+/// text that the deferred recover of the queued function keeps.
+pub fn panic_occured_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    let text = panic_payload_text(&*payload);
+    // PORT: Go `debug.Stack()`; the text is only logged.
+    let stack = std::backtrace::Backtrace::force_capture();
+    format!("panic handling request: {text}\n{stack}")
+}
+
+/// Go `%v` of a recovered panic value.
+pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(p) = payload.downcast_ref::<crate::core::GoPanic>() {
+        p.message.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{payload:?}")
+    }
+}
+
 /// The locals of Go `handleCrossProject` that its closures share.
 struct CrossProjectState<'a, Req, Resp> {
     ctx: &'a Context,
     params: &'a Req,
     orchestrator: &'a dyn CrossProjectOrchestrator,
     symbol_and_entries_to_resp: SymbolAndEntriesToResp<Req, Resp>,
+    search: Option<search_thread::StartSearch<Req, Resp>>,
     is_rename: bool,
     implementations: bool,
     options: SymbolEntryTransformOptions,
@@ -306,6 +415,62 @@ struct CrossProjectState<'a, Req, Resp> {
     err: RefCell<Option<GoError>>,
     /// Go `panicsOccured` (under `panicMu`); `None` is Go's nil slice.
     panics_occured: RefCell<Option<Vec<String>>>,
+}
+
+/// The language service of an item: the caller's for item 0, or the one
+/// that phase 1 made.
+enum ItemLs<'a> {
+    Caller(&'a LanguageService),
+    Owned(LanguageService),
+}
+
+impl ItemLs<'_> {
+    fn get(&self) -> &LanguageService {
+        match self {
+            ItemLs::Caller(ls) => ls,
+            ItemLs::Owned(ls) => ls,
+        }
+    }
+}
+
+/// An item that left the queue and has not committed yet.
+struct Slot<'a, Resp> {
+    /// Queue order: items commit in this order.
+    number: usize,
+    item: ProjectAndTextDocumentPosition<'a>,
+    response: Rc<RefCell<Response<Resp>>>,
+    state: SlotState<'a, Resp>,
+}
+
+enum SlotState<'a, Resp> {
+    /// Phases 1 and 2 run on the dispatch thread when the item is first in
+    /// the window.
+    Inline,
+    /// Phase 2 runs on a search thread. The language service answers the
+    /// thread's host reads and keeps the program alive until the commit.
+    Running(LanguageService),
+    /// Phases 1 and 2 ended; the item commits when it is first.
+    Done {
+        ls: Option<ItemLs<'a>>,
+        outcome: search_thread::ItemOutcome<Resp>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Inline,
+    Running,
+    Done,
+}
+
+impl<Resp> SlotState<'_, Resp> {
+    fn phase(&self) -> Phase {
+        match self {
+            SlotState::Inline => Phase::Inline,
+            SlotState::Running(_) => Phase::Running,
+            SlotState::Done { .. } => Phase::Done,
+        }
+    }
 }
 
 impl<'a, Req, Resp> CrossProjectState<'a, Req, Resp>
@@ -336,133 +501,292 @@ where
     }
 
     // Go: wg.RunAndWait()
-    // PORT: runs the queued items serially in queue order, including items
-    // queued while it runs.
+    // PORT: runs the queued items, including items queued while it runs, in
+    // the 3 phases of the file header, and returns when every item committed.
+    // At most `search_thread::max_in_flight()` searches run on search
+    // threads at once (Go: GOMAXPROCS).
     fn run_and_wait(&self) {
+        let limit = search_thread::max_in_flight();
+        let (sender, receiver) = mpsc::channel::<search_thread::ToDispatch<Resp>>();
+        let mut window: VecDeque<Slot<'a, Resp>> = VecDeque::new();
+        let mut next_number = 0usize;
+        let mut in_flight = 0usize;
         loop {
-            let next = self.wg.borrow_mut().pop_front();
-            let Some((item, response)) = next else {
-                return;
-            };
-            self.run_queued_item(item, &response);
+            // Take items from the queue in order. An item for a search thread
+            // opens at once while fewer than `limit` searches run. An item
+            // for the dispatch thread waits until it is first in the window.
+            loop {
+                let inline = match self.wg.borrow().front() {
+                    None => break,
+                    Some((item, _)) => self.search.is_none() || item.ls.is_some(),
+                };
+                if (inline && !window.is_empty()) || (!inline && in_flight >= limit) {
+                    break;
+                }
+                let (item, response) = self
+                    .wg
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("the queue has a first item");
+                let number = next_number;
+                next_number += 1;
+                let state = if inline {
+                    SlotState::Inline
+                } else {
+                    self.start_thread_item(number, &item, &sender)
+                };
+                if matches!(state, SlotState::Running(_)) {
+                    in_flight += 1;
+                }
+                window.push_back(Slot {
+                    number,
+                    item,
+                    response,
+                    state,
+                });
+            }
+
+            match window.front().map(|slot| slot.state.phase()) {
+                None => return,
+                Some(Phase::Inline) => {
+                    let front = window.front_mut().expect("the window has a first item");
+                    front.state = self.run_inline_item(&front.item);
+                    continue;
+                }
+                Some(Phase::Done) => {
+                    let slot = window.pop_front().expect("the window has a first item");
+                    self.commit_item(slot);
+                    continue;
+                }
+                Some(Phase::Running) => {}
+            }
+
+            // The first item runs on a search thread: wait for a message.
+            let message = receiver
+                .recv()
+                .expect("the dispatch thread holds a sender of the channel");
+            match message {
+                search_thread::ToDispatch::Query { item, query, reply } => {
+                    let answer = match window.iter().find(|slot| slot.number == item) {
+                        Some(Slot {
+                            state: SlotState::Running(ls),
+                            ..
+                        }) => search_thread::answer_query(ls, query),
+                        _ => search_thread::HostAnswer::Gone,
+                    };
+                    let _ = reply.send(answer);
+                }
+                search_thread::ToDispatch::Done { item, outcome } => {
+                    if let Some(slot) = window.iter_mut().find(|slot| slot.number == item) {
+                        let state = std::mem::replace(&mut slot.state, SlotState::Inline);
+                        slot.state = match state {
+                            SlotState::Running(ls) => {
+                                in_flight -= 1;
+                                SlotState::Done {
+                                    ls: Some(ItemLs::Owned(ls)),
+                                    outcome,
+                                }
+                            }
+                            state => state,
+                        };
+                    }
+                }
+            }
         }
     }
 
-    // Go: ls/crossproject.go:83 the function that enqueueItem queues
-    fn run_queued_item(
+    // Go: ls/crossproject.go:83 the queued function, phase 1 for an item
+    // whose phase 2 runs on a search thread.
+    fn start_thread_item(
         &self,
-        item: ProjectAndTextDocumentPosition<'a>,
-        response: &Rc<RefCell<Response<Resp>>>,
-    ) {
+        number: usize,
+        item: &ProjectAndTextDocumentPosition<'a>,
+        sender: &mpsc::Sender<search_thread::ToDispatch<Resp>>,
+    ) -> SlotState<'a, Resp> {
         if self.ctx.err().is_some() {
-            return;
-        }
-        // Go: defer func() { if r := recover(); r != nil { ... } }()
-        let result =
-            std::panic::catch_unwind(AssertUnwindSafe(|| self.process_item(item, response)));
-        if let Err(r) = result {
-            let text = if let Some(p) = r.downcast_ref::<crate::core::GoPanic>() {
-                p.message.clone()
-            } else if let Some(s) = r.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = r.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                format!("{r:?}")
+            return SlotState::Done {
+                ls: None,
+                outcome: search_thread::ItemOutcome::skipped(),
             };
-            // PORT: Go `debug.Stack()`; the text is only logged.
-            let stack = std::backtrace::Backtrace::force_capture();
-            let panic_occured = format!("panic handling request: {text}\n{stack}");
+        }
+        let start_search = self
+            .search
+            .expect("an item for a search thread has a search function");
+        // Go: defer func() { if r := recover(); r != nil { ... } }()
+        let opened = std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<LanguageService> {
+            // Get it now
+            let ls = self
+                .orchestrator
+                .get_language_service_for_project_with_file(self.ctx, &item.project, &item.uri)?;
+            let search = search_thread::SearchItem {
+                ctx: self.ctx.clone(),
+                uri: item.uri.clone(),
+                position: item.position,
+                is_rename: self.is_rename,
+                implementations: self.implementations,
+                options: self.options,
+            };
+            start_search(self.params, &ls, number, search, sender.clone());
+            Some(ls)
+        }));
+        match opened {
+            Ok(Some(ls)) => SlotState::Running(ls),
+            Ok(None) => SlotState::Done {
+                ls: None,
+                outcome: search_thread::ItemOutcome::skipped(),
+            },
+            Err(payload) => SlotState::Done {
+                ls: None,
+                outcome: search_thread::ItemOutcome::panicked(panic_occured_text(payload)),
+            },
+        }
+    }
+
+    // Go: ls/crossproject.go:83 the queued function, phases 1 and 2 on the
+    // dispatch thread.
+    fn run_inline_item(&self, item: &ProjectAndTextDocumentPosition<'a>) -> SlotState<'a, Resp> {
+        let ctx = self.ctx;
+        if ctx.err().is_some() {
+            return SlotState::Done {
+                ls: None,
+                outcome: search_thread::ItemOutcome::skipped(),
+            };
+        }
+        let is_default_project = Rc::ptr_eq(&item.project, &self.default_project);
+        let mut item_ls: Option<ItemLs<'a>> = None;
+        let mut locations: Vec<(lsproto::DocumentUri, lsproto::Position)> = Vec::new();
+        // Go: defer func() { if r := recover(); r != nil { ... } }()
+        let searched =
+            std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<Result<Resp, GoError>> {
+                // Process the item
+                let ls = match item.ls {
+                    Some(ls) => item_ls.insert(ItemLs::Caller(ls)),
+                    None => {
+                        // Get it now
+                        let ls = self
+                            .orchestrator
+                            .get_language_service_for_project_with_file(
+                                ctx,
+                                &item.project,
+                                &item.uri,
+                            )?;
+                        item_ls.insert(ItemLs::Owned(ls))
+                    }
+                }
+                .get();
+                // PORT: other language services can be alive (the items that
+                // run on search threads); make this one's program current.
+                let _program = ls.enter_program();
+                search_item(
+                    ls,
+                    ctx,
+                    self.params,
+                    &item.uri,
+                    item.position,
+                    self.is_rename,
+                    self.implementations,
+                    self.options,
+                    |ls, ctx, params, data, options| {
+                        (self.symbol_and_entries_to_resp)(ls, ctx, params, data, options)
+                    },
+                    &mut |entry| {
+                        // Find the default definition that can be in another project
+                        // Later we will use this load ancestor tree that references this location and expand search
+                        if is_default_project && self.default_definition.borrow().is_none() {
+                            // PORT: `NonLocalDefinition` borrows the language
+                            // service that made it. `results` keeps one item per
+                            // project id and the default project's item is
+                            // queued first with `defaultLs`, so it is `item.ls`.
+                            let default_ls = item.ls.expect(
+                                "the default project item carries the default language service",
+                            );
+                            let default_definition =
+                                default_ls.get_non_local_definition(ctx, entry);
+                            *self.default_definition.borrow_mut() = default_definition;
+                        }
+                    },
+                    &mut locations,
+                )
+            }));
+        let outcome = match searched {
+            Ok(result) => search_thread::ItemOutcome {
+                locations,
+                result,
+                panic: None,
+            },
+            Err(payload) => search_thread::ItemOutcome {
+                locations,
+                result: None,
+                panic: Some(panic_occured_text(payload)),
+            },
+        };
+        SlotState::Done {
+            ls: item_ls,
+            outcome,
+        }
+    }
+
+    // Go: ls/crossproject.go:96 the session calls of the queued function
+    // (step 4) and the response (step 5): phase 3 of an item.
+    fn commit_item(&self, slot: Slot<'a, Resp>) {
+        let Slot {
+            item,
+            response,
+            state,
+            ..
+        } = slot;
+        let SlotState::Done { ls, outcome } = state else {
+            unreachable!("an item commits after its search");
+        };
+        let search_thread::ItemOutcome {
+            locations,
+            result,
+            panic,
+        } = outcome;
+        // The item's program is current, as in Go's callback, which runs
+        // inside the item's search.
+        let _program = ls.as_ref().map(|ls| ls.get().enter_program());
+        let committed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            for (uri, position) in locations {
+                // Get default configured project for this file
+                let def_projects = match self.orchestrator.get_projects_for_file(self.ctx, &uri) {
+                    Ok(def_projects) => def_projects,
+                    Err(_) => continue,
+                };
+                for def_project in def_projects {
+                    // Optimization: don't enqueue if will be discarded
+                    if self.can_search_project(&def_project) {
+                        self.enqueue_item(ProjectAndTextDocumentPosition {
+                            project: def_project,
+                            ls: None,
+                            uri: uri.clone(),
+                            position,
+                            for_original_location: true,
+                        });
+                    }
+                }
+            }
+        }));
+        let panic_occured = match committed {
+            Err(payload) => Some(panic_occured_text(payload)),
+            Ok(()) => panic,
+        };
+        if let Some(panic_occured) = panic_occured {
             self.panics_occured
                 .borrow_mut()
                 .get_or_insert_with(Vec::new)
                 .push(panic_occured);
-        }
-    }
-
-    // Go: ls/crossproject.go:96 the body of the queued function after its
-    // deferred recover
-    fn process_item(
-        &self,
-        item: ProjectAndTextDocumentPosition<'a>,
-        response: &Rc<RefCell<Response<Resp>>>,
-    ) {
-        let ctx = self.ctx;
-        // Process the item
-        let ls_holder: LanguageService;
-        let ls: &LanguageService = match item.ls {
-            Some(ls) => ls,
-            None => {
-                // Get it now
-                match self
-                    .orchestrator
-                    .get_language_service_for_project_with_file(ctx, &item.project, &item.uri)
-                {
-                    Some(ls) => {
-                        ls_holder = ls;
-                        &ls_holder
-                    }
-                    None => return,
-                }
-            }
-        };
-        let (data, ok) = ls.provide_symbols_and_entries(
-            ctx,
-            &item.uri,
-            item.position,
-            self.is_rename,
-            self.implementations,
-        );
-        if ctx.err().is_some() {
             return;
         }
-        if ok {
-            for entry in &data.symbols_and_entries {
-                // Find the default definition that can be in another project
-                // Later we will use this load ancestor tree that references this location and expand search
-                if Rc::ptr_eq(&item.project, &self.default_project)
-                    && self.default_definition.borrow().is_none()
-                {
-                    // PORT: `NonLocalDefinition` borrows the language service
-                    // that made it. `results` keeps one item per project id
-                    // and the default project's item is queued first with
-                    // `defaultLs`, so `ls` is `item.ls` here.
-                    let default_ls = item
-                        .ls
-                        .expect("the default project item carries the default language service");
-                    let default_definition = default_ls.get_non_local_definition(ctx, entry);
-                    *self.default_definition.borrow_mut() = default_definition;
-                }
-                ls.for_each_original_definition_location(ctx, entry, &mut |uri, position| {
-                    // Get default configured project for this file
-                    let def_projects = match self.orchestrator.get_projects_for_file(ctx, &uri) {
-                        Ok(def_projects) => def_projects,
-                        Err(_) => return,
-                    };
-                    for def_project in def_projects {
-                        // Optimization: don't enqueue if will be discarded
-                        if self.can_search_project(&def_project) {
-                            self.enqueue_item(ProjectAndTextDocumentPosition {
-                                project: def_project,
-                                ls: None,
-                                uri: uri.clone(),
-                                position,
-                                for_original_location: true,
-                            });
-                        }
-                    }
-                });
-            }
-        }
-
-        match (self.symbol_and_entries_to_resp)(ls, ctx, self.params, data, self.options) {
-            Ok(result) => {
+        match result {
+            None => {}
+            Some(Ok(result)) => {
                 let mut response = response.borrow_mut();
                 response.complete = true;
                 response.result = result;
                 response.for_original_location = item.for_original_location;
             }
-            Err(err_search) => {
+            Some(Err(err_search)) => {
                 let mut err = self.err.borrow_mut();
                 if err.is_none() {
                     *err = Some(err_search);

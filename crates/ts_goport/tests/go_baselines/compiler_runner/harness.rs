@@ -630,15 +630,101 @@ fn compile_files_with_host(
     // !!!
     // if (compilerOptions.project || !rootFiles || rootFiles.length === 0) { ... readProject ... }
 
-    // !!! Need `getPreEmitDiagnostics` program for this
-    // (the pre-emit and post-emit error comparison of Strada is not ported)
     let current_directory = host.get_current_directory();
     let use_case_sensitive_file_names = host.fs().use_case_sensitive_file_names();
-    let program = create_program(host, config.clone());
-    let _scope = enter_program(Some(program.program()));
+
+    let mut pre_compiler_options = (**config.compiler_options()).clone();
+    pre_compiler_options.trace_resolution = Tristate::False;
+    let pre_config = Rc::new(ParsedCommandLine {
+        parsed_config: ParsedOptions {
+            compiler_options: Rc::new(pre_compiler_options),
+            file_names: config.file_names().to_vec(),
+            ..ParsedOptions::default()
+        },
+        config_file: config.config_file.clone(),
+        errors: config.errors.clone(),
+        ..ParsedCommandLine::default()
+    });
+    let pre_program = create_program(host.clone(), pre_config.clone());
+    let pre_errors = {
+        let _scope = enter_program(Some(pre_program.program()));
+        tsprogram::sort_and_deduplicate_diagnostics(get_program_like_diagnostics(
+            &pre_program,
+            &pre_config,
+            harness_options,
+        ))
+    };
+
+    let post_program = create_program(host, config.clone());
+    let _scope = enter_program(Some(post_program.program()));
+    let emit_options = EmitOptions {
+        write_file: Some(recorder.write_file()),
+        ..EmitOptions::default()
+    };
+    let emit_result = match &post_program {
+        ProgramLike::Program(_) => ts_goport::emitter::program_emit::emit(emit_options),
+        ProgramLike::Incremental(program) => program.emit(emit_options),
+    };
+    let post_errors = tsprogram::sort_and_deduplicate_diagnostics(get_program_like_diagnostics(
+        &post_program,
+        &config,
+        harness_options,
+    ));
+
+    let errors = if post_errors.len() != pre_errors.len() {
+        let (longer_errors, shorter_errors) = if pre_errors.len() > post_errors.len() {
+            (&pre_errors, &post_errors)
+        } else {
+            (&post_errors, &pre_errors)
+        };
+        let mut diag = new_ad_hoc_compiler_diagnostic(format!(
+            "Pre-emit ({}) and post-emit ({}) diagnostic counts do not match! This can indicate that a semantic _error_ was added by the emit resolver - such an error may not be reflected on the command line or in the editor, but may be captured in a baseline here!",
+            pre_errors.len(),
+            post_errors.len()
+        ));
+        diag.add_related_info(Some(new_ad_hoc_compiler_diagnostic(
+            "The excess diagnostics are:".to_string(),
+        )));
+        for d in longer_errors {
+            let matched = shorter_errors
+                .iter()
+                .any(|d2| ts_goport::ast::compare_diagnostics(d, d2) == 0);
+            if !matched {
+                diag.add_related_info(Some(d.clone()));
+            }
+        }
+        let mut errors = shorter_errors.clone();
+        errors.push(diag);
+        errors
+    } else {
+        post_errors
+    };
+
+    new_compilation_result(
+        current_directory,
+        use_case_sensitive_file_names,
+        post_program.program(),
+        config,
+        emit_result,
+        errors,
+        harness_options,
+        recorder.outputs(),
+    )
+}
+
+/// The diagnostics that Go `compileFilesWithHost` collects from one program,
+/// in its order. The program is current.
+// PORT: Go writes these lines out twice, for `preProgram` and `postProgram`.
+// Go reads `program.Options()`; `config` holds the same options.
+fn get_program_like_diagnostics(
+    program: &ProgramLike,
+    config: &ParsedCommandLine,
+    harness_options: &HarnessOptions,
+) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let emit_result = match &program {
+    match program {
         ProgramLike::Program(_) => {
+            diagnostics.extend(tsprogram::get_config_file_parsing_diagnostics());
             diagnostics.extend(tsprogram::get_program_diagnostics());
             diagnostics.extend(tsprogram::get_syntactic_diagnostics(Node::NIL));
             diagnostics.extend(tsprogram::get_semantic_diagnostics(Node::NIL));
@@ -649,12 +735,9 @@ fn compile_files_with_host(
             if harness_options.capture_suggestions {
                 diagnostics.extend(tsprogram::get_suggestion_diagnostics(Node::NIL));
             }
-            ts_goport::emitter::program_emit::emit(EmitOptions {
-                write_file: Some(recorder.write_file()),
-                ..EmitOptions::default()
-            })
         }
         ProgramLike::Incremental(program) => {
+            diagnostics.extend(program.get_config_file_parsing_diagnostics());
             diagnostics.extend(program.get_program_diagnostics());
             diagnostics.extend(program.get_syntactic_diagnostics(Node::NIL));
             diagnostics.extend(program.get_semantic_diagnostics(Node::NIL));
@@ -665,23 +748,32 @@ fn compile_files_with_host(
             if harness_options.capture_suggestions {
                 diagnostics.extend(program.get_suggestion_diagnostics(Node::NIL));
             }
-            program.emit(EmitOptions {
-                write_file: Some(recorder.write_file()),
-                ..EmitOptions::default()
-            })
         }
-    };
+    }
+    diagnostics
+}
 
-    new_compilation_result(
-        current_directory,
-        use_case_sensitive_file_names,
-        program.program(),
-        config,
-        emit_result,
-        diagnostics,
-        harness_options,
-        recorder.outputs(),
-    )
+// Go: diagnostics/diagnostics.go:152 NewAdHocMessage, used as
+// `ast.NewCompilerDiagnostic(diagnostics.NewAdHocMessage(message))`.
+// PORT: `ts_diagnostics::Message` has a `u32` code, so the Go code -1 is set
+// on the diagnostic (`Diagnostic.code`, which the baselines print). A
+// diagnostic holds a `&'static Message`, so the message is leaked. Decision
+// (bump A queue #78): this test helper stays out of the shared
+// `ts_diagnostics` crate.
+fn new_ad_hoc_compiler_diagnostic(message: String) -> Diagnostic {
+    let text: &'static str = Box::leak(message.into_boxed_str());
+    let message: &'static Message = Box::leak(Box::new(Message::new(
+        0,
+        ts_diagnostics::Category::Error,
+        "-1",
+        text,
+        false,
+        false,
+        false,
+    )));
+    let mut diag = ts_goport::ast::new_compiler_diagnostic(message, Vec::new());
+    diag.code = -1;
+    diag
 }
 
 // Go: harnessutil.go:679 CompilationResult

@@ -387,7 +387,9 @@ impl DeclarationTransformer {
         self.witnessed_cjs_exports.clear();
         self.state.borrow_mut().current_source_file = node;
         self.collect_file_references(node);
-        self.resolver.precalculate_declaration_emit_visibility(node);
+        let original = self.emit_context.most_original(node);
+        self.resolver
+            .precalculate_declaration_emit_visibility(original);
         let updated = self.transform_source_file(node);
         self.state.borrow_mut().current_source_file = Node::NIL;
         updated

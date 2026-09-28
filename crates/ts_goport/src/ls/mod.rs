@@ -30,12 +30,16 @@ pub mod host;
 pub mod hover;
 pub mod import_tracker;
 pub mod inlay_hints;
+pub mod jsdoc;
+pub mod jsdoc_snippet;
 pub mod languageservice;
 pub mod linkedediting;
 pub mod lsconv;
 pub mod lsutil;
 pub mod organizeimports;
+pub mod program_view;
 pub mod rename;
+pub mod search_thread;
 pub mod selectionranges;
 pub mod semantictokens;
 pub mod signaturehelp;
@@ -73,10 +77,14 @@ pub use host::*;
 pub use hover::*;
 pub use import_tracker::*;
 pub use inlay_hints::*;
+pub use jsdoc::*;
+pub use jsdoc_snippet::*;
 pub use languageservice::*;
 pub use linkedediting::*;
 pub use organizeimports::*;
+pub use program_view::*;
 pub use rename::*;
+pub use search_thread::*;
 pub use selectionranges::*;
 pub use semantictokens::*;
 pub use signaturehelp::*;
@@ -96,9 +104,10 @@ pub mod prelude {
         completions_p3::*, completions_p4::*, constants::*, crossproject::*, definition::*,
         diagnostics::*, displaypartswriter::*, documenthighlights::*, file_rename::*,
         findallreferences_p1::*, findallreferences_p2::*, folding::*, format::*, host::*, hover::*,
-        import_tracker::*, inlay_hints::*, languageservice::*, linkedediting::*,
-        organizeimports::*, rename::*, selectionranges::*, semantictokens::*, signaturehelp::*,
-        source_map::*, sourcedefinition::*, string_completions::*, symbols::*, utilities::*,
+        import_tracker::*, inlay_hints::*, jsdoc::*, jsdoc_snippet::*, languageservice::*,
+        linkedediting::*, organizeimports::*, program_view::*, rename::*, search_thread::*,
+        selectionranges::*, semantictokens::*, signaturehelp::*, source_map::*,
+        sourcedefinition::*, string_completions::*, symbols::*, utilities::*,
     };
     pub use crate::astnav;
     pub use crate::format;

@@ -22,6 +22,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Go `chan *Message` with capacity 1 for one pending server-to-client call.
 type ResponseChan = Rc<RefCell<Option<Message>>>;
@@ -36,6 +37,10 @@ pub struct AsyncConn {
     // thread the `RefCell` borrow stands in for it (reads use it too).
     protocol: RefCell<Box<dyn Protocol>>,
     handler: Rc<dyn Handler>,
+
+    // timing, when non-nil, accumulates the wall-clock time spent handling each
+    // request. Clients retrieve the collected data via a getServerTiming request.
+    timing: RefCell<Option<TimingCollector>>,
 
     // For server→client requests
     // PORT: Go `atomic.Int64` and the `pendingMu` lock are plain cells.
@@ -66,6 +71,7 @@ pub fn new_async_conn_with_protocol(
         rwc,
         protocol: RefCell::new(protocol),
         handler,
+        timing: RefCell::new(None),
         seq: Cell::new(0),
         pending: RefCell::new(FxHashMap::default()),
         deferred: RefCell::new(VecDeque::new()),
@@ -75,6 +81,18 @@ pub fn new_async_conn_with_protocol(
 // PORT: the Go methods are inherent methods; `impl Conn` below forwards to
 // them, so callers need not import `Conn`.
 impl AsyncConn {
+    // Go: conn_async.go:55 SetCollectTiming
+    // SetCollectTiming enables or disables per-request server processing-time
+    // measurement. When enabled, the connection accumulates timing that clients can
+    // retrieve via a getServerTiming request.
+    pub fn set_collect_timing(&self, enabled: bool) {
+        if enabled {
+            *self.timing.borrow_mut() = Some(new_timing_collector());
+        } else {
+            *self.timing.borrow_mut() = None;
+        }
+    }
+
     // Go: conn_async.go:49 Run
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
@@ -132,7 +150,42 @@ impl AsyncConn {
     // the same body (the handler call and the response write). Go
     // `debug.Stack()` is the backtrace at the recover point.
     fn handle_request(&self, ctx: &Context, msg: Message) {
+        // Intercept the meta-requests for collected server timing before dispatching
+        // to the handler, so they are answered directly and not themselves recorded.
+        if msg.method == Method::GET_SERVER_TIMING.0 {
+            let snapshot = server_timing_snapshot(self.timing.borrow().as_ref());
+            let write_err = self
+                .protocol
+                .borrow_mut()
+                .write_response(msg.id.as_ref(), Some(Box::new(snapshot)));
+            if let Err(write_err) = write_err {
+                panic!(
+                    "api: failed to write server timing response: {}",
+                    write_err.error()
+                );
+            }
+            return;
+        }
+        if msg.method == Method::RESET_SERVER_TIMING.0 {
+            if let Some(timing) = self.timing.borrow_mut().as_mut() {
+                timing.reset();
+            }
+            let write_err = self
+                .protocol
+                .borrow_mut()
+                .write_response(msg.id.as_ref(), None);
+            if let Err(write_err) = write_err {
+                panic!(
+                    "api: failed to write reset server timing response: {}",
+                    write_err.error()
+                );
+            }
+            return;
+        }
+
         let id = msg.id.clone();
+
+        let start = Instant::now();
 
         // Recover from panics and convert to error response with stack trace
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -140,6 +193,10 @@ impl AsyncConn {
                 Ok(result) => (result, None),
                 Err(err) => (None, Some(err)),
             };
+
+            if let Some(timing) = self.timing.borrow_mut().as_mut() {
+                timing.record(&msg.method, start.elapsed());
+            }
 
             let mut protocol = self.protocol.borrow_mut();
 

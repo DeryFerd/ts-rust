@@ -4,8 +4,9 @@
 //! PORT: the pinned reference build embeds the libs and names them
 //! `bundled:///libs/lib.*.d.ts` (see the oracle `*.files.txt` lists), so
 //! embed.go is ported and noembed.go is not. The lib texts come from
-//! `crates/ts_bundled/libs`, which is identical to the pinned
-//! `internal/bundled/libs`.
+//! `crates/ts_bundled/libs`, with the libs that changed at the pin taken from
+//! `crates/ts_goport/libs` (see its PROVENANCE.md). Together they equal the
+//! pinned `internal/bundled/libs`.
 
 use crate::frontend::prelude::*;
 use std::sync::OnceLock;
@@ -309,7 +310,16 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
         .copied()
 }
 
+// PORT: one `EMBEDDED_CONTENTS` entry. `crates/ts_bundled/libs` stays at the
+// old pin because the protected `ts_compiler` crate shares it. The `goport`
+// form takes a lib that changed at the pin from `crates/ts_goport/libs`.
 macro_rules! bundled_lib {
+    (goport $name:literal) => {
+        (
+            concat!("libs/", $name),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/libs/", $name)),
+        )
+    };
     ($name:literal) => {
         (
             concat!("libs/", $name),
@@ -330,15 +340,15 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.dom.asynciterable.d.ts"),
     bundled_lib!("lib.dom.d.ts"),
     bundled_lib!("lib.dom.iterable.d.ts"),
-    bundled_lib!("lib.es2015.collection.d.ts"),
-    bundled_lib!("lib.es2015.core.d.ts"),
+    bundled_lib!(goport "lib.es2015.collection.d.ts"),
+    bundled_lib!(goport "lib.es2015.core.d.ts"),
     bundled_lib!("lib.es2015.d.ts"),
     bundled_lib!("lib.es2015.generator.d.ts"),
     bundled_lib!("lib.es2015.iterable.d.ts"),
     bundled_lib!("lib.es2015.promise.d.ts"),
     bundled_lib!("lib.es2015.proxy.d.ts"),
     bundled_lib!("lib.es2015.reflect.d.ts"),
-    bundled_lib!("lib.es2015.symbol.d.ts"),
+    bundled_lib!(goport "lib.es2015.symbol.d.ts"),
     bundled_lib!("lib.es2015.symbol.wellknown.d.ts"),
     bundled_lib!("lib.es2016.array.include.d.ts"),
     bundled_lib!("lib.es2016.d.ts"),
@@ -351,7 +361,7 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.es2017.intl.d.ts"),
     bundled_lib!("lib.es2017.object.d.ts"),
     bundled_lib!("lib.es2017.sharedmemory.d.ts"),
-    bundled_lib!("lib.es2017.string.d.ts"),
+    bundled_lib!(goport "lib.es2017.string.d.ts"),
     bundled_lib!("lib.es2017.typedarrays.d.ts"),
     bundled_lib!("lib.es2018.asyncgenerator.d.ts"),
     bundled_lib!("lib.es2018.asynciterable.d.ts"),
@@ -371,7 +381,7 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.es2020.d.ts"),
     bundled_lib!("lib.es2020.date.d.ts"),
     bundled_lib!("lib.es2020.full.d.ts"),
-    bundled_lib!("lib.es2020.intl.d.ts"),
+    bundled_lib!(goport "lib.es2020.intl.d.ts"),
     bundled_lib!("lib.es2020.number.d.ts"),
     bundled_lib!("lib.es2020.promise.d.ts"),
     bundled_lib!("lib.es2020.sharedmemory.d.ts"),
@@ -413,7 +423,7 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.es2025.iterator.d.ts"),
     bundled_lib!("lib.es2025.promise.d.ts"),
     bundled_lib!("lib.es2025.regexp.d.ts"),
-    bundled_lib!("lib.es5.d.ts"),
+    bundled_lib!(goport "lib.es5.d.ts"),
     bundled_lib!("lib.es6.d.ts"),
     bundled_lib!("lib.esnext.array.d.ts"),
     bundled_lib!("lib.esnext.collection.d.ts"),

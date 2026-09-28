@@ -341,6 +341,11 @@ impl FilesParser {
             .shared
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
+        // PERF: a later `tsc -b` program gets its shared `.d.ts` and `.json`
+        // files from the build host's cache. A worker parse of such a file
+        // is not used: it takes CPU from the checks of the earlier
+        // projects, and the loader waits for running parses at the end.
+        lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_names();
         let prefetch = PrefetchGuard::install(pool.shared.clone());
         self.start(loader, tasks, 0);
         pool.shared
@@ -674,11 +679,22 @@ impl FilesParser {
             redirect_targets_map: &'a mut Option<FxHashMap<Path, Vec<String>>>,
             redirect_files_by_path: &'a mut Option<FxHashMap<Path, RedirectsFile>>,
             package_id_to_source_file: &'a mut Option<FxHashMap<PackageId, Rc<ParsedSourceFile>>>,
+            // recordedDuplicates tracks, per task data, the set of file-name casings that
+            // have already been recorded in duplicateSourceFiles. A file that is reached
+            // from multiple import sites is walked once per site, but each distinct casing
+            // is only parsed and acquired in the parse cache once. Recording the same casing
+            // as a duplicate more than once would cause it to be released more times than it
+            // was acquired when the snapshot is disposed, leaving a dangling cache entry that
+            // panics the next time it is referenced.
+            //
+            // PORT: Go `map[*parseTaskData]*collections.Set[string]`, made on first use.
+            // The key is the `Rc` pointer of the task data, as for `seen`.
+            recorded_duplicates: FxHashMap<*const RefCell<ParseTaskData>, FxHashSet<String>>,
             total_file_count: usize,
         }
 
         impl Collector<'_> {
-            // Go: filesparser.go:347 collectFiles
+            // Go: filesparser.go:355 collectFiles
             fn collect_files(&mut self, tasks: &[ParseTaskRef]) {
                 let loader = self.loader;
                 for task in tasks {
@@ -722,7 +738,13 @@ impl FilesParser {
                     // ensure we only walk each task once
                     if let Some(checked_name) = self.seen.get(&data_key).cloned() {
                         if let Some(file) = task.borrow().file.clone() {
-                            if checked_name != normalized_file_path {
+                            if checked_name != normalized_file_path
+                                && self
+                                    .recorded_duplicates
+                                    .entry(data_key)
+                                    .or_default()
+                                    .insert(normalized_file_path.clone())
+                            {
                                 self.duplicate_source_files.push(DuplicateSourceFile {
                                     parse_options: file.parse_options().clone(),
                                     text: file.text,
@@ -966,6 +988,7 @@ impl FilesParser {
             redirect_targets_map: &mut redirect_targets_map,
             redirect_files_by_path: &mut redirect_files_by_path,
             package_id_to_source_file: &mut package_id_to_source_file,
+            recorded_duplicates: FxHashMap::default(),
             total_file_count,
         };
         collector.collect_files(&loader.root_tasks);
@@ -1034,7 +1057,7 @@ impl FilesParser {
         }
     }
 
-    // Go: filesparser.go:539 (*filesParser).addIncludeReason
+    // Go: filesparser.go:557 (*filesParser).addIncludeReason
     // PORT: Go can append a nil reason. Only the automatic type directive
     // root task has no reason, and `collectFiles` never passes it here, so a
     // nil reason is skipped.
@@ -1225,6 +1248,9 @@ struct PrefetchQueue {
     rank: Option<(Vec<Arc<PrefetchJob>>, usize)>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
+    /// The files that the loader's host gives from its cache
+    /// (`CompilerHost::cached_source_file_names`). They get no job.
+    cached: FxHashSet<String>,
     next_job: usize,
     closed: bool,
 }
@@ -1232,13 +1258,16 @@ struct PrefetchQueue {
 impl PrefetchQueue {
     /// Makes the job of a file that has none and records it by name. A
     /// `lib.dom.d.ts` job goes to `first`; the caller pushes other jobs.
-    /// `None` when the queue is closed or full.
+    /// `None` when the queue is closed or full, or the file is `cached`.
     fn add(
         &mut self,
         opts: SourceFileParseOptions,
         script_kind: ScriptKind,
     ) -> Option<Arc<PrefetchJob>> {
-        if self.closed || self.next_job >= DETACHED_STORE_LIMIT {
+        if self.closed
+            || self.next_job >= DETACHED_STORE_LIMIT
+            || self.cached.contains(&opts.file_name)
+        {
             return None;
         }
         let job = Arc::new(PrefetchJob {

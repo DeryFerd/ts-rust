@@ -793,10 +793,38 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:495 existingTypeNodeIsNotReferenceOrIsReferenceWithCompatibleTypeArgumentCount
-    pub fn existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(
+    // Go: checker/nodebuilderimpl.go:495 canReuseExistingJSTypeNode
+    pub fn can_reuse_existing_js_type_node(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        existing: Node,
+        t: TypeId,
+    ) -> bool {
+        self.get_intended_type_from_js_doc_type_reference(existing).is_nil()
+            && self.existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(b, existing, t)
+    }
+
+    // Go: checker/nodebuilderimpl.go:499 tryGetResolvedSymbolFromTypeNode
+    pub fn try_get_resolved_symbol_from_type_node(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
+        node: Node,
+    ) -> SymbolId {
+        if node.is_nil() {
+            return SymbolId::NIL;
+        }
+        self.get_type_from_type_node(node);
+        // call to ensure symbol is resolved
+        let Some(links) = self.symbol_node_links.try_get(node) else {
+            return SymbolId::NIL;
+        };
+        links.resolved_symbol
+    }
+
+    // Go: checker/nodebuilderimpl.go:512 existingTypeNodeIsNotReferenceOrIsReferenceWithCompatibleTypeArgumentCount
+    pub fn existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
         existing: Node,
         t: TypeId,
     ) -> bool {
@@ -807,17 +835,15 @@ impl Checker {
         if !is_type_reference_node(existing) {
             return true;
         }
-        // `type` is a reference type, and `existing` is a type reference node, but we still need to make sure they refer to the _same_ target type
-        // before we go comparing their type argument counts.
-        self.get_type_from_type_reference(existing);
-        // call to ensure symbol is resolved
-        let Some(links) = self.symbol_node_links.try_get(existing) else {
-            return true;
-        };
-        let symbol = links.resolved_symbol;
+
+        let symbol = self.try_get_resolved_symbol_from_type_node(b, existing);
         if symbol.is_nil() {
             return true;
         }
+
+        // `type` is a reference type, and `existing` is a type reference node, but we still need to make sure they refer to the _same_ target type
+        // before we go comparing their type argument counts.
+
         let existing_target = self.get_declared_type_of_symbol(symbol);
         let target = self.ty(t).as_type_reference().object.target;
         if existing_target.is_nil() || existing_target != target {
@@ -849,7 +875,7 @@ impl Checker {
         }
         if annotation_type.is_some()
             && self.type_node_is_equivalent_to_type(b, host, t, annotation_type)
-            && self.existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(b, existing, t)
+            && self.can_reuse_existing_js_type_node(b, existing, t)
         {
             let result = self.try_reuse_existing_node_helper(b, existing);
             if result.is_some() {
@@ -1587,10 +1613,7 @@ impl Checker {
         if !name.is_empty() {
             return name;
         }
-        if self.sym(symbol).name == INTERNAL_SYMBOL_NAME_MISSING {
-            return "__missing".to_string();
-        }
-        self.sym(symbol).name.to_string()
+        escape_internal_symbol_name(self.sym(symbol).name.as_str())
     }
 
     // Go: checker/nodebuilderimpl.go:1012 getTypeParametersOfClassOrInterface

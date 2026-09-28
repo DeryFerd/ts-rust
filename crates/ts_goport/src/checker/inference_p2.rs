@@ -146,6 +146,11 @@ impl Checker {
         target: TypeId,
         constraint: TypeId,
     ) -> TypeId {
+        if source.is_nil() || target.is_nil() || constraint.is_nil() {
+            // Go reads `source.id`, `target.id` and `constraint.id`: a
+            // reverse mapped symbol of another checker has no links here.
+            go_nil_dereference();
+        }
         let key = ReverseMappedTypeKey {
             source_id: source,
             target_id: target,
@@ -1077,8 +1082,6 @@ impl Checker {
                 SmallVec::<[TypeId; 8]>::from_slice(&info.contra_candidates),
             )
         };
-        // PORT: Go tests `!= nil`; a nil and an empty candidate list are the
-        // same here because candidates only grow by `append` or reset to nil.
         if !candidates.is_empty() {
             return self.get_union_type_ex(&candidates, UnionReduction::SUBTYPE, None, TypeId::NIL);
         }
@@ -1254,6 +1257,7 @@ pub fn clone_inference_info(info: &InferenceInfo) -> InferenceInfo {
     InferenceInfo {
         type_parameter: info.type_parameter,
         candidates: info.candidates.clone(),
+        candidate_depths: info.candidate_depths.clone(),
         contra_candidates: info.contra_candidates.clone(),
         inferred_type: info.inferred_type,
         priority: info.priority,
@@ -1283,12 +1287,13 @@ impl Checker {
         !info.candidates.is_empty() || !info.contra_candidates.is_empty()
     }
 
-    // Go: checker/inference.go:1597 hasInferenceCandidatesOrDefault
+    // Go: checker/inference.go:1621 hasInferenceCandidatesOrDefault
     pub fn has_inference_candidates_or_default(&self, n: InferenceContextId, info: usize) -> bool {
-        let info = &self.inference_context(n).inferences[info];
-        !info.candidates.is_empty()
-            || !info.contra_candidates.is_empty()
-            || has_type_parameter_default(self, info.type_parameter)
+        self.has_inference_candidates(n, info)
+            || has_type_parameter_default(
+                self,
+                self.inference_context(n).inferences[info].type_parameter,
+            )
     }
 }
 

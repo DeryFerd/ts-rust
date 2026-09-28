@@ -3,17 +3,16 @@
 //!
 //! PORT: Go `host` keeps a pointer to its `*Orchestrator` and reads
 //! `opts.Sys`, `opts.Command` and `toPath` through it. Here the host keeps
-//! those values itself, so the orchestrator process and the build worker
-//! process can both make one (plan D1). The orchestrator owns the host as
-//! `Rc<BuildHost>` and passes clones where Go passes `o.host`.
+//! those values itself, so it needs no reference back to the orchestrator.
+//! The orchestrator owns the host as `Rc<BuildHost>` and passes clones
+//! where Go passes `o.host`.
 //!
 //! PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero) and
 //! `time.Duration` is `Duration`, as in build_task.rs.
 
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::parse_cache::ParseCache;
-use crate::execute::incremental::build_info::BuildInfo;
-use crate::execute::incremental::incremental::{self as incremental, BuildInfoReader};
+use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
 use crate::frontend::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -90,9 +89,8 @@ pub struct BuildHost {
     compare_paths_options: ComparePathsOptions,
 
     host: Rc<dyn CompilerHost>,
-    // PORT: the `*cachedvfs.FS` of `host`, kept so the orchestrator can
-    // share it with the build workers (see `CachedFsState`). Go reaches it
-    // as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
+    // PORT: the `*cachedvfs.FS` of `host`, kept for `resetCaches`. Go
+    // reaches it as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
     pub cached_fs: Rc<CachedFs>,
 
     // Caches that last only for build cycle and then cleared out
@@ -225,14 +223,11 @@ impl BuildHost {
     }
 
     // Go: build/host.go:77 (*host).ReadBuildInfo
-    // PORT: Go reads through the task's `loadOrStoreBuildInfo` cache. Only
-    // `incremental.ReadBuildInfoProgram` calls this, and it runs in the
-    // build worker, which has no tasks (plan D1). The task cache was filled
-    // from the same file by the orchestrator, so the worker reads the file
-    // (`incremental.NewBuildInfoReader(h.host)`), which gives the same value.
-    pub fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo> {
-        incremental::new_build_info_reader(self.host.clone()).read_build_info(config)
-    }
+    // PORT: Go reads the build info cache of the config's task
+    // (`loadOrStoreBuildInfo`). Its only caller is `ReadBuildInfoProgram` in
+    // `compileAndEmit`, with the config of the task that compiles, so
+    // `BuildTask::compile_and_emit_start` reads its own cache (`TaskBuildInfo`)
+    // and the host does not implement `incremental.BuildInfoReader`.
 }
 
 impl CompilerHost for BuildHost {
@@ -264,13 +259,35 @@ impl CompilerHost for BuildHost {
             || file_extension_is(&opts.file_name, EXTENSION_JSON)
         {
             // Cache dts and json files as they will be reused
+            // PORT: a parse that the cache keeps can be left out of one
+            // program (a deduplicated package, or a file that only such a
+            // package imports) and be a program file of a later one. Go
+            // keeps the whole `*ast.SourceFile`. The note makes the publish
+            // of the first program give the store its complete Go file, so
+            // the later program can use it.
             return self.source_files.load_or_store(
                 SourceFileCacheKey(opts.clone()),
-                |key| self.host.get_source_file(&key.0),
+                |key| {
+                    let file = self.host.get_source_file(&key.0);
+                    if let Some(file) = &file {
+                        crate::program::note_parsed_source_file(file);
+                    }
+                    file
+                },
                 false, /* allowZero */
             );
         }
         self.host.get_source_file(opts)
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_names`). The
+    // `.d.ts` and `.json` files that `get_source_file` keeps.
+    fn cached_source_file_names(&self) -> FxHashSet<String> {
+        let mut names = FxHashSet::default();
+        self.source_files.for_each_stored(|key| {
+            names.insert(key.0.file_name.clone());
+        });
+        names
     }
 
     // Go: build/host.go:60 (*host).GetResolvedProjectReference
@@ -330,15 +347,12 @@ impl ParseConfigHost for BuildHost {
     }
 }
 
-// Go: build/host.go:30 `_ incremental.BuildInfoReader = (*host)(nil)`
-impl BuildInfoReader for BuildHost {
-    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo> {
-        BuildHost::read_build_info(self, config)
-    }
-}
-
 // Go: build/host.go:31 `_ incremental.Host = (*host)(nil)`
 impl incremental::Host for BuildHost {
+    fn fs(&self) -> Rc<dyn Fs> {
+        CompilerHost::fs(self)
+    }
+
     fn get_m_time(&self, file_name: &str) -> Option<SystemTime> {
         BuildHost::get_m_time(self, file_name)
     }
@@ -389,5 +403,10 @@ impl CompilerHost for BuildCompilerHost {
         path: &Path,
     ) -> Option<Rc<ParsedCommandLine>> {
         self.host.get_resolved_project_reference(file_name, path)
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_names`).
+    fn cached_source_file_names(&self) -> FxHashSet<String> {
+        self.host.cached_source_file_names()
     }
 }

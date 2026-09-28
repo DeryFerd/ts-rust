@@ -15,12 +15,15 @@
 //! - `ls_program::get_type_checker` returns the same `Rc<RefCell<Checker>>`
 //!   for nested calls in one request (Go gets the same checker again). A
 //!   `borrow_mut` is held only where no nested call can borrow it again.
+//! - The search methods are generic over the program (`ProgramView`, see
+//!   `program_view.rs`), so that a cross-project request can run them on a
+//!   search thread. They get the checker with `ProgramView::get_type_checker`,
+//!   which is `ls_program::get_type_checker` on the dispatch thread.
 
 use crate::ls::prelude::*;
 
 use crate::astnav;
 use crate::flags_macros::go_enum;
-use crate::frontend::compiler;
 use crate::frontend::tspath;
 use crate::gostd::{Context, GoError};
 use crate::ls::lsconv;
@@ -207,7 +210,7 @@ impl SymbolAndEntries {
     }
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:167 getRangeOfEntry
     pub fn get_range_of_entry(&self, entry: &Rc<RefCell<ReferenceEntry>>) -> lsproto::Range {
         self.resolve_entry(entry)
@@ -425,7 +428,7 @@ pub fn get_context_node(node: Node) -> Node {
 }
 
 // utils
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:321 getLspRangeOfNode
     // PORT: Go nil `sourceFile` and `endNode` are `Node::NIL`.
     pub fn get_lsp_range_of_node(
@@ -837,7 +840,7 @@ pub fn is_definition_visible(
     }
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:584 forEachOriginalDefinitionLocation
     pub fn for_each_original_definition_location(
         &self,
@@ -853,7 +856,7 @@ impl LanguageService {
         // PORT: Go reads `symbol.Declarations` directly; see the file header.
         let declarations = {
             let symbol = entry.borrow().definition.as_ref().expect(NIL_DEREF).symbol;
-            let (checker, _done) = ls_program::get_type_checker(program, ctx);
+            let (checker, _done) = program.get_type_checker(ctx);
             let declarations = checker.borrow().sym(symbol).declarations.to_vec();
             declarations
         };
@@ -900,7 +903,7 @@ pub struct SymbolAndEntriesData {
     pub position: i32,
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:628 provideSymbolsAndEntries
     // PORT: Go passes the URI by value; here by reference.
     pub fn provide_symbols_and_entries(
@@ -999,7 +1002,7 @@ impl LanguageService {
         ctx: &Context,
         position: i32,
         node: Node,
-        program: &'static compiler::NewProgram,
+        program: P,
         is_rename: bool,
         implementations: bool,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
@@ -1011,13 +1014,55 @@ impl LanguageService {
             }
         } else {
             options.use_ = ReferenceUse::RENAME;
-            options.use_aliases_for_rename = true;
+            options.use_aliases_for_rename = self
+                .user_preferences()
+                .use_aliases_for_rename
+                .is_true_or_unknown();
         }
         // PORT: Go `*ast.SourceFile` is the file root `Node`.
-        let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();
+        let source_files: Vec<Node> = program.source_file_roots();
         self.get_referenced_symbols_for_node(ctx, position, node, program, &source_files, options)
     }
+}
 
+/// `ProvideReferences` as a `CrossProjectSearch`: its searches in other
+/// projects run on search threads.
+pub struct ReferencesSearch;
+
+impl CrossProjectSearch for ReferencesSearch {
+    type Req = lsproto::ReferenceParams;
+    type Resp = lsproto::ReferencesResponse;
+
+    fn to_resp<P: ProgramView>(
+        ls: &LanguageService<P>,
+        ctx: &Context,
+        params: &Self::Req,
+        data: SymbolAndEntriesData,
+        options: SymbolEntryTransformOptions,
+    ) -> Result<Self::Resp, GoError> {
+        ls.symbol_and_entries_to_references(ctx, params, data, options)
+    }
+}
+
+/// `ProvideImplementations` as a `CrossProjectSearch`.
+pub struct ImplementationsSearch;
+
+impl CrossProjectSearch for ImplementationsSearch {
+    type Req = lsproto::ImplementationParams;
+    type Resp = lsproto::ImplementationResponse;
+
+    fn to_resp<P: ProgramView>(
+        ls: &LanguageService<P>,
+        ctx: &Context,
+        params: &Self::Req,
+        data: SymbolAndEntriesData,
+        options: SymbolEntryTransformOptions,
+    ) -> Result<Self::Resp, GoError> {
+        ls.symbol_and_entries_to_implementations(ctx, params, data, options)
+    }
+}
+
+impl LanguageService {
     // Go: ls/findallreferences.go:694 ProvideReferences
     pub fn provide_references(
         &self,
@@ -1031,6 +1076,7 @@ impl LanguageService {
             params,
             orchestrator,
             LanguageService::symbol_and_entries_to_references,
+            Some(start_search::<ReferencesSearch>),
             combine_references,
             false, /*isRename*/
             false, /*implementations*/
@@ -1051,13 +1097,16 @@ impl LanguageService {
             params,
             orchestrator,
             LanguageService::symbol_and_entries_to_vs_references,
+            None, /*search*/
             combine_vs_references,
             false, /*isRename*/
             false, /*implementations*/
             SymbolEntryTransformOptions::default(),
         )
     }
+}
 
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:722 symbolAndEntriesToReferences
     pub fn symbol_and_entries_to_references(
         &self,
@@ -1085,7 +1134,9 @@ impl LanguageService {
             locations: Some(locations),
         })
     }
+}
 
+impl LanguageService {
     // Go: ls/findallreferences.go:730 symbolAndEntriesToVSReferences
     pub fn symbol_and_entries_to_vs_references(
         &self,
@@ -1463,13 +1514,16 @@ impl LanguageService {
             params,
             orchestrator,
             LanguageService::symbol_and_entries_to_implementations,
+            Some(start_search::<ImplementationsSearch>),
             combine_implementations,
             false, /*isRename*/
             true,  /*implementations*/
             options,
         )
     }
+}
 
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:943 symbolAndEntriesToImplementations
     pub fn symbol_and_entries_to_implementations(
         &self,
@@ -1529,7 +1583,7 @@ impl LanguageService {
 
         // !!! includeDeclarations
         if !include_declarations && let Some(definition) = &definition {
-            let (checker, _done) = ls_program::get_type_checker(self.get_program(), ctx);
+            let (checker, _done) = self.get_program().get_type_checker(ctx);
             let checker = checker.borrow();
             references.retain(|entry| {
                 !is_declaration_of_symbol(&checker.symbols, entry.borrow().node, definition.symbol)
@@ -1574,7 +1628,7 @@ pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: Symbo
             .any(|&decl| decl == source)
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:1000 convertEntriesToLocations
     pub fn convert_entries_to_locations(
         &self,
@@ -1608,10 +1662,7 @@ impl LanguageService {
             if entry_node.is_some() {
                 // Get the context range (broader scope including declaration context)
                 // PORT: Go `*ast.SourceFile` is the file root `Node`.
-                let context_file = self
-                    .program
-                    .get_source_file(&entry_file_name)
-                    .map_or(Node::NIL, |f| f.root);
+                let context_file = self.program.source_file_root(&entry_file_name);
                 let context_text_range =
                     to_context_range(entry_text_range, context_file, entry_context);
                 if let Some(context_text_range) = context_text_range {
@@ -1636,28 +1687,22 @@ impl LanguageService {
     // `Vec` of lists (a nil list is empty). Go returns a non-nil slice.
     pub fn merge_references(
         &self,
-        program: &'static compiler::NewProgram,
+        program: P,
         references_to_merge: Vec<Vec<Rc<RefCell<SymbolAndEntries>>>>,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
         let mut result: Vec<Rc<RefCell<SymbolAndEntries>>> = Vec::new();
         let get_source_file_index_of_entry =
-            |program: &'static compiler::NewProgram, entry: &Rc<RefCell<ReferenceEntry>>| -> i32 {
+            |program: P, entry: &Rc<RefCell<ReferenceEntry>>| -> i32 {
                 let source_file = {
                     let entry = entry.borrow();
                     if entry.kind == EntryKind::RANGE {
                         // PORT: Go `*ast.SourceFile` is the file root `Node`.
-                        program
-                            .get_source_file(&entry.file_name)
-                            .map_or(Node::NIL, |f| f.root)
+                        program.source_file_root(&entry.file_name)
                     } else {
                         get_source_file_of_node(entry.node)
                     }
                 };
-                program
-                    .source_files()
-                    .iter()
-                    .position(|f| f.root == source_file)
-                    .map_or(-1, |i| i as i32)
+                program.source_file_index(source_file)
             };
 
         for references in references_to_merge {
@@ -1828,7 +1873,9 @@ impl LanguageService {
         }
         result
     }
+}
 
+impl<P: ProgramView> LanguageService<P> {
     // === functions for find all ref implementation ===
 
     // Go: ls/findallreferences.go:1161 getReferencedSymbolsForNode
@@ -1841,7 +1888,7 @@ impl LanguageService {
         ctx: &Context,
         position: i32,
         mut node: Node,
-        program: &'static compiler::NewProgram,
+        program: P,
         source_files: &[Node],
         options: RefOptions,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
@@ -1860,10 +1907,10 @@ impl LanguageService {
             );
         }
 
-        let (checker, _done) = ls_program::get_type_checker(program, ctx);
+        let (checker, _done) = program.get_type_checker(ctx);
 
         if node.kind() == SyntaxKind::SourceFile {
-            let resolved_ref = get_reference_at_position(node, position, program);
+            let resolved_ref = program.reference_at_position(node, position);
             let Some(resolved_ref) = resolved_ref else {
                 return Vec::new();
             };

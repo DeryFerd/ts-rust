@@ -1106,7 +1106,7 @@ impl ResolutionState<'_> {
         let mut builder = String::new();
         for name in &names {
             let peer_package_json = self.get_package_json_info(&format!("{node_modules}{name}"));
-            if let Some(peer_package_json) = peer_package_json {
+            if let Some(peer_package_json) = peer_package_json.filter(|p| p.exists()) {
                 let version = peer_package_json
                     .contents
                     .as_ref()
@@ -1272,7 +1272,11 @@ pub fn move_to_next_directory_separator_if_available(
     let offset = (prev_separator_index + 1) as usize;
     // PORT: Go slices bytes. `offset` is one byte after the start of the
     // package name, which can be inside a multi-byte character.
-    match path.as_bytes()[offset..].iter().position(|&b| b == b'/') {
+    let next_separator_index = path
+        .as_bytes()
+        .get(offset..)
+        .and_then(|rest| rest.iter().position(|&b| b == b'/'));
+    match next_separator_index {
         None => {
             if is_folder {
                 return path.len() as i32;

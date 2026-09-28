@@ -707,7 +707,7 @@ impl Scanner {
         token
     }
 
-    // Go: scanner/scanner.go:1702 scanEscapeSequence
+    // Go: scanner/scanner.go:1690 scanEscapeSequence
     // PORT: the `String` form of `scan_escape_sequence_into`, for regexp.rs.
     // The string and template scanners call `scan_escape_sequence_into`.
     pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
@@ -716,7 +716,7 @@ impl Scanner {
         out
     }
 
-    // Go: scanner/scanner.go:1702 scanEscapeSequence
+    // Go: scanner/scanner.go:1690 scanEscapeSequence
     // PORT: Go returns strings that can hold a CESU-8 lone surrogate
     // (`EncodeJSStringRune`). A Rust `String` cannot; `push_js_string_rune`
     // writes a valid-UTF-8 escape form instead (see
@@ -934,7 +934,6 @@ impl Scanner {
                         utf8_decode_rune_in_string(&self.text, self.scanner_state.pos as usize);
                     c = rune_to_char(r);
                     self.scanner_state.pos += size;
-                    self.contains_non_ascii = true;
                 }
                 // LineContinuation: a backslash followed by a line terminator is "the empty code unit sequence".
                 if c == '\u{2028}' || c == '\u{2029}' {

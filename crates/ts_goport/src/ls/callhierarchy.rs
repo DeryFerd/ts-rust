@@ -827,6 +827,7 @@ impl LanguageService {
             &incoming_entry,
             orchestrator,
             LanguageService::symbol_and_entries_to_incoming_calls,
+            None, /*search*/
             combine_incoming_calls,
             false,
             false,

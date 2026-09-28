@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ts_goport::execute::watchmanager::WatchBackend;
+use ts_goport::execute::watchmanager::{WatchBackend, WatchDirectoryRequest};
 use ts_goport::fswatch::{self, Event, EventKind};
 use ts_goport::gostd::{GoError, errors};
 
@@ -97,29 +97,52 @@ impl WatchBackend for MockWatchBackend {
         recursive: bool,
         ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ) -> Result<Box<dyn fswatch::Watch>, GoError> {
-        let mut dirs = self.dirs.lock().unwrap();
-        if let Some(directory_exists) = &self.directory_exists {
-            if !directory_exists(dir) {
-                return Err(errors::errorf(
-                    format!("directory does not exist: {dir}"),
-                    Vec::new(),
-                ));
-            }
-        }
-        let w = Arc::new(MockWatch {
-            path: dir.to_string(),
+        let closers = self.watch_directories(vec![WatchDirectoryRequest {
+            dir: dir.to_string(),
             callback: fn_,
             recursive,
             ignore,
-            closed: AtomicBool::new(false),
-        });
-        dirs.insert(dir.to_string(), w.clone());
-        Ok(Box::new(MockWatchCloser(w)))
+        }])?;
+        Ok(closers
+            .into_iter()
+            .next()
+            .expect("WatchDirectories returns one closer per request"))
+    }
+
+    // Go: mock_watch_backend.go:70 MockWatchBackend.WatchDirectories
+    fn watch_directories(
+        &self,
+        requests: Vec<WatchDirectoryRequest>,
+    ) -> Result<Vec<Box<dyn fswatch::Watch>>, GoError> {
+        let mut dirs = self.dirs.lock().unwrap();
+        for request in &requests {
+            if let Some(directory_exists) = &self.directory_exists {
+                if !directory_exists(&request.dir) {
+                    return Err(errors::errorf(
+                        format!("directory does not exist: {}", request.dir),
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
+        let mut closers: Vec<Box<dyn fswatch::Watch>> = Vec::with_capacity(requests.len());
+        for request in requests {
+            let w = Arc::new(MockWatch {
+                path: request.dir.clone(),
+                callback: request.callback,
+                recursive: request.recursive,
+                ignore: request.ignore,
+                closed: AtomicBool::new(false),
+            });
+            dirs.insert(request.dir, w.clone());
+            closers.push(Box::new(MockWatchCloser(w)));
+        }
+        Ok(closers)
     }
 }
 
 impl MockWatchBackend {
-    // Go: mock_watch_backend.go:74 MockWatchBackend.SendEvents
+    // Go: mock_watch_backend.go:93 MockWatchBackend.SendEvents
     /// SendEvents routes events through the registered watch callbacks
     /// that match each event's path. Directory watches match if the event
     /// path is a child (or recursive descendant) of the watched directory.
@@ -164,7 +187,7 @@ impl MockWatchBackend {
         }
     }
 
-    // Go: mock_watch_backend.go:115 MockWatchBackend.SendChangedPaths
+    // Go: mock_watch_backend.go:134 MockWatchBackend.SendChangedPaths
     /// SendChangedPaths converts a list of file changes into fswatch
     /// events with appropriate event kinds and routes them through
     /// registered watches via SendEvents. For new/modified files, it also
@@ -205,7 +228,7 @@ impl MockWatchBackend {
     }
 }
 
-// Go: mock_watch_backend.go:146 pathIsUnder
+// Go: mock_watch_backend.go:165 pathIsUnder
 /// pathIsUnder reports whether eventPath is inside dir. If recursive is
 /// false, only direct children match.
 fn path_is_under(event_path: &str, dir: &str, recursive: bool) -> bool {
@@ -226,7 +249,7 @@ fn path_is_under(event_path: &str, dir: &str, recursive: bool) -> bool {
 }
 
 impl MockWatchBackend {
-    // Go: mock_watch_backend.go:167 MockWatchBackend.WatchState
+    // Go: mock_watch_backend.go:186 MockWatchBackend.WatchState
     /// WatchState returns a deterministic, human-readable summary of all
     /// active watches. This is intended to be included in test baselines
     /// so that watch registration correctness is verified via snapshot diffs.

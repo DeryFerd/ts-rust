@@ -1337,6 +1337,260 @@ fn build_file_delete() {
 }
 
 // ---------------------------------------------------------------------------
+// TestBuildDependencyUpdate
+// ---------------------------------------------------------------------------
+
+// Go: tscbuild_test.go:972 TestBuildDependencyUpdate (added by tsgo#4301)
+fn build_dependency_update_inputs() -> Vec<TscInput> {
+    vec![
+        TscInput {
+            // https://github.com/microsoft/typescript-go/issues/2666
+            sub_scenario: "rebuilds when dependency in node_modules is updated".into(),
+            files: files! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "/home/src/workspaces/project/src/index.ts" => dedent(r#"
+					import { myValue } from "my-dep";
+					export const value: string = myValue;
+				"#),
+                "/home/src/workspaces/project/node_modules/my-dep/package.json" => dedent(r#"
+					{
+						"name": "my-dep",
+						"version": "1.0.0",
+						"types": "index.d.ts"
+					}
+				"#),
+                "/home/src/workspaces/project/node_modules/my-dep/index.d.ts" => "export declare const myValue: string;",
+            },
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![
+                no_change(),
+                TscEdit {
+                    caption: "update dependency d.ts with breaking type change".into(),
+                    edit: edit(|sys| {
+                        sys.write_file_no_error(
+                            "/home/src/workspaces/project/node_modules/my-dep/index.d.ts",
+                            "export declare const myValue: number;",
+                        );
+                    }),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "restore dependency d.ts".into(),
+                    edit: edit(|sys| {
+                        sys.write_file_no_error(
+                            "/home/src/workspaces/project/node_modules/my-dep/index.d.ts",
+                            "export declare const myValue: string;",
+                        );
+                    }),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "update dependency d.ts timestamp without changing text".into(),
+                    edit: edit(|sys| {
+                        sys.write_file_no_error(
+                            "/home/src/workspaces/project/node_modules/my-dep/index.d.ts",
+                            "export declare const myValue: string;",
+                        );
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+                TscEdit {
+                    caption: "delete dependency d.ts".into(),
+                    edit: edit(|sys| {
+                        sys.remove_no_error(
+                            "/home/src/workspaces/project/node_modules/my-dep/index.d.ts",
+                        );
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "rebuilds when missing dependency package json is added".into(),
+            files: files! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "/home/src/workspaces/project/src/index.ts" => dedent(r#"
+					import { myValue } from "my-dep";
+					export const value: string = myValue;
+				"#),
+                "/home/src/workspaces/project/node_modules/my-dep/index.d.ts" => "export declare const myValue: string;",
+                "/home/src/workspaces/project/node_modules/my-dep/alt.d.ts" => "export declare const myValue: number;",
+            },
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![TscEdit {
+                caption: "add package json redirecting types to a declaration file with a breaking type change".into(),
+                edit: edit(|sys| {
+                    sys.write_file_no_error(
+                        "/home/src/workspaces/project/node_modules/my-dep/package.json",
+                        r#"{"types":"alt.d.ts"}"#,
+                    );
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "rebuilds when dependency package json redirects to a different declaration file".into(),
+            files: files! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "/home/src/workspaces/project/src/index.ts" => dedent(r#"
+					import { myValue } from "my-dep";
+					export const value: string = myValue;
+				"#),
+                "/home/src/workspaces/project/node_modules/my-dep/package.json" => dedent(r#"
+					{
+						"name": "my-dep",
+						"version": "1.0.0",
+						"types": "index.d.ts"
+					}
+				"#),
+                "/home/src/workspaces/project/node_modules/my-dep/index.d.ts" => "export declare const myValue: string;",
+                "/home/src/workspaces/project/node_modules/my-dep/alt.d.ts" => "export declare const myValue: number;",
+            },
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![TscEdit {
+                caption: "redirect package types to a declaration file with a breaking type change".into(),
+                edit: edit(|sys| {
+                    sys.replace_file_text(
+                        "/home/src/workspaces/project/node_modules/my-dep/package.json",
+                        "index.d.ts",
+                        "alt.d.ts",
+                    );
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "rebuilds when absolute non-root dependency is updated".into(),
+            files: files! {
+                "C:/work/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"paths": {
+								"abs-dep": ["D:/work/deps/dep.d.ts"]
+							},
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "C:/work/project/src/index.ts" => dedent(r#"
+					import { myValue } from "abs-dep";
+					export const value: string = myValue;
+				"#),
+                "D:/work/deps/dep.d.ts" => "export declare const myValue: string;",
+            },
+            cwd: "C:/work/project".into(),
+            windows_style_root: "C:/".into(),
+            ignore_case: true,
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![TscEdit {
+                caption: "update absolute non-root dependency with breaking type change".into(),
+                edit: edit(|sys| {
+                    sys.write_file_no_error(
+                        "D:/work/deps/dep.d.ts",
+                        "export declare const myValue: number;",
+                    );
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "watches absolute non-root dependency updates".into(),
+            files: files! {
+                "C:/work/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"paths": {
+								"abs-dep": ["D:/work/deps/dep.d.ts"]
+							},
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "C:/work/project/src/index.ts" => dedent(r#"
+					import { myValue } from "abs-dep";
+					export const value: string = myValue;
+				"#),
+                "D:/work/deps/dep.d.ts" => "export declare const myValue: string;",
+            },
+            cwd: "C:/work/project".into(),
+            windows_style_root: "C:/".into(),
+            ignore_case: true,
+            command_line_args: args(&["--b", "--verbose", "--watch"]),
+            edits: vec![TscEdit {
+                caption: "update absolute non-root dependency with breaking type change".into(),
+                edit: edit(|sys| {
+                    sys.write_file_no_error(
+                        "D:/work/deps/dep.d.ts",
+                        "export declare const myValue: number;",
+                    );
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ]
+}
+
+#[test]
+fn build_dependency_update() {
+    run_tsc_inputs(
+        "dependencyUpdate",
+        build_dependency_update_inputs(),
+        WatchFilter::NonWatch,
+    );
+}
+
+#[test]
+fn build_dependency_update_watch() {
+    run_tsc_inputs(
+        "dependencyUpdate",
+        build_dependency_update_inputs(),
+        WatchFilter::WatchOnly,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // TestBuildInferredTypeFromTransitiveModule
 // ---------------------------------------------------------------------------
 

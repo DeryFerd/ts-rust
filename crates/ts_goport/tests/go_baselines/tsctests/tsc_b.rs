@@ -10,6 +10,7 @@ use crate::support::runner::{
     FileMap, TscEdit, TscInput, WatchFilter, edit, no_change, no_change_only_edit, run_tsc_inputs,
 };
 use crate::support::stringtestutil::{dedent, go_sprintf};
+use crate::support::test_sys::get_file_map_with_build;
 use crate::support::vfstest::{MapFile, symlink};
 
 /// Go `FileMap{path: value, ...}`. Each value goes through `MapFile::from`.
@@ -776,8 +777,6 @@ fn tsc_module_resolution_inputs() -> Vec<TscInput> {
                     edit: edit(|sys| {
                         sys.replace_file_text(r"/user/username/projects/myproject/packages/pkg1/package.json", r#""module""#, r#""commonjs""#);
                     }),
-                    expected_diff: "Package.json watch pending, so no change detected yet"
-                        .to_string(),
                     ..Default::default()
                 },
                 TscEdit {
@@ -792,8 +791,6 @@ fn tsc_module_resolution_inputs() -> Vec<TscInput> {
                     edit: edit(|sys| {
                         sys.replace_file_text(r"/user/username/projects/myproject/packages/pkg1/package.json", r#""module""#, r#""commonjs""#);
                     }),
-                    expected_diff: "Package.json watch pending, so no change detected yet"
-                        .to_string(),
                     ..Default::default()
                 },
                 TscEdit {
@@ -859,8 +856,6 @@ fn tsc_module_resolution_inputs() -> Vec<TscInput> {
                     edit: edit(|sys| {
                         sys.replace_file_text(r"/user/username/projects/myproject/packages/pkg2/package.json", r"index.js", r"other.js");
                     }),
-                    expected_diff: "Package.json watch pending, so no change detected yet"
-                        .to_string(),
                     ..Default::default()
                 },
                 TscEdit {
@@ -871,6 +866,98 @@ fn tsc_module_resolution_inputs() -> Vec<TscInput> {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: r"build mode watches missing package-json lookups".to_string(),
+            files: files! {
+                r"/user/username/projects/myproject/packages/pkg1/index.ts" => dedent(r"
+					import type { TheNum } from 'pkg2'
+					export const theNum: TheNum = 42;"),
+                r"/user/username/projects/myproject/packages/pkg1/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"outDir": "build",
+						},
+					}"#),
+            },
+            cwd: "/user/username/projects/myproject".to_string(),
+            command_line_args: argv(&[
+                "-b",
+                "packages/pkg1",
+                "-w",
+                "--verbose",
+                "--traceResolution",
+            ]),
+            edits: vec![
+                TscEdit {
+                    caption: "resolves import after package is installed".to_string(),
+                    edit: edit(|sys| {
+                        sys.write_file_no_error(r"/user/username/projects/myproject/node_modules/pkg2/package.json", &dedent(r#"
+							{
+								"name": "pkg2",
+								"version": "1.0.0",
+								"types": "index.d.ts"
+							}"#));
+                        sys.write_file_no_error(r"/user/username/projects/myproject/node_modules/pkg2/index.d.ts", r"export type TheNum = 42;");
+                    }),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "reports import errors after package is removed".to_string(),
+                    edit: edit(|sys| {
+                        sys.remove_no_error(r"/user/username/projects/myproject/node_modules/pkg2/package.json");
+                        sys.remove_no_error(r"/user/username/projects/myproject/node_modules/pkg2/index.d.ts");
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: r"build mode watches package-json lookups from existing buildinfo".to_string(),
+            files: get_file_map_with_build(
+                files! {
+                    r"/user/username/projects/myproject/packages/pkg1/index.ts" => dedent(r"
+					import type { TheNum } from 'pkg2'
+					export const theNum: TheNum = 42;"),
+                    r"/user/username/projects/myproject/packages/pkg1/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"outDir": "zzbuild",
+						},
+					}"#),
+                    r"/user/username/projects/myproject/node_modules/pkg2/package.json" => dedent(r#"
+					{
+						"name": "pkg2",
+						"version": "1.0.0",
+						"types": "index.d.ts"
+					}"#),
+                    r"/user/username/projects/myproject/node_modules/pkg2/index.d.ts" => r"export type TheNum = 42;",
+                },
+                &argv(&[
+                    "-b",
+                    "/user/username/projects/myproject/packages/pkg1",
+                    "--verbose",
+                    "--traceResolution",
+                ]),
+            ),
+            cwd: "/user/username/projects/myproject".to_string(),
+            command_line_args: argv(&[
+                "-b",
+                "packages/pkg1",
+                "-w",
+                "--verbose",
+                "--traceResolution",
+            ]),
+            edits: vec![TscEdit {
+                caption: "reports import errors after package is removed".to_string(),
+                edit: edit(|sys| {
+                    sys.remove_no_error(r"/user/username/projects/myproject/node_modules/pkg2/package.json");
+                    sys.remove_no_error(r"/user/username/projects/myproject/node_modules/pkg2/index.d.ts");
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
         },
         TscInput {

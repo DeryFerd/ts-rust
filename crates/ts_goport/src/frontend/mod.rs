@@ -8,6 +8,7 @@ pub mod compiler;
 pub mod core_ext;
 pub mod json;
 pub mod module;
+pub mod nativepath;
 pub mod outputpaths;
 pub mod packagejson;
 pub mod parser;

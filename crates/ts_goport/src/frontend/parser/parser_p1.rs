@@ -789,7 +789,6 @@ impl Parser {
             attach_file_to_diagnostics(self.jsdoc_diagnostics.clone(), result.root);
         result.common_js_module_indicator = self.common_js_module_indicator;
         result.is_declaration_file = is_declaration_file;
-        result.contains_non_ascii = self.scanner.contains_non_ascii();
         result.language_variant = self.language_variant;
         result.script_kind = self.script_kind;
         set_node_flags(result.root, result.root.flags() | self.source_flags);
@@ -798,6 +797,8 @@ impl Parser {
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
         set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
+        // PORT: the store copy of `ContainsNonASCII`, which Go NewSourceFile
+        // sets (`ParsedSourceFile::new`).
         set_file_store_parse_fields(
             result.store,
             result.language_variant,

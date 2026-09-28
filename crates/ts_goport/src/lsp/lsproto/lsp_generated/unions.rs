@@ -397,67 +397,6 @@ impl IsZero for StringOrMarkupContent {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
-    pub full_document_diagnostic_report: Option<FullDocumentDiagnosticReport>,
-    pub unchanged_document_diagnostic_report: Option<UnchangedDocumentDiagnosticReport>,
-}
-
-impl MarshalerTo for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
-    // Go: (o *FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport) MarshalJSONTo
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        assert_only_one(
-            "exactly one element of FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport should be set",
-            bool_to_int(self.full_document_diagnostic_report.is_some())
-                + bool_to_int(self.unchanged_document_diagnostic_report.is_some()),
-        );
-
-        if let Some(v) = &self.full_document_diagnostic_report {
-            return v.marshal_json_to(enc);
-        }
-        if let Some(v) = &self.unchanged_document_diagnostic_report {
-            return v.marshal_json_to(enc);
-        }
-        panic!("unreachable")
-    }
-}
-
-impl UnmarshalerFrom for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
-    // Go: (o *FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport) UnmarshalJSONFrom
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        *self = FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport::default();
-
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
-            b"\"full\"" => {
-                let v = self
-                    .full_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
-            }
-            b"\"unchanged\"" => {
-                let v = self
-                    .unchanged_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
-            }
-            _ => {}
-        }
-        Err(err_invalid_value(
-            "FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
-            data,
-        ))
-    }
-}
-
-impl IsZero for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
-    // PORT: Go reflect.Value.IsZero (all fields nil).
-    fn is_zero(&self) -> bool {
-        self.full_document_diagnostic_report.is_none()
-            && self.unchanged_document_diagnostic_report.is_none()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorkspaceFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
     pub full_document_diagnostic_report: Option<WorkspaceFullDocumentDiagnosticReport>,
     pub unchanged_document_diagnostic_report: Option<WorkspaceUnchangedDocumentDiagnosticReport>,
@@ -1266,6 +1205,67 @@ impl IsZero for TextEditOrAnnotatedTextEditOrSnippetTextEdit {
         self.text_edit.is_none()
             && self.annotated_text_edit.is_none()
             && self.snippet_text_edit.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
+    pub full_document_diagnostic_report: Option<FullDocumentDiagnosticReport>,
+    pub unchanged_document_diagnostic_report: Option<UnchangedDocumentDiagnosticReport>,
+}
+
+impl MarshalerTo for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
+    // Go: (o *FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        assert_only_one(
+            "exactly one element of FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport should be set",
+            bool_to_int(self.full_document_diagnostic_report.is_some())
+                + bool_to_int(self.unchanged_document_diagnostic_report.is_some()),
+        );
+
+        if let Some(v) = &self.full_document_diagnostic_report {
+            return v.marshal_json_to(enc);
+        }
+        if let Some(v) = &self.unchanged_document_diagnostic_report {
+            return v.marshal_json_to(enc);
+        }
+        panic!("unreachable")
+    }
+}
+
+impl UnmarshalerFrom for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
+    // Go: (o *FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport) UnmarshalJSONFrom
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        *self = FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport::default();
+
+        let data = dec.read_value()?;
+        match json_object_raw_field(data, "kind").0.as_slice() {
+            b"\"full\"" => {
+                let v = self
+                    .full_document_diagnostic_report
+                    .insert(Default::default());
+                return json_unmarshal(data, v, &[]);
+            }
+            b"\"unchanged\"" => {
+                let v = self
+                    .unchanged_document_diagnostic_report
+                    .insert(Default::default());
+                return json_unmarshal(data, v, &[]);
+            }
+            _ => {}
+        }
+        Err(err_invalid_value(
+            "FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
+            data,
+        ))
+    }
+}
+
+impl IsZero for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport {
+    // PORT: Go reflect.Value.IsZero (all fields nil).
+    fn is_zero(&self) -> bool {
+        self.full_document_diagnostic_report.is_none()
+            && self.unchanged_document_diagnostic_report.is_none()
     }
 }
 

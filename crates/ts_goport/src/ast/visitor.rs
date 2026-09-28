@@ -133,13 +133,14 @@ pub fn new_node_visitor<'a, C>(
 /// Go `node.AsSyntaxList().Children`.
 // PORT: node.rs has no accessor for the `SyntaxList` children.
 pub(crate) fn syntax_list_children(node: Node) -> Vec<Node> {
-    match ast_data_of(node) {
-        NodeData::SyntaxList(d) => NodeSlice::from_ids(node.file_index(), &d.children).to_vec(),
+    let file = node.file_index();
+    with_ast_data(node, |d| match d {
+        NodeData::SyntaxList(d) => d.children.iter().map(|&id| Node::new(file, id)).collect(),
         _ => panic!(
             "ast field Children does not exist on node kind {:?}",
             node.kind()
         ),
-    }
+    })
 }
 
 impl<'a, C> NodeVisitor<'a, C> {
@@ -465,7 +466,7 @@ impl Node {
     /// Go `node.VisitEachChild(v)`: dispatches on the Go node data type.
     pub fn visit_each_child<C>(self, v: &mut NodeVisitor<'_, C>) -> Node {
         let node = self;
-        match ast_data_of(node) {
+        with_ast_data(node, |d| match d {
             NodeData::SourceFile(_) => visit_each_child_source_file(node, v),
             NodeData::QualifiedName(_) => visit_each_child_qualified_name(node, v),
             NodeData::ComputedPropertyName(_) => visit_each_child_computed_property_name(node, v),
@@ -695,7 +696,7 @@ impl Node {
             }
             // Go: ast/ast.go:1216 (node *NodeDefault) VisitEachChild
             _ => node,
-        }
+        })
     }
 }
 

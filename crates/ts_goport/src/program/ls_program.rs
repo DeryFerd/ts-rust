@@ -846,8 +846,8 @@ pub fn get_semantic_diagnostics(
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let _program = enter(p);
-    collect_checker_diagnostics(p, ctx, source_file, &mut |_ctx, c, file| {
-        get_semantic_diagnostics_with_checker(c, file)
+    collect_checker_diagnostics(p, ctx, source_file, &mut |ctx, c, file| {
+        get_semantic_diagnostics_with_checker(ctx, c, file)
     })
 }
 
@@ -859,8 +859,8 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
     let _program = enter(p);
     let all_diags =
-        collect_checker_diagnostics_from_files(p, ctx, source_files, &mut |_ctx, c, file| {
-            get_bind_and_check_diagnostics_with_checker(c, file)
+        collect_checker_diagnostics_from_files(p, ctx, source_files, &mut |ctx, c, file| {
+            get_bind_and_check_diagnostics_with_checker(ctx, c, file)
         });
     let mut result = FxHashMap::default();
     for (i, diags) in all_diags.into_iter().enumerate() {
@@ -876,8 +876,8 @@ pub fn get_suggestion_diagnostics(
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let _program = enter(p);
-    collect_checker_diagnostics(p, ctx, source_file, &mut |_ctx, c, file| {
-        get_suggestion_diagnostics_with_checker(c, file)
+    collect_checker_diagnostics(p, ctx, source_file, &mut |ctx, c, file| {
+        get_suggestion_diagnostics_with_checker(ctx, c, file)
     })
 }
 

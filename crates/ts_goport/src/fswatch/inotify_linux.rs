@@ -99,6 +99,7 @@ pub const INOTIFY_BUFFER_SIZE: usize = 8192;
 /// inotifySubscription.
 pub struct InotifySubscription {
     pub path: String,
+    pub watch_path: String,
     pub dir_watch: Arc<DirWatch>,
     pub wd: i32,
 }
@@ -254,7 +255,7 @@ impl WatcherImpl for InotifyBackend {
     /// virtual dispatch under b.mu (so it's serialized against handleEvent).
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         if !w.recursive {
-            if let Err(err) = self.watch_dir(w, &w.dir) {
+            if let Err(err) = self.watch_dir(w, &w.dir, &w.physical_dir) {
                 return Err(DirWatchError {
                     err: errors::errorf(
                         format!("inotify_add_watch on '{}' failed: {}", w.dir, err.error()),
@@ -267,24 +268,27 @@ impl WatcherImpl for InotifyBackend {
             return Ok(());
         }
         if let Err(err) = walk_dir(
-            &w.dir,
+            &w.physical_dir,
             true,
-            Some(&mut |path: &str, is_dir: bool| -> Result<(), GoError> {
-                if !is_dir {
-                    return Ok(());
-                }
-                if let Err(err) = self.watch_dir(w, path) {
-                    return Err(DirWatchError {
-                        err: errors::errorf(
-                            format!("inotify_add_watch on '{}' failed: {}", path, err.error()),
-                            vec![err],
-                        ),
-                        dir_watch: w.clone(),
+            Some(
+                &mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
+                    if !is_dir {
+                        return Ok(());
                     }
-                    .to_go_error());
-                }
-                Ok(())
-            }),
+                    let path = &w.display_path(watch_path);
+                    if let Err(err) = self.watch_dir(w, path, watch_path) {
+                        return Err(DirWatchError {
+                            err: errors::errorf(
+                                format!("inotify_add_watch on '{}' failed: {}", path, err.error()),
+                                vec![err],
+                            ),
+                            dir_watch: w.clone(),
+                        }
+                        .to_go_error());
+                    }
+                    Ok(())
+                },
+            ),
         ) {
             let _ = self.close_watch(w);
             return Err(err);
@@ -365,11 +369,17 @@ impl InotifyBackend {
     // Go: inotify_linux.go:244 inotifyBackend.watchDir
     /// watchDir registers an inotify watch on path and records the resulting
     /// subscription. Returns the kernel watch descriptor on success.
-    pub fn watch_dir(&self, w: &Arc<DirWatch>, path: &str) -> Result<i32, GoError> {
+    pub fn watch_dir(
+        &self,
+        w: &Arc<DirWatch>,
+        path: &str,
+        watch_path: &str,
+    ) -> Result<i32, GoError> {
         let inotify = self.locked.lock().unwrap().inotify;
-        let wd = unix::inotify_add_watch(inotify, path, INOTIFY_MASK)?;
+        let wd = unix::inotify_add_watch(inotify, watch_path, INOTIFY_MASK)?;
         let sub = Arc::new(InotifySubscription {
             path: path.to_string(),
+            watch_path: watch_path.to_string(),
             dir_watch: w.clone(),
             wd,
         });
@@ -498,22 +508,24 @@ impl InotifyBackend {
     ) -> bool {
         let w = &sub.dir_watch;
         let mut path = sub.path.clone();
+        let mut watch_path = sub.watch_path.clone();
         let is_dir = ev.mask & unix::IN_ISDIR != 0;
         if !name.is_empty() {
             path = format!("{path}/{name}");
+            watch_path = format!("{watch_path}/{name}");
         }
 
         if ev.mask & (unix::IN_CREATE | unix::IN_MOVED_TO) != 0 {
             w.events.create(&path);
             if is_dir && w.recursive {
                 let _ = walk_dir(
-                    &path,
+                    &watch_path,
                     true,
                     Some(&mut |p: &str, p_is_dir: bool| -> Result<(), GoError> {
                         if !p_is_dir {
                             return Ok(());
                         }
-                        let _ = self.watch_dir(w, p);
+                        let _ = self.watch_dir(w, &w.display_path(p), p);
                         Ok(())
                     }),
                 );

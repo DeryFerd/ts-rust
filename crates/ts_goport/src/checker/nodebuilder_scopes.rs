@@ -174,14 +174,9 @@ impl Checker {
                     // PORT: Go `originalParameters != nil`. A nil and an empty slice
                     // are the same here.
                     if !original_parameters.is_empty() && original_param != param {
-                        // Can't reference parameters that come from an expansion
-                        adds.push((self.sym(param).name.to_string(), self.unknown_symbol));
-                        // Can't reference the original expanded parameter either
+                        // Can't reference the expanded parameter name, just the original, unless we've expanded the param list for some reason
                         if original_param.is_some() {
-                            adds.push((
-                                self.sym(original_param).name.to_string(),
-                                self.unknown_symbol,
-                            ));
+                            adds.push((self.sym(original_param).name.to_string(), original_param));
                         }
                     } else {
                         let declarations = self.sym(param).declarations.clone();

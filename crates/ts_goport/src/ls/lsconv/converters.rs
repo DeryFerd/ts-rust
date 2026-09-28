@@ -52,6 +52,12 @@ pub fn new_converters(
 }
 
 impl Converters {
+    /// The position encoding. A cross-project search thread makes its own
+    /// converters with it (`ls/search_thread.rs`).
+    pub fn position_encoding(&self) -> lsproto::PositionEncodingKind {
+        self.position_encoding.clone()
+    }
+
     /// Go `c.getLineMap(fileName)` followed by a dereference.
     // PORT: Go dereferences the returned pointer, which panics when it is nil.
     fn line_map_of(&self, file_name: &str) -> Rc<LSPLineMap> {

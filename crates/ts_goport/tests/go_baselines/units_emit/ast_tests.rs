@@ -756,6 +756,28 @@ fn test_position_map_multiple_non_ascii() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
+// Go: ast/positionmap_test.go:123 TestPositionMapLoneSurrogateSentinel
+// PORT: `encode_js_string_rune` writes the port form of the lone surrogate
+// (see `scanner_util::GO_STRING_MARKER`), so `text.len()` is its port length.
+#[test]
+fn test_position_map_lone_surrogate_sentinel() {
+    let text = "a".to_string() + &encode_js_string_rune(0xD800) + "b";
+    let pm = compute_position_map(&text);
+    assert!(!pm.is_ascii_only(), "expected non-ASCII");
+
+    let len = text.len() as i32;
+    let mut errors = Vec::new();
+    let got = pm.utf8_to_utf16(len);
+    if got != 3 {
+        errors.push(format!("UTF8ToUTF16({len}) = {got}, want 3"));
+    }
+    let got = pm.utf16_to_utf8(2);
+    if got != len - 1 {
+        errors.push(format!("UTF16ToUTF8(2) = {got}, want {}", len - 1));
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
 // Go: ast/positionmap_test.go:122 TestPositionMapRoundtrip
 #[test]
 fn test_position_map_roundtrip() {

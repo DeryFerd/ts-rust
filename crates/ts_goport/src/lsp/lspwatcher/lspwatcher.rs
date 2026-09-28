@@ -417,26 +417,15 @@ impl Watcher {
     }
 
     // Go: lsp/lspwatcher/lspwatcher.go:392 Watcher.forwardEvents
-    // forwardEvents translates fswatch events rooted at watchedDirectory into LSP
-    // file events (remapping paths back into the requestedDirectory namespace) and
-    // enqueues them for the next debounced flush.
-    pub fn forward_events(
-        self: &Rc<Self>,
-        watched_directory: &str,
-        requested_directory: &str,
-        kind: lsproto::WatchKind,
-        events: &[fswatch::Event],
-    ) {
+    // forwardEvents translates fswatch events into LSP file events and enqueues
+    // them for the next debounced flush.
+    pub fn forward_events(self: &Rc<Self>, kind: lsproto::WatchKind, events: &[fswatch::Event]) {
         if self.closed.get() {
             return;
         }
         {
             let mut pending = self.pending.borrow_mut();
             let pending = pending.get_or_insert_with(|| IndexMap::with_capacity(events.len()));
-            let compare_paths_options = tspath::ComparePathsOptions {
-                use_case_sensitive_file_names: self.fs.use_case_sensitive_file_names(),
-                ..Default::default()
-            };
             for event in events {
                 // PORT: Go also has a `default: continue` arm for other kinds;
                 // the Rust enum has only these two.
@@ -460,12 +449,7 @@ impl Watcher {
                     }
                 };
 
-                let path = remap_event_path(
-                    watched_directory,
-                    requested_directory,
-                    &tspath::normalize_slashes(&event.path),
-                    &compare_paths_options,
-                );
+                let path = tspath::normalize_slashes(&event.path);
                 let uri = lsconv::file_name_to_document_uri(&path);
                 pending.insert(
                     uri.0.clone(),
@@ -488,49 +472,36 @@ impl Watcher {
     // Nothing is emitted if the watch doesn't request create notifications.
     pub fn emit_synthetic_creates(
         self: &Rc<Self>,
-        watched_directory: &str,
-        requested_directory: &str,
+        directory: &str,
         kind: lsproto::WatchKind,
         recursive: bool,
     ) {
         if kind.0 & lsproto::WatchKind::CREATE.0 == 0 {
             return;
         }
-        let compare_paths_options = tspath::ComparePathsOptions {
-            use_case_sensitive_file_names: self.fs.use_case_sensitive_file_names(),
-            ..Default::default()
-        };
-        let mut paths: Vec<String> = vec![requested_directory.to_string()];
+        let mut paths: Vec<String> = vec![directory.to_string()];
         if recursive {
-            let _ = self.fs.walk_dir(
-                watched_directory,
-                &mut |path: &str,
-                      _entry: Option<&vfs::DirEntry>,
-                      err: Option<vfs::FsError>|
-                 -> Result<(), vfs::FsError> {
-                    if err.is_some() {
-                        return Ok(());
-                    }
-                    let normalized_path = tspath::normalize_slashes(path);
-                    if normalized_path == watched_directory {
-                        return Ok(());
-                    }
-                    paths.push(remap_event_path(
-                        watched_directory,
-                        requested_directory,
-                        &normalized_path,
-                        &compare_paths_options,
-                    ));
-                    Ok(())
-                },
-            );
+            let _ = self.fs.walk_dir(directory, &mut |path: &str,
+                                                      _entry: Option<&vfs::DirEntry>,
+                                                      err: Option<vfs::FsError>|
+             -> Result<(), vfs::FsError> {
+                if err.is_some() {
+                    return Ok(());
+                }
+                let normalized_path = tspath::normalize_slashes(path);
+                if normalized_path == directory {
+                    return Ok(());
+                }
+                paths.push(normalized_path);
+                Ok(())
+            });
         } else {
-            let entries = self.fs.get_accessible_entries(watched_directory);
+            let entries = self.fs.get_accessible_entries(directory);
             for name in &entries.files {
-                paths.push(tspath::combine_paths(requested_directory, &[name]));
+                paths.push(tspath::combine_paths(directory, &[name]));
             }
             for name in &entries.directories {
-                paths.push(tspath::combine_paths(requested_directory, &[name]));
+                paths.push(tspath::combine_paths(directory, &[name]));
             }
         }
         self.enqueue_synthetic_creates(&paths);
@@ -633,7 +604,7 @@ impl Watch {
                 if self.watching_target.get() && self.subscription.borrow().is_some() {
                     return Ok(()); // already watching the target
                 }
-                let target_directory = watcher.fs.realpath(&self.requested_directory);
+                let target_directory = self.requested_directory.clone();
                 let mut options: Vec<Box<dyn fswatch::WatchOption>> = Vec::new();
                 if self.recursive {
                     options.push(fswatch::with_recursive());
@@ -650,12 +621,7 @@ impl Watch {
                     let _ = previous.close();
                 }
                 if emit_synthetic_creates {
-                    watcher.emit_synthetic_creates(
-                        &target_directory,
-                        &self.requested_directory,
-                        self.kind,
-                        self.recursive,
-                    );
+                    watcher.emit_synthetic_creates(&target_directory, self.kind, self.recursive);
                 }
                 return Ok(());
             }
@@ -671,7 +637,7 @@ impl Watch {
                 }
                 return Ok(());
             }
-            let ancestor_directory = watcher.fs.realpath(&ancestor);
+            let ancestor_directory = ancestor;
             if !self.watching_target.get()
                 && self.subscription.borrow().is_some()
                 && *self.watched_directory.borrow() == ancestor_directory
@@ -732,7 +698,7 @@ impl Watch {
                 }
             }
             if !events.is_empty() {
-                watcher.forward_events(&watched_directory, &w.requested_directory, w.kind, &events);
+                watcher.forward_events(w.kind, &events);
             }
             if terminated {
                 // The delete event for the directory was forwarded above; now
@@ -792,34 +758,6 @@ pub fn nearest_existing_ancestor(fs: &dyn vfs::Fs, dir: &str) -> (String, bool) 
         }
         dir = parent;
     }
-}
-
-// Go: lsp/lspwatcher/lspwatcher.go:507 remapEventPath
-// remapEventPath translates an absolute path observed under watchedDirectory
-// (the canonicalized, symlink-resolved directory actually watched) back into
-// the requestedDirectory namespace the session requested. When the two
-// directories are identical, the path is returned unchanged.
-pub fn remap_event_path(
-    watched_directory: &str,
-    requested_directory: &str,
-    path: &str,
-    compare_paths_options: &tspath::ComparePathsOptions,
-) -> String {
-    if watched_directory == requested_directory {
-        return path.to_string();
-    }
-    if tspath::contains_path(watched_directory, path, compare_paths_options) {
-        let relative = tspath::get_relative_path_from_directory(
-            watched_directory,
-            path,
-            compare_paths_options,
-        );
-        if relative.is_empty() || relative == "." {
-            return requested_directory.to_string();
-        }
-        return tspath::combine_paths(requested_directory, &[&relative]);
-    }
-    path.to_string()
 }
 
 // Go: lsp/lspwatcher/lspwatcher.go:552 watchRoot

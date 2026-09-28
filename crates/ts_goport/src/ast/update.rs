@@ -3096,10 +3096,9 @@ impl NodeFactory {
 // PORT: `Node::attribute_list` returns the same handle but gives NIL for other
 // kinds; this keeps Go's panic from `AsImportAttributes`.
 pub(crate) fn import_attributes_list(node: Node) -> NodeList {
-    match ast_data_of(node) {
-        ts_ast::NodeData::ImportAttributes(d) => {
-            NodeList::from_ts(node.file_index(), Some(&d.attributes))
-        }
-        _ => panic!("AsImportAttributes called on {:?}", node.kind()),
-    }
+    crate::ast::synthetic::list_of!(node, |d| match d {
+        ts_ast::NodeData::ImportAttributes(d) => Some(Some(AnyList::Nodes(&d.attributes))),
+        _ => None,
+    })
+    .unwrap_or_else(|| panic!("AsImportAttributes called on {:?}", node.kind()))
 }

@@ -574,7 +574,7 @@ impl Binder {
         // PERF: query Q7-3. The node data is looked up once here, and the
         // field reads below (modifiers, name) use it. The reads and their
         // order are the same as Go's.
-        let data = ast_data_of(node);
+        let data = parsed_node_data(node);
         debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
         let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
             || is_export_specifier(node) && module_export_name_is_default(node.name_in(data));
@@ -782,11 +782,11 @@ impl Binder {
     // and allocates nothing for an identifier name. `&mut self` only to note
     // a private identifier name in the arena (`note_private_name`).
     pub fn get_declaration_name(&mut self, node: Node) -> Name {
-        self.get_declaration_name_in(node, ast_data_of(node))
+        self.get_declaration_name_in(node, parsed_node_data(node))
     }
 
     /// `get_declaration_name` on `d`, the data of `node` that the caller
-    /// already loaded with `ast_data_of` (query Q7-3). It holds the body.
+    /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
     pub fn get_declaration_name_in(&mut self, node: Node, d: &'static NodeData) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
@@ -880,7 +880,10 @@ impl Binder {
 //
 // PORT: Go `ast.GetSymbolId` hands out lazy global ids. Here the arena index
 // is the symbol id. It is stable because every checker arena starts as a
-// clone of the binder arena, and it is unique, which is all the name needs.
+// clone of the binder arena, and it is unique, which is all the name needs
+// inside the process. Go binds files in parallel, and each file into its own
+// arena here, so a bind cannot give the Go id. Where Go shows `symbol.Name`
+// outside the process (the API), `go_symbol_name` puts the id back.
 pub fn get_symbol_name_for_private_identifier(
     symbols: &SymbolArena,
     containing_class_symbol: SymbolId,
@@ -890,6 +893,51 @@ pub fn get_symbol_name_for_private_identifier(
     format!(
         "{}#{}@{}",
         INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
+    )
+}
+
+/// Rust-only: the text of Go `symbol.Name` for `symbol`, as the API returns
+/// it (Go api/session.go:75 `newSymbolResponse`). A private identifier name
+/// holds the arena index of its class
+/// (`get_symbol_name_for_private_identifier`). Go holds `ast.GetSymbolId` of
+/// the class there, which is also the API handle of the class (Go
+/// api/proto.go:40 `SymbolHandle`). This returns the name with that id
+/// (`get_symbol_id`). Other names come back as they are. Only a symbol that
+/// a private identifier declares has such a name, as in
+/// `SymbolArena::prepare_file_arena`; a name that source text spells stays.
+#[must_use]
+pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    let s = symbols.sym(symbol);
+    let name = s.name.as_str();
+    if !s.name.is_internal() {
+        return name.to_string();
+    }
+    let Some(rest) = name
+        .strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX)
+        .and_then(|rest| rest.strip_prefix('#'))
+    else {
+        return name.to_string();
+    };
+    let Some(at) = rest.find('@') else {
+        return name.to_string();
+    };
+    let Ok(class) = rest[..at].parse::<u32>() else {
+        return name.to_string();
+    };
+    if class == 0
+        || class as usize >= symbols.symbol_count()
+        || !s
+            .declarations
+            .iter()
+            .any(|&declaration| is_private_identifier(get_name_of_declaration(declaration)))
+    {
+        return name.to_string();
+    }
+    format!(
+        "{}#{}{}",
+        INTERNAL_SYMBOL_NAME_PREFIX,
+        get_symbol_id(symbols, SymbolId(class)),
+        &rest[at..]
     )
 }
 
@@ -1358,7 +1406,7 @@ impl Binder {
         // (like TypeLiterals for example) will not be put in any table.
         // PORT: the kind is read once. The binder never changes a node's kind.
         // PERF: query Q7-3. The property, method and accessor arms load the
-        // node data once (`ast_data_of`) and pass it on, so their field reads
+        // node data once (`parsed_node_data`) and pass it on, so their field reads
         // (`postfix_token`, `modifiers`, `name`) skip the node lookup.
         let kind = node.kind();
         match kind {
@@ -1441,12 +1489,12 @@ impl Binder {
                 self.bind_variable_declaration_or_binding_element(node);
             }
             SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
-                self.bind_property_worker(node, ast_data_of(node));
+                self.bind_property_worker(node, parsed_node_data(node));
             }
             SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::PROPERTY,
                     SymbolFlags::PROPERTY_EXCLUDES,
                 );
@@ -1454,7 +1502,7 @@ impl Binder {
             SyntaxKind::EnumMember => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::ENUM_MEMBER,
                     SymbolFlags::ENUM_MEMBER_EXCLUDES,
                 );
@@ -1469,7 +1517,7 @@ impl Binder {
                 );
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
-                let d = ast_data_of(node);
+                let d = parsed_node_data(node);
                 // Go `ast.IsObjectLiteralMethod(node)` with the kind known.
                 let excludes = if kind == SyntaxKind::MethodDeclaration
                     && node.parent().kind() == SyntaxKind::ObjectLiteralExpression
@@ -1498,7 +1546,7 @@ impl Binder {
             SyntaxKind::GetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::GET_ACCESSOR,
                     SymbolFlags::GET_ACCESSOR_EXCLUDES,
                 );
@@ -1506,7 +1554,7 @@ impl Binder {
             SyntaxKind::SetAccessor => {
                 self.bind_property_or_method_or_accessor(
                     node,
-                    ast_data_of(node),
+                    parsed_node_data(node),
                     SymbolFlags::SET_ACCESSOR,
                     SymbolFlags::SET_ACCESSOR_EXCLUDES,
                 );

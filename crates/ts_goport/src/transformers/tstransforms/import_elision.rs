@@ -49,6 +49,14 @@ impl TransformerVisit for ImportElisionTransformer {
 
     // Go: transformers/tstransforms/importelision.go:27 ImportElisionTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
+        // PORT: Go also tests `tx.emitResolver != nil`; the Rust transformer
+        // always has one.
+        if is_source_file(node) {
+            let original = self.emit_context.most_original(node);
+            self.emit_resolver
+                .mark_linked_references_recursively(original);
+        }
+
         let ec = self.emit_context.clone();
         let f = ec.factory();
         match node.kind() {

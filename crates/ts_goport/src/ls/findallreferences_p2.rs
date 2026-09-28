@@ -5,9 +5,7 @@
 use crate::ls::prelude::*;
 
 use crate::astnav;
-use crate::frontend::compiler;
 use crate::gostd::Context;
-use crate::program::ls_program;
 
 // PORT (whole file):
 // - The types of Go lines 29-473 (`ReferenceEntry`, `SymbolAndEntries`,
@@ -15,7 +13,10 @@ use crate::program::ls_program;
 //   `*ReferenceEntry` and `*SymbolAndEntries` are `Rc<RefCell<..>>`
 //   (map-ls-navigation 2.2).
 // - Go `*checker.Checker` parameters are `&mut Checker`. `refState` holds the
-//   checker for the whole search (`RefState<'c>`).
+//   checker for the whole search (`RefState<'c, P>`).
+// - Go `*compiler.Program` parameters are `program: P` with
+//   `P: ProgramView` (program_view.rs), so that the search can run on a
+//   search thread.
 // - Go `[]*ast.SourceFile` is `&[Node]` (file roots). The source file name set
 //   (`*collections.Set[string]`) is `&FxHashSet<String>`.
 // - Go positions (`int`) are `i32` byte offsets.
@@ -25,7 +26,7 @@ use crate::program::ls_program;
 //   and empty are the same `Vec` unless a caller tells them apart (then the
 //   function returns `Option<Vec<..>>` and says so).
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:1246 (*LanguageService).getReferencesForStringLiteral
     pub fn get_references_for_string_literal(
         &self,
@@ -100,7 +101,7 @@ pub fn is_string_literal_property_reference(
     false
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:1293 (*LanguageService).getReferencedSymbolsForModuleIfDeclaredBySourceFile
     // PORT: returns None for Go nil. The caller (`getReferencedSymbolsForNode`)
     // tests `moduleReferences != nil`, and an empty non-nil result stops the
@@ -110,7 +111,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         symbol: SymbolId,
-        program: &'static compiler::NewProgram,
+        program: P,
         source_files: &[Node],
         checker: &mut Checker,
         options: RefOptions,
@@ -659,9 +660,9 @@ pub fn find_first_jsx_node(root: Node) -> Node {
 }
 
 // Go: ls/findallreferences.go:1610 getReferencesForNonModule
-pub fn get_references_for_non_module(
+pub fn get_references_for_non_module<P: ProgramView>(
     _referenced_file: Node,
-    _program: &'static compiler::NewProgram,
+    _program: P,
 ) -> Vec<Rc<RefCell<ReferenceEntry>>> {
     // !!! not implemented
     Vec::new()
@@ -685,7 +686,7 @@ pub fn get_merged_aliased_symbol_of_namespace_export_declaration(
     SymbolId::NIL
 }
 
-impl LanguageService {
+impl<P: ProgramView> LanguageService<P> {
     // Go: ls/findallreferences.go:1627 (*LanguageService).getReferencedSymbolsForModule
     // PORT: Go gets the request checker here (`program.GetTypeChecker(ctx)`)
     // and runs the rest of the body with it. That body is
@@ -697,13 +698,13 @@ impl LanguageService {
     pub fn get_referenced_symbols_for_module(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: P,
         symbol: SymbolId,
         exclude_import_type_of_export_equals: bool,
         source_files: &[Node],
         source_files_set: &FxHashSet<String>,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
-        let (checker, _done) = ls_program::get_type_checker(program, ctx);
+        let (checker, _done) = program.get_type_checker(ctx);
         let c = &mut *checker.borrow_mut();
         self.get_referenced_symbols_for_module_worker(
             program,
@@ -720,7 +721,7 @@ impl LanguageService {
     // checker that Go gets there.
     pub fn get_referenced_symbols_for_module_worker(
         &self,
-        program: &'static compiler::NewProgram,
+        program: P,
         symbol: SymbolId,
         exclude_import_type_of_export_equals: bool,
         source_files: &[Node],
@@ -886,9 +887,9 @@ pub fn get_special_search_kind(node: Node) -> &'static str {
 
 // Go: ls/findallreferences.go:1748 getReferencedSymbolsForSymbol
 #[allow(clippy::too_many_arguments)]
-pub fn get_referenced_symbols_for_symbol(
+pub fn get_referenced_symbols_for_symbol<P: ProgramView>(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: P,
     original_symbol: SymbolId,
     node: Node,
     source_files: &[Node],
@@ -1032,13 +1033,13 @@ pub struct InheritKey {
 // and set for the whole search (`'c`). Go `collections.Set[*ast.Node]` node
 // seen trackers are `FxHashSet<Node>`. `symbolToReferences` and
 // `sourceFileToSeenSymbols` are lookups only; `result` keeps the Go order.
-pub struct RefState<'c> {
+pub struct RefState<'c, P> {
     pub source_files: &'c [Node],
     pub source_files_set: &'c FxHashSet<String>,
     pub special_search_kind: &'static str, // "none", "constructor", or "class"
     pub checker: &'c mut Checker,
     pub ctx: &'c Context,
-    pub program: &'static compiler::NewProgram,
+    pub program: P,
     pub search_meaning: SemanticMeaning,
     pub options: RefOptions,
     pub result: Vec<Rc<RefCell<SymbolAndEntries>>>,
@@ -1053,16 +1054,16 @@ pub struct RefState<'c> {
 // Go: ls/findallreferences.go:1821 newState
 // PORT: Go returns `*refState`; the state is returned by value.
 #[allow(clippy::too_many_arguments)]
-pub fn new_state<'c>(
+pub fn new_state<'c, P: ProgramView>(
     ctx: &'c Context,
-    program: &'static compiler::NewProgram,
+    program: P,
     source_files: &'c [Node],
     source_files_set: &'c FxHashSet<String>,
     node: Node,
     checker: &'c mut Checker,
     search_meaning: SemanticMeaning,
     options: RefOptions,
-) -> RefState<'c> {
+) -> RefState<'c, P> {
     RefState {
         source_files,
         source_files_set,
@@ -1082,7 +1083,7 @@ pub fn new_state<'c>(
     }
 }
 
-impl<'c> RefState<'c> {
+impl<'c, P: ProgramView> RefState<'c, P> {
     // Go: ls/findallreferences.go:1837 (*refState).includesSourceFile
     pub fn includes_source_file(&self, source_file: Node) -> bool {
         self.source_files_set
@@ -1346,7 +1347,7 @@ pub fn for_each_descendant_of_kind(node: Node, kind: SyntaxKind, action: &mut dy
     });
 }
 
-impl<'c> RefState<'c> {
+impl<'c, P: ProgramView> RefState<'c, P> {
     // Go: ls/findallreferences.go:2000 (*refState).addImplementationReferences
     pub fn add_implementation_references(&mut self, ref_node: Node, add_ref: &mut dyn FnMut(Node)) {
         // Check if we found a function/propertyAssignment/method with an implementation or initializer

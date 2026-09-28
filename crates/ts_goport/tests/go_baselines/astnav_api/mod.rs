@@ -5,6 +5,7 @@
 //! - `jstest`: internal/testutil/jstest/node.go (runs Node.js scripts).
 //! - `astnav_tokens`: internal/astnav/tokens_test.go (astnav baselines).
 //! - `api_proto`: internal/api/proto_test.go.
+//! - `api_timing`: internal/api/timing_test.go.
 //! - `api_encoder`: internal/api/encoder/{encoder,decoder}_test.go (api baselines).
 //!
 //! PORT: Go `t.Run` subtests run in order through `Subtests` (Go
@@ -14,6 +15,7 @@
 
 mod api_encoder;
 mod api_proto;
+mod api_timing;
 mod astnav_tokens;
 pub(crate) mod jstest;
 

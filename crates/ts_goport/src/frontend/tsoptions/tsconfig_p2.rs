@@ -391,13 +391,11 @@ pub fn parse_config(
                         && raw_map.contains_key(property_name)
                         && let Some(CompilerOptionsValue::List(slice)) = raw_map.get(property_name)
                     {
-                        // PORT: Go `path.(string)` panics for a non-string
-                        // element; so does this port.
                         let value: Vec<CompilerOptionsValue> = slice
                             .iter()
                             .map(|path| {
                                 let CompilerOptionsValue::String(path_str) = path else {
-                                    panic!("interface conversion: path is not string");
+                                    return path.clone();
                                 };
                                 if starts_with_config_dir_template(path)
                                     || is_rooted_disk_path(path_str)
@@ -1197,9 +1195,9 @@ fn get_substituted_string_array_with_config_dir_template(
 }
 
 // Go: tsoptions/tsconfigparsing.go:1554 handleOptionConfigDirTemplateSubstitution
-// PORT: Go `mergeCompilerOptions` copies the `Paths` pointer, so in Go this
-// also changes `paths` of a cached extended config. Here each options value
-// owns its `paths`, so only this config changes.
+// PORT: Go clones the shared `Paths` map before the first change (tsgo#4362)
+// so a cached extended config keeps its value. Each options value here owns
+// its `paths`, so no clone is needed.
 fn handle_option_config_dir_template_substitution(
     compiler_options: Option<&mut CompilerOptions>,
     base_path: &str,

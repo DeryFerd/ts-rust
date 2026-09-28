@@ -44,7 +44,7 @@ impl LanguageService {
         let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let c = &mut *checker.borrow_mut();
         let range_node = get_node_for_quick_info(node);
-        let symbol = get_symbol_at_location_for_quick_info(c, node);
+        let symbol = get_symbol_at_location_for_quick_info(c, range_node);
 
         // Always create VerbosityContext for hover so that canExpandSymbol can signal
         // canIncreaseVerbosity even at Level 0. The nodebuilder also detects expandable
