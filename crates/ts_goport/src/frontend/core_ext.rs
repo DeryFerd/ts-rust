@@ -14,8 +14,11 @@ pub struct TypeAcquisition {
 // Go: core/projectreference.go:5 ProjectReference
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectReference {
+    // Path is a normalized path on disk.
     pub path: String,
+    // OriginalPath is the path as it was originally written.
     pub original_path: String,
+    // Circular indicates that this reference is intended to form a circularity.
     pub circular: bool,
 }
 

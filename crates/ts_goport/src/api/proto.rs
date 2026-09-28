@@ -12,6 +12,11 @@
 //! Go `*T` fields are `Option<T>`; Go `[]*T` fields are `Vec<T>` (no Go
 //! code stores a nil element). Go `any` in `TypeResponse.Value` only holds
 //! JSON primitives, so it is `LspAny`.
+//!
+//! PORT: tsgo#4915 generates the TS API from this Go source
+//! (`_tools/gen-proto`). Its `nonnil`, `deprecated` and `internal` struct
+//! tags and the `@gen-proto-*` comments on the session handlers only steer
+//! that generator. They do not change the JSON, so the port leaves them out.
 
 use crate::api::prelude::*;
 
@@ -200,17 +205,8 @@ pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
 
-    // MethodGetServerTiming retrieves the server's collected per-request
-    // processing-time totals and recent-request ring buffer. It is handled by
-    // the connection itself (not the session) and is not recorded in the timing
-    // it reports.
-    pub const GET_SERVER_TIMING: Method = Method(Cow::Borrowed("getServerTiming"));
-
-    // MethodResetServerTiming clears the server's collected timing totals and
-    // recent-request ring buffer. Like MethodGetServerTiming, it is handled by
-    // the connection itself and is not recorded.
-    pub const RESET_SERVER_TIMING: Method = Method(Cow::Borrowed("resetServerTiming"));
-
+    // tsgo#4915: MethodGetServerTiming and MethodResetServerTiming are gone;
+    // the connection answers them (`ipc::timing`).
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
     // tsgo#4642
@@ -429,6 +425,16 @@ proto_json!(marshal InitializeResponse {
 
 // DocumentIdentifier identifies a document by either a file name (plain string) or a URI object.
 // On the wire it is string | { uri: string }.
+//
+// @example
+//
+// Using a file name:
+//
+//	project.program.getSourceFile("/path/to/file.ts");
+//
+// Using a URI:
+//
+//	project.program.getSourceFile({ uri: "file:///path/to/file.ts" });
 // Go: proto.go:180 DocumentIdentifier
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocumentIdentifier {
@@ -1558,7 +1564,9 @@ pub struct ProjectResponse {
     pub id: ProjectID,
     pub config_file_name: String,
     pub parsed_command_line: Option<ConfigFileResponse>,
+    // Deprecated: Use parsedCommandLine.fileNames.
     pub root_files: Vec<String>,
+    // Deprecated: Use parsedCommandLine.options.
     pub compiler_options: Option<CompilerOptions>,
 }
 
@@ -1751,6 +1759,8 @@ proto_json!(both GetSymbolsAtLocationsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SymbolResponse {
     pub id: SymbolID,
+    // Project is the project in which the symbol was first observed. It is the
+    // default project for follow-up lookups whose results can vary by project.
     pub project: ProjectID,
     pub name: String,
     pub flags: u32,
@@ -1820,7 +1830,8 @@ pub struct TypeResponse {
     pub flags: u32,
     pub object_flags: u32,
 
-    // LiteralType data
+    // Value is literal type data. BigInt literals are encoded as signed decimal
+    // strings because JSON cannot represent bigint; absent values are null.
     pub value: LspAny,
 
     // ObjectType / TypeReference / StringMappingType / IndexType target
@@ -2970,6 +2981,7 @@ proto_json!(marshal IndexInfoResponse {
 // Go: proto.go:959 SourceFileResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SourceFileResponse {
+    // Data is the base64-encoded binary AST data in the encoder's format.
     pub data: String,
 }
 

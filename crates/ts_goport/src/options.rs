@@ -115,7 +115,7 @@ pub fn bool_to_tristate(b: bool) -> Tristate {
 // ---------------------------------------------------------------------------
 
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
-/// Upstream keeps this struct in sync with the API's `compilerOptions.ts`.
+/// CompilerOptions contains the compiler options exposed by the API.
 // Go: core/compileroptions.go:16 CompilerOptions
 // PORT: Go `noCopy` is dropped. Go `[]string` fields are
 // `Option<Vec<String>>`: a nil slice is `None` and an empty non-nil slice is
@@ -241,7 +241,10 @@ pub struct CompilerOptions {
     pub out_file: String,
 
     // Internal fields
-    pub config_file_path: String,
+    // PORT: tsgo#4915 tags these `internal:"true"` (and the deprecated fields
+    // above `deprecated:"true"`) for the TS API generator. The JSON is the
+    // same, so the port has no tags.
+    pub config_file_path: String, // internal, but intentionally exposed via API
     pub no_dts_resolution: Tristate,
     pub paths_base_path: String,
     pub diagnostics: Tristate,
