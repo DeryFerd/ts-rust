@@ -528,7 +528,7 @@ impl Parser {
         {
             self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true /*value*/);
         }
-        let heritage_clauses = self.parse_heritage_clauses();
+        let heritage_clauses = self.parse_heritage_clauses(false /*isInterface*/);
         let members;
         if self.parse_expected(SyntaxKind::OpenBraceToken) {
             // ClassTail[Yield,Await] : (Modified) See 14.5
@@ -614,30 +614,83 @@ pub fn is_async_modifier(modifier: Node) -> bool {
 
 impl Parser {
     // Go: parser/parser.go:1823 parseHeritageClauses
-    pub fn parse_heritage_clauses(&mut self) -> NodeList {
+    pub fn parse_heritage_clauses(&mut self, is_interface: bool) -> NodeList {
         // ClassTail[Yield,Await] : (Modified) See 14.5
         //      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
         if self.is_heritage_clause() {
-            return self.parse_list(
-                ParsingContext::HeritageClauses,
-                Parser::parse_heritage_clause,
-            );
+            return self.parse_list(ParsingContext::HeritageClauses, |p: &mut Parser| {
+                p.parse_heritage_clause(is_interface)
+            });
         }
         NodeList::NIL
     }
 
     // Go: parser/parser.go:1832 parseHeritageClause
-    pub fn parse_heritage_clause(&mut self) -> Node {
+    pub fn parse_heritage_clause(&mut self, is_interface: bool) -> Node {
         let pos = self.node_pos();
         let kind = self.token;
         self.next_token();
-        let types = self.parse_delimited_list(
-            ParsingContext::HeritageClauseElement,
-            Parser::parse_expression_with_type_arguments,
-        );
+        let mut parse_element: fn(&mut Parser) -> Node =
+            Parser::parse_expression_with_type_arguments;
+        if is_type_heritage_clause(is_interface, kind) {
+            parse_element = Parser::parse_type_heritage_clause_element;
+        }
+        let types = self.parse_delimited_list(ParsingContext::HeritageClauseElement, parse_element);
         let node = self.factory.new_heritage_clause(kind, types);
         let node = self.finish_node(node, pos);
         self.check_js_syntax(node)
+    }
+}
+
+// Go: parser/parser.go:1847 isTypeHeritageClause
+pub fn is_type_heritage_clause(is_interface: bool, token: SyntaxKind) -> bool {
+    is_interface && token == SyntaxKind::ExtendsKeyword
+        || !is_interface && token == SyntaxKind::ImplementsKeyword
+}
+
+impl Parser {
+    // Go: parser/parser.go:1852 parseTypeHeritageClauseElement
+    /// Go returns an `*ast.HeritageClauseElement`: a TypeReference, or the
+    /// ExpressionWithTypeArguments when its expression is not an entity name.
+    pub fn parse_type_heritage_clause_element(&mut self) -> Node {
+        let pos = self.node_pos();
+        let expression_with_type_arguments = self.parse_expression_with_type_arguments();
+        if !is_valid_heritage_type_reference_expression(expression_with_type_arguments.expression())
+        {
+            return expression_with_type_arguments;
+        }
+        let type_name = self.convert_entity_name_expression_to_entity_name(
+            expression_with_type_arguments.expression(),
+        );
+        let type_arguments = expression_with_type_arguments.type_argument_list();
+        let result = self
+            .factory
+            .new_type_reference_node(type_name, type_arguments);
+        self.finish_node(result, pos)
+    }
+}
+
+// Go: parser/parser.go:1862 isValidHeritageTypeReferenceExpression
+pub fn is_valid_heritage_type_reference_expression(node: Node) -> bool {
+    if is_identifier(node) {
+        return node_is_present(node);
+    }
+    is_property_access_expression(node)
+        && !is_optional_chain(node)
+        && node_is_present(node.name())
+        && is_valid_heritage_type_reference_expression(node.expression())
+}
+
+impl Parser {
+    // Go: parser/parser.go:1872 convertEntityNameExpressionToEntityName
+    pub fn convert_entity_name_expression_to_entity_name(&mut self, node: Node) -> Node {
+        if is_identifier(node) {
+            return node;
+        }
+        let left = self.convert_entity_name_expression_to_entity_name(node.expression());
+        let right = node.name();
+        let result = self.factory.new_qualified_name(left, right);
+        self.finish_node_with_end(result, node.pos(), node.end())
     }
 
     // Go: parser/parser.go:1840 parseExpressionWithTypeArguments
@@ -1121,7 +1174,7 @@ impl Parser {
         self.parse_expected(SyntaxKind::InterfaceKeyword);
         let name = self.parse_identifier();
         let type_parameters = self.parse_type_parameters();
-        let heritage_clauses = self.parse_heritage_clauses();
+        let heritage_clauses = self.parse_heritage_clauses(true /*isInterface*/);
         let members = self.parse_object_type_members();
         let node = self.factory.new_interface_declaration(
             modifiers,

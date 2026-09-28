@@ -1,5 +1,6 @@
 //! Ports of internal/scanner/scanner_test.go and
-//! internal/parser/parser_test.go (TestJSDocImportTypeParentChain,
+//! internal/parser/parser_test.go (TestHeritageClauseElementKinds,
+//! TestJSDocImportTypeParentChain,
 //! TestJSDocTypeSourceSurvivesReparse,
 //! TestJSDocTypeSourcePropagatesToConstructedReparse and
 //! TestSourceFilePositionMapWithNonASCIIStringLiteral; the Go benchmark and
@@ -35,6 +36,72 @@ fn test_scan_string_preserves_lone_surrogates() {
         + &encode_js_string_rune(0xD801)
         + "🦀";
     assert_eq!(s.token_value(), expected);
+}
+
+// Go: parser/parser_test.go:166 TestHeritageClauseElementKinds
+#[test]
+fn test_heritage_clause_element_kinds() {
+    let source_text = r#"
+class C extends Base<number> implements Contract<string> {}
+interface I extends Parent<boolean> {}
+interface Invalid implements Recovery {}
+interface MissingExtends extends A. {}
+class MissingImplements implements B. {}
+"#;
+    let opts = SourceFileParseOptions {
+        file_name: "/index.ts".to_string(),
+        path: Path("/index.ts".to_string()),
+        ..Default::default()
+    };
+
+    let file = parse_source_file(&opts, leak(source_text), ScriptKind::TS);
+    let statements = file.statements().nodes();
+    // Go `decl.HeritageClauses.Nodes[clause].AsHeritageClause().Types.Nodes[0].Kind`.
+    let first_element_kind = |decl: Node, clause: usize| {
+        decl.heritage_clauses()
+            .nodes()
+            .get(clause)
+            .types()
+            .nodes()
+            .get(0)
+            .kind()
+    };
+
+    let class_decl = statements.get(0);
+    assert!(is_class_declaration(class_decl));
+    assert_eq!(
+        first_element_kind(class_decl, 0),
+        SyntaxKind::ExpressionWithTypeArguments
+    );
+    assert_eq!(first_element_kind(class_decl, 1), SyntaxKind::TypeReference);
+
+    let interface_decl = statements.get(1);
+    assert!(is_interface_declaration(interface_decl));
+    assert_eq!(
+        first_element_kind(interface_decl, 0),
+        SyntaxKind::TypeReference
+    );
+
+    let invalid_interface_decl = statements.get(2);
+    assert!(is_interface_declaration(invalid_interface_decl));
+    assert_eq!(
+        first_element_kind(invalid_interface_decl, 0),
+        SyntaxKind::ExpressionWithTypeArguments
+    );
+
+    let missing_extends_decl = statements.get(3);
+    assert!(is_interface_declaration(missing_extends_decl));
+    assert_eq!(
+        first_element_kind(missing_extends_decl, 0),
+        SyntaxKind::ExpressionWithTypeArguments
+    );
+
+    let missing_implements_decl = statements.get(4);
+    assert!(is_class_declaration(missing_implements_decl));
+    assert_eq!(
+        first_element_kind(missing_implements_decl, 0),
+        SyntaxKind::ExpressionWithTypeArguments
+    );
 }
 
 // Go: parser/parser_test.go:164 TestJSDocImportTypeParentChain

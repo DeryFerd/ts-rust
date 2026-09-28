@@ -799,15 +799,36 @@ pub fn is_expression_with_type_arguments_in_class_extends_clause(node: Node) -> 
 
 // Go: ast/utilities.go:1411 TryGetClassExtendingExpressionWithTypeArguments
 pub fn try_get_class_extending_expression_with_type_arguments(node: Node) -> Node {
+    if !is_expression_with_type_arguments(node) {
+        return Node::NIL;
+    }
     let (cls, is_implements) =
-        try_get_class_implementing_or_extending_expression_with_type_arguments(node);
+        try_get_class_implementing_or_extending_heritage_clause_element(node);
     if cls.is_some() && !is_implements {
         return cls;
     }
     Node::NIL
 }
 
+// Go: ast/utilities.go:1445 TryGetClassImplementingOrExtendingHeritageClauseElement
+/// Returns `(class, isImplements)`.
+pub fn try_get_class_implementing_or_extending_heritage_clause_element(node: Node) -> (Node, bool) {
+    if (is_expression_with_type_arguments(node) || is_type_reference_node(node))
+        && is_heritage_clause(node.parent())
+        && is_class_like(node.parent().parent())
+    {
+        return (
+            node.parent().parent(),
+            node.parent().token() == SyntaxKind::ImplementsKeyword,
+        );
+    }
+    (Node::NIL, false)
+}
+
 // Go: ast/utilities.go:1419 TryGetClassImplementingOrExtendingExpressionWithTypeArguments
+// PORT: Go replaced this with `TryGetClassImplementingOrExtendingHeritageClauseElement`
+// in tsgo#4797. It stays until its last Rust user (`checker/checker_p35.rs`,
+// `get_type_of_node`) ports its part.
 /// Returns `(class, isImplements)`.
 pub fn try_get_class_implementing_or_extending_expression_with_type_arguments(
     node: Node,
@@ -1176,6 +1197,8 @@ pub fn get_containing_class(node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:1697 GetExtendsHeritageClauseElement
+// PORT: Go removed this in tsgo#4797 (callers use `GetClassExtendsHeritageElement`).
+// It stays until its last Rust users (the checker files) port their part.
 pub fn get_extends_heritage_clause_element(node: Node) -> Node {
     // Go: core.FirstOrNil
     get_extends_heritage_clause_elements(node)
@@ -1195,12 +1218,33 @@ pub fn get_implements_heritage_clause_elements(node: Node) -> Vec<Node> {
 }
 
 // Go: ast/utilities.go:1709 GetHeritageElements
+/// Go returns `[]*HeritageClauseElement`: ExpressionWithTypeArguments or
+/// TypeReference nodes (tsgo#4797).
 pub fn get_heritage_elements(node: Node, kind: SyntaxKind) -> Vec<Node> {
     let clause = get_heritage_clause(node, kind);
     if clause.is_some() {
         return clause.types().nodes().to_vec();
     }
     Vec::new()
+}
+
+// Go: ast/utilities.go:1739 GetHeritageClauseElementName
+/// GetHeritageClauseElementName returns the expression or type name of a heritage clause element.
+pub fn get_heritage_clause_element_name(node: Node) -> Node {
+    if is_type_reference_node(node) {
+        return node.type_name();
+    }
+    node.expression()
+}
+
+// Go: ast/utilities.go:1746 IsNameOfHeritageClauseTypeReference
+pub fn is_name_of_heritage_clause_type_reference(mut node: Node) -> bool {
+    while is_qualified_name(node.parent()) {
+        node = node.parent();
+    }
+    is_type_reference_node(node.parent())
+        && node.parent().type_name() == node
+        && is_heritage_clause(node.parent().parent())
 }
 
 // Go: ast/utilities.go:1717 GetHeritageClause

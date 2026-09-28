@@ -7127,7 +7127,7 @@ impl Parser {
         {
             self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true);
         }
-        let heritage_clauses = self.parse_heritage_clauses();
+        let heritage_clauses = self.parse_heritage_clauses(false /*isInterface*/);
         let members = if self.parse_expected(SyntaxKind::OpenBraceToken) {
             let members = self.parse_list(ParsingContext::ClassMembers, Self::parse_class_element);
             self.parse_expected(SyntaxKind::CloseBraceToken);
@@ -7174,25 +7174,60 @@ impl Parser {
     }
 
     // Go: parser.go:1823 parseHeritageClauses
-    fn parse_heritage_clauses(&mut self) -> NodeList {
+    fn parse_heritage_clauses(&mut self, is_interface: bool) -> NodeList {
         if self.is_heritage_clause() {
-            return self.parse_list(ParsingContext::HeritageClauses, Self::parse_heritage_clause);
+            return self.parse_list(ParsingContext::HeritageClauses, |p: &mut Self| {
+                p.parse_heritage_clause(is_interface)
+            });
         }
         NodeList::NIL
     }
 
     // Go: parser.go:1832 parseHeritageClause
     // PORT: checkJSSyntax is not ported; this parser only parses TS files.
-    fn parse_heritage_clause(&mut self) -> Node {
+    fn parse_heritage_clause(&mut self, is_interface: bool) -> Node {
         let pos = self.node_pos();
         let kind = self.token;
         self.next_token();
-        let types = self.parse_delimited_list(
-            ParsingContext::HeritageClauseElement,
-            Self::parse_expression_with_type_arguments,
-        );
+        let mut parse_element: fn(&mut Self) -> Node = Self::parse_expression_with_type_arguments;
+        if crate::frontend::parser::is_type_heritage_clause(is_interface, kind) {
+            parse_element = Self::parse_type_heritage_clause_element;
+        }
+        let types = self.parse_delimited_list(ParsingContext::HeritageClauseElement, parse_element);
         let n = self.factory.new_heritage_clause(kind, types);
         self.finish_node(n, pos)
+    }
+
+    // Go: parser.go:1852 parseTypeHeritageClauseElement
+    // PORT: Go `isValidHeritageTypeReferenceExpression` is the free function
+    // of the Go frontend parser (`frontend/parser/parser_p2.rs`).
+    fn parse_type_heritage_clause_element(&mut self) -> Node {
+        let pos = self.node_pos();
+        let expression_with_type_arguments = self.parse_expression_with_type_arguments();
+        if !crate::frontend::parser::is_valid_heritage_type_reference_expression(
+            expression_with_type_arguments.expression(),
+        ) {
+            return expression_with_type_arguments;
+        }
+        let type_name = self.convert_entity_name_expression_to_entity_name(
+            expression_with_type_arguments.expression(),
+        );
+        let type_arguments = expression_with_type_arguments.type_argument_list();
+        let n = self
+            .factory
+            .new_type_reference_node(type_name, type_arguments);
+        self.finish_node(n, pos)
+    }
+
+    // Go: parser.go:1872 convertEntityNameExpressionToEntityName
+    fn convert_entity_name_expression_to_entity_name(&mut self, node: Node) -> Node {
+        if is_identifier(node) {
+            return node;
+        }
+        let left = self.convert_entity_name_expression_to_entity_name(node.expression());
+        let right = node.name();
+        let n = self.factory.new_qualified_name(left, right);
+        self.finish_node_with_end(n, node.pos(), node.end())
     }
 
     // Go: parser.go:1840 parseExpressionWithTypeArguments
