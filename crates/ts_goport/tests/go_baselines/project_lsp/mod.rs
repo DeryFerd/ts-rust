@@ -57,6 +57,7 @@ mod configfilechanges_test;
 mod customconfigfilename_test;
 mod dirty_syncmap_test;
 mod extendedconfigcache_test;
+mod file_version_test;
 mod logging_logtree_test;
 mod lsp_dynamic_queue_test;
 mod lsp_progress_test;

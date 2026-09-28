@@ -53,6 +53,13 @@ pub struct ParsedSourceFile {
     /// If this is the SourceFile itself, then this module was "forced"
     /// to be an external module (previously "true").
     pub external_module_indicator: Node,
+    /// The owner of this file version when it can be freed: set by the
+    /// language server parse cache for a path that was published before
+    /// (`ast::freeable_path`). Every holder of the parse keeps the version
+    /// alive (lsshells M3a).
+    // PORT: no Go field. Go's GC frees the `SourceFile` when no program and
+    // no parse cache entry holds it.
+    pub version: std::cell::OnceCell<std::sync::Arc<crate::ast::FileVersion>>,
 }
 
 impl ParsedSourceFile {
@@ -101,6 +108,7 @@ impl ParsedSourceFile {
             text_count: 0,
             common_js_module_indicator: Node::NIL,
             external_module_indicator: Node::NIL,
+            version: std::cell::OnceCell::new(),
         }
     }
 

@@ -256,7 +256,7 @@ The batch that adds it is not accepted until Theo approves.
   frontend and the tables of a version. The frontend `NewProgram` goes
   with its last `Rc` holder. Its parses stay: the publish that gives a
   file its `GoFile` keeps that file's parse, because the `GoFile` borrows
-  it. `GoSharedState` owns its copies of the frontend data (the
+  it (a freeable file version, below, is the exception). `GoSharedState` owns its copies of the frontend data (the
   resolutions are `Arc<ResolvedModule>`, one per frontend resolution). Each checker worker frees its
   checker and the synthetic nodes it made (`free_synthetic_nodes`), and
   each emit thread frees its synthetic nodes. A worker, bind, emit or
@@ -268,6 +268,20 @@ The batch that adds it is not accepted until Theo approves.
   runs and a field fallback). The `GoProgram` shell and the file versions
   stay leaked for now. A one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go.
+- Freeable file versions (lsshells M3a, `ast/file_version.rs`). In a
+  language server or API process (`project::new_session`), a parse cache
+  parse of a path that a publish on this thread published before gets a
+  `FileVersion`. Its parse holds it (`ParsedSourceFile::version`), and so
+  do the `VersionTables` of each program version that has the file, so a
+  seeded thread keeps it too. The registry keeps a `Weak`. Its `GoFile`
+  borrows leaked copies of the parse lists, so the publish keeps no parse.
+  When its last holder lets go, each per-file thread-local map
+  (`PerFileMap`: `SOURCE_FILE_DATA`, `TOKEN_CACHES`, `TOKEN_FACTORIES`,
+  `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`) forgets the entries of the
+  file at its next write. The store, the node data and the `GoFile` stay
+  leaked for now. Tier 0, the first version of each file and every CLI
+  publish never get one. `GOPORT_FREE_FILE_VERSIONS=0` turns this off,
+  `=1` turns it on in any process.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task

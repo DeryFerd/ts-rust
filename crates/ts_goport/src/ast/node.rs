@@ -2085,10 +2085,12 @@ thread_local! {
     /// we keep one per node: a leaked slice for a parsed node, a slice of the
     /// thread's synthetic arena for a factory node (see `Node::decorators`).
     static DECORATORS: RefCell<FxHashMap<Node, NodeSlice>> = RefCell::new(FxHashMap::default());
-    /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node.
-    static SUBTREE_FACTS: RefCell<FxHashMap<Node, SubtreeFacts>> = RefCell::new(FxHashMap::default());
-    /// Go `Node.Text()` results that Go builds with string concatenation.
-    static JOINED_TEXT: RefCell<FxHashMap<Node, &'static str>> = RefCell::new(FxHashMap::default());
+    /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node. It forgets
+    /// the nodes of dead file versions (`PerFileMap`, lsshells M3a).
+    static SUBTREE_FACTS: RefCell<PerFileMap<SubtreeFacts>> = const { RefCell::new(PerFileMap::new()) };
+    /// Go `Node.Text()` results that Go builds with string concatenation. It
+    /// forgets the nodes of dead file versions (`PerFileMap`).
+    static JOINED_TEXT: RefCell<PerFileMap<&'static str>> = const { RefCell::new(PerFileMap::new()) };
     /// Empty Go member lists of parsed mapped types (see `mapped_type_members`).
     static MAPPED_TYPE_MEMBERS: RefCell<FxHashMap<Node, &'static ts_ast::NodeList>> =
         RefCell::new(FxHashMap::default());
@@ -2366,7 +2368,7 @@ impl Node {
             return facts;
         }
         let facts = compute_subtree_facts(self).without(SubtreeFacts::COMPUTED);
-        SUBTREE_FACTS.with(|c| c.borrow_mut().insert(self, facts));
+        SUBTREE_FACTS.with(|c| c.borrow_mut().write().insert(self, facts));
         facts
     }
 
@@ -2529,7 +2531,7 @@ fn joined_text(n: Node, build: impl FnOnce() -> String) -> &'static str {
         return s;
     }
     let s: &'static str = Name::from(build()).as_str();
-    JOINED_TEXT.with(|c| c.borrow_mut().insert(n, s));
+    JOINED_TEXT.with(|c| c.borrow_mut().write().insert(n, s));
     s
 }
 

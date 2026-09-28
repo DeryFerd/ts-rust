@@ -96,6 +96,16 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
                     parser::parse_source_file(&opts, text, key.script_kind)
                 }
             };
+            // Not in Go: a new version of a published path can be freed. The
+            // holders of the parse (programs, cache entries) keep it alive
+            // (lsshells M3a, `ast/file_version.rs`).
+            if crate::ast::freeable_path(&key.path.0) {
+                assert!(
+                    file.version
+                        .set(crate::ast::FileVersion::new(file.store))
+                        .is_ok()
+                );
+            }
             let file = Rc::new(file);
             // PORT: the next program version publishes the file's store. A
             // version that does not include the file (a package duplicate, an

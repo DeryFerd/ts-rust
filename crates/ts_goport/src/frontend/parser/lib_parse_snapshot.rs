@@ -867,6 +867,8 @@ impl<'a> Decoder<'a> {
             text_count: self.usize()?,
             common_js_module_indicator: self.node()?,
             external_module_indicator: self.node()?,
+            // A lib file is never freed.
+            version: std::cell::OnceCell::new(),
         })
     }
 }
@@ -1625,6 +1627,7 @@ impl Encoder {
             text_count,
             common_js_module_indicator,
             external_module_indicator,
+            version: _,
         } = file;
         if *store != self.store {
             return Err("the file is in another store".into());

@@ -175,7 +175,8 @@ pub struct SourceFileInfo {
     pub comment_directives: Vec<CommentDirective>,
     // PERF: the diagnostic lists borrow the parsed file of the Go frontend
     // instead of copying it. The publish of the file keeps that parse for
-    // good (see `go_files_of_unpublished_stores`). The legacy path leaks its
+    // good (see `go_files_of_unpublished_stores`), except for a freeable
+    // file version, which borrows leaked copies. The legacy path leaks its
     // own lists.
     pub diagnostics: &'static [Diagnostic],
     pub js_diagnostics: &'static [Diagnostic],
@@ -560,6 +561,10 @@ pub(crate) struct VersionTables {
     /// (`GOPORT_FRONTEND=go`). None on the legacy path. The frontend program
     /// itself is in `FRONTENDS`, on the loading thread only.
     go: Option<go_frontend::GoSharedState>,
+    /// The freeable file versions of the program files (lsshells M3a). A
+    /// thread that holds the tables keeps them alive, so a worker thread can
+    /// read its program files after the frontend program is freed.
+    file_versions: Vec<Arc<crate::ast::FileVersion>>,
 }
 
 impl VersionTables {
@@ -574,6 +579,7 @@ impl VersionTables {
             file_associations: OnceLock::new(),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             go: None,
+            file_versions: Vec::new(),
         }
     }
 
@@ -899,7 +905,16 @@ pub fn new_alias_resolver_program(
         resolved_modules: OnceLock::from(IndexMap::new()),
         common_source_directory: OnceLock::new(),
         alias_resolver: true,
-        tables: TablesSlot::new(VersionTables::new(file_by_path), false),
+        // The files stay alive while the alias resolver program reads them.
+        tables: TablesSlot::new(
+            VersionTables {
+                file_versions: crate::ast::live_file_versions(
+                    files.iter().map(|file| file.file_index()),
+                ),
+                ..VersionTables::new(file_by_path)
+            },
+            false,
+        ),
     }));
     assert!(program.state.set(program_state).is_ok());
     register_program_version(program);
@@ -4026,7 +4041,9 @@ thread_local! {
 /// cross-project search threads start from it too (`ls/search_thread.rs`).
 /// The thread keeps its copy of the program tables until it ends, so it can
 /// finish its work after the program is released, as a Go goroutine that
-/// holds the program does.
+/// holds the program does. The tables hold the freeable file versions of
+/// the program files (`VersionTables::file_versions`), so the thread keeps
+/// those alive too.
 pub(crate) struct WorkerSeed {
     program: &'static GoProgram,
     tables: Option<(u32, Arc<VersionTables>)>,

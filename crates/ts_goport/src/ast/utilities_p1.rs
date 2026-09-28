@@ -12,7 +12,9 @@ use crate::prelude::*;
 thread_local! {
     static NEXT_NODE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NEXT_SYMBOL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static NODE_IDS: RefCell<FxHashMap<Node, u64>> = RefCell::new(FxHashMap::default());
+    // Forgets the ids of dead file versions (`PerFileMap`, lsshells M3a).
+    // Their nodes are not read again, and an id is never given twice.
+    static NODE_IDS: RefCell<PerFileMap<u64>> = const { RefCell::new(PerFileMap::new()) };
     // Dense: indexed by the lineage index of a binder symbol; 0 means no id
     // yet (Go ids start at 1). Binder symbols only: every arena gives an
     // index the same binder symbol (`SymbolArena::id_slot`, key 0).
@@ -98,7 +100,7 @@ pub(crate) fn keep_own_symbol_ids(key: u32) {
 pub struct IdSeed {
     next_node_id: u64,
     next_symbol_id: u64,
-    node_ids: FxHashMap<Node, u64>,
+    node_ids: PerFileMap<u64>,
     symbol_ids: Vec<u64>,
 }
 
@@ -114,7 +116,12 @@ pub fn id_seed() -> IdSeed {
     IdSeed {
         next_node_id: NEXT_NODE_ID.with(std::cell::Cell::get),
         next_symbol_id: NEXT_SYMBOL_ID.with(std::cell::Cell::get),
-        node_ids: NODE_IDS.with(|ids| ids.borrow().clone()),
+        node_ids: NODE_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            // The copy has no ids of dead file versions.
+            ids.write();
+            ids.clone()
+        }),
         symbol_ids: SYMBOL_IDS.with(|ids| ids.borrow().clone()),
     }
 }
@@ -170,7 +177,7 @@ pub fn get_node_id(node: Node) -> u64 {
             next.set(id);
             id
         });
-        ids.insert(node, id);
+        ids.write().insert(node, id);
         id
     })
 }

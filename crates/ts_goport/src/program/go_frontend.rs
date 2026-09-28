@@ -364,8 +364,8 @@ fn case_sensitivity() -> CaseSensitivity {
 /// (`publish_file_stores`). `parsed` holds the program files by store id.
 /// A store that is not a program file is a file that the language server
 /// parsed outside a program load (`PARSED_UNPUBLISHED`), or a config file.
-/// Each parse that gets its Go file here is kept for good (see the PERF
-/// note below).
+/// Each parse that gets its Go file here is kept for good, unless it is a
+/// freeable file version (see the PERF note below).
 fn go_files_of_unpublished_stores(
     parsed: &FxHashMap<usize, &Rc<ParsedSourceFile>>,
     cwd: &str,
@@ -386,21 +386,26 @@ fn go_files_of_unpublished_stores(
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
         }
-        // PERF: `program_file_info` borrows the parse. A published file is
-        // never freed, so its parse is kept for good, whether a program or
-        // the parse cache made it. The frontend program is freed with its
-        // last holder; this keeps only the parses. A file that an earlier
-        // publish gave its Go file keeps the parse of that publish.
-        let file: Option<&'static ParsedSourceFile> = parsed
-            .get(&store)
-            .copied()
-            .or_else(|| outside.get(&store))
-            .map(|file| {
-                let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
-                &**kept
-            });
+        // PERF: the `SourceFileInfo` borrows lists of the parse. A published
+        // file is never freed, so its parse is kept for good, whether a
+        // program or the parse cache made it. The frontend program is freed
+        // with its last holder; this keeps only the parses. A file that an
+        // earlier publish gave its Go file keeps the parse of that publish.
+        // A freeable file version (lsshells M3a) keeps no parse: the parse
+        // holds the version, so a kept parse would keep it alive. Its
+        // `SourceFileInfo` borrows leaked copies of the lists instead.
+        let file = parsed.get(&store).copied().or_else(|| outside.get(&store));
         let info = match file {
-            Some(file) => program_file_info(store, file),
+            Some(file) => {
+                crate::ast::note_published_path(&file.path().0);
+                let lists = if file.version.get().is_some() {
+                    KeptLists::copied(file)
+                } else {
+                    let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
+                    KeptLists::borrowed(kept)
+                };
+                program_file_info(store, file, lists)
+            }
             None => other_store_info(store, cwd, case_sensitivity),
         };
         // PORT: a store that is not a parsed source file (a config file) is
@@ -642,6 +647,10 @@ fn build_program(
     let tables = VersionTables {
         file_meta,
         go: Some(shared),
+        file_versions: parsed
+            .values()
+            .filter_map(|file| file.version.get().cloned())
+            .collect(),
         ..VersionTables::new(file_by_path)
     };
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
@@ -699,13 +708,60 @@ fn trace_from_sys() -> TraceFn {
     })
 }
 
+/// The parse lists that a `SourceFileInfo` borrows for good.
+struct KeptLists {
+    diagnostics: &'static [Diagnostic],
+    js_diagnostics: &'static [Diagnostic],
+    jsdoc_diagnostics: &'static [Diagnostic],
+    reparsed_clones: &'static [Node],
+    jsdoc_cache: &'static FxHashMap<Node, Vec<Node>>,
+}
+
+impl KeptLists {
+    /// The lists of `file`, a parse that the publish keeps for good.
+    fn borrowed(file: &'static ParsedSourceFile) -> Self {
+        Self {
+            diagnostics: &file.diagnostics,
+            js_diagnostics: &file.js_diagnostics,
+            jsdoc_diagnostics: &file.jsdoc_diagnostics,
+            reparsed_clones: &file.reparsed_clones,
+            jsdoc_cache: &file.jsdoc_cache,
+        }
+    }
+
+    /// Leaked copies of the lists of `file`, a freeable file version whose
+    /// parse is not kept. The lists of a TypeScript file are almost always
+    /// empty, and an empty list is not copied.
+    fn copied(file: &ParsedSourceFile) -> Self {
+        fn leak<T: Clone>(list: &[T]) -> &'static [T] {
+            if list.is_empty() {
+                &[]
+            } else {
+                Box::leak(list.to_vec().into_boxed_slice())
+            }
+        }
+        Self {
+            diagnostics: leak(&file.diagnostics),
+            js_diagnostics: leak(&file.js_diagnostics),
+            jsdoc_diagnostics: leak(&file.jsdoc_diagnostics),
+            reparsed_clones: leak(&file.reparsed_clones),
+            jsdoc_cache: if file.jsdoc_cache.is_empty() {
+                &super::EMPTY_JSDOC_CACHE
+            } else {
+                Box::leak(Box::new(file.jsdoc_cache.clone()))
+            },
+        }
+    }
+}
+
 /// `SourceFileInfo` of a program file, from the Go parser fields. The Go
 /// program fields are in `VersionTables::file_meta`.
-// PERF: the diagnostics, reparsed clones and JSDoc cache borrow the parsed
-// file, which the publish keeps. The other lists stay copies: `source_file_parser_fields`
+// PERF: the diagnostics, reparsed clones and JSDoc cache borrow `lists`:
+// the lists of the parse, which the publish keeps, or leaked copies for a
+// freeable file version. The other lists stay copies: `source_file_parser_fields`
 // (ast/synthetic.rs) copies them out as owned lists, and the frontend
 // program still reads the parsed file.
-fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFileInfo {
+fn program_file_info(store: usize, file: &ParsedSourceFile, lists: KeptLists) -> SourceFileInfo {
     let info = SourceFileInfo {
         file_name: file.file_name().to_string(),
         path: file.path().0.clone(),
@@ -718,9 +774,9 @@ fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFil
         type_reference_directives: file.type_reference_directives.clone(),
         lib_reference_directives: file.lib_reference_directives.clone(),
         comment_directives: file.comment_directives.clone(),
-        diagnostics: &file.diagnostics,
-        js_diagnostics: &file.js_diagnostics,
-        jsdoc_diagnostics: &file.jsdoc_diagnostics,
+        diagnostics: lists.diagnostics,
+        js_diagnostics: lists.js_diagnostics,
+        jsdoc_diagnostics: lists.jsdoc_diagnostics,
         has_lazy_js_doc: file.has_lazy_js_doc,
         contains_non_ascii: file.contains_non_ascii,
         trivia: crate::ast::go_view::TriviaRuns::default(),
@@ -729,12 +785,12 @@ fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFil
     let late = LateSourceFileInfo {
         file_index: store,
         external_module_indicator: file.external_module_indicator,
-        reparsed_clones: &file.reparsed_clones,
+        reparsed_clones: lists.reparsed_clones,
         imports: file.imports.clone(),
         module_augmentations: file.module_augmentations.clone(),
         ambient_module_names: file.ambient_module_names.clone(),
         uses_uri_style_node_core_modules: file.uses_uri_style_node_core_modules,
-        jsdoc_cache: &file.jsdoc_cache,
+        jsdoc_cache: lists.jsdoc_cache,
         post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
