@@ -13,6 +13,7 @@ use crate::frontend::tspath;
 use crate::frontend::vfs;
 use crate::frontend::vfs::Fs as _;
 use crate::gostd::Context;
+use crate::gostd::unicode;
 use crate::modulespecifiers;
 use crate::program::ls_program;
 use std::cell::Cell;
@@ -103,7 +104,7 @@ pub fn word_indices(s: &str) -> Vec<i32> {
             }
             continue;
         }
-        if unicode_is_upper(rune_value)
+        if unicode::is_upper(rune_value)
             && (unicode_is_lower(rune_of(utf8_decode_last_rune_in_string(s, byte_index).0))
                 || (byte_index + 1 < s.len()
                     && unicode_is_lower(rune_of(utf8_decode_rune_in_string(s, byte_index + 1).0))))
@@ -117,19 +118,6 @@ pub fn word_indices(s: &str) -> Vec<i32> {
 /// A decoded Go rune as a `char` (`utf8.RuneError` is U+FFFD).
 fn rune_of(r: i32) -> char {
     char::from_u32(r as u32).unwrap_or(char::REPLACEMENT_CHARACTER)
-}
-
-/// Go `unicode.IsUpper`: general category Lu.
-// PORT: the Rust `Uppercase` property is Lu plus `Other_Uppercase`; the
-// `Other_Uppercase` ranges are removed so the result is Go's category test.
-fn unicode_is_upper(c: char) -> bool {
-    if !c.is_uppercase() {
-        return false;
-    }
-    !matches!(
-        c as u32,
-        0x2160..=0x216F | 0x24B6..=0x24CF | 0x1F130..=0x1F149 | 0x1F150..=0x1F169 | 0x1F170..=0x1F189
-    )
 }
 
 /// Go `unicode.IsLower`: general category Ll.

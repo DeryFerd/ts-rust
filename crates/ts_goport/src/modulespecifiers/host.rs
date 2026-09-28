@@ -25,6 +25,9 @@ struct ProgramCaches {
     package_json_info: FxHashMap<String, Rc<InfoCacheEntry>>,
     /// Go: compiler/program.go knownSymlinks (a lazily computed value).
     known_symlinks: Option<Rc<KnownSymlinks>>,
+    /// Go: compiler/program.go opts.TypingsLocation, which is also the
+    /// `typingsLocation` of the program's resolver. See `typings_location`.
+    typings_location: Option<Rc<str>>,
 }
 
 /// The most programs whose caches a thread keeps. A checker worker serves
@@ -58,6 +61,37 @@ fn with_program_caches<R>(f: impl FnOnce(&mut ProgramCaches) -> R) -> R {
         }
         f(&mut caches[0].1)
     })
+}
+
+/// The typings location of the current program (Go `p.opts.TypingsLocation`).
+// PORT: the frontend program holds it, and only the thread that loaded the
+// program can read the frontend program (`program::go_frontend_program`).
+// Only a language server program with type acquisition has a typings
+// location (Go project/project.go:391). The language server loads its
+// programs on the dispatch thread, and its language service and checkers
+// run there, so the location is read there. The probe for that thread is
+// `ls_program::parsed_source_file`: it finds only the programs that
+// `ls_program` made on this thread. Other threads get "": a compile checker
+// worker, a one-program process, and a language server search thread
+// (`ls/search_thread.rs`). Go gives "" for the first two. On a search
+// thread of a program with type acquisition, Go gives the location.
+fn typings_location() -> Rc<str> {
+    if let Some(location) = with_program_caches(|c| c.typings_location.clone()) {
+        return location;
+    }
+    let made_on_this_thread = try_prog()
+        .and_then(|program| program.source_files().next())
+        .is_some_and(|file| crate::program::ls_program::parsed_source_file(file.root).is_some());
+    let location: Rc<str> = if made_on_this_thread {
+        crate::program::go_frontend_program()
+            .map(|program| program.get_global_typings_cache_location())
+            .unwrap_or_default()
+            .into()
+    } else {
+        Rc::from("")
+    };
+    with_program_caches(|c| c.typings_location = Some(location.clone()));
+    location
 }
 
 // Go: module/resolver.go:1757 getPackageJsonInfo
@@ -113,15 +147,18 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
     None
 }
 
-// Go: module/resolver.go:493 getPackageScopeForPath
-// PORT: the typings location is always empty in this crate.
+// Go: module/resolver.go:497 getPackageScopeForPath
 fn get_package_scope_for_path(directory: &str) -> Option<Rc<InfoCacheEntry>> {
-    tspath::for_each_ancestor_directory_stopping_at_global_cache("", directory, |directory| {
-        if let Some(result) = get_package_json_info_for_directory(directory) {
-            return (Some(result), true);
-        }
-        (None, false)
-    })
+    tspath::for_each_ancestor_directory_stopping_at_global_cache(
+        &typings_location(),
+        directory,
+        |directory| {
+            if let Some(result) = get_package_json_info_for_directory(directory) {
+                return (Some(result), true);
+            }
+            (None, false)
+        },
+    )
 }
 
 // Go: module/resolver.go ResolvePackageDirectory
@@ -281,9 +318,8 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:132 GetGlobalTypingsCacheLocation
-    // PORT: the program options never set a typings location here.
     fn get_global_typings_cache_location(&self) -> String {
-        String::new()
+        typings_location().to_string()
     }
 
     fn use_case_sensitive_file_names(&self) -> bool {
