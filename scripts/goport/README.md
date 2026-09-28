@@ -70,6 +70,8 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
   one host: `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup`
   session copies its source to the host first). `buildbench-report.py <runs-dir>...` makes the table.
 
+Revision evidence is the exception: `candidate.sh side` builds its release bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
+
 ## Editor sessions: `ls_edit_bench.py`
 
 Our other checks measure startup and watch mode. This one measures a language server during edits,

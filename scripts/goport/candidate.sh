@@ -238,7 +238,7 @@ evidence_key() {
       echo "$line"
       if [[ -f $wt/${line:3} ]]; then sha256sum < "$wt/${line:3}"; fi
     done
-    echo "pin=$pin profile=release"
+    echo "pin=$pin profile=release toolchain=$(rustc --version 2>/dev/null) incremental=0"
   } | sha256sum | cut -c1-16
 }
 
@@ -282,7 +282,8 @@ side_unit() {
   if [[ -f $B/bins.sha256 ]]; then say "reuse bins $B (built from $(cat "$B/COMMIT"))"; else
     say "$(date -u +%FT%TZ) build release bins in $TARGET"
     if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
-    run_sh "cd $wt && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
+    # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
+    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
     run_sh "rm -rf $B.new && mkdir $B.new && cd $TARGET/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
     if [[ $DRY == 0 ]]; then
       exec 8>&-
