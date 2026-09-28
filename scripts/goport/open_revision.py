@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """Records a new bound revision in the saved typechecker state before any measurement.
 
-With --new-batch it first saves the current batch record under docs/typechecker-batches/,
-adds it to batchRecords, opens the new batch and extends the two approved rules to it with
-the same pins (root under delegation-2026-09-25, as for the earlier goport batches).
-Without --new-batch it adds the revision to the current batch (refused when that batch is
+With --new-batch it first saves the current (accepted) batch record under docs/typechecker-batches/,
+adds it to batchRecords and opens the new batch with protectedSet "goport": goport's own tests and
+the gate items are the protected set (docs/typechecker-accountability.md, "Protected set"). That needs
+Theo's standing rule goport-protected-set (batchId "*") in acceptanceRuleChanges. Nothing is extended
+per batch. The new batch records protectedBase: the accepted batch whose goport test results and gate
+manifest the candidate is compared with (see protected_base).
+Without --new-batch it adds the revision to the current goport batch (refused when that batch is
 already accepted).
 
-Before any write it checks the batch checkout: fp.py must equal --fingerprint, --commit must
-be HEAD, and every .rs file changed since the previous revision's commit must be rustfmt clean
-(rustfmt --edition 2024). It records scripts/goport/roster_fp.py of the checkout as
-batch.rosterFingerprint and as rosterFingerprint on the new history row.
+Before any write it checks the batch checkout: fp.py must equal --fingerprint, --commit must be HEAD,
+and every .rs file changed since the previous revision's commit must be rustfmt clean
+(rustfmt --edition 2024).
 
 Usage:
-  scripts/goport/open_revision.py --revision 119 --fingerprint <sha256> --commit <sha>
+  scripts/goport/open_revision.py --revision 132 --fingerprint <sha256> --commit <sha>
       --hypothesis "<text>" --change "<text>" [--new-batch <batch-id> --origin "<text>"] [--dry-run]
-Writes through scripts/state (export, then import). --dry-run runs the checks and prints the
-new history row, but writes nothing. Run from the repository root.
+  scripts/goport/open_revision.py --base      prints protected_base of the saved state as JSON
+Writes through scripts/state (export, then import). --dry-run runs the checks and prints the new
+history row, but writes nothing. Run from the repository root.
 """
 import argparse, copy, datetime, hashlib, json, os, subprocess, sys
 
-KEEP = ['checkout', 'allowedChangedFiles', 'writerOutputDirectory', 'requiredRetained', 'phase',
-        'implementer', 'inheritedExpectationMappings', 'carryForward']
-RULES = ['opt-in-crate-no-new-loss', 'unbound-history-rows']
+GOPORT_RULE = 'goport-protected-set'
+KEEP = ['checkout', 'writerOutputDirectory', 'phase', 'implementer', 'carryForward', 'openDefects']
+# Scope of a goport batch: the whole repository except the saved state and target/. candidate.sh
+# check and open read it through --allowed. "!" entries exclude.
+ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '!target/**']
+# Evidence of one revision. open clears it, so a new revision never shows the last one's evidence.
+EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateVerdict', 'languageServerOracle', 'quality', 'qualityEvidence',
+            'ordinaryQuery', 'localCheck', 'acceptance']
 AUDITOR = {'role': 'audit_accepted_roster', 'agent': 'aae6dbb734c07335a', 'verdict': 'PENDING'}
 REVIEWER = {'role': 'independent_reviewer', 'agent': 'a0bc38f3370585da3', 'verdict': 'PENDING'}
 
@@ -35,9 +43,31 @@ def git(checkout, *args):
     return subprocess.check_output(['git', '-C', checkout, *args])
 
 
-def first_field(script, checkout):
-    """First output field of fp.py or roster_fp.py ("<sha256> <file count>")."""
-    return subprocess.check_output(['python3', f'scripts/goport/{script}', checkout], text=True).split()[0]
+def export():
+    return json.loads(subprocess.check_output(['node', 'scripts/state.mjs', 'export']))
+
+
+def goport_rule(state):
+    rule = next((r for r in state.get('acceptanceRuleChanges', []) if r.get('id') == GOPORT_RULE and r.get('batchId') == '*'), None)
+    if not rule or rule.get('protectedSet') != 'goport' or not (rule.get('baseline') or {}).get('path'):
+        sys.exit(f'no standing {GOPORT_RULE} rule (batchId "*", protectedSet "goport", baseline) in acceptanceRuleChanges; '
+                 'root records it first (legacy removal stage 1)')
+    return rule
+
+
+def protected_base(state):
+    """The base of the next candidate: the last accepted batch, with {path, sha256} of its goport test
+    results (the rule's baseline when that batch used the legacy roster) and of its gate manifest.
+    An open goport batch keeps the base that open recorded."""
+    b = state['batch']
+    if b.get('compilerAccepted') is not True:
+        if not b.get('protectedBase'):
+            sys.exit(f'batch {b["id"]} is not accepted and has no protectedBase')
+        return b['protectedBase']
+    tests = ({'path': b['goportTests']['results'], 'sha256': b['goportTests']['sha256']} if b.get('protectedSet') == 'goport'
+             else {k: goport_rule(state)['baseline'][k] for k in ('path', 'sha256')})
+    return {'batch': b['id'], 'revision': b['recoveryRevision'], 'tests': tests,
+            'gate': {'path': b['gate']['manifest'], 'sha256': b['gate']['sha256']}}
 
 
 def unformatted(checkout, base):
@@ -57,29 +87,41 @@ def unformatted(checkout, base):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--revision', type=int, required=True)
-    p.add_argument('--fingerprint', required=True)
-    p.add_argument('--commit', required=True)
-    p.add_argument('--hypothesis', required=True)
-    p.add_argument('--change', required=True)
+    p.add_argument('--base', action='store_true', help='print the protected base of the saved state and exit')
+    p.add_argument('--allowed', action='store_true', help='print the allowedChangedFiles of a new goport batch and exit')
+    p.add_argument('--revision', type=int)
+    p.add_argument('--fingerprint')
+    p.add_argument('--commit')
+    p.add_argument('--hypothesis')
+    p.add_argument('--change')
     p.add_argument('--new-batch')
     p.add_argument('--origin', default='')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
+    if a.allowed:
+        print('\n'.join(ALLOWED))
+        return
+    s = export()
+    if a.base:
+        print(json.dumps(protected_base(s)))
+        return
+    if None in (a.revision, a.fingerprint, a.commit, a.hypothesis, a.change):
+        p.error('--revision, --fingerprint, --commit, --hypothesis and --change are required')
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    s = json.loads(subprocess.check_output(['node', 'scripts/state.mjs', 'export']))
     old = s['batch']
     last = old['recoveryHistory'][-1]
     if a.revision != last['revision'] + 1:
         sys.exit(f'revision {a.revision} is not the next revision ({last["revision"] + 1})')
     if not a.new_batch and old.get('compilerAccepted') is True:
         sys.exit(f'batch {old["id"]} is accepted; open R{a.revision} with --new-batch')
+    if not a.new_batch and old.get('protectedSet') != 'goport':
+        sys.exit(f'batch {old["id"]} uses the retired legacy roster; open R{a.revision} with --new-batch')
 
     checkout = old['checkout']
     head = git(checkout, 'rev-parse', 'HEAD').decode().strip()
     if git(checkout, 'rev-parse', '--verify', f'{a.commit}^{{commit}}').decode().strip() != head:
         sys.exit(f'--commit {a.commit} is not HEAD of {checkout} ({head[:12]})')
-    fp = first_field('fp.py', checkout)
+    fp = subprocess.check_output(['python3', 'scripts/goport/fp.py', checkout], text=True).split()[0]
     if fp != a.fingerprint:
         sys.exit(f'--fingerprint {a.fingerprint[:12]} does not match fp.py of {checkout} ({fp[:12]})')
     base = last.get('commit') or old.get('commit')
@@ -88,13 +130,17 @@ def main():
     bad = unformatted(checkout, base)
     if bad:
         sys.exit(f'rustfmt --edition 2024 would change {len(bad)} file(s) changed since {base}:\n  ' + '\n  '.join(bad))
-    roster = first_field('roster_fp.py', checkout)
     previous_fp = old['sourceFingerprint']
 
     record = None
     if a.new_batch:
         if old.get('compilerAccepted') is not True:
             sys.exit('the current batch is not accepted; finish it before opening a new one')
+        goport_rule(s)
+        protected = protected_base(s)
+        for ref in (protected['tests'], protected['gate']):
+            if sha(ref['path']) != ref['sha256']:
+                sys.exit(f'protected base {ref["path"]} does not match its sha256 {ref["sha256"][:12]}')
         record = f"docs/typechecker-batches/{old['id']}.json"
         if os.path.exists(record):
             sys.exit(f'{record} exists')
@@ -102,7 +148,8 @@ def main():
         s['batchRecords'].append({'path': record, 'sha256': hashlib.sha256(text).hexdigest(), 'bytes': len(text)})
         b = {k: copy.deepcopy(old[k]) for k in KEEP if k in old}
         b.update({'id': a.new_batch, 'previousBatch': {'id': old['id'], 'archive': s['batchRecords'][-1]},
-                  'latestHono': old.get('latestHono'), 'origin': a.origin,
+                  'latestHono': old.get('latestHono'), 'origin': a.origin, 'protectedSet': 'goport', 'protectedBase': protected,
+                  'allowedChangedFiles': ALLOWED,
                   'compilerEditsAuthorized': True, 'productionEditsAuthorized': True, 'semanticEditsAuthorized': True,
                   'testEditsAuthorized': False, 'runtimeAuthorized': True, 'expectedCompilerRecoveries': [],
                   'expectationUpdates': [], 'verdictHistory': [], 'focusedResults': [], 'runtimeToolHandles': [],
@@ -112,30 +159,25 @@ def main():
         if old.get('upstreamPin'):
             pin = old['upstreamPin']['to']
             b['upstreamPin'] = {'from': pin, 'to': pin, 'rule': None, 'note': f"same pin as {old['id']}"}
-        for rid in RULES:
-            prev = [r for r in s['acceptanceRuleChanges'] if r['id'] == rid][-1]
-            r = copy.deepcopy(prev)
-            r.update(batchId=a.new_batch, extendedUtc=now, extendedBy='root under delegation-2026-09-25; same pins and scope')
-            s['acceptanceRuleChanges'].append(r)
         s['reason'] = f"Batch {old['id']} accepted at R{last['revision']}. Batch {a.new_batch} opened at R{a.revision}."
     else:
         b = old
         s['reason'] = f'R{a.revision} bound in batch {b["id"]}.'
+    b.update({k: None for k in EVIDENCE})
     b.update({'recoveryRevision': a.revision, 'hypothesis': a.hypothesis, 'sourceFingerprint': a.fingerprint,
               'beforeEditingSourceFingerprint': previous_fp, 'sourceBindingStatus': 'SOURCE_BOUND',
-              'commit': a.commit, 'rosterFingerprint': roster, 'fullResult': None, 'fullOutcome': None, 'corpus': None,
-              'ordinaryQuery': None, 'completedRuns': [], 'compilerAccepted': False, 'passingCredit': False,
+              'commit': a.commit, 'completedRuns': [], 'compilerAccepted': False, 'passingCredit': False,
               'auditor': dict(AUDITOR), 'reviewer': dict(REVIEWER),
-              'nextPermittedAction': f'Run the R{a.revision} pipeline.'})
+              'nextPermittedAction': f'Run the R{a.revision} pipeline (candidate.sh side).'})
     row = {'revision': a.revision, 'hypothesis': a.hypothesis, 'hypothesisLabel': b['id'].replace('recovery-continuation-', ''),
            'phase': 'recovery-continuation', 'sourceFingerprint': a.fingerprint, 'beforeEditingSourceFingerprint': previous_fp,
-           'rosterFingerprint': roster, 'fullResultSha256': None, 'status': 'bound_before_full_measurement',
+           'protectedSet': 'goport', 'fullResultSha256': None, 'status': 'bound_before_full_measurement',
            'recordedUtc': now, 'commit': a.commit, 'change': a.change}
     b['recoveryHistory'] = b['recoveryHistory'] + [row]
     s['batch'] = b
     s['status'], s['decision'], s['updated'] = 'active', 'REVIEW', now
     if a.dry_run:
-        print(json.dumps({'dryRun': True, 'batch': b['id'], 'batchRecord': record, 'row': row}, indent=1))
+        print(json.dumps({'dryRun': True, 'batch': b['id'], 'batchRecord': record, 'protectedBase': b['protectedBase'], 'row': row}, indent=1))
         return
     if record:
         with open(record, 'xb') as f:

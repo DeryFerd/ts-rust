@@ -5,7 +5,7 @@ cd /home/theo/Code/sandbox/ts-rust
 R=$1; O=target/continuation-r97-goport/measure/$R; mkdir -p $O
 WT=target/worktrees/checker-port
 cp target/continuation-r97-goport/runtime/cargo-target/release/goport $O/goport.bin
-test -z "$(git -C $WT status --porcelain crates/ts_goport crates/ts_compiler/src/lib.rs Cargo.toml Cargo.lock)" || { echo "dirty allowed files"; exit 1; }
+test -z "$(git -C $WT status --porcelain | grep -v '^?? crates/ts_goport/CANDIDATE.md$')" || { echo "dirty checkout"; exit 1; }
 export GOPORT_BIN=$PWD/$O/goport.bin
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/measure.sh $R > $O/summary-main.txt 2>&1
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/measure-extra.sh $R > $O/summary-extra.txt 2>&1

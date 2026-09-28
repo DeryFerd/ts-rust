@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
-"""Records the evidence, both PASS verdicts and the acceptance of the current bound revision.
+"""Records the evidence, both PASS verdicts and the acceptance of the current bound revision of a
+goport batch (protectedSet "goport", docs/typechecker-accountability.md "Protected set").
 
-Run after the pipeline, bound runs, gate and quality checks finished and both independent
-agents returned PASS on the check-format result. It sets the state to ready/PASS, runs the
-local check, and records the acceptance only when the check passes.
+Run after `candidate.sh side` finished (SIDE DONE) and both independent agents returned PASS on the
+verdict request. It reads the side evidence in --evidence (the cache dir that `candidate.sh
+verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, lsp.json and
+quality.json. It sets the state to ready/PASS, runs the local check, and records the acceptance only
+when the check passes.
 
 Usage:
-  scripts/goport/accept_revision.py --revision 119 --bound r23,r23b --gate r119-full
-      --scope "<one line>" --outcome "<one line>" [--extra evidence.json]
-      [--profile release] [--carry-from 118]
+  scripts/goport/accept_revision.py --revision 132 --evidence <cache dir>
+      --scope "<one line>" --outcome "<one line>" [--extra evidence.json] [--profile release]
 Run from the repository root. --extra is a JSON object merged into the batch (e.g. cliAudit).
---profile names the cargo profile of the bound runs (release for correctness evidence;
-fat-LTO goport is for timing and release builds).
---carry-from uses Theo's standing goport-only roster carry-forward rule: the roster result,
-raw result and corpus of that earlier measured revision stand for this one. It refuses
-unless roster_fp.py on batch.checkout equals that revision's rosterFingerprint.
+--profile names the cargo profile of the bound runs (release for correctness evidence).
 """
-import argparse, datetime, hashlib, json, subprocess, sys
+import argparse, datetime, hashlib, json, os, subprocess, sys
 
+ROOT = os.getcwd()  # the repository root (run from there)
 AUDITOR = 'aae6dbb734c07335a'
 REVIEWER = 'a0bc38f3370585da3'
-R = 'target/continuation-r97-goport'
+RULE = 'goport-protected-set'
 
 
 def sha(path):
     return hashlib.sha256(open(path, 'rb').read()).hexdigest()
+
+
+def rel(path):
+    """A path under the repository root as the state writes it (relative); others stay absolute."""
+    path = os.path.abspath(path)
+    return os.path.relpath(path, ROOT) if path.startswith(ROOT + '/') else path
 
 
 def export():
@@ -41,13 +46,11 @@ def put(state, tag):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--revision', type=int, required=True)
-    p.add_argument('--bound', required=True)
-    p.add_argument('--gate', required=True)
+    p.add_argument('--evidence', required=True, help='evidence cache dir of candidate.sh side')
     p.add_argument('--scope', required=True)
     p.add_argument('--extra')
     p.add_argument('--outcome', required=True, help='one-line measured outcome for the history row')
     p.add_argument('--profile', default='release', help='cargo profile of the bound runs')
-    p.add_argument('--carry-from', type=int, help='earlier full_measured revision whose roster result is carried')
     a = p.parse_args()
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     s = export()
@@ -55,54 +58,64 @@ def main():
     row = b['recoveryHistory'][-1]
     if row['revision'] != a.revision or b['recoveryRevision'] != a.revision:
         sys.exit(f'current revision is R{row["revision"]}, not R{a.revision}')
-    fp, rev = b['sourceFingerprint'], f'r{a.revision}'
-    # ev names the revision whose roster evidence (full result, raw result, corpus) is used.
-    ev, efp, carry = rev, fp, None
-    if a.carry_from is not None:
-        ev = f'r{a.carry_from}'
-        src = next((r for r in b['recoveryHistory'] if r['revision'] == a.carry_from), None)
-        if a.carry_from >= a.revision or not src or not str(src.get('status', '')).startswith('full_measured') \
-                or src.get('rosterCarryForward'):
-            sys.exit(f'R{a.carry_from} is not an earlier full_measured revision with its own roster run')
-        tool = lambda script: subprocess.check_output(['python3', f'scripts/goport/{script}', b['checkout']], text=True).split()[0]
-        if tool('fp.py') != fp:
-            sys.exit(f'{b["checkout"]} is not the batch source {fp}')
-        roster = tool('roster_fp.py')
-        if roster != src.get('rosterFingerprint'):
-            sys.exit(f'roster fingerprint {roster} differs from R{a.carry_from} ({src.get("rosterFingerprint")}); run the roster')
-        efp = src['sourceFingerprint']
-        carry = {'fromRevision': a.carry_from, 'fromSourceFingerprint': efp, 'rosterFingerprint': roster}
-        b['rosterFingerprint'], b['rosterCarryForward'] = roster, carry
-    cr, raw = f'target/continuation-{ev}-check-result.json', f'target/continuation-{ev}-full-result.json'
-    chk, rawsha = sha(cr), sha(raw)
-    if carry and chk != src.get('fullResultSha256'):
-        sys.exit(f'{cr} is not the full result recorded for R{a.carry_from}')
-    runs = [{'manifest': f'{R}/measure/{x}/manifest.json', 'sha256': sha(f'{R}/measure/{x}/manifest.json')} for x in a.bound.split(',')]
-    proj = lambda cfg: {'runner': f'goport --profile {a.profile} ({b["commit"]}), bound runs {a.bound}', 'runs': runs, 'config': cfg,
-                        'complete': True, 'exitCode': 0, 'diagnostics': 0, 'oracleDiagnostics': 0, 'matchesOracle': True,
+    if b.get('protectedSet') != 'goport':
+        sys.exit(f'batch {b["id"]} is not a goport batch (protectedSet "goport"); the legacy roster is retired')
+    fp, rev, C = b['sourceFingerprint'], f'r{a.revision}', os.path.abspath(a.evidence)
+    ev = {}
+    for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'quality'):
+        if not os.path.exists(f'{C}/{k}.json'):
+            sys.exit(f'missing {C}/{k}.json: run candidate.sh side to SIDE DONE first')
+        ev[k] = json.load(open(f'{C}/{k}.json'))
+    tests, gate, gc, bound, lsp, quality = (ev[k] for k in ('tests', 'gate', 'gate-compare', 'bound', 'lsp', 'quality'))
+    base = b['protectedBase']
+    problems = []
+    if os.path.realpath(tests['base']) != os.path.realpath(base['tests']['path']) or tests['baseSha256'] != base['tests']['sha256']:
+        problems.append(f"tests.json base {tests['base']} is not the protected base {base['tests']['path']}")
+    if os.path.realpath(gc['base']['manifest']) != os.path.realpath(base['gate']['path']):
+        problems.append(f"gate-compare base {gc['base']['manifest']} is not the protected base {base['gate']['path']}")
+    if any(tests['compare'][k] for k in ('lost', 'absent', 'unrun')) or gc['counts']['regressions']:
+        problems.append('tests.json or gate-compare.json reports a loss or a regression')
+    if bound.get('sourceFingerprint') != fp or quality.get('sourceFingerprint') != fp:
+        problems.append(f'bound runs or quality record another source than {fp[:12]}')
+    for k, c in (('tests', tests['commit']), ('gate', gate['commit'])):
+        if not b['commit'].startswith(c[:9]) and not c.startswith(b['commit']):
+            print(f'note: {k} evidence ran on commit {c[:9]}, the batch commit is {b["commit"][:9]} (same crates tree)')
+    if problems:
+        sys.exit('refused:\n  ' + '\n  '.join(problems))
+
+    runs = [{'manifest': rel(m), 'sha256': sha(m)} for m in bound['manifests']]
+    proj = lambda cfg: {'runner': f'goport --profile {a.profile} ({b["commit"]}), bound runs {",".join(bound["rounds"])}', 'runs': runs,
+                        'config': cfg, 'complete': True, 'exitCode': 0, 'diagnostics': 0, 'oracleDiagnostics': 0, 'matchesOracle': True,
                         'repeatIdentical': True, 'date': now[:10], 'sourceFingerprint': fp}
-    b['fullResult'] = {'path': cr, 'sha256': chk, 'derivedFrom': raw, 'converter': f'target/continuation-{ev}-check-result.py'}
-    b['fullResultRaw'] = {'path': raw, 'sha256': rawsha}
     b['ordinaryQuery'] = proj('target/project-inputs/query/source/packages/query-core/tsconfig.prod.json')
     b['latestHono'] = proj('target/project-inputs/hono/source/tsconfig.build.json')
-    c = f'target/continuation-{ev}-current-source-corpus'
-    b['corpus'] = {'sourceFingerprint': efp,
-                   'diagnostics': {'comparison': f'{c}/diagnostics-comparison.json', 'sha256': sha(f'{c}/diagnostics-comparison.json')},
-                   'semantic': {'comparison': f'{c}/semantic-comparison.json', 'sha256': sha(f'{c}/semantic-comparison.json')}}
-    g = f'{R}/compat/gate/{a.gate}/manifest.json'
-    b['gate'] = {'manifest': g, 'sha256': sha(g)}
-    b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': f'{R}/quality-{rev}'}
+    b['goportTests'] = {'results': rel(tests['results']), 'sha256': tests['sha256'], 'base': base['tests']['path'],
+                        'baseSha256': base['tests']['sha256'], 'compare': tests['compare'],
+                        'nameMap': tests.get('nameMap'), 'testbin': rel(tests['testbin']), 'commit': tests['commit'],
+                        'compareOutput': {'path': rel(tests['compareOutput']), 'sha256': sha(tests['compareOutput'])}}
+    b['gate'] = {'manifest': rel(gate['manifest']), 'sha256': gate['sha256']}
+    b['gateCompare'] = {'base': base['gate']['path'], 'baseSha256': base['gate']['sha256'], 'new': rel(gate['manifest']),
+                        'sha256': gate['sha256'], 'regressions': gc['counts']['regressions'],
+                        'knownOpen': [f"{k['id']} growth {k['growth']:.2f} (base {k['baseGrowth']:.2f})" for k in gc['knownOpen']],
+                        'output': {'path': rel(f'{C}/gate-compare.json'), 'sha256': sha(f'{C}/gate-compare.json')}}
+    b['gateVerdict'] = {'label': gate['label'], 'verdict': gate['verdict'], 'host': gate['host'], 'counts': gate['counts'],
+                        'failing': [f"{f['id']} {f['detail']}" for f in gate['failing']]}
+    b['languageServerOracle'] = {'label': lsp['label'], 'summary': rel(lsp['summary']), 'host': lsp.get('host'),
+                                 'result': f"{lsp['requests']:,} requests: {lsp['diff']} diff, {lsp['crash']} crash, "
+                                           f"{lsp['timeout']} timeout, {lsp['goportError']} goport_error"}
+    b['quality'] = {'record': rel(f'{C}/quality.json'),
+                    'result': f"rustfmt {quality['rustfmtExit']}, clippy {quality['clippyExit']}, {quality['tsGoportWarnings']} "
+                              f"ts_goport warnings, fingerprint unchanged {quality['fingerprintUnchanged']}"}
+    b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': rel(C)}
     if a.extra:
         b.update(json.load(open(a.extra)))
-    verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'],
-                                   'sourceFingerprint': fp, 'fullResultSha256': chk, 'utc': now}
+    verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'], 'sourceFingerprint': fp,
+                                   'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'], 'utc': now}
     b['auditor'] = verdict('audit_accepted_roster', AUDITOR)
     b['reviewer'] = verdict('independent_reviewer', REVIEWER)
     b.setdefault('verdictHistory', []).extend([b['auditor'], b['reviewer']])
-    row.update({'fullResultSha256': chk, 'fullResultRawSha256': rawsha, 'status': 'full_measured', 'outcome': a.outcome,
+    row.update({'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'], 'status': 'full_measured', 'outcome': a.outcome,
                 'ordinaryQuery': 'complete, 0 diagnostics, matches tsgo-oracle', 'hono': 'complete, 0 diagnostics, matches tsgo-oracle'})
-    if carry:
-        row.update({'rosterFingerprint': carry['rosterFingerprint'], 'rosterCarryForward': carry})
     s['status'], s['decision'], s['updated'] = 'ready', 'PASS', now
     put(s, f'{rev}-a')
     check = subprocess.run(['node', 'scripts/check-typechecker-batch.mjs', 'docs/typechecker-state'], capture_output=True, text=True)
@@ -115,8 +128,7 @@ def main():
     b['localCheck'] = {'command': 'node scripts/check-typechecker-batch.mjs docs/typechecker-state', 'exit': 0, 'verdict': 'PASS',
                        'rule': result.get('rule'), 'ranUtc': now}
     b['acceptance'] = {'acceptedUtc': now, 'scope': a.scope, 'acceptedBy': 'root, with both independent PASS verdicts',
-                       'rules': ['opt-in-crate-no-new-loss', f'unbound-history-rows (extension to {b["id"]} by root under delegation-2026-09-25)']
-                       + ([f'goport-only-roster-carry-forward (standing, Theo 2026-09-28; roster from R{a.carry_from})'] if carry else [])}
+                       'rules': [f'{RULE} (standing, Theo 2026-09-28; base {base["batch"]} R{base["revision"]})']}
     b['compilerAccepted'], b['passingCredit'] = True, True
     b['nextPermittedAction'] = f'R{a.revision} accepted.'
     s['latestAcceptedHono'] = {'date': now[:10], 'sourceFingerprint': fp, 'complete': True, 'diagnostics': 0, 'matchesOracle': True, 'runs': runs}
