@@ -63,7 +63,7 @@ Compare the result with the baseline below. Targets:
 | carryForwardRevisions | 0 | every goport-only revision after R125 |
 | builds.goport hours | 36.7 | only timing and release builds |
 | journalParses / wfstatus | 106 / 0 | wfstatus only |
-| rawSsh / remoteShRun | 842 / 546 | remote.sh higher |
+| rawSsh / remoteShRun | 842 / 546 | rawSsh near 0 (quick looks use `remote.sh look`) |
 | medianCallsBeforeFirstEdit | 43 | lower |
 
 `formatOnlyRevisions` also counts a revision that was opened before the window but recorded again inside it. R125 shows up in the first post-change window this way.
@@ -93,3 +93,4 @@ Short polls went from 9.18 to 0.31 per subagent-hour. Most subagent waits now us
 6. Re-audit: queued in `docs/goport-next.md` for 2026-09-30, with a session reminder. `scripts/audit/metrics.py` is committed. Early run (since 08:10Z): shortPollsPerSubagentHour 0.3, askUserQuestions 0, rawSsh 53 against remoteShRun 33, medianCallsBeforeFirstEdit 53.
 - Also added: AGENTS.md "Workflow changes" (do not resume a workflow after changing a later phase; a resume on 2026-09-28 re-ran 9 finished port lanes), "Pin" (main-based work sets GOPORT_PIN until the default pin switch) and "Host locks" (a subagent ran a job over raw ssh on a locked host during a host move).
 - Not done: gate stages across hosts, more cargo concurrency, a symbol index, smaller contexts (as recommended).
+- Item 4 follow-up (root): the onboarding workflow (`4c3530ea2`) found that `run auto` never held its lock (ssh closed the fd) and that 0 of 41 new agents used `run auto`, mostly because root prompts named hosts and paraphrased the brief. Fixed: remote.sh `look`, `job`, `push`, `sync-pin`, `status`; `run <host>` locks itself; `scripts/goport/facts`; AGENTS.md now says to paste the brief word for word and name hosts only for timing. Target changed to rawSsh near 0.
