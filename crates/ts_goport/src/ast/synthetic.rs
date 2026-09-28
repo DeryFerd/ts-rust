@@ -38,6 +38,7 @@
 //! own port decision.
 
 use crate::prelude::*;
+use std::cell::OnceCell;
 use ts_ast::NodeData;
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
@@ -60,7 +61,7 @@ enum Slot {
 /// The mutable Go `NodeBase` fields of a factory node.
 #[derive(Clone)]
 struct SyntheticNode {
-    /// The ts_ast node (kind and data): an index into `SyntheticArena::datas`.
+    /// The ts_ast node (kind and data): an entry of `SyntheticArena::datas`.
     /// A Go write to a data field or to the kind adds a new entry and moves
     /// the node to it, so a list handle taken before the write still reads
     /// the old list, like a Go `*NodeList` pointer.
@@ -130,17 +131,45 @@ impl OwnList {
     }
 }
 
+/// Bytes per chunk of `SyntheticArena::datas` and `SyntheticArena::lists`.
+// PERF: 14 KiB is jemalloc's largest small size class, and small classes
+// pack densely in slabs. A larger chunk is a large allocation, which starts
+// at a random cache line offset and so touches one page more (10% for a
+// 40 KiB chunk).
+const CHUNK_BYTES: usize = 14 * 1024;
+
+/// Cells per chunk of `SyntheticArena::datas`. The `Rc` header is 16 bytes.
+const DATA_CHUNK: usize = (CHUNK_BYTES - 16) / size_of::<OnceCell<ts_ast::Node>>();
+
+/// Lists per chunk of `SyntheticArena::lists`.
+const LIST_CHUNK: usize = CHUNK_BYTES / size_of::<OwnList>();
+
+/// A chunk of `SyntheticArena::datas`: `DATA_CHUNK` cells that fill in
+/// order.
+type DataChunk = Rc<[OnceCell<ts_ast::Node>]>;
+
 /// The synthetic nodes of one thread.
 struct SyntheticArena {
     slots: Vec<Slot>,
     /// Alias slot of each parsed node, so one parsed node gets one slot.
     aliases: FxHashMap<Node, u32>,
-    /// The ts_ast nodes of the node slots (see `SyntheticNode::data`). An
-    /// `Rc`, so a read can hold a node while the arena is not borrowed.
-    datas: Vec<Rc<ts_ast::Node>>,
-    /// Factory lists (`SyntheticList::Own`). Boxed, so a list keeps its
-    /// address (`synthetic_list_ptr`) when the vector grows.
-    lists: Vec<Box<OwnList>>,
+    /// The ts_ast nodes of the node slots (see `SyntheticNode::data`), in
+    /// chunks. A read holds the chunk of its node (an `Rc`), so it can hold
+    /// the node while the arena is not borrowed. A new node fills the next
+    /// cell (`OnceCell::set` needs no `&mut`), so it can be added while such
+    /// a read runs. Entry `i` is cell `i % DATA_CHUNK` of chunk
+    /// `i / DATA_CHUNK`.
+    // PERF: one allocation per chunk. An `Rc` per node made each 40-byte
+    // node a 64-byte allocation plus an 8-byte pointer (goport_typesyms on
+    // effect: +16% peak memory).
+    datas: Vec<DataChunk>,
+    /// The number of filled cells in `datas`.
+    data_len: u32,
+    /// Factory lists (`SyntheticList::Own`), in chunks of `LIST_CHUNK`. A
+    /// chunk never grows past its capacity, so a list keeps its address
+    /// (`synthetic_list_ptr`). Entry `i` is
+    /// `lists[i / LIST_CHUNK][i % LIST_CHUNK]`.
+    lists: Vec<Vec<OwnList>>,
     /// Node slices that node reads made (`SyntheticList::Slice`), where Go
     /// allocates a new slice on each call.
     slices: Vec<Box<[Node]>>,
@@ -152,9 +181,55 @@ impl SyntheticArena {
             slots: vec![Slot::Nil],
             aliases: FxHashMap::default(),
             datas: Vec::new(),
+            data_len: 0,
             lists: Vec::new(),
             slices: Vec::new(),
         }
+    }
+
+    /// The ts_ast node of data entry `index`.
+    #[inline]
+    fn data(&self, index: u32) -> &ts_ast::Node {
+        let i = index as usize;
+        self.datas[i / DATA_CHUNK][i % DATA_CHUNK]
+            .get()
+            .expect("synthetic node data entry is not filled")
+    }
+
+    /// Adds a data entry and returns its index.
+    fn push_data(&mut self, node: ts_ast::Node) -> u32 {
+        let i = self.data_len as usize;
+        if i % DATA_CHUNK == 0 {
+            self.datas
+                .push((0..DATA_CHUNK).map(|_| OnceCell::new()).collect());
+        }
+        assert!(
+            self.datas[i / DATA_CHUNK][i % DATA_CHUNK].set(node).is_ok(),
+            "synthetic node data entry is filled twice"
+        );
+        self.data_len += 1;
+        i as u32
+    }
+
+    /// The factory list of entry `index`.
+    #[inline]
+    fn own_list(&self, index: u32) -> &OwnList {
+        let i = index as usize;
+        &self.lists[i / LIST_CHUNK][i % LIST_CHUNK]
+    }
+
+    /// Adds a factory list and returns its index.
+    fn push_list(&mut self, list: OwnList) -> u32 {
+        if self
+            .lists
+            .last()
+            .is_none_or(|chunk| chunk.len() == LIST_CHUNK)
+        {
+            self.lists.push(Vec::with_capacity(LIST_CHUNK));
+        }
+        let chunk = self.lists.len() - 1;
+        self.lists[chunk].push(list);
+        (chunk * LIST_CHUNK + self.lists[chunk].len() - 1) as u32
     }
 
     /// The node slot of synthetic handle `n`.
@@ -177,10 +252,10 @@ impl SyntheticArena {
     /// The list that `list` names. Panics on a node slice.
     fn list(&self, list: SyntheticList) -> AnyList<'_> {
         match list {
-            SyntheticList::Field { data, sel } => sel(&self.datas[data as usize].data)
+            SyntheticList::Field { data, sel } => sel(&self.data(data).data)
                 .flatten()
                 .expect("synthetic list field is not in its node data"),
-            SyntheticList::Own { index } => self.lists[index as usize].get(),
+            SyntheticList::Own { index } => self.own_list(index).get(),
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
     }
@@ -207,7 +282,7 @@ pub struct SyntheticSeed {
     slots: Vec<Slot>,
     aliases: FxHashMap<Node, u32>,
     datas: Vec<ts_ast::Node>,
-    lists: Vec<Box<OwnList>>,
+    lists: Vec<OwnList>,
     slices: Vec<Box<[Node]>>,
 }
 
@@ -225,8 +300,8 @@ pub fn synthetic_seed() -> SyntheticSeed {
         SyntheticSeed {
             slots: a.slots.clone(),
             aliases: a.aliases.clone(),
-            datas: a.datas.iter().map(|d| (**d).clone()).collect(),
-            lists: a.lists.clone(),
+            datas: (0..a.data_len).map(|i| a.data(i).clone()).collect(),
+            lists: a.lists.iter().flatten().cloned().collect(),
             slices: a.slices.clone(),
         }
     })
@@ -241,15 +316,19 @@ pub fn synthetic_slot_count() -> usize {
 
 /// Makes `seed` the synthetic nodes of this thread.
 pub fn install_synthetic_seed(seed: SyntheticSeed) {
-    ARENA.with(|a| {
-        *a.borrow_mut() = SyntheticArena {
-            slots: seed.slots,
-            aliases: seed.aliases,
-            datas: seed.datas.into_iter().map(Rc::new).collect(),
-            lists: seed.lists,
-            slices: seed.slices,
-        }
-    });
+    let mut arena = SyntheticArena {
+        slots: seed.slots,
+        aliases: seed.aliases,
+        slices: seed.slices,
+        ..SyntheticArena::new()
+    };
+    for node in seed.datas {
+        arena.push_data(node);
+    }
+    for list in seed.lists {
+        arena.push_list(list);
+    }
+    ARENA.with(|a| *a.borrow_mut() = arena);
 }
 
 /// Leaks the synthetic nodes of this thread instead of freeing them when the
@@ -318,14 +397,36 @@ fn with_node_mut<R>(n: Node, f: impl FnOnce(&mut SyntheticNode) -> R) -> R {
 // Node data reads
 // ──────────────────────────────────────────────────────────────────────
 
+/// The ts_ast node of a synthetic node, held apart from the arena by its
+/// chunk (see `SyntheticArena::datas`).
+struct HeldNode {
+    chunk: DataChunk,
+    cell: usize,
+}
+
+impl std::ops::Deref for HeldNode {
+    type Target = ts_ast::Node;
+
+    #[inline]
+    fn deref(&self) -> &ts_ast::Node {
+        self.chunk[self.cell]
+            .get()
+            .expect("synthetic node data entry is not filled")
+    }
+}
+
 /// The ts_ast node (kind and data) of synthetic node `n`, held apart from
 /// the arena, so the reader can make and change synthetic nodes.
 #[cold]
 #[inline(never)]
-fn synthetic_ast_node(n: Node) -> Rc<ts_ast::Node> {
+fn synthetic_ast_node(n: Node) -> HeldNode {
     ARENA.with(|a| {
         let a = a.borrow();
-        a.datas[a.node(n).data as usize].clone()
+        let i = a.node(n).data as usize;
+        HeldNode {
+            chunk: a.datas[i / DATA_CHUNK].clone(),
+            cell: i % DATA_CHUNK,
+        }
     })
 }
 
@@ -624,7 +725,7 @@ pub fn synthetic_list_of(n: Node, sel: ListSel) -> Option<Option<SyntheticList>>
     ARENA.with(|a| {
         let a = a.borrow();
         let data = a.node(n).data;
-        sel(&a.datas[data as usize].data).map(|l| l.map(|_| SyntheticList::Field { data, sel }))
+        sel(&a.data(data).data).map(|l| l.map(|_| SyntheticList::Field { data, sel }))
     })
 }
 
@@ -678,7 +779,7 @@ pub fn synthetic_list_eq(x: SyntheticList, y: SyntheticList) -> bool {
 
 /// The address of the node list that `list` names, for Go pointer keys
 /// (`NodeList::list_ptr`). It stays the same while the thread's arena lives:
-/// node data is in an `Rc` and a factory list in a `Box`.
+/// node data and factory lists are in chunks that do not move.
 #[must_use]
 pub fn synthetic_list_ptr(list: SyntheticList) -> *const () {
     ARENA.with(|a| a.borrow().list(list).ptr())
@@ -719,12 +820,8 @@ pub fn synthetic_missing_list(list: SyntheticList) -> SyntheticList {
 }
 
 fn push_own_list(list: OwnList) -> SyntheticList {
-    ARENA.with(|a| {
-        let mut a = a.borrow_mut();
-        a.lists.push(Box::new(list));
-        SyntheticList::Own {
-            index: (a.lists.len() - 1) as u32,
-        }
+    ARENA.with(|a| SyntheticList::Own {
+        index: a.borrow_mut().push_list(list),
     })
 }
 
@@ -769,13 +866,12 @@ fn replace_synthetic_ast_node(n: Node, f: impl FnOnce(&ts_ast::Node) -> ts_ast::
     );
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        let a = &mut *a;
+        let node = f(a.data(a.node(n).data));
+        let data = a.push_data(node);
         let Slot::Node(s) = &mut a.slots[slot_index(n)] else {
             panic!("synthetic handle does not name a node slot");
         };
-        let node = f(&a.datas[s.data as usize]);
-        a.datas.push(Rc::new(node));
-        s.data = (a.datas.len() - 1) as u32;
+        s.data = data;
     });
 }
 
@@ -911,11 +1007,10 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
-    let node = Rc::new(new_ts_node(kind, data));
+    let node = new_ts_node(kind, data);
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        a.datas.push(node);
-        let data = (a.datas.len() - 1) as u32;
+        let data = a.push_data(node);
         let index = a.slots.len() as u32;
         a.slots.push(Slot::Node(SyntheticNode {
             data,
@@ -1196,6 +1291,44 @@ mod tests {
             assert!(synthetic_slot_count() > 1);
             free_synthetic_nodes();
             assert_eq!(synthetic_slot_count(), 1);
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // Node data and factory lists fill chunks. A new chunk does not move an
+    // earlier entry, and a read that holds a node can make more nodes.
+    #[test]
+    fn synthetic_entries_stay_in_place_across_chunks() {
+        std::thread::spawn(|| {
+            let f = NodeFactory::new();
+            let first = f.new_identifier("first");
+            let list = f.new_node_list(&[first]);
+            let ptr = list.list_ptr();
+            let last = with_ast_data(first, |_| {
+                let mut last = NodeList::NIL;
+                for i in 0..2 * DATA_CHUNK.max(LIST_CHUNK) {
+                    last = f.new_node_list(&[f.new_identifier(format!("n{i}"))]);
+                }
+                last
+            });
+            assert_eq!(list.list_ptr(), ptr);
+            assert_eq!(list.nodes().to_vec(), vec![first]);
+            assert_eq!(first.text(), "first");
+            let last_text = format!("n{}", 2 * DATA_CHUNK.max(LIST_CHUNK) - 1);
+            assert_eq!(last.nodes().get(0).text(), last_text);
+
+            // The seed copy keeps every index.
+            let seed = synthetic_seed();
+            std::thread::spawn(move || {
+                install_synthetic_seed(seed);
+                assert_eq!(list.nodes().to_vec(), vec![first]);
+                assert_eq!(first.text(), "first");
+                assert_eq!(last.nodes().get(0).text(), last_text);
+            })
+            .join()
+            .expect("seed thread panicked");
+            free_synthetic_nodes();
         })
         .join()
         .expect("test thread panicked");
