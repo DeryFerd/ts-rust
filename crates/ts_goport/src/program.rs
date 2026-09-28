@@ -346,9 +346,18 @@ const MAX_EMIT_THREADS: usize = 32;
 /// 0 (no pool) when the cores are not more than the checkers. With no spare
 /// core the pool only competes with the checker threads, and each d.ts part
 /// loses the caches that its JS part warmed (effect at 4 cores and 4
-/// checkers: +1.6% wall, +30 MiB). `GOPORT_EMIT_THREADS` sets the count at
-/// any core count (same maximum); 0 turns the pool off, so every emit runs
-/// on the checker threads as before the pool.
+/// checkers: +1.6% wall, +30 MiB). When the process may run on
+/// `WIDE_CORES` CPUs or more and they hold SMT siblings (fewer physical
+/// cores than CPUs), the pool gets the physical cores that the checkers do
+/// not use. `GOPORT_EMIT_THREADS` sets the count at any core count (same
+/// maximum); 0 turns the pool off, so every emit runs on the checker
+/// threads as before the pool.
+// PERF (perf11 effecttail E9, dbook, effect emit, perf10 release tsgo, 30
+// paired rounds): at 32 threads (16 cores) a pool of 12 took 0.95% and
+// 1.25% less wall time than 32 (-7 to -9 ms, peak RSS -29 MiB); the 32
+// pool threads shared cores and L3 with the checkers. At 16 threads on 16
+// cores 12 was neutral, so the rule leaves CPUs without siblings alone.
+// perf10 found a pool of 4 17 ms faster on mini-743d (16 threads, 8 cores).
 fn emit_thread_count() -> usize {
     static SET: OnceLock<Option<usize>> = OnceLock::new();
     let set = *SET.get_or_init(|| {
@@ -356,9 +365,21 @@ fn emit_thread_count() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
     });
-    let cores = available_cores();
-    set.unwrap_or(if cores > checker_count() { cores } else { 0 })
-        .min(MAX_EMIT_THREADS)
+    set.unwrap_or_else(|| {
+        let cores = available_cores();
+        let checkers = checker_count();
+        if cores <= checkers {
+            return 0;
+        }
+        if cores >= WIDE_CORES
+            && let Some(physical) = physical_core_count()
+            && physical < cores
+        {
+            return physical.saturating_sub(checkers);
+        }
+        cores
+    })
+    .min(MAX_EMIT_THREADS)
 }
 
 /// Makes the emit pool of the current program with `count` threads.
@@ -1040,13 +1061,17 @@ pub fn available_cores() -> usize {
 const WIDE_CORES: usize = 16;
 
 /// True when this process may run on at least `WIDE_CORES` CPUs and
-/// `WIDE_CORES` physical cores. Read once. The physical cores are read only
-/// when `available_cores` is at least `WIDE_CORES`.
+/// `WIDE_CORES` physical cores. The physical cores are read only when
+/// `available_cores` is at least `WIDE_CORES`.
 fn wide_cores() -> bool {
-    static WIDE: OnceLock<bool> = OnceLock::new();
-    *WIDE.get_or_init(|| {
-        available_cores() >= WIDE_CORES && physical_cores().is_some_and(|cores| cores >= WIDE_CORES)
-    })
+    available_cores() >= WIDE_CORES
+        && physical_core_count().is_some_and(|cores| cores >= WIDE_CORES)
+}
+
+/// `physical_cores`, read once: it reads a sysfs file per core.
+fn physical_core_count() -> Option<usize> {
+    static PHYSICAL: OnceLock<Option<usize>> = OnceLock::new();
+    *PHYSICAL.get_or_init(physical_cores)
 }
 
 /// The physical cores that this process may run on: the CPUs of
