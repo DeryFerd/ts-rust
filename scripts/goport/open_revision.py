@@ -107,6 +107,11 @@ def main():
                   'testEditsAuthorized': False, 'runtimeAuthorized': True, 'expectedCompilerRecoveries': [],
                   'expectationUpdates': [], 'verdictHistory': [], 'focusedResults': [], 'runtimeToolHandles': [],
                   'commands': [], 'interruptedRuns': [], 'recoveryHistory': old['recoveryHistory']})
+        # A new batch stays at the Go pin its predecessor was accepted at (candidate.sh side reads
+        # batch.upstreamPin.to). A pin-bump batch sets a new "to" itself.
+        if old.get('upstreamPin'):
+            pin = old['upstreamPin']['to']
+            b['upstreamPin'] = {'from': pin, 'to': pin, 'rule': None, 'note': f"same pin as {old['id']}"}
         for rid in RULES:
             prev = [r for r in s['acceptanceRuleChanges'] if r['id'] == rid][-1]
             r = copy.deepcopy(prev)
