@@ -144,9 +144,14 @@ pub fn is_potentially_valid_js_doc_snippet_completion_position(file: Node, posit
 }
 
 // Go: ls/jsdoc_snippet.go:118 getDocCommentTemplateAtPosition
-// PORT: `cwd` is the current directory of the language service program. The
-// reparse is published with no program, so its nodes can be read (as in
-// `sourcedefinition.rs`), and publishing needs it.
+// PORT: Go reads the reparse like any parsed file, with lazy JSDoc. Here a
+// lazy JSDoc read of a published file asks the current program for the
+// parser input, and the language service program has none for a file that
+// is in no program ("not a Go frontend program file"). So the reparse is
+// read before it is published: its node and JSDoc reads use its store (as
+// for a parse cache file or in the astnav tests). It is published after the
+// reads, so no unpublished store stays on this thread. `cwd` is the current
+// directory of the language service program, which the publish needs.
 fn get_doc_comment_template_at_position(
     source_file: Node,
     position: i32,
@@ -186,14 +191,15 @@ fn get_doc_comment_template_at_position(
             parsed.script_kind,
         ));
         crate::program::note_parsed_source_file(&reparse);
-        crate::program::publish_parsed_files(cwd);
-        return get_doc_comment_template_at_position(
+        let template = get_doc_comment_template_at_position(
             reparse.root,
             position,
             generate_return_in_doc_template,
             new_line,
             cwd,
         );
+        crate::program::publish_parsed_files(cwd);
+        return template;
     }
     if is_non_empty_js_doc(existing_doc_comment) {
         return None;
@@ -233,7 +239,7 @@ fn get_doc_comment_template_at_position(
     let indentation = get_indentation_string_at_position(source_file, position);
     let mut tags = parameter_doc_comments(
         &comment_owner_info.parameters,
-        is_source_file_js(source_file),
+        is_template_source_file_js(source_file),
         indentation,
         new_line,
     );
@@ -254,6 +260,20 @@ fn get_doc_comment_template_at_position(
     Some(DocCommentTemplate {
         new_text: "/** */".to_string(),
     })
+}
+
+// Go: ast.IsSourceFileJS(sourceFile) in getDocCommentTemplateAtPosition
+// PORT: the reparse is read before it is published (see
+// `get_doc_comment_template_at_position`), and a file that is not published
+// has no `SourceFileInfo`. Its recorded parse has the script kind.
+fn is_template_source_file_js(source_file: Node) -> bool {
+    if !is_file_store_before_program(source_file.file_index()) {
+        return is_source_file_js(source_file);
+    }
+    let script_kind = ls_program::parsed_source_file(source_file)
+        .expect("invalid memory address or nil pointer dereference")
+        .script_kind;
+    script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }
 
 // Go: ls/jsdoc_snippet.go:177 getDocCommentEndAtPosition
