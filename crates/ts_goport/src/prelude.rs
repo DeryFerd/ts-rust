@@ -10,6 +10,7 @@ pub use crate::core::*;
 pub use crate::diag;
 pub use crate::evaluator::*;
 pub use crate::flags::*;
+pub use crate::go_assert;
 pub use crate::options::*;
 pub use crate::printer::*;
 pub use crate::program::*;

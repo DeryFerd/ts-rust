@@ -96,13 +96,9 @@ impl ClassFieldsTransformer {
                     fn_,
                 )
             }
-            PrivateIdentifierKind::UNTRANSFORMED => {
-                debug_assert!(
-                    false,
-                    "Access helpers should not be created for untransformed private elements"
-                );
-                Node::NIL
-            }
+            PrivateIdentifierKind::UNTRANSFORMED => crate::gostd::debug::fail(
+                "Access helpers should not be created for untransformed private elements",
+            ),
             _ => {
                 debug_assert!(false, "Unknown private element type");
                 Node::NIL
@@ -375,7 +371,7 @@ impl ClassFieldsTransformer {
         let result = visitor(self, node, facts);
         self.enclosing_class_declarations.remove(&original);
         self.end_class_lexical_environment();
-        debug_assert!(
+        go_assert!(
             match (&self.lexical_environment, &saved_lexical_environment) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Rc::ptr_eq(a, b),
@@ -983,7 +979,7 @@ impl ClassFieldsTransformer {
     pub(super) fn create_brand_check_weak_set_for_private_methods(&mut self) {
         let env = self.get_private_identifier_environment();
         let weak_set_name = env.borrow().data.weak_set_name;
-        debug_assert!(
+        go_assert!(
             weak_set_name.is_some(),
             "weakSetName should be set in private identifier environment"
         );
@@ -1041,7 +1037,7 @@ impl ClassFieldsTransformer {
         let ec = self.ec();
         let f = ec.factory();
         if constructor.is_some() {
-            debug_assert!(parameters.is_some());
+            go_assert!(parameters.is_some());
             return f.update_constructor_declaration(
                 constructor,
                 ModifierList::NIL, /*modifiers*/
@@ -1520,7 +1516,7 @@ impl ClassFieldsTransformer {
                 }
                 return Node::NIL;
             } else {
-                debug_assert!(false, "Undeclared private name for property declaration.");
+                crate::gostd::debug::fail("Undeclared private name for property declaration.");
             }
         }
 
@@ -1640,7 +1636,7 @@ impl ClassFieldsTransformer {
 
         let env = self.get_private_identifier_environment();
         let weak_set_name = env.borrow().data.weak_set_name;
-        debug_assert!(
+        go_assert!(
             weak_set_name.is_some(),
             "weakSetName should be set in private identifier environment"
         );
@@ -1755,7 +1751,8 @@ impl ClassFieldsTransformer {
         let env = self
             .lexical_environment
             .as_ref()
-            .expect("lexicalEnvironment is nil");
+            // Go: debug.Assert(tx.lexicalEnvironment != nil)
+            .unwrap_or_else(|| crate::gostd::debug::assert_failed(None));
         let mut data = env.data.borrow_mut();
         data.get_or_insert_with(|| Rc::new(RefCell::new(ClassLexicalEnvironment::default())))
             .clone()
@@ -1766,7 +1763,8 @@ impl ClassFieldsTransformer {
         let env = self
             .lexical_environment
             .as_ref()
-            .expect("lexicalEnvironment is nil");
+            // Go: debug.Assert(tx.lexicalEnvironment != nil)
+            .unwrap_or_else(|| crate::gostd::debug::assert_failed(None));
         let mut private_env = env.private_env.borrow_mut();
         private_env
             .get_or_insert_with(|| Rc::new(RefCell::new(PrivateEnvironment::default())))
@@ -1846,7 +1844,7 @@ impl ClassFieldsTransformer {
             if brand_check_identifier.is_nil() {
                 brand_check_identifier = lex.class_constructor;
             }
-            debug_assert!(
+            go_assert!(
                 brand_check_identifier.is_some(),
                 "classConstructor should be set in private identifier environment"
             );
@@ -1892,7 +1890,7 @@ impl ClassFieldsTransformer {
     ) {
         let getter_name = self.create_hoisted_variable_for_private_name(name, "_get");
         let brand_check_identifier = Self::brand_check_identifier_for(lex, env, is_static);
-        debug_assert!(
+        go_assert!(
             is_static || brand_check_identifier.is_some(),
             "weakSetName should be set in private identifier environment"
         );
@@ -1931,7 +1929,7 @@ impl ClassFieldsTransformer {
     ) {
         let setter_name = self.create_hoisted_variable_for_private_name(name, "_set");
         let brand_check_identifier = Self::brand_check_identifier_for(lex, env, is_static);
-        debug_assert!(
+        go_assert!(
             is_static || brand_check_identifier.is_some(),
             "weakSetName should be set in private identifier environment"
         );
@@ -1971,7 +1969,7 @@ impl ClassFieldsTransformer {
         let getter_name = self.create_hoisted_variable_for_private_name(name, "_get");
         let setter_name = self.create_hoisted_variable_for_private_name(name, "_set");
         let brand_check_identifier = Self::brand_check_identifier_for(lex, env, is_static);
-        debug_assert!(
+        go_assert!(
             is_static || brand_check_identifier.is_some(),
             "weakSetName should be set in private identifier environment"
         );
@@ -2320,7 +2318,7 @@ impl ClassFieldsTransformer {
 
     // Go: transformers/estransforms/classfields.go:3317 classFieldsTransformer.visitObjectAssignmentElement
     pub(super) fn visit_object_assignment_element(&mut self, node: Node) -> Node {
-        debug_assert!(node.is_some() && is_object_binding_or_assignment_element(node));
+        go_assert!(node.is_some() && is_object_binding_or_assignment_element(node));
         if is_spread_assignment(node) {
             return self.visit_assignment_rest_property(node);
         }

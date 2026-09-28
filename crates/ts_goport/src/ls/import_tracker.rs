@@ -317,7 +317,7 @@ pub fn get_source_file_like_for_import_declaration(node: Node) -> Node {
     if is_source_file(parent) {
         return parent;
     }
-    debug_assert!(is_module_block(parent) && is_ambient_module_declaration(parent.parent()));
+    crate::go_assert!(is_module_block(parent) && is_ambient_module_declaration(parent.parent()));
     parent.parent()
 }
 
@@ -422,7 +422,7 @@ impl<F: FnMut(Node) -> bool> ImportersForExport<'_, F> {
         if module_symbol.is_nil() {
             return;
         }
-        debug_assert!(
+        crate::go_assert!(
             self.checker
                 .sym(module_symbol)
                 .flags
@@ -465,7 +465,7 @@ impl<F: FnMut(Node) -> bool> ImportersForExport<'_, F> {
             }
         } else if !self.is_available_through_global {
             let source_file_like = get_source_file_like_for_import_declaration(import_declaration);
-            debug_assert!(
+            crate::go_assert!(
                 is_source_file(source_file_like) || is_module_declaration(source_file_like)
             );
             let add_transitive_dependencies =
@@ -567,14 +567,10 @@ impl<F: FnMut(Node) -> bool> ImportersForExport<'_, F> {
                     }
                     self.direct_imports.push(direct);
                 }
-                _ => {
-                    // PORT: Go `debug.FailBadSyntaxKind(direct, "Unexpected import kind.")`;
-                    // the node kind is printed with Debug (panic text only).
-                    panic!(
-                        "Debug failure. Unexpected import kind.\nNode {:?} was unexpected.",
-                        direct.kind()
-                    );
-                }
+                _ => crate::gostd::debug::fail_bad_syntax_kind(
+                    direct.kind(),
+                    Some("Unexpected import kind."),
+                ),
             }
         }
     }
@@ -1102,7 +1098,7 @@ pub fn is_node_import(node: Node) -> bool {
             parent.property_name().is_nil()
         }
         SyntaxKind::ImportClause | SyntaxKind::NamespaceImport => {
-            debug_assert!(parent.name() == node);
+            crate::go_assert!(parent.name() == node);
             true
         }
         SyntaxKind::BindingElement => {
@@ -1169,7 +1165,7 @@ pub fn get_export_equals_local_symbol(
         return checker.get_immediate_aliased_symbol_exported(imported_symbol);
     }
     let decl = checker.sym(imported_symbol).value_declaration;
-    debug_assert!(decl.is_some());
+    crate::go_assert!(decl.is_some());
     if is_export_assignment(decl) {
         return decl.expression().symbol();
     } else if is_binary_expression(decl) {

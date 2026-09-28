@@ -158,7 +158,7 @@ pub fn get_comment_indent(
     let previous_line = get_ecma_line_of_position(source_file, position) - 1;
     let comment_start_line = get_ecma_line_of_position(source_file, enclosing_comment_range.pos());
 
-    debug_assert!(comment_start_line >= 0, "commentStartLine >= 0");
+    crate::go_assert!(comment_start_line >= 0, "commentStartLine >= 0");
 
     if previous_line <= comment_start_line {
         let line_starts = get_ecma_line_starts(source_file);
@@ -635,7 +635,7 @@ pub fn derive_actual_indentation_from_list(
     source_file: Node,
     options: &lsutil::FormatCodeSettings,
 ) -> i32 {
-    debug_assert!(list.is_some() && index >= 0 && (index as usize) < list.nodes().len());
+    crate::go_assert!(list.is_some() && index >= 0 && (index as usize) < list.nodes().len());
 
     let nodes = list.nodes();
     let node = nodes.get(index as usize);
@@ -738,7 +738,7 @@ pub fn child_starts_on_the_same_line_with_else_in_if_statement(
 ) -> bool {
     if parent.kind() == SyntaxKind::IfStatement && parent.else_statement() == child {
         let else_keyword = astnav::find_preceding_token(source_file, child.pos());
-        debug_assert!(else_keyword.is_some());
+        crate::go_assert!(else_keyword.is_some());
         let else_keyword_start_line = get_start_line_for_node(else_keyword, source_file);
         return else_keyword_start_line == child_start_line;
     }

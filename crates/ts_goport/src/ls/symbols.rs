@@ -15,6 +15,7 @@ use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
 use crate::frontend::stringutil_ls;
+use crate::gostd::unicode;
 
 impl LanguageService {
     // Go: ls/symbols.go:24 ProvideDocumentSymbols
@@ -912,7 +913,7 @@ pub fn get_match_score(s: &str, pattern: &str) -> i32 {
                 return -1;
             };
             s = &s[c.len_utf8()..];
-            if exact && c == p || !exact && unicode_to_lower(c) == unicode_to_lower(p) {
+            if exact && c == p || !exact && unicode::to_lower(c) == unicode::to_lower(p) {
                 break;
             }
             score += 1;
@@ -933,14 +934,6 @@ fn unicode_is_upper(c: char) -> bool {
         c as u32,
         0x2160..=0x216F | 0x24B6..=0x24CF | 0x1F130..=0x1F149 | 0x1F150..=0x1F169 | 0x1F170..=0x1F189
     )
-}
-
-/// Go `unicode.ToLower` (simple case mapping).
-// PORT: the only rune with a multi-rune full lowercase is U+0130, whose first
-// rune ('i') is also the Go simple lowercase. So the first rune is the Go
-// result (the same helper as in `frontend/stringutil_ls.rs`).
-fn unicode_to_lower(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
 }
 
 // Go: ls/symbols.go:620 compareDeclarationInfos

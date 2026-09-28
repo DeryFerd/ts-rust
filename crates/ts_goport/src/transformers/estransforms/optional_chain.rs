@@ -109,7 +109,7 @@ impl OptionalChainTransformer {
             return self.visit_optional_expression(node, capture_this_arg, is_delete);
         }
         let mut expression = self.visit_node(node.expression());
-        debug_assert!(expression.is_nil() || !is_synthetic_reference_expression(expression));
+        go_assert!(expression.is_nil() || !is_synthetic_reference_expression(expression));
 
         let ec = self.ec();
         let f = ec.factory();
@@ -311,11 +311,11 @@ fn is_non_null_chain(node: Node) -> bool {
 // Go: transformers/estransforms/optionalchain.go:136 flattenChain
 /// Returns Go `flattenResult{expression, chain}`.
 fn flatten_chain(mut chain: Node) -> (Node, Vec<Node>) {
-    debug_assert!(!is_non_null_chain(chain));
+    go_assert!(!is_non_null_chain(chain));
     let mut links: Vec<Node> = vec![chain];
     while !is_tagged_template_expression(chain) && chain.question_dot_token().is_nil() {
         chain = skip_partially_emitted_expressions(chain.expression());
-        debug_assert!(!is_non_null_chain(chain));
+        go_assert!(!is_non_null_chain(chain));
         links.insert(0, chain);
     }
     (chain.expression(), links)

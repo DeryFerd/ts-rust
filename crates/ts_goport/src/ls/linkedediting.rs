@@ -82,7 +82,7 @@ impl LanguageService {
             if tag.is_nil() {
                 return Ok(lsproto::LinkedEditingRangeResponse::default());
             }
-            debug_assert!(
+            crate::go_assert!(
                 is_jsx_opening_element(tag) || is_jsx_closing_element(tag),
                 "tag should be opening or closing element"
             );
