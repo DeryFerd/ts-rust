@@ -136,7 +136,7 @@ pub fn localize(
 ) -> String {
     let mut message = message;
     if message.is_none() {
-        message = ts_diagnostics::message_by_key(key);
+        message = crate::diag::key_to_message(key);
     }
     let Some(message) = message else {
         panic!("Unknown diagnostic message: {key}");
