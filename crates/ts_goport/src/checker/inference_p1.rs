@@ -44,9 +44,9 @@ pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
 /// id goes in the high 32 bits with zero low bits: a symbol as its id, a
 /// type as its id with bit 31 set. An id that does not fit (a node with
 /// zero low bits, a nil symbol, or a symbol or type id of 2^31 or more) is
-/// stored as `None`. Such an entry is not a mapped type or an
-/// intersection, so `has_matching_recursion_identity` on it only compares
-/// `get_recursion_identity` and gives the same answer.
+/// stored as `None`. Such an entry is not a mapped type, an indexed access
+/// or an intersection, so `has_matching_recursion_identity` on it only
+/// compares `get_recursion_identity_from_target` and gives the same answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecursionKey(u64);
 

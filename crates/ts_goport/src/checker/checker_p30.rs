@@ -548,11 +548,12 @@ impl Checker {
             .collect();
         let source_value = string_literal_value(self, source);
         let this: &Checker = self;
-        get_spelling_suggestion(
+        get_spelling_suggestion_with_max_candidate_count(
             &source_value,
             candidates,
             |t: &TypeId| string_literal_value(this, *t),
             |a: &TypeId, b: &TypeId| this.compare_types(*a, *b),
+            1000,
         )
     }
 }
@@ -1492,6 +1493,64 @@ impl Checker {
                 .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION);
         }
         false
+    }
+
+    // Return true the given type is a primitive union type where no two literal type constituents are
+    // comparable. Specifically, that means (a) the union doesn't contain literals from different enum
+    // types, and (b) the union doesn't contain both enum literals and string or number literals.
+    // Go: checker/checker.go:27821 isUniformUnionType
+    pub fn is_uniform_union_type(&mut self, t: TypeId) -> bool {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::PRIMITIVE_UNION)
+        {
+            if !self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNIFORM_ENUM_COMPUTED)
+            {
+                let types = self.ty(t).types_list();
+                let uniform = if self.compute_is_uniform_union_type(&types) {
+                    ObjectFlags::IS_UNIFORM_ENUM
+                } else {
+                    ObjectFlags::NONE
+                };
+                self.ty_mut(t).object_flags |= ObjectFlags::IS_UNIFORM_ENUM_COMPUTED | uniform;
+            }
+            return self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNIFORM_ENUM);
+        }
+        false
+    }
+
+    // Go: checker/checker.go:27831 computeIsUniformUnionType
+    pub fn compute_is_uniform_union_type(&mut self, types: &[TypeId]) -> bool {
+        let mut enum_symbol = SymbolId::NIL;
+        let mut has_string_or_number_literal = false;
+        for &t in types {
+            let flags = self.ty(t).flags;
+            if flags.intersects(TypeFlags::ENUM_LIKE) {
+                if has_string_or_number_literal {
+                    return false;
+                }
+                let symbol = self.ty(t).symbol;
+                let parent = self.get_parent_of_symbol(symbol);
+                if enum_symbol.is_nil() {
+                    enum_symbol = parent;
+                } else if enum_symbol != parent {
+                    return false;
+                }
+            } else if flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL) {
+                if enum_symbol.is_some() {
+                    return false;
+                }
+                has_string_or_number_literal = true;
+            }
+        }
+        true
     }
 
     // Go: checker/checker.go:27684 containsUndefinedType

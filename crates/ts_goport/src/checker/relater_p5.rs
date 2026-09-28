@@ -425,6 +425,10 @@ impl Checker {
                 let target_has_rest_element = self
                     .target_tuple_type(target)
                     .combined_flags
+                    .intersects(ElementFlags::REST);
+                let target_has_variable_element = self
+                    .target_tuple_type(target)
+                    .combined_flags
                     .intersects(ElementFlags::VARIABLE);
                 let source_min_length: i32;
                 if self.is_tuple_type(source) {
@@ -443,7 +447,7 @@ impl Checker {
                     }
                     return Ternary::FALSE;
                 }
-                if !target_has_rest_element && target_arity < source_min_length {
+                if !target_has_variable_element && target_arity < source_min_length {
                     if report_errors {
                         self.report_error(
                             r,
@@ -453,7 +457,7 @@ impl Checker {
                     }
                     return Ternary::FALSE;
                 }
-                if !target_has_rest_element && (source_rest || target_arity < source_arity) {
+                if !target_has_variable_element && (source_rest || target_arity < source_arity) {
                     if report_errors {
                         if source_min_length < target_min_length {
                             self.report_error(
@@ -493,6 +497,16 @@ impl Checker {
                         target_position =
                             target_arity - 1 - source_position_from_end.min(target_end_count);
                     } else {
+                        if source_position >= target_arity {
+                            if report_errors {
+                                self.report_error(
+                                    r,
+                                    diag::Target_allows_only_0_element_s_but_source_may_have_more,
+                                    args![target_arity],
+                                );
+                            }
+                            return Ternary::FALSE;
+                        }
                         target_position = source_position;
                     }
                     let mut target_flags = ElementFlags::NONE;
@@ -1863,7 +1877,6 @@ impl Checker {
             // Suppress if next message is an excess property error
             return;
         } else if msg_eq(chain_message, diag::Excessive_complexity_comparing_types_0_and_1)
-            || msg_eq(chain_message, diag::Excessive_stack_depth_comparing_types_0_and_1)
             || msg_eq(chain_message, diag::The_type_0_is_readonly_and_cannot_be_assigned_to_the_mutable_type_1)
         {
             // Suppress if next message is an excessive complexity/stack depth message for source and target or a readonly

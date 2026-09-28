@@ -54,8 +54,6 @@ pub struct Binder {
     pub in_assignment_pattern: bool,
     pub seen_parse_error: bool,
     pub symbol_count: i32,
-    // PORT: Go `classifiableNames` is not kept. Go stores it on the file and
-    // nothing reads it.
     pub not_const_enum_only_modules: FxHashSet<SymbolId>,
     /// Go `symbolArena`. The program-wide symbol arena, moved in while binding.
     pub symbols: SymbolArena,
@@ -614,8 +612,6 @@ impl Binder {
             // you have multiple 'vars' with the same name in the same container).  In this case
             // just add this node into the declarations list of the symbol.
             //
-            // PORT: Go also adds a classifiable name to `classifiableNames`,
-            // which nothing reads (see `Binder`).
             // PERF: one table lookup finds the symbol and the slot to store
             // a new one; `new_symbol` does not change tables.
             let (found, slot) = self.symbols.get_slot(symbol_table, &name);

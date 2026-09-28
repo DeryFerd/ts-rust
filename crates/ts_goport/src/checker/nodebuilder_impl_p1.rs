@@ -463,25 +463,32 @@ impl Checker {
         }
         // Push t onto the type stack so shouldExpandType's cycle detection works correctly.
         ctx.borrow_mut().type_stack.push(t);
-        if self.ty(t).alias.is_some() {
-            self.should_expand_type(b, t, true);
-        }
-        if !ctx.borrow().can_increase_expansion_depth {
-            self.should_expand_type(b, t, false);
-        }
-        ctx.borrow_mut().type_stack.pop();
-        if ctx.borrow().can_increase_expansion_depth {
-            return;
-        }
-        // Recurse into type arguments (e.g., check Apple in Promise<Apple>).
-        if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
-            for arg in self.get_type_arguments(t) {
-                self.check_type_expandability(b, arg);
-                if ctx.borrow().can_increase_expansion_depth {
-                    return;
+        // PORT: Go pops t in a `defer`; every return below breaks out of this block.
+        'body: {
+            // If t is an ancestor in the current expansion, return early to avoid unbounded recursion.
+            if self.is_type_on_stack(b, t) {
+                break 'body;
+            }
+            if self.ty(t).alias.is_some() {
+                self.should_expand_type(b, t, true);
+            }
+            if !ctx.borrow().can_increase_expansion_depth {
+                self.should_expand_type(b, t, false);
+            }
+            if ctx.borrow().can_increase_expansion_depth {
+                break 'body;
+            }
+            // Recurse into type arguments (e.g., check Apple in Promise<Apple>).
+            if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
+                for arg in self.get_type_arguments(t) {
+                    self.check_type_expandability(b, arg);
+                    if ctx.borrow().can_increase_expansion_depth {
+                        break 'body;
+                    }
                 }
             }
         }
+        ctx.borrow_mut().type_stack.pop();
     }
 
     // Go: checker/nodebuilderimpl.go:260 appendReferenceToType
@@ -810,7 +817,7 @@ impl Checker {
         _b: &Rc<RefCell<NodeBuilderImpl>>,
         node: Node,
     ) -> SymbolId {
-        if node.is_nil() {
+        if node.is_nil() || node.parent().is_nil() {
             return SymbolId::NIL;
         }
         self.get_type_from_type_node(node);

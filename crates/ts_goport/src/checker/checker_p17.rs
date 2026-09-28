@@ -185,6 +185,14 @@ impl Checker {
 
     // Go: checker/checker.go:14896 getTargetOfExportAssignment
     pub fn get_target_of_export_assignment(&mut self, node: Node) -> SymbolId {
+        // An `export =` / `export default` inside a namespace/module block is a grammar error;
+        // checkExportAssignment reports it and returns without resolving the expression. Mirror that
+        // bail-out here (using the same container computation) so that alias resolution triggered by
+        // the emit resolver does not resolve — and report "Cannot find name" diagnostics on — the
+        // expression, which would produce diagnostics inconsistent with checking.
+        if is_contained_by_namespace(node) {
+            return SymbolId::NIL;
+        }
         let resolved = self.get_target_of_alias_like_expression(node.expression());
         self.mark_symbol_of_alias_declaration_if_type_only(node, Node::NIL);
         resolved
@@ -1309,6 +1317,8 @@ impl Checker {
             if has_synthetic_default {
                 let anonymous_symbol =
                     self.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
+                let declarations = self.sym(original_symbol).declarations.clone();
+                self.sym_mut(anonymous_symbol).declarations = declarations;
                 let default_containing_object = self.create_default_property_wrapper_for_module(
                     symbol,
                     original_symbol,
@@ -1399,6 +1409,13 @@ impl Checker {
         self.alias_symbol_links.get(new_symbol).alias_target = alias_target;
         self.symbols
             .set(member_table, INTERNAL_SYMBOL_NAME_DEFAULT, new_symbol);
+        let mut anonymous_symbol = anonymous_symbol;
+        if anonymous_symbol.is_nil() && original_symbol.is_some() {
+            anonymous_symbol =
+                self.new_symbol(SymbolFlags::OBJECT_LITERAL, INTERNAL_SYMBOL_NAME_OBJECT);
+            let declarations = self.sym(original_symbol).declarations.clone();
+            self.sym_mut(anonymous_symbol).declarations = declarations;
+        }
         self.new_anonymous_type(anonymous_symbol, member_table, &[], &[], &[])
     }
 

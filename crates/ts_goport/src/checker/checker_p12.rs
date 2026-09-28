@@ -744,10 +744,7 @@ impl Checker {
             if call_signatures != resolved_call_signatures
                 || construct_signatures != resolved_construct_signatures
             {
-                let symbol = self.new_symbol(
-                    SymbolFlags::NONE,
-                    INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION,
-                );
+                let symbol = self.ty(t).symbol;
                 let result = self.new_object_type(
                     ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE,
                     symbol,

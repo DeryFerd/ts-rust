@@ -74,6 +74,11 @@ impl Checker {
         self.es_symbol_type
     }
 
+    // Go: checker/exports.go:57 GetNonPrimitiveType
+    pub fn get_non_primitive_type(&self) -> TypeId {
+        self.non_primitive_type
+    }
+
     // Go: checker/exports.go:57 GetBaseTypeOfLiteralType
     pub fn get_base_type_of_literal_type_exported(&mut self, t: TypeId) -> TypeId {
         self.get_base_type_of_literal_type(t)
@@ -92,6 +97,11 @@ impl Checker {
     // Go: checker/exports.go:69 GetArgumentsSymbol
     pub fn get_arguments_symbol(&self) -> SymbolId {
         self.arguments_symbol
+    }
+
+    // Go: checker/exports.go:77 GetUnknownSignature
+    pub fn get_unknown_signature(&self) -> SignatureId {
+        self.unknown_signature
     }
 
     // Go: checker/exports.go:65 GetUnionType
@@ -424,9 +434,26 @@ impl Checker {
         self.get_apparent_type(t)
     }
 
+    // Go: checker/exports.go:299 GetFullyQualifiedName
+    // GetFullyQualifiedName returns the fully qualified name of a symbol, walking up
+    // its parent chain (e.g. `"/path/to/module".Namespace.Name`).
+    pub fn get_fully_qualified_name_exported(&mut self, symbol: SymbolId) -> String {
+        self.get_fully_qualified_name(symbol, Node::NIL /*containingLocation*/)
+    }
+
     // Go: checker/exports.go:269 GetBaseConstructorTypeOfClass
     pub fn get_base_constructor_type_of_class_exported(&mut self, t: TypeId) -> TypeId {
         self.get_base_constructor_type_of_class(t)
+    }
+
+    // Go: checker/exports.go:307 GetMemberOverrideModifierStatus
+    pub fn get_member_override_modifier_status_exported(
+        &mut self,
+        node: Node,
+        member: Node,
+        member_symbol: SymbolId,
+    ) -> MemberOverrideStatus {
+        self.get_member_override_modifier_status(node, member, member_symbol)
     }
 
     // Go: checker/exports.go:273 GetRestTypeOfSignature
