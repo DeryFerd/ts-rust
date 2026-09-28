@@ -20,6 +20,7 @@
 //! override are process-wide in the port.
 
 mod ast_tests;
+mod checkerpool_tests;
 mod childprog;
 mod emittestutil;
 mod execute_tests;

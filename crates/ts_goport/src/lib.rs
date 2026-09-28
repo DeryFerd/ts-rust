@@ -38,6 +38,7 @@ pub mod scanner_util;
 pub mod sourcemap;
 pub mod tracing;
 pub mod transformers;
+pub mod transpile;
 
 // Language-service port (Go `internal/{ls,lsp,project,format,astnav,fswatch,jsonrpc,api}`).
 pub mod api;
