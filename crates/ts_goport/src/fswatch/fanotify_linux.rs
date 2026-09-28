@@ -441,23 +441,25 @@ impl WatcherImpl for FanotifyBackend {
         if let Err(err) = walk_dir(
             &w.physical_dir,
             true,
-            Some(&mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
-                if !is_dir {
-                    return Ok(());
-                }
-                let path = &w.display_path(watch_path);
-                if let Err(err) = self.mark_dir(w, path, watch_path) {
-                    return Err(DirWatchError {
-                        err: errors::errorf(
-                            format!("fanotify_mark on '{}' failed: {}", path, err.error()),
-                            vec![err],
-                        ),
-                        dir_watch: w.clone(),
+            Some(
+                &mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
+                    if !is_dir {
+                        return Ok(());
                     }
-                    .to_go_error());
-                }
-                Ok(())
-            }),
+                    let path = &w.display_path(watch_path);
+                    if let Err(err) = self.mark_dir(w, path, watch_path) {
+                        return Err(DirWatchError {
+                            err: errors::errorf(
+                                format!("fanotify_mark on '{}' failed: {}", path, err.error()),
+                                vec![err],
+                            ),
+                            dir_watch: w.clone(),
+                        }
+                        .to_go_error());
+                    }
+                    Ok(())
+                },
+            ),
         ) {
             let _ = self.close_watch(w);
             return Err(err);
@@ -533,12 +535,7 @@ impl FanotifyBackend {
     }
 
     // Go: fanotify_linux.go:345 fanotifyBackend.markDir
-    pub fn mark_dir(
-        &self,
-        w: &Arc<DirWatch>,
-        path: &str,
-        mark_path: &str,
-    ) -> Result<(), GoError> {
+    pub fn mark_dir(&self, w: &Arc<DirWatch>, path: &str, mark_path: &str) -> Result<(), GoError> {
         let (fanotify_fd, mark_mask) = {
             let l = self.locked.lock().unwrap();
             (l.fanotify_fd, l.mark_mask)
@@ -743,7 +740,8 @@ impl FanotifyBackend {
                                 if !p_is_dir {
                                     return Ok(());
                                 }
-                                let _ = self.mark_dir(&s.dir_watch, &s.dir_watch.display_path(p), p);
+                                let _ =
+                                    self.mark_dir(&s.dir_watch, &s.dir_watch.display_path(p), p);
                                 Ok(())
                             }),
                         );

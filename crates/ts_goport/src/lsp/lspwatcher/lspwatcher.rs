@@ -481,23 +481,20 @@ impl Watcher {
         }
         let mut paths: Vec<String> = vec![directory.to_string()];
         if recursive {
-            let _ = self.fs.walk_dir(
-                directory,
-                &mut |path: &str,
-                      _entry: Option<&vfs::DirEntry>,
-                      err: Option<vfs::FsError>|
-                 -> Result<(), vfs::FsError> {
-                    if err.is_some() {
-                        return Ok(());
-                    }
-                    let normalized_path = tspath::normalize_slashes(path);
-                    if normalized_path == directory {
-                        return Ok(());
-                    }
-                    paths.push(normalized_path);
-                    Ok(())
-                },
-            );
+            let _ = self.fs.walk_dir(directory, &mut |path: &str,
+                                                      _entry: Option<&vfs::DirEntry>,
+                                                      err: Option<vfs::FsError>|
+             -> Result<(), vfs::FsError> {
+                if err.is_some() {
+                    return Ok(());
+                }
+                let normalized_path = tspath::normalize_slashes(path);
+                if normalized_path == directory {
+                    return Ok(());
+                }
+                paths.push(normalized_path);
+                Ok(())
+            });
         } else {
             let entries = self.fs.get_accessible_entries(directory);
             for name in &entries.files {

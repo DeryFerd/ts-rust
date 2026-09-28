@@ -1294,7 +1294,13 @@ impl DirWatch {
                 .any(|cb| cb.terminal.is_some() && !cb.delivered);
             let has_events = self.events.size() > 0;
             let has_error = self.events.has_error();
-            (has_pending_cbs, has_terminal, has_events, has_error, dw.debounce.clone())
+            (
+                has_pending_cbs,
+                has_terminal,
+                has_events,
+                has_error,
+                dw.debounce.clone(),
+            )
         };
 
         if has_pending_cbs && (has_events || has_error || has_terminal) {

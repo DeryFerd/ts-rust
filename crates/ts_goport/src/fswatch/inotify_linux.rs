@@ -270,23 +270,25 @@ impl WatcherImpl for InotifyBackend {
         if let Err(err) = walk_dir(
             &w.physical_dir,
             true,
-            Some(&mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
-                if !is_dir {
-                    return Ok(());
-                }
-                let path = &w.display_path(watch_path);
-                if let Err(err) = self.watch_dir(w, path, watch_path) {
-                    return Err(DirWatchError {
-                        err: errors::errorf(
-                            format!("inotify_add_watch on '{}' failed: {}", path, err.error()),
-                            vec![err],
-                        ),
-                        dir_watch: w.clone(),
+            Some(
+                &mut |watch_path: &str, is_dir: bool| -> Result<(), GoError> {
+                    if !is_dir {
+                        return Ok(());
                     }
-                    .to_go_error());
-                }
-                Ok(())
-            }),
+                    let path = &w.display_path(watch_path);
+                    if let Err(err) = self.watch_dir(w, path, watch_path) {
+                        return Err(DirWatchError {
+                            err: errors::errorf(
+                                format!("inotify_add_watch on '{}' failed: {}", path, err.error()),
+                                vec![err],
+                            ),
+                            dir_watch: w.clone(),
+                        }
+                        .to_go_error());
+                    }
+                    Ok(())
+                },
+            ),
         ) {
             let _ = self.close_watch(w);
             return Err(err);
@@ -367,7 +369,12 @@ impl InotifyBackend {
     // Go: inotify_linux.go:244 inotifyBackend.watchDir
     /// watchDir registers an inotify watch on path and records the resulting
     /// subscription. Returns the kernel watch descriptor on success.
-    pub fn watch_dir(&self, w: &Arc<DirWatch>, path: &str, watch_path: &str) -> Result<i32, GoError> {
+    pub fn watch_dir(
+        &self,
+        w: &Arc<DirWatch>,
+        path: &str,
+        watch_path: &str,
+    ) -> Result<i32, GoError> {
         let inotify = self.locked.lock().unwrap().inotify;
         let wd = unix::inotify_add_watch(inotify, watch_path, INOTIFY_MASK)?;
         let sub = Arc::new(InotifySubscription {
