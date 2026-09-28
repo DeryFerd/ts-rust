@@ -70,6 +70,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
 fn main() {
+    // First: it must run before the first heap allocation.
+    ts_goport::thp_guard::thp_guard();
     // One budget sets the parse and bind threads and the malloc arenas.
     let budget = ThreadBudget::one_program(0);
     set_malloc_tunables(&budget);
@@ -126,7 +128,9 @@ fn main() {
 ///   geometric mean against that static build: without them 12 to 14% slower
 ///   on dbook (THP `madvise`) and 3 to 7% slower on cup2 (THP `always`); with
 ///   them 0.5 to 6% faster on dbook and 2 to 4% slower on cup2. On cup2
-///   jemalloc peak RSS is 2 to 11% above the static build.
+///   jemalloc peak RSS is 2 to 11% above the static build. When little
+///   memory is free in 2 MiB blocks, huge page faults wait in compaction;
+///   `thp_guard` (called first in `main`) then turns THP off.
 ///
 /// glibc malloc (a build without the `jemalloc` feature):
 /// - `top_pad=67108864` (64 MiB) makes each thread heap read-write in full

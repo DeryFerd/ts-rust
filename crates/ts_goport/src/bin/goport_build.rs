@@ -50,6 +50,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
 fn main() {
+    // First: it must run before the first heap allocation.
+    ts_goport::thp_guard::thp_guard();
     // A build keeps the wide budget (`ThreadBudget::WIDE`): parse and bind
     // threads up to 8, and 16 arenas with glibc malloc.
     let budget = ThreadBudget::WIDE;

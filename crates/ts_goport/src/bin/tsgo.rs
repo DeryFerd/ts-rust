@@ -59,6 +59,8 @@ const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
+    // First: it must run before the first heap allocation.
+    ts_goport::thp_guard::thp_guard();
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
     // `notify_context` signal thread.
