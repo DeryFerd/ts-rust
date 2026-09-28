@@ -667,7 +667,10 @@ impl Decoder<'_> {
             end,
             code,
             category,
+            // tsgo#4712: a lib file has no external diagnostic.
+            source: String::new(),
             message,
+            message_text: String::new(),
             message_args,
             message_chain,
             related_information,

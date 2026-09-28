@@ -28,9 +28,13 @@ pub mod execute;
 pub mod flags;
 mod flags_macros;
 pub mod frontend;
+// Go `internal/ipc` (tsgo#4712).
+pub mod ipc;
 pub mod locale;
 pub mod modulespecifiers;
 pub mod options;
+// The JSON form of `core.CompilerOptions` (moved out of `api` in bump B wave 3).
+pub mod options_json;
 pub mod pprof;
 pub mod prelude;
 pub mod printer;

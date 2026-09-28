@@ -232,8 +232,10 @@ fn transpile_worker(
     }
 
     let fs: Rc<dyn Fs> = Rc::new(MapFs::from_map(files));
-    let host = new_compiler_host(INPUT_DIRECTORY, fs, LIB_DIRECTORY, None, None);
+    // tsgo#4712: the 6th argument is the content mapper project (Go nil).
+    let host = new_compiler_host(INPUT_DIRECTORY, fs, LIB_DIRECTORY, None, None, None);
 
+    // tsgo#4712: Go `core.ParsedOptions` moved to `tsoptions.ParsedOptions`.
     let config = Rc::new(ParsedCommandLine {
         parsed_config: ParsedOptions {
             file_names: vec![input_file_name.clone()],

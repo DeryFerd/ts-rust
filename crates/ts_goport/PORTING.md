@@ -526,7 +526,11 @@ in `map-watch-api.md`.
   `gostd`, `locale`, `compiler` (`frontend::compiler`), `tsoptions`,
   `tspath`, `vfs`, `module`, `packagejson`, `modulespecifiers`,
   `sourcemap`, `json_ext`, `scanner_ls`, `ls_program`
-  (`program::ls_program`).
+  (`program::ls_program`), `ipc` (api and contentmapper preludes),
+  `spanmap` (api encoder and contentmapper preludes), `ast` (contentmapper
+  prelude; the package's own `Diagnostic` and `MappedDiagnosticDirective`
+  win there, so write `crate::core::Diagnostic` and
+  `ast::MappedDiagnosticDirective` for the AST ones).
 - Call another Go package through its name, as Go does:
   `lsproto::Hover`, `lsutil::UserPreferences`,
   `astnav::get_token_at_position(file, pos)`,
@@ -535,7 +539,9 @@ in `map-watch-api.md`.
   `UserPreferences`.
 - A new file in an existing module keeps that module's header:
   `use crate::prelude::*;` (checker, printer, ast, sourcemap,
-  modulespecifiers), `use crate::frontend::prelude::*;` (frontend), or
+  modulespecifiers), `use crate::frontend::prelude::*;` (frontend),
+  `use crate::ipc::prelude::*;` (ipc),
+  `use crate::contentmapper::prelude::*;` (contentmapper), or
   `use super::*;` (children of `program`).
 - `lsproto` files do not see the crate prelude. It exports `Diagnostic`,
   `FormattingOptions` and `Message`, and lsproto defines the same names.
