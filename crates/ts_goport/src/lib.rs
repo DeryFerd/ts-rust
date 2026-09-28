@@ -44,6 +44,7 @@ pub mod program;
 pub mod pseudochecker;
 pub mod scanner_util;
 pub mod sourcemap;
+pub mod thp_guard;
 pub mod tracing;
 pub mod transformers;
 
