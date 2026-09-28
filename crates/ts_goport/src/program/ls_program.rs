@@ -1024,16 +1024,11 @@ fn get_declaration_diagnostics_for_file(
 // shares as `Rc<RefCell<Checker>>`, so the resolver links to that `Rc`
 // (`get_emit_resolver_of_shared_checker`) instead of a compile worker
 // checker. The host methods read the current program, which is `p`.
-// `EmitHost.checker_index` is the resolver's index; only the compile path
-// (JS emit on a worker thread) uses it.
 fn new_emit_host(p: &'static NewProgram, ctx: &Context, file: Node) -> (Rc<EmitHost>, Release) {
     let (checker, done) = get_type_checker_for_file(p, ctx, file);
     let emit_resolver =
         crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker(&checker);
-    let host = Rc::new(EmitHost {
-        checker_index: emit_resolver.checker_index,
-        emit_resolver,
-    });
+    let host = Rc::new(EmitHost { emit_resolver });
     (host, done)
 }
 
