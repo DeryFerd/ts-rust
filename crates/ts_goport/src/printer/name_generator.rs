@@ -436,7 +436,7 @@ impl NameGenerator {
                         &auto_generate.suffix,
                     );
                 } else if kind == GeneratedIdentifierFlags::LOOP {
-                    debug_assert!(is_identifier(name));
+                    go_assert!(is_identifier(name));
                     return self.make_temp_variable_name(
                         TEMP_FLAGS_I,
                         auto_generate.flags.is_reserved_in_nested_scopes(),

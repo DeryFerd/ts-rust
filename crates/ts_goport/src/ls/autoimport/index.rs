@@ -1,5 +1,7 @@
 use crate::ls::autoimport::prelude::*;
 
+use crate::gostd::unicode;
+
 // Port of Go `ls/autoimport/index.go`.
 //
 // PORT: Go `rune` keys are `char`. Names are Go strings in the port form
@@ -55,7 +57,7 @@ impl<T: Named + Clone> Index<T> {
         if first_rune == char::REPLACEMENT_CHARACTER {
             return Vec::new();
         }
-        let first_rune_upper = unicode_to_upper(first_rune);
+        let first_rune_upper = unicode::to_upper(first_rune);
         let Some(candidates) = self.index.get(&first_rune_upper) else {
             return Vec::new();
         };
@@ -102,8 +104,8 @@ impl<T: Named + Clone> Index<T> {
             return Vec::new();
         }
 
-        let first_rune_upper = unicode_to_upper(first_rune);
-        let first_rune_lower = unicode_to_lower(first_rune);
+        let first_rune_upper = unicode::to_upper(first_rune);
+        let first_rune_lower = unicode::to_lower(first_rune);
 
         // Look up entries that have words starting with this letter
         let mut word_starts: &[i32] = &[];
@@ -159,12 +161,12 @@ impl<T: Named + Clone> Index<T> {
             }
             if i == 0 {
                 // Name start keyed by uppercase
-                first_rune = unicode_to_upper(first_rune);
+                first_rune = unicode::to_upper(first_rune);
                 self.index.entry(first_rune).or_default().push(entry_index);
                 seen_runes.insert(first_rune, true); // (Still set seenRunes in case first character is non-alphabetic)
             } else {
                 // Subsequent word starts keyed by lowercase
-                first_rune = unicode_to_lower(first_rune);
+                first_rune = unicode::to_lower(first_rune);
                 if !seen_runes.get(&first_rune).copied().unwrap_or(false) {
                     self.index.entry(first_rune).or_default().push(entry_index);
                     seen_runes.insert(first_rune, true);
@@ -255,31 +257,11 @@ fn decode_rune_in_string(s: &str, pos: usize) -> (char, usize) {
     }
 }
 
-/// Go `unicode.ToUpper` (simple case mapping).
-// PORT: Rust `char::to_uppercase` gives the full mapping. A multi-rune full
-// uppercase has no simple mapping, so the rune stays the same (the same
-// helper as in `frontend/stringutil_ls.rs`, which keeps it private).
-fn unicode_to_upper(c: char) -> char {
-    let mut u = c.to_uppercase();
-    match (u.next(), u.next()) {
-        (Some(single), None) => single,
-        _ => c,
-    }
-}
-
-/// Go `unicode.ToLower` (simple case mapping).
-// PORT: the only rune with a multi-rune full lowercase is U+0130, whose first
-// rune ('i') is also the Go simple lowercase. So the first rune is the Go
-// result (the same helper as in `frontend/stringutil_ls.rs`).
-fn unicode_to_lower(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
 /// Go `strings.ToLower`: `unicode.ToLower` on each rune.
 // PORT: not `str::to_lowercase`, which maps a final sigma to U+03C2 and
 // U+0130 to two runes. Go maps each rune on its own. Go `strings.ToLower`
 // of a non-ASCII string is `strings.Map(unicode.ToLower, s)`, which writes
 // U+FFFD for each invalid byte; `go_map_runes` does that on the port form.
 fn strings_to_lower(s: &str) -> String {
-    go_map_runes(s, unicode_to_lower)
+    go_map_runes(s, unicode::to_lower)
 }

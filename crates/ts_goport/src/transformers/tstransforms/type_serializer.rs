@@ -247,10 +247,7 @@ impl MetadataSerializer {
             | SyntaxKind::JsDocOptionalType => {
                 return self.serialize_type_node(node.type_());
             }
-            _ => {
-                // PORT: Go `debug.FailBadSyntaxKind(node)`.
-                panic!("Unexpected node kind {:?}", node.kind());
-            }
+            _ => crate::gostd::debug::fail_bad_syntax_kind(node.kind(), None),
         }
         self.f().new_identifier("Object")
     }
@@ -329,10 +326,7 @@ impl MetadataSerializer {
                     SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral => {
                         self.serialize_literal_of_literal_type_node(operand)
                     }
-                    _ => {
-                        // PORT: Go `debug.FailBadSyntaxKind(operand)`.
-                        panic!("Unexpected node kind {:?}", operand.kind());
-                    }
+                    _ => crate::gostd::debug::fail_bad_syntax_kind(operand.kind(), None),
                 }
             }
             SyntaxKind::NumericLiteral => self.f().new_identifier("Number"),
@@ -341,10 +335,7 @@ impl MetadataSerializer {
                 self.f().new_identifier("Boolean")
             }
             SyntaxKind::NullKeyword => self.f().new_void_zero_expression(),
-            _ => {
-                // PORT: Go `debug.FailBadSyntaxKind(node)`.
-                panic!("Unexpected node kind {:?}", node.kind());
-            }
+            _ => crate::gostd::debug::fail_bad_syntax_kind(node.kind(), None),
         }
     }
 
@@ -411,10 +402,10 @@ impl MetadataSerializer {
             TypeReferenceSerializationKind::PROMISE => f.new_identifier("Promise"),
 
             TypeReferenceSerializationKind::OBJECT_TYPE => f.new_identifier("Object"),
-            _ => {
-                // PORT: Go `debug.AssertNever(kind, ...)`.
-                panic!("unknown type reference serialization kind: {kind:?}");
-            }
+            _ => crate::gostd::debug::assert_never(
+                &kind.0.to_string(),
+                Some("unknown type reference serialization kind"),
+            ),
         }
     }
 

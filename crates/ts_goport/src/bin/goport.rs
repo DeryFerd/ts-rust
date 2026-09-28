@@ -63,7 +63,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// The jemalloc settings that `set_malloc_tunables` sets. `tsgo.rs` and
 /// `goport_build.rs` have the same value, and `scripts/build-release.sh`
-/// reads it from this line for its BOLT runs.
+/// reads it from this line for its BOLT runs. `scripts/build-release.sh` builds
+/// the same value into jemalloc (`JEMALLOC_SYS_WITH_MALLOC_CONF`); with
+/// another value there, the bins exec themselves to set it.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
@@ -155,13 +157,25 @@ fn main() {
 /// the same binary again once with them set. It does nothing when the caller
 /// already set the variable (`_RJEM_MALLOC_CONF` or `GLIBC_TUNABLES`), so the
 /// caller can override the values. The run continues without the settings
-/// when the exec fails.
+/// when the exec fails. A jemalloc build with `JEMALLOC_CONF` built in (see
+/// there) has the settings from its start and does not exec.
+// PERF (perf11 qprof, dbook, perf10 release tsgo with `_RJEM_MALLOC_CONF`
+// set by the caller): without the exec, `--version` takes 0.46 to 0.53 ms
+// less and the time to `main` drops from 4.06 to 3.21 ms.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        // A build with `JEMALLOC_CONF` built into jemalloc
+        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
+        // needs no exec: jemalloc reads it at its start, and
+        // `_RJEM_MALLOC_CONF` still overrides it.
+        #[cfg(feature = "jemalloc")]
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
+            return;
+        }
         #[cfg(not(feature = "jemalloc"))]
         let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]

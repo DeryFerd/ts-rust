@@ -115,10 +115,7 @@ pub(crate) fn is_named_evaluation_and(
         SyntaxKind::ExportAssignment => {
             is_anonymous_function_definition(emit_context, node.expression(), cb)
         }
-        _ => {
-            debug_assert!(false, "Unhandled case in isNamedEvaluation");
-            false
-        }
+        _ => crate::gostd::debug::fail("Unhandled case in isNamedEvaluation"),
     }
 }
 
@@ -168,7 +165,7 @@ pub(crate) fn get_assigned_name_of_property_name(
         return (assigned_name, name);
     }
 
-    debug_assert!(
+    go_assert!(
         is_computed_property_name(name),
         "Expected computed property name"
     );
@@ -744,9 +741,6 @@ pub(crate) fn transform_named_evaluation(
             ignore_empty_string_literal,
             assigned_name,
         ),
-        _ => {
-            debug_assert!(false, "Unhandled case in transformNamedEvaluation");
-            node
-        }
+        _ => crate::gostd::debug::fail("Unhandled case in transformNamedEvaluation"),
     }
 }

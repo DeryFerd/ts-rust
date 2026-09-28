@@ -407,7 +407,7 @@ impl InlayHintState<'_> {
             None,
         );
         let id_to_symbol = node_builder.borrow().impl_.borrow().id_to_symbol.clone();
-        debug_assert!(type_node.is_some(), "should always get typenode");
+        crate::go_assert!(type_node.is_some(), "should always get typenode");
         lsproto::StringOrInlayHintLabelParts {
             inlay_hint_label_parts: Some(self.get_inlay_hint_label_parts(type_node, &id_to_symbol)),
             ..Default::default()
@@ -437,7 +437,7 @@ impl InlayHintState<'_> {
                 None,
             );
         let id_to_symbol = node_builder.borrow().impl_.borrow().id_to_symbol.clone();
-        debug_assert!(type_node.is_some(), "should always get typePredicateNode");
+        crate::go_assert!(type_node.is_some(), "should always get typePredicateNode");
         lsproto::StringOrInlayHintLabelParts {
             inlay_hint_label_parts: Some(self.get_inlay_hint_label_parts(type_node, &id_to_symbol)),
             ..Default::default()
@@ -882,8 +882,7 @@ impl InlayHintState<'_> {
                 self.visit_for_display_parts(node.argument_expression(), id_to_symbol, parts);
                 parts.push(label_part("]"));
             }
-            // Go: debug.FailBadSyntaxKind(node)
-            _ => panic!("Unexpected node.\nNode {:?} was unexpected.", node.kind()),
+            _ => crate::gostd::debug::fail_bad_syntax_kind(node.kind(), None),
         }
     }
 
@@ -1020,7 +1019,7 @@ impl InlayHintState<'_> {
             if index < associated_names.len() as i32 {
                 let associated_name = associated_names[index as usize];
                 if associated_name.is_some() {
-                    debug_assert!(is_identifier(associated_name.name()));
+                    crate::go_assert!(is_identifier(associated_name.name()));
                     let is_rest_tuple_element;
                     if is_named_tuple_member(associated_name) {
                         is_rest_tuple_element = associated_name.dot_dot_dot_token().is_some();
