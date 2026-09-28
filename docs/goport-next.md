@@ -6,7 +6,6 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **R130 = goport-perf13** (NX stack in release builds from perf12, and the start-up guard that turns off huge pages on fragmented host memory) when its workflow passes. Roster carry-forward from R125.
 - **Default pin switch.** UPSTREAM.json current, ~/.local/bin/tsgo-oracle and the default Go checkout still point at dc37b5249; main is at 52168999f3dc and bump B moves it to 16c25522e123. Switch once, straight to the bump B pin, after bump B is accepted, in a quiet window, on zbook and every host (move the old default caches under pins/dc37b5249ab6 first). Owns: UPSTREAM.json, scripts/upstream/pin.py.
 
 - **Split the `ts_goport` crate, step 1 (`goport_util` + `goport_lsproto`, -19.5% on every touch rebuild).** Plan: `target/continuation-r97-goport/buildspeed/split-plan-r129.md` (no-move layout, shim modules, 3 blockers). Merge right after bump B phase 2c is in main (bumpB2c changes 17 step 1 files); rebase cost then: 1 line in frontend/mod.rs, osutil.rs into util, blob regen, 1 roster drive. Steps 2 to 4 wait for bump B wave 3 (tell its owner: keep `ipc`, `CompilerOptionsJSON` and `marshal_field_omitempty` out of `api/`) and for M2a/M2b. Prep branch ready: goport-split1 1c8b6b336 (tests 0 lost, output byte-equal, quick gate no new FAIL; one-line edit: checker -8%, ls -20%, util -63%, lsproto -74%; `buildspeed/split1/verify.md` has the rebase steps). After the merge, test runners must run 7 test binaries (add goport_util_lib and goport_lsproto_lib).
