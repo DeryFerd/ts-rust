@@ -265,13 +265,33 @@ pub(crate) struct QueuedParseTask {
 // loader takes their results (`take_prefetched`). The loader still
 // loads files in the serial order, so store ids, resolution order and file
 // order do not change.
-#[derive(Default)]
 pub struct FilesParser {
     pub(crate) queue: Vec<QueuedParseTask>,
     pub task_data_by_path: FxHashMap<Path, Rc<RefCell<ParseTaskData>>>,
     pub max_depth: i32,
     /// Go `singleThreaded`: no parse workers.
     pub single_threaded: bool,
+}
+
+// PORT: Go's garbage collector frees the parse tasks with the loader. Here
+// a loaded task holds its sub tasks, and a sub task of a file that was
+// queued before holds the task that loaded the file (`loaded_task`). When
+// files import each other, these links make an `Rc` cycle that is never
+// freed. Every task that has links is in `task_data_by_path` (only those
+// tasks load), so taking their links out lets the whole graph go. A
+// one-program process does not drop the parser
+// (`with_loader_state_forgotten`).
+impl Drop for FilesParser {
+    fn drop(&mut self) {
+        for data in self.task_data_by_path.values() {
+            for task in data.borrow().tasks.values() {
+                let mut task = task.borrow_mut();
+                task.sub_tasks = Vec::new();
+                task.loaded_task = None;
+                task.redirected_parse_task = None;
+            }
+        }
+    }
 }
 
 // Go: filesparser.go:219 getParseTaskData
