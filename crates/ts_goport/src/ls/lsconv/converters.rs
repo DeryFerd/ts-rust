@@ -9,6 +9,8 @@ use crate::frontend::tspath;
 use crate::gostd;
 use crate::locale;
 use crate::lsp::lsproto;
+use crate::spanmap::{self, Feature, Fidelity, SpanMap};
+use std::ops::Deref;
 use std::sync::LazyLock;
 
 // Go: ls/lsconv/converters.go:23 Converters
@@ -18,10 +20,48 @@ pub struct Converters {
     position_encoding: lsproto::PositionEncodingKind,
 }
 
-// Go: ls/lsconv/converters.go:28 Script
+// Go: ls/lsconv/converters.go:35 MappedPosition
+// PORT: Go embeds `spanmap.MappedPosition`; `Deref` gives its fields
+// (`position`, `fidelity`) as Go field promotion does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MappedPosition<T> {
+    pub script: T,
+    pub mapped_position: spanmap::MappedPosition,
+}
+
+impl<T> Deref for MappedPosition<T> {
+    type Target = spanmap::MappedPosition;
+
+    fn deref(&self) -> &spanmap::MappedPosition {
+        &self.mapped_position
+    }
+}
+
+// Go: ls/lsconv/converters.go:44 Script
+// Script is a source text the converters operate over. For a content-mapped file, Text() is the content
+// mapper's virtual output and SpanMap() returns the map from that output back to the original text
+// (OriginalText()); virtual ranges are then automatically converted to original coordinates (see
+// ToLSPRange). For an ordinary file SpanMap() is nil and OriginalText() equals Text().
+// PORT: tsgo#4712 adds `OriginalFileName`, `SpanMap` and `OriginalText`.
+// The defaults are Go's answers for a script that is not content-mapped
+// (Go `script` in ls/source_map.go, `originalTextScript`, the project
+// overlays), so implementors outside the ls lane keep compiling.
 pub trait Script {
     fn file_name(&self) -> &str;
+
+    fn original_file_name(&self) -> &str {
+        self.file_name()
+    }
+
     fn text(&self) -> &str;
+
+    fn span_map(&self) -> Option<&SpanMap> {
+        None
+    }
+
+    fn original_text(&self) -> &str {
+        self.text()
+    }
 }
 
 // PORT: Go `*ast.SourceFile` implements Script through its `FileName` and
@@ -34,6 +74,27 @@ impl Script for Node {
     }
 
     fn text(&self) -> &str {
+        source_file_text(*self)
+    }
+
+    // Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
+    // PORT: stand-in until the syntax lane stores the tsgo#4712 content
+    // mapper info on source files. Without that info no file has a
+    // canonical source file, and Go returns `FileName()`.
+    fn original_file_name(&self) -> &str {
+        source_file_file_name(*self)
+    }
+
+    // Go: ast/ast.go:2579 (*SourceFile).SpanMap
+    // PORT: stand-in, as above. Go returns nil without content mapper info.
+    fn span_map(&self) -> Option<&SpanMap> {
+        None
+    }
+
+    // Go: ast/ast.go:2561 (*SourceFile).OriginalText
+    // PORT: stand-in, as above. Go returns the file text without content
+    // mapper info.
+    fn original_text(&self) -> &str {
         source_file_text(*self)
     }
 }
@@ -99,6 +160,109 @@ impl Converters {
             uri: file_name_to_document_uri(script.file_name()),
             range: self.to_lsp_range(script, rng),
         }
+    }
+}
+
+// Go: ls/lsconv/converters.go:220 FromLSPPositionForSourceFile
+// FromLSPPositionForSourceFile converts an lsproto.Position to offsets in a SourceFile. When the file has
+// supplemental content-mapper outputs, results include every qualifying virtual projection across the
+// canonical and supplemental files. Projections not participating in feature are omitted.
+#[must_use]
+pub fn from_lsp_position_for_source_file(
+    c: &Converters,
+    file: Node,
+    position: lsproto::Position,
+    feature: Feature,
+) -> Vec<MappedPosition<Node>> {
+    let files = source_file_projections(file);
+    lsp_position_to_virtual(c, &files, position, feature)
+}
+
+// Go: ls/lsconv/converters.go:225 sourceFileProjections
+fn source_file_projections(file: Node) -> Vec<Node> {
+    // PORT: Go `file.SupplementalSourceFiles()`. The AST has no tsgo#4712
+    // content mapper info yet (syntax lane), and Go returns nil for a file
+    // without it, so the list is empty.
+    let supplemental: &[Node] = &[];
+    let mut files = Vec::with_capacity(1 + supplemental.len());
+    files.push(file);
+    files.extend_from_slice(supplemental);
+    files
+}
+
+// Go: ls/lsconv/converters.go:232 lspPositionToVirtual
+fn lsp_position_to_virtual<T: Script + Clone>(
+    c: &Converters,
+    scripts: &[T],
+    position: lsproto::Position,
+    feature: Feature,
+) -> Vec<MappedPosition<T>> {
+    let mut result = Vec::with_capacity(scripts.len());
+    for script in scripts {
+        for mapped in c.lsp_position_to_virtual(script, position, feature) {
+            result.push(MappedPosition {
+                script: script.clone(),
+                mapped_position: mapped,
+            });
+        }
+    }
+    result
+}
+
+impl Converters {
+    // Go: ls/lsconv/converters.go:242 (*Converters).lspPositionToVirtual
+    fn lsp_position_to_virtual(
+        &self,
+        script: &dyn Script,
+        position: lsproto::Position,
+        feature: Feature,
+    ) -> Vec<spanmap::MappedPosition> {
+        let Some(spans) = script.span_map() else {
+            return vec![spanmap::MappedPosition {
+                position: self.line_and_character_to_position(script, &position),
+                fidelity: Fidelity::EXACT,
+            }];
+        };
+        let original = OriginalTextScript {
+            file_name: script.original_file_name(),
+            text: script.original_text(),
+        };
+        let orig_offset = self.line_and_character_to_position(&original, &position);
+        SpanMap::original_to_virtual_positions(Some(spans), orig_offset, feature)
+    }
+}
+
+// Go: ls/lsconv/converters.go:589 originalTextScript
+// PORT: Go copies the two strings; here the script borrows them.
+struct OriginalTextScript<'a> {
+    file_name: &'a str,
+    text: &'a str,
+}
+
+impl Script for OriginalTextScript<'_> {
+    // Go: ls/lsconv/converters.go:594 originalTextScript.FileName
+    fn file_name(&self) -> &str {
+        self.file_name
+    }
+
+    // Go: ls/lsconv/converters.go:595 originalTextScript.OriginalFileName
+    fn original_file_name(&self) -> &str {
+        self.file_name
+    }
+
+    // Go: ls/lsconv/converters.go:596 originalTextScript.Text
+    fn text(&self) -> &str {
+        self.text
+    }
+
+    // Go: ls/lsconv/converters.go:597 originalTextScript.OriginalText
+    fn original_text(&self) -> &str {
+        self.text
+    }
+
+    // Go: ls/lsconv/converters.go:598 originalTextScript.SpanMap
+    fn span_map(&self) -> Option<&SpanMap> {
+        None
     }
 }
 

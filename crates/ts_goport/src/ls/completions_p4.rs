@@ -28,6 +28,18 @@ impl LanguageService {
                 Vec::new(),
             ));
         }
+        let file = source_file_for_supplemental_file_index(file, data.supplemental_file_index);
+        if file.is_nil() {
+            // PORT: Go reads `*data.SupplementalFileIndex` here. A nil index
+            // returns the file, so the index is set when the file is nil.
+            let index = data
+                .supplemental_file_index
+                .expect("invalid memory address or nil pointer dereference");
+            return Err(gostd::errors::errorf(
+                format!("supplemental source file index not found: {index}"),
+                Vec::new(),
+            ));
+        }
 
         let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let mut checker_ref = checker.borrow_mut();
@@ -90,7 +102,10 @@ impl LanguageService {
             if data.is_import_statement_completion {
                 return item;
             }
-            let (edits, description) = autoimport::Fix {
+            // Auto-imports in content-mapped files are evaluated eagerly so edits outside
+            // of verbatim spans can cause the completion item to be filtered out entirely.
+            // Only real files take this code path, so the final Edits() is guaranteed ok.
+            let (edits, description, _) = autoimport::Fix {
                 auto_import_fix: auto_import.clone(),
                 ..Default::default()
             }

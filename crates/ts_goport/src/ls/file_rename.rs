@@ -91,7 +91,8 @@ impl LanguageService {
 
         // PORT: Go ranges over the `GetChanges` map (random order). The
         // tracker returns an IndexMap in the order files were first changed.
-        for (file_name, edits) in change_tracker.get_changes() {
+        let (changes, _) = change_tracker.get_changes();
+        for (file_name, edits) in changes {
             let uri = lsconv::file_name_to_document_uri(&file_name);
             let mut lsp_edits: Vec<lsproto::TextEditOrAnnotatedTextEditOrSnippetTextEdit> =
                 Vec::with_capacity(edits.len());

@@ -2,7 +2,52 @@
 
 use crate::ls::prelude::*;
 
+use crate::spanmap::{Feature, Fidelity};
+
 impl<P: ProgramView> LanguageService<P> {
+    // Go: ls/source_map.go:18 sourceFileRangeToLSPLocation
+    // sourceFileRangeToLSPLocation maps a range from an arbitrary program SourceFile to an LSP location,
+    // composing content-mapper span maps and declaration source maps as needed. LS features should use this
+    // for cross-file results instead of calling getMappedLocation or lsconv.ToLSPLocation directly.
+    // This unfiltered form is appropriate for diagnostics and text edits.
+    // PORT: Go first checks `file.ContentMapper() != ""` and then returns
+    // `l.converters.ToLSPLocation(file, fileRange)`. The AST has no tsgo#4712
+    // content mapper info yet (syntax lane), and Go `ContentMapper()` is ""
+    // without it, so every file takes the `getMappedLocation` path. At pin B
+    // `getMappedLocation` returns the fidelity of `ToLSPRange` on a script
+    // that is not content-mapped, which is `FidelityExact`. The Rust
+    // `get_mapped_location` returns only the location, so the fidelity is
+    // written here.
+    pub fn source_file_range_to_lsp_location(
+        &self,
+        file: Node,
+        file_range: TextRange,
+    ) -> (lsproto::Location, Fidelity) {
+        (
+            self.get_mapped_location(source_file_file_name(file), file_range),
+            Fidelity::EXACT,
+        )
+    }
+
+    // Go: ls/source_map.go:28 sourceFileRangeToLSPLocationForFeature
+    // sourceFileRangeToLSPLocationForFeature is the preferred conversion for visible LS results that may
+    // come from another file. It applies content-mapper feature filtering and follows declaration source maps.
+    // Do not use it for diagnostics or text edits.
+    // PORT: as `source_file_range_to_lsp_location`. The content-mapped path
+    // is Go `l.converters.ToLSPLocationForFeature(file, fileRange, feature)`,
+    // so `feature` has no use until that path is ported.
+    pub fn source_file_range_to_lsp_location_for_feature(
+        &self,
+        file: Node,
+        file_range: TextRange,
+        _feature: Feature,
+    ) -> (lsproto::Location, Fidelity) {
+        (
+            self.get_mapped_location(source_file_file_name(file), file_range),
+            Fidelity::EXACT,
+        )
+    }
+
     // Go: ls/source_map.go:12 getMappedLocation
     pub fn get_mapped_location(&self, file_name: &str, file_range: TextRange) -> lsproto::Location {
         let Some(start_pos) = self.try_get_source_position(file_name, file_range.pos()) else {

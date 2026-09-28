@@ -197,7 +197,7 @@ fn get_all_isolated_declarations_code_actions(
         fixer.add_symbol_to_existing_import(sym);
     }
 
-    let mut changes = change_tracker.get_changes();
+    let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let file_changes = changes
         .shift_remove(source_file_file_name(fix_context.source_file))
@@ -258,7 +258,7 @@ fn try_code_action(
         fixer.add_symbol_to_existing_import(sym);
     }
 
-    let mut changes = change_tracker.get_changes();
+    let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let mut file_changes = changes
         .shift_remove(source_file_file_name(fix_context.source_file))

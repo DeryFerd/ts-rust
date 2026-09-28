@@ -135,6 +135,23 @@ pub fn ensure_item_data(
     Some(list)
 }
 
+// Go: ls/completions.go:153 sourceFileForSupplementalFileIndex
+// PORT: Go `*ast.SourceFile` is the file root `Node` (nil is `Node::NIL`).
+// Go `*int32` is `Option<i32>`.
+pub fn source_file_for_supplemental_file_index(file: Node, index: Option<i32>) -> Node {
+    let Some(index) = index else {
+        return file;
+    };
+    // PORT: Go `file.SupplementalSourceFiles()`. The AST has no tsgo#4712
+    // content mapper info yet (syntax lane), and Go returns nil for a file
+    // without it, so the list is empty and every index is out of range.
+    let supplemental: &[Node] = &[];
+    if index >= 0 && (index as usize) < supplemental.len() {
+        return supplemental[index as usize];
+    }
+    Node::NIL
+}
+
 // Go: ls/completions.go:94 completionData
 // *completionDataData | *completionDataKeyword | *completionDataJSDocTagName | *completionDataJSDocTag | *completionDataJSDocParameterName
 // PORT: Go `type completionData = any` is an enum over the five pointer types.

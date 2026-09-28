@@ -87,7 +87,7 @@ fn get_import_code_actions(
 
     let mut actions: Vec<CodeAction> = Vec::new();
     for fix_info in &info {
-        let (edits, description) = fix_info.fix.edits(
+        let (edits, description, ok) = fix_info.fix.edits(
             ctx,
             fix_context.source_file,
             fix_context.program.options(),
@@ -96,16 +96,18 @@ fn get_import_code_actions(
             &fix_context.ls.user_preferences(),
         );
 
-        actions.push(CodeAction {
-            description,
-            changes: edits,
-            fix_id: IMPORT_FIX_ID.to_string(),
-            fix_all_description: crate::diagnostics_loc::message_localize(
-                diag::Add_all_missing_imports,
-                &locale::from_context(ctx),
-                &args![],
-            ),
-        });
+        if ok {
+            actions.push(CodeAction {
+                description,
+                changes: edits,
+                fix_id: IMPORT_FIX_ID.to_string(),
+                fix_all_description: crate::diagnostics_loc::message_localize(
+                    diag::Add_all_missing_imports,
+                    &locale::from_context(ctx),
+                    &args![],
+                ),
+            });
+        }
     }
     Ok(actions)
 }

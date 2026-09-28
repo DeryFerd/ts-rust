@@ -283,10 +283,13 @@ fn get_changes(
     import_adder: Option<&mut (dyn autoimport::ImportAdder + 'static)>,
     source_file: Node,
 ) -> Vec<lsproto::TextEdit> {
+    let (mut changes, unmappable) = change_tracker.get_changes();
+    if !unmappable.is_empty() {
+        return Vec::new();
+    }
     // PORT: Go indexes the map; a missing file gives a nil slice.
-    let mut file_changes = change_tracker
-        .get_changes()
-        .shift_remove(source_file_file_name(source_file))
+    let mut file_changes = changes
+        .shift_remove(source_file_original_file_name(source_file))
         .unwrap_or_default();
     if let Some(import_adder) = import_adder
         && import_adder.has_fixes()
