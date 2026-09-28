@@ -865,7 +865,7 @@ impl Checker {
         }
         // Case 2 in above example
         // entityName.kind could be a QualifiedName or a Missing identifier
-        debug_assert!(entity_name.parent().kind() == SyntaxKind::ImportEqualsDeclaration);
+        go_assert!(entity_name.parent().kind() == SyntaxKind::ImportEqualsDeclaration);
         self.resolve_entity_name(
             entity_name,
             SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
@@ -1360,7 +1360,7 @@ impl Checker {
         let flags = self.sym(value_symbol).flags | self.sym(type_symbol).flags;
         let name = self.sym(value_symbol).name.clone();
         let result = self.new_symbol(flags, &name);
-        debug_assert!(
+        go_assert!(
             !self.sym(value_symbol).declarations.is_empty()
                 || !self.sym(type_symbol).declarations.is_empty()
         );

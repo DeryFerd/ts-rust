@@ -24,6 +24,7 @@ mod childprog;
 mod emittestutil;
 mod execute_tests;
 mod ls_tests;
+mod ls_userprefs;
 mod module_tests;
 mod parsetestutil;
 mod printer_emit;

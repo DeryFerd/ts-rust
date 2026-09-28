@@ -66,7 +66,7 @@ pub struct Program {
 }
 
 /// The work of `tsc.EmitFilesAndReportErrors` that `Program::start_check`
-/// and `Program::start_check_and_emit` did before the caller asks for it.
+/// and `Program::start_emit` did before the caller asks for it.
 #[derive(Default)]
 struct StartedCheck {
     /// The first `GetGlobalDiagnostics` result. The next
@@ -328,8 +328,8 @@ impl Program {
 
     // Go: incremental/program.go:141 GetGlobalDiagnostics
     // PORT: the first call returns what `start_check` read, if it ran. The
-    // call after the check waits for the read that `start_check_and_emit`
-    // sent behind the check, if it did.
+    // call after the check waits for the read that `start_emit` sent
+    // behind the check, if it did.
     #[must_use]
     pub fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         self.panic_if_no_program("GetGlobalDiagnostics");
@@ -392,12 +392,8 @@ impl Program {
     }
 
     /// PORT: not in Go (perf). When the options allow an early emit
-    /// (`early_emit_options_allow`): `start_check`, then, when it sent a
-    /// check and the check cannot see the outputs
-    /// (`check_cannot_see_outputs`), the rest of the checker work of
-    /// `tsc.EmitFilesAndReportErrors` without a wait: the second global
-    /// diagnostics read and the emit of the affected files with `options`
-    /// (`start_emit_files`). `tsc -p` calls it when the program is made
+    /// (`early_emit_options_allow`): `start_check`, then `start_emit`.
+    /// `tsc -p` calls it when the program is made
     /// (`perform_incremental_compilation`). When the options do not allow
     /// it, it does nothing, and the calls run in Go's order.
     ///
@@ -414,9 +410,28 @@ impl Program {
             return;
         }
         self.start_check();
+        self.start_emit(options);
+    }
+
+    /// PORT: not in Go (perf). After `start_check`: when the options allow
+    /// an early emit (`early_emit_options_allow`), `start_check` sent a
+    /// check and the check cannot see the outputs
+    /// (`check_cannot_see_outputs`), sends the rest of the checker work of
+    /// `tsc.EmitFilesAndReportErrors` without a wait: the second global
+    /// diagnostics read and the emit of the affected files with `options`
+    /// (`start_emit_files`). Else it does nothing. `start_check_and_emit`
+    /// (`tsc -p`) calls it, and `tsc -b` calls it when the task emits
+    /// (`BuildTask::compile_and_emit_finish`), right before
+    /// `EmitAndReportStatistics`.
+    pub fn start_emit(&self, options: EmitOptions) {
+        debug_assert!(
+            self.started.borrow().emit.is_none(),
+            "start_emit: the emit already started"
+        );
         // The file rules read every program file: the checkers check
         // meanwhile.
-        if self.started.borrow().check.is_none()
+        if !early_emit_options_allow()
+            || self.started.borrow().check.is_none()
             || !self.snapshot.borrow().can_use_incremental_state()
             || !check_cannot_see_outputs()
         {
@@ -433,7 +448,7 @@ impl Program {
     }
 
     /// PORT: not in Go. True when the caller used everything that
-    /// `start_check` and `start_check_and_emit` read and started. `tsc -b`
+    /// `start_check` and `start_emit` read and started. `tsc -b`
     /// and `tsc -p` assert it after the emit: a result left over means the
     /// calls did not follow `EmitFilesAndReportErrors`.
     #[must_use]
@@ -510,7 +525,7 @@ impl Program {
 
     // Go: incremental/program.go:202 Emit
     // GetModeForUsageLocation implements compiler.AnyProgram interface.
-    // PORT: with an emit that `start_check_and_emit` sent, this waits for it
+    // PORT: with an emit that `start_emit` sent, this waits for it
     // and finishes it. That emit started only without `noEmit` and
     // `noEmitOnError`, so Go goes to `emitFiles` here too.
     pub fn emit(&self, options: EmitOptions) -> EmitResult {

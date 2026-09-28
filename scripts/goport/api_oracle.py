@@ -30,13 +30,15 @@ Protocol 3 (bump B, 16c25522e123) adds to protocol 2:
   The other API changes up to 16c25522e123 keep the requests of `build`: new methods only (transpile*
   tsgo#4849, emit, getSymbolsInScope, ...), the language service methods keep their wire names (tsgo#4893
   moves them only in the TS client), and tsgo#4915 adds only generator comments and tags.
+  `build --kind ext` (protocol 3 only) sends the methods that B adds or changes and that the other kinds do
+  not send: design in target/continuation-r97-goport/upstream/bumpB/api-battery/design.md.
 `build` writes traces of the run's protocol. Normalization reads the escaped names from protocol 2 on.
 Build the traces at each pin: they hold positions from the pin's encoded AST (UTF-16 offsets after the
 O pin, UTF-8 at O; they differ in files with non-ASCII text). With GOPORT_PIN unset the run uses the
 current pin of UPSTREAM.json.
 
 Commands:
-  build     --preset P --battery B [--kind files|proto|callbacks|lsp|xchecker] [--oracle BIN] [--limit N]
+  build     --preset P --battery B [--kind files|proto|callbacks|lsp|xchecker|ext] [--oracle BIN] [--limit N]
   record    --battery B [--oracle BIN] [--jobs N] [--force] [--only S]
   selfcheck --battery B [--oracle BIN] [--jobs N] [--runs N] [--only S]
   check     --battery B --goport BIN --label L [--jobs N] [--only S]
@@ -57,7 +59,11 @@ Trace format goport-api-trace/1 (JSONL). Line 1 is the header:
   protocol ("jsonrpc": --async, or "msgpack"), callbacks (list, empty = none),
   callbackMode ("fallback": answer null except overlay paths; "real": answer every
   callback from the real read-only FS), transport ("stdio" or "lsp"), lspOpen (files
-  the LSP client opens before custom/initializeAPISession).
+  the LSP client opens before custom/initializeAPISession), fixture ({rel path: text},
+  written under the run dir before the server starts). The callback "writeFile" (tsgo#4699)
+  records {path, bytes, sha256} and writes nothing; an `emit` answer gets them as "@writes",
+  sorted by path. An `emit` request is sent only with that callback, a fixture and a project
+  config under the run dir (else not_run), so no run writes into a project input.
 Each later line is one event, numbered from 0:
   {"kind": "request", "method": M, "params": P, "paramsFrom": F}   F optional
   {"kind": "overlay", "path": ABS, "content": TEXT | null}           callback FS overlay
@@ -66,7 +72,8 @@ Each later line is one event, numbered from 0:
 Placeholders (expanded in params before paramsFrom):
   "@SNAPSHOT@"          snapshot of the latest successful updateSnapshot answer
   "@PROJECT@"           id of the project whose configFileName is the header tsconfig
-  "@PROJECT:<rel>@"     id of the project whose config is <project dir>/<rel>
+  "@PROJECT:<rel>@"     id of the project whose config is <project dir>/<rel> (<rel> may start
+                        with @RUN_DIR@ for a fixture config)
   "@PROJECT_DIR@", "@RUN_DIR@" inside strings
 paramsFrom: one spec or a list of specs, applied in order. A spec takes a value from
 the raw answer of an earlier event of the same server run (handles differ between
@@ -98,6 +105,7 @@ changed during the run.
 
 import argparse
 import base64
+import bisect
 import collections
 import concurrent.futures
 import copy
@@ -168,6 +176,7 @@ SF_TRANSIENT = 1 << 25
 SF_VALUE = 1 | 2 | 4 | 8 | 4096 | 16 | 32 | 128 | 256 | 512 | 8192 | 32768 | 65536
 SF_TYPE = 32 | 64 | 128 | 256 | 8 | 2048 | 262144 | 524288
 SF_NAMESPACE = 512 | 1024 | 128 | 256
+SF_BLOCK_SCOPED_VARIABLE, SF_TYPE_PARAMETER, SF_ALIAS = 2, 262144, 2097152
 # Go: checker/types.go TypeFormatFlagsNoTruncation | TypeFormatFlagsUseFullyQualifiedType
 TYPE_FORMAT_FLAGS = 1 | 64
 # Go: checker SignatureKindCall, SignatureKindConstruct
@@ -215,6 +224,17 @@ PRESETS = {
         "caps": {"ids": 3, "calls": 2, "typeNodes": 2, "fnExprs": 1, "shorthand": 1, "sigDecls": 1,
                  "memberCompletions": 1, "globalCompletions": 0, "refsForNode": 0, "sigUsages": 0},
     },
+}
+
+# `build --kind ext` settings (api-battery/design.md section 4.1): ext_file sample count, files the samples skip,
+# the emit fixture sources and the JSX files that transpile reads.
+EXT_PRESETS = {
+    "query-core": {"files": 8, "sampleExclude": [],
+                   "fixture": ["src/subscribable.ts", "src/timeoutManager.ts", "src/focusManager.ts",
+                               "src/onlineManager.ts", "src/notifyManager.ts"]},
+    "hono": {"files": 12, "sampleExclude": [], "jsx": ["src/**/*.tsx"]},
+    # 50 of zod's 131 roots are near-identical locale tables; the zod battery covers them.
+    "zod": {"files": 10, "sampleExclude": ["src/v4/locales/**"]},
 }
 
 
@@ -438,10 +458,17 @@ SHAPES.update({m: [TYPE] for m in TYPE_LIST_METHODS})
 SHAPES.update({"getResolvedSignature": SIG, "getTargetOfSignature": SIG, "getSignaturesOfType": [SIG],
                "getTypePredicateOfSignature": PREDICATE, "getIndexInfosOfType": [INDEX_INFO],
                "getCompletionsAtPosition": COMPLETIONS, "getReferencedSymbolsForNode": [REF_SYMBOL]})
+# Methods that only `build --kind ext` sends (protocol 3).
+SHAPES.update({"getSymbolOfSourceFile": SYM, "getSymbolsOfSourceFiles": [SYM], "getSymbolsInScope": [SYM],
+               "getApparentPropertiesOfType": [SYM], "getApparentType": TYPE, "getDefaultFromTypeParameter": TYPE,
+               "getTypeParameterAtPosition": TYPE, "getNonPrimitiveType": TYPE})
 # Lists that come from Go map iteration (random order). Sorted before renumbering.
-UNORDERED = {"getMembersOfSymbol": "", "getExportsOfSymbol": "", "getCompletionsAtPosition": "/entries"}
+UNORDERED = {"getMembersOfSymbol": "", "getExportsOfSymbol": "", "getCompletionsAtPosition": "/entries",
+             "getSymbolsInScope": ""}
 # Methods whose msgpack answer is raw bytes (Go: RawBinary in session.go).
-BINARY_METHODS = {"getSourceFile", "typeToTypeNode", "signatureToSignatureDeclaration", "echo"}
+BINARY_METHODS = {"getSourceFile", "typeToTypeNode", "signatureToSignatureDeclaration", "echo", "getConfigSourceFile"}
+# tsgo#4699 emit methods: files emit in parallel, so these lists come in any order.
+EMIT_METHODS = {"emit", "emitToString", "getJavaScriptEmit", "getDeclarationEmit"}
 
 # Internal symbol names that embed a symbol id (Go: checker.go:22882 "\xFE@name@<id>",
 # binder.go:375 "\xFE#<class id>@#name"). Go JSON writes the \xFE byte as U+FFFD. Protocol 2 sends
@@ -451,6 +478,9 @@ _PREFIX = "__" if PROTOCOL2 else "."
 _INTERNAL_AT = re.compile(rf"^({_PREFIX})@(.*)@(\d+)$", re.S)
 _INTERNAL_PRIVATE = re.compile(rf"^({_PREFIX})#(\d+)@(.*)$", re.S)
 _EMBEDDED = re.compile("\u27e8[^\u27e9]*\u27e9")
+# The same internal names inside a getFullyQualifiedName answer ("A.__@iterator@123"): the id is masked.
+_FQN_AT = re.compile(rf"({re.escape(_PREFIX)}@[^@]*@)\d+")
+_FQN_PRIVATE = re.compile(rf"({re.escape(_PREFIX)}#)\d+@")
 
 
 def walk_shape(shape, v, f, on_object=None):
@@ -538,7 +568,15 @@ class Normalizer:
                       (lambda e: canon(mask_ids(method, [e])))
                 lst = sorted(lst, key=key)
                 v = pointer_set(v, ptr, lst) if ptr else lst
-        if method == "updateSnapshot" and isinstance(v, dict) and isinstance(v.get("changes"), dict):
+        if method in EMIT_METHODS and isinstance(v, dict):
+            for k in ("emittedFiles", "diagnostics"):
+                if isinstance(v.get(k), list):
+                    v[k] = sorted(v[k], key=canon)
+        if method == "getFullyQualifiedName" and isinstance(v, str):
+            v = _FQN_AT.sub(lambda m: m.group(1) + "⟨#⟩", v)
+            v = _FQN_PRIVATE.sub(lambda m: m.group(1) + "⟨#⟩@", v)
+        if method in ("updateSnapshot", "updateTemporarySnapshot") and isinstance(v, dict) \
+                and isinstance(v.get("changes"), dict):
             ch = v["changes"]
             for proj in (ch.get("changedProjects") or {}).values():
                 for k in ("changedFiles", "deletedFiles"):
@@ -804,7 +842,14 @@ class CallbackFS:
         self.mode = mode
         self.overlay = {}  # abs path -> text | None (deleted)
         self.calls = set()
+        self.writes = []  # writeFile calls since the last take_writes: {path, bytes, sha256}
         self.lock = threading.Lock()
+
+    def take_writes(self):
+        """The writeFile calls since the last call, sorted by path (Go emits files in parallel)."""
+        with self.lock:
+            writes, self.writes = self.writes, []
+        return sorted(writes, key=lambda w: (str(w["path"]), w["sha256"]))
 
     def set_overlay(self, path, content):
         with self.lock:
@@ -814,6 +859,14 @@ class CallbackFS:
                 self.overlay[path] = content
 
     def handle(self, method, arg):
+        if method == "writeFile" and method in self.names:
+            # tsgo#4699 (Go: callbackfs.go WriteFile {path, data}). Recorded, never written.
+            arg = arg if isinstance(arg, dict) else {}
+            data = str(arg.get("data") or "").encode("utf-8")
+            with self.lock:
+                self.calls.add((method, str(arg.get("path") or "")))
+                self.writes.append({"path": arg.get("path"), "bytes": len(data), "sha256": sha256_bytes(data)})
+            return None
         if method.startswith("#notification:") or method not in CALLBACK_NAMES:
             return None
         path = arg if isinstance(arg, str) else ""
@@ -1025,6 +1078,17 @@ def load_trace(path):
     return lines[0], lines[1:]
 
 
+def write_fixture(run_dir, fixture):
+    """Writes the header's fixture files under the run dir (never outside it)."""
+    for rel, text in sorted((fixture or {}).items()):
+        path = os.path.normpath(os.path.join(run_dir, rel))
+        if os.path.isabs(rel) or not path.startswith(os.path.join(run_dir, "")):
+            raise HarnessError(f"fixture path {rel!r} is not under the run dir")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+
 def eval_when(src, conds):
     for c in conds or []:
         v = pointer_get(src, c.get("pointer", ""))
@@ -1105,7 +1169,7 @@ def expand(v, ctx):
             return ctx["snapshot"] if ctx.get("snapshot") is not None else v
         m = _PROJECT_RE.match(v)
         if m:
-            rel = m.group(1) or ctx["tsconfig"]
+            rel = (m.group(1) or ctx["tsconfig"]).replace("@RUN_DIR@", ctx["run_dir"])
             want = os.path.normpath(os.path.join(ctx["project_dir"], rel))
             projects = ctx.get("projects") or []
             for p in projects:
@@ -1144,6 +1208,7 @@ class SessionRun:
         restarts = 0
         exit_codes = []
         t_start = time.time()
+        write_fixture(run_dir, h.get("fixture"))
         server = self._start(run_dir, cbfs, 0)
         try:
             if server is None:
@@ -1171,9 +1236,20 @@ class SessionRun:
                     records.append({"event": k, "method": method, "status": st, "reason": reason})
                     k += 1
                     continue
+                guard = self._emit_guard(method, params, run_dir)
+                if guard:
+                    log(f"{h['name']} event {k}: {guard}")
+                    records.append({"event": k, "method": method, "status": "not_run", "reason": guard})
+                    k += 1
+                    continue
+                if cbfs is not None:
+                    cbfs.take_writes()
                 t0 = time.time()
                 status, ans = server.api.request(k + 1, method, params, self.timeout)
                 ms = int((time.time() - t0) * 1000)
+                writes = cbfs.take_writes() if cbfs is not None else []
+                if status == "ok" and isinstance(ans, dict) and (method == "emit" or writes):
+                    ans = {**ans, "@writes": writes}
                 rec = {"event": k, "method": method, "status": status, "ms": ms, "sent": norm.strings(params)}
                 if restarts:
                     rec["epoch"] = restarts
@@ -1241,6 +1317,22 @@ class SessionRun:
             self.ctx["snapshot"] = ans.get("snapshot")
             self.ctx["projects"] = ans.get("projects") or []
 
+    def _emit_guard(self, method, params, run_dir):
+        """None when the request may be sent. tsgo#4699 `emit` writes through the session FS (the real disk
+        without the writeFile callback), so it goes only to a fixture project under the run dir, with the
+        callback. Then no run writes into a project input, also when a server ignores the callback."""
+        if method != "emit":
+            return None
+        h = self.header
+        if "writeFile" not in (h.get("callbacks") or []) or not h.get("fixture"):
+            return "emit guard: the trace has no writeFile callback or no fixture"
+        pid = params.get("project") if isinstance(params, dict) else None
+        proj = next((p for p in self.ctx["projects"] if p.get("id") == pid), None)
+        cfg = str((proj or {}).get("configFileName") or "")
+        if not cfg.startswith(os.path.join(run_dir, "")):
+            return "emit guard: the project config is not under the run dir"
+        return None
+
     def _start(self, run_dir, cbfs, n):
         server = Server(self.binary, self.header, run_dir, cbfs, f"{self.role}{n}")
         try:
@@ -1274,7 +1366,7 @@ class SessionRun:
             if g is not None and g.get("status") == "skipped":
                 continue
             params, _ = build_params(ev, raw, self.ctx)
-            if params is MISSING:
+            if params is MISSING or self._emit_guard(ev["method"], params, run_dir):
                 continue
             st, ans = server.api.request(j + 1, ev["method"], params, self.timeout)
             if st == "ok":
@@ -1418,9 +1510,14 @@ def trace_inputs(header, events):
     rels = {header["project"]["tsconfig"]}
     pdir = header["project"]["dir"]
     for ev in events:
-        f = (ev.get("params") or {}).get("file") if isinstance(ev.get("params"), dict) else None
-        if isinstance(f, str) and f.startswith("@PROJECT_DIR@/"):
-            rels.add(f[len("@PROJECT_DIR@/"):])
+        params = ev.get("params") if isinstance(ev.get("params"), dict) else {}
+        for key in ("file", "fileName"):
+            f = params.get(key)
+            if isinstance(f, str) and f.startswith("@PROJECT_DIR@/"):
+                rels.add(f[len("@PROJECT_DIR@/"):])
+            elif key == "file" and ev.get("method") == "readConfigFile" and isinstance(f, str) \
+                    and not f.startswith(("/", "@", "bundled:")):
+                rels.add(f)  # relative to the cwd, the project dir
     return pdir, sorted(rels)
 
 
@@ -2072,8 +2169,9 @@ class TraceBuilder:
 GO_KIND_CALL_SIGNATURE = 180  # checked against kind_generated.go in `build`
 
 
-def oracle_session(oracle, pdir, tsconfig, files, tmp_root):
-    """Go answers used to choose samples: project roots and encoded ASTs."""
+def oracle_session(oracle, pdir, tsconfig, files, tmp_root, project_out=None):
+    """Go answers used to choose samples: project roots and encoded ASTs. project_out (a dict)
+    gets the ProjectResponse of the project."""
     run_dir = tempfile.mkdtemp(prefix="build-", dir=tmp_root)
     header = {"name": "build", "project": {"dir": pdir, "tsconfig": tsconfig}}
     srv = Server(oracle, header, run_dir, None, "build")
@@ -2085,6 +2183,8 @@ def oracle_session(oracle, pdir, tsconfig, files, tmp_root):
             raise HarnessError(f"updateSnapshot: {snap}")
         want = os.path.join(pdir, tsconfig)
         proj = next((p for p in snap["projects"] if p["configFileName"] == want), snap["projects"][0])
+        if project_out is not None:
+            project_out.update(proj)
         roots = set(proj["rootFiles"])
         encoded = {}
         for n, rel in enumerate(files):
@@ -2308,6 +2408,9 @@ def cmd_build(args):
     if args.preset not in PRESETS:
         raise UsageError(f"unknown preset {args.preset}")
     preset = dict(PRESETS[args.preset])
+    if args.kind == "ext" and (PROTOCOL < 3 or args.preset not in EXT_PRESETS):
+        raise UsageError(f"--kind ext needs protocol 3 (pin {PIN} has {PROTOCOL}) and a preset in "
+                         f"{', '.join(EXT_PRESETS)}")
     kinds = go_kinds()
     GO_KIND_CALL_SIGNATURE = kinds["KindCallSignature"]
     caps = dict(preset["caps"])
@@ -2316,8 +2419,9 @@ def cmd_build(args):
         caps[k] = int(v)
     files = glob_files(preset["dir"], preset["include"], preset["exclude"])
     tmp_root = make_tmp_root()
+    project = {}
     try:
-        roots, encoded = oracle_session(args.oracle, preset["dir"], preset["tsconfig"], files, tmp_root)
+        roots, encoded = oracle_session(args.oracle, preset["dir"], preset["tsconfig"], files, tmp_root, project)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
     files = [f for f in files if os.path.join(preset["dir"], f) in roots and f in encoded]
@@ -2355,11 +2459,18 @@ def cmd_build(args):
     elif kind == "xchecker":
         for header, ev in xchecker_traces(preset, args.battery, files, samples, apath):
             written.append(write_trace(out_dir, header, ev))
+    elif kind == "ext":
+        ext = ExtPlan(args.preset, preset, files, encoded, kinds, caps, project, samples)
+        for header, ev in ext_traces(ext, args.battery):
+            check_emit_guard(header, ev)
+            written.append(write_trace(out_dir, header, ev))
     else:
         raise UsageError(f"unknown kind {kind}")
     index = {"preset": args.preset, "kind": kind, "caps": caps, "files": files, "traces": len(written),
              "oracle": args.oracle, "oracleSha": sha256_file(args.oracle),
              "requests": sum(sum(1 for _ in open(p)) - 1 for p in written)}
+    if kind == "ext":
+        index["ext"] = ext.summary()
     write_json(os.path.join(out_dir, "index.json"), index)
     print(json.dumps({k: v for k, v in index.items() if k != "files"}, indent=1))
     return EXIT_OK
@@ -2504,6 +2615,447 @@ def xchecker_traces(preset, battery, files, samples, apath):
 
 
 # ---------------------------------------------------------------------------
+# build --kind ext: the API methods that pin 16c25522e123 adds or changes and that the other kinds do not
+# send (target/continuation-r97-goport/upstream/bumpB/api-battery/design.md, section numbers below).
+# Wave 1 and wave 2 methods are in separate traces, so a missing wave 2 handler cannot turn wave 1 events
+# into not_run. `check --only` keys: ext_file, ext_misc, ext_config, adder, temp, emit, transpile.
+# ---------------------------------------------------------------------------
+
+REL_IMPORT = re.compile(r"""(?:from|import)\s*['"](\.{1,2}/[^'"]+)['"]""")
+TEMP_SUFFIX = "\nexport const __apiOracleTemp: number = \"x\";\n"
+
+
+def u16_offsets(text):
+    """UTF-16 offset of each code point index of `text`, plus the end."""
+    out, n = [], 0
+    for ch in text:
+        out.append(n)
+        n += 2 if ord(ch) > 0xFFFF else 1
+    out.append(n)
+    return out
+
+
+def line_start_u16(text, offs, pos16):
+    """UTF-16 offset of the start of the line that holds UTF-16 offset pos16."""
+    ci = bisect.bisect_left(offs, pos16)
+    return offs[text.rfind("\n", 0, ci) + 1]
+
+
+def resolve_rel_import(rel, spec, roots):
+    base = re.sub(r"\.(m|c)?js$", "", os.path.normpath(os.path.join(os.path.dirname(rel), spec)))
+    return next((c for c in (base, base + ".ts", base + ".mts", base + "/index.ts") if c in roots), None)
+
+
+def first_statement_end(enc, decl, K):
+    """UTF-16 end of the first statement of the body block of node `decl`, or None (no body, empty body)."""
+    block = stmts = None
+    for j in range(decl + 1, enc.count):
+        kind, _pos, end, _next, parent, _data, _flags = enc.node(j)
+        if block is None:
+            if parent == decl and kind == K["KindBlock"]:
+                block = j
+        elif stmts is None:
+            if parent == block and kind == 0xFFFFFFFF:
+                stmts = j
+        elif parent == stmts:
+            return end
+    return None
+
+
+class ExtPlan:
+    """The files of the ext traces (section 4.1), chosen from the root file list of `build`."""
+
+    def __init__(self, name, preset, files, encoded, kinds, caps, project, samples=None):
+        cfg = EXT_PRESETS[name]
+        pdir = preset["dir"]
+        self.preset, self.kinds, self.files = preset, kinds, files
+        self.enc = {f: EncodedFile(encoded[f]) for f in files}
+        self.samples = samples or {f: FileSamples(self.enc[f], f, kinds, caps) for f in files}
+        self.text = {}
+        for f in files:
+            with open(os.path.join(pdir, f), encoding="utf-8", newline="") as fh:
+                self.text[f] = fh.read()
+        roots = set(files)
+        imports = {f: sorted({r for r in (resolve_rel_import(f, sp, roots) for sp in REL_IMPORT.findall(self.text[f]))
+                              if r}) for f in files}
+        importers = {f: sorted(g for g in files if f in imports[g]) for f in files}
+        excl = [glob_regex(p) for p in cfg["sampleExclude"]]
+        ts_files = [f for f in files if not f.endswith(".d.ts") and not any(r.match(f) for r in excl)]
+        # The bigger half by encoded node count (ties by name), in name order: enough constructs per file.
+        by_nodes = sorted(ts_files, key=lambda f: (-self.enc[f].count, f))
+        big = sorted(by_nodes[:max(cfg["files"], len(by_nodes) // 2)])
+        self.ext_files = spread(big, cfg["files"])
+        # Import adder: target A, B1 = A's first imported root, B2 = the first big file that A does not import.
+        self.adder = []
+        for a in spread([f for f in big if imports[f]], 3):
+            b2 = next((g for g in big if g != a and g not in imports[a] and not g.endswith("index.ts")), None)
+            if b2:
+                self.adder.append((a, imports[a][0], b2))
+        # Temporary snapshots: small files that import a root and that a root imports, with their first importer.
+        small = [f for f in ts_files if len(self.text[f].encode()) <= 25000 and imports[f] and importers[f]]
+        self.temp = [(t, importers[t][0]) for t in spread(small, 2)]
+        self.emit_files = spread(big, 8)
+        self.variants = spread(big, 5)
+        self.jsx = spread(glob_files(pdir, cfg["jsx"], []), 5) if cfg.get("jsx") else []
+        self.fixture = cfg.get("fixture") or []
+        # The project's own compilerOptions (the bundler-plugin use of transpile), project dir as @PROJECT_DIR@.
+        self.options = Normalizer([(pdir, "@PROJECT_DIR@")]).strings(project.get("compilerOptions") or {})
+
+    def summary(self):
+        return {"extFiles": self.ext_files, "adder": self.adder, "temp": self.temp, "emitFiles": self.emit_files,
+                "variants": self.variants, "jsx": self.jsx, "fixture": self.fixture}
+
+    def handle(self, rel, i):
+        return self.samples[rel].handle(i, os.path.join(self.preset["dir"], rel))
+
+
+def at(ev, pointer, into, **kw):
+    return {"event": ev, "pointer": pointer, "into": into, **kw}
+
+
+def pdir_file(rel):
+    return "@PROJECT_DIR@/" + rel
+
+
+def ext_file_trace(ext, rel):
+    """Section 4.2 ext_file: wave 1 methods about one file (#4791, #4700, #4893, #4689, #4897, #4556, #3515)."""
+    K, s, enc, text = ext.kinds, ext.samples[rel], ext.enc[rel], ext.text[rel]
+    tb = TraceBuilder()
+    open_session(tb, ext.preset)
+    ck, obj, file = tb.ck, tb.obj, pdir_file(rel)
+
+    def about_symbol(spec):
+        for m in ("getFullyQualifiedName", "getJsDocTags", "getDocumentationComment"):
+            tb.req(m, ck(), spec)
+
+    mod = tb.req("getSymbolOfSourceFile", ck(file=file))
+    tb.req("getFullyQualifiedName", ck(), at(mod, "/id", "/symbol"))
+    exports = tb.req("getExportsOfSymbol", obj(), at(mod, "/id", "/objectId"))
+    for k in range(3):
+        about_symbol(at(exports, "", "/symbol", pick={"sortBy": ["name"], "index": k, "then": "/id"}))
+    for i, pos in s.ids[:4]:
+        a = tb.req("getSymbolAtPosition", ck(file=file, position=pos))
+        about_symbol(at(a, "/id", "/symbol"))
+        t = tb.req("getTypeAtPosition", ck(file=file, position=pos))
+        ap = tb.req("getApparentType", obj(), at(t, "/id", "/objectId"))
+        tb.req("typeToString", ck(), at(ap, "/id", "/type"))
+        tb.req("getApparentPropertiesOfType", obj(), at(t, "/id", "/objectId"))
+    if s.ids:
+        i, pos = s.ids[0]
+        for meaning in (SF_TYPE_PARAMETER, SF_ALIAS, SF_BLOCK_SCOPED_VARIABLE):
+            tb.req("getSymbolsInScope", ck(file=file, position=pos, meaning=meaning))
+        tb.req("getSymbolsInScope", ck(location=ext.handle(rel, i), meaning=SF_BLOCK_SCOPED_VARIABLE | SF_FUNCTION))
+    # Type parameter handles come from TypeParameter nodes, gated on the type flag (design decision 8).
+    is_tp = [{"pointer": "/flags", "mask": TF_TYPE_PARAMETER}]
+    tp_nodes = [j for j in range(1, enc.count) if enc.node(j)[0] == K["KindTypeParameter"]]
+    for j in spread(tp_nodes, 3):
+        t = tb.req("getTypeAtLocation", ck(location=ext.handle(rel, j)))
+        d = tb.req("getDefaultFromTypeParameter", obj(), at(t, "/id", "/objectId", when=is_tp))
+        tb.req("typeToString", ck(), at(d, "/id", "/type"))
+        tb.req("getConstraintOfTypeParameter", obj(), at(t, "/id", "/objectId", when=is_tp))
+    for i in s.calls[:2]:
+        g = tb.req("getResolvedSignature", ck(location=ext.handle(rel, i)))
+        for index in (0, 1):
+            tp = tb.req("getTypeParameterAtPosition", ck(index=index), at(g, "/id", "/signature"))
+            tb.req("typeToString", ck(), at(tp, "/id", "/type"))
+    offs = u16_offsets(text)
+    for i in s.sig_decls[:2]:
+        t = tb.req("getTypeAtLocation", ck(location=ext.handle(rel, i)))
+        sg = tb.req("getSignaturesOfType", ck(kind=SIG_CALL), at(t, "/id", "/type"))
+        tps = tb.req("getTypeParametersOfSignature", obj(),
+                     at(sg, "/0/id", "/objectId", when=[{"pointer": "/0/typeParameters", "nonzero": True}]))
+        tb.req("getDefaultFromTypeParameter", obj(), at(tps, "/0/id", "/objectId"))
+        p_close = line_start_u16(text, offs, enc.node(i)[2] - 1)  # the line of the closing "}"
+        body_end = first_statement_end(enc, i, K)
+        d1 = tb.req("signatureToSignatureDeclaration", ck(kind=K["KindMethodSignature"]), at(sg, "/0/id", "/signature"))
+        tb.req("formatNodeForInsertion", ck(file=file, position=p_close), at(d1, "/data", "/data"))
+        tb.req("formatNodeForInsertion", ck(file=file, position=0), at(d1, "/data", "/data"))
+        d2 = tb.req("signatureToSignatureDeclaration", ck(kind=K["KindFunctionDeclaration"]),
+                    at(sg, "/0/id", "/signature"))
+        tb.req("formatNodeForInsertion", ck(file=file, position=offs[-1]), at(d2, "/data", "/data"))
+        tn = tb.req("typeToTypeNode", ck(), at(t, "/id", "/type"))
+        if body_end is not None:
+            tb.req("formatNodeForInsertion", ck(file=file, position=line_start_u16(text, offs, body_end - 1)),
+                   at(tn, "/data", "/data"))
+    return tb.events
+
+
+def ext_misc_trace(ext):
+    """Section 4.2 ext_misc: once per project (#4533, #4569, #4791, #4897 globals, error probes)."""
+    tb = TraceBuilder()
+    open_session(tb, ext.preset)
+    ck, obj = tb.ck, tb.obj
+    n = tb.req("getNonPrimitiveType", ck())
+    tb.req("typeToString", ck(), at(n, "/id", "/type"))
+    tb.req("getPropertiesOfType", ck(), at(n, "/id", "/type"))
+    tb.req("getWellKnownSignatures", ck())
+    tb.req("getSymbolsOfSourceFiles", ck(files=[pdir_file(f) for f in ext.ext_files]))
+    tb.req("getSymbolsOfSourceFiles", ck(files=[]))
+    tb.req("getSymbolsOfSourceFiles", ck(files=[pdir_file(ext.files[0]), pdir_file("does/not/exist.ts")]))
+    tb.req("getSymbolOfSourceFile", ck(file="bundled:///libs/lib.es5.d.ts"))
+    first = ext.ext_files[0]
+    pos = ext.samples[first].ids[0][1] if ext.samples[first].ids else 0
+    for meaning in (SF_VALUE, SF_TYPE):  # all globals: 0.4 to 0.7 MB each (design decision 11)
+        tb.req("getSymbolsInScope", ck(file=pdir_file(first), position=pos, meaning=meaning))
+    # errors
+    tb.req("getSymbolsInScope", ck(meaning=SF_VALUE))
+    tb.req("getSymbolsInScope", ck(location="bad-handle", meaning=SF_VALUE))
+    call = next(((f, ext.samples[f].calls[0]) for f in ext.ext_files if ext.samples[f].calls), None)
+    if call:
+        g = tb.req("getResolvedSignature", ck(location=ext.handle(*call)))
+        tb.req("getTypeParameterAtPosition", ck(index=-1), at(g, "/id", "/signature"))
+    tb.req("getFullyQualifiedName", ck(symbol=987654321))
+    tb.req("getApparentType", {**obj(), "objectId": 4000000000})
+    return tb.events
+
+
+def ext_config_trace(ext):
+    """Section 4.2 ext_config: config files of the project (#4724, #4888, #4627)."""
+    preset = ext.preset
+    tb = TraceBuilder()
+    open_session(tb, preset)
+    ck = tb.ck
+    conf = pdir_file(preset["tsconfig"])
+    names = tb.req("getConfigFileNames", ck())
+    for ptr in ("/0", "/1"):
+        tb.req("getConfigSourceFile", ck(), at(names, ptr, "/file"))
+    tb.req("getConfigSourceFile", ck(file=pdir_file(ext.files[0])))
+    tb.req("getConfigSourceFile", ck(file=pdir_file("does/not/exist.json")))
+    r = tb.req("readConfigFile", {"file": conf})
+    tb.req("readConfigFile", {"file": preset["tsconfig"]})
+    tb.req("readConfigFile", {"file": {"uri": "file://" + os.path.join(preset["dir"], preset["tsconfig"])}})
+    x = tb.req("readConfigFile", {}, at(names, "/1", "/file"))
+    tb.req("readConfigFile", {"file": "package.json"})
+    tb.req("readConfigFile", {"file": "missing.json"})
+    pj = "parseJsonConfigFileContent"
+    tb.req(pj, {"configFileName": conf}, at(r, "/config", "/json"))
+    tb.req(pj, {"configDirectory": "@PROJECT_DIR@"}, at(r, "/config", "/json"))
+    tb.req(pj, {}, [at(x, "/config", "/json"), at(names, "/1", "/configFileName")])
+    tb.req(pj, {"json": {}, "configDirectory": "@PROJECT_DIR@", "configFileName": conf})
+    tb.req(pj, {"json": {}})
+    tb.req(pj, {"json": {"files": [None], "include": [None], "exclude": [None]}, "configDirectory": "@PROJECT_DIR@"})
+    first = ext.files[0]
+    for argv in (["-p", conf], ["-p", conf, "--noEmit", "--declaration", "--outDir", "out"],
+                 [first, "--target", "es2022", "--module", "nodenext", "--strict"],
+                 ["--lib", "es2022,dom", "--types", "node", first], ["--notAnOption"], ["--target", "es3000"], []):
+        tb.req("parseCommandLine", {"commandLine": argv})
+    tb.req("parseConfigFile", {}, at(names, "/1", "/file"))
+    return tb.events
+
+
+def ext_adder_trace(ext):
+    """Section 4.2 ext_adder: getImportAdderEdits (#3881, wave 2)."""
+    tb = TraceBuilder()
+    open_session(tb, ext.preset)
+    ck, obj = tb.ck, tb.obj
+
+    def pick(ev, index, slot, mask=None):
+        p = {"sortBy": ["name"], "index": index, "then": "/id"}
+        if mask:
+            p["where"] = {"field": "flags", "mask": mask}
+        return at(ev, "", f"/actions/{slot}/symbol", pick=p)
+
+    def adder(a, specs, **kw):
+        tb.req("getImportAdderEdits", ck(file=pdir_file(a), actions=[{"kind": "importSymbol", **kw} for _ in specs]),
+               specs)
+
+    for a, b1, b2 in ext.adder:
+        m = tb.req("getSymbolsOfSourceFiles", ck(files=[pdir_file(b1), pdir_file(b2)]))
+        e1 = tb.req("getExportsOfSymbol", obj(), at(m, "/0/id", "/objectId"))
+        e2 = tb.req("getExportsOfSymbol", obj(), at(m, "/1/id", "/objectId"))
+        adder(a, [pick(e2, 0, 0)])  # a new import
+        adder(a, [pick(e2, 0, 0), pick(e2, 1, 1)])  # two names, one import
+        adder(a, [pick(e1, 0, 0)])  # a module that A imports
+        adder(a, [pick(e1, 0, 0), pick(e2, 0, 1)])  # two modules
+        adder(a, [pick(e2, 0, 0, SF_TYPE)], isValidTypeOnlyUseSite=False)
+    a = pdir_file(ext.adder[0][0])
+    for actions in ([{"kind": "unknown"}], [{"kind": "importSymbol", "symbol": 0}],
+                    [{"kind": "importSymbol", "symbol": 987654321}]):
+        tb.req("getImportAdderEdits", ck(file=a, actions=actions))
+    tb.req("getImportAdderEdits", ck(file=pdir_file("does/not/exist.ts"),
+                                     actions=[{"kind": "importSymbol", "symbol": 987654321}]))
+    return tb.events
+
+
+def ext_temp_trace(ext):
+    """Section 4.2 ext_temp: updateTemporarySnapshot (#4642, wave 2). Overlays only; no file is written."""
+    tb = TraceBuilder()
+    s1 = open_session(tb, ext.preset)
+    snap = lambda ev: at(ev, "/snapshot", "/snapshot")  # noqa: E731
+    pr = lambda **kw: {"project": "@PROJECT@", **kw}  # noqa: E731
+    first_x = None
+    for t, imp in ext.temp:
+        text, file = ext.text[t], pdir_file(t)
+        tb.req("getSemanticDiagnostics", pr(files=[file]), snap(s1))
+        tb.req("updateSnapshot", {})  # a newer snapshot stays the latest
+        x = tb.req("updateTemporarySnapshot", {"file": file, "newText": text + TEMP_SUFFIX}, snap(s1))
+        first_x = first_x if first_x is not None else x
+        tb.req("getSemanticDiagnostics", pr(files=[file]), snap(x))
+        tb.req("getSyntacticDiagnostics", pr(files=[file]), snap(x))
+        ty = tb.req("getTypeAtPosition", pr(file=file, position=utf16_len(text) + len("\nexport const ")), snap(x))
+        tb.req("typeToString", pr(), [snap(x), at(ty, "/id", "/type")])
+        tb.req("getSourceFile", pr(file=file), snap(x))
+        tb.req("getSemanticDiagnostics", pr(files=[pdir_file(imp)]), snap(x))
+        y = tb.req("updateTemporarySnapshot", {"file": file, "newText": text}, snap(x))  # temporary on temporary
+        tb.req("getSemanticDiagnostics", pr(files=[file]), snap(y))
+        tb.req("release", {}, snap(y))
+        tb.req("release", {}, snap(x))
+        tb.req("getSemanticDiagnostics", pr(files=[file]), snap(s1))
+        tb.req("getSourceFile", pr(file=file), snap(s1))
+        z_file = pdir_file(os.path.join(os.path.dirname(t), "__api_oracle_temp.ts"))  # not on disk
+        z_text = f"import * as m from \"./{os.path.splitext(os.path.basename(t))[0]}\";\nexport const probe = m;\n"
+        z = tb.req("updateTemporarySnapshot", {"file": z_file, "newText": z_text}, snap(s1))
+        tb.req("getDefaultProjectForFile", {"file": z_file}, snap(z))
+        tb.req("getSemanticDiagnostics", pr(files=[z_file]), snap(z))
+        tb.req("getTypeAtPosition", pr(file=z_file, position=z_text.index("probe")), snap(z))
+        tb.req("release", {}, snap(z))
+    t0 = pdir_file(ext.temp[0][0])
+    tb.req("updateTemporarySnapshot", {"file": pdir_file("notes.txt"), "newText": "x"}, snap(s1))
+    tb.req("updateTemporarySnapshot", {"file": t0, "newText": "x"}, snap(first_x))  # released
+    tb.req("updateTemporarySnapshot", {"snapshot": 999, "file": t0, "newText": "x"})
+    tb.req("updateSnapshot", {})
+    tb.req("getSemanticDiagnostics", tb.diag(t0))
+    return tb.events
+
+
+def ext_emit_trace(ext):
+    """Section 4.2 ext_emit: emit to memory (#4699, wave 2). These handlers never write."""
+    tb = TraceBuilder()
+    open_session(tb, ext.preset)
+    ck = tb.ck
+    tb.req("emitToString", ck())
+    for emit_only in (1, 2, 3):
+        tb.req("emitToString", ck(emitOnly=emit_only))
+    files = [pdir_file(f) for f in ext.emit_files]
+    for f in files:
+        tb.req("getJavaScriptEmit", ck(files=[f]))
+        tb.req("getDeclarationEmit", ck(files=[f]))
+    tb.req("getJavaScriptEmit", ck(files=files[:5]))
+    tb.req("getDeclarationEmit", ck(files=files[:5]))
+    tb.req("getJavaScriptEmit", ck(files=[]))
+    tb.req("getDeclarationEmit", ck(files=[{"uri": "file://" + os.path.join(ext.preset["dir"], ext.emit_files[0])}]))
+    tb.req("getJavaScriptEmit", ck(files=[pdir_file("does/not/exist.ts")]))
+    tb.req("getJavaScriptEmit", ck())
+    return tb.events
+
+
+def ext_emit_fixture_trace(ext):
+    """Section 4.2 ext_emit_fixture: `emit` (#4699) on a fixture under the run dir, with the writeFile
+    callback (design decision 4). Returns (fixture, events)."""
+    names = [os.path.basename(rel) for rel in ext.fixture]
+    fx = {}
+    for rel in ext.fixture:
+        with open(os.path.join(ext.preset["dir"], rel), encoding="utf-8", newline="") as f:
+            fx["emitfx/" + os.path.basename(rel)] = f.read()
+    config = {"compilerOptions": {"target": "es2020", "module": "esnext", "moduleResolution": "bundler",
+                                  "lib": ["es2022", "dom"], "strict": True, "declaration": True, "declarationMap": True,
+                                  "sourceMap": True, "outDir": "out", "types": []}, "files": names}
+    fx["emitfx/tsconfig.json"] = json.dumps(config, indent=2) + "\n"
+    fx["emitfx/tsconfig.noemit.json"] = json.dumps({"extends": "./tsconfig.json", "compilerOptions": {"noEmit": True}},
+                                                   indent=2) + "\n"
+    fx["emitfx/tsconfig.errors.json"] = json.dumps({"extends": "./tsconfig.json",
+                                                    "compilerOptions": {"noEmitOnError": True},
+                                                    "files": names + ["bad.ts"]}, indent=2) + "\n"
+    fx["emitfx/bad.ts"] = "export const n: number = \"x\";\n"
+    fx["emitfx/bad.json"] = "{\n  \"compilerOptions\": {\n    \"strict\" true\n  }\n}\n"
+    cfg = lambda name: "@RUN_DIR@/emitfx/" + name  # noqa: E731
+    ck = lambda name, **kw: {"snapshot": "@SNAPSHOT@", "project": "@PROJECT:" + cfg(name) + "@", **kw}  # noqa: E731
+    tb = TraceBuilder()
+    tb.req("initialize")
+    tb.req("updateSnapshot", open_params(cfg("tsconfig.json")))
+    tb.req("emit", ck("tsconfig.json"))
+    for emit_only in (1, 2, 3):
+        tb.req("emit", ck("tsconfig.json", emitOnly=emit_only))
+    tb.req("emitToString", ck("tsconfig.json"))
+    tb.req("updateSnapshot", open_params(cfg("tsconfig.noemit.json")))
+    tb.req("emit", ck("tsconfig.noemit.json"))  # skipped: noEmit
+    tb.req("getJavaScriptEmit", ck("tsconfig.noemit.json", files=[cfg(names[0])]))  # forced
+    tb.req("updateSnapshot", open_params(cfg("tsconfig.errors.json")))
+    tb.req("emit", ck("tsconfig.errors.json"))  # skipped: noEmitOnError and TS2322
+    tb.req("emitToString", ck("tsconfig.errors.json"))
+    tb.req("readConfigFile", {"file": cfg("bad.json")})
+    return fx, tb.events
+
+
+TRANSPILE_MODULE_SETS = [
+    ({"module": 1, "target": 9, "sourceMap": True, "esModuleInterop": True}, True),
+    ({"module": 199, "target": 99, "verbatimModuleSyntax": True}, True),
+    ({"module": 99, "target": 9, "inlineSourceMap": True, "inlineSources": True, "removeComments": True}, True),
+    ({"module": 99, "target": 2, "experimentalDecorators": True}, True),
+    ({}, False)]
+TRANSPILE_DECLARATION_SETS = [({"declarationMap": True}, True), ({"stripInternal": True, "target": 99}, True)]
+TRANSPILE_SYNTAX_ERROR = "const x: = 1;\nexport {}"
+
+
+def ext_transpile_trace(ext, declaration):
+    """Section 4.2 ext_transpile_module and ext_transpile_declaration (#4849, wave 2). No snapshot.
+    Go panics on a .d.ts input ("Output generation failed"); the event stays (design decision 10)."""
+    tb = TraceBuilder()
+    tb.req("initialize")
+    m_file = "transpileDeclarationFromFile" if declaration else "transpileModuleFromFile"
+    m_text = "transpileDeclaration" if declaration else "transpileModule"
+    def from_file(f, options, report=True):
+        tb.req(m_file, {"fileName": pdir_file(f), "options": {"compilerOptions": options, "reportDiagnostics": report}})
+
+    for f in ext.files:
+        from_file(f, ext.options)
+    for f in ext.variants:
+        for options, report in TRANSPILE_DECLARATION_SETS if declaration else TRANSPILE_MODULE_SETS:
+            from_file(f, options, report)
+    inline = {"compilerOptions": {"module": 99, "target": 9}, "reportDiagnostics": True}
+    for f in ext.variants[:2]:
+        tb.req(m_text, {"input": ext.text[f], "options": {**inline, "fileName": f}})
+    if declaration:
+        tb.req(m_text, {"input": TRANSPILE_SYNTAX_ERROR, "options": {"reportDiagnostics": True}})
+        tb.req(m_text, {"input": "export function f(a) { return a; }\n", "options": {"reportDiagnostics": True}})
+    else:
+        tb.req(m_text, {"input": ext.text[ext.variants[0]], "options": inline})  # Go default name module.ts
+        tb.req(m_text, {"input": TRANSPILE_SYNTAX_ERROR, "options": {"reportDiagnostics": True}})
+        tb.req(m_text, {"input": TRANSPILE_SYNTAX_ERROR, "options": {"reportDiagnostics": False}})
+        tb.req(m_text, {"input": "", "options": {}})
+        tb.req(m_text, {"input": "import x = require(\"y\");\nexport = x;\n",
+                        "options": {"compilerOptions": {"module": 1}}})
+        for f in ext.jsx:
+            from_file(f, {"jsx": 4, "jsxImportSource": "hono/jsx", "module": 99, "target": 9})
+            from_file(f, {"jsx": 1})
+        if ext.jsx:
+            tb.req(m_text, {"input": "export const el = <div id=\"a\">{1}</div>;\n",
+                            "options": {"compilerOptions": {"jsx": 4}, "reportDiagnostics": True}})  # module.tsx
+    tb.req(m_file, {"fileName": pdir_file("does/not/exist.ts"), "options": {}})
+    return tb.events
+
+
+def ext_traces(ext, battery):
+    """(header, events) of every ext trace (section 3)."""
+    h = lambda name, **kw: trace_header(name, battery, ext.preset, **kw)  # noqa: E731
+    for rel in ext.ext_files:
+        yield h("ext_file_" + slug(rel), file=rel), ext_file_trace(ext, rel)
+    yield h("ext_misc"), ext_misc_trace(ext)
+    yield h("ext_config"), ext_config_trace(ext)
+    if ext.adder:
+        yield h("ext_adder"), ext_adder_trace(ext)
+    if ext.temp:
+        yield h("ext_temp"), ext_temp_trace(ext)
+    yield h("ext_emit"), ext_emit_trace(ext)
+    if ext.fixture:
+        fx, events = ext_emit_fixture_trace(ext)
+        yield h("ext_emit_fixture", callbacks=["writeFile"], fixture=fx), events
+    yield h("ext_transpile_module"), ext_transpile_trace(ext, False)
+    yield h("ext_transpile_declaration"), ext_transpile_trace(ext, True)
+
+
+def check_emit_guard(header, events):
+    """The build side of SessionRun._emit_guard: a trace sends `emit` only to a fixture project."""
+    for k, ev in enumerate(events):
+        if ev.get("method") != "emit":
+            continue
+        project = (ev.get("params") or {}).get("project")
+        if "writeFile" not in (header.get("callbacks") or []) or not header.get("fixture") or ev.get("paramsFrom") \
+                or not isinstance(project, str) or not project.startswith("@PROJECT:@RUN_DIR@/"):
+            raise HarnessError(f"{header['name']} event {k}: emit outside a fixture project")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -2526,7 +3078,7 @@ def main(argv=None):
     p.add_argument("--oracle", default=DEFAULT_ORACLE)
     p.add_argument("--preset", required=True)
     p.add_argument("--battery", required=True)
-    p.add_argument("--kind", default="files", choices=["files", "proto", "callbacks", "lsp", "xchecker"])
+    p.add_argument("--kind", default="files", choices=["files", "proto", "callbacks", "lsp", "xchecker", "ext"])
     p.add_argument("--limit", type=int, help="first N files")
     p.add_argument("--sample", type=int, help="N files spread over the list")
     p.add_argument("--cap", action="append", help="override a sample cap, e.g. ids=4")

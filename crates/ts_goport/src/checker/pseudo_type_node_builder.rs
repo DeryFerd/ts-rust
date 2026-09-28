@@ -450,9 +450,9 @@ impl Checker {
                 let reused = self.reuse_node(b, source);
                 f.new_literal_type_node(reused)
             }
-            _ => panic!(
-                "Unhandled pseudotype kind in pseudotype node construction: {:?}",
-                t.kind
+            _ => crate::gostd::debug::assert_never(
+                &t.kind.0.to_string(),
+                Some("Unhandled pseudotype kind in pseudotype node construction"),
             ),
         }
     }
@@ -1045,9 +1045,8 @@ impl Checker {
             PseudoTypeKind::OBJECT_LITERAL
             | PseudoTypeKind::SINGLE_CALL_SIGNATURE
             | PseudoTypeKind::TUPLE => TypeId::NIL, // no simple mapping to a type, since these are structural types
-            _ => panic!(
-                "Unhandled pseudochecker.PseudoTypeKind in pseudoTypeToType: {:?}",
-                t.kind
+            _ => crate::gostd::debug::fail(
+                "Unhandled pseudochecker.PseudoTypeKind in pseudoTypeToType",
             ),
         }
     }

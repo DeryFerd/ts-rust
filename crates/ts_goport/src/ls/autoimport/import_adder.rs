@@ -291,7 +291,7 @@ impl ImportAdder for ImportAdderImpl {
                     entry.named_imports.insert(symbol_name, binding);
                 } else {
                     // Default import
-                    debug_assert!(
+                    crate::go_assert!(
                         entry
                             .default_import
                             .as_ref()
@@ -322,14 +322,14 @@ impl ImportAdder for ImportAdderImpl {
                     fix.add_as_type_only,
                 );
                 let mut entry = entry.borrow_mut();
-                debug_assert!(
+                crate::go_assert!(
                     entry.use_require == fix.use_require,
                     "(Add new) Tried to add an `import` and a `require` for the same module"
                 );
 
                 match fix.import_kind {
                     lsproto::ImportKind::DEFAULT => {
-                        debug_assert!(
+                        crate::go_assert!(
                             entry
                                 .default_import
                                 .as_ref()
@@ -403,7 +403,7 @@ impl ImportAdder for ImportAdderImpl {
                                 },
                             );
                         } else {
-                            debug_assert!(
+                            crate::go_assert!(
                                 entry
                                     .namespace_like_import
                                     .as_ref()
@@ -420,7 +420,7 @@ impl ImportAdder for ImportAdderImpl {
                     }
 
                     lsproto::ImportKind::NAMESPACE => {
-                        debug_assert!(
+                        crate::go_assert!(
                             entry
                                 .namespace_like_import
                                 .as_ref()
@@ -442,7 +442,7 @@ impl ImportAdder for ImportAdderImpl {
             lsproto::AutoImportFixKind::PROMOTE_TYPE_ONLY => {
                 // Excluding from fix-all
             }
-            _ => panic!("Debug failure. Unexpected fix kind: {:?}", fix.kind),
+            _ => crate::gostd::debug::fail(&format!("Unexpected fix kind: {}", fix.kind.string())),
         }
     }
 }
@@ -664,7 +664,7 @@ pub fn try_get_auto_importable_reference_from_type_node(
     );
 
     let type_node = visitor.visit_node(import_type_node);
-    debug_assert!(
+    crate::go_assert!(
         type_node.is_nil() || is_type_node(type_node),
         "expected a type node"
     );
@@ -692,7 +692,7 @@ fn get_name_for_exported_symbol(
         if !name.is_empty() {
             return name;
         }
-        debug_assert!(
+        crate::go_assert!(
             symbols.sym(symbol).parent.is_some(),
             "Expected exported symbol to have module symbol as parent"
         );

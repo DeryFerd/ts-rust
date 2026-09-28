@@ -704,10 +704,11 @@ fn perform_compilation(
 /// Starts the parse of the default lib files of `config` on the parse
 /// workers, before the compiler host, the build info read and the loader
 /// setup (`start_default_lib_prefetch`). The program loaded next on this
-/// thread takes the parses; its loader checks each one.
+/// thread takes the parses; its loader checks each one. `tsc -b` calls it
+/// too (`BuildTask::compile_and_emit_start`).
 // PORT: not in Go (see `start_default_lib_prefetch`). A test run
 // (`testing`) keeps the Go order.
-fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
+pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
     if testing {
         return;
     }

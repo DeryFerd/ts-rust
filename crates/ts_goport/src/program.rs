@@ -347,9 +347,18 @@ const MAX_EMIT_THREADS: usize = 32;
 /// 0 (no pool) when the cores are not more than the checkers. With no spare
 /// core the pool only competes with the checker threads, and each d.ts part
 /// loses the caches that its JS part warmed (effect at 4 cores and 4
-/// checkers: +1.6% wall, +30 MiB). `GOPORT_EMIT_THREADS` sets the count at
-/// any core count (same maximum); 0 turns the pool off, so every emit runs
-/// on the checker threads as before the pool.
+/// checkers: +1.6% wall, +30 MiB). When the process may run on
+/// `WIDE_CORES` CPUs or more and they hold SMT siblings (fewer physical
+/// cores than CPUs), the pool gets the physical cores that the checkers do
+/// not use. `GOPORT_EMIT_THREADS` sets the count at any core count (same
+/// maximum); 0 turns the pool off, so every emit runs on the checker
+/// threads as before the pool.
+// PERF (perf11 effecttail E9, dbook, effect emit, perf10 release tsgo, 30
+// paired rounds): at 32 threads (16 cores) a pool of 12 took 0.95% and
+// 1.25% less wall time than 32 (-7 to -9 ms, peak RSS -29 MiB); the 32
+// pool threads shared cores and L3 with the checkers. At 16 threads on 16
+// cores 12 was neutral, so the rule leaves CPUs without siblings alone.
+// perf10 found a pool of 4 17 ms faster on mini-743d (16 threads, 8 cores).
 fn emit_thread_count() -> usize {
     static SET: OnceLock<Option<usize>> = OnceLock::new();
     let set = *SET.get_or_init(|| {
@@ -357,9 +366,21 @@ fn emit_thread_count() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
     });
-    let cores = available_cores();
-    set.unwrap_or(if cores > checker_count() { cores } else { 0 })
-        .min(MAX_EMIT_THREADS)
+    set.unwrap_or_else(|| {
+        let cores = available_cores();
+        let checkers = checker_count();
+        if cores <= checkers {
+            return 0;
+        }
+        if cores >= WIDE_CORES
+            && let Some(physical) = physical_core_count()
+            && physical < cores
+        {
+            return physical.saturating_sub(checkers);
+        }
+        cores
+    })
+    .min(MAX_EMIT_THREADS)
 }
 
 /// Makes the emit pool of the current program with `count` threads.
@@ -967,7 +988,7 @@ fn trace_bind_source_file(file: Node) -> Option<crate::tracing::Pop> {
 /// The state of this thread that binding must not change: synthetic nodes,
 /// ids and lazy JSDoc. A bind thread starts from a copy of the loading
 /// thread's state, so anything it adds would be lost. The early emit
-/// (`execute::incremental::Program::start_check_and_emit`) also reads it:
+/// (`execute::incremental::Program::start_emit`) also reads it:
 /// an emit pool starts from a copy of the same state.
 pub(crate) fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     (
@@ -977,26 +998,39 @@ pub(crate) fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     )
 }
 
-/// Number of bind threads: `ThreadBudget::bind_threads` of the last
-/// program load on this thread (`note_program_load`).
+/// Number of bind threads for `files` files to bind:
+/// `ThreadBudget::bind_threads` of the last program load on this thread
+/// (`note_program_load`). On `WIDE_CORES` physical cores (`wide_cores`), a
+/// load with at least `WIDE_BIND_FILES` files to bind binds as a large load.
 /// `GOPORT_BIND_THREADS` sets it (below 2 binds serially).
-fn bind_thread_count() -> usize {
+// PERF (perf11 W5, tscb `ab32`, dbook 32 threads, 20 paired rounds): the
+// first program of the query chain build (`tsc -b`, 445 files, 27 root
+// tasks) bound in 5.6 ms less wall time on 16 bind threads than on 4.
+fn bind_thread_count(files: usize) -> usize {
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
     {
         return count;
     }
-    ThreadBudget::current().bind_threads(LARGE_LOAD.get())
+    let large = LARGE_LOAD.get() || files >= WIDE_BIND_FILES && wide_cores();
+    ThreadBudget::current().bind_threads(large)
 }
+
+/// From this many files to bind on, a load binds as a large load on
+/// `WIDE_CORES` physical cores (`bind_thread_count`). Query (`-p`, 186
+/// files) stays below it: there 8 bind threads were faster than 16.
+const WIDE_BIND_FILES: usize = 300;
 
 /// A program load with at least this many root tasks (root files, `lib`
 /// entries and the automatic type directive task) is large.
 // PERF (perf9 round 3, effect R3-E1): root tasks are query 27, hono 190,
 // elysia 241, zod 324 and effect 459. At 16 threads, 7 parse workers
 // parsed effect 12 ms and zod 9 ms faster than 4, and hono in the same
-// time. Query gains nothing from more parse threads (lib.dom bounds its
-// parse), and its peak RSS is near the 1.15x rule.
+// time. With glibc malloc, query gained nothing from more parse threads
+// (lib.dom bounds its parse), and its peak RSS was near the 1.15x rule.
+// With jemalloc, a load that is not large parses on 8 threads too
+// (`ThreadBudget::one_program`).
 const LARGE_LOAD_ROOT_TASKS: usize = 128;
 
 thread_local! {
@@ -1028,13 +1062,17 @@ pub fn available_cores() -> usize {
 const WIDE_CORES: usize = 16;
 
 /// True when this process may run on at least `WIDE_CORES` CPUs and
-/// `WIDE_CORES` physical cores. Read once. The physical cores are read only
-/// when `available_cores` is at least `WIDE_CORES`.
+/// `WIDE_CORES` physical cores. The physical cores are read only when
+/// `available_cores` is at least `WIDE_CORES`.
 fn wide_cores() -> bool {
-    static WIDE: OnceLock<bool> = OnceLock::new();
-    *WIDE.get_or_init(|| {
-        available_cores() >= WIDE_CORES && physical_cores().is_some_and(|cores| cores >= WIDE_CORES)
-    })
+    available_cores() >= WIDE_CORES
+        && physical_core_count().is_some_and(|cores| cores >= WIDE_CORES)
+}
+
+/// `physical_cores`, read once: it reads a sysfs file per core.
+fn physical_core_count() -> Option<usize> {
+    static PHYSICAL: OnceLock<Option<usize>> = OnceLock::new();
+    *PHYSICAL.get_or_init(physical_cores)
 }
 
 /// The physical cores that this process may run on: the CPUs of
@@ -1137,17 +1175,21 @@ impl ThreadBudget {
     /// while the checkers run (the checkers, main, the loading thread and
     /// `extra`; `tsgo` has 1 extra, its signal thread), and one to each
     /// parse worker that only a large load adds (the spare arenas).
-    /// - A load that is not large parses on as many threads as the check (4
-    ///   workers and the loading thread), which fit the check arenas.
-    /// - A large load adds up to 3 parse workers, which use the spare
-    ///   arenas, and binds on 8 threads. When the process may run on
-    ///   `WIDE_CORES` physical cores or more (`wide_cores`), a large load
-    ///   parses and binds on `WIDE_CORES` threads (15 parse workers and the
-    ///   loading thread). The arenas do not change: `tsgo` and `goport`
-    ///   use jemalloc, which does not read `arena_max`.
-    /// - With spare arenas, a load that is not large binds on as many
-    ///   threads as it had parse workers. The bind threads then take the
-    ///   arenas of the parse workers, which ended, and make no new ones.
+    /// - With glibc malloc (a build without the `jemalloc` feature), a load
+    ///   that is not large parses on as many threads as the check (4
+    ///   workers and the loading thread), which fit the check arenas. With
+    ///   spare arenas, it binds on as many threads as it had parse workers.
+    ///   The bind threads then take the arenas of the parse workers, which
+    ///   ended, and make no new ones.
+    /// - With jemalloc (the default feature and the shipped build), which
+    ///   does not read `arena_max`, a load that is not large parses and
+    ///   binds on up to 8 threads (7 parse workers and the loading thread).
+    /// - A large load parses on up to 8 threads (with glibc malloc, the 3
+    ///   workers more use the spare arenas) and binds on 8. When the
+    ///   process may run on `WIDE_CORES` physical cores or more
+    ///   (`wide_cores`), a large load parses and binds on `WIDE_CORES`
+    ///   threads (15 parse workers and the loading thread). The arenas do
+    ///   not change: `tsgo` and `goport` use jemalloc.
     // PERF (perf9 round 2, env-only runs on cup2 and zbook): with 8 parse
     // threads at 8 and 16 cores, the parse threads shared arena locks. With
     // 5, the query parse on cup2 took 21 ms instead of 29 (wall 8% to 12%
@@ -1169,17 +1211,25 @@ impl ThreadBudget {
     // bind threads its changes step from 20 to 16 ms (wall -6 to -10 ms).
     // At 16 threads on 8 cores (mini-743d) more threads gave nothing, so the
     // rule counts physical cores. Query is not a large load.
+    // PERF (perf11 Q12, qprof `knobs2`, dbook, 60 rounds, env-only on the
+    // perf10 release tsgo): the glibc arena locks of perf9 round 2 do not
+    // apply to jemalloc. Query (not large) with 7 parse workers and 8 bind
+    // threads: at 8 threads check -2.69 ms [-3.21, -2.07] and emit -2.47
+    // [-2.94, -2.08], at 16 and 32 threads -2.4 to -2.7 ms, peak RSS -1.5
+    // MiB. 15 workers and 16 bind threads were slower there than 7 and 8
+    // (-1.6 against -2.6 ms). At 4 cores the counts do not change.
     pub fn one_program(extra: usize) -> Self {
         let cores = available_cores();
         let parse = DEFAULT_CHECKERS + 1;
         let parse_large = parse + 3;
         let spare = cores.min(parse_large) - cores.min(parse);
         let wide = wide_cores();
+        let jemalloc = cfg!(feature = "jemalloc");
         ThreadBudget {
-            parse,
+            parse: if jemalloc { parse_large } else { parse },
             parse_large: if wide { WIDE_CORES } else { parse_large },
             bind: if wide { WIDE_CORES } else { 8 },
-            bind_small: if spare > 0 { parse - 1 } else { 8 },
+            bind_small: if spare > 0 && !jemalloc { parse - 1 } else { 8 },
             arena_max: DEFAULT_CHECKERS + 2 + extra + spare,
         }
     }
@@ -1313,7 +1363,7 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
         .filter(|file| file.file_bind.get().is_none())
         .map(|file| file.root)
         .collect();
-    let threads = bind_thread_count().min(files.len());
+    let threads = bind_thread_count(files.len()).min(files.len());
     if single_threaded() || threads < 2 {
         return;
     }

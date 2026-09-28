@@ -1303,7 +1303,7 @@ impl NodeFactory {
             let property_name = try_get_property_name_of_binding_or_assignment_element(element);
             if property_name.is_some() {
                 if is_computed_property_name(property_name) {
-                    debug_assert!(
+                    go_assert!(
                         computed_temp_variables.is_some(),
                         "Encountered computed property name but 'computedTempVariables' argument was not provided."
                     );

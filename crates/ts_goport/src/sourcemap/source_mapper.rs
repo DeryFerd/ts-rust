@@ -155,7 +155,7 @@ fn create_document_position_mapper(
         gostd::slices::sort_func(
             list.as_mut_slice(),
             |a: &SourceMappedPosition, b: &SourceMappedPosition| {
-                debug_assert!(
+                go_assert!(
                     a.source_index == b.source_index,
                     "All source mappings should have the same source index"
                 );
@@ -473,7 +473,7 @@ fn compute_position_of_line_and_utf16_character(
             if pos == line_end && utf16_count < character {
                 panic!("Bad UTF-16 character offset. Line: {line}, character: {character}.");
             }
-            debug_assert!(pos as usize <= text.len());
+            go_assert!(pos as usize <= text.len());
             return pos;
         }
         if pos as usize > text.len() {
@@ -491,7 +491,7 @@ fn compute_position_of_line_and_utf16_character(
         }
         return res;
     }
-    debug_assert!(res as usize <= text.len()); // Allow single character overflow for trailing newline
+    go_assert!(res as usize <= text.len()); // Allow single character overflow for trailing newline
     res
 }
 

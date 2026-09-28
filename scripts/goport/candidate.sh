@@ -238,7 +238,7 @@ evidence_key() {
       echo "$line"
       if [[ -f $wt/${line:3} ]]; then sha256sum < "$wt/${line:3}"; fi
     done
-    echo "pin=$pin profile=release"
+    echo "pin=$pin profile=release toolchain=$(rustc --version 2>/dev/null) incremental=0"
   } | sha256sum | cut -c1-16
 }
 
@@ -268,7 +268,7 @@ free_name() { local n=$2 i=2; while [[ -e $1/$n ]]; do n=$2-$i i=$((i + 1)); don
 # the cache dir (bins/, bound.json, gate.json, lsp.json) and is reused. Last log line: SIDE DONE or
 # SIDE FAIL rc=<N>.
 side_unit() {
-  local label=$1 wt=$2 pin=${3#-} host=$4 key C B commit fp n r gl ll rc oracle lock synced=0 g l
+  local label=$1 wt=$2 pin=${3#-} host=$4 key C B commit fp n r gl ll rc oracle lock synced=0 g l gate_fail=''
   local -a pinexec=()
   [[ $DRY == 1 ]] || trap 'rc=$?; if ((rc)); then echo "SIDE FAIL rc=$rc"; else echo "SIDE DONE"; fi' EXIT
   [[ -z $pin ]] || pinexec=(env GOPORT_PIN="$pin" python3 "$ROOT/scripts/upstream/pin.py" exec --)
@@ -282,7 +282,8 @@ side_unit() {
   if [[ -f $B/bins.sha256 ]]; then say "reuse bins $B (built from $(cat "$B/COMMIT"))"; else
     say "$(date -u +%FT%TZ) build release bins in $TARGET"
     if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
-    run_sh "cd $wt && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
+    # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
+    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
     run_sh "rm -rf $B.new && mkdir $B.new && cd $TARGET/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
     if [[ $DRY == 0 ]]; then
       exec 8>&-
@@ -319,7 +320,7 @@ side_unit() {
   remote_sync() {
     [[ $host != local && $synced == 0 ]] || return 0
     synced=1
-    [[ -z $pin ]] || run_sh "python3 scripts/upstream/pin.py sync $host $pin >> $C/sync.log 2>&1"
+    [[ -z $pin ]] || run_sh "scripts/goport/remote.sh sync-pin $host $pin >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-scripts $host >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-bins $host $B >> $C/sync.log 2>&1"
   }
@@ -339,11 +340,15 @@ side_unit() {
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/compat/gate/$gl >> $C/sync.log 2>&1"
     if [[ $DRY == 0 ]]; then
       tail -n 3 "$C/gate-$gl.log"
-      ((rc == 0)) || die "gate $gl rc $rc (log $C/gate-$gl.log)"
+      [[ -f $R/compat/gate/$gl/manifest.json ]] || die "gate $gl rc $rc and no manifest (log $C/gate-$gl.log)"
+      # A FAIL is recorded in gate-fail.json (not reused) with the failing items, and the other steps
+      # still run, so the verdict request has all the evidence. The unit ends SIDE FAIL.
+      g=$C/gate.json; ((rc == 0)) || { g=$C/gate-fail.json; gate_fail="gate $gl rc $rc (log $C/gate-$gl.log)"; }
       jq --arg l "$gl" --arg m "$R/compat/gate/$gl/manifest.json" --arg s "$(sha256sum < "$R/compat/gate/$gl/manifest.json" | cut -c1-64)" --arg h "$host" \
         '{label: $l, manifest: $m, sha256: $s, host: $h, verdict, commit, upstreamPin,
-          counts: ([.results[].status] | group_by(.) | map({(.[0]): length}) | add)}' \
-        "$R/compat/gate/$gl/manifest.json" > "$C/gate.json"
+          counts: ([.results[].status] | group_by(.) | map({(.[0]): length}) | add),
+          failing: [.results[] | select(.status == "FAIL") | {id, detail}]}' \
+        "$R/compat/gate/$gl/manifest.json" > "$g"
     fi
   fi
 
@@ -370,8 +375,27 @@ PY
     fi
   fi
 
+  # Quality on the checkout: rustfmt and clippy (R114 and R124 were refused for quality alone, and the
+  # roster carry-forward rule still requires quality on the current source). Fingerprint before and after.
+  if [[ -f $C/quality.json ]]; then say "reuse quality $(jq -c . "$C/quality.json")"; else
+    say "$(date -u +%FT%TZ) quality: rustfmt and clippy"
+    if [[ $DRY == 0 ]]; then
+      local fpa fpb fmt=0 cl=0 warn
+      fpb=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
+      (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files 'crates/ts_goport/**/*.rs') > "$C/rustfmt.log" 2>&1) || fmt=$?
+      (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \
+        "$ROOT/scripts/run-cargo-capped.sh" clippy --locked -p ts_goport --all-targets > "$C/clippy.log" 2>&1) || cl=$?
+      fpa=$(python3 scripts/goport/fp.py "$wt" | cut -d' ' -f1)
+      warn=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -c -- '--> crates/ts_goport' || true)
+      jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" \
+        '{sourceFingerprint: $fp, rustfmtExit: $fmt, clippyExit: $cl, tsGoportWarnings: $w, fingerprintUnchanged: $same}' > "$C/quality.json"
+      [[ $fmt == 0 && $cl == 0 && $warn == 0 && $fpa == "$fpb" ]] || { rm -f "$C/quality.json.ok"; gate_fail="${gate_fail:+$gate_fail; }quality: rustfmt $fmt, clippy $cl, warnings $warn"; }
+    fi
+  fi
+
   say "$(date -u +%FT%TZ) evidence $C"
-  for g in bound gate lsp; do if [[ -f $C/$g.json ]]; then echo "   $g: $(jq -c 'del(.manifests)' "$C/$g.json")"; fi; done
+  for g in bound gate gate-fail lsp quality; do if [[ -f $C/$g.json ]]; then echo "   $g: $(jq -c 'del(.manifests)' "$C/$g.json")"; fi; done
+  [[ -z $gate_fail ]] || die "$gate_fail"
 }
 
 # cmd_verdict <rev>: prints the verdict request texts from the state, the check result and the evidence
@@ -416,7 +440,8 @@ elif prev and prev['rosterFingerprint'] == row.get('rosterFingerprint'):
     result = f'protected roster carried forward from R{p} (rosterFingerprint {prev["rosterFingerprint"]} equal), check-format result {pcr} sha256 {sha(pcr)}'
 else:
     result, missing = f'check-format result {cr}: MISSING', missing + [cr]
-bound, gate, lsp = (load(f'{cache}/{k}.json') for k in ('bound', 'gate', 'lsp'))
+bound, gate, lsp, quality = (load(f'{cache}/{k}.json') for k in ('bound', 'gate', 'lsp', 'quality'))
+gate = gate or load(f'{cache}/gate-fail.json')
 bins = f'{cache}/bins'
 if bound:
     ev.append(f"Bound runs {' and '.join(bound['rounds'])} ({', '.join(map(rel, bound['manifests']))}): all MATCH, the two runs identical; "
@@ -434,6 +459,13 @@ if lsp:
               f"{lsp['crash']} crash, {lsp['timeout']} timeout.")
 else:
     missing.append('LSP oracle (candidate.sh side)')
+if gate and gate.get('failing'):
+    ev.append('Gate FAIL items: ' + '; '.join(f"{f['id']}: {f['detail']}" for f in gate['failing']) + '.')
+if quality:
+    ev.append(f"Quality on the source: rustfmt exit {quality['rustfmtExit']}, clippy exit {quality['clippyExit']}, "
+              f"{quality['tsGoportWarnings']} ts_goport warnings, fingerprint unchanged {quality['fingerprintUnchanged']}.")
+else:
+    missing.append('quality: rustfmt and clippy (candidate.sh side)')
 pin = (b.get('upstreamPin') or {}).get('to')
 head = (f"Batch {b['id']}, revision {rev}, source fingerprint {b['sourceFingerprint']} "
         f"({b['checkout']} commit {b['commit']}, crates tree {git('rev-parse', 'HEAD:crates')[:12]}; roster fingerprint {row.get('rosterFingerprint') or 'not recorded'}), "
@@ -472,7 +504,7 @@ while (($#)); do
     --origin) ORIGIN=${2:?--origin needs a value}; shift 2 ;;
     --resume) RESUME=${2:?--resume needs a value}; shift 2 ;;
     --checkout) CHECKOUT=${2:?--checkout needs a value}; shift 2 ;;
-    --gate-host) HOST=${2:?--gate-host needs a value}; shift 2 ;;
+    --gate-host) HOST=${2:?--gate-host needs a value}; [[ $HOST != auto ]] || die "--gate-host auto is not supported (sync-pin and fetch need one host); pick a free one with remote.sh status"; shift 2 ;;
     --*) die "unknown option $1" ;;
     *) args+=("$1"); shift ;;
   esac

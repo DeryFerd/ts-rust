@@ -17,6 +17,7 @@ mod core;
 mod diagnostics;
 mod fswatch_eventlist;
 mod fswatch_fallback;
+mod fswatch_n;
 mod fswatch_walkdir;
 mod fswatch_watcher;
 mod jsnum;

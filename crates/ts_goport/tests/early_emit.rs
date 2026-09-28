@@ -1,10 +1,9 @@
-//! The early emit of `tsc -p` with an incremental program
-//! (`execute::incremental::Program::start_check_and_emit`). Each checker gets
-//! its emit jobs right behind its check job, so it emits when its own check
-//! ends and the emit pool runs during the check. The outputs, the build
-//! info, stdout and the exit code must be the same as with
-//! `GOPORT_EARLY_EMIT=0`, which keeps Go's barrier (the emit starts after
-//! the whole check).
+//! The early emit of `tsc -p` and `tsc -b` with an incremental program
+//! (`execute::incremental::Program::start_emit`). Each checker gets its emit
+//! jobs right behind its check job, so it emits when its own check ends and
+//! the emit pool runs during the check. The outputs, the build info, stdout
+//! and the exit code must be the same as with `GOPORT_EARLY_EMIT=0`, which
+//! keeps Go's barrier (the emit starts after the whole check).
 //!
 //! The fixture is `fixtures/emit_pool`: 4 program files and the es2020 lib
 //! files, so 4 checkers get files. With declarations the JS parts of
@@ -79,15 +78,57 @@ fn early_emit_writes_what_the_barrier_writes() {
         );
         assert!(
             barrier.files.contains_key("tsconfig.tsbuildinfo")
-                && barrier
-                    .files
-                    .keys()
-                    .any(|name| name.ends_with(".js") || name.ends_with(".d.ts")),
+                && barrier.files.keys().any(|name| std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|e| e == "js")
+                    || name.ends_with(".d.ts")),
             "{case}: the run must write outputs and build info: {:?}",
             barrier.files.keys()
         );
         assert_eq!(early, barrier, "{case}: the early emit against the barrier");
     }
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+#[test]
+fn build_early_emit_writes_what_the_barrier_writes() {
+    let root = scratch_dir();
+    let out = root.join("out");
+    // The fixture as a composite project, with its outputs and build info
+    // in the scratch dir. The base config's `include` and `rootDir` stay
+    // relative to the fixture.
+    let config = root.join("tsconfig.json");
+    let text = format!(
+        r#"{{
+  "extends": "{FIXTURE}/tsconfig.json",
+  "compilerOptions": {{
+    "composite": true,
+    "outDir": "{out}",
+    "tsBuildInfoFile": "{out}/tsconfig.tsbuildinfo"
+  }}
+}}
+"#,
+        out = out.display()
+    );
+    fs::write(&config, text).unwrap_or_else(|error| panic!("write {}: {error}", config.display()));
+    let barrier = tsgo_build(&config, &out, false);
+    let early = tsgo_build(&config, &out, true);
+    assert_eq!(
+        barrier.status,
+        Some(0),
+        "the fixture must build without diagnostics, so the check is sent: {}",
+        barrier.stdout
+    );
+    assert!(
+        barrier.files.contains_key("tsconfig.tsbuildinfo")
+            && barrier.files.keys().any(|name| std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "js")
+                || name.ends_with(".d.ts")),
+        "the build must write outputs and build info: {:?}",
+        barrier.files.keys()
+    );
+    assert_eq!(early, barrier, "the early emit against the barrier");
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 
@@ -170,6 +211,32 @@ fn tsgo(out: &Path, extra: &[&str], early: bool) -> Run {
         .env("GOPORT_EARLY_EMIT", if early { "1" } else { "0" })
         .output()
         .expect("run tsgo");
+    let mut files = BTreeMap::new();
+    if out.exists() {
+        read_files(out, out, &mut files);
+    }
+    Run {
+        files,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        status: output.status.code(),
+    }
+}
+
+/// Runs `tsgo -b` on `config`, whose outputs and build info are in `out`.
+/// `early` false sets `GOPORT_EARLY_EMIT=0`. It removes `out` first, so the
+/// project is out of date, and returns what the run wrote there and printed.
+fn tsgo_build(config: &Path, out: &Path, early: bool) -> Run {
+    if out.exists() {
+        fs::remove_dir_all(out).unwrap_or_else(|error| panic!("remove {}: {error}", out.display()));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+        .arg("-b")
+        .arg(config)
+        .args(["--listEmittedFiles", "--pretty", "false"])
+        .env("GOPORT_EMIT_THREADS", "2")
+        .env("GOPORT_EARLY_EMIT", if early { "1" } else { "0" })
+        .output()
+        .expect("run tsgo -b");
     let mut files = BTreeMap::new();
     if out.exists() {
         read_files(out, out, &mut files);

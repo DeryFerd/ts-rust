@@ -2,6 +2,8 @@
 
 use crate::frontend::prelude::*;
 
+use crate::gostd::unicode;
+
 // Go: tspath/path.go:13 Path
 // PORT: Go `type Path string`. A newtype keeps the Go method set
 // (`GetDirectoryPath`, `ContainsPath`, ...). `Deref<Target = str>` and
@@ -49,14 +51,6 @@ const URL_SCHEME_SEPARATOR: &str = "://";
 // PORT: stringutil is not a unit of this wave. These are private copies of
 // the Go functions that tspath calls, so no other unit's names are claimed.
 // ---------------------------------------------------------------------------
-
-// PORT: Go `unicode.ToLower` uses the simple (one rune) mapping. Rust
-// `char::to_lowercase` gives the full mapping. The only rune with a
-// multi-rune full lowercase is U+0130, whose first rune ('i') is also its
-// simple lowercase. So the first rune is the Go result.
-fn simple_to_lower(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
 
 // PORT: simple uppercase. A multi-rune full uppercase (for example U+00DF)
 // has no simple mapping in UnicodeData, so the rune stays the same.
@@ -144,8 +138,8 @@ fn compare_strings_case_insensitive(a: &str, b: &str) -> i32 {
             (None, Some(_)) => return -1,
             (Some(_), None) => return 1,
             (Some(ca), Some(cb)) => {
-                let lca = simple_to_lower(ca);
-                let lcb = simple_to_lower(cb);
+                let lca = unicode::to_lower(ca);
+                let lcb = unicode::to_lower(cb);
                 if lca != lcb {
                     if lca < lcb {
                         return -1;
@@ -852,7 +846,7 @@ pub fn to_file_name_lower_case(file_name: &str) -> String {
         if r == I_WITH_DOT {
             r
         } else {
-            simple_to_lower(r)
+            unicode::to_lower(r)
         }
     })
 }

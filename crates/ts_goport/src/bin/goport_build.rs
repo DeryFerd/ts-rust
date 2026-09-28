@@ -74,12 +74,21 @@ fn main() {
 /// values. jemalloc gets `JEMALLOC_CONF`. With glibc malloc, a build runs
 /// about 20 threads per program, so `arena_max` is 16 here
 /// (`ThreadBudget::WIDE`). The variable stays set, so the exec runs once.
+/// A jemalloc build with `JEMALLOC_CONF` built in does not exec.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        // A build with `JEMALLOC_CONF` built into jemalloc
+        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
+        // needs no exec: jemalloc reads it at its start, and
+        // `_RJEM_MALLOC_CONF` still overrides it.
+        #[cfg(feature = "jemalloc")]
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
+            return;
+        }
         #[cfg(not(feature = "jemalloc"))]
         let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]

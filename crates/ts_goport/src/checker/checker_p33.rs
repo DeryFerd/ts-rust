@@ -409,7 +409,7 @@ impl Checker {
                         } else {
                             0
                         };
-                    debug_assert!(index >= 0);
+                    go_assert!(index >= 0);
                     // A parameter declaration decorator will have three arguments (see `ParameterDecorator` in
                     // core.d.ts).
                     let target_type;

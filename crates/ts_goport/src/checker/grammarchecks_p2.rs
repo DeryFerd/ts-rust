@@ -491,7 +491,7 @@ impl Checker {
                         if containing_func.is_some()
                             && containing_func.kind() != SyntaxKind::Constructor
                         {
-                            debug_assert!(
+                            go_assert!(
                                 !get_function_flags(containing_func)
                                     .intersects(FunctionFlags::ASYNC),
                                 "Enclosing function should never be an async function."

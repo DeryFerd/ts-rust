@@ -3,6 +3,7 @@ use crate::ls::lsutil::prelude::*;
 use crate::frontend::core_nodemodules::{
     EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES, node_core_modules,
 };
+use crate::gostd::unicode;
 
 // Port of Go `ls/lsutil/utilities.go`.
 
@@ -175,7 +176,7 @@ pub fn module_specifier_to_valid_identifier(
     let base_name_runes: Vec<char> = base_name.chars().collect();
     if !base_name_runes.is_empty() && is_identifier_start(base_name_runes[0]) {
         if force_capitalize {
-            res.push(unicode_to_upper(base_name_runes[0]));
+            res.push(unicode::to_upper(base_name_runes[0]));
         } else {
             res.push(base_name_runes[0]);
         }
@@ -187,7 +188,7 @@ pub fn module_specifier_to_valid_identifier(
         let is_valid = is_identifier_part(rune);
         if is_valid {
             if !last_char_was_valid {
-                res.push(unicode_to_upper(rune));
+                res.push(unicode::to_upper(rune));
             } else {
                 res.push(rune);
             }
@@ -206,17 +207,4 @@ pub fn module_specifier_to_valid_identifier(
 // Go: ls/lsutil/utilities.go:155 IsNonContextualKeyword
 pub fn is_non_contextual_keyword(token: SyntaxKind) -> bool {
     is_keyword_kind(token) && !is_contextual_keyword(token)
-}
-
-// PORT: Go `unicode.ToUpper` uses the simple (one rune) mapping. Rust only
-// has the full mapping; a mapping to more than one char has no simple form,
-// so the rune stays the same. (A rune whose full mapping has several chars
-// but whose simple mapping differs, such as U+1FB3, stays unchanged here
-// while Go maps it.)
-fn unicode_to_upper(r: char) -> char {
-    let mut upper = r.to_uppercase();
-    match (upper.next(), upper.next()) {
-        (Some(single), None) => single,
-        _ => r,
-    }
 }
