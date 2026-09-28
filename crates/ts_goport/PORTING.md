@@ -208,6 +208,15 @@ methods reach the AST through it.
   only, loads it once with `parsed_node_data` for the `_in` reads
   (`data_accessor!`). `Node::bind()` returns the binder data by value, and
   the text of a synthetic node is interned (`Name`).
+- Synthetic node owners (`ast/synthetic.rs`): on the language server
+  dispatch thread, each program version owns the synthetic nodes, lists
+  and data writes made while it is current, and its release frees them
+  (`open_synthetic_owner`, `free_synthetic_owner`). A freed handle panics
+  on read and is never given to another node. Code whose synthetic nodes
+  a cache keeps across program versions (token cache, lazy JSDoc, parses,
+  files published outside a program) opens `enter_base_synthetic_owner()`
+  so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
+  off.
 - Store columns and the other registry tables of a published file are read
   through one file lookup (`frozen_of` in `ast/store.rs`), not
   `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
@@ -598,9 +607,10 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   `ls.enter_program()` for each. A checker from a pool of its own gets its
   guard with `ProgramGuard::with_release`.
 - Release: `ls_program::release_program(p)` is Go's program drop (the
-  snapshot `programCounter.Deref`). It frees the checker pools of `p` and
-  its program version now, or when the last guard of `p` drops. The
-  `NewProgram`, the `GoProgram` shell and the file versions stay leaked
+  snapshot `programCounter.Deref`). It frees the checker pools of `p`, its
+  program version and the synthetic nodes that the dispatch thread made
+  while the version was current, now or when the last guard of `p` drops.
+  The `NewProgram`, the `GoProgram` shell and the file versions stay leaked
   (multi-program M2, M3).
 - Go `*ast.SourceFile` is `Node` (the file root). An `Rc<ParsedSourceFile>`
   from a `NewProgram` method becomes `file.root`.

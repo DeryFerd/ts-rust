@@ -3,10 +3,12 @@
 
 use std::rc::Rc;
 
+use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::lsp::lsproto;
+use ts_goport::program::ls_program;
 use ts_goport::project::{ProgramUpdateKind, Session};
 
-use super::projecttestutil::{FileMap, files};
+use super::projecttestutil::{FileMap, files, with_request_id};
 use super::util::*;
 
 // Go: snapshot_test.go:21 setup
@@ -197,5 +199,60 @@ child_test! {
 
         session.did_change_file(&bg(), &uri(other_uri), 2, &[whole("export const other = 2;")]);
         let _ = language_service(&session, other_uri);
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (the GC frees the nodes). A released program
+    // version frees the synthetic nodes that the dispatch thread made for
+    // it. Declaration diagnostics make node builder nodes for each version,
+    // and the live synthetic slots stay flat across edits.
+    fn released_program_frees_its_synthetic_nodes() {
+        let file = "/home/projects/TS/p1/index.ts";
+        let file_uri = "file:///home/projects/TS/p1/index.ts";
+        let props: String = (0..80).map(|i| format!("p{i}: {i}, ")).collect();
+        let text = format!(
+            "function make() {{ return {{ {props}}}; }}\n\
+             export const lsMix0 = make();\n\
+             export const lsMix1 = class {{ private p = 12; }};\n"
+        );
+        let session = setup(files(&[
+            ("/home/projects/TS/p1/tsconfig.json", r#"{ "compilerOptions": { "declaration": true } }"#),
+            (file, text.as_str()),
+        ]));
+        open(&session, file_uri, &text);
+        // Code, start and end of the declaration diagnostics of the file.
+        let declaration_diagnostics = |p: &'static NewProgram| -> Vec<(i32, i32, i32)> {
+            let root = p.get_source_file(file).expect("index.ts is in the program").root;
+            ls_program::get_declaration_diagnostics(p, &with_request_id(&bg()), root)
+                .iter()
+                .map(|d| (d.code, d.pos, d.end))
+                .collect()
+        };
+        let live = ts_goport::ast::synthetic_live_slot_count;
+
+        let p1 = program(&session, file_uri);
+        let before = live();
+        let first = declaration_diagnostics(p1);
+        let made = live() - before;
+        // TS4094: the private member of the exported class expression.
+        assert!(first.iter().any(|&(code, _, _)| code == 4094), "{first:?}");
+
+        // Each edit makes a new program version, and the snapshot update
+        // releases the one before. An edit after the last line keeps the
+        // diagnostic positions.
+        let end_line = text.lines().count() as u32;
+        let mut live_after_release = Vec::new();
+        for version in 2..=5 {
+            edit(&session, file_uri, version, (end_line, 0), (end_line, 0), "\n");
+            let p = program(&session, file_uri);
+            live_after_release.push(live());
+            assert_eq!(declaration_diagnostics(p), first);
+        }
+        let growth = live_after_release[3].saturating_sub(live_after_release[0]);
+        assert!(
+            growth < made / 2,
+            "live synthetic slots grew by {growth} over 3 released versions, one version made {made}: {live_after_release:?}"
+        );
     }
 }

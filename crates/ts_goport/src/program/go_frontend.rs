@@ -307,6 +307,8 @@ pub(super) fn publish_parsed_files(cwd: &str) {
 /// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
 /// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
 fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
+    // The cache outlives program versions, so the nodes belong to the thread.
+    let _base = crate::ast::enter_base_synthetic_owner();
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
