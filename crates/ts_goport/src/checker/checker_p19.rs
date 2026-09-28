@@ -2240,8 +2240,10 @@ mod key_hash_tests {
     /// `KeyBuilder` hashes the bytes it was given, in order, for keys that
     /// stay inline and keys that spill past the inline buffer. The short
     /// `get_type_list_key` paths hash the same bytes as the builder.
+    /// The test keeps its accepted name from before tsgo#4784 renamed
+    /// `KeyHasher` to `KeyBuilder`.
     #[test]
-    fn key_builder_and_short_keys_match_bytes() {
+    fn key_hasher_and_short_keys_match_bytes() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
             x ^= x << 13;
