@@ -7,9 +7,10 @@
 use crate::prelude::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::emitter::{EmitOnly, Emitter, js_emit_needs_checker};
+use crate::frontend::tspath::{Path, has_extension, path_is_relative, to_path};
 use crate::sourcemap::generator::RawSourceMap;
 
 // Go: compiler/program.go:1600 WriteFileData
@@ -67,7 +68,7 @@ pub struct SourceMapEmitResult {
 // resolver reaches that checker there), and the results combine in file
 // order. Each emit makes its own text writer. When the emit pool is on
 // (`program::emit_pool_enabled`), the JS part of a file whose transforms
-// make no checker call runs on the pool instead (`emit_files_with_pool`).
+// make no checker call runs on the pool instead (`start_emit_files_with_pool`).
 pub fn emit(options: EmitOptions) -> EmitResult {
     emit_with(options, |emit_file| emit_file())
 }
@@ -93,7 +94,9 @@ pub fn emit_with(
     );
     let emit_only = options.emit_only;
     let write_file = options.write_file.clone();
-    let pooled = emit_files_with_pool(&source_files, |_| (emit_only, write_file.clone()), wrap);
+    let pooled =
+        start_emit_files_with_pool(&source_files, |_| (emit_only, write_file.clone()), wrap)
+            .map(PendingPoolEmit::wait);
     let results = match pooled {
         Some(results) => results,
         None => run_emit_jobs(source_files, move |source_file| {
@@ -107,7 +110,12 @@ pub fn emit_with(
 
 /// `emit` for many targets at once, one result per target in input order.
 pub fn emit_batch(targets: Vec<EmitOptions>) -> Vec<EmitResult> {
-    emit_batch_with(targets, |emit_file| emit_file())
+    start_emit_batch(targets).wait()
+}
+
+/// `emit_batch` without the wait (`start_emit_batch_with`).
+pub fn start_emit_batch(targets: Vec<EmitOptions>) -> PendingEmitBatch {
+    start_emit_batch_with(targets, |emit_file| emit_file())
 }
 
 /// `emit_with` for many targets at once, one result per target in input
@@ -127,11 +135,75 @@ pub fn emit_batch_with(
     targets: Vec<EmitOptions>,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> Vec<EmitResult> {
-    if options().no_emit_on_error.is_true() {
-        return targets
+    start_emit_batch_with(targets, wrap).wait()
+}
+
+/// An `emit_batch_with` whose jobs are sent and not waited for yet
+/// (`start_emit_batch_with`).
+pub struct PendingEmitBatch(PendingBatch);
+
+enum PendingBatch {
+    /// `noEmitOnError`: every target emitted before the start returned, one
+    /// result per target.
+    Done(Vec<EmitResult>),
+    /// The jobs of the files, and for each target whether it has a file.
+    Sent {
+        has_file: Vec<bool>,
+        files: PendingFiles,
+    },
+}
+
+/// The jobs of the files of a batch, one result per file in file order.
+enum PendingFiles {
+    Pool(PendingPoolEmit),
+    Checkers(PendingCheckerJobs<EmitResult>),
+}
+
+impl PendingEmitBatch {
+    /// Waits for every job and returns one result per target, in target
+    /// order: the result of `emit_batch_with`.
+    #[must_use]
+    pub fn wait(self) -> Vec<EmitResult> {
+        let (has_file, files) = match self.0 {
+            PendingBatch::Done(results) => return results,
+            PendingBatch::Sent { has_file, files } => (has_file, files),
+        };
+        let mut results = match files {
+            PendingFiles::Pool(pool) => pool.wait(),
+            PendingFiles::Checkers(jobs) => jobs.wait(),
+        }
+        .into_iter();
+
+        // `combine_emit_results` of one result is that result.
+        has_file
             .into_iter()
-            .map(|target| emit_with(target, wrap))
-            .collect();
+            .map(|has_file| {
+                if has_file {
+                    results.next().expect("one emit result per batch file")
+                } else {
+                    combine_emit_results(Vec::new())
+                }
+            })
+            .collect()
+    }
+}
+
+/// The first half of `emit_batch_with`: sends the jobs of every target to
+/// the emit pool and the checker threads, and returns without waiting.
+/// Each checker thread runs them after the jobs sent to it before (the
+/// early emit: `execute::incremental::Program::start_check_and_emit`).
+/// With `noEmitOnError` it emits every target before it returns.
+pub fn start_emit_batch_with(
+    targets: Vec<EmitOptions>,
+    wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
+) -> PendingEmitBatch {
+    if options().no_emit_on_error.is_true() {
+        return PendingEmitBatch(PendingBatch::Done(
+            targets
+                .into_iter()
+                .map(|target| emit_with(target, wrap))
+                .collect(),
+        ));
     }
 
     // Without `noEmitOnError`, `handle_no_emit_on_error` returns None, so
@@ -167,33 +239,147 @@ pub fn emit_batch_with(
     // batch replaces, so each checker does the same work in the same order.
     // With the pool, no trace is written (`emit_pool_enabled`), so there is
     // no trace event per target.
-    let pooled = emit_files_with_pool(&files, |file| file_targets[&file].clone(), wrap);
-    let mut results = match pooled {
-        Some(results) => results,
+    let pooled = start_emit_files_with_pool(&files, |file| file_targets[&file].clone(), wrap);
+    let jobs = match pooled {
+        Some(pool) => PendingFiles::Pool(pool),
         None => {
             // The closure gets only the file, so it finds the file's target here.
             let file_targets = Arc::new(file_targets);
-            run_on_checker_threads_for_files(&files, move |source_file| {
-                // One Go `Program.Emit` trace event per target, on the emit thread.
-                let _trace = trace_emit();
-                let (emit_only, write_file) = &file_targets[&source_file];
-                wrap(&|| emit_source_file(source_file, *emit_only, write_file.clone()))
-            })
+            PendingFiles::Checkers(send_on_checker_threads_for_files(
+                &files,
+                move |source_file| {
+                    // One Go `Program.Emit` trace event per target, on the emit thread.
+                    let _trace = trace_emit();
+                    let (emit_only, write_file) = &file_targets[&source_file];
+                    wrap(&|| emit_source_file(source_file, *emit_only, write_file.clone()))
+                },
+            ))
         }
-    }
-    .into_iter();
+    };
+    PendingEmitBatch(PendingBatch::Sent {
+        has_file,
+        files: jobs,
+    })
+}
 
-    // `combine_emit_results` of one result is that result.
-    has_file
+/// PORT: not in Go (perf). True when `tsc -p` with an incremental program
+/// may send the emit of the current program right behind its check
+/// (`execute::incremental::Program::start_check_and_emit`): each checker
+/// then emits when its own check ends, and the emit pool runs during the
+/// check. Go waits for the whole check before it emits. Each checker still
+/// gets the same jobs in the same order, and all state that emit writes is
+/// per thread, per checker, per emit, loading thread only or a pure cache,
+/// except the file system: a check can probe files, and the emit writes
+/// files and makes directories. Go never lets a check see the outputs of
+/// this emit. These rules keep every check-time probe away from them
+/// (perf10 `design.md` section 4):
+///
+/// - F1: the module resolution is not node16 or nodenext, or no checked
+///   file has a relative module name without an extension (imports, module
+///   augmentations, synthetic imports). This removes every import extension
+///   probe (`Checker::get_suggested_import_extension`, TS2834 and TS2835).
+/// - F2: no program file is inside `outDir` or `declarationDir`.
+/// - F3: neither has a `node_modules` path segment. F2 and F3 keep the
+///   probes for module specifiers in type text (`modulespecifiers::host`
+///   `get_package_json_info_for_directory` and `resolve_package_directory`,
+///   `modulespecifiers::util::try_get_any_file_from_path`) away from the
+///   outputs and the directories that the emit makes.
+/// - F4: `preserveSymlinks` is off, so the program file paths of F2 are the
+///   paths that the probes reach.
+/// - No `outFile`.
+///
+/// A new file system read on a checker thread must be added to this list
+/// and to the rules. The rules are in two parts: the options
+/// (`early_emit_options_allow`, which also covers F4 and `outFile`) and the
+/// program files (`check_cannot_see_outputs`, F1 to F3). Loading thread
+/// only.
+#[must_use]
+pub fn emit_can_start_with_check() -> bool {
+    early_emit_options_allow() && check_cannot_see_outputs()
+}
+
+/// The option part of `emit_can_start_with_check`. False with `noEmit`,
+/// `noEmitOnError` (the emit needs every diagnostic first),
+/// `--singleThreaded`, a trace, `preserveSymlinks` (F4), `outFile`, and
+/// `GOPORT_EARLY_EMIT=0`. Then `tsc -p` keeps Go's order exactly: it does
+/// not start the check early either.
+#[must_use]
+pub fn early_emit_options_allow() -> bool {
+    let options = options();
+    early_emit_enabled()
+        && !options.no_emit.is_true()
+        && !options.no_emit_on_error.is_true()
+        && !single_threaded()
+        && crate::tracing::get().is_none()
+        && !options.preserve_symlinks.is_true()
+        && options.out_file.is_empty()
+}
+
+/// The program file part of `emit_can_start_with_check`: F1, F2 and F3.
+/// It reads every program file, so `start_check_and_emit` runs it after it
+/// sent the check.
+#[must_use]
+pub fn check_cannot_see_outputs() -> bool {
+    let options = options();
+    let output_dirs: Vec<Path> = [&options.out_dir, &options.declaration_dir]
         .into_iter()
-        .map(|has_file| {
-            if has_file {
-                results.next().expect("one emit result per batch file")
-            } else {
-                combine_emit_results(Vec::new())
-            }
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| {
+            to_path(
+                dir,
+                get_current_directory(),
+                use_case_sensitive_file_names(),
+            )
         })
-        .collect()
+        .collect();
+    // F3
+    if output_dirs
+        .iter()
+        .any(|dir| dir.0.split('/').any(|part| part == "node_modules"))
+    {
+        return false;
+    }
+    // F2
+    let files = source_files();
+    if !output_dirs.is_empty()
+        && files.iter().any(|&file| {
+            let path = Path(source_file_info(file).path.clone());
+            output_dirs.iter().any(|dir| dir.contains_path(&path))
+        })
+    {
+        return false;
+    }
+    // F1
+    let resolution = options.get_module_resolution_kind();
+    if resolution != ModuleResolutionKind::NODE16 && resolution != ModuleResolutionKind::NODE_NEXT {
+        return true;
+    }
+    !files.into_iter().any(|file| {
+        if skip_type_checking(file, false) {
+            return false;
+        }
+        let info = source_file_info(file);
+        let synthetic = [
+            get_import_helpers_import_specifier(&info.path),
+            get_jsx_runtime_import_specifier(&info.path).1,
+        ];
+        info.imports
+            .iter()
+            .chain(&info.module_augmentations)
+            .chain(synthetic.iter().filter(|name| name.is_some()))
+            .any(|name| {
+                let name = name.text();
+                path_is_relative(name) && !has_extension(name)
+            })
+    })
+}
+
+/// False when `GOPORT_EARLY_EMIT` is `0`: the emit then waits for the whole
+/// check, as in Go (`emit_can_start_with_check`). For tests and timing on
+/// one binary. Read once.
+fn early_emit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GOPORT_EARLY_EMIT").as_deref() != Ok("0"))
 }
 
 /// Go `tr.Push(tracing.PhaseEmit, "emit", nil, true)` at the start of
@@ -263,7 +449,7 @@ fn file_emit(source_file: Node, emit_only: EmitOnly) -> FileEmit {
 }
 
 /// The part of one file's emit that runs on its checker thread when the
-/// emit pool is on (`emit_files_with_pool`).
+/// emit pool is on (`start_emit_files_with_pool`).
 struct CheckerPart {
     emit_only: EmitOnly,
     write_file: Option<WriteFile>,
@@ -272,10 +458,10 @@ struct CheckerPart {
     js_part: Option<EmitPoolJob<EmitResult>>,
 }
 
-/// PORT: not in Go. `emit_with` and `emit_batch_with` of `files` (each
-/// with its `target`: `emit_only` and `write_file`) with the emit pool, one
-/// result per file in file order. None, before any work, when the pool is
-/// off (`emit_pool_enabled`) or would get no file: the caller then runs
+/// PORT: not in Go. Starts `emit_with` and `emit_batch_with` of `files`
+/// (each with its `target`: `emit_only` and `write_file`) with the emit
+/// pool, and returns without waiting. None, before any work, when the pool
+/// is off (`emit_pool_enabled`) or would get no file: the caller then runs
 /// every file on its checker thread as before.
 ///
 /// First the JS part of each file that `file_emit` moves goes to the emit
@@ -285,11 +471,11 @@ struct CheckerPart {
 /// checker calls in the same order. The JS part makes no checker call.
 /// A d.ts part waits for its JS part before it writes (`Emitter::js_part`),
 /// so the outputs of a file are written in Go's order.
-fn emit_files_with_pool(
+fn start_emit_files_with_pool(
     files: &[Node],
     target: impl Fn(Node) -> (EmitOnly, Option<WriteFile>),
     wrap: Wrap,
-) -> Option<Vec<EmitResult>> {
+) -> Option<PendingPoolEmit> {
     if files.is_empty() || !emit_pool_enabled() {
         return None;
     }
@@ -344,8 +530,8 @@ fn emit_files_with_pool(
 
     // The closure gets only the file, so it takes the file's part here.
     let checker_parts = Mutex::new(checker_parts);
-    let checker_results = catch_unwind(AssertUnwindSafe(|| {
-        run_on_checker_threads_for_files(&checker_files, move |source_file| {
+    let checker = catch_unwind(AssertUnwindSafe(|| {
+        send_on_checker_threads_for_files(&checker_files, move |source_file| {
             let part = checker_parts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -359,24 +545,48 @@ fn emit_files_with_pool(
             }
         })
     }));
-    // Every pool job ends before a panic goes on.
-    let on_pool: Vec<(usize, std::thread::Result<EmitResult>)> = on_pool
-        .into_iter()
-        .map(|(index, job)| (index, job.join()))
-        .collect();
-    let mut checker_results = checker_results
-        .unwrap_or_else(|payload| resume_unwind(payload))
-        .into_iter();
-    let mut on_pool = on_pool.into_iter().peekable();
-    let results = (0..files.len())
-        .map(
-            |index| match on_pool.next_if(|(pool_index, _)| *pool_index == index) {
-                Some((_, result)) => result.unwrap_or_else(|payload| resume_unwind(payload)),
-                None => checker_results.next().expect("one result per checker file"),
-            },
-        )
-        .collect();
-    Some(results)
+    Some(PendingPoolEmit {
+        file_count: files.len(),
+        checker,
+        on_pool,
+    })
+}
+
+/// The jobs that `start_emit_files_with_pool` sent.
+struct PendingPoolEmit {
+    file_count: usize,
+    /// The checker thread jobs, or the payload of a panic while they were
+    /// sent.
+    checker: std::thread::Result<PendingCheckerJobs<EmitResult>>,
+    /// The files whose whole emit runs on the pool, by file position.
+    on_pool: Vec<(usize, EmitPoolJob<EmitResult>)>,
+}
+
+impl PendingPoolEmit {
+    /// Waits for every job and returns one result per file, in file order.
+    /// Every pool job ends before a panic goes on.
+    fn wait(self) -> Vec<EmitResult> {
+        let checker_results = self
+            .checker
+            .and_then(|jobs| catch_unwind(AssertUnwindSafe(|| jobs.wait())));
+        let on_pool: Vec<(usize, std::thread::Result<EmitResult>)> = self
+            .on_pool
+            .into_iter()
+            .map(|(index, job)| (index, job.join()))
+            .collect();
+        let mut checker_results = checker_results
+            .unwrap_or_else(|payload| resume_unwind(payload))
+            .into_iter();
+        let mut on_pool = on_pool.into_iter().peekable();
+        (0..self.file_count)
+            .map(
+                |index| match on_pool.next_if(|(pool_index, _)| *pool_index == index) {
+                    Some((_, result)) => result.unwrap_or_else(|payload| resume_unwind(payload)),
+                    None => checker_results.next().expect("one result per checker file"),
+                },
+            )
+            .collect()
+    }
 }
 
 /// The JS part of a file's emit when the d.ts part runs on the checker
