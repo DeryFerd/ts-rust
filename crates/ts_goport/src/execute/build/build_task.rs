@@ -451,6 +451,17 @@ impl BuildTask {
             .copied()
             .unwrap_or_default();
         compile_times.borrow_mut().config_time = config_time;
+        // PORT: perf, as `tsc -p` does: the parse of the default lib files
+        // starts before the build info read and the program load. Only for
+        // a program that loads while the build host caches no parse (the
+        // first one of a build cycle): later programs take the lib files
+        // from that cache, and the workers would parse them for nothing.
+        let mut host_has_parses = false;
+        host.source_files
+            .for_each_stored(|_| host_has_parses = true);
+        if !host_has_parses {
+            crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
+        }
         let build_info_read_start = sys.now();
         let mut old_program = None;
         if !command.build_options.force.is_true() {
