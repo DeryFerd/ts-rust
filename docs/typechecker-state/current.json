@@ -3,7 +3,7 @@
   "status": "active",
   "decision": "REVIEW",
   "updated": "2026-09-28T11:51:22.621646+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-13 accepted at R125. Batch recovery-continuation-go-checker-port-14 opened at R126.",
+  "reason": "R126 measured: auditor PASS, reviewer STOP (clippy missing); clippy then showed 1 warning in a test. Not accepted; R127 = R126 + the test fix.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -581,7 +581,23 @@
     "runtimeAuthorized": true,
     "expectedCompilerRecoveries": [],
     "expectationUpdates": [],
-    "verdictHistory": [],
+    "verdictHistory": [
+      {
+        "revision": 126,
+        "role": "audit_accepted_roster",
+        "agent": "aae6dbb734c07335a",
+        "verdict": "PASS",
+        "sourceFingerprint": "11aa77dbf47551b11c98e118f4c0a1bfaff916a698fa3da1c19d10beca483bca"
+      },
+      {
+        "revision": 126,
+        "role": "independent_reviewer",
+        "agent": "a0bc38f3370585da3",
+        "verdict": "STOP",
+        "sourceFingerprint": "11aa77dbf47551b11c98e118f4c0a1bfaff916a698fa3da1c19d10beca483bca",
+        "note": "clippy not run on this source"
+      }
+    ],
     "focusedResults": [],
     "runtimeToolHandles": [],
     "commands": [],
@@ -616,7 +632,17 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R126 pipeline."
+    "nextPermittedAction": "Run the R126 pipeline.",
+    "openDefects": [
+      {
+        "id": "lsp-sigsegv-alvin-r125",
+        "status": "open, not seen since (0 of 4,869 gdb sessions in int12 p1, p2, ata; per-request threads removed)"
+      },
+      {
+        "id": "editor-long-growth",
+        "status": "open: editor/query-core/long growth 1.40 MiB/edit, limit 1.00 (R125 5.38); fix = free language server program shells and file versions per edit (docs/goport-next.md)"
+      }
+    ]
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
