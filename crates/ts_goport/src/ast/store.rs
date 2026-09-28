@@ -3145,18 +3145,14 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
 // ──────────────────────────────────────────────────────────────────────
 
 thread_local! {
-    /// The size of the first chunk of this thread's AST arena
-    /// (`set_ast_arena_start`).
-    static AST_ARENA_START: Cell<usize> = const { Cell::new(1 << 20) };
-    /// Set when this thread made its AST arena.
-    static AST_ARENA_MADE: Cell<bool> = const { Cell::new(false) };
-    /// AST nodes and lists live for the whole process. One leaked bump
-    /// arena per thread holds them, so each node costs a pointer bump, not
-    /// a malloc. The arena never drops, like the `Box::leak` it replaces.
-    static AST_ARENA: &'static bumpalo::Bump = {
-        AST_ARENA_MADE.set(true);
-        Box::leak(Box::new(bumpalo::Bump::with_capacity(AST_ARENA_START.get())))
-    };
+    /// Parsed AST nodes and lists live for the whole process. One leaked
+    /// bump arena per parsing thread holds them, so each node costs a
+    /// pointer bump, not a malloc. The arena never drops, like the
+    /// `Box::leak` it replaces. Synthetic nodes are not here: the synthetic
+    /// arena (`ast/synthetic.rs`) owns them, so checker workers make no AST
+    /// arena.
+    static AST_ARENA: &'static bumpalo::Bump =
+        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
 }
 
 /// Moves `value` into this thread's leaked AST arena.
@@ -3165,25 +3161,6 @@ thread_local! {
 pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
     let arena: &'static bumpalo::Bump = AST_ARENA.with(|a| *a);
     arena.alloc(value)
-}
-
-/// Sets the size of the first chunk of this thread's AST arena (1 MiB by
-/// default). Later chunks double in size. Call it before the thread makes
-/// its first node. A released program leaks the arenas of its checker
-/// workers, and the part of a chunk that no node uses leaks with them, so
-/// the workers of a later program version size the chunk from what the
-/// workers of a released one used (`program.rs` `worker_arena_start`).
-pub(crate) fn set_ast_arena_start(bytes: usize) {
-    AST_ARENA_START.set(bytes);
-}
-
-/// The bytes that the nodes of this thread's AST arena use, or 0 when the
-/// thread made no arena (asking does not make one).
-pub(crate) fn ast_arena_used() -> usize {
-    if !AST_ARENA_MADE.get() {
-        return 0;
-    }
-    AST_ARENA.with(|arena| arena.allocated_bytes() - arena.chunk_capacity())
 }
 
 /// A ts_ast node with kind `kind` and data `data`. Only kind and data are

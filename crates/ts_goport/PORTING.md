@@ -192,17 +192,22 @@ methods reach the AST through it.
   `to_vec()`; empty when nil). `NodeList` has `.nodes() -> NodeSlice`,
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
-- `NodeList`, `ModifierList` and `NodeSlice` are Copy structs defined in
-  `ast/node.rs` (for example `{ file: u32, list: Option<&'static ts_ast::NodeList> }`).
+- `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
+  `ast/node.rs`. A list of parsed data points at its ts_ast list (it lives
+  for the process). A list of synthetic data is an index into the thread's
+  synthetic arena (`SyntheticList`), so it is valid only on the thread
+  that made it, like a synthetic `Node`. Equality is Go pointer equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
-- Node data reads are scoped, so that a thread can later free its
-  synthetic nodes (`ast/synthetic.rs`). Read a field with `by_data!`,
-  `with_data!` or `with_ast_data(n, |d| ...)`, and a list field with
-  `list_of!` or `modifiers_of!` (`list_by_data!` in `node.rs`). Nothing
-  returns a reference into node data. Only parsed data is `&'static`
-  (`static_ast_node`): the binder, which binds parsed nodes only, loads it
-  once with `parsed_node_data` for the `_in` reads (`data_accessor!`).
+- Node data reads are scoped, because a thread owns its synthetic nodes
+  and frees them when its program is released (`ast/synthetic.rs`). Read
+  a field with `by_data!`, `with_data!` or `with_ast_data(n, |d| ...)`,
+  and a list field with `list_of!` or `modifiers_of!` (`list_by_data!` in
+  `node.rs`). Nothing returns a reference into node data. Only parsed data
+  is `&'static` (`static_ast_node`): the binder, which binds parsed nodes
+  only, loads it once with `parsed_node_data` for the `_in` reads
+  (`data_accessor!`). `Node::bind()` returns the binder data by value, and
+  the text of a synthetic node is interned (`Name`).
 - Store columns and the other registry tables of a published file are read
   through one file lookup (`frozen_of` in `ast/store.rs`), not
   `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
@@ -226,7 +231,10 @@ The batch that adds it is not accepted until Theo approves.
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
 - `program::release_program` frees the checker pool and the frontend of a
-  version. The program shell and the file versions stay leaked for now.
+  version. Each checker worker frees its checker and the synthetic nodes
+  it made (`free_synthetic_nodes`). The program shell and the file
+  versions stay leaked for now. A one-program process forgets its
+  checkers and their synthetic nodes at the end, like Go.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task

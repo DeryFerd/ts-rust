@@ -419,7 +419,10 @@ pub struct IterationTypesResolver {
 #[derive(Clone, Default)]
 pub struct WideningContext {
     /// Parent context
-    pub parent: Option<Rc<RefCell<WideningContext>>>,
+    // PORT: weak, so a parent and its `child_contexts` do not form an `Rc`
+    // cycle that leaks (Go's GC frees them). A child is only used while its
+    // parent is alive: the widening recursion holds the parent.
+    pub parent: Option<std::rc::Weak<RefCell<WideningContext>>>,
     /// Name of property in parent
     pub property_name: String,
     /// Types of siblings

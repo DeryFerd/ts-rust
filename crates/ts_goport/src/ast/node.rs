@@ -1030,6 +1030,13 @@ static NO_BIND: NodeBindData = NodeBindData {
     added_flags: NodeFlags::NONE,
 };
 
+/// `Node::bind_field` for a factory node.
+#[cold]
+#[inline(never)]
+fn synthetic_bind_field<T>(n: Node, field: impl FnOnce(&NodeBindData) -> T) -> T {
+    field(&synthetic_bind(n))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // core.TextRange (internal/core/text.go)
 // ──────────────────────────────────────────────────────────────────────
@@ -1256,46 +1263,67 @@ fn go_kind(file: usize, id: ts_ast::NodeId, n: &ts_ast::Node) -> SyntaxKind {
 // NodeSlice: Go `[]*Node`
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `[]*Node`. It points either at a ts_ast id list of one file or at a
-/// cached slice of `Node`s. The default value is Go `nil`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NodeSlice {
-    file: u32,
-    ids: &'static [ts_ast::NodeId],
-    nodes: &'static [Node],
+/// Go `[]*Node`. It points at a ts_ast id list of one file, at a slice of
+/// `Node`s that lives for the process, or at a list of this thread's
+/// synthetic arena. The default value is Go `nil`.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSlice(SliceRepr);
+
+#[derive(Clone, Copy, Debug)]
+enum SliceRepr {
+    /// Ts_ast ids in `file`.
+    Ids {
+        file: u32,
+        ids: &'static [ts_ast::NodeId],
+    },
+    /// Nodes that live for the process.
+    Nodes(&'static [Node]),
+    /// The `len` nodes of a list of this thread's synthetic arena.
+    Synthetic { list: SyntheticList, len: u32 },
+}
+
+impl Default for NodeSlice {
+    fn default() -> Self {
+        Self::NIL
+    }
 }
 
 impl NodeSlice {
     /// Go `nil`.
-    pub const NIL: Self = Self {
-        file: 0,
-        ids: &[],
-        nodes: &[],
-    };
+    pub const NIL: Self = Self(SliceRepr::Nodes(&[]));
 
     /// A slice over ts_ast ids in `file`.
     #[must_use]
     pub fn from_ids(file: usize, ids: &'static [ts_ast::NodeId]) -> Self {
-        Self {
+        Self(SliceRepr::Ids {
             file: file as u32,
             ids,
-            nodes: &[],
-        }
+        })
     }
 
     /// A slice over nodes that live for the program.
     #[must_use]
     pub fn from_nodes(nodes: &'static [Node]) -> Self {
-        Self {
-            file: 0,
-            ids: &[],
-            nodes,
-        }
+        Self(SliceRepr::Nodes(nodes))
     }
 
+    /// The nodes of a list of this thread's synthetic arena.
+    #[must_use]
+    pub fn from_synthetic(list: SyntheticList) -> Self {
+        Self(SliceRepr::Synthetic {
+            list,
+            len: synthetic_list_len(list) as u32,
+        })
+    }
+
+    #[inline]
     #[must_use]
     pub fn len(self) -> usize {
-        self.ids.len() + self.nodes.len()
+        match self.0 {
+            SliceRepr::Ids { ids, .. } => ids.len(),
+            SliceRepr::Nodes(nodes) => nodes.len(),
+            SliceRepr::Synthetic { len, .. } => len as usize,
+        }
     }
 
     #[must_use]
@@ -1307,10 +1335,16 @@ impl NodeSlice {
     #[inline]
     #[must_use]
     pub fn get(self, i: usize) -> Node {
-        if self.ids.is_empty() {
-            self.nodes[i]
-        } else {
-            Node::new(self.file as usize, self.ids[i])
+        match self.0 {
+            SliceRepr::Ids { file, ids } => Node::new(file as usize, ids[i]),
+            SliceRepr::Nodes(nodes) => nodes[i],
+            SliceRepr::Synthetic { list, len } => {
+                assert!(
+                    i < len as usize,
+                    "index {i} out of range for a slice of {len}"
+                );
+                synthetic_list_node(list, i)
+            }
         }
     }
 
@@ -1334,13 +1368,15 @@ impl NodeSlice {
 
     #[must_use]
     pub fn iter(self) -> NodeSliceIter {
-        let ids = if self.ids.is_empty() {
-            SliceIds::Nodes
-        } else {
-            match frozen_store_ids(self.file as usize) {
-                Some(ids) => SliceIds::Frozen(ids),
+        let ids = match self.0 {
+            SliceRepr::Nodes(nodes) => SliceIds::Nodes(nodes),
+            // An empty slice reads no node, so it needs no store lookup.
+            SliceRepr::Ids { ids, .. } if ids.is_empty() => SliceIds::Nodes(&[]),
+            SliceRepr::Ids { file, ids } => match frozen_store_ids(file as usize) {
+                Some(frozen) => SliceIds::Frozen(ids, frozen),
                 None => SliceIds::Slow,
-            }
+            },
+            SliceRepr::Synthetic { .. } => SliceIds::Slow,
         };
         NodeSliceIter {
             slice: self,
@@ -1356,15 +1392,20 @@ impl NodeSlice {
     }
 }
 
+// PERF: 24 bytes. The synthetic list is a variant of `SyntheticList`, whose
+// tag and index fit next to the length.
+const _: () = assert!(std::mem::size_of::<NodeSlice>() == 24);
+
 /// How a `NodeSliceIter` turns position `i` into a node, read once for the
 /// whole loop.
 #[derive(Clone, Copy, Debug)]
 enum SliceIds {
-    /// The slice holds nodes (`NodeSlice::from_nodes`), not ids.
-    Nodes,
-    /// Ids of a frozen store (`frozen_store_ids`).
-    Frozen(FrozenIds),
-    /// `Node::new` per id: before freeze, and for synthetic and legacy files.
+    /// The nodes of the slice (`NodeSlice::from_nodes`).
+    Nodes(&'static [Node]),
+    /// The ids of the slice, of a frozen store (`frozen_store_ids`).
+    Frozen(&'static [ts_ast::NodeId], FrozenIds),
+    /// `NodeSlice::get` per node: ids before freeze and of legacy files, and
+    /// synthetic lists.
     Slow,
 }
 
@@ -1385,11 +1426,10 @@ impl NodeSliceIter {
     #[inline]
     fn at(&self, i: usize) -> Node {
         match self.ids {
-            SliceIds::Nodes => self.slice.nodes[i],
-            SliceIds::Frozen(ids) => {
-                let id = self.slice.ids[i];
-                let n = ids.node(id);
-                debug_assert_eq!(n, Node::new(self.slice.file as usize, id));
+            SliceIds::Nodes(nodes) => nodes[i],
+            SliceIds::Frozen(slice_ids, ids) => {
+                let n = ids.node(slice_ids[i]);
+                debug_assert_eq!(n, self.slice.get(i));
                 n
             }
             SliceIds::Slow => self.slice.get(i),
@@ -1454,8 +1494,10 @@ impl IntoIterator for &NodeSlice {
 // PERF: U1 (e). A list that the parser made in a store and that no node
 // data holds yet is a pending handle (`PendingList`): its ids live in the
 // AST bump arena, and `store_list_value` builds the ts_ast list once, in the
-// node data. The handle stays 16 bytes (tag, file, pointer). The checker
-// reads `Ts` handles only; the `Pending` arms are for the parse.
+// node data. The handle stays 16 bytes (tag, file or index, pointer), so it
+// returns in registers; that is why the synthetic lists are variants here,
+// not a nested `SyntheticList`. The checker reads `Ts` handles of parsed
+// data; the `Pending` arms are for the parse.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NodeList(ListRef);
 
@@ -1465,8 +1507,9 @@ enum ListRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A ts_ast list of file `file`: a list field of node data, or a leaked
-    /// list (synthetic lists, lists of the legacy frontend).
+    /// A ts_ast list of parsed data (store or legacy) of file `file`: a list
+    /// field of node data, or a leaked list (lists of the legacy frontend).
+    /// It lives for the process.
     Ts {
         file: u32,
         list: &'static ts_ast::NodeList,
@@ -1476,9 +1519,31 @@ enum ListRef {
         file: u32,
         list: &'static PendingList,
     },
+    /// A list field of synthetic node data (`SyntheticList::Field`).
+    Field { data: u32, sel: ListSel },
+    /// A synthetic factory list (`SyntheticList::Own`).
+    Own { index: u32 },
 }
 
 const _: () = assert!(std::mem::size_of::<NodeList>() == 16);
+
+impl ListRef {
+    fn synthetic(list: SyntheticList) -> Self {
+        match list {
+            SyntheticList::Field { data, sel } => Self::Field { data, sel },
+            SyntheticList::Own { index } => Self::Own { index },
+            SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
+        }
+    }
+
+    fn synthetic_list(self) -> Option<SyntheticList> {
+        match self {
+            Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
+            Self::Own { index } => Some(SyntheticList::Own { index }),
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+        }
+    }
+}
 
 impl PartialEq for NodeList {
     fn eq(&self, other: &Self) -> bool {
@@ -1491,7 +1556,10 @@ impl PartialEq for NodeList {
                 (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
                     std::ptr::eq(a, b)
                 }
-                _ => false,
+                (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
+                    (Some(a), Some(b)) => synthetic_list_eq(a, b),
+                    _ => false,
+                },
             },
             _ => false,
         }
@@ -1504,8 +1572,8 @@ impl NodeList {
     /// Go `nil`.
     pub const NIL: Self = Self(ListRef::Nil);
 
-    /// The handle of ts_ast list `list` of file `file`: a list field of node
-    /// data, or a leaked list. `None` is Go `nil`.
+    /// The handle of ts_ast list `list` of parsed file `file`: a list field
+    /// of node data, or a leaked list. `None` is Go `nil`.
     #[inline]
     #[must_use]
     pub fn from_ts(file: usize, list: Option<&'static ts_ast::NodeList>) -> Self {
@@ -1528,6 +1596,12 @@ impl NodeList {
         })
     }
 
+    /// The handle of a list of this thread's synthetic arena.
+    #[must_use]
+    pub fn synthetic(list: SyntheticList) -> Self {
+        Self(ListRef::synthetic(list))
+    }
+
     /// The file of the list: a store id, a legacy file index or
     /// `SYNTHETIC_NODE_FILE`. 0 for `NodeList::NIL`.
     #[inline]
@@ -1536,11 +1610,12 @@ impl NodeList {
         match self.0 {
             ListRef::Nil => 0,
             ListRef::Ts { file, .. } | ListRef::Pending { file, .. } => file as usize,
+            ListRef::Field { .. } | ListRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
 
-    /// The ts_ast list of the handle. `None` for `NodeList::NIL` and for a
-    /// pending list.
+    /// The ts_ast list of a handle of parsed data. `None` for
+    /// `NodeList::NIL`, a pending list and a synthetic list.
     #[inline]
     #[must_use]
     pub fn ts_list(self) -> Option<&'static ts_ast::NodeList> {
@@ -1548,6 +1623,13 @@ impl NodeList {
             ListRef::Ts { list, .. } => Some(list),
             _ => None,
         }
+    }
+
+    /// The synthetic list of the handle, else `None`.
+    #[inline]
+    #[must_use]
+    pub fn synthetic_list(self) -> Option<SyntheticList> {
+        self.0.synthetic_list()
     }
 
     /// The pending store list of the handle (U1 (e)), else `None`.
@@ -1560,15 +1642,17 @@ impl NodeList {
         }
     }
 
-    /// The address of the list, for Go pointer compares. `None` for
+    /// The address of the list, for Go pointer compares and keys. `None` for
     /// `NodeList::NIL`. A Go `nil` marker list (`store::NIL_LIST_POS`) has an
-    /// address.
+    /// address. A synthetic list keeps its address while its thread's arena
+    /// lives (`synthetic_list_ptr`).
     #[must_use]
     pub fn list_ptr(self) -> Option<*const ()> {
         match self.0 {
             ListRef::Nil => None,
             ListRef::Ts { list, .. } => Some(std::ptr::from_ref(list).cast()),
             ListRef::Pending { list, .. } => Some(std::ptr::from_ref(list).cast()),
+            repr => repr.synthetic_list().map(synthetic_list_ptr),
         }
     }
 
@@ -1583,6 +1667,9 @@ impl NodeList {
             ListRef::Nil => false,
             ListRef::Ts { list, .. } => list.has_trailing_comma,
             ListRef::Pending { list, .. } => list.has_trailing_comma,
+            repr => repr
+                .synthetic_list()
+                .is_some_and(|list| with_synthetic_list(list, |l| l.nodes().has_trailing_comma)),
         }
     }
 
@@ -1609,17 +1696,25 @@ impl NodeList {
                     has_trailing_comma: true,
                 }),
             }),
+            // A factory parse (lazy JSDoc): the thread's arena owns the list.
+            repr => match repr.synthetic_list() {
+                Some(list) => Self::synthetic(synthetic_missing_list(list)),
+                None => self,
+            },
         }
     }
 
     /// Go `list == nil`. A required ts_ast list field of a store node holds
-    /// Go `nil` as a marker list (`store::NIL_LIST_POS`).
+    /// Go `nil` as a marker list (`store::NIL_LIST_POS`). A synthetic list is
+    /// never a marker: synthetic data holds Go `nil` in a required list field
+    /// as an empty list with an undefined `Loc` (`synthetic_req_list_value`).
     #[must_use]
     pub fn is_nil(self) -> bool {
         match self.0 {
             ListRef::Nil => true,
             ListRef::Ts { list, .. } => is_nil_list_marker(list),
             ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
+            ListRef::Field { .. } | ListRef::Own { .. } => false,
         }
     }
 
@@ -1635,6 +1730,7 @@ impl NodeList {
             ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, &list.nodes),
             ListRef::Nil => NodeSlice::NIL,
             ListRef::Pending { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
+            repr => NodeSlice::from_synthetic(repr.synthetic_list().expect("synthetic list")),
         }
     }
 
@@ -1652,10 +1748,15 @@ impl NodeList {
                 assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
                 return text_range_of(&list.range);
             }
+            // A synthetic list holds the Go `Loc`.
+            repr => {
+                let list = repr.synthetic_list().expect("synthetic list");
+                return with_synthetic_list(list, |l| text_range_of(&l.nodes().range));
+            }
         };
         assert!(!is_nil_list_marker(l), "nil NodeList dereference");
-        // Synthetic and store lists hold the Go `Loc`.
-        if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
+        // Store lists hold the Go `Loc`.
+        if has_file_store(file) {
             return text_range_of(&l.range);
         }
         let Some(file) = try_go_file(file) else {
@@ -1711,7 +1812,8 @@ impl NodeList {
 // ModifierList
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `*ast.ModifierList`. `ModifierList::NIL` is Go `nil`.
+/// Go `*ast.ModifierList`. `ModifierList::NIL` is Go `nil`. Equality is
+/// pointer equality, like Go.
 // PERF: U1 (e). A parser list that no node data holds yet is a pending
 // handle (`PendingModifierList`), as for `NodeList`. 16 bytes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1723,7 +1825,7 @@ enum ModifiersRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A ts_ast list of file `file` (see `ListRef::Ts`).
+    /// A ts_ast list of parsed file `file` (see `ListRef::Ts`).
     Ts {
         file: u32,
         list: &'static ts_ast::ModifierList,
@@ -1733,9 +1835,24 @@ enum ModifiersRef {
         file: u32,
         list: &'static PendingModifierList,
     },
+    /// A modifier list field of synthetic node data
+    /// (`SyntheticList::Field`).
+    Field { data: u32, sel: ListSel },
+    /// A synthetic factory modifier list (`SyntheticList::Own`).
+    Own { index: u32 },
 }
 
 const _: () = assert!(std::mem::size_of::<ModifierList>() == 16);
+
+impl ModifiersRef {
+    fn synthetic_list(self) -> Option<SyntheticList> {
+        match self {
+            Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
+            Self::Own { index } => Some(SyntheticList::Own { index }),
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+        }
+    }
+}
 
 impl PartialEq for ModifierList {
     fn eq(&self, other: &Self) -> bool {
@@ -1747,7 +1864,10 @@ impl PartialEq for ModifierList {
             (ModifiersRef::Pending { list: a, .. }, ModifiersRef::Pending { list: b, .. }) => {
                 std::ptr::eq(a, b)
             }
-            _ => false,
+            (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
+                (Some(a), Some(b)) => synthetic_list_eq(a, b),
+                _ => false,
+            },
         }
     }
 }
@@ -1782,6 +1902,16 @@ impl ModifierList {
         })
     }
 
+    /// The handle of a modifier list of this thread's synthetic arena.
+    #[must_use]
+    pub fn synthetic(list: SyntheticList) -> Self {
+        Self(match ListRef::synthetic(list) {
+            ListRef::Field { data, sel } => ModifiersRef::Field { data, sel },
+            ListRef::Own { index } => ModifiersRef::Own { index },
+            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } => unreachable!(),
+        })
+    }
+
     /// The file of the list (see `NodeList::file`). 0 for
     /// `ModifierList::NIL`.
     #[inline]
@@ -1790,11 +1920,12 @@ impl ModifierList {
         match self.0 {
             ModifiersRef::Nil => 0,
             ModifiersRef::Ts { file, .. } | ModifiersRef::Pending { file, .. } => file as usize,
+            ModifiersRef::Field { .. } | ModifiersRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
 
-    /// The ts_ast list of the handle. `None` for `ModifierList::NIL` and for
-    /// a pending list.
+    /// The ts_ast list of a handle of parsed data. `None` for
+    /// `ModifierList::NIL`, a pending list and a synthetic list.
     #[inline]
     #[must_use]
     pub fn ts_list(self) -> Option<&'static ts_ast::ModifierList> {
@@ -1802,6 +1933,13 @@ impl ModifierList {
             ModifiersRef::Ts { list, .. } => Some(list),
             _ => None,
         }
+    }
+
+    /// The synthetic list of the handle, else `None`.
+    #[inline]
+    #[must_use]
+    pub fn synthetic_list(self) -> Option<SyntheticList> {
+        self.0.synthetic_list()
     }
 
     /// The pending store list of the handle (U1 (e)), else `None`.
@@ -1837,6 +1975,8 @@ impl ModifierList {
                 file,
                 list: &list.list,
             }),
+            ModifiersRef::Field { data, sel } => NodeList(ListRef::Field { data, sel }),
+            ModifiersRef::Own { index } => NodeList(ListRef::Own { index }),
         }
     }
 
@@ -1872,14 +2012,16 @@ impl ModifierList {
         match self.0 {
             ModifiersRef::Nil => ModifierFlags::NONE,
             ModifiersRef::Ts { file, list } => {
-                let file = file as usize;
-                if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
+                if has_file_store(file as usize) {
                     return ModifierFlags(list.flags.0);
                 }
                 self.legacy_modifier_flags()
             }
             // A store list.
             ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
+            repr => with_synthetic_list(repr.synthetic_list().expect("synthetic list"), |m| {
+                ModifierFlags(m.modifiers().flags.0)
+            }),
         }
     }
 
@@ -1940,8 +2082,9 @@ fn visit_modifiers(v: &mut dyn FnMut(Node) -> bool, modifiers: ModifierList) -> 
 
 thread_local! {
     /// Go `Node.Decorators()` results. Go allocates a new slice on each call;
-    /// we keep one per node so `NodeSlice` can borrow it.
-    static DECORATORS: RefCell<FxHashMap<Node, &'static [Node]>> = RefCell::new(FxHashMap::default());
+    /// we keep one per node: a leaked slice for a parsed node, a slice of the
+    /// thread's synthetic arena for a factory node (see `Node::decorators`).
+    static DECORATORS: RefCell<FxHashMap<Node, NodeSlice>> = RefCell::new(FxHashMap::default());
     /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node.
     static SUBTREE_FACTS: RefCell<FxHashMap<Node, SubtreeFacts>> = RefCell::new(FxHashMap::default());
     /// Go `Node.Text()` results that Go builds with string concatenation.
@@ -1993,7 +2136,7 @@ impl Node {
     // (`BINDER_ADDED_FLAGS`), the rule that `Node::parser_flags` needs.
     #[inline]
     fn added_flags(self) -> NodeFlags {
-        let added = self.bind().added_flags;
+        let added = self.bind_field(|b| b.added_flags);
         debug_assert!(
             BINDER_ADDED_FLAGS.contains(added),
             "binder added {:#x}, outside BINDER_ADDED_FLAGS",
@@ -2123,24 +2266,28 @@ impl Node {
     }
 
     /// Binder data for this node. Nil values before the file is bound.
-    // PERF: the program file path stays small enough to inline. The
-    // synthetic path (thread-local arena and `RefCell` borrow) is cold.
     #[inline]
     #[must_use]
-    pub fn bind(self) -> &'static NodeBindData {
-        if is_synthetic_node(self) {
-            return self.bind_synthetic();
-        }
-        match self.go_file().node_bind.get() {
-            Some(v) => v.get(nid(self).index()),
-            None => &NO_BIND,
-        }
+    pub fn bind(self) -> NodeBindData {
+        self.bind_field(|b| *b)
     }
 
-    #[cold]
-    #[inline(never)]
-    fn bind_synthetic(self) -> &'static NodeBindData {
-        synthetic_bind(self)
+    /// Reads one field of the binder data of this node. The data of a
+    /// factory node belongs to its thread, so the field is read, not
+    /// borrowed.
+    // PERF: the program file path stays small enough to inline, and it loads
+    // only the field. The synthetic path (thread-local arena and `RefCell`
+    // borrow) is cold.
+    #[inline]
+    fn bind_field<T>(self, field: impl FnOnce(&NodeBindData) -> T) -> T {
+        if is_synthetic_node(self) {
+            return synthetic_bind_field(self, field);
+        }
+        let bind: &NodeBindData = match self.go_file().node_bind.get() {
+            Some(v) => v.get(nid(self).index()),
+            None => &NO_BIND,
+        };
+        field(bind)
     }
 
     // Go: ast.go:198 Name
@@ -2231,16 +2378,24 @@ impl Node {
             return NodeSlice::NIL;
         }
         if let Some(cached) = DECORATORS.with(|c| c.borrow().get(&self).copied()) {
-            return NodeSlice::from_nodes(cached);
+            return cached;
         }
         let filtered: Vec<Node> = modifiers
             .nodes()
             .iter()
             .filter(|&m| is_decorator(m))
             .collect();
-        let leaked: &'static [Node] = Box::leak(filtered.into_boxed_slice());
-        DECORATORS.with(|c| c.borrow_mut().insert(self, leaked));
-        NodeSlice::from_nodes(leaked)
+        // The slice of a factory node belongs to the thread's synthetic
+        // arena, which frees it with the node.
+        let slice = if !is_synthetic_node(self) {
+            NodeSlice::from_nodes(Box::leak(filtered.into_boxed_slice()))
+        } else if filtered.is_empty() {
+            NodeSlice::NIL
+        } else {
+            NodeSlice::from_synthetic(new_synthetic_slice(filtered))
+        };
+        DECORATORS.with(|c| c.borrow_mut().insert(self, slice));
+        slice
     }
 
     // Go: ast.go:229 Symbol
@@ -2249,13 +2404,13 @@ impl Node {
     // same.
     #[must_use]
     pub fn symbol(self) -> SymbolId {
-        self.bind().symbol
+        self.bind_field(|b| b.symbol)
     }
 
     // Go: ast.go:237 LocalSymbol
     #[must_use]
     pub fn local_symbol(self) -> SymbolId {
-        self.bind().local_symbol
+        self.bind_field(|b| b.local_symbol)
     }
 
     // Go: ast.go:245 Locals
@@ -2266,10 +2421,10 @@ impl Node {
     #[must_use]
     pub fn locals(self) -> SymbolTable {
         if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind().locals.is_nil());
+            debug_assert!(self.bind_field(|b| b.locals.is_nil()));
             return SymbolTable::NIL;
         }
-        self.bind().locals
+        self.bind_field(|b| b.locals)
     }
 
     /// Go `LocalsContainerData().NextContainer`.
@@ -2277,28 +2432,28 @@ impl Node {
     #[must_use]
     pub fn next_container(self) -> Node {
         if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind().next_container.is_nil());
+            debug_assert!(self.bind_field(|b| b.next_container.is_nil()));
             return Node::NIL;
         }
-        self.bind().next_container
+        self.bind_field(|b| b.next_container)
     }
 
     /// Go `FlowNodeData().FlowNode`.
     #[must_use]
     pub fn flow_node(self) -> FlowNodeId {
-        self.bind().flow_node
+        self.bind_field(|b| b.flow_node)
     }
 
     /// Go `EndFlowNode` of a function-like or module node.
     #[must_use]
     pub fn end_flow_node(self) -> FlowNodeId {
-        self.bind().end_flow_node
+        self.bind_field(|b| b.end_flow_node)
     }
 
     /// Go `ReturnFlowNode` of a function-like node or class static block.
     #[must_use]
     pub fn return_flow_node(self) -> FlowNodeId {
-        self.bind().return_flow_node
+        self.bind_field(|b| b.return_flow_node)
     }
 }
 
@@ -2367,12 +2522,13 @@ fn case_expression(n: Node, file: usize, id: ts_ast::NodeId) -> Node {
 }
 
 /// Caches a string that Go builds on each call, so `text()` can return
-/// `&'static str`.
+/// `&'static str`. The text is interned (`Name`), so the texts of the
+/// factory nodes of released programs are kept once, not per node.
 fn joined_text(n: Node, build: impl FnOnce() -> String) -> &'static str {
     if let Some(s) = JOINED_TEXT.with(|c| c.borrow().get(&n).copied()) {
         return s;
     }
-    let s: &'static str = Box::leak(build().into_boxed_str());
+    let s: &'static str = Name::from(build()).as_str();
     JOINED_TEXT.with(|c| c.borrow_mut().insert(n, s));
     s
 }
@@ -3387,8 +3543,8 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
 
 /// The walk of `for_each_child_impl` over the data of a factory node. The
 /// data is read in a scope, so each list is read in place (`DataList`), and
-/// the list hook gets a copy of it (`copy_synthetic_list`). Otherwise it
-/// visits like `NodeChildVisit`.
+/// the list hook gets a copy of it that the thread's synthetic arena owns
+/// (`copy_synthetic_list`). Otherwise it visits like `NodeChildVisit`.
 struct SyntheticChildVisit<'a, 'b> {
     n: Node,
     v: &'a mut dyn FnMut(Node) -> bool,

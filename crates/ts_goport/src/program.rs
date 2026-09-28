@@ -260,9 +260,9 @@ struct CheckerPool {
 }
 
 impl CheckerPool {
-    /// Stops the workers: each drops its checker, then it closes their job
-    /// queues and waits for each thread to end, so the checkers are freed on
-    /// return.
+    /// Stops the workers: each drops its checker and frees its synthetic
+    /// nodes, then it closes their job queues and waits for each thread to
+    /// end, so the checkers and the nodes they made are freed on return.
     fn shut_down(self) {
         for thread in self.stop() {
             // A job panic stays in its job result, so a worker ends normally.
@@ -270,67 +270,30 @@ impl CheckerPool {
         }
     }
 
-    /// `shut_down` without the wait: the workers drop their checkers and
-    /// end while the caller goes on. Nothing waits for them; at process
-    /// exit a worker that is still freeing just stops.
+    /// `shut_down` without the wait: the workers drop their checkers, free
+    /// their synthetic nodes and end while the caller goes on. Nothing waits
+    /// for them; at process exit a worker that is still freeing just stops.
     fn shut_down_in_background(self) {
         drop(self.stop());
     }
 
-    /// Sends each worker the job that drops its checker, closes the job
-    /// queues and returns the worker threads.
+    /// Sends each worker the job that drops its checker and frees its
+    /// synthetic nodes, closes the job queues and returns the worker
+    /// threads.
     fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
-        // A pool that only ends with the process forgets its checkers (see
-        // `create_checkers`); a released program frees them here.
+        // A pool that only ends with the process forgets its checkers and
+        // synthetic nodes (see `create_checkers`); a released program frees
+        // them here.
         for worker in &self.workers {
             let _ = worker.send(Box::new(|| {
                 drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
-                record_worker_arena_use();
+                free_synthetic_nodes();
+                WORKER_RELEASED.with(|released| released.set(true));
             }));
         }
         drop(self.workers);
         self.threads
     }
-}
-
-/// The AST arena bytes that each checker worker of the last released pool
-/// used, by worker index (see `worker_arena_start`).
-static WORKER_ARENA_USE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-/// Records the AST arena use of this checker worker. A released pool runs it
-/// on each worker after it drops the checker.
-fn record_worker_arena_use() {
-    let Some(index) = worker_index() else {
-        return;
-    };
-    let used = crate::ast::store::ast_arena_used();
-    let mut uses = WORKER_ARENA_USE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if uses.len() <= index {
-        uses.resize(index + 1, 0);
-    }
-    uses[index] = used;
-}
-
-/// The first AST arena chunk of checker worker `index`: what worker `index`
-/// of the last released pool used, plus a sixteenth, in whole pages. None
-/// (the 1 MiB default) before any pool is released, so a one-program
-/// process keeps the default. A pool released in the background
-/// (`release_program_in_background`) records its use when its worker is
-/// done, so a pool made before that reads an older pool's use. It is only
-/// a size hint. A released pool leaks its worker arenas (the
-/// nodes are `&'static`), so a 1 MiB chunk would leak about 1 MiB for each
-/// worker and program version while a Query core worker uses 25 to 80 KB.
-/// A worker checks the same files in each version, so its use changes
-/// little; when it needs more, the arena adds a chunk twice as large.
-fn worker_arena_start(index: usize) -> Option<usize> {
-    const PAGE: usize = 4096;
-    let uses = WORKER_ARENA_USE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let used = *uses.get(index)?;
-    Some((used + used / 16).div_ceil(PAGE) * PAGE)
 }
 
 /// Work for one checker worker. It runs on the worker thread, where
@@ -2622,18 +2585,19 @@ pub fn bind_file_outside_program(file: Node) {
 }
 
 /// Frees what the loading thread keeps for `program`: it stops the checker
-/// pool (and waits for its workers), removes the frontend program from this
-/// thread and empties the declaration diagnostic cache. Do not use `program`
-/// after this. Its `GoProgram`, frontend program and file versions stay
-/// leaked. Panics when `program` is current on this thread.
+/// pool (and waits for its workers, which free their checkers and synthetic
+/// nodes), removes the frontend program from this thread and empties the
+/// declaration diagnostic cache. Do not use `program` after this. Its
+/// `GoProgram`, frontend program and file versions stay leaked. Panics when
+/// `program` is current on this thread.
 pub fn release_program(program: &'static GoProgram) {
     release_program_with(program, CheckerPool::shut_down);
 }
 
-/// `release_program` that does not wait for the checker workers: they drop
-/// their checkers on their own threads while the caller goes on (Go frees a
-/// program in the background GC). `tsc -b` uses it, so the next project
-/// does not wait for the free.
+/// `release_program` that does not wait for the checker workers: they free
+/// their checkers and synthetic nodes on their own threads while the caller
+/// goes on (Go frees a program in the background GC). `tsc -b` uses it, so
+/// the next project does not wait for the free.
 pub fn release_program_in_background(program: &'static GoProgram) {
     release_program_with(program, CheckerPool::shut_down_in_background);
 }
@@ -3507,6 +3471,9 @@ thread_local! {
     static WORKER_CHECKER: RefCell<Option<Checker>> = const { RefCell::new(None) };
     /// The pool index of the checker of a worker thread.
     static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Set on a worker thread when `CheckerPool::stop` freed its checker and
+    /// synthetic nodes.
+    static WORKER_RELEASED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The thread-local state that a checker worker starts from: the current
@@ -3577,14 +3544,10 @@ fn create_checkers() -> CheckerPool {
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
             let seed = WorkerSeed::take();
-            let arena_start = worker_arena_start(index);
             let thread = std::thread::Builder::new()
                 .name(format!("checker-{index}"))
                 .stack_size(CHECKER_STACK_SIZE)
                 .spawn(move || {
-                    if let Some(bytes) = arena_start {
-                        crate::ast::store::set_ast_arena_start(bytes);
-                    }
                     seed.install();
                     let checker = Checker::new(index);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -3596,11 +3559,15 @@ fn create_checkers() -> CheckerPool {
                     // the loading thread ends, after every job sent its
                     // result, so this runs once per checker, at the end of
                     // the process. Like Go, which never frees a checker, the
-                    // checker is not dropped: freeing its arenas at thread
-                    // exit cost 0.83% of query CPU. `release_program` drops
-                    // the checker first (`CheckerPool::stop`), so a released
-                    // program does not leak it.
-                    std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                    // checker and the synthetic nodes are not dropped:
+                    // freeing the checker arenas at thread exit cost 0.83%
+                    // of query CPU. `release_program` frees both first
+                    // (`CheckerPool::stop`), so a released program does not
+                    // leak them.
+                    if !WORKER_RELEASED.with(std::cell::Cell::get) {
+                        std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
+                        forget_synthetic_nodes();
+                    }
                 })
                 .expect("cannot start a checker thread");
             (sender, thread)
