@@ -193,10 +193,17 @@ impl AliasResolver {
     // PORT: Go binds a second-pass root file only if an earlier pass bound
     // it (registry.go:1078 reads it from the host). Here every root file is
     // bound.
+    // PORT: Go's `NewChecker` has no context. `ctx` is for
+    // `should_stop_build`: a build that the caller drops on cancel stops the
+    // file walk between two files, or before the program, and gets `None`.
+    // For any other context the result is always `Some`. Each walk step
+    // finishes its file (it resolves each module name, and reads and binds
+    // each target), so a stop leaves only complete cache entries.
     pub fn new_checker(
         self: &Rc<Self>,
+        ctx: &Context,
         also_reads: &[Node],
-    ) -> (Rc<RefCell<Checker>>, AliasResolverProgramScope) {
+    ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
         // Go: NewChecker reads each root file; a nil file is a nil dereference.
         if self.root_files.iter().any(|file| file.is_nil()) {
             go_panic(
@@ -218,6 +225,9 @@ impl AliasResolver {
         let mut read_names: FxHashSet<String> = FxHashSet::default();
         let mut next = 0;
         while next < files.len() {
+            if should_stop_build(ctx) {
+                return None;
+            }
             let file = files[next];
             next += 1;
             for module_reference in checker_module_references(file) {
@@ -234,6 +244,10 @@ impl AliasResolver {
                 }
             }
         }
+        // PORT: a stop here also makes no program shell.
+        if should_stop_build(ctx) {
+            return None;
+        }
         let scope = crate::program::new_alias_resolver_program(
             self.options(),
             &self.root_files,
@@ -244,7 +258,7 @@ impl AliasResolver {
         );
         self.checker_program.set(Some(scope.program()));
         let checker = ls_program::new_checker_for_version(scope.program());
-        (Rc::new(RefCell::new(checker)), scope)
+        Some((Rc::new(RefCell::new(checker)), scope))
     }
 
     /// The resolution that Go `GetResolvedModule` gives the checker for

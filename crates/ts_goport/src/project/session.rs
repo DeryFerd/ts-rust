@@ -2936,8 +2936,10 @@ impl Session {
     // dispatch loop starts it only after a quiet period with no message, so
     // a request does not wait for it. Go runs the whole warm on a goroutine.
     // A file event or a newer warm cancels the context before or during the
-    // clone (`WarmAutoImportPreempt`). A clone that has started still runs,
-    // as Go's does, and its result is discarded. A clone that has not
+    // clone (`WarmAutoImportPreempt`). A clone that has started runs to its
+    // next cancel point, and its result is discarded, as Go's is. Its
+    // registry build has more cancel points than Go's
+    // (`autoimport::registry::DISCARD_ON_CANCEL_KEY`). A clone that has not
     // started is skipped: Go's would run and be discarded, and the only
     // trace it leaves is its snapshot id, which is taken here, where Go's
     // clone takes it.
@@ -3068,11 +3070,21 @@ impl Session {
             },
             ..Default::default()
         };
+        // PORT: a cancelled warm drops its clone below (Go session.go:1844),
+        // so its registry build may stop at more points than Go's
+        // (`autoimport::registry::DISCARD_ON_CANCEL_KEY`). `build_ctx` is a
+        // value child of `warm_ctx`, so it is cancelled exactly when
+        // `warm_ctx` is.
+        let build_ctx = gostd::context::with_value(
+            &warm_ctx,
+            &crate::ls::autoimport::registry::DISCARD_ON_CANCEL_KEY,
+            (),
+        );
         // PORT: the clone takes the id kept for it when the warm started.
         let next_snapshot_id = self.snapshot_id.replace(snapshot_id - 1);
         let cloned_snapshot = Snapshot::clone_(
             &new_snapshot,
-            &warm_ctx,
+            &build_ctx,
             warm_change,
             &new_snapshot.fs.overlays,
             self,

@@ -12,10 +12,11 @@ use ts_goport::frontend::packagejson::InfoCacheEntry;
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::tspath::Path;
 use ts_goport::frontend::vfs::Fs;
+use ts_goport::gostd::context;
 use ts_goport::ls::autoimport::aliasresolver::{
-    bind_alias_resolver_source_file, new_alias_resolver,
+    AliasResolver, bind_alias_resolver_source_file, new_alias_resolver,
 };
-use ts_goport::ls::autoimport::registry::RegistryCloneHost;
+use ts_goport::ls::autoimport::registry::{DISCARD_ON_CANCEL_KEY, RegistryCloneHost};
 use ts_goport::options::CompilerOptions;
 
 use super::projecttestutil::{self, files};
@@ -51,6 +52,49 @@ impl RegistryCloneHost for FakeCloneHost {
     fn dispose(&self) {}
 }
 
+/// The setup of Go's test (aliasresolver_crash_test.go:47 to :67): an
+/// alias resolver over one parsed and bound file with a type error. Returns
+/// the resolver and the file.
+fn alias_resolver_with_type_error() -> (Rc<AliasResolver>, Node) {
+    const FILE_NAME: &str = "/pkg/index.ts";
+    let text: &'static str =
+        "declare function f(arg: { a: string }): () => void;\nexport const x = f({ a: 1 });\n";
+
+    let (_, fs) = projecttestutil::wrapped_map_fs(
+        files(&[(FILE_NAME, text)]),
+        true, /*useCaseSensitiveFileNames*/
+    );
+    let host = Rc::new(FakeCloneHost { fs });
+
+    let source_file = Rc::new(parse_source_file(
+        &SourceFileParseOptions {
+            file_name: FILE_NAME.to_string(),
+            path: Path(FILE_NAME.to_string()),
+            ..Default::default()
+        },
+        text,
+        ScriptKind::TS,
+    ));
+    // PORT: a parsed file reaches a program version only after
+    // `note_parsed_source_file` (the parse cache calls it; Go needs no step).
+    ts_goport::program::note_parsed_source_file(&source_file);
+    let root = source_file.root;
+    bind_alias_resolver_source_file("/", root);
+
+    let resolution_host: Rc<dyn module::ResolutionHost> = host.clone();
+    let resolver =
+        module::new_resolver(resolution_host, Rc::new(CompilerOptions::default()), "", "");
+    let r = new_alias_resolver(
+        vec![root],
+        FxHashMap::default(),
+        host,
+        Rc::new(resolver),
+        Rc::new(|f: &str| Path(f.to_string())),
+        Rc::new(|_: &dyn HasFileName, _: &str| {}),
+    );
+    (r, root)
+}
+
 child_test! {
     // Go: aliasresolver_crash_test.go:44 TestAliasResolverGetDiagnosticsDoesNotPanic
     // Regression test for microsoft/typescript-go#4322.
@@ -59,42 +103,29 @@ child_test! {
     // aliasResolver standing in for a real program. This file has a type error, and
     // extracting exports should still complete without crashing.
     fn alias_resolver_get_diagnostics_does_not_panic() {
-        const FILE_NAME: &str = "/pkg/index.ts";
-        let text: &'static str =
-            "declare function f(arg: { a: string }): () => void;\nexport const x = f({ a: 1 });\n";
+        let (r, root) = alias_resolver_with_type_error();
 
-        let (_, fs) = projecttestutil::wrapped_map_fs(files(&[(FILE_NAME, text)]), true /*useCaseSensitiveFileNames*/);
-        let host = Rc::new(FakeCloneHost { fs });
-
-        let source_file = Rc::new(parse_source_file(
-            &SourceFileParseOptions {
-                file_name: FILE_NAME.to_string(),
-                path: Path(FILE_NAME.to_string()),
-                ..Default::default()
-            },
-            text,
-            ScriptKind::TS,
-        ));
-        // PORT: a parsed file reaches a program version only after
-        // `note_parsed_source_file` (the parse cache calls it; Go needs no step).
-        ts_goport::program::note_parsed_source_file(&source_file);
-        let root = source_file.root;
-        bind_alias_resolver_source_file("/", root);
-
-        let resolution_host: Rc<dyn module::ResolutionHost> = host.clone();
-        let resolver = module::new_resolver(resolution_host, Rc::new(CompilerOptions::default()), "", "");
-        let r = new_alias_resolver(
-            vec![root],
-            FxHashMap::default(),
-            host,
-            Rc::new(resolver),
-            Rc::new(|f: &str| Path(f.to_string())),
-            Rc::new(|_: &dyn HasFileName, _: &str| {}),
-        );
-
-        let (ch, _scope) = r.new_checker(&[]);
+        let (ch, _scope) = r.new_checker(&bg(), &[]).expect("checker");
 
         // Type-checking this file's diagnostics must not panic.
         ch.borrow_mut().get_diagnostics_exported(&bg(), root);
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart. The file walk of `new_checker` stops on a
+    // cancelled context only in a build marked `DISCARD_ON_CANCEL_KEY` (the
+    // auto-import warm, which drops its clone on cancel). Any other build
+    // keeps Go's behavior: Go's NewChecker has no context.
+    fn alias_resolver_walk_stops_only_for_a_discarded_build() {
+        let (r, _) = alias_resolver_with_type_error();
+        let (canceled, cancel) = context::with_cancel(&bg());
+        cancel();
+
+        let discarded = context::with_value(&canceled, &DISCARD_ON_CANCEL_KEY, ());
+        assert!(r.new_checker(&discarded, &[]).is_none());
+        assert!(r.checker_program.get().is_none(), "a stopped walk makes no program");
+
+        assert!(r.new_checker(&canceled, &[]).is_some());
     }
 }
