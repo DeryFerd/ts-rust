@@ -5,7 +5,9 @@ use crate::ls::autoimport::prelude::*;
 // PORT (whole file):
 // - Concurrency. `sync.WaitGroup` / `wg.Go` run each task at its start
 //   point, serially in Go start order (map-project decision 1); the
-//   `ctx.Err()` checks stay. Mutexes are dropped. `atomic.Int32` is `Cell`.
+//   `ctx.Err()` checks stay. A build that the caller drops on cancel has
+//   more stop points (`should_stop_build`). Mutexes are dropped.
+//   `atomic.Int32` is `Cell`.
 // - Go map iteration that feeds the index (`exports` maps, the second-pass
 //   root files and lookup sources) uses `IndexMap` / `IndexSet` in insertion
 //   order. PORT: Go map order is random. Index order decides ties in the
@@ -41,6 +43,7 @@ use crate::frontend::parser::ParsedSourceFile;
 use crate::frontend::tspath;
 use crate::frontend::vfs;
 use crate::frontend::vfs::Fs as _;
+use crate::gostd::context::ContextKey;
 use crate::gostd::{Context, GoError};
 use crate::ls::{lsconv, lsutil};
 use crate::lsp::lsproto;
@@ -718,6 +721,23 @@ pub struct RegistryChange {
     pub user_preferences: Option<lsutil::UserPreferences>,
 }
 
+/// PORT: marks a registry build whose result the caller drops when the
+/// context is cancelled: the auto-import warm (`Session::run_pending_warm`,
+/// Go session.go:1844). No Go counterpart. Go runs the warm on a goroutine,
+/// so no request waits for it. Here it runs on the dispatch thread, so a
+/// cancelled warm must stop within about a millisecond. A build without the
+/// key (a request) keeps Go's cancel points, because Go adopts its clone
+/// even when the request was cancelled.
+pub static DISCARD_ON_CANCEL_KEY: ContextKey<()> = ContextKey::new("discardOnCancelKey");
+
+/// PORT: true when a build marked with `DISCARD_ON_CANCEL_KEY` has a
+/// cancelled context. The build then returns at once. It leaves only
+/// builder state, which the caller drops. `err` is read first, so a build
+/// that is not cancelled pays one atomic load, as for Go's checks.
+pub fn should_stop_build(ctx: &Context) -> bool {
+    ctx.err().is_some() && ctx.value(&DISCARD_ON_CANCEL_KEY).is_some()
+}
+
 // Go: ls/autoimport/registry.go:495 RegistryCloneHost
 // PORT: Go embeds `module.ResolutionHost` and repeats its `FS()`; both come
 // from the supertrait (`fs`, `get_current_directory`). Go
@@ -1344,12 +1364,20 @@ impl RegistryBuilder {
                     .or_else(|| task.directory_package_names.clone());
             }
             task.discovered = self.discover_bucket_packages(
+                ctx,
                 task.package_names.as_ref(),
                 &task.dir_name,
                 &task.dir_path,
             );
         }
         // Go: wg.Wait()
+        // PORT: the stop points marked `should_stop_build` are the port's
+        // (see `DISCARD_ON_CANCEL_KEY`). A stopped build returns at once and
+        // skips Go's later steps. They change only this builder, which the
+        // caller drops.
+        if should_stop_build(ctx) {
+            return;
+        }
         if node_modules_logger.is_some() {
             node_modules_logger.logf(&format!(
                 "Discovered packages: {:?}",
@@ -1466,6 +1494,9 @@ impl RegistryBuilder {
                 seen.len()
             ));
         }
+        if should_stop_build(ctx) {
+            return;
+        }
         self.unique_package_count = seen.len() as i32;
 
         // --- Phase 3: Bucket building (parallel per bucket) ---
@@ -1544,6 +1575,9 @@ impl RegistryBuilder {
         }
 
         // Go: wg.Wait()
+        if should_stop_build(ctx) {
+            return;
+        }
 
         for br in &all_results {
             if br.err.is_some() {
@@ -1571,6 +1605,12 @@ impl RegistryBuilder {
         let second_pass_start = Instant::now();
         let mut second_pass_file_count = 0;
         for br in &all_results {
+            // PORT: Go has no check in the second pass. A stop here leaves
+            // an installed bucket with a partial second pass, so only a
+            // build that the caller drops can stop here.
+            if should_stop_build(ctx) {
+                return;
+            }
             if br.err.is_some() {
                 continue;
             }
@@ -1582,6 +1622,9 @@ impl RegistryBuilder {
             let mut root_files: IndexMap<String, Node> = IndexMap::new();
             for target in targets {
                 for file_name in self.resolve_ambient_module_name(target, &br.entry.key()) {
+                    if should_stop_build(ctx) {
+                        return;
+                    }
                     if root_files.contains_key(&file_name) {
                         continue;
                     }
@@ -1621,9 +1664,15 @@ impl RegistryBuilder {
                     .values()
                     .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
                     .collect();
-                let (ch, _alias_program) = alias_resolver.new_checker(&source_files);
+                let Some((ch, _alias_program)) = alias_resolver.new_checker(ctx, &source_files)
+                else {
+                    return;
+                };
                 let mut ch_ref = ch.borrow_mut();
                 for (source, &source_file) in sources.values().zip(&source_files) {
+                    if should_stop_build(ctx) {
+                        return;
+                    }
                     let source = source.borrow();
                     let host = self.host.clone();
                     let realpath: Rc<dyn Fn(&str) -> String> =
@@ -2034,14 +2083,21 @@ impl RegistryBuilder {
     // Go: ls/autoimport/registry.go:1370 discoverBucketPackages
     // discoverBucketPackages resolves the package.json and realpath for each package name
     // in a node_modules directory. This is the discovery phase of the three-phase extraction pipeline.
+    // PORT: `ctx` is the port's, for `should_stop_build` (Go has no context
+    // here). A stopped build gets a partial list, and `update_indexes`
+    // returns after discovery.
     pub fn discover_bucket_packages(
         &self,
+        ctx: &Context,
         package_names: Option<&FxHashSet<String>>,
         dir_name: &str,
         dir_path: &tspath::Path,
     ) -> Vec<Rc<DiscoveredPackage>> {
         let mut result: Vec<Rc<DiscoveredPackage>> = Vec::with_capacity(set_len(package_names));
         for package_name in package_names.into_iter().flatten() {
+            if should_stop_build(ctx) {
+                break;
+            }
             let types_package_name = module::get_types_package_name(package_name);
             let package_json = self.host.get_package_json(&tspath::combine_paths(
                 dir_name,
@@ -2245,7 +2301,8 @@ impl RegistryBuilder {
             }),
         );
 
-        let (ch, _alias_program) = alias_resolver.new_checker(&[]);
+        // PORT: `None` only for a stopped build (`should_stop_build`).
+        let (ch, _alias_program) = alias_resolver.new_checker(ctx, &[])?;
         let mut ch_ref = ch.borrow_mut();
         let mut extractor = self.new_export_extractor(
             package_name,
@@ -2481,6 +2538,12 @@ impl RegistryBuilder {
             let index = bucket.index.as_ref().expect(NIL_DEREF);
             let mut index = index.borrow_mut();
             for file_exports in extraction.exports.values() {
+                // PORT: see `should_stop_build`. Go sets `err` at the end of
+                // the function; this is the same end state.
+                if should_stop_build(ctx) {
+                    result.err = ctx.err();
+                    return;
+                }
                 for exp in file_exports {
                     index.insert_as_words(exp.clone());
                 }
@@ -2654,6 +2717,12 @@ impl RegistryBuilder {
 
         // Insert newly extracted exports into the index
         for file_exports in extraction.exports.values() {
+            // PORT: see `should_stop_build`. Go sets `err` at the end of the
+            // function; this is the same end state.
+            if should_stop_build(ctx) {
+                result.err = ctx.err();
+                return;
+            }
             for exp in file_exports {
                 new_index
                     .as_mut()

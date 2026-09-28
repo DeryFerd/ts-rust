@@ -22,7 +22,9 @@
 //! Release: Go frees a program when no snapshot and no request uses it.
 //! `release_program` is the snapshot part (Go `programCounter.Deref`); the
 //! release waits until no guard of the program is alive. The program shell
-//! and its file versions stay leaked (see `program::release_program`).
+//! and its file versions stay leaked (see `program::release_program`). A
+//! compiler host whose last live program is released drops its data
+//! (`CompilerHost::release`).
 //!
 //! PORT: Go keeps the checker pools in `Program` fields. `NewProgram` does
 //! not have them, so they live in a thread-local registry keyed by the
@@ -107,6 +109,12 @@ struct ProgramCheckers {
     compiler_checker_pool: Option<Rc<CompilerCheckerPool>>,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: RefCell<FxHashMap<Node, Vec<Diagnostic>>>,
+    /// The host of the load that made the files of `program`: its own host
+    /// after `new_program` or an update that loads again, and the old
+    /// program's load host after an update that clones. Go `UpdateProgram`
+    /// shares `processedFiles`, whose resolver reads that host's file system
+    /// after the load too (`GetPackageScopeForPath`).
+    load_host: Rc<dyn CompilerHost>,
 }
 
 thread_local! {
@@ -136,11 +144,75 @@ thread_local! {
     /// alive, by program version id. The last such guard releases them.
     static RELEASE_PENDING: RefCell<FxHashMap<u32, &'static NewProgram>> =
         RefCell::new(FxHashMap::default());
+
+    /// The number of programs in `PROGRAM_CHECKERS` that use each compiler
+    /// host, by host address (`host_key`). A program uses its own host and
+    /// its load host (`ProgramCheckers::load_host`).
+    // PORT: not in Go. Go's GC frees a host when no program references it;
+    // the port keeps the program shells, so it counts the live users.
+    static HOST_USERS: RefCell<FxHashMap<usize, u32>> = RefCell::new(FxHashMap::default());
 }
 
 /// Registry key of `p`.
 fn program_key(p: &'static NewProgram) -> usize {
     p as *const NewProgram as usize
+}
+
+/// `HOST_USERS` key of `host`.
+fn host_key(host: &Rc<dyn CompilerHost>) -> usize {
+    Rc::as_ptr(host).cast::<()>().addr()
+}
+
+/// The hosts that a registered program uses: its own host, then its load
+/// host when that is another host.
+fn used_hosts(checkers: &ProgramCheckers) -> Vec<Rc<dyn CompilerHost>> {
+    let own = checkers.program.host();
+    let mut hosts = vec![own.clone()];
+    if !Rc::ptr_eq(own, &checkers.load_host) {
+        hosts.push(checkers.load_host.clone());
+    }
+    hosts
+}
+
+/// Counts the live programs that use each host of `checkers`.
+fn hold_hosts(checkers: &ProgramCheckers) {
+    HOST_USERS.with(|users| {
+        let mut users = users.borrow_mut();
+        for host in used_hosts(checkers) {
+            *users.entry(host_key(&host)).or_insert(0) += 1;
+        }
+    });
+}
+
+/// Undoes `hold_hosts`, then releases each host that no live program uses
+/// now (Go: the GC frees the host with its last program). When that is the
+/// load host, no live program shares the processed files of the load
+/// either, so their resolver caches go too.
+fn release_hosts(checkers: &ProgramCheckers) {
+    let unused: Vec<Rc<dyn CompilerHost>> = HOST_USERS.with(|users| {
+        let mut users = users.borrow_mut();
+        used_hosts(checkers)
+            .into_iter()
+            .filter(|host| {
+                let key = host_key(host);
+                let count = users
+                    .get_mut(&key)
+                    .expect("a registered program holds its hosts");
+                *count -= 1;
+                if *count == 0 {
+                    users.remove(&key);
+                    return true;
+                }
+                false
+            })
+            .collect()
+    });
+    for host in unused {
+        if Rc::ptr_eq(&host, &checkers.load_host) {
+            checkers.program.release_resolver_caches();
+        }
+        host.release();
+    }
 }
 
 /// The registry entry of `p`. Panics for a program that `new_program` or
@@ -280,7 +352,7 @@ pub fn new_program(
         Box::leak(Box::new(crate::frontend::compiler::new_program(opts)))
     };
     let version = new_program_version(p, None);
-    init_checker_pool(p, version, create_checker_pool);
+    init_checker_pool(p, version, create_checker_pool, p.host().clone());
     p
 }
 
@@ -307,8 +379,16 @@ pub fn update_program(
         p.update_program(changed_file_path, new_host)
     };
     let result: &'static NewProgram = Box::leak(Box::new(result));
+    // A clone shares the old program's processed files (Go `UpdateProgram`),
+    // so it uses the old load host too.
+    let load_host = if reused {
+        old.as_ref()
+            .map_or_else(|| p.host().clone(), |old| old.load_host.clone())
+    } else {
+        result.host().clone()
+    };
     let version = new_program_version(result, old.map(|old| old.version));
-    init_checker_pool(result, version, create_checker_pool);
+    init_checker_pool(result, version, create_checker_pool, load_host);
     (result, new_file, reused)
 }
 
@@ -336,7 +416,9 @@ pub fn release_program(p: &'static NewProgram) {
 }
 
 /// Removes `p` from the registry, which drops its checker pools once no
-/// project holds them, and releases its program version.
+/// project holds them, releases its program version, releases each host
+/// of `p` that no live program uses now, and frees the synthetic nodes
+/// that this thread made while the version was current.
 fn release_now(p: &'static NewProgram) {
     let Some(checkers) =
         PROGRAM_CHECKERS.with(|programs| programs.borrow_mut().remove(&program_key(p)))
@@ -344,17 +426,28 @@ fn release_now(p: &'static NewProgram) {
         return;
     };
     crate::program::release_program(checkers.version);
+    release_hosts(&checkers);
+    let version = checkers.version;
+    drop(checkers);
+    // Not in Go: the GC frees the nodes that no checker or request reaches.
+    // No snapshot and no guard of the version is alive here.
+    crate::ast::free_synthetic_owner(version.id);
 }
 
 // Go: compiler/program.go:335 initCheckerPool
+// PORT: `load_host` is not in Go (`ProgramCheckers::load_host`).
 fn init_checker_pool(
     p: &'static NewProgram,
     version: &'static GoProgram,
     create_checker_pool: Option<CreateCheckerPool>,
+    load_host: Rc<dyn CompilerHost>,
 ) {
     if !p.finished_processing {
         panic!("Program must finish processing files before initializing checker pool");
     }
+    // PORT: the synthetic nodes that this thread makes while `version` is
+    // current belong to it; `release_now` frees them.
+    crate::ast::open_synthetic_owner(version.id);
 
     let (checker_pool, compiler_checker_pool): (
         Rc<dyn CheckerPool>,
@@ -373,7 +466,9 @@ fn init_checker_pool(
         checker_pool,
         compiler_checker_pool,
         declaration_diagnostic_cache: RefCell::new(FxHashMap::default()),
+        load_host,
     });
+    hold_hosts(&checkers);
     PROGRAM_CHECKERS.with(|programs| {
         programs.borrow_mut().insert(program_key(p), checkers);
     });
@@ -1024,16 +1119,11 @@ fn get_declaration_diagnostics_for_file(
 // shares as `Rc<RefCell<Checker>>`, so the resolver links to that `Rc`
 // (`get_emit_resolver_of_shared_checker`) instead of a compile worker
 // checker. The host methods read the current program, which is `p`.
-// `EmitHost.checker_index` is the resolver's index; only the compile path
-// (JS emit on a worker thread) uses it.
 fn new_emit_host(p: &'static NewProgram, ctx: &Context, file: Node) -> (Rc<EmitHost>, Release) {
     let (checker, done) = get_type_checker_for_file(p, ctx, file);
     let emit_resolver =
         crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker(&checker);
-    let host = Rc::new(EmitHost {
-        checker_index: emit_resolver.checker_index,
-        emit_resolver,
-    });
+    let host = Rc::new(EmitHost { emit_resolver });
     (host, done)
 }
 

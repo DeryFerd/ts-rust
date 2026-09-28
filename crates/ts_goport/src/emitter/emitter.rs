@@ -6,8 +6,7 @@
 
 use crate::prelude::*;
 
-use super::program_emit::{EmitResult, SourceMapEmitResult, WriteFile, WriteFileData};
-use crate::binder::reference_resolver::ReferenceResolverHooks;
+use super::program_emit::{EmitResult, PoolJsPart, SourceMapEmitResult, WriteFile, WriteFileData};
 use crate::declarations::DeclarationTransformer;
 use crate::frontend::outputpaths::OutputPaths;
 use crate::frontend::outputpaths::get_source_file_path_in_new_dir;
@@ -45,6 +44,12 @@ pub struct Emitter {
     pub source_file: Node,
     pub emit_result: EmitResult,
     pub write_file: Option<WriteFile>,
+    /// PORT: not in Go. Set when this emitter runs only the d.ts part of the
+    /// file, on its checker thread, and the JS part runs on the emit pool
+    /// (`program_emit`). The d.ts part waits for the JS part before it
+    /// writes, so a file's outputs are written in Go's order (JS, then
+    /// d.ts), and its `WriteFileData` holds the JS diagnostics too.
+    pub js_part: Option<Rc<RefCell<PoolJsPart>>>,
 }
 
 impl Emitter {
@@ -365,6 +370,8 @@ impl Emitter {
             writer,
             source_map_generator.clone(),
         );
+        // PORT: not in Go. See `js_part`.
+        self.wait_for_js_part();
 
         let mut source_map_url_pos = -1;
         if let Some(generator) = &source_map_generator {
@@ -430,7 +437,7 @@ impl Emitter {
         let mut data = WriteFileData {
             source_map_url_pos,
             build_info: None,
-            diagnostics: self.emitter_diagnostics.get_diagnostics(),
+            diagnostics: self.write_data_diagnostics(),
             skipped_dts_write: false,
         };
         let result = self.write_text(js_file_path, &text, Some(&mut data));
@@ -451,6 +458,34 @@ impl Emitter {
 
         // Reset state
         self.writer().clear();
+    }
+
+    /// Waits for the JS part on the emit pool, if this emitter runs a d.ts
+    /// part (`js_part`). Go runs the JS part first on the same goroutine.
+    fn wait_for_js_part(&self) {
+        if let Some(js_part) = &self.js_part {
+            js_part.borrow_mut().wait();
+        }
+    }
+
+    /// Go `e.emitterDiagnostics.GetDiagnostics()` for `WriteFileData`. In Go
+    /// the collection also holds the diagnostics of the JS part when the
+    /// d.ts part writes; with the JS part on the emit pool they are added
+    /// here.
+    fn write_data_diagnostics(&self) -> Vec<Diagnostic> {
+        let Some(js_part) = &self.js_part else {
+            return self.emitter_diagnostics.get_diagnostics();
+        };
+        let mut js_part = js_part.borrow_mut();
+        js_part.wait();
+        let mut diagnostics = DiagnosticsCollection::default();
+        for diagnostic in js_part.diagnostics() {
+            diagnostics.add(diagnostic.clone());
+        }
+        for diagnostic in self.emitter_diagnostics.get_diagnostics() {
+            diagnostics.add(diagnostic);
+        }
+        diagnostics.get_diagnostics()
     }
 
     // Go: compiler/emitter.go:374 emitter.writeText
@@ -599,6 +634,78 @@ fn into_transformer(t: impl IntoTransformer) -> Option<TransformerBox> {
     t.into_transformer()
 }
 
+/// The choices Go `getScriptTransformers` makes from the options and the
+/// file before it builds the transformers.
+struct ScriptTransformChoice {
+    import_elision_enabled: bool,
+    jsx_transform_enabled: bool,
+    /// The emit resolver (the checker) is the reference resolver. Else the
+    /// binder reference resolver is.
+    emit_resolver_references: bool,
+}
+
+// Go: compiler/emitter.go:107 getScriptTransformers (its first lines)
+fn script_transform_choice(options: &CompilerOptions, source_file: Node) -> ScriptTransformChoice {
+    // JS files don't use reference calculations as they don't do import elision, no need to calculate it
+    let import_elision_enabled =
+        !options.verbatim_module_syntax.is_true() && !is_in_js_file(source_file);
+    let jsx_transform_enabled = options.get_jsx_transform_enabled()
+        && source_file_info(source_file).language_variant == LanguageVariant::JSX;
+    ScriptTransformChoice {
+        import_elision_enabled,
+        jsx_transform_enabled,
+        emit_resolver_references: import_elision_enabled
+            || jsx_transform_enabled
+            || !options.get_isolated_modules()
+            || options.emit_decorator_metadata.is_true(),
+    }
+}
+
+/// PORT: not in Go. True when the script transforms of `source_file` (its JS
+/// part) can call the emit resolver, which needs the file's checker. When
+/// false, the JS part runs on the program's emit pool (`program_emit`).
+///
+/// The script transforms reach the checker in these places only:
+/// - the emit resolver as the reference resolver, the import elision
+///   transform (with `MarkLinkedReferencesRecursively`), the JSX transform,
+///   decorator metadata and const enum inlining (all of them only when
+///   `script_transform_choice` picks the emit resolver);
+/// - `GetEnumMemberValue` for each member of an enum declaration (the
+///   runtime syntax transform).
+///
+/// The module transforms pass a nil resolver to
+/// `getExternalModuleNameLiteral`. The emit host of the pool has an emit
+/// resolver that panics on every call, so a use this rule misses crashes the
+/// run and cannot change an output.
+pub fn js_emit_needs_checker(source_file: Node) -> bool {
+    script_transform_choice(options(), source_file).emit_resolver_references
+        || may_have_enum_declaration(source_file)
+}
+
+/// PORT: not in Go. True when `source_file` may have an `EnumDeclaration`.
+/// The binder gives every enum declaration a symbol with an enum flag
+/// (`bind_enum_declaration`), so this scans the file's binder entries, which
+/// are fewer than its nodes, instead of walking its tree. A merged symbol
+/// (an enum and a namespace of one name) also counts, which only keeps a JS
+/// part on the checker thread. It is true for a file that is not bound.
+fn may_have_enum_declaration(source_file: Node) -> bool {
+    let (Some(node_bind), Some(symbols)) = (
+        crate::ast::go_file(source_file.file_index())
+            .node_bind
+            .get(),
+        prog().bound_symbols.get(),
+    ) else {
+        return true;
+    };
+    let is_enum = |symbol: SymbolId| {
+        symbol.is_some() && symbols.sym(symbol).flags.intersects(SymbolFlags::ENUM)
+    };
+    let (_, _, entries) = node_bind.parts();
+    entries
+        .iter()
+        .any(|entry| is_enum(entry.symbol) || is_enum(entry.local_symbol))
+}
+
 // Go: compiler/emitter.go:107 getScriptTransformers
 pub fn get_script_transformers(
     emit_context: &Rc<EmitContext>,
@@ -610,26 +717,18 @@ pub fn get_script_transformers(
     let mut tx: Vec<TransformerBox> = Vec::new();
     let options = options();
 
-    // JS files don't use reference calculations as they don't do import elision, no need to calculate it
-    let import_elision_enabled =
-        !options.verbatim_module_syntax.is_true() && !is_in_js_file(source_file);
-    let jsx_transform_enabled = options.get_jsx_transform_enabled()
-        && source_file_info(source_file).language_variant == LanguageVariant::JSX;
+    let ScriptTransformChoice {
+        import_elision_enabled,
+        jsx_transform_enabled,
+        emit_resolver_references,
+    } = script_transform_choice(options, source_file);
 
     let emit_resolver: Rc<dyn EmitResolver> = host.emit_resolver();
 
-    let reference_resolver: Rc<dyn TransformReferenceResolver> = if import_elision_enabled
-        || jsx_transform_enabled
-        || !options.get_isolated_modules()
-        || options.emit_decorator_metadata.is_true()
-    {
+    let reference_resolver: Rc<dyn TransformReferenceResolver> = if emit_resolver_references {
         Rc::new(EmitResolverReferenceResolver(emit_resolver.clone()))
     } else {
-        Rc::new(new_binder_reference_resolver(
-            options,
-            ReferenceResolverHooks::default(),
-            host.checker_index,
-        ))
+        Rc::new(new_binder_reference_resolver(options))
     };
 
     let opts = TransformOptions {

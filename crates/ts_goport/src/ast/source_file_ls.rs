@@ -154,7 +154,9 @@ pub fn source_file_get_or_create_token(
         );
     }
     // PORT: Go `if node.tokenCache == nil { make(...) }`: the thread-local map
-    // always exists.
+    // always exists. The cache outlives program versions, so the token
+    // belongs to the thread (`enter_base_synthetic_owner`).
+    let _base = enter_base_synthetic_owner();
     let token = create_token(kind, file, pos, end, flags);
     set_node_loc(token, loc);
     set_node_parent(token, parent);

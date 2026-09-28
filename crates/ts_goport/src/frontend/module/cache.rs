@@ -110,6 +110,22 @@ impl Caches {
             shared: None,
         }
     }
+
+    /// Drops the cached resolutions and package.json entries when no
+    /// program uses this resolver any more
+    /// (`NewProgram::release_resolver_caches`). A package.json cache that
+    /// another resolver shares stays.
+    // PORT: not in Go. Go's GC frees the resolver with its last program.
+    pub fn release(&self) {
+        let modules = std::mem::take(&mut *self.module_resolution_cache.cache.borrow_mut());
+        let type_ref_directives =
+            std::mem::take(&mut *self.type_ref_directive_resolution_cache.cache.borrow_mut());
+        let patterns = self.parsed_patterns_for_paths.borrow_mut().take();
+        drop((modules, type_ref_directives, patterns));
+        if Rc::strong_count(&self.package_json_info_cache) == 1 {
+            self.package_json_info_cache.clear();
+        }
+    }
 }
 
 // Go: module/cache.go:20 moduleResolutionCache and :40

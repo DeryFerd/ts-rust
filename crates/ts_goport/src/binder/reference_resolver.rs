@@ -4,8 +4,12 @@
 //! (`referenceResolver`). Here it is the struct `ReferenceResolver`.
 //! Go hook closures capture the checker. Here each hook is a plain function
 //! that takes the checker as its first argument, and each resolver method
-//! takes `c: &mut Checker` to pass to the hooks. The fallback name resolver
-//! (`crate::checker::NameResolver`) also needs the checker.
+//! takes `c: &mut H`, a `NameResolverHost`, to pass to the hooks and to the
+//! fallback name resolver (`crate::checker::NameResolver`). With hooks, the
+//! host is the checker (the checker's emit resolver). With no hooks, the host
+//! can be the program's binder symbols (JS emit, see
+//! `transformers::reference_resolver`), since Go then reads only binder
+//! symbols.
 
 use crate::prelude::*;
 
@@ -52,20 +56,20 @@ pub fn new_reference_resolver(
 
 impl ReferenceResolver {
     // Go: binder/referenceresolver.go:44 getResolvedSymbol
-    fn get_resolved_symbol(&self, c: &mut Checker, node: Node) -> SymbolId {
+    fn get_resolved_symbol<H: NameResolverHost>(&self, c: &mut H, node: Node) -> SymbolId {
         if node.is_some() {
             if let Some(get_resolved_symbol) = self.hooks.get_resolved_symbol {
-                return get_resolved_symbol(c, node);
+                return get_resolved_symbol(c.hook_checker(), node);
             }
         }
         SymbolId::NIL
     }
 
     // Go: binder/referenceresolver.go:53 getMergedSymbol
-    fn get_merged_symbol(&self, c: &mut Checker, symbol: SymbolId) -> SymbolId {
+    fn get_merged_symbol<H: NameResolverHost>(&self, c: &mut H, symbol: SymbolId) -> SymbolId {
         if symbol.is_some() {
             if let Some(get_merged_symbol) = self.hooks.get_merged_symbol {
-                return get_merged_symbol(c, symbol);
+                return get_merged_symbol(c.hook_checker(), symbol);
             }
             return symbol;
         }
@@ -73,21 +77,25 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:63 getParentOfSymbol
-    fn get_parent_of_symbol(&self, c: &mut Checker, symbol: SymbolId) -> SymbolId {
+    fn get_parent_of_symbol<H: NameResolverHost>(&self, c: &mut H, symbol: SymbolId) -> SymbolId {
         if symbol.is_some() {
             if let Some(get_parent_of_symbol) = self.hooks.get_parent_of_symbol {
-                return get_parent_of_symbol(c, symbol);
+                return get_parent_of_symbol(c.hook_checker(), symbol);
             }
-            return c.sym(symbol).parent;
+            return c.symbol_arena().sym(symbol).parent;
         }
         SymbolId::NIL
     }
 
     // Go: binder/referenceresolver.go:73 getSymbolOfDeclaration
-    fn get_symbol_of_declaration(&self, c: &mut Checker, declaration: Node) -> SymbolId {
+    fn get_symbol_of_declaration<H: NameResolverHost>(
+        &self,
+        c: &mut H,
+        declaration: Node,
+    ) -> SymbolId {
         if declaration.is_some() {
             if let Some(get_symbol_of_declaration) = self.hooks.get_symbol_of_declaration {
-                return get_symbol_of_declaration(c, declaration);
+                return get_symbol_of_declaration(c.hook_checker(), declaration);
             }
             return declaration.symbol();
         }
@@ -95,9 +103,9 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:83 getReferencedValueSymbol
-    fn get_referenced_value_symbol(
+    fn get_referenced_value_symbol<H: NameResolverHost>(
         &mut self,
-        c: &mut Checker,
+        c: &mut H,
         reference: Node,
         start_in_declaration_container: bool,
     ) -> SymbolId {
@@ -118,7 +126,7 @@ impl ReferenceResolver {
         let meaning = SymbolFlags::EXPORT_VALUE | SymbolFlags::VALUE | SymbolFlags::ALIAS;
         if let Some(resolve_name) = self.hooks.resolve_name {
             return resolve_name(
-                c,
+                c.hook_checker(),
                 location,
                 reference.text(),
                 meaning,
@@ -157,12 +165,21 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:107 isTypeOnlyAliasDeclaration
-    fn is_type_only_alias_declaration(&self, c: &mut Checker, symbol: SymbolId) -> bool {
+    fn is_type_only_alias_declaration<H: NameResolverHost>(
+        &self,
+        c: &mut H,
+        symbol: SymbolId,
+    ) -> bool {
         if symbol.is_some() {
             if let Some(get_type_only_alias_declaration) =
                 self.hooks.get_type_only_alias_declaration
             {
-                return get_type_only_alias_declaration(c, symbol, SymbolFlags::VALUE).is_some();
+                return get_type_only_alias_declaration(
+                    c.hook_checker(),
+                    symbol,
+                    SymbolFlags::VALUE,
+                )
+                .is_some();
             }
 
             let mut node = self.get_declaration_of_alias_symbol(c, symbol);
@@ -193,8 +210,13 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:134 getDeclarationOfAliasSymbol
-    fn get_declaration_of_alias_symbol(&self, c: &Checker, symbol: SymbolId) -> Node {
-        c.sym(symbol)
+    fn get_declaration_of_alias_symbol<H: NameResolverHost>(
+        &self,
+        c: &H,
+        symbol: SymbolId,
+    ) -> Node {
+        c.symbol_arena()
+            .sym(symbol)
             .declarations
             .iter()
             .rev()
@@ -204,21 +226,20 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:138 getExportSymbolOfValueSymbolIfExported
-    fn get_export_symbol_of_value_symbol_if_exported(
+    fn get_export_symbol_of_value_symbol_if_exported<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         mut symbol: SymbolId,
     ) -> SymbolId {
         if symbol.is_some() {
             if let Some(get_export_symbol_of_value_symbol_if_exported) =
                 self.hooks.get_export_symbol_of_value_symbol_if_exported
             {
-                return get_export_symbol_of_value_symbol_if_exported(c, symbol);
+                return get_export_symbol_of_value_symbol_if_exported(c.hook_checker(), symbol);
             }
-            if c.sym(symbol).flags.intersects(SymbolFlags::EXPORT_VALUE)
-                && c.sym(symbol).export_symbol.is_some()
-            {
-                symbol = c.sym(symbol).export_symbol;
+            let data = c.symbol_arena().sym(symbol);
+            if data.flags.intersects(SymbolFlags::EXPORT_VALUE) && data.export_symbol.is_some() {
+                symbol = data.export_symbol;
             }
             return self.get_merged_symbol(c, symbol);
         }
@@ -226,9 +247,9 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:151 GetReferencedExportContainer
-    pub fn get_referenced_export_container(
+    pub fn get_referenced_export_container<H: NameResolverHost>(
         &mut self,
-        c: &mut Checker,
+        c: &mut H,
         node: Node,
         prefix_locals: bool,
     ) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/ {
@@ -242,13 +263,17 @@ impl ReferenceResolver {
             && node == node.parent().name();
         let mut symbol = self.get_referenced_value_symbol(c, node, start_in_declaration_container);
         if symbol.is_some() {
-            if c.sym(symbol).flags.intersects(SymbolFlags::EXPORT_VALUE) {
+            if c.symbol_arena()
+                .sym(symbol)
+                .flags
+                .intersects(SymbolFlags::EXPORT_VALUE)
+            {
                 // If we reference an exported entity within the same module declaration, then whether
                 // we prefix depends on the kind of entity. SymbolFlags.ExportHasLocal encompasses all the
                 // kinds that we do NOT prefix.
-                let export_symbol = c.sym(symbol).export_symbol;
+                let export_symbol = c.symbol_arena().sym(symbol).export_symbol;
                 let export_symbol = self.get_merged_symbol(c, export_symbol);
-                let export_flags = c.sym(export_symbol).flags;
+                let export_flags = c.symbol_arena().sym(export_symbol).flags;
                 if !prefix_locals
                     && export_flags.intersects(SymbolFlags::EXPORT_HAS_LOCAL)
                     && !export_flags.intersects(SymbolFlags::VARIABLE)
@@ -259,8 +284,10 @@ impl ReferenceResolver {
             }
             let parent_symbol = self.get_parent_of_symbol(c, symbol);
             if parent_symbol.is_some() {
-                let parent_value_declaration = c.sym(parent_symbol).value_declaration;
-                if c.sym(parent_symbol)
+                let parent_value_declaration =
+                    c.symbol_arena().sym(parent_symbol).value_declaration;
+                if c.symbol_arena()
+                    .sym(parent_symbol)
                     .flags
                     .intersects(SymbolFlags::VALUE_MODULE)
                     && parent_value_declaration.is_some()
@@ -288,14 +315,21 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:190 GetReferencedImportDeclaration
-    pub fn get_referenced_import_declaration(&mut self, c: &mut Checker, node: Node) -> Node {
+    pub fn get_referenced_import_declaration<H: NameResolverHost>(
+        &mut self,
+        c: &mut H,
+        node: Node,
+    ) -> Node {
         let symbol =
             self.get_referenced_value_symbol(c, node, false /*startInDeclarationContainer*/);
         if symbol.is_some() {
             // We should only get the declaration of an alias if there isn't a local value
             // declaration for the symbol
-            if is_non_local_alias(&c.symbols, symbol, SymbolFlags::VALUE /*excludes*/)
-                && !self.is_type_only_alias_declaration(c, symbol)
+            if is_non_local_alias(
+                c.symbol_arena(),
+                symbol,
+                SymbolFlags::VALUE, /*excludes*/
+            ) && !self.is_type_only_alias_declaration(c, symbol)
             {
                 return self.get_declaration_of_alias_symbol(c, symbol);
             }
@@ -305,24 +339,32 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:202 GetReferencedValueDeclaration
-    pub fn get_referenced_value_declaration(&mut self, c: &mut Checker, node: Node) -> Node {
+    pub fn get_referenced_value_declaration<H: NameResolverHost>(
+        &mut self,
+        c: &mut H,
+        node: Node,
+    ) -> Node {
         let symbol =
             self.get_referenced_value_symbol(c, node, false /*startInDeclarationContainer*/);
         if symbol.is_some() {
             let symbol = self.get_export_symbol_of_value_symbol_if_exported(c, symbol);
-            return c.sym(symbol).value_declaration;
+            return c.symbol_arena().sym(symbol).value_declaration;
         }
         Node::NIL
     }
 
     // Go: binder/referenceresolver.go:209 GetReferencedValueDeclarations
-    pub fn get_referenced_value_declarations(&mut self, c: &mut Checker, node: Node) -> Vec<Node> {
+    pub fn get_referenced_value_declarations<H: NameResolverHost>(
+        &mut self,
+        c: &mut H,
+        node: Node,
+    ) -> Vec<Node> {
         let mut declarations = Vec::new();
         let symbol =
             self.get_referenced_value_symbol(c, node, false /*startInDeclarationContainer*/);
         if symbol.is_some() {
             let symbol = self.get_export_symbol_of_value_symbol_if_exported(c, symbol);
-            for &declaration in &c.sym(symbol).declarations {
+            for &declaration in &c.symbol_arena().sym(symbol).declarations {
                 match declaration.kind() {
                     SyntaxKind::VariableDeclaration
                     | SyntaxKind::Parameter
@@ -350,12 +392,16 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:240 GetElementAccessExpressionName
-    pub fn get_element_access_expression_name(&self, c: &mut Checker, expression: Node) -> String {
+    pub fn get_element_access_expression_name<H: NameResolverHost>(
+        &self,
+        c: &mut H,
+        expression: Node,
+    ) -> String {
         if expression.is_some() {
             if let Some(get_element_access_expression_name) =
                 self.hooks.get_element_access_expression_name
             {
-                let (name, ok) = get_element_access_expression_name(c, expression);
+                let (name, ok) = get_element_access_expression_name(c.hook_checker(), expression);
                 if ok {
                     return name;
                 }
@@ -365,7 +411,11 @@ impl ReferenceResolver {
     }
 
     // Go: binder/referenceresolver.go:251 GetReferencedMemberValueDeclaration
-    pub fn get_referenced_member_value_declaration(&self, c: &mut Checker, node: Node) -> Node {
+    pub fn get_referenced_member_value_declaration<H: NameResolverHost>(
+        &self,
+        c: &mut H,
+        node: Node,
+    ) -> Node {
         // member references are `this.something` or `this[something]`, so should always simply have a resolved symbol
         let mut s = self.get_resolved_symbol(c, node);
         if s.is_nil() && node.symbol().is_some() {
@@ -376,6 +426,6 @@ impl ReferenceResolver {
             return Node::NIL;
         }
         let s = self.get_export_symbol_of_value_symbol_if_exported(c, s);
-        c.sym(s).value_declaration
+        c.symbol_arena().sym(s).value_declaration
     }
 }

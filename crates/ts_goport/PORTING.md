@@ -208,6 +208,15 @@ methods reach the AST through it.
   only, loads it once with `parsed_node_data` for the `_in` reads
   (`data_accessor!`). `Node::bind()` returns the binder data by value, and
   the text of a synthetic node is interned (`Name`).
+- Synthetic node owners (`ast/synthetic.rs`): on the language server
+  dispatch thread, each program version owns the synthetic nodes, lists
+  and data writes made while it is current, and its release frees them
+  (`open_synthetic_owner`, `free_synthetic_owner`). A freed handle panics
+  on read and is never given to another node. Code whose synthetic nodes
+  a cache keeps across program versions (token cache, lazy JSDoc, parses,
+  files published outside a program) opens `enter_base_synthetic_owner()`
+  so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
+  off.
 - Store columns and the other registry tables of a published file are read
   through one file lookup (`frozen_of` in `ast/store.rs`), not
   `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
@@ -232,11 +241,12 @@ The batch that adds it is not accepted until Theo approves.
   from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
-- `program::release_program` frees the checker pool and the frontend of a
-  version. Each checker worker frees its checker and the synthetic nodes
-  it made (`free_synthetic_nodes`). The program shell and the file
-  versions stay leaked for now. A one-program process forgets its
-  checkers and their synthetic nodes at the end, like Go.
+- `program::release_program` frees the checker pool, the emit pool and the
+  frontend of a version. Each checker worker frees its checker and the
+  synthetic nodes it made (`free_synthetic_nodes`), and each emit thread
+  frees its synthetic nodes. The program shell and the file versions stay
+  leaked for now. A one-program process forgets its checkers and the
+  synthetic nodes of both pools at the end, like Go.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
@@ -254,9 +264,10 @@ The batch that adds it is not accepted until Theo approves.
   (`program::release_program_in_background`). So the pools of up to 4
   started projects work at the same time, like Go's goroutines. The
   started projects still emit one at a time in build order, and a
-  project's emit runs on its own checker threads only: the emit resolver
-  needs the file's checker, which lives on its worker thread, and
-  synthetic nodes are thread-local (`ast/synthetic.rs`).
+  project's emit runs on its own checker threads and its own emit pool
+  (see Threads): the emit resolver needs the file's checker, which lives
+  on its worker thread, and synthetic nodes are thread-local
+  (`ast/synthetic.rs`).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -325,6 +336,47 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   runs each file on its checker's thread with no checker borrowed
   (`program::run_on_checker_threads_for_files`); the emit resolver borrows
   the checker itself.
+- Each program also has an emit pool (not in Go; `program::send_emit_pool_jobs`):
+  up to 32 threads with no checker, one per core, made on the first emit
+  that uses it. There is no pool when the cores are not more than the
+  checkers: then it has no spare core and only slows the checker threads.
+  The JS part of a file goes there when its transforms make no checker
+  call (`emitter::emitter::js_emit_needs_checker`: Go's binder
+  reference resolver case of `getScriptTransformers`, and no enum in the
+  file). The d.ts part, and a JS part that needs the checker, stay on the
+  checker thread, so each checker gets the same calls in the same order.
+  The pool's emit resolver panics on every call
+  (`emitter::no_checker`), so a wrong rule ends the run (exit 70) and
+  cannot change an output. The binder reference resolver reads the
+  program's binder symbols (`transformers::reference_resolver::BinderSymbols`),
+  on every thread. A d.ts part waits for its file's JS part before it
+  writes, so a file's outputs are written in Go's order. The pool is off
+  with `--singleThreaded`, `--generateTrace`, an emit called on a checker
+  thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count,
+  also when no core is spare).
+  With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
+  moves no JS part runs as with the pool off and makes no pool. The
+  language server does not emit through `program_emit`.
+- `tsc -p` with an incremental program starts its emit with the check (not
+  in Go; `incremental::Program::start_check_and_emit`). Go waits for the
+  whole check, reads the global diagnostics again, then emits. Here the
+  loading thread sends each checker its check job, its global diagnostics
+  job and its emit jobs in that order, with no wait between them, and the
+  pool jobs go out at the same time. Each checker thread runs the same jobs
+  in the same order as with the waits, so each checker emits when its own
+  check ends and the pool emits the JS parts during the check. All state
+  that emit writes is per thread, per checker, per emit, loading thread
+  only or a pure cache, except the file system: a check can probe files
+  (the TS2834/TS2835 import extension suggestion, module specifiers in type
+  text). `program_emit::emit_can_start_with_check` starts early only when
+  no such probe can reach an output (no extensionless relative import in a
+  checked file with node16 or nodenext, no program file in `outDir` or
+  `declarationDir`, no `node_modules` in them, no `preserveSymlinks`, no
+  `outFile`). `noEmit`, `noEmitOnError`, `--singleThreaded`, a trace and
+  `GOPORT_EARLY_EMIT=0` keep Go's order. `tsc -b`, watch, the plain
+  program and the goport bins do not start early. With the early start,
+  `--extendedDiagnostics` "Check time" is the wait for the check and "Emit
+  time" the wait for the rest of the emit after it.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,
@@ -333,7 +385,10 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 
 ## Release builds
 
-- Build release binaries with the workspace `goport` profile:
+- Correctness evidence (gate, bound runs, sweeps, corpus, oracle checks) uses
+  plain `--release`: `scripts/run-cargo-capped.sh build --release -p ts_goport --bins`.
+  Fat LTO does not change output, and it costs 7 to 20 minutes per build.
+- Timing and shipped binaries use the workspace `goport` profile:
   `scripts/run-cargo-capped.sh build --profile goport -p ts_goport --bins`.
   It inherits `release` and adds `lto = "fat"` and `codegen-units = 1`.
   Other crates keep the default release settings. The binaries land in
@@ -356,6 +411,10 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   elysia) adds up to 3 parse workers at 8 or more cores, and the budget
   has one spare arena for each (9 in `goport`, 10 in `tsgo`). The bind
   mallocs little: a large program binds on 8 threads, which share arenas.
+  When the process may run on 16 or more physical cores (the CPUs of
+  `Cpus_allowed_list` with SMT siblings counted once), a large program
+  parses on 16 threads (15 workers) and binds on 16 threads; the arenas do
+  not change.
   A program that is not large (query) binds on 4 threads when there are
   spare arenas, so its bind threads take the arenas of the ended parse
   workers and it makes no more arenas than with 6 or 7 (query at 16
@@ -598,10 +657,20 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   `ls.enter_program()` for each. A checker from a pool of its own gets its
   guard with `ProgramGuard::with_release`.
 - Release: `ls_program::release_program(p)` is Go's program drop (the
-  snapshot `programCounter.Deref`). It frees the checker pools of `p` and
-  its program version now, or when the last guard of `p` drops. The
-  `NewProgram`, the `GoProgram` shell and the file versions stay leaked
-  (multi-program M2, M3).
+  snapshot `programCounter.Deref`). It frees the checker pools of `p`, its
+  program version and the synthetic nodes that the dispatch thread made
+  while the version was current, now or when the last guard of `p` drops.
+  The `NewProgram`, the `GoProgram` shell and the file versions stay leaked
+  (multi-program M2, M3). A compiler host drops its data
+  (`CompilerHost::release`, not in Go) when no live program uses it. A
+  program uses its own host and the host of the load that made its files:
+  a clone shares the old program's processed files (Go `UpdateProgram`),
+  whose resolver reads that load's host. When that load host has no live
+  program, the load's resolver caches go too
+  (`NewProgram::release_resolver_caches`).
+- Parse workers (`CompilerHost::prefetch_parses`, not in Go) run only for
+  the first program load of a project. A later load gets its files from
+  the parse cache.
 - Go `*ast.SourceFile` is `Node` (the file root). An `Rc<ParsedSourceFile>`
   from a `NewProgram` method becomes `file.root`.
 - Go `p.X(..)` on a program: call `NewProgram::x` when it exists; else

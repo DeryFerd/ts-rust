@@ -17,6 +17,7 @@ use crate::gostd::timer;
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -535,7 +536,9 @@ pub type AfterFuncStop = Arc<dyn Fn() -> bool + Send + Sync>;
 /// or f was already stopped.
 /// The stop function does not wait for f to complete before returning.
 ///
-/// PORT: `f` runs on a new thread, so it may only touch `Send` data.
+/// PORT: `f` runs on a new OS thread, so it may only touch `Send` data.
+/// A thread is much more costly than a goroutine: do not call this once per
+/// request (see `CheckerPool::register_request_cleanup`).
 pub fn after_func<F: FnOnce() + Send + 'static>(ctx: &Context, f: F) -> AfterFuncStop {
     let a = Arc::new(AfterFuncCtx {
         cancel_ctx: CancelCtx::new(ctx.clone()),
@@ -554,6 +557,10 @@ pub fn after_func<F: FnOnce() + Send + 'static>(ctx: &Context, f: F) -> AfterFun
         stopped
     })
 }
+
+/// The number of threads that `after_func` callbacks have started in this
+/// process. Tests read it to check that a code path starts no thread.
+pub static AFTER_FUNC_GOROUTINES: AtomicUsize = AtomicUsize::new(0);
 
 // Go: context/context.go:342 afterFuncer
 // PORT: only custom Context implementations have an AfterFunc method; the
@@ -575,6 +582,7 @@ impl Canceler for AfterFuncCtx {
         }
         self.once.call_once(|| {
             if let Some(f) = lock(&self.f).take() {
+                AFTER_FUNC_GOROUTINES.fetch_add(1, Ordering::Relaxed);
                 go(f);
             }
         });

@@ -1,11 +1,15 @@
 //! Port of Go `internal/project/session_test.go` (`TestSession`).
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use ts_goport::frontend::tspath;
+use ts_goport::frontend::vfs::{Replacements, wrapvfs_wrap};
 use ts_goport::ls::lsutil;
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
+use ts_goport::project::{self, Session, SessionInit, SessionOptions};
 
 use super::projecttestutil::{self, FileMap, files};
 use super::util::*;
@@ -1430,5 +1434,122 @@ child_test! {
             "/home/projects/TS/p1/tsconfig.json",
             "TS file should belong to tsconfig.json project"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-import warm (no Go counterpart)
+// ---------------------------------------------------------------------------
+
+/// The names of the exports in the node_modules buckets of the session's
+/// auto-import registry.
+fn node_modules_export_names(session: &Rc<Session>) -> BTreeSet<String> {
+    let registry = session
+        .snapshot()
+        .auto_import_registry()
+        .expect("auto import registry");
+    let mut names = BTreeSet::new();
+    for bucket in registry.node_modules.values() {
+        if let Some(index) = &bucket.index {
+            names.extend(index.borrow().entries.iter().map(|export| export.name()));
+        }
+    }
+    names
+}
+
+child_test! {
+    // PORT: no Go counterpart. The auto-import warm runs on the dispatch
+    // thread, and its registry build stops at extra points when a file event
+    // cancels it (`registry::DISCARD_ON_CANCEL_KEY`). Here it stops in the
+    // file walk of the alias checker. The warm drops the whole clone, as Go's
+    // does (session.go:1844), so the session snapshot and its registry stay
+    // as they were, and a later request builds the whole index.
+    fn cancelled_auto_import_warm_leaves_snapshot_and_registry_unchanged() {
+        const INDEX_URI: &str = "file:///home/projects/app/index.ts";
+        // Only the alias checker of the warm reads this file: foo's
+        // entrypoint re-exports it, and the program does not include it.
+        const OTHER: &str = "/home/projects/node_modules/foo/other.d.ts";
+        let (_, map_fs) = projecttestutil::wrapped_map_fs(
+            files(&[
+                ("/home/projects/app/tsconfig.json", "{}"),
+                ("/home/projects/app/index.ts", ""),
+                ("/home/projects/node_modules/foo/package.json", r#"{ "types": "index.d.ts" }"#),
+                (
+                    "/home/projects/node_modules/foo/index.d.ts",
+                    "export const foo = 0;\nexport * from \"./other\";",
+                ),
+                (OTHER, "export declare const bar: number;"),
+            ]),
+            false, /*useCaseSensitiveFileNames*/
+        );
+        // Runs once, when the file system first reads OTHER.
+        let on_read_other: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::default();
+        let fs = {
+            let inner = map_fs.clone();
+            let on_read_other = on_read_other.clone();
+            wrapvfs_wrap(
+                map_fs,
+                Replacements {
+                    read_file: Some(Box::new(move |path: &str| {
+                        if path == OTHER {
+                            let hook = on_read_other.borrow_mut().take();
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
+                        inner.read_file(path)
+                    })),
+                    ..Default::default()
+                },
+            )
+        };
+        // The options of `bare_session`.
+        let session = project::new_session(&SessionInit {
+            background_ctx: bg(),
+            options: Rc::new(SessionOptions {
+                watch_enabled: false,
+                logging_enabled: false,
+                ..projecttestutil::session_options("/")
+            }),
+            fs,
+            client: None,
+            logger: None,
+            npm_executor: None,
+            parse_cache: None,
+        });
+
+        open(&session, INDEX_URI, "");
+        session.wait_for_background_tasks();
+        // A change of one open file queues a warm (Go warmAutoImportCache).
+        edit(&session, INDEX_URI, 2, (0, 0), (0, 0), "let a = 1;");
+        let _ = language_service(&session, INDEX_URI);
+        let before = session.snapshot();
+        let registry_before = before.auto_import_registry().expect("auto import registry");
+        let stats_before = format!("{:?}", registry_before.get_cache_stats());
+
+        // A file event arrives while the warm reads OTHER (Go DidChangeFile
+        // cancels the warm).
+        let weak = Rc::downgrade(&session);
+        *on_read_other.borrow_mut() = Some(Box::new(move || {
+            if let Some(session) = weak.upgrade() {
+                session.cancel_warm_auto_import_cache();
+            }
+        }));
+        session.wait_for_background_tasks();
+        assert!(on_read_other.borrow().is_none(), "the warm did not read {OTHER}");
+
+        let after = session.snapshot();
+        assert!(Rc::ptr_eq(&after, &before), "the cancelled warm changed the snapshot");
+        let registry_after = after.auto_import_registry().expect("auto import registry");
+        assert!(Rc::ptr_eq(&registry_after, &registry_before));
+        assert_eq!(format!("{:?}", registry_after.get_cache_stats()), stats_before);
+
+        // The warm left no partial state: a request builds the whole index.
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri(INDEX_URI))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        let names = node_modules_export_names(&session);
+        assert!(names.contains("foo") && names.contains("bar"), "{names:?}");
+        session.close();
     }
 }

@@ -7,14 +7,15 @@
 //! the timer tests in `synctest` bubbles; the idle-cleanup timer here is a
 //! `gostd::local` timer that only fires in `run_pending`, so the tests
 //! that wait for it (`IdleCleanup`, `FileAssociationCleanup`,
-//! `StaggeredIdleCleanup`, `RequestAssociationCleanupOnContextDone`,
-//! `DiagnosticsRecreatedAfterIdleDisposal`, `CrossReleaseAffinityWithContention`)
-//! are not ported, and the long fake sleeps of the other tests are left
-//! out. `DoubleReleaseSafe` can not be written: `Release::call` takes
-//! `self`. Go `synctest.Wait()` has nothing to wait for on one thread.
+//! `StaggeredIdleCleanup`, `DiagnosticsRecreatedAfterIdleDisposal`,
+//! `CrossReleaseAffinityWithContention`) are not ported, and the long fake
+//! sleeps of the other tests are left out. `DoubleReleaseSafe` can not be
+//! written: `Release::call` takes `self`. Go `synctest.Wait()` has nothing
+//! to wait for on one thread.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ts_goport::checker::Checker;
@@ -259,6 +260,57 @@ child_test! {
         );
         // Go: defer reqCancel()
         req_cancel();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:375 TestCheckerPoolRequestAssociationCleanupOnContextDone
+    // PORT: Go waits for the AfterFunc goroutine with `synctest.Wait()`. The
+    // port runs the delete at the next `mu_lock` and starts no thread. The
+    // live second request is port-only.
+    fn request_association_cleanup_on_context_done() {
+        let (_session, pool) = test_pool(opts(2, 10), opts(4, 30));
+        let threads_before = context::AFTER_FUNC_GOROUTINES.load(Ordering::Relaxed);
+
+        // Create a cancellable context to simulate request lifecycle.
+        let (req_ctx, req_cancel) = context::with_cancel(&bg());
+        let ctx = req(&req_ctx, "ctx-cleanup-req", CheckerLifetime::TEMPORARY);
+        let (live_ctx, live_cancel) = context::with_cancel(&bg());
+        let live = req(&live_ctx, "live-req", CheckerLifetime::TEMPORARY);
+
+        let (_c, release) = pool.get_checker(&ctx, NIL);
+        release.call();
+        let (live_c, live_release) = pool.get_checker(&live, NIL);
+        live_release.call();
+
+        // Association should still exist after release.
+        pool.mu_lock();
+        assert!(
+            pool.request_associations.borrow().contains_key("ctx-cleanup-req"),
+            "request association should persist after release"
+        );
+
+        // Cancel the request context — association should be cleaned up.
+        req_cancel();
+        pool.mu_lock();
+        assert!(
+            !pool.request_associations.borrow().contains_key("ctx-cleanup-req"),
+            "request association should be cleaned up after context cancellation"
+        );
+
+        // The live request keeps its association and its checker.
+        let (live_again, live_release) = pool.get_checker(&live, NIL);
+        assert!(same(&live_again, &live_c), "a live request should keep its checker");
+        live_release.call();
+        live_cancel();
+        pool.mu_lock();
+        assert!(pool.request_associations.borrow().is_empty());
+
+        assert_eq!(
+            context::AFTER_FUNC_GOROUTINES.load(Ordering::Relaxed),
+            threads_before,
+            "request cleanup should start no thread"
+        );
     }
 }
 

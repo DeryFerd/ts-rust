@@ -72,6 +72,8 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
     new_ref_count_cache(
         options,
         |key: &ParseCacheKey, fh: Rc<dyn FileHandle>| -> HashedSourceFile {
+            // Program versions share the parse, so its nodes belong to the thread.
+            let _base = crate::ast::enter_base_synthetic_owner();
             let opts = key.source_file_parse_options();
             let content = fh.content();
             // PORT: during a program load a parse worker (`FilesParser`
