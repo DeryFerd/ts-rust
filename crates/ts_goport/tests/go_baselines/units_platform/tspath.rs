@@ -845,7 +845,44 @@ fn test_to_file_name_lower_case() {
     );
 }
 
-// Go: path_test.go:575 TestToPath
+// Go: path_test.go:591 TestTrimFilePathPrefix (tsgo#4900)
+// PORT: Go returns `path, false` on a mismatch; the Rust port returns `None`.
+#[test]
+fn test_trim_file_path_prefix() {
+    // case-sensitive exact match
+    assert_eq!(
+        tspath::trim_file_path_prefix("/project/src/file.ts", "/project/src", true).as_deref(),
+        Some("/file.ts")
+    );
+    // case-sensitive mismatch
+    assert_eq!(
+        tspath::trim_file_path_prefix("/project/SRC/file.ts", "/project/src", true),
+        None
+    );
+    // case-insensitive match
+    assert_eq!(
+        tspath::trim_file_path_prefix("/project/SRC/file.ts", "/project/src", false).as_deref(),
+        Some("/file.ts")
+    );
+    // no match
+    assert_eq!(
+        tspath::trim_file_path_prefix("/other/file.ts", "/project/src", false),
+        None
+    );
+    // case-folding shrinks prefix byte length without changing rune count:
+    // each Kelvin sign '\u212A' case-folds to the single-byte 'k'.
+    assert_eq!(
+        tspath::trim_file_path_prefix("/kkk/a.ts", "/\u{212A}\u{212A}\u{212A}", false).as_deref(),
+        Some("/a.ts")
+    );
+    // path equal to prefix
+    assert_eq!(
+        tspath::trim_file_path_prefix("/project/src", "/project/src", true).as_deref(),
+        Some("")
+    );
+}
+
+// Go: path_test.go:644 TestToPath
 #[test]
 fn test_to_path() {
     assert_eq!(

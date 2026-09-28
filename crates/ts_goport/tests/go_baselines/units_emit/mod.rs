@@ -1,6 +1,6 @@
 //! Rust ports of the Go compiler, emit and language service unit tests
 //! (sub-track S3): ast, scanner, parser, sourcemap, module,
-//! modulespecifiers, compiler, checker, execute/build, execute/tsc, printer,
+//! modulespecifiers, outputpaths, compiler, checker, execute/build, execute/tsc, printer,
 //! transformers/tstransforms, ls, ls/lsconv and ls/lsutil, with the Go test
 //! helpers testutil/parsetestutil and testutil/emittestutil.
 //!
@@ -27,6 +27,7 @@ mod execute_tests;
 mod ls_tests;
 mod ls_userprefs;
 mod module_tests;
+mod outputpaths_tests;
 mod parsetestutil;
 mod printer_emit;
 mod printer_misc;

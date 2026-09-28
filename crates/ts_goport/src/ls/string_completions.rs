@@ -1360,24 +1360,20 @@ impl LanguageService {
     }
 }
 
-// Go: ls/string_completions.go:969 tryRemoveDirectoryPrefix
+// Go: ls/string_completions.go:992 tryRemoveDirectoryPrefix
+// tsgo#4900: `TrimFilePathPrefix` cuts the prefix by runes, not by its byte
+// length.
 fn try_remove_directory_prefix(
     path: &str,
     prefix: &str,
     use_case_sensitive_file_names: bool,
 ) -> Option<String> {
-    let canonical_path = tspath::get_canonical_file_name(path, use_case_sensitive_file_names);
-    let canonical_prefix = tspath::get_canonical_file_name(prefix, use_case_sensitive_file_names);
-    if canonical_path.starts_with(canonical_prefix.as_str()) {
-        // PORT: Go `path[len(prefix):]` cuts bytes; see the file header.
-        let mut without_prefix =
-            String::from_utf8_lossy(&path.as_bytes()[prefix.len()..]).into_owned();
-        if without_prefix.starts_with('/') || without_prefix.starts_with('\\') {
-            without_prefix = without_prefix[1..].to_string();
-        }
-        return Some(without_prefix);
+    let without_prefix =
+        tspath::trim_file_path_prefix(path, prefix, use_case_sensitive_file_names)?;
+    if without_prefix.starts_with('/') || without_prefix.starts_with('\\') {
+        return Some(without_prefix[1..].to_string());
     }
-    None
+    Some(without_prefix.into_owned())
 }
 
 impl LanguageService {
@@ -2925,5 +2921,24 @@ impl LanguageService {
         };
 
         add_replacement_spans(to_complete, found_range.pos() + prefix.len() as i32, names)
+    }
+}
+
+// Go: ls/string_completions_test.go (tsgo#4900)
+#[cfg(test)]
+mod tests {
+    use super::try_remove_directory_prefix;
+
+    // Go: ls/string_completions_test.go:17 TestTryRemoveDirectoryPrefixCaseFoldingShrinksPrefix
+    // Each Kelvin sign '\u212A' below case-folds to the single-byte 'k', so the raw
+    // prefix is longer in bytes (15) than path (12), even though path's canonical
+    // form is case-insensitively prefixed by prefix's canonical form.
+    #[test]
+    fn test_try_remove_directory_prefix_case_folding_shrinks_prefix() {
+        let prefix = "/a/\u{212A}\u{212A}\u{212A}\u{212A}";
+        let path = "/a/kkkk/x.ts";
+        let actual =
+            try_remove_directory_prefix(path, prefix, false /*useCaseSensitiveFileNames*/);
+        assert_eq!(actual.as_deref(), Some("x.ts"));
     }
 }

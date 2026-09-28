@@ -3,6 +3,7 @@
 use crate::frontend::prelude::*;
 
 use crate::gostd::unicode;
+use std::borrow::Cow;
 
 // Go: tspath/path.go:13 Path
 // PORT: Go `type Path string`. A newtype keeps the Go method set
@@ -805,6 +806,75 @@ pub fn get_canonical_file_name(file_name: &str, use_case_sensitive_file_names: b
         return file_name.to_string();
     }
     to_file_name_lower_case(file_name)
+}
+
+// Go: tspath/path.go:629 TrimFilePathPrefix (tsgo#4900)
+// TrimFilePathPrefix removes prefix from the start of path, honoring
+// useCaseSensitiveFileNames the same way GetCanonicalFileName does. It returns
+// the remainder of path if path starts with prefix.
+//
+// This must not slice path using len(prefix): case-folding (as performed by
+// GetCanonicalFileName) can change a string's UTF-8 byte length without
+// changing its rune count (e.g. the Kelvin sign '\u212A' case-folds to the
+// single-byte 'k'), so path and prefix can disagree in byte length even when
+// one is (a case-insensitive match for) a prefix of the other.
+// PORT: Go returns `path, false` when path does not start with prefix; this
+// returns `None`. `path` and `prefix` are port forms (see
+// `scanner_util::GO_STRING_MARKER`): the test and the cut use the Go bytes,
+// and the remainder is in the value form (`go_slice`).
+pub fn trim_file_path_prefix<'a>(
+    path: &'a str,
+    prefix: &str,
+    use_case_sensitive_file_names: bool,
+) -> Option<Cow<'a, str>> {
+    if use_case_sensitive_file_names {
+        if !go_has_prefix(path, prefix) {
+            return None;
+        }
+        return Some(go_slice(path, go_len(prefix), go_len(path)));
+    }
+    let canonical_prefix =
+        get_canonical_file_name(prefix, false /*useCaseSensitiveFileNames*/);
+    if !go_has_prefix(
+        &get_canonical_file_name(path, false /*useCaseSensitiveFileNames*/),
+        &canonical_prefix,
+    ) {
+        return None;
+    }
+    Some(trim_rune_count(
+        path,
+        go_rune_count_in_string(&canonical_prefix),
+    ))
+}
+
+// Go: tspath/path.go:642 trimRuneCount (tsgo#4900)
+// trimRuneCount returns the suffix of s after skipping up to runeCount runes,
+// clamping to the end of s if it has fewer runes than runeCount.
+// PORT: Go decodes the bytes of `s`, so a byte that is not valid UTF-8 is one
+// rune. This decodes the Go bytes of the port form the same way.
+fn trim_rune_count(s: &str, rune_count: usize) -> Cow<'_, str> {
+    let bytes = go_string_bytes(s);
+    let mut i = 0;
+    for _ in 0..rune_count {
+        if i >= bytes.len() {
+            break;
+        }
+        i += go_decode_rune_bytes(&bytes[i..]).1;
+    }
+    go_slice(s, i, bytes.len())
+}
+
+// PORT: Go `utf8.RuneCountInString` on the Go bytes of the port form `s`:
+// each byte that is not valid UTF-8 is one rune.
+fn go_rune_count_in_string(s: &str) -> usize {
+    let bytes = go_string_bytes(s);
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() {
+        i += go_decode_rune_bytes(&bytes[i..]).1;
+        count += 1;
+    }
+    count
 }
 
 // Go: tspath/path.go:638 ToFileNameLowerCase

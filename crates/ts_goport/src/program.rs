@@ -3485,7 +3485,9 @@ fn source_file_may_be_emitted_worker(
     true
 }
 
-// Go: outputpaths/outputpaths.go GetSourceFilePathInNewDirWorker
+// Go: outputpaths/outputpaths.go:175 GetSourceFilePathInNewDirWorker
+// tsgo#4900: `TrimFilePathPrefix` cuts the common source directory by runes,
+// not by its byte length.
 fn get_source_file_path_in_new_dir_worker(
     file_name: &str,
     new_dir_path: &str,
@@ -3493,14 +3495,16 @@ fn get_source_file_path_in_new_dir_worker(
     common_source_directory: &str,
     case_sensitivity: CaseSensitivity,
 ) -> String {
-    let mut source_file_path = ts_path::resolve_path(current_directory, &[file_name]);
+    let source_file_path = ts_path::resolve_path(current_directory, &[file_name]);
     let common = ts_path::ensure_trailing_directory_separator(common_source_directory);
-    let is_in_common = ts_path::canonical_file_name(&source_file_path, case_sensitivity)
-        .starts_with(&ts_path::canonical_file_name(&common, case_sensitivity));
-    if is_in_common {
-        source_file_path = source_file_path[common.len().min(source_file_path.len())..].to_string();
+    match crate::frontend::tspath::trim_file_path_prefix(
+        &source_file_path,
+        &common,
+        case_sensitivity == CaseSensitivity::Sensitive,
+    ) {
+        Some(trimmed) => ts_path::combine_paths(new_dir_path, &[&trimmed]),
+        None => ts_path::combine_paths(new_dir_path, &[&source_file_path]),
     }
-    ts_path::combine_paths(new_dir_path, &[&source_file_path])
 }
 
 // Go: compiler/program.go:1792 GetSourceFile

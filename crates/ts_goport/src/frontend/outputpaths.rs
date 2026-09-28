@@ -297,7 +297,8 @@ pub fn change_to_declaration_extension(path: &str, host: &dyn OutputPathsHost) -
     )
 }
 
-// Go: outputpaths/outputpaths.go:142 GetSourceFilePathInNewDir
+// Go: outputpaths/outputpaths.go:161 GetSourceFilePathInNewDir
+// tsgo#4900: the same as the worker.
 pub fn get_source_file_path_in_new_dir(
     file_name: &str,
     new_dir_path: &str,
@@ -305,20 +306,13 @@ pub fn get_source_file_path_in_new_dir(
     common_source_directory: &str,
     use_case_sensitive_file_names: bool,
 ) -> String {
-    let mut source_file_path = get_normalized_absolute_path(file_name, current_directory);
-    let common_source_directory = ensure_trailing_directory_separator(common_source_directory);
-    let is_source_file_in_common_source_directory = contains_path(
-        &common_source_directory,
-        &source_file_path,
-        &ComparePathsOptions {
-            use_case_sensitive_file_names,
-            current_directory: current_directory.to_string(),
-        },
-    );
-    if is_source_file_in_common_source_directory {
-        source_file_path = source_file_path[common_source_directory.len()..].to_string();
-    }
-    combine_paths(new_dir_path, &[&source_file_path])
+    get_source_file_path_in_new_dir_worker(
+        file_name,
+        new_dir_path,
+        current_directory,
+        common_source_directory,
+        use_case_sensitive_file_names,
+    )
 }
 
 // Go: outputpaths/outputpaths.go:155 getOutputPathWithoutChangingExtension
@@ -343,7 +337,9 @@ fn get_output_path_without_changing_extension(
     input_file_name.to_string()
 }
 
-// Go: outputpaths/outputpaths.go:165 GetSourceFilePathInNewDirWorker
+// Go: outputpaths/outputpaths.go:175 GetSourceFilePathInNewDirWorker
+// tsgo#4900: `TrimFilePathPrefix` cuts the common source directory by runes,
+// not by its byte length.
 pub fn get_source_file_path_in_new_dir_worker(
     file_name: &str,
     new_dir_path: &str,
@@ -351,15 +347,15 @@ pub fn get_source_file_path_in_new_dir_worker(
     common_source_directory: &str,
     use_case_sensitive_file_names: bool,
 ) -> String {
-    let mut source_file_path = get_normalized_absolute_path(file_name, current_directory);
-    let common_dir =
-        get_canonical_file_name(common_source_directory, use_case_sensitive_file_names);
-    let canon_file = get_canonical_file_name(&source_file_path, use_case_sensitive_file_names);
-    let is_source_file_in_common_source_directory = canon_file.starts_with(common_dir.as_str());
-    if is_source_file_in_common_source_directory {
-        source_file_path = source_file_path[common_source_directory.len()..].to_string();
+    let source_file_path = get_normalized_absolute_path(file_name, current_directory);
+    match trim_file_path_prefix(
+        &source_file_path,
+        common_source_directory,
+        use_case_sensitive_file_names,
+    ) {
+        Some(trimmed) => combine_paths(new_dir_path, &[&trimmed]),
+        None => combine_paths(new_dir_path, &[&source_file_path]),
     }
-    combine_paths(new_dir_path, &[&source_file_path])
 }
 
 // Go: outputpaths/outputpaths.go:177 getOwnEmitOutputFilePath

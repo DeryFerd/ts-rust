@@ -119,7 +119,7 @@ impl LanguageService {
         document_changes
     }
 
-    // Go: ls/file_rename.go:81 createPathUpdater
+    // Go: ls/file_rename.go:89 createPathUpdater
     // PORT: the Go closure calls `l.UseCaseSensitiveFileNames()` on each call;
     // the boxed closure borrows `self` for that.
     pub fn create_path_updater<'a>(
@@ -131,18 +131,29 @@ impl LanguageService {
             use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
             ..Default::default()
         };
+        let trimmed_old_path = tspath::remove_trailing_directory_separator(old_path).to_string();
         let old_path = old_path.to_string();
         let new_path = new_path.to_string();
         Box::new(move |path: &str| -> (String, bool) {
             if tspath::compare_paths(path, &old_path, &compare_options) == 0 {
                 return (new_path.clone(), true);
             }
-            if tspath::starts_with_directory(path, &old_path, self.use_case_sensitive_file_names())
+            // Trim the directory prefix ourselves (rather than using
+            // tspath.StartsWithDirectory followed by a separate slice on
+            // len(oldPath)) so the containment check and the suffix we return can
+            // never disagree, and so we don't slice path by a byte count derived
+            // from a canonicalized/differently-cased string: case-folding can
+            // change a path's UTF-8 byte length without changing its rune count
+            // (e.g. the Kelvin sign '\u212A' folds to the single-byte 'k'), which
+            // could otherwise put len(oldPath) out of range of path.
+            // (tsgo#4900)
+            if let Some(suffix) = tspath::trim_file_path_prefix(
+                path,
+                &trimmed_old_path,
+                self.use_case_sensitive_file_names(),
+            ) && (suffix.starts_with('/') || suffix.starts_with('\\'))
             {
-                // PORT: Go slices bytes (`path[len(oldPath):]`); a lossy
-                // conversion keeps this from panicking inside a character.
-                let rest = String::from_utf8_lossy(&path.as_bytes()[old_path.len()..]);
-                return (format!("{new_path}{rest}"), true);
+                return (format!("{new_path}{suffix}"), true);
             }
             (String::new(), false)
         })
