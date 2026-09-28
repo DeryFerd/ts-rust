@@ -234,7 +234,6 @@ pub struct InferenceState {
     pub source_stack: InferenceStack,
     pub target_stack: InferenceStack,
     pub next: Option<Rc<RefCell<InferenceState>>>,
-    pub depth: i32,
 }
 
 impl Checker {
@@ -388,14 +387,14 @@ impl Checker {
             };
             // First, infer between identically matching source and target constituents and remove the
             // matching types.
-            // PORT: perf. `target` is a union here, so Go `Distributed()`
-            // is its type list. The shared list copies no elements.
-            let target_distributed = self.ty(target).types_list();
+            // PORT: perf. The shared list copies no elements.
+            let target_types = self.ty(target).types_list();
             let (temp_sources, temp_targets) = self.infer_from_matching_types(
                 n,
                 source_types,
-                &target_distributed,
+                &target_types,
                 &mut |c: &mut Checker, s: TypeId, t: TypeId| c.is_type_or_base_identical_to(s, t),
+                false, /*sort*/
             );
             // Next, infer between closely matching source and target constituents and remove
             // the matching types. Types closely match when they are instantiations of the same
@@ -405,6 +404,7 @@ impl Checker {
                 &temp_sources,
                 &temp_targets,
                 &mut |c: &mut Checker, s: TypeId, t: TypeId| c.is_type_closely_matched_by(s, t),
+                true, /*sort*/
             );
             if targets.is_empty() {
                 return;
@@ -445,6 +445,7 @@ impl Checker {
                     source_types,
                     &target_types,
                     &mut |c: &mut Checker, s: TypeId, t: TypeId| c.is_type_identical_to(s, t),
+                    false, /*sort*/
                 );
                 if sources.is_empty() || targets.is_empty() {
                     return;
@@ -514,7 +515,6 @@ impl Checker {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
                             info.candidates = Vec::new();
-                            info.candidate_depths = Vec::new();
                             info.contra_candidates = Vec::new();
                             info.top_level = true;
                             info.priority = priority;
@@ -533,28 +533,14 @@ impl Checker {
                                     .push(candidate);
                                 self.clear_cached_inferences(ctx);
                             }
-                        } else {
-                            let depth = n.borrow().depth;
-                            let info = &mut self.inference_context_mut(ctx).inferences[inference];
-                            let found = info.candidates.iter().position(|&c| c == candidate);
-                            if found.is_none_or(|i| info.candidate_depths[i] < depth) {
-                                // Candidate isn't present or is present with lower depth
-                                if let Some(i) = found {
-                                    // Remove candidate with lower depth
-                                    info.candidates.remove(i);
-                                    info.candidate_depths.remove(i);
-                                }
-                                let index = info
-                                    .candidate_depths
-                                    .iter()
-                                    .position(|&d| d < depth)
-                                    .unwrap_or(info.candidate_depths.len());
-                                // Insert candidate at end or immediately before first candidate with lower depth.
-                                // This ensures candidates with the highest depth are stored first.
-                                info.candidates.insert(index, candidate);
-                                info.candidate_depths.insert(index, depth);
-                                self.clear_cached_inferences(ctx);
-                            }
+                        } else if !self.inference_context(ctx).inferences[inference]
+                            .candidates
+                            .contains(&candidate)
+                        {
+                            self.inference_context_mut(ctx).inferences[inference]
+                                .candidates
+                                .push(candidate);
+                            self.clear_cached_inferences(ctx);
                         }
                     }
                     if !priority.intersects(InferencePriority::RETURN_TYPE)
@@ -738,7 +724,6 @@ impl Checker {
         target_types: &[TypeId],
         variances: &[VarianceFlags],
     ) {
-        n.borrow_mut().depth += 1;
         for i in 0..std::cmp::min(source_types.len(), target_types.len()) {
             if i < variances.len()
                 && variances[i] & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
@@ -748,7 +733,6 @@ impl Checker {
                 self.infer_from_types(n, source_types[i], target_types[i]);
             }
         }
-        n.borrow_mut().depth -= 1;
     }
 
     // Go: checker/inference.go:294 inferWithPriority
@@ -950,6 +934,7 @@ impl Checker {
         sources: &[TypeId],
         targets: &[TypeId],
         matches: &mut dyn FnMut(&mut Checker, TypeId, TypeId) -> bool,
+        sort: bool,
     ) -> (SmallVec<[TypeId; 8]>, SmallVec<[TypeId; 8]>) {
         // PORT: perf. The matched and returned lists are short temporaries,
         // so they live on the stack up to 8 entries.
@@ -958,12 +943,36 @@ impl Checker {
         for &t in targets {
             for &s in sources {
                 if matches(self, s, t) {
-                    self.infer_from_types(n, s, t);
+                    if !sort {
+                        self.infer_from_types(n, s, t);
+                    }
                     if !matched_sources.contains(&s) {
                         matched_sources.push(s);
                     }
                     if !matched_targets.contains(&t) {
                         matched_targets.push(t);
+                    }
+                }
+            }
+        }
+        if sort {
+            // Sort target types by decreasing depth of generic instantiations. Intuitively, a successful
+            // inference from a type argument with deeper nesting is of higher quality because we've stripped
+            // away more layers of type instantiations that otherwise might skew the results. For example,
+            // when inferring from string[] | string[][] to T[] | T[][], the inference of string we make from
+            // relating string[][] to T[][] is of higher quality than the inference of string[] we make relating
+            // string[][] to T[].
+            // PORT: Go `slices.SortFunc` is `gostd::slices::sort_func` (Go
+            // pdqsort), so the comparisons, and the type arguments that
+            // `get_type_depth` resolves, come in Go's order.
+            crate::gostd::slices::sort_func(
+                &mut matched_targets[..],
+                |&t1: &TypeId, &t2: &TypeId| self.compare_types_and_depth(t1, t2),
+            );
+            for &t in &matched_targets {
+                for &s in &matched_sources {
+                    if matches(self, s, t) {
+                        self.infer_from_types(n, s, t);
                     }
                 }
             }
@@ -982,6 +991,61 @@ impl Checker {
             unmatched(sources, &matched_sources),
             unmatched(targets, &matched_targets),
         )
+    }
+
+    // Compare two types first by depth and then by the regular type ordering.
+    // Go: checker/inference.go:410 compareTypesAndDepth
+    // PORT: Go package function; a checker method here because
+    // `get_type_depth` resolves type arguments.
+    pub fn compare_types_and_depth(&mut self, t1: TypeId, t2: TypeId) -> i32 {
+        let d1 = self.get_type_depth(t1, 3);
+        let d2 = self.get_type_depth(t2, 3);
+        if d1 != d2 {
+            return d2 - d1; // Largest depth sorts first
+        }
+        self.compare_types(t1, t2)
+    }
+
+    // Return the depth of the given type up to the given maximum depth. For generic aliased types
+    // and type references, the depth is one plus the largest type argument depth. For union and
+    // intersection types, the depth is the largest constituent type depth. For all other types,
+    // the depth is zero. The maximum depth limits infinite recursion of circular types.
+    // Go: checker/inference.go:423 getTypeDepth
+    pub fn get_type_depth(&mut self, t: TypeId, max_depth: i32) -> i32 {
+        if max_depth != 0 {
+            if let Some(alias) = self
+                .ty(t)
+                .alias
+                .clone()
+                .filter(|alias| !alias.type_arguments.is_empty())
+            {
+                return self.get_type_list_depth(&alias.type_arguments, max_depth - 1) + 1;
+            }
+            if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
+                let type_arguments = self.get_type_arguments(t);
+                if !type_arguments.is_empty() {
+                    return self.get_type_list_depth(&type_arguments, max_depth - 1) + 1;
+                }
+            }
+            if self
+                .ty(t)
+                .flags
+                .intersects(TypeFlags::UNION_OR_INTERSECTION)
+            {
+                let types = self.ty(t).types_list();
+                return self.get_type_list_depth(&types, max_depth);
+            }
+        }
+        0
+    }
+
+    // Go: checker/inference.go:440 getTypeListDepth
+    pub fn get_type_list_depth(&mut self, types: &[TypeId], max_depth: i32) -> i32 {
+        let mut depth = 0;
+        for &t in types {
+            depth = std::cmp::max(depth, self.get_type_depth(t, max_depth));
+        }
+        depth
     }
 
     // Go: checker/inference.go:391 inferToMultipleTypes
