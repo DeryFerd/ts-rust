@@ -170,3 +170,35 @@ child_test! {
         assert_eq!(statement.js_doc(root).len(), 1);
     }
 }
+
+child_test! {
+    // Files that import each other make the parse tasks of a load an `Rc`
+    // cycle: a task holds its sub tasks, and a sub task of a file that is
+    // already queued holds the task that loaded it. The loader takes these
+    // links out when it is done, so a freed load keeps no parse task. The
+    // probe is the include reasons, which the tasks and the program share.
+    fn parse_tasks_of_a_freed_load_are_freed() {
+        let session = bare_session(files(&[
+            ("/home/projects/TS/p1/tsconfig.json", "{}"),
+            ("/home/projects/TS/p1/index.ts", INDEX_TEXT),
+            (
+                "/home/projects/TS/p1/a.ts",
+                "import { b } from './b';\nexport const a = 1;\nexport const c = b;",
+            ),
+            ("/home/projects/TS/p1/b.ts", "import { a } from './a';\nexport const b = a;"),
+        ]));
+        open(&session, INDEX_URI, INDEX_TEXT);
+        let (load, reasons) = {
+            let p = program(&session, INDEX_URI);
+            let reasons: Vec<_> =
+                p.get_include_reasons().values().flatten().map(Rc::downgrade).collect();
+            (Rc::downgrade(&p), reasons)
+        };
+        assert!(reasons.len() >= 3, "index.ts, a.ts and b.ts have include reasons");
+
+        import_edit(&session, 2);
+        assert!(load.upgrade().is_none(), "the released load is not freed");
+        let kept = reasons.iter().filter(|reason| reason.upgrade().is_some()).count();
+        assert_eq!(kept, 0, "the freed load keeps {kept} of {} include reasons", reasons.len());
+    }
+}

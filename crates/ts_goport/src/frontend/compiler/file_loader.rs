@@ -168,9 +168,10 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             current_directory: current_directory.clone(),
         },
         files_parser: RefCell::new(FilesParser {
+            queue: Vec::new(),
+            task_data_by_path: FxHashMap::default(),
             max_depth: max_node_module_js_depth,
             single_threaded,
-            ..Default::default()
         }),
         root_tasks: Vec::with_capacity(
             root_files.len() + compiler_options.lib.as_ref().map_or(0, Vec::len),

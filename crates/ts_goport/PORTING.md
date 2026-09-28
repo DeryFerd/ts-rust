@@ -267,7 +267,15 @@ The batch that adds it is not accepted until Theo approves.
   version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
   runs and a field fallback). The `GoProgram` shell and the file versions
   stay leaked for now. A one-program process forgets its checkers and the
-  synthetic nodes of both pools at the end, like Go.
+  synthetic nodes of both pools at the end, like Go. Watch mode uses
+  `program::release_program_later`: the old checker pool stops before the
+  new build, but the frontend and the tables are freed after the status
+  report, so the free is not in the rebuild time.
+- The parse tasks of a load go with the loader. Go's garbage collector
+  frees them. Here the `sub_tasks` and `loaded_task` links make an `Rc`
+  cycle when files import each other, so the `FilesParser` drop takes
+  those links out. A one-program process forgets the loader
+  (`with_loader_state_forgotten`), so it does not pay for the free.
 - Freeable file versions (lsshells M3a, `ast/file_version.rs`). In a
   language server or API process (`project::new_session`), a parse cache
   parse of a path that a publish on this thread published before gets a

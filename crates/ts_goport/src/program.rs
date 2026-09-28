@@ -689,7 +689,10 @@ fn current_tables() -> Option<(u32, Arc<VersionTables>)> {
 /// them from the slot and from this thread's copy. With
 /// `keep_version_tables` they stay, and only the declaration diagnostic
 /// cache is emptied, as before.
-fn release_tables(id: u32, state: &ProgramState) {
+/// Takes the tables of program `id` out of its slot and out of this
+/// thread's cache. The caller frees them when it drops the result (other
+/// threads can still hold them).
+fn release_tables(id: u32, state: &ProgramState) -> Option<Arc<VersionTables>> {
     let slot = match &state.tables {
         TablesSlot::Version(slot) if !keep_version_tables() => slot,
         TablesSlot::Version(slot) => {
@@ -697,11 +700,11 @@ fn release_tables(id: u32, state: &ProgramState) {
             if let Some(tables) = tables {
                 clear_declaration_diagnostic_cache(&tables);
             }
-            return;
+            return None;
         }
         TablesSlot::Leaked(tables) => {
             clear_declaration_diagnostic_cache(tables);
-            return;
+            return None;
         }
     };
     let taken = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -712,7 +715,7 @@ fn release_tables(id: u32, state: &ProgramState) {
     });
     // Dropped after the lock and the borrow end.
     drop(cached);
-    drop(taken);
+    taken
 }
 
 fn clear_declaration_diagnostic_cache(tables: &VersionTables) {
@@ -3129,7 +3132,26 @@ pub fn bind_file_outside_program(file: Node) {
 /// `GoProgram` and the file versions stay leaked. Panics when `program` is
 /// current on this thread.
 pub fn release_program(program: &'static GoProgram) {
-    release_program_with(program, CheckerPool::shut_down);
+    drop(release_program_with(program, CheckerPool::shut_down));
+}
+
+/// `release_program` that frees the frontend program and the tables only
+/// when the result drops. Watch mode keeps the result until it reports the
+/// new build, so these frees are not in the rebuild time. The checker pool
+/// stops at once, as in `release_program`, so the old checkers do not add
+/// to the memory of the new build.
+pub fn release_program_later(program: &'static GoProgram) -> ReleasedProgram {
+    release_program_with(program, CheckerPool::shut_down)
+}
+
+/// What a released program version keeps until it drops: its frontend
+/// program (freed here when no other holder has it) and its tables (freed
+/// when no other thread holds them). The version cannot be read in the
+/// meantime: its slot is empty.
+#[must_use = "dropping it frees the released program at once"]
+pub struct ReleasedProgram {
+    frontend: Option<Rc<crate::frontend::compiler::NewProgram>>,
+    tables: Option<Arc<VersionTables>>,
 }
 
 /// `release_program` that does not wait for the checker workers: they free
@@ -3138,11 +3160,18 @@ pub fn release_program(program: &'static GoProgram) {
 /// tables go when the last of them ends. `tsc -b` uses it, so the next
 /// project does not wait for the free.
 pub fn release_program_in_background(program: &'static GoProgram) {
-    release_program_with(program, CheckerPool::shut_down_in_background);
+    drop(release_program_with(
+        program,
+        CheckerPool::shut_down_in_background,
+    ));
 }
 
-/// `release_program` with the pool stop that `shut_down` names.
-fn release_program_with(program: &'static GoProgram, shut_down: fn(CheckerPool)) {
+/// `release_program` with the pool stop that `shut_down` names. The caller
+/// picks when the result drops.
+fn release_program_with(
+    program: &'static GoProgram,
+    shut_down: fn(CheckerPool),
+) -> ReleasedProgram {
     assert!(
         !try_prog().is_some_and(|current| std::ptr::eq(current, program)),
         "program {} is released while it is current",
@@ -3152,13 +3181,13 @@ fn release_program_with(program: &'static GoProgram, shut_down: fn(CheckerPool))
     if let Some(pool) = pool {
         shut_down(pool);
     }
-    // The frontend program is freed here when this thread held its last
-    // `Rc`, after the map borrow ends.
+    // The map borrow ends before the frontend program can be freed.
     let frontend = FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
-    drop(frontend);
-    if let Some(state) = program.state.get() {
-        release_tables(program.id, state);
-    }
+    let tables = program
+        .state
+        .get()
+        .and_then(|state| release_tables(program.id, state));
+    ReleasedProgram { frontend, tables }
 }
 
 /// The Go frontend program, or None on the legacy path. Loading thread only.
