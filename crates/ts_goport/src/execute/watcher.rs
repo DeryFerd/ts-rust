@@ -540,9 +540,9 @@ impl Watcher {
 
         // PORT: Go `w.program.GetProgram().FilesByPath()`. `FilesByPath` is on
         // the frontend program of the current program version.
-        let program_files = crate::program::go_frontend_program()
-            .expect("the watch build made a Go frontend program")
-            .files_by_path();
+        let program = crate::program::go_frontend_program()
+            .expect("the watch build made a Go frontend program");
+        let program_files = program.files_by_path();
         self.source_file_cache
             .borrow_mut()
             .retain(|path, _| program_files.contains_key(path));

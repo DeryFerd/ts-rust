@@ -74,6 +74,7 @@ mod projectcollectiondefaultproject_test;
 mod projectlifetime_test;
 mod projectreferencesprogram_test;
 mod refcountcache_test;
+mod released_program_test;
 mod session_test;
 mod snapshot_test;
 mod snapshotfs_test;

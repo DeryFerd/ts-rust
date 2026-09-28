@@ -64,7 +64,7 @@ fn import_edit(session: &Rc<Session>, version: i32) {
 }
 
 /// The program version of `p` and a probe of its tables.
-fn version_and_probe(p: &'static NewProgram) -> (&'static GoProgram, VersionTablesProbe) {
+fn version_and_probe(p: &NewProgram) -> (&'static GoProgram, VersionTablesProbe) {
     let version = ls_program::program_version(p);
     let probe = program::version_tables_probe(version).expect("a program version has tables");
     (version, probe)
@@ -87,20 +87,20 @@ child_test! {
     // program keeps its tables and still answers.
     fn released_program_versions_free_their_tables() {
         let session = open_p1();
-        let (_, load) = version_and_probe(program(&session, INDEX_URI));
+        let (_, load) = version_and_probe(&program(&session, INDEX_URI));
 
         body_edit(&session, 2, "2");
-        let (_, clone) = version_and_probe(program(&session, INDEX_URI));
+        let (_, clone) = version_and_probe(&program(&session, INDEX_URI));
         assert!(load.is_freed(), "the released load keeps its tables");
         assert!(!clone.is_freed());
 
         import_edit(&session, 3);
         let p3 = program(&session, INDEX_URI);
-        let (_, live) = version_and_probe(p3);
+        let (_, live) = version_and_probe(&p3);
         assert!(clone.is_freed(), "the released clone keeps its tables");
         assert!(!live.is_freed());
-        assert_eq!(sem_diag_count(p3, "/home/projects/TS/p1/index.ts"), 0);
-        let _program = ls_program::enter(p3);
+        assert_eq!(sem_diag_count(&p3, "/home/projects/TS/p1/index.ts"), 0);
+        let _program = ls_program::enter(&p3);
         assert!(program::get_source_file(A_FILE).is_some());
     }
 }
@@ -110,7 +110,7 @@ child_test! {
     // with the version id. It does not read another version's data.
     fn read_of_released_program_version_panics() {
         let session = open_p1();
-        let (version, probe) = version_and_probe(program(&session, INDEX_URI));
+        let (version, probe) = version_and_probe(&program(&session, INDEX_URI));
         body_edit(&session, 2, "2");
         assert!(probe.is_freed());
 
@@ -132,10 +132,10 @@ child_test! {
     fn seeded_thread_keeps_tables_after_release() {
         let session = open_p1();
         let p1 = program(&session, INDEX_URI);
-        let (_, probe) = version_and_probe(p1);
+        let (_, probe) = version_and_probe(&p1);
         let (start, started) = mpsc::channel::<()>();
         let reader = {
-            let _program = ls_program::enter(p1);
+            let _program = ls_program::enter(&p1);
             program::spawn_seeded_thread(move || {
                 started.recv().expect("the test thread sends start");
                 program::get_source_file(A_FILE).is_some()

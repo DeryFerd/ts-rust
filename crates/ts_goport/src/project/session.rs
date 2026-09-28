@@ -1336,7 +1336,11 @@ impl Session {
             project_info_telemetry_event: Some(lsproto::ProjectInfoTelemetryEvent {
                 properties: props,
                 measurements: Some(count_file_stats(
-                    project.program.expect(NIL_DEREF).get_source_files(),
+                    project
+                        .program
+                        .as_ref()
+                        .expect(NIL_DEREF)
+                        .get_source_files(),
                 )),
                 ..Default::default()
             }),
@@ -1528,7 +1532,7 @@ impl Session {
             let p = project.borrow();
             ls::new_language_service(
                 p.config_file_path.clone(),
-                p.program.expect(NIL_DEREF),
+                p.program.clone().expect(NIL_DEREF),
                 snapshot.clone(),
                 &uri.file_name(),
             )
@@ -1612,7 +1616,7 @@ impl Session {
         let mut services: Vec<ls::LanguageService> = Vec::with_capacity(projects.len());
         for project in &projects {
             let project = project.borrow();
-            let Some(program) = project.program else {
+            let Some(program) = project.program.clone() else {
                 continue;
             };
 
@@ -1655,7 +1659,7 @@ impl Session {
         }
         Some(ls::new_language_service(
             project.config_file_path.clone(),
-            project.program.expect(NIL_DEREF),
+            project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
         ))
@@ -1717,7 +1721,7 @@ impl Session {
         let project = project.borrow();
         Ok(ls::new_language_service(
             project.config_file_path.clone(),
-            project.program.expect(NIL_DEREF),
+            project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
         ))
@@ -1815,7 +1819,7 @@ impl Session {
         let project = project.borrow();
         Ok(ls::new_language_service(
             project.config_file_path.clone(),
-            project.program.expect(NIL_DEREF),
+            project.program.clone().expect(NIL_DEREF),
             new_snapshot.clone(),
             &uri.file_name(),
         ))
@@ -2839,6 +2843,7 @@ impl Session {
                             typings_info: typings_info.clone(),
                             file_names: p
                                 .program
+                                .as_ref()
                                 .expect(NIL_DEREF)
                                 .get_source_files()
                                 .iter()

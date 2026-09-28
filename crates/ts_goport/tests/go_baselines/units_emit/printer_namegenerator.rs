@@ -43,9 +43,9 @@ fn with_bound_file(
                 ..Default::default()
             },
         );
-        let _current = ls_program::enter(p);
-        ls_program::bind_source_files(p);
-        body(source_file(p, "/main.ts").root);
+        let _current = ls_program::enter(&p);
+        ls_program::bind_source_files(&p);
+        body(source_file(&p, "/main.ts").root);
     });
 }
 

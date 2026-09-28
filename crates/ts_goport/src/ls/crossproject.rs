@@ -52,10 +52,10 @@ const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer de
 
 // Go: ls/crossproject.go:17 Project
 // PORT: plan contract C4. Go `*compiler.Program` is
-// `&'static compiler::NewProgram`, which is never nil.
+// `Rc<compiler::NewProgram>`, which is never nil.
 pub trait Project {
     fn id(&self) -> tspath::Path;
-    fn get_program(&self) -> &'static compiler::NewProgram;
+    fn get_program(&self) -> Rc<compiler::NewProgram>;
     fn has_file(&self, file_name: &str) -> bool;
 }
 

@@ -3,20 +3,21 @@
 use crate::ls::prelude::*;
 
 // Go: ls/languageservice.go:15 LanguageService
-// PORT: plan contract C4. Go `*compiler.Program` is the leaked
-// `&'static compiler::NewProgram`. Go `Host` is `Rc<dyn Host>`, Go
+// PORT: plan contract C4. Go `*compiler.Program` is `Rc<compiler::NewProgram>`:
+// the language service keeps its program alive. Go `Host` is `Rc<dyn Host>`, Go
 // `*lsconv.Converters` is shared (`Rc`). All methods take `&self`, so the
 // mapper cache is a `RefCell`. The fields are `pub` because other files of
 // package `ls` read them (Go same-package access).
-// PORT: `P` is the program. It is `&'static NewProgram` except on a search
-// thread of a cross-project request (`program_view.rs`). The methods that
-// the search runs are in `impl<P: ProgramView> LanguageService<P>` blocks;
-// all other methods are for the default `P` only.
-pub struct LanguageService<P = &'static compiler::NewProgram> {
+// PORT: `P` is the program. It is `compiler::NewProgram` except on a search
+// thread of a cross-project request (`SearchView`, `program_view.rs`). The
+// methods that the search runs are in `impl<P: ProgramView>
+// LanguageService<P>` blocks; all other methods are for the default `P`
+// only.
+pub struct LanguageService<P = compiler::NewProgram> {
     pub project_path: tspath::Path,
     pub host: Rc<dyn Host>,
     pub active_config: lsutil::UserPreferences,
-    pub program: P,
+    pub program: Rc<P>,
     pub converters: Rc<lsconv::Converters>,
     // PORT: Go caches `*DocumentPositionMapper` values, including nil. The
     // contract type holds only non-nil mappers, so a nil result is not cached
@@ -37,7 +38,7 @@ pub struct LanguageService<P = &'static compiler::NewProgram> {
 // PORT: Go returns `*LanguageService`; the caller owns the value here.
 pub fn new_language_service(
     project_path: tspath::Path,
-    program: &'static compiler::NewProgram,
+    program: Rc<compiler::NewProgram>,
     host: Rc<dyn Host>,
     active_file: &str,
 ) -> LanguageService {
@@ -45,6 +46,7 @@ pub fn new_language_service(
     // `host.Converters()` before `host.GetPreferences(activeFile)`.
     let converters = host.converters();
     let active_config = host.get_preferences(active_file);
+    let program_guard = ls_program::enter(&program);
     LanguageService {
         project_path,
         host,
@@ -52,7 +54,7 @@ pub fn new_language_service(
         converters,
         active_config,
         document_position_mappers: RefCell::new(FxHashMap::default()),
-        _program_guard: ls_program::enter(program),
+        _program_guard: program_guard,
     }
 }
 
@@ -61,7 +63,7 @@ pub fn new_language_service(
 /// view's program version current (`ls_program::enter_version`).
 pub fn new_language_service_for_view<P: ProgramView>(
     project_path: tspath::Path,
-    program: P,
+    program: Rc<P>,
     host: Rc<dyn Host>,
     active_config: lsutil::UserPreferences,
     program_guard: ls_program::ProgramGuard,
@@ -82,7 +84,7 @@ impl LanguageService {
     /// Makes this language service's program current again while the guard
     /// lives (see the `_program_guard` field).
     pub fn enter_program(&self) -> ls_program::ProgramGuard {
-        ls_program::enter(self.program)
+        ls_program::enter(&self.program)
     }
 }
 
@@ -97,8 +99,8 @@ impl<P: ProgramView> LanguageService<P> {
     }
 
     // Go: ls/languageservice.go:44 GetProgram
-    pub fn get_program(&self) -> P {
-        self.program
+    pub fn get_program(&self) -> &P {
+        &self.program
     }
 
     // Go: ls/languageservice.go:48 UserPreferences
@@ -116,7 +118,7 @@ impl<P: ProgramView> LanguageService<P> {
     // Go: ls/languageservice.go:56 tryGetProgramAndFile
     // PORT: Go `*ast.SourceFile` is the file root `Node` (`Node::NIL` when the
     // program has no such file).
-    pub fn try_get_program_and_file(&self, file_name: &str) -> (P, Node) {
+    pub fn try_get_program_and_file(&self, file_name: &str) -> (&P, Node) {
         let program = self.get_program();
         let file = program.source_file_root(file_name);
         (program, file)
@@ -124,7 +126,7 @@ impl<P: ProgramView> LanguageService<P> {
 
     // Go: ls/languageservice.go:62 getProgramAndFile
     // PORT: Go passes the URI by value; here by reference.
-    pub fn get_program_and_file(&self, document_uri: &lsproto::DocumentUri) -> (P, Node) {
+    pub fn get_program_and_file(&self, document_uri: &lsproto::DocumentUri) -> (&P, Node) {
         let file_name = document_uri.file_name();
         let (program, file) = self.try_get_program_and_file(&file_name);
         if file.is_nil() {
@@ -210,7 +212,7 @@ impl LanguageService {
             registry,
             from_file,
             self.project_path.clone(),
-            self.program,
+            Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         );
         Ok(Some(Rc::new(view)))
@@ -231,7 +233,7 @@ impl LanguageService {
             registry,
             from_file,
             self.project_path.clone(),
-            self.program,
+            Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         ))
     }

@@ -253,7 +253,11 @@ The batch that adds it is not accepted until Theo approves.
   `get_go_symlink_cache`, ...). The program of a one-program process
   leaks its tables and reads them with no lock or thread-local.
 - `program::release_program` frees the checker pool, the emit pool, the
-  frontend and the tables of a version. Each checker worker frees its
+  frontend and the tables of a version. The frontend `NewProgram` goes
+  with its last `Rc` holder. Its parses stay: the publish that gives a
+  file its `GoFile` keeps that file's parse, because the `GoFile` borrows
+  it. `GoSharedState` owns its copies of the frontend data (the
+  resolutions are `Arc<ResolvedModule>`, one per frontend resolution). Each checker worker frees its
   checker and the synthetic nodes it made (`free_synthetic_nodes`), and
   each emit thread frees its synthetic nodes. A worker, bind, emit or
   search thread gets a copy of the tables `Arc` in its `WorkerSeed` and
@@ -261,7 +265,7 @@ The batch that adds it is not accepted until Theo approves.
   release, as a Go goroutine that holds the program does. A read of a
   released version's tables on a thread with no copy panics ("program
   version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
-  runs and a field fallback). The program shell and the file versions
+  runs and a field fallback). The `GoProgram` shell and the file versions
   stay leaked for now. A one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
@@ -590,8 +594,9 @@ program version:
   dispatch thread. Items commit in queue order, so the results are those
   of a serial run in Go start order.
 - The search code is generic over `ProgramView`
-  (`LanguageService<P = &'static NewProgram>`). Keep new code on that path
-  generic, and keep `Rc` values and checkers on their thread.
+  (`LanguageService<P = NewProgram>` holds `Rc<P>`; the search code takes
+  `&P`). Keep new code on that path generic, and keep `Rc` values and
+  checkers on their thread.
 
 ### Go runtime (`crate::gostd`)
 
@@ -652,9 +657,15 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 ### Programs and checkers
 
 - Go `*compiler.Program` in ls, project and api code is
-  `&'static compiler::NewProgram` (leaked for the process like
-  `GoProgram`; `Copy`; pointer equality is `std::ptr::eq`; a map key is
-  `p as *const _ as usize`).
+  `Rc<compiler::NewProgram>` where it is stored (a project, a checker
+  pool, a language service, the `ls_program` registry, `FRONTENDS`) and
+  `&compiler::NewProgram` where code only reads it. Holding the `Rc`
+  keeps the program alive, as a Go pointer does. Pointer equality is
+  `Rc::ptr_eq` (`std::ptr::eq` for two borrows). A map key is the
+  address only while the map's owner holds the `Rc`
+  (`ls_program` registry, `programCounter`); a per-thread cache that can
+  outlive the program uses the program version id
+  (`ProgramView::identity`).
 - Go `compiler.NewProgram(opts)` is `ls_program::new_program(opts,
   create_checker_pool)`; `p.UpdateProgram(..)` is
   `ls_program::update_program(p, ..)`. Go `ProgramOptions.CreateCheckerPool`
@@ -677,9 +688,10 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   snapshot `programCounter.Deref`). It frees the checker pools of `p`, its
   program version and the synthetic nodes that the dispatch thread made
   while the version was current, now or when the last guard of `p` drops.
-  The version's tables go with it (see "Program"). The `NewProgram`, the
-  `GoProgram` shell and the file versions stay leaked (multi-program M2,
-  M3). A compiler host drops its data
+  The version's tables go with it (see "Program"). The registry drops its
+  `Rc` of `p`, so the `NewProgram` is freed with its last holder. The
+  `GoProgram` shell and the file versions stay leaked (M3). A compiler
+  host drops its data
   (`CompilerHost::release`, not in Go) when no live program uses it. A
   program uses its own host and the host of the load that made its files:
   a clone shares the old program's processed files (Go `UpdateProgram`),

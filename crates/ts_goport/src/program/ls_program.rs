@@ -2,8 +2,10 @@
 //! service, plus the Go compiler checker pool (`compiler/checkerpool.go`).
 //!
 //! Everything here runs on the LSP dispatch thread. Go `*compiler.Program`
-//! is `&'static NewProgram`. A Go program method `p.X(..)` that the
-//! language service needs is `ls_program::x(p, ..)`.
+//! is `Rc<NewProgram>` where it is stored and `&NewProgram` where code only
+//! reads it. A holder of the `Rc` keeps the program alive, as a Go pointer
+//! does. A Go program method `p.X(..)` that the language service needs is
+//! `ls_program::x(p, ..)`.
 //!
 //! Programs: each `NewProgram` made by `new_program` or `update_program` is
 //! also a program version of the process (`program::new_program_version`),
@@ -22,10 +24,11 @@
 //! Release: Go frees a program when no snapshot and no request uses it.
 //! `release_program` is the snapshot part (Go `programCounter.Deref`); the
 //! release waits until no guard of the program is alive. It frees the
-//! version's program tables; the program shell and its file versions stay
-//! leaked (see `program::release_program`). A
-//! compiler host whose last live program is released drops its data
-//! (`CompilerHost::release`).
+//! version's program tables, and the registry drops its `Rc`, so the
+//! `NewProgram` is freed with its last holder. The `GoProgram` shell and the
+//! file versions stay leaked (see `program::release_program`). A compiler
+//! host whose last live program is released drops its data
+//! (`CompilerHost::release`), even when a stale holder keeps the program.
 //!
 //! PORT: Go keeps the checker pools in `Program` fields. `NewProgram` does
 //! not have them, so they live in a thread-local registry keyed by the
@@ -90,7 +93,7 @@ pub trait CheckerPool {
 }
 
 /// Go `ProgramOptions.CreateCheckerPool`.
-pub type CreateCheckerPool = Rc<dyn Fn(&'static NewProgram) -> Rc<dyn CheckerPool>>;
+pub type CreateCheckerPool = Rc<dyn Fn(&Rc<NewProgram>) -> Rc<dyn CheckerPool>>;
 
 // ---------------------------------------------------------------------------
 // Program registry
@@ -99,7 +102,7 @@ pub type CreateCheckerPool = Rc<dyn Fn(&'static NewProgram) -> Rc<dyn CheckerPoo
 /// The Go `Program` fields that `NewProgram` does not hold.
 struct ProgramCheckers {
     /// The frontend program.
-    program: &'static NewProgram,
+    program: Rc<NewProgram>,
     /// Its program version.
     version: &'static GoProgram,
     /// Go `Program.opts.CreateCheckerPool`.
@@ -126,7 +129,8 @@ thread_local! {
 
     /// The checker pools of each program made by `new_program` or
     /// `update_program`, by program address. `release_program` removes an
-    /// entry.
+    /// entry. An entry holds its program, so its address is not reused
+    /// while the entry exists.
     static PROGRAM_CHECKERS: RefCell<FxHashMap<usize, Rc<ProgramCheckers>>> =
         RefCell::new(FxHashMap::default());
 
@@ -142,21 +146,23 @@ thread_local! {
     static BEFORE_GUARDS: Cell<Option<&'static GoProgram>> = const { Cell::new(None) };
 
     /// Programs that `release_program` released while a guard of theirs was
-    /// alive, by program version id. The last such guard releases them.
-    static RELEASE_PENDING: RefCell<FxHashMap<u32, &'static NewProgram>> =
+    /// alive: the registry key, by program version id. The last such guard
+    /// releases them.
+    static RELEASE_PENDING: RefCell<FxHashMap<u32, usize>> =
         RefCell::new(FxHashMap::default());
 
     /// The number of programs in `PROGRAM_CHECKERS` that use each compiler
     /// host, by host address (`host_key`). A program uses its own host and
     /// its load host (`ProgramCheckers::load_host`).
-    // PORT: not in Go. Go's GC frees a host when no program references it;
-    // the port keeps the program shells, so it counts the live users.
+    // PORT: not in Go. Go's GC frees a host when no program references it.
+    // Here a stale holder (a pool or a request) can keep a released program
+    // and its host, so the live users are counted.
     static HOST_USERS: RefCell<FxHashMap<usize, u32>> = RefCell::new(FxHashMap::default());
 }
 
 /// Registry key of `p`.
-fn program_key(p: &'static NewProgram) -> usize {
-    p as *const NewProgram as usize
+fn program_key(p: &NewProgram) -> usize {
+    std::ptr::from_ref(p).addr()
 }
 
 /// `HOST_USERS` key of `host`.
@@ -218,14 +224,14 @@ fn release_hosts(checkers: &ProgramCheckers) {
 
 /// The registry entry of `p`. Panics for a program that `new_program` or
 /// `update_program` did not make, or that is released.
-fn program_checkers(p: &'static NewProgram) -> Rc<ProgramCheckers> {
+fn program_checkers(p: &NewProgram) -> Rc<ProgramCheckers> {
     PROGRAM_CHECKERS
         .with(|programs| programs.borrow().get(&program_key(p)).cloned())
         .expect("program was not made by ls_program::new_program, or it is released")
 }
 
 /// The program version of `p`.
-pub fn program_version(p: &'static NewProgram) -> &'static GoProgram {
+pub fn program_version(p: &NewProgram) -> &'static GoProgram {
     program_checkers(p).version
 }
 
@@ -241,11 +247,11 @@ pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
             .filter(|parsed| parsed.root == file);
     };
     let path = tspath::Path(go_file.info.path.clone());
-    let programs: Vec<&'static NewProgram> = PROGRAM_CHECKERS.with(|programs| {
+    let programs: Vec<Rc<NewProgram>> = PROGRAM_CHECKERS.with(|programs| {
         programs
             .borrow()
             .values()
-            .map(|checkers| checkers.program)
+            .map(|checkers| Rc::clone(&checkers.program))
             .collect()
     });
     programs.into_iter().find_map(|p| {
@@ -269,7 +275,7 @@ pub struct ProgramGuard {
 }
 
 /// Makes `p` the current program of this thread while the guard lives.
-pub fn enter(p: &'static NewProgram) -> ProgramGuard {
+pub fn enter(p: &NewProgram) -> ProgramGuard {
     enter_version(program_version(p))
 }
 
@@ -327,8 +333,8 @@ impl Drop for ProgramGuard {
         if !still_entered {
             let pending =
                 RELEASE_PENDING.with(|pending| pending.borrow_mut().remove(&self.version.id));
-            if let Some(p) = pending {
-                release_now(p);
+            if let Some(key) = pending {
+                release_now(key);
             }
         }
     }
@@ -347,27 +353,27 @@ impl Drop for ProgramGuard {
 pub fn new_program(
     opts: ProgramOptions,
     create_checker_pool: Option<CreateCheckerPool>,
-) -> &'static NewProgram {
-    let p: &'static NewProgram = {
+) -> Rc<NewProgram> {
+    let p = {
         let _scope = crate::core::enter_program(None);
-        Box::leak(Box::new(crate::frontend::compiler::new_program(opts)))
+        Rc::new(crate::frontend::compiler::new_program(opts))
     };
-    let version = new_program_version(p, None);
-    init_checker_pool(p, version, create_checker_pool, p.host().clone());
+    let version = new_program_version(&p, None);
+    init_checker_pool(&p, version, create_checker_pool, p.host().clone());
     p
 }
 
 // Go: compiler/program.go:288 UpdateProgram
-// PORT: `NewProgram::update_program` builds the new program. It is leaked,
+// PORT: `NewProgram::update_program` builds the new program. It
 // becomes a program version that shares the unchanged file versions of
 // `p`, and gets its checker pool here. `create_checker_pool`, when set,
 // overrides the one of `p` (Go `newOpts.CreateCheckerPool`).
 pub fn update_program(
-    p: &'static NewProgram,
+    p: &NewProgram,
     changed_file_path: &tspath::Path,
     new_host: Rc<dyn CompilerHost>,
     create_checker_pool: Option<CreateCheckerPool>,
-) -> (&'static NewProgram, Option<Rc<ParsedSourceFile>>, bool) {
+) -> (Rc<NewProgram>, Option<Rc<ParsedSourceFile>>, bool) {
     let old = PROGRAM_CHECKERS.with(|programs| programs.borrow().get(&program_key(p)).cloned());
     let create_checker_pool = create_checker_pool.or_else(|| {
         old.as_ref()
@@ -379,7 +385,7 @@ pub fn update_program(
         let _scope = crate::core::enter_program(None);
         p.update_program(changed_file_path, new_host)
     };
-    let result: &'static NewProgram = Box::leak(Box::new(result));
+    let result = Rc::new(result);
     // A clone shares the old program's processed files (Go `UpdateProgram`),
     // so it uses the old load host too.
     let load_host = if reused {
@@ -388,8 +394,8 @@ pub fn update_program(
     } else {
         result.host().clone()
     };
-    let version = new_program_version(result, old.map(|old| old.version));
-    init_checker_pool(result, version, create_checker_pool, load_host);
+    let version = new_program_version(&result, old.map(|old| old.version));
+    init_checker_pool(&result, version, create_checker_pool, load_host);
     (result, new_file, reused)
 }
 
@@ -397,7 +403,7 @@ pub fn update_program(
 /// returns true) and no request holds it. This is the snapshot part: the
 /// checker pools of `p` and its program version are freed now, or when the
 /// last guard of `p` drops (a request that still runs on it).
-pub fn release_program(p: &'static NewProgram) {
+pub fn release_program(p: &NewProgram) {
     let Some(checkers) =
         PROGRAM_CHECKERS.with(|programs| programs.borrow().get(&program_key(p)).cloned())
     else {
@@ -410,19 +416,23 @@ pub fn release_program(p: &'static NewProgram) {
             .any(|&(_, version)| std::ptr::eq(version, checkers.version))
     });
     if entered {
-        RELEASE_PENDING.with(|pending| pending.borrow_mut().insert(checkers.version.id, p));
+        RELEASE_PENDING.with(|pending| {
+            pending
+                .borrow_mut()
+                .insert(checkers.version.id, program_key(p))
+        });
     } else {
-        release_now(p);
+        release_now(program_key(p));
     }
 }
 
-/// Removes `p` from the registry, which drops its checker pools once no
-/// project holds them, releases its program version, releases each host
-/// of `p` that no live program uses now, and frees the synthetic nodes
-/// that this thread made while the version was current.
-fn release_now(p: &'static NewProgram) {
-    let Some(checkers) =
-        PROGRAM_CHECKERS.with(|programs| programs.borrow_mut().remove(&program_key(p)))
+/// Removes the program with registry key `key` from the registry: the
+/// registry's `Rc` of the program goes, and its checker pools go once no
+/// project holds them. It releases the program version and each host of
+/// the program that no live program uses now, and frees the synthetic
+/// nodes that this thread made while the version was current.
+fn release_now(key: usize) {
+    let Some(checkers) = PROGRAM_CHECKERS.with(|programs| programs.borrow_mut().remove(&key))
     else {
         return;
     };
@@ -438,7 +448,7 @@ fn release_now(p: &'static NewProgram) {
 // Go: compiler/program.go:335 initCheckerPool
 // PORT: `load_host` is not in Go (`ProgramCheckers::load_host`).
 fn init_checker_pool(
-    p: &'static NewProgram,
+    p: &Rc<NewProgram>,
     version: &'static GoProgram,
     create_checker_pool: Option<CreateCheckerPool>,
     load_host: Rc<dyn CompilerHost>,
@@ -461,7 +471,7 @@ fn init_checker_pool(
         (checker_pool, Some(pool))
     };
     let checkers = Rc::new(ProgramCheckers {
-        program: p,
+        program: Rc::clone(p),
         version,
         create_checker_pool,
         checker_pool,
@@ -477,7 +487,7 @@ fn init_checker_pool(
 
 // Go: compiler/program.go:350 GetCheckerPool
 // GetCheckerPool returns the checker pool associated with this program.
-pub fn get_checker_pool(p: &'static NewProgram) -> Rc<dyn CheckerPool> {
+pub fn get_checker_pool(p: &NewProgram) -> Rc<dyn CheckerPool> {
     program_checkers(p).checker_pool.clone()
 }
 
@@ -488,7 +498,7 @@ pub fn get_checker_pool(p: &'static NewProgram) -> Rc<dyn CheckerPool> {
 // `Checker::new` (`bind_all`), with the program of `p` current.
 // PORT: Go `c.id = nextCheckerID.Add(1)`. `Checker::new(index)` sets
 // `id = index + 1`, so the index is the counter value before the add.
-pub fn new_checker(p: &'static NewProgram) -> Checker {
+pub fn new_checker(p: &NewProgram) -> Checker {
     new_checker_for_version(program_version(p))
 }
 
@@ -517,20 +527,20 @@ pub fn new_checker_for_version(version: &'static GoProgram) -> Checker {
 // an empty `OnceCell` until `createCheckers`. Go `fileAssociations` maps a
 // file to its checker; here it maps the file index to the checker index.
 pub struct CompilerCheckerPool {
-    program: &'static NewProgram,
+    program: Rc<NewProgram>,
     create_checkers_once: Cell<bool>,
     checkers: Vec<OnceCell<Rc<RefCell<Checker>>>>,
     file_associations: OnceCell<FxHashMap<usize, usize>>,
 }
 
 // Go: compiler/checkerpool.go:36 newCheckerPool
-fn new_checker_pool(program: &'static NewProgram) -> CompilerCheckerPool {
+fn new_checker_pool(program: &Rc<NewProgram>) -> CompilerCheckerPool {
     new_checker_pool_with_tracing(program)
 }
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing
 // PORT: tracing is dropped.
-fn new_checker_pool_with_tracing(program: &'static NewProgram) -> CompilerCheckerPool {
+fn new_checker_pool_with_tracing(program: &Rc<NewProgram>) -> CompilerCheckerPool {
     let mut checker_count: i64 = 4;
     if program.single_threaded() {
         checker_count = 1;
@@ -544,7 +554,7 @@ fn new_checker_pool_with_tracing(program: &'static NewProgram) -> CompilerChecke
         .max(1);
 
     CompilerCheckerPool {
-        program,
+        program: Rc::clone(program),
         create_checkers_once: Cell::new(false),
         checkers: (0..checker_count).map(|_| OnceCell::new()).collect(),
         file_associations: OnceCell::new(),
@@ -628,7 +638,7 @@ impl CompilerCheckerPool {
         }
         let checker_count = self.checkers.len();
         for i in 0..checker_count {
-            let checker = new_checker(self.program);
+            let checker = new_checker(&self.program);
             let _ = self.checkers[i].set(Rc::new(RefCell::new(checker)));
         }
 
@@ -701,7 +711,7 @@ impl CompilerCheckerPool {
 // PORT: the Rust binder binds every file of the program version into one
 // arena (`program::bind_all`). A file version that an earlier version
 // bound is not bound again.
-pub fn bind_source_files(p: &'static NewProgram) {
+pub fn bind_source_files(p: &NewProgram) {
     let _program = enter(p);
     bind_all();
 }
@@ -712,7 +722,7 @@ pub fn bind_source_files(p: &'static NewProgram) {
 
 // Go: compiler/program.go:461 GetTypeChecker
 // Return the type checker associated with the program.
-pub fn get_type_checker(p: &'static NewProgram, ctx: &Context) -> (Rc<RefCell<Checker>>, Release) {
+pub fn get_type_checker(p: &NewProgram, ctx: &Context) -> (Rc<RefCell<Checker>>, Release) {
     let program = enter(p);
     let checkers = program_checkers(p);
     let (checker, release) = match &checkers.compiler_checker_pool {
@@ -723,7 +733,7 @@ pub fn get_type_checker(p: &'static NewProgram, ctx: &Context) -> (Rc<RefCell<Ch
 }
 
 // Go: compiler/program.go:468 ForEachCheckerParallel
-pub fn for_each_checker_parallel(p: &'static NewProgram, cb: &mut dyn FnMut(usize, &mut Checker)) {
+pub fn for_each_checker_parallel(p: &NewProgram, cb: &mut dyn FnMut(usize, &mut Checker)) {
     let _program = enter(p);
     let checkers = program_checkers(p);
     if let Some(pool) = &checkers.compiler_checker_pool {
@@ -737,7 +747,7 @@ pub fn for_each_checker_parallel(p: &'static NewProgram, cb: &mut dyn FnMut(usiz
 // types obtained from different checkers, so only non-type data (such as diagnostics or string
 // representations of types) should be obtained from checkers returned by this method.
 pub fn get_type_checker_for_file(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     file: Node,
 ) -> (Rc<RefCell<Checker>>, Release) {
@@ -754,7 +764,7 @@ pub fn get_type_checker_for_file(
 // Return a checker for the given file, locked to the current thread to prevent data races from multiple threads
 // accessing the same checker. The lock will be released when the `done` function is called.
 pub fn get_type_checker_for_file_exclusive(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     file: Node,
 ) -> (Rc<RefCell<Checker>>, Release) {
@@ -781,7 +791,7 @@ pub fn get_type_checker_for_file_exclusive(
 // of the current program; each public function here makes `p` current.
 
 /// Go `p.files` as file nodes.
-fn source_file_nodes(p: &'static NewProgram) -> Vec<Node> {
+fn source_file_nodes(p: &NewProgram) -> Vec<Node> {
     p.files.iter().map(|file| file.root).collect()
 }
 
@@ -790,7 +800,7 @@ fn source_file_nodes(p: &'static NewProgram) -> Vec<Node> {
 // If sourceFile is non-nil, returns diagnostics for just that file.
 // If sourceFile is nil, returns diagnostics for all files in the program.
 fn collect_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
     concurrent: bool,
@@ -810,7 +820,7 @@ fn collect_diagnostics(
 // PORT: Go runs the files on a WorkGroup. On the dispatch thread they run
 // one after another, in file order.
 fn collect_diagnostics_from_files(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_files: &[Node],
     concurrent: bool,
@@ -830,7 +840,7 @@ fn collect_diagnostics_from_files(
 // processed in parallel with one task per checker, reducing contention and improving
 // cache locality. Otherwise, falls back to per-file concurrent collection.
 fn collect_checker_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
     collect: &mut dyn FnMut(&Context, &mut Checker, Node) -> Vec<Diagnostic>,
@@ -854,7 +864,7 @@ fn collect_checker_diagnostics(
 // PORT: Go runs the files of an external pool on a WorkGroup. On the
 // dispatch thread they run one after another, in file order.
 fn collect_checker_diagnostics_from_files(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_files: &[Node],
     collect: &mut dyn FnMut(&Context, &mut Checker, Node) -> Vec<Diagnostic>,
@@ -885,7 +895,7 @@ fn collect_checker_diagnostics_from_files(
 
 // Go: compiler/program.go:599 GetSyntacticDiagnostics
 pub fn get_syntactic_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -919,11 +929,7 @@ pub fn get_syntactic_diagnostics(
 // PORT: Go binds only `sourceFile` when it is set, else every file. The
 // Rust binder binds every file of the program version into one arena, so
 // both cases bind all files.
-pub fn get_bind_diagnostics(
-    p: &'static NewProgram,
-    ctx: &Context,
-    source_file: Node,
-) -> Vec<Diagnostic> {
+pub fn get_bind_diagnostics(p: &NewProgram, ctx: &Context, source_file: Node) -> Vec<Diagnostic> {
     let _program = enter(p);
     bind_source_files(p);
     collect_diagnostics(
@@ -937,7 +943,7 @@ pub fn get_bind_diagnostics(
 
 // Go: compiler/program.go:654 GetSemanticDiagnostics
 pub fn get_semantic_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -949,7 +955,7 @@ pub fn get_semantic_diagnostics(
 
 // Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
 pub fn get_semantic_diagnostics_without_no_emit_filtering(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
@@ -967,7 +973,7 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
 
 // Go: compiler/program.go:667 GetSuggestionDiagnostics
 pub fn get_suggestion_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -978,7 +984,7 @@ pub fn get_suggestion_diagnostics(
 }
 
 // Go: compiler/program.go:671 GetProgramDiagnostics
-pub fn get_program_diagnostics(p: &'static NewProgram) -> Vec<Diagnostic> {
+pub fn get_program_diagnostics(p: &NewProgram) -> Vec<Diagnostic> {
     let _program = enter(p);
     let mut diagnostics = p.program_diagnostics.clone();
     diagnostics.extend(
@@ -991,10 +997,7 @@ pub fn get_program_diagnostics(p: &'static NewProgram) -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:678 GetIncludeProcessorDiagnostics
-pub fn get_include_processor_diagnostics(
-    p: &'static NewProgram,
-    source_file: Node,
-) -> Vec<Diagnostic> {
+pub fn get_include_processor_diagnostics(p: &NewProgram, source_file: Node) -> Vec<Diagnostic> {
     let _program = enter(p);
     if skip_type_checking(p, source_file, false) {
         return Vec::new();
@@ -1009,11 +1012,7 @@ pub fn get_include_processor_diagnostics(
 }
 
 // Go: compiler/program.go:686 SkipTypeChecking
-pub fn skip_type_checking(
-    p: &'static NewProgram,
-    source_file: Node,
-    ignore_no_check: bool,
-) -> bool {
+pub fn skip_type_checking(p: &NewProgram, source_file: Node, ignore_no_check: bool) -> bool {
     let _program = enter(p);
     let options = p.options();
     let info = source_file_info(source_file);
@@ -1026,7 +1025,7 @@ pub fn skip_type_checking(
 }
 
 // Go: compiler/program.go:694 canIncludeBindAndCheckDiagnostics
-fn can_include_bind_and_check_diagnostics(p: &'static NewProgram, source_file: Node) -> bool {
+fn can_include_bind_and_check_diagnostics(p: &NewProgram, source_file: Node) -> bool {
     let info = source_file_info(source_file);
     if info.check_js_directive.is_some_and(|d| !d.enabled) {
         return false;
@@ -1051,7 +1050,7 @@ fn can_include_bind_and_check_diagnostics(p: &'static NewProgram, source_file: N
 }
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics
-pub fn get_global_diagnostics(p: &'static NewProgram, ctx: &Context) -> Vec<Diagnostic> {
+pub fn get_global_diagnostics(p: &NewProgram, ctx: &Context) -> Vec<Diagnostic> {
     let _program = enter(p);
     if p.files.is_empty() {
         return Vec::new();
@@ -1067,7 +1066,7 @@ pub fn get_global_diagnostics(p: &'static NewProgram, ctx: &Context) -> Vec<Diag
 
 // Go: compiler/program.go:1302 GetDeclarationDiagnostics
 pub fn get_declaration_diagnostics(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -1083,7 +1082,7 @@ pub fn get_declaration_diagnostics(
 
 // Go: compiler/program.go:1394 getDeclarationDiagnosticsForFile
 fn get_declaration_diagnostics_for_file(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     source_file: Node,
 ) -> Vec<Diagnostic> {
@@ -1120,7 +1119,7 @@ fn get_declaration_diagnostics_for_file(
 // shares as `Rc<RefCell<Checker>>`, so the resolver links to that `Rc`
 // (`get_emit_resolver_of_shared_checker`) instead of a compile worker
 // checker. The host methods read the current program, which is `p`.
-fn new_emit_host(p: &'static NewProgram, ctx: &Context, file: Node) -> (Rc<EmitHost>, Release) {
+fn new_emit_host(p: &NewProgram, ctx: &Context, file: Node) -> (Rc<EmitHost>, Release) {
     let (checker, done) = get_type_checker_for_file(p, ctx, file);
     let emit_resolver =
         crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker(&checker);
@@ -1129,7 +1128,7 @@ fn new_emit_host(p: &'static NewProgram, ctx: &Context, file: Node) -> (Rc<EmitH
 }
 
 // Go: compiler/program.go:1548 IsGlobalTypingsFile
-pub fn is_global_typings_file(p: &'static NewProgram, file_name: &str) -> bool {
+pub fn is_global_typings_file(p: &NewProgram, file_name: &str) -> bool {
     if !tspath::is_declaration_file_name(file_name) {
         return false;
     }

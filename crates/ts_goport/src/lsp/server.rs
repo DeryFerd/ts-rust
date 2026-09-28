@@ -3236,7 +3236,7 @@ impl Server {
                     || (),
                     || {
                         // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
-                        let programs: Vec<&'static compiler::NewProgram> = snapshot
+                        let programs: Vec<Rc<compiler::NewProgram>> = snapshot
                             .project_collection
                             .projects()
                             .iter()

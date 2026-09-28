@@ -1067,11 +1067,11 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
     };
     // PORT: the frontend parses with no current program; the result is a
     // program version (see the module comment).
-    let np: &'static NewProgram = {
+    let np = {
         let _scope = enter_program(None);
-        Box::leak(Box::new(new_program(program_options)))
+        Rc::new(new_program(program_options))
     };
-    let program = tsprogram::new_program_version(np, None);
+    let program = tsprogram::new_program_version(&np, None);
     if config.compiler_options().incremental.is_true() {
         let _scope = enter_program(Some(program));
         let reader = TestBuildInfoReader {

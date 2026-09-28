@@ -111,7 +111,7 @@ impl<P: ProgramView> LanguageService<P> {
         &self,
         ctx: &Context,
         symbol: SymbolId,
-        program: P,
+        program: &P,
         source_files: &[Node],
         checker: &mut Checker,
         options: RefOptions,
@@ -662,7 +662,7 @@ pub fn find_first_jsx_node(root: Node) -> Node {
 // Go: ls/findallreferences.go:1610 getReferencesForNonModule
 pub fn get_references_for_non_module<P: ProgramView>(
     _referenced_file: Node,
-    _program: P,
+    _program: &P,
 ) -> Vec<Rc<RefCell<ReferenceEntry>>> {
     // !!! not implemented
     Vec::new()
@@ -698,7 +698,7 @@ impl<P: ProgramView> LanguageService<P> {
     pub fn get_referenced_symbols_for_module(
         &self,
         ctx: &Context,
-        program: P,
+        program: &P,
         symbol: SymbolId,
         exclude_import_type_of_export_equals: bool,
         source_files: &[Node],
@@ -721,7 +721,7 @@ impl<P: ProgramView> LanguageService<P> {
     // checker that Go gets there.
     pub fn get_referenced_symbols_for_module_worker(
         &self,
-        program: P,
+        program: &P,
         symbol: SymbolId,
         exclude_import_type_of_export_equals: bool,
         source_files: &[Node],
@@ -889,7 +889,7 @@ pub fn get_special_search_kind(node: Node) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub fn get_referenced_symbols_for_symbol<P: ProgramView>(
     ctx: &Context,
-    program: P,
+    program: &P,
     original_symbol: SymbolId,
     node: Node,
     source_files: &[Node],
@@ -1039,7 +1039,7 @@ pub struct RefState<'c, P> {
     pub special_search_kind: &'static str, // "none", "constructor", or "class"
     pub checker: &'c mut Checker,
     pub ctx: &'c Context,
-    pub program: P,
+    pub program: &'c P,
     pub search_meaning: SemanticMeaning,
     pub options: RefOptions,
     pub result: Vec<Rc<RefCell<SymbolAndEntries>>>,
@@ -1056,7 +1056,7 @@ pub struct RefState<'c, P> {
 #[allow(clippy::too_many_arguments)]
 pub fn new_state<'c, P: ProgramView>(
     ctx: &'c Context,
-    program: P,
+    program: &'c P,
     source_files: &'c [Node],
     source_files_set: &'c FxHashSet<String>,
     node: Node,

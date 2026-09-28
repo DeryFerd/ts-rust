@@ -21,7 +21,6 @@
 use crate::execute::tsc::compile::CompileTimes;
 use crate::gostd::{Context, context};
 use crate::prelude::*;
-use std::borrow::Cow;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use ts_path::CaseSensitivity;
@@ -174,8 +173,10 @@ pub struct SourceFileInfo {
     pub type_reference_directives: Vec<FileReference>,
     pub lib_reference_directives: Vec<FileReference>,
     pub comment_directives: Vec<CommentDirective>,
-    // PERF: the diagnostic lists borrow the leaked parsed file of the Go
-    // frontend instead of copying it. The legacy path leaks its own lists.
+    // PERF: the diagnostic lists borrow the parsed file of the Go frontend
+    // instead of copying it. The publish of the file keeps that parse for
+    // good (see `go_files_of_unpublished_stores`). The legacy path leaks its
+    // own lists.
     pub diagnostics: &'static [Diagnostic],
     pub js_diagnostics: &'static [Diagnostic],
     pub jsdoc_diagnostics: &'static [Diagnostic],
@@ -750,8 +751,8 @@ struct FileProgramMeta {
 thread_local! {
     /// The Go frontend program of each program version, by `GoProgram::id`.
     /// Only the thread that loaded a program has it: the frontend data is
-    /// not thread-safe.
-    static FRONTENDS: RefCell<FxHashMap<u32, go_frontend::GoFrontendState>> =
+    /// not thread-safe. The checker reads `GoSharedState`.
+    static FRONTENDS: RefCell<FxHashMap<u32, Rc<crate::frontend::compiler::NewProgram>>> =
         RefCell::new(FxHashMap::default());
 }
 
@@ -767,9 +768,9 @@ fn state_of(program: &'static GoProgram) -> &'static ProgramState {
 
 /// The Go frontend program, or None on the legacy path. Panics on a checker
 /// worker thread, which must use the copies in `VersionTables::go`.
-fn go_frontend() -> Option<go_frontend::GoFrontendState> {
+fn go_frontend() -> Option<Rc<crate::frontend::compiler::NewProgram>> {
     let id = prog().id;
-    let frontend = FRONTENDS.with(|frontends| frontends.borrow().get(&id).copied());
+    let frontend = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned());
     if frontend.is_none() && with_tables(|tables| tables.go.is_some()) {
         panic!("the Go frontend program is read on the loading thread only");
     }
@@ -3073,7 +3074,7 @@ pub fn update_program_version(
 /// Call it on the loading thread, after `np` is built with no current
 /// program.
 pub fn new_program_version(
-    np: &'static crate::frontend::compiler::NewProgram,
+    np: &Rc<crate::frontend::compiler::NewProgram>,
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     go_frontend::new_program_version(np, previous)
@@ -3109,8 +3110,9 @@ pub fn bind_file_outside_program(file: Node) {
 /// nodes), removes the frontend program from this thread and takes the
 /// program tables (`VersionTables`), which are freed when no other thread
 /// holds them. Do not use `program` after this: a read of its tables
-/// panics. Its `GoProgram`, frontend program and file versions stay
-/// leaked. Panics when `program` is current on this thread.
+/// panics. The frontend program is freed with its last `Rc` holder. The
+/// `GoProgram` and the file versions stay leaked. Panics when `program` is
+/// current on this thread.
 pub fn release_program(program: &'static GoProgram) {
     release_program_with(program, CheckerPool::shut_down);
 }
@@ -3135,22 +3137,25 @@ fn release_program_with(program: &'static GoProgram, shut_down: fn(CheckerPool))
     if let Some(pool) = pool {
         shut_down(pool);
     }
-    FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
+    // The frontend program is freed here when this thread held its last
+    // `Rc`, after the map borrow ends.
+    let frontend = FRONTENDS.with(|frontends| frontends.borrow_mut().remove(&program.id));
+    drop(frontend);
     if let Some(state) = program.state.get() {
         release_tables(program.id, state);
     }
 }
 
 /// The Go frontend program, or None on the legacy path. Loading thread only.
-pub fn go_frontend_program() -> Option<&'static crate::frontend::compiler::NewProgram> {
-    go_frontend().map(|go| go.program)
+pub fn go_frontend_program() -> Option<Rc<crate::frontend::compiler::NewProgram>> {
+    go_frontend()
 }
 
 // Go: compiler/program.go:1841 ExplainFiles
 // PORT: the legacy path has no Go frontend program and writes nothing.
 pub fn explain_files(w: &mut String, locale: &crate::locale::Locale) {
     if let Some(go) = go_frontend() {
-        go.program.explain_files(w, locale);
+        go.explain_files(w, locale);
     }
 }
 
@@ -3169,7 +3174,7 @@ pub fn options() -> &'static CompilerOptions {
 // removed. Go reports those as program diagnostics.
 pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
     if let Some(go) = go_frontend() {
-        return go.program.get_config_file_parsing_diagnostics();
+        return go.get_config_file_parsing_diagnostics();
     }
     with_tables(|tables| {
         verify_options::without_reverified_option_diagnostics(&tables.config_diagnostics)
@@ -3188,16 +3193,16 @@ pub fn single_threaded() -> bool {
 // entry, the other modes are tried, because the Rust loader may key an
 // import by a different mode than the Go mode computation. A miss (Go: a
 // failed resolution) returns None.
-// PERF: the Go frontend path borrows the stored resolution. Only the legacy
-// path, which builds a new one, returns it owned.
+// PERF: the Go frontend path shares the stored resolution. The other paths
+// build a new one.
 pub fn get_resolved_module(
     file: Node,
     module_reference: &str,
     mode: ResolutionMode,
-) -> Option<Cow<'static, ResolvedModule>> {
+) -> Option<Arc<ResolvedModule>> {
     // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule (never nil)
     if let Some(resolver) = alias_resolver() {
-        return Some(Cow::Owned(resolver.resolved_module(
+        return Some(Arc::new(resolver.resolved_module(
             file,
             module_reference,
             mode,
@@ -3205,9 +3210,12 @@ pub fn get_resolved_module(
     }
     if let Some(resolved) = with_tables(|tables| {
         let go = tables.go.as_ref()?;
-        Some(go.get_resolved_module(file, module_reference, mode))
+        Some(
+            go.get_resolved_module(file, module_reference, mode)
+                .cloned(),
+        )
     }) {
-        return resolved.map(Cow::Borrowed);
+        return resolved;
     }
     let program = prog();
     let go_file = crate::ast::go_file(file.file_index());
@@ -3231,7 +3239,7 @@ pub fn get_resolved_module(
                 .expect("legacy program")
                 .resolved_module_file(go_file.legacy_source().id, module_reference, format)
         })?;
-    Some(Cow::Owned(build_resolved_module(
+    Some(Arc::new(build_resolved_module(
         module_reference,
         &target.file_name,
     )))
@@ -3284,7 +3292,7 @@ pub fn get_resolved_module_from_module_specifier(
         panic!("moduleSpecifier must be a StringLiteralLike");
     }
     let mode = get_mode_for_usage_location(file, module_specifier);
-    get_resolved_module(file, module_specifier.text(), mode).map(Cow::into_owned)
+    get_resolved_module(file, module_specifier.text(), mode).map(Arc::unwrap_or_clone)
 }
 
 // Go: compiler/program.go:511 GetResolvedModules
@@ -3328,7 +3336,7 @@ pub fn get_resolved_modules()
                     continue;
                 }
                 if let Some(resolved) = get_resolved_module(file.root, &name, mode) {
-                    in_file.insert((name, mode), resolved.into_owned());
+                    in_file.insert((name, mode), Arc::unwrap_or_clone(resolved));
                 }
             }
             result.insert(file.info.path.clone(), in_file);
@@ -4563,11 +4571,10 @@ pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 // `ts_compiler` program diagnostics.
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     if let Some(go) = go_frontend() {
-        let mut diagnostics = go.program.program_diagnostics.clone();
+        let mut diagnostics = go.program_diagnostics.clone();
         diagnostics.extend(
-            go.program
-                .include_processor
-                .get_diagnostics(go.program)
+            go.include_processor
+                .get_diagnostics(&go)
                 .borrow_mut()
                 .get_global_diagnostics(),
         );
@@ -5128,7 +5135,7 @@ pub fn identifier_count() -> i32 {
         unported!("IdentifierCount");
     };
     let mut count = 0;
-    for file in go.program.source_files() {
+    for file in go.source_files() {
         count += file.identifier_count;
     }
     count
