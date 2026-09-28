@@ -183,17 +183,13 @@ struct FileStore {
     // `adopt_detached_store` (another thread) and `publish_file_stores`
     // drop them.
     lazy_jsdoc_cache: FxHashMap<Node, &'static [Node]>,
-    /// Go `file.LanguageVariant`, the parse `file.Diagnostics()` and
-    /// `file.ContainsNonASCII` (Go `NewSourceFile` set it from the text),
+    /// Go `file.LanguageVariant` and the parse `file.Diagnostics()`,
     /// written by `finishSourceFile`. Reads of a file that is not published
     /// use them (`ast::source_file_language_variant`,
     /// `ast::source_file_diagnostics`), for example the format tests, which
     /// parse a file with no program.
-    // PORT: Go removed `ContainsNonASCII` in tsgo#4776. It stays here until
-    // its last reader (`program/go_frontend.rs`) ports its part.
     language_variant: LanguageVariant,
     diagnostics: &'static [Diagnostic],
-    contains_non_ascii: bool,
     /// The SourceFile node of this store, set by `publish_file_stores`.
     root: Node,
     /// Go `SourceFile.ECMALineMap()`, computed on first use after publish
@@ -1334,8 +1330,7 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
 }
 
 /// Go `result.LanguageVariant` and `result.diagnostics` in
-/// `finishSourceFile`, and `ContainsNonASCII`, which Go `NewSourceFile` sets
-/// from the text (`ParsedSourceFile::new`).
+/// `finishSourceFile`.
 // PORT: the diagnostics are leaked so reads can return a `&'static` slice,
 // like `GoFile::info.diagnostics` after the publish. A parse without errors
 // leaks nothing.
@@ -1343,13 +1338,11 @@ pub fn set_file_store_parse_fields(
     file: usize,
     language_variant: LanguageVariant,
     diagnostics: &[Diagnostic],
-    contains_non_ascii: bool,
 ) {
     let diagnostics: &'static [Diagnostic] = Box::leak(diagnostics.to_vec().into_boxed_slice());
     with_store_mut(file, |s| {
         s.language_variant = language_variant;
         s.diagnostics = diagnostics;
-        s.contains_non_ascii = contains_non_ascii;
     });
 }
 
@@ -1363,13 +1356,6 @@ pub fn file_store_language_variant(file: usize) -> LanguageVariant {
 #[must_use]
 pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
     with_store(file, |s| s.diagnostics)
-}
-
-/// Go `file.ContainsNonASCII` of a store file: true when the text has a
-/// byte >= 0x80. False for a store that `finishSourceFile` did not finish.
-#[must_use]
-pub fn file_store_contains_non_ascii(file: usize) -> bool {
-    with_store(file, |s| s.contains_non_ascii)
 }
 
 /// Go `file.jsdocCache[node]` of a store file whose program is not
@@ -3120,8 +3106,8 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 s.lazy_jsdoc_cache.len()
             ),
             format!(
-                "variant {:?} diagnostics {diagnostics:?} non_ascii {}",
-                s.language_variant, s.contains_non_ascii
+                "variant {:?} diagnostics {diagnostics:?}",
+                s.language_variant
             ),
             format!(
                 "facts {:?} bind {:?} overflow {}",

@@ -375,12 +375,7 @@ fn decode(
     // The store writes of Go `finishSourceFile` (parser_p1.rs), then the
     // freeze of `parse_into_store`.
     set_file_store_js_doc_cache(store, &file.jsdoc_cache);
-    set_file_store_parse_fields(
-        store,
-        file.language_variant,
-        &file.diagnostics,
-        file.contains_non_ascii,
-    );
+    set_file_store_parse_fields(store, file.language_variant, &file.diagnostics);
     if file.has_lazy_js_doc {
         set_file_store_lazy_js_doc(store, &file.parse_options, file.script_kind);
     }
@@ -848,7 +843,6 @@ impl<'a> Decoder<'a> {
             language_variant: LanguageVariant(self.i32()?),
             script_kind: ScriptKind(self.i32()?),
             is_declaration_file: self.flag()?,
-            contains_non_ascii: self.flag()?,
             uses_uri_style_node_core_modules: self.tristate()?,
             identifier_count: self.i32()?,
             imports: self.nodes()?,
@@ -1606,7 +1600,6 @@ impl Encoder {
             language_variant,
             script_kind,
             is_declaration_file,
-            contains_non_ascii,
             uses_uri_style_node_core_modules,
             identifier_count,
             imports,
@@ -1637,7 +1630,6 @@ impl Encoder {
         self.zz(i64::from(language_variant.0));
         self.zz(i64::from(script_kind.0));
         self.u8(u8::from(*is_declaration_file));
-        self.u8(u8::from(*contains_non_ascii));
         self.u8(*uses_uri_style_node_core_modules as u8);
         self.zz(i64::from(*identifier_count));
         self.nodes(imports)?;

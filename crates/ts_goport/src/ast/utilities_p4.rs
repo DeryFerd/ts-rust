@@ -507,14 +507,6 @@ pub fn get_class_extends_heritage_element(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ast/utilities.go:3071 GetImplementsTypeNodes
-// PORT: Go removed this in tsgo#4797 (callers use `GetImplementsHeritageClauseElements`).
-// It stays until its last Rust users (`ls/utilities.rs`,
-// `ls/codeactions_fixclassincorrectlyimplementsinterface.rs`) port their part.
-pub fn get_implements_type_nodes(node: Node) -> Vec<Node> {
-    get_heritage_elements(node, SyntaxKind::ImplementsKeyword)
-}
-
 // Go: ast/utilities.go:3075 IsTypeKeywordToken
 pub fn is_type_keyword_token(node: Node) -> bool {
     node.kind() == SyntaxKind::TypeKeyword

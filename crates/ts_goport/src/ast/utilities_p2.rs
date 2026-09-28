@@ -825,25 +825,6 @@ pub fn try_get_class_implementing_or_extending_heritage_clause_element(node: Nod
     (Node::NIL, false)
 }
 
-// Go: ast/utilities.go:1419 TryGetClassImplementingOrExtendingExpressionWithTypeArguments
-// PORT: Go replaced this with `TryGetClassImplementingOrExtendingHeritageClauseElement`
-// in tsgo#4797. It stays until its last Rust user (`checker/checker_p35.rs`,
-// `get_type_of_node`) ports its part.
-/// Returns `(class, isImplements)`.
-pub fn try_get_class_implementing_or_extending_expression_with_type_arguments(
-    node: Node,
-) -> (Node, bool) {
-    if is_expression_with_type_arguments(node) {
-        if is_heritage_clause(node.parent()) && is_class_like(node.parent().parent()) {
-            return (
-                node.parent().parent(),
-                node.parent().token() == SyntaxKind::ImplementsKeyword,
-            );
-        }
-    }
-    (Node::NIL, false)
-}
-
 // Go: ast/utilities.go:1428 GetNameOfDeclaration
 pub fn get_name_of_declaration(declaration: Node) -> Node {
     if declaration.is_nil() {
@@ -1194,17 +1175,6 @@ pub fn is_module_with_string_literal_name(node: Node) -> bool {
 // Go: ast/utilities.go:1693 GetContainingClass
 pub fn get_containing_class(node: Node) -> Node {
     find_ancestor(node.parent(), is_class_like)
-}
-
-// Go: ast/utilities.go:1697 GetExtendsHeritageClauseElement
-// PORT: Go removed this in tsgo#4797 (callers use `GetClassExtendsHeritageElement`).
-// It stays until its last Rust users (the checker files) port their part.
-pub fn get_extends_heritage_clause_element(node: Node) -> Node {
-    // Go: core.FirstOrNil
-    get_extends_heritage_clause_elements(node)
-        .first()
-        .copied()
-        .unwrap_or(Node::NIL)
 }
 
 // Go: ast/utilities.go:1701 GetExtendsHeritageClauseElements

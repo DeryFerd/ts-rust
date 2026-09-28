@@ -452,101 +452,176 @@ pub fn new_compiler_diagnostic(
 }
 
 /// Go `ast.DiagnosticsCollection`. The mutex is dropped (single thread).
+/// PORT: Go keeps `*Diagnostic` pointers in the file lists and the location
+/// index, and `Add` and `Lookup` return the stored pointer, which callers
+/// change later (for example, they add related information). Here the
+/// collection owns each stored diagnostic in `diagnostics`, the lists and the
+/// index hold its position there, and `add` and `lookup` return
+/// `&mut Diagnostic`.
 /// PORT: `file_diagnostics` is an `IndexMap` so `get_diagnostics` sees a
 /// deterministic order before its sort. Go map order is random there.
-/// Go keys the file lists by `file.Path()` (tsgo#4901), so a replaced
-/// SourceFile of the same path shares its list. Here the key is the file
-/// name, which callers pass: one program has one file name per path, so the
-/// lists are the same.
+/// Go keys the file lists and the location index by `file.Path()`
+/// (tsgo#4901), so a replaced SourceFile of the same path shares its list.
+/// Here the key is the file name: one program has one file name per path, so
+/// the lists are the same.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsCollection {
     pub count: i32,
-    pub file_diagnostics: IndexMap<String, Vec<Diagnostic>>,
-    pub file_diagnostics_sorted: FxHashSet<String>,
-    pub non_file_diagnostics: Vec<Diagnostic>,
-    pub non_file_diagnostics_sorted: bool,
+    diagnostics: Vec<Diagnostic>,
+    file_diagnostics: IndexMap<&'static str, Vec<usize>>,
+    file_diagnostics_sorted: FxHashSet<&'static str>,
+    non_file_diagnostics: Vec<usize>,
+    non_file_diagnostics_sorted: bool,
+    // #4825: the stored diagnostics by location, for the `add` dedup.
+    diagnostic_index: FxHashMap<DiagnosticLocationKey, usize>,
+    diagnostic_collisions: FxHashMap<DiagnosticLocationKey, Vec<usize>>,
 }
 
 impl DiagnosticsCollection {
     // Go: ast/diagnostic.go:172 Add
-    pub fn add(&mut self, diagnostic: Diagnostic) {
+    // #4825: returns the stored diagnostic: an equal one that is already
+    // stored, or `diagnostic`.
+    pub fn add(&mut self, diagnostic: Diagnostic) -> &mut Diagnostic {
+        let key = get_diagnostic_location_key(&diagnostic);
+        if let Some(existing) = self.find_equal(key, &diagnostic) {
+            return &mut self.diagnostics[existing];
+        }
+        let id = self.diagnostics.len();
+        match self.diagnostic_index.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.diagnostic_collisions.entry(key).or_default().push(id);
+            }
+        }
+
         self.count += 1;
 
         if diagnostic.file().is_some() {
-            let file_name = source_file_file_name(diagnostic.file()).to_string();
-            self.file_diagnostics
-                .entry(file_name.clone())
-                .or_default()
-                .push(diagnostic);
-            self.file_diagnostics_sorted.remove(&file_name);
+            let path = source_file_file_name(diagnostic.file());
+            self.file_diagnostics.entry(path).or_default().push(id);
+            self.file_diagnostics_sorted.remove(path);
         } else {
-            self.non_file_diagnostics.push(diagnostic);
+            self.non_file_diagnostics.push(id);
             self.non_file_diagnostics_sorted = false;
         }
+        self.diagnostics.push(diagnostic);
+        &mut self.diagnostics[id]
+    }
+
+    // The equal-diagnostic search at the start of Go `Add` (#4825).
+    // PORT: split out so `add` can return the stored entry after the search
+    // borrows end.
+    fn find_equal(&self, key: DiagnosticLocationKey, diagnostic: &Diagnostic) -> Option<usize> {
+        let existing = *self.diagnostic_index.get(&key)?;
+        if equal_diagnostics(&self.diagnostics[existing], diagnostic) {
+            return Some(existing);
+        }
+        self.diagnostic_collisions
+            .get(&key)?
+            .iter()
+            .copied()
+            .find(|&collision| equal_diagnostics(&self.diagnostics[collision], diagnostic))
     }
 
     // Go: ast/diagnostic.go:191 Lookup
-    // PORT: Go returns the stored pointer; this returns a clone of it.
-    pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<Diagnostic> {
+    // PORT: returns the stored diagnostic (Go returns the pointer).
+    pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<&mut Diagnostic> {
         let diagnostics = if diagnostic.file().is_some() {
-            self.get_diagnostics_for_file_locked(source_file_file_name(diagnostic.file()))
+            self.get_diagnostics_for_file_locked(diagnostic.file())
         } else {
             self.get_global_diagnostics_locked()
         };
         // Go slices.BinarySearchFunc: the first index where cmp >= 0.
-        let i = diagnostics.partition_point(|d| compare_diagnostics(d, diagnostic) < 0);
-        if i < diagnostics.len() && compare_diagnostics(&diagnostics[i], diagnostic) == 0 {
-            return Some(diagnostics[i].clone());
+        let i = diagnostics
+            .partition_point(|&d| compare_diagnostics(&self.diagnostics[d], diagnostic) < 0);
+        if i < diagnostics.len()
+            && compare_diagnostics(&self.diagnostics[diagnostics[i]], diagnostic) == 0
+        {
+            return Some(&mut self.diagnostics[diagnostics[i]]);
         }
         None
     }
 
     // Go: ast/diagnostic.go:207 GetGlobalDiagnostics
     pub fn get_global_diagnostics(&mut self) -> Vec<Diagnostic> {
-        self.get_global_diagnostics_locked()
+        let ids = self.get_global_diagnostics_locked();
+        ids.iter().map(|&id| self.diagnostics[id].clone()).collect()
     }
 
     // Go: ast/diagnostic.go:214 getGlobalDiagnosticsLocked
-    fn get_global_diagnostics_locked(&mut self) -> Vec<Diagnostic> {
+    // PORT: returns positions in `diagnostics` (Go returns the pointers).
+    fn get_global_diagnostics_locked(&mut self) -> Vec<usize> {
         if !self.non_file_diagnostics_sorted {
-            self.non_file_diagnostics
-                .sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+            sort_diagnostic_ids(&mut self.non_file_diagnostics, &self.diagnostics);
             self.non_file_diagnostics_sorted = true;
         }
         self.non_file_diagnostics.clone()
     }
 
     // Go: ast/diagnostic.go:222 GetDiagnosticsForFile
-    pub fn get_diagnostics_for_file(&mut self, file_name: &str) -> Vec<Diagnostic> {
-        self.get_diagnostics_for_file_locked(file_name)
+    // #4825: takes the source file, not its name.
+    pub fn get_diagnostics_for_file(&mut self, file: Node) -> Vec<Diagnostic> {
+        let ids = self.get_diagnostics_for_file_locked(file);
+        ids.iter().map(|&id| self.diagnostics[id].clone()).collect()
     }
 
     // Go: ast/diagnostic.go:229 getDiagnosticsForFileLocked
-    fn get_diagnostics_for_file_locked(&mut self, file_name: &str) -> Vec<Diagnostic> {
-        if !self.file_diagnostics_sorted.contains(file_name) {
-            if let Some(diagnostics) = self.file_diagnostics.get_mut(file_name) {
-                diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+    // PORT: returns positions in `diagnostics` (Go returns the pointers).
+    fn get_diagnostics_for_file_locked(&mut self, file: Node) -> Vec<usize> {
+        let path = source_file_file_name(file);
+        if !self.file_diagnostics_sorted.contains(path) {
+            if let Some(ids) = self.file_diagnostics.get_mut(path) {
+                sort_diagnostic_ids(ids, &self.diagnostics);
             }
-            self.file_diagnostics_sorted.insert(file_name.to_string());
+            self.file_diagnostics_sorted.insert(path);
         }
-        self.file_diagnostics
-            .get(file_name)
-            .cloned()
-            .unwrap_or_default()
+        self.file_diagnostics.get(path).cloned().unwrap_or_default()
     }
 
     // Go: ast/diagnostic.go:237 GetDiagnostics
     #[must_use]
     pub fn get_diagnostics(&self) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<Diagnostic> = Vec::with_capacity(self.count as usize);
-        diagnostics.extend(self.non_file_diagnostics.iter().cloned());
-        for diags in self.file_diagnostics.values() {
-            diagnostics.extend(diags.iter().cloned());
+        let lists =
+            std::iter::once(&self.non_file_diagnostics).chain(self.file_diagnostics.values());
+        for ids in lists {
+            diagnostics.extend(ids.iter().map(|&id| self.diagnostics[id].clone()));
         }
         // PORT: Go uses the unstable slices.SortFunc; any order of equal
         // elements is valid there, so a stable sort is used here.
         diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
         diagnostics
+    }
+}
+
+// Go `slices.SortStableFunc(list, CompareDiagnostics)` on a list of
+// positions in `diagnostics`.
+fn sort_diagnostic_ids(ids: &mut [usize], diagnostics: &[Diagnostic]) {
+    ids.sort_by(|&a, &b| compare_diagnostics(&diagnostics[a], &diagnostics[b]).cmp(&0));
+}
+
+// Go: ast/diagnostic.go:288 diagnosticLocationKey (#4825)
+// PORT: `path` is the file name (see `DiagnosticsCollection`). Go `loc` is
+// `pos` and `end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DiagnosticLocationKey {
+    path: &'static str,
+    pos: i32,
+    end: i32,
+    code: i32,
+}
+
+// Go: ast/diagnostic.go:294 getDiagnosticLocationKey (#4825)
+// PORT: `get_diagnostic_path` is the Go path part: the file name, or "" when
+// there is no file.
+fn get_diagnostic_location_key(diagnostic: &Diagnostic) -> DiagnosticLocationKey {
+    DiagnosticLocationKey {
+        path: get_diagnostic_path(diagnostic),
+        pos: diagnostic.pos(),
+        end: diagnostic.end(),
+        code: diagnostic.code(),
     }
 }
 
@@ -584,6 +659,8 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
         && d1.pos() == d2.pos()
         && d1.end() == d2.end()
         && d1.code() == d2.code()
+        // #4825
+        && get_diagnostic_message_identity(d1) == get_diagnostic_message_identity(d2)
         && d1.message_args() == d2.message_args()
         && d1.message_chain().len() == d2.message_chain().len()
         && d1
@@ -591,6 +668,18 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
             .iter()
             .zip(d2.message_chain())
             .all(|(a, b)| equal_message_chain(a, b))
+}
+
+// Go: ast/diagnostic.go:395 getDiagnosticMessageIdentity (#4825)
+// PORT: a port diagnostic always has its message (see
+// `new_diagnostic_from_serialized`). Go `message.String()` is the message
+// text. Go also returns `MessageText()` first when it is set (external
+// diagnostics of tsgo#4712), which is not ported yet.
+fn get_diagnostic_message_identity(diagnostic: &Diagnostic) -> &'static str {
+    if diagnostic.code() == -1 {
+        return diagnostic.message.text();
+    }
+    diagnostic.message_key()
 }
 
 // Go: ast/diagnostic.go:276 equalMessageChain
@@ -693,6 +782,15 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
         return c;
     }
     c = d1.code() - d2.code();
+    if c != 0 {
+        return c;
+    }
+    // #4825
+    // PORT: keys and message texts are plain UTF-8 (not port forms), so the
+    // `str` order is the Go byte order.
+    c = ordering_to_int(
+        get_diagnostic_message_identity(d1).cmp(get_diagnostic_message_identity(d2)),
+    );
     if c != 0 {
         return c;
     }

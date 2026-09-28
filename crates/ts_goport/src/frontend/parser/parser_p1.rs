@@ -794,14 +794,7 @@ impl Parser {
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
         set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
-        // PORT: the store copy of `ContainsNonASCII`, which Go NewSourceFile
-        // sets (`ParsedSourceFile::new`).
-        set_file_store_parse_fields(
-            result.store,
-            result.language_variant,
-            &result.diagnostics,
-            result.contains_non_ascii,
-        );
+        set_file_store_parse_fields(result.store, result.language_variant, &result.diagnostics);
         // For non-JS files, enable lazy JSDoc parsing on demand
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;
