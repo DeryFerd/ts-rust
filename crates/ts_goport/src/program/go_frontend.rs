@@ -28,6 +28,10 @@ use ts_diagnostics::Message;
 /// thread holds it (`FRONTENDS`). The checker reads `GoSharedState`.
 pub(super) struct GoFrontendState {
     pub(super) program: &'static NewProgram,
+    /// #4712: Go `Program.contentMapperOptionDiagnostics`.
+    // PORT: `NewProgram` has no field for it, so the program version keeps
+    // it (see `content_mapper_option_diagnostics_of`).
+    pub(super) content_mapper_option_diagnostics: Vec<Diagnostic>,
 }
 
 /// Thread-safe copies of the Go frontend data that checker code reads.
@@ -89,6 +93,9 @@ pub(super) struct GoSharedState {
     /// Go `Program.toPath` inputs.
     current_directory: String,
     use_case_sensitive_file_names: bool,
+    /// #4712: Go `Program.ContentMapperExtensions` (the extensions of the
+    /// command line).
+    content_mapper_extensions: Vec<String>,
 }
 
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
@@ -239,12 +246,14 @@ pub(super) fn update_program_version(
     // the changed file. A new cached host over the OS file system reads it
     // again.
     let host_cwd = old_np.get_current_directory();
+    // #4712: no content mapper project (see `load_config`).
     let host = new_cached_fs_compiler_host(
         &host_cwd,
         bundled::wrap_fs(osvfs_fs()),
         &bundled::lib_path(),
         None,
         Some(trace_from_sys()),
+        None,
     );
     let changed_path = crate::frontend::tspath::to_path(
         changed_file,
@@ -281,6 +290,15 @@ thread_local! {
     /// (`resolve_js_doc_outside_program`).
     static OUTSIDE_PARSE_INPUTS: RefCell<FxHashMap<usize, Arc<LazyJsDocInput>>> =
         RefCell::new(FxHashMap::default());
+
+    /// The parses of `PARSED_UNPUBLISHED` that a publish kept for good
+    /// (`go_files_of_unpublished_stores`), by store id. A store here is
+    /// published, so `unpublished_parsed_source_file` no longer finds it.
+    // PORT: bump B 2c config hand-off (api ext battery, `getConfigSourceFile`
+    // event 3): the project system parses the root config, and a program
+    // version publishes its store before the api request encodes it.
+    static PUBLISHED_OUTSIDE: RefCell<FxHashMap<usize, &'static Rc<ParsedSourceFile>>> =
+        RefCell::new(FxHashMap::default());
 }
 
 /// `note_parsed_source_file` (program.rs).
@@ -294,6 +312,13 @@ pub(super) fn note_parsed_source_file(file: &Rc<ParsedSourceFile>) {
 /// this thread, while the store is not published.
 pub(super) fn unpublished_parsed_source_file(store: usize) -> Option<Rc<ParsedSourceFile>> {
     PARSED_UNPUBLISHED.with(|parsed| parsed.borrow().get(&store).cloned())
+}
+
+/// The parse of store `store` that a publish kept for good: a file parsed
+/// on this thread outside a program load (`note_parsed_source_file`) that
+/// a publish gave no program. None for any other store.
+pub(super) fn published_outside_parsed_source_file(store: usize) -> Option<Rc<ParsedSourceFile>> {
+    PUBLISHED_OUTSIDE.with(|kept| kept.borrow().get(&store).map(|&file| Rc::clone(file)))
 }
 
 /// `publish_parsed_files` (program.rs).
@@ -395,6 +420,7 @@ fn go_files_of_unpublished_stores(
             Some(&file) => Some(file),
             None => outside.get(&store).map(|file| {
                 let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
+                PUBLISHED_OUTSIDE.with(|published| published.borrow_mut().insert(store, kept));
                 &**kept
             }),
         };
@@ -482,9 +508,23 @@ fn load_config(
         &bundled::lib_path(),
     );
 
-    // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
-    let host =
-        new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
+    // Go: tsc.go:302 NewCachedFSCompilerHost, tsc.go:310 NewProgram.
+    // #4712: the 6th argument is Go `contentMapperProject` (tsc.go:298
+    // `getContentMapperProject(tsc.NewContentMapperHost(ctx, sys, options),
+    // config)`).
+    // PORT: Go makes a content mapper host only with `runExternalCode`, and
+    // the host spawns the mapper processes through `sys.Spawn`. The port has
+    // no OS spawner here, so the host has no content mapper project: Go's
+    // value without `runExternalCode`. A content-mapped file then fails its
+    // transform with `ErrProjectUnavailable`, as in Go without that option.
+    let host = new_cached_fs_compiler_host(
+        &cwd,
+        fs,
+        &bundled::lib_path(),
+        None,
+        Some(trace_from_sys()),
+        None,
+    );
     Ok(ProgramOptions {
         host,
         config: Rc::new(config),
@@ -577,7 +617,12 @@ fn build_program(
     }
 
     let id = next_program_id();
-    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState { program: np }));
+    // #4712
+    let content_mapper_option_diagnostics = content_mapper_option_diagnostics_of(np, previous);
+    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState {
+        program: np,
+        content_mapper_option_diagnostics,
+    }));
     FRONTENDS.with(|frontends| {
         assert!(
             frontends.borrow_mut().insert(id, frontend).is_none(),
@@ -639,6 +684,60 @@ fn build_program(
     }));
     assert!(program.state.set(program_state).is_ok());
     program
+}
+
+/// Go `Program.contentMapperOptionDiagnostics` of `np` (#4712). Go
+/// `NewProgram` collects them (`collectContentMapperOptionDiagnostics`),
+/// and `ReuseProgram` clones the list of the program it reuses. A reused
+/// program shares the processed files of that program (see
+/// `GoSharedState::new`); `previous` is the version `np` was updated from,
+/// if it is still loaded.
+fn content_mapper_option_diagnostics_of(
+    np: &'static NewProgram,
+    previous: Option<&'static GoProgram>,
+) -> Vec<Diagnostic> {
+    let old = previous
+        .and_then(|old| FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).copied()));
+    match old {
+        Some(old)
+            if Rc::ptr_eq(
+                &np.processed_files.resolved_modules,
+                &old.program.processed_files.resolved_modules,
+            ) =>
+        {
+            old.content_mapper_option_diagnostics.clone()
+        }
+        _ => collect_content_mapper_option_diagnostics(np),
+    }
+}
+
+// Go: compiler/program.go:800 collectContentMapperOptionDiagnostics (#4712)
+// PORT: returns the list; Go sets `p.contentMapperOptionDiagnostics`.
+fn collect_content_mapper_option_diagnostics(p: &NewProgram) -> Vec<Diagnostic> {
+    // Go: compiler/program.go:134 ContentMapperProject
+    let Some(project) = p.host().content_mapper_project() else {
+        return Vec::new();
+    };
+    let option_diagnostics = project.diagnostics();
+    option_diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let (file, loc) =
+                crate::frontend::tsoptions::get_content_mapper_option_diagnostic_location(
+                    Some(p.command_line().as_ref()),
+                    &diagnostic.mapper,
+                    &diagnostic.path,
+                );
+            crate::ast::new_external_diagnostic(
+                file,
+                loc,
+                &diagnostic.source,
+                ts_diagnostics::Category::Error,
+                diagnostic.code,
+                &diagnostic.message_text,
+            )
+        })
+        .collect()
 }
 
 /// Go `getTraceFromSys` (tsc.go:280) with no testing hooks:
@@ -956,6 +1055,8 @@ impl GoSharedState {
             has_emit_blocking_diagnostics,
             current_directory: p.get_current_directory(),
             use_case_sensitive_file_names: p.use_case_sensitive_file_names(),
+            // #4712
+            content_mapper_extensions: p.command_line().content_mapper_extensions(),
             resolved_modules,
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
@@ -974,6 +1075,11 @@ impl GoSharedState {
             known_symlinks,
             source_files_found_searching_node_modules,
         }
+    }
+
+    // Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+    pub(super) fn content_mapper_extensions(&self) -> &[String] {
+        &self.content_mapper_extensions
     }
 
     // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded

@@ -7,7 +7,10 @@
 use crate::prelude::*;
 
 use super::program_emit::{EmitResult, PoolJsPart, SourceMapEmitResult, WriteFile, WriteFileData};
-use crate::declarations::DeclarationTransformer;
+use crate::declarations::{
+    DeclarationTransformer, SupplementalReferencesTransformer,
+    new_supplemental_references_transformer,
+};
 use crate::frontend::outputpaths::OutputPaths;
 use crate::frontend::outputpaths::get_source_file_path_in_new_dir;
 use crate::frontend::tspath::{
@@ -55,6 +58,34 @@ pub struct Emitter {
     pub js_part: Option<Rc<RefCell<PoolJsPart>>>,
 }
 
+// Go: compiler/emitter.go:55 declarationTransformer (#4712)
+// PORT: renamed, because `DeclarationTransformer` is the declarations
+// transformer struct.
+trait DeclarationTransformerLike {
+    fn transform_source_file(&mut self, source_file: Node) -> Node;
+    fn get_diagnostics(&self) -> Vec<Diagnostic>;
+}
+
+impl DeclarationTransformerLike for DeclarationTransformer {
+    fn transform_source_file(&mut self, source_file: Node) -> Node {
+        self.transform_source_file_root(source_file)
+    }
+
+    fn get_diagnostics(&self) -> Vec<Diagnostic> {
+        DeclarationTransformer::get_diagnostics(self)
+    }
+}
+
+impl DeclarationTransformerLike for SupplementalReferencesTransformer {
+    fn transform_source_file(&mut self, source_file: Node) -> Node {
+        SupplementalReferencesTransformer::transform_source_file(self, source_file)
+    }
+
+    fn get_diagnostics(&self) -> Vec<Diagnostic> {
+        SupplementalReferencesTransformer::get_diagnostics(self)
+    }
+}
+
 impl Emitter {
     fn writer(&self) -> std::cell::RefMut<'_, dyn EmitTextWriter> {
         self.writer.as_ref().expect("nil writer").borrow_mut()
@@ -86,21 +117,35 @@ impl Emitter {
         self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
     }
 
-    // Go: compiler/emitter.go:54 emitter.getDeclarationTransformers
+    // Go: compiler/emitter.go:60 emitter.getDeclarationTransformers
+    // #4712: takes the source file, and adds the supplemental references
+    // transformer.
     fn get_declaration_transformers(
         &self,
         emit_context: &Rc<EmitContext>,
+        source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
-    ) -> Vec<DeclarationTransformer> {
-        let transform = crate::declarations::new_declaration_transformer(
+    ) -> Vec<Box<dyn DeclarationTransformerLike>> {
+        let force_dts_emit = self.emit_only == EmitOnly::BuilderSignature
+            || self.force_emit && self.emit_only == EmitOnly::Dts;
+        let mut transformers: Vec<Box<dyn DeclarationTransformerLike>> = Vec::with_capacity(2);
+        transformers.push(Box::new(crate::declarations::new_declaration_transformer(
             self.host.clone(),
             Some(emit_context.clone()),
             options(),
             declaration_file_path,
             declaration_map_path,
-        );
-        vec![transform]
+        )));
+        // PORT: Go passes the source file, and the transformer reads its
+        // `SupplementalSourceFiles()`. The Rust transformer takes that list.
+        transformers.push(Box::new(new_supplemental_references_transformer(
+            self.host.clone(),
+            source_file_supplemental_source_files(source_file).to_vec(),
+            declaration_file_path,
+            force_dts_emit,
+        )));
+        transformers
     }
 
     // Go: compiler/emitter.go:59 emitter.runScriptTransformers
@@ -142,10 +187,11 @@ impl Emitter {
         let mut diags = Vec::new();
         for mut transformer in self.get_declaration_transformers(
             emit_context,
+            source_file,
             declaration_file_path,
             declaration_map_path,
         ) {
-            source_file = transformer.transform_source_file_root(source_file);
+            source_file = transformer.transform_source_file(source_file);
             diags.extend(transformer.get_diagnostics());
         }
         (source_file, diags)
@@ -239,6 +285,13 @@ impl Emitter {
         {
             return;
         }
+        // #4712
+        // Declaration files for content-mapped files don't get source maps because the mapped positions would point into
+        // transformed TS content that exists only in-memory during the build. As a future improvement, it may be possible
+        // to double-map the positions using the content-mapped file's spanmap.
+        let emit_declaration_map = self.emit_only != EmitOnly::BuilderSignature
+            && options.declaration_map.is_true()
+            && source_file_content_mapper(source_file).is_empty();
 
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -293,8 +346,7 @@ impl Emitter {
             // Module: 			   options.Module, // NYI
             // ModuleResolution:   options.ModuleResolution, // NYI
             target: options.get_emit_script_target(),
-            source_map: self.emit_only != EmitOnly::BuilderSignature
-                && options.declaration_map.is_true(),
+            source_map: emit_declaration_map,
             inline_source_map: options.inline_source_map.is_true(),
             // InlineSources:       options.InlineSources.IsTrue(), // ignored, per strada
             // ExtendedDiagnostics: options.ExtendedDiagnostics.IsTrue(), // NYI
@@ -314,9 +366,7 @@ impl Emitter {
         );
 
         let declaration_map_options = CompilerOptions {
-            source_map: if self.emit_only != EmitOnly::BuilderSignature
-                && options.declaration_map.is_true()
-            {
+            source_map: if emit_declaration_map {
                 Tristate::True
             } else {
                 Tristate::False

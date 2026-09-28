@@ -497,9 +497,12 @@ fn file_emit(source_file: Node, target: &EmitterOptions) -> FileEmit {
     let emit_only = target.emit_only;
     let options = options();
     // With `noEmit` the JS part only sets `emit_skipped`: not worth a job.
+    // #4712: a content-mapped file has no JS output path
+    // (`get_output_paths_for_file`).
     let has_js = matches!(emit_only, EmitOnly::All | EmitOnly::Js)
         && !options.emit_declaration_only.is_true()
-        && !options.no_emit.is_true();
+        && !options.no_emit.is_true()
+        && source_file_content_mapper(source_file).is_empty();
     if !has_js || js_emit_needs_checker(source_file) {
         return FileEmit::OnChecker;
     }

@@ -236,7 +236,8 @@ pub fn program_version(p: &'static NewProgram) -> &'static GoProgram {
 /// program that has it; here the programs hold the `ParsedSourceFile`.
 /// A file that is not published yet (Go `parser.ParseSourceFile` outside a
 /// program) has the parse that `program::note_parsed_source_file` recorded
-/// on this thread.
+/// on this thread, and so does such a file after a publish that gave it no
+/// program.
 pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
     let Some(go_file) = crate::ast::try_go_file(file.file_index()) else {
         return super::go_frontend::unpublished_parsed_source_file(file.file_index())
@@ -250,10 +251,18 @@ pub fn parsed_source_file(file: Node) -> Option<Rc<ParsedSourceFile>> {
             .map(|checkers| checkers.program)
             .collect()
     });
-    programs.into_iter().find_map(|p| {
-        p.get_source_file_by_path(&path)
-            .filter(|parsed| parsed.root == file)
-    })
+    programs
+        .into_iter()
+        .find_map(|p| {
+            p.get_source_file_by_path(&path)
+                .filter(|parsed| parsed.root == file)
+        })
+        // PORT: bump B 2c config hand-off (api ext battery,
+        // `getConfigSourceFile` event 3).
+        .or_else(|| {
+            super::go_frontend::published_outside_parsed_source_file(file.file_index())
+                .filter(|parsed| parsed.root == file)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +355,8 @@ impl Drop for ProgramGuard {
 // program version of the process (`program::new_program_version`).
 // PORT: Go runs `initCheckerPool` before `verifyCompilerOptions`. Here the
 // pool is set up after the program is built. Neither step reads the other.
+// #4712: Go `collectContentMapperOptionDiagnostics` runs when the program
+// version is built (`go_frontend::content_mapper_option_diagnostics_of`).
 pub fn new_program(
     opts: ProgramOptions,
     create_checker_pool: Option<CreateCheckerPool>,
@@ -1174,7 +1185,8 @@ fn collect_diagnostics(
             collect_diagnostics_from_files(p, ctx, &source_file_nodes(p), concurrent, collect);
         diagnostics.into_iter().flatten().collect()
     };
-    sort_and_deduplicate_diagnostics(result)
+    // #4712
+    filter_and_sort_diagnostics(result)
 }
 
 // Go: compiler/program.go:545 collectDiagnosticsFromFiles
@@ -1213,11 +1225,12 @@ fn collect_checker_diagnostics(
         let (c, done) = get_type_checker_for_file_exclusive(p, ctx, source_file);
         let result = collect(ctx, &mut c.borrow_mut(), source_file);
         done.call();
-        return sort_and_deduplicate_diagnostics(result);
+        // #4712
+        return filter_and_sort_diagnostics(result);
     }
     let diagnostics =
         collect_checker_diagnostics_from_files(p, ctx, &source_file_nodes(p), collect);
-    sort_and_deduplicate_diagnostics(diagnostics.into_iter().flatten().collect())
+    filter_and_sort_diagnostics(diagnostics.into_iter().flatten().collect())
 }
 
 // Go: compiler/program.go:576 collectCheckerDiagnosticsFromFiles
@@ -1331,7 +1344,8 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
         });
     let mut result = FxHashMap::default();
     for (i, diags) in all_diags.into_iter().enumerate() {
-        result.insert(source_files[i], sort_and_deduplicate_diagnostics(diags));
+        // #4712
+        result.insert(source_files[i], filter_and_sort_diagnostics(diags));
     }
     result
 }
@@ -1352,6 +1366,9 @@ pub fn get_suggestion_diagnostics(
 pub fn get_program_diagnostics(p: &'static NewProgram) -> Vec<Diagnostic> {
     let _program = enter(p);
     let mut diagnostics = p.program_diagnostics.clone();
+    // #4712
+    diagnostics.extend(p.content_mapper_diagnostics.iter().cloned());
+    diagnostics.extend(content_mapper_option_diagnostics());
     diagnostics.extend(
         p.include_processor
             .get_diagnostics(p)
@@ -1404,10 +1421,8 @@ fn can_include_bind_and_check_diagnostics(p: &'static NewProgram, source_file: N
         return false;
     }
 
-    if info.script_kind == ScriptKind::TS
-        || info.script_kind == ScriptKind::TSX
-        || info.script_kind == ScriptKind::EXTERNAL
-    {
+    // #4712: no ScriptKindExternal.
+    if info.script_kind == ScriptKind::TS || info.script_kind == ScriptKind::TSX {
         return true;
     }
 
@@ -1415,11 +1430,11 @@ fn can_include_bind_and_check_diagnostics(p: &'static NewProgram, source_file: N
     let is_check_js = is_js && is_check_js_enabled_for_file(source_file, p.options());
     let is_plain_js = is_plain_js_file(source_file, p.options().check_js);
 
-    // By default, only type-check .ts, .tsx, Deferred, plain JS, checked JS and External
+    // By default, only type-check .ts, .tsx, plain JS, and checked JS
     // - plain JS: .js files with no // ts-check and checkJs: undefined
     // - check JS: .js files with either // ts-check or checkJs: true
-    // - external: files that are added by plugins
-    is_plain_js || is_check_js || info.script_kind == ScriptKind::DEFERRED
+    // #4712: no ScriptKindDeferred.
+    is_plain_js || is_check_js
 }
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics

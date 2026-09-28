@@ -99,6 +99,9 @@ pub struct ResolvedModule {
     pub original_path: String,
     pub extension: String,
     pub resolved_using_ts_extension: bool,
+    /// #4712: the resolution used a content mapper extension (Go
+    /// `ResolvedUsingExtraExtensions`).
+    pub resolved_using_extra_extensions: bool,
     pub package_id: PackageId,
     pub is_external_library_import: bool,
     pub alternate_result: String,
@@ -1485,9 +1488,11 @@ fn build_early_info(
         ts_path::ScriptKind::Jsx => ScriptKind::JSX,
         ts_path::ScriptKind::Ts => ScriptKind::TS,
         ts_path::ScriptKind::Tsx => ScriptKind::TSX,
-        ts_path::ScriptKind::External => ScriptKind::EXTERNAL,
+        // #4712: Go removed ScriptKindExternal (5) and ScriptKindDeferred
+        // (7); the legacy loader keeps their values.
+        ts_path::ScriptKind::External => ScriptKind(5),
         ts_path::ScriptKind::Json => ScriptKind::JSON,
-        ts_path::ScriptKind::Deferred => ScriptKind::DEFERRED,
+        ts_path::ScriptKind::Deferred => ScriptKind(7),
         ts_path::ScriptKind::Unknown => ScriptKind::TS,
     };
     let language_variant = get_language_variant(script_kind);
@@ -2945,6 +2950,37 @@ pub fn options() -> &'static CompilerOptions {
     &prog().options
 }
 
+// Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+// PORT: the Go frontend program copies the extensions of its command line
+// (`GoSharedState`), so checker threads can read them. The legacy loader
+// has no content mappers.
+pub fn content_mapper_extensions() -> Vec<String> {
+    state()
+        .go
+        .as_ref()
+        .map(|go| go.content_mapper_extensions().to_vec())
+        .unwrap_or_default()
+}
+
+/// Go `Program.contentMapperDiagnostics` (#4712): the program diagnostics
+/// that the loader reports when a content mapper fails for good (Go
+/// `processedFiles.contentMapperDiagnostics`). The legacy loader has none.
+/// Loading thread only.
+fn content_mapper_diagnostics() -> Vec<Diagnostic> {
+    go_frontend()
+        .map(|go| go.program.content_mapper_diagnostics.clone())
+        .unwrap_or_default()
+}
+
+/// Go `Program.contentMapperOptionDiagnostics` (#4712), made by
+/// `collectContentMapperOptionDiagnostics` (see `go_frontend`). The legacy
+/// loader has none. Loading thread only.
+fn content_mapper_option_diagnostics() -> Vec<Diagnostic> {
+    go_frontend()
+        .map(|go| go.content_mapper_option_diagnostics.clone())
+        .unwrap_or_default()
+}
+
 // Go: compiler/program.go:403 GetConfigFileParsingDiagnostics
 // PORT: `ts_compiler` records of the option checks in `verify_options` are
 // removed. Go reports those as program diagnostics.
@@ -3044,6 +3080,8 @@ fn build_resolved_module(module_reference: &str, resolved_file_name: &str) -> Re
         extension: extension.to_string(),
         resolved_using_ts_extension: ts_path::has_typescript_extension(module_reference)
             && !ts_path::is_declaration_file(module_reference),
+        // #4712: the legacy loader has no content mappers.
+        resolved_using_extra_extensions: false,
         package_id,
         is_external_library_import,
         alternate_result: String::new(),
@@ -3394,6 +3432,15 @@ fn source_file_may_be_emitted_worker(
     if info.is_declaration_file {
         return false;
     }
+    // #4712
+    // Runtime output for content-mapped files is owned by the external content mapper or build tool. Only
+    // include them in the emit set when their transformed TypeScript can produce declarations.
+    if !source_file_content_mapper(source_file).is_empty()
+        && !force_dts_emit
+        && !options.get_emit_declarations()
+    {
+        return false;
+    }
     // Source file from node_modules are not emitted
     if is_source_file_from_external_library(source_file) {
         return false;
@@ -3569,8 +3616,12 @@ fn get_source_file_from_reference_legacy(origin: Node, r#ref: &FileReference) ->
         &get_directory_path(source_file_file_name(origin)),
         &[&r#ref.file_name],
     );
-    let supported_extensions_base =
-        crate::frontend::tsoptions::get_supported_extensions(options(), &[]);
+    // #4712: with the content mapper extensions (Go
+    // `p.CommandLine().ContentMapperExtensions()`; none on the legacy path).
+    let supported_extensions_base = crate::frontend::tsoptions::get_supported_extensions(
+        options(),
+        &content_mapper_extensions(),
+    );
     let supported_extensions =
         crate::frontend::tsoptions::get_supported_extensions_with_json_if_resolve_json_module(
             Some(options()),
@@ -3612,9 +3663,9 @@ fn get_source_file_from_reference_legacy(origin: Node, r#ref: &FileReference) ->
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
 // compiler/emitHost.go:94 emitHost.GetOutputPathsFor and Program.Emit with
 // the program options.
-// PORT: Go reads two fields of the source file. It is named for the emit
-// host method so it does not clash with the frontend `get_output_paths_for`
-// in the frontend prelude.
+// PORT: Go reads three fields of the source file (#4712: the content
+// mapper). It is named for the emit host method so it does not clash with
+// the frontend `get_output_paths_for` in the frontend prelude.
 pub fn get_output_paths_for_source_file(
     file: Node,
     host: &dyn crate::frontend::outputpaths::OutputPathsHost,
@@ -3624,6 +3675,7 @@ pub fn get_output_paths_for_source_file(
     crate::frontend::outputpaths::get_output_paths_for_file(
         &info.file_name,
         info.script_kind,
+        source_file_content_mapper(file),
         options(),
         host,
         force,
@@ -4163,7 +4215,8 @@ fn collect_diagnostics(
             .flat_map(|f| collect(f.root))
             .collect()
     };
-    sort_and_deduplicate_diagnostics(result)
+    // #4712
+    filter_and_sort_diagnostics(result)
 }
 
 // Go: compiler/program.go:562 collectCheckerDiagnostics
@@ -4178,11 +4231,31 @@ pub fn collect_checker_diagnostics_with(
             return Vec::new();
         }
         let result = with_type_checker_for_file(file, move |c| collect(c, file));
-        return sort_and_deduplicate_diagnostics(result);
+        // #4712
+        return filter_and_sort_diagnostics(result);
     }
     let files = source_files();
     let diagnostics = collect_checker_diagnostics_from_files(&files, collect);
-    sort_and_deduplicate_diagnostics(diagnostics.into_iter().flatten().collect())
+    filter_and_sort_diagnostics(diagnostics.into_iter().flatten().collect())
+}
+
+// Go: compiler/program.go:684 filterAndSortDiagnostics (#4712)
+fn filter_and_sort_diagnostics(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    diags.retain(|diag| {
+        let file = diag.file;
+        if !diag.reports_unnecessary || file.is_nil() || !diag.source().is_empty() {
+            return true;
+        }
+        let Some(span_map) = source_file_span_map(file) else {
+            return true;
+        };
+        let (_, fidelity) = crate::spanmap::SpanMap::virtual_to_original_span(
+            Some(span_map),
+            TextRange::new(diag.pos, diag.end),
+        );
+        fidelity != crate::spanmap::Fidelity::NONE
+    });
+    sort_and_deduplicate_diagnostics(diags)
 }
 
 // Go: compiler/program.go:576 collectCheckerDiagnosticsFromFiles
@@ -4294,7 +4367,8 @@ impl PendingSemanticDiagnostics {
         files
             .iter()
             .zip(self.0.wait())
-            .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
+            // #4712
+            .map(|(&file, diags)| (file, filter_and_sort_diagnostics(diags)))
             .collect()
     }
 }
@@ -4324,6 +4398,9 @@ pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     if let Some(go) = go_frontend() {
         let mut diagnostics = go.program.program_diagnostics.clone();
+        // #4712
+        diagnostics.extend(content_mapper_diagnostics());
+        diagnostics.extend(content_mapper_option_diagnostics());
         diagnostics.extend(
             go.program
                 .include_processor
@@ -4372,20 +4449,18 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     if info.check_js_directive.is_some_and(|d| !d.enabled) {
         return false;
     }
-    if info.script_kind == ScriptKind::TS
-        || info.script_kind == ScriptKind::TSX
-        || info.script_kind == ScriptKind::EXTERNAL
-    {
+    // #4712: no ScriptKindExternal.
+    if info.script_kind == ScriptKind::TS || info.script_kind == ScriptKind::TSX {
         return true;
     }
     let is_js = info.script_kind == ScriptKind::JS || info.script_kind == ScriptKind::JSX;
     let is_check_js = is_js && is_check_js_enabled_for_file(source_file, options);
     let is_plain_js = is_plain_js_file(source_file, options.check_js);
-    // By default, only type-check .ts, .tsx, Deferred, plain JS, checked JS and External
+    // By default, only type-check .ts, .tsx, plain JS, and checked JS
     // - plain JS: .js files with no // ts-check and checkJs: undefined
     // - check JS: .js files with either // ts-check or checkJs: true
-    // - external: files that are added by plugins
-    is_plain_js || is_check_js || info.script_kind == ScriptKind::DEFERRED
+    // #4712: no ScriptKindDeferred.
+    is_plain_js || is_check_js
 }
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics
@@ -4565,6 +4640,11 @@ impl crate::frontend::outputpaths::OutputPathsHost for EmitHost {
         common_source_directory().to_string()
     }
 
+    // Go: compiler/emitHost.go:116 emitHost.ContentMapperExtensions (#4712)
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        content_mapper_extensions()
+    }
+
     // Go: compiler/emitHost.go:109 emitHost.GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         get_current_directory().to_string()
@@ -4618,7 +4698,12 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
         ))
     }
 
-    // Go: compiler/emitHost.go:99 emitHost.GetResolutionModeOverride
+    // Go: compiler/emitHost.go:99 emitHost.SourceFileMayBeEmitted (#4712)
+    fn source_file_may_be_emitted(&self, file: Node, force_dts_emit: bool) -> bool {
+        source_file_may_be_emitted_worker(file, force_dts_emit, false)
+    }
+
+    // Go: compiler/emitHost.go:103 emitHost.GetResolutionModeOverride
     fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
         self.emit_resolver.get_resolution_mode_override(node)
     }
@@ -4755,6 +4840,46 @@ pub fn get_bind_and_check_diagnostics_with_checker(
                 directive.loc,
                 diag::Unused_ts_expect_error_directive,
                 Vec::new(),
+            ));
+        }
+    }
+    // #4712
+    apply_content_mapper_diagnostic_directives(source_file, filtered)
+}
+
+// Go: compiler/program.go:1493 applyContentMapperDiagnosticDirectives (#4712)
+fn apply_content_mapper_diagnostic_directives(
+    source_file: Node,
+    diags: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    let directives = source_file_diagnostic_directives(source_file);
+    if directives.is_empty() {
+        return diags;
+    }
+    let mut used = vec![false; directives.len()];
+    let mut mark_used = |diag: &Diagnostic| -> bool {
+        if !diag.source().is_empty() {
+            return false;
+        }
+        for (i, directive) in directives.iter().enumerate() {
+            if diag.pos >= directive.virtual_range.pos() && diag.pos < directive.virtual_range.end()
+            {
+                used[i] = true;
+                return true;
+            }
+        }
+        false
+    };
+    let mut filtered: Vec<Diagnostic> = diags.into_iter().filter(|diag| !mark_used(diag)).collect();
+    for (i, directive) in directives.iter().enumerate() {
+        if directive.policy == crate::ast::MappedDiagnosticDirectivePolicy::EXPECT && !used[i] {
+            filtered.push(crate::ast::new_external_diagnostic(
+                source_file,
+                directive.original_range,
+                &directive.source,
+                ts_diagnostics::Category::Error,
+                directive.unused_code,
+                &directive.unused_message_text,
             ));
         }
     }
@@ -4965,7 +5090,19 @@ pub fn get_diagnostics_of_any_program(
     let mut all_diagnostics = get_config_file_parsing_diagnostics();
     let config_file_parsing_diagnostics_length = all_diagnostics.len();
 
-    append_diagnostics_for_all_files(files, &mut all_diagnostics, &mut get_syntactic_diagnostics);
+    // #4712
+    let mut syntactic_diagnostics = Vec::new();
+    append_diagnostics_for_all_files(
+        files,
+        &mut syntactic_diagnostics,
+        &mut get_syntactic_diagnostics,
+    );
+    if !syntactic_diagnostics.is_empty() {
+        // Per-file content mapper failures are syntactic diagnostics, but the locationless diagnostic
+        // that disables a repeatedly failing mapper must still be reported.
+        all_diagnostics.extend(content_mapper_diagnostics());
+    }
+    all_diagnostics.extend(syntactic_diagnostics);
 
     // If we didn't have any syntactic errors, then also try getting the program (options),
     // global and semantic errors.
@@ -5122,15 +5259,25 @@ fn convert_to_relative_path(file_name: &str) -> String {
     )
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:467 WriteFormatDiagnostic
+// Go: diagnosticwriter/diagnosticwriter.go:555 WriteFormatDiagnostic
 // PORT: Go writes to an io.Writer; this returns the text. A diagnostic whose
 // file is not a program source file (the tsconfig) has a nil file here, so
 // its location comes from the side table built at load time.
+// PORT: Go wraps the diagnostic in `ASTDiagnostic`, whose `File` and `Pos`
+// go through `resolve` (#4712): see `resolve_diagnostic_location`.
 pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     let mut output = String::new();
     if diagnostic.file.is_some() {
-        let (line, character) =
-            get_ecma_line_and_utf16_character_of_position(diagnostic.file, diagnostic.pos);
+        let resolved = resolve_diagnostic_location(diagnostic);
+        let (line, character) = if resolved.use_original {
+            // Go `newOriginalTextFile`: the position is in the original text.
+            ecma_line_and_utf16_character_of_text_position(
+                source_file_original_text(diagnostic.file),
+                resolved.loc.pos(),
+            )
+        } else {
+            get_ecma_line_and_utf16_character_of_position(diagnostic.file, resolved.loc.pos())
+        };
         let file_name = &source_file_info(diagnostic.file).file_name;
         output.push_str(&format!(
             "{}({},{}): ",
@@ -5152,8 +5299,9 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
         ));
     }
     output.push_str(&format!(
-        "{} TS{}: ",
+        "{} {}{}: ",
         diagnostic.category.name(),
+        diagnostic_prefix(diagnostic),
         diagnostic.code
     ));
     write_flattened_diagnostic_message(&mut output, diagnostic, "\n");
@@ -5161,25 +5309,112 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     output
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:461 WriteFormatDiagnostics
+// Go: diagnosticwriter/diagnosticwriter.go:83 resolvedLocation (#4712)
+// resolvedLocation describes how a diagnostic on a content-mapped file should be reported.
+struct ResolvedLocation {
+    loc: TextRange,
+    use_original: bool, // render against the file's original, untransformed text
+    synthesized: bool,  // the range is in virtual code with no corresponding original location
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:90 (*ASTDiagnostic).resolve (#4712)
+// resolve determines where and against which text a diagnostic should be reported. A content mapper's
+// own diagnostics already carry original ranges. A compiler diagnostic on a content-mapped file has its
+// virtual range mapped back to the original; if it falls entirely within synthesized code, there is no
+// original location, so it is shown against the virtual text and flagged as synthesized.
+fn resolve_diagnostic_location(d: &Diagnostic) -> ResolvedLocation {
+    let loc = TextRange::new(d.pos, d.end);
+    let mut resolved = ResolvedLocation {
+        loc,
+        use_original: false,
+        synthesized: false,
+    };
+    if d.file.is_nil() {
+        return resolved;
+    }
+    if !d.source().is_empty() {
+        resolved.use_original = true;
+    } else if let Some(span_map) = source_file_span_map(d.file) {
+        let (mapped, fidelity) =
+            crate::spanmap::SpanMap::virtual_to_original_span(Some(span_map), loc);
+        if fidelity == crate::spanmap::Fidelity::NONE {
+            resolved.synthesized = true;
+        } else {
+            resolved.loc = mapped;
+            resolved.use_original = true;
+        }
+    }
+    resolved
+}
+
+/// Go `scanner.GetECMALineAndUTF16CharacterOfPosition` on the Go
+/// `originalTextFile` of a content-mapped file (#4712), whose line map is
+/// `core.ComputeECMALineStarts` of its original text.
+// PORT: `get_ecma_line_and_utf16_character_of_position` reads the text of a
+// file node; the original text has no node, so this is the same code on
+// the text.
+fn ecma_line_and_utf16_character_of_text_position(text: &str, pos: i32) -> (i32, i32) {
+    let line_map = compute_ecma_line_starts(text);
+    let line = compute_line_of_position(&line_map, pos);
+    let end = pos as usize;
+    let mut boundary = end;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let character =
+        utf16_len(&text[line_map[line as usize] as usize..boundary]) + (end - boundary) as i32;
+    (line, character)
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:364 diagnosticPrefix (#4712)
+// diagnosticPrefix returns the prefix shown before a diagnostic's code, e.g. "TS" for compiler
+// diagnostics or a content mapper's custom source for its diagnostics.
+fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
+    let source = diagnostic.source();
+    if !source.is_empty() {
+        return source;
+    }
+    "TS"
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:549 WriteFormatDiagnostics
 pub fn write_format_diagnostics(output: &mut String, diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         output.push_str(&format_diagnostic(diagnostic));
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:263 WriteFlattenedDiagnosticMessage
+// Go: diagnosticwriter/diagnosticwriter.go:342 WriteFlattenedDiagnosticMessage
 // PORT: this legacy writer has no Go `FormattingOptions`, so the locale is
 // Go `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
 // `write_format_diagnostic`).
 fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnostic, newline: &str) {
     writer.push_str(&diagnostic.localize(&crate::locale::DEFAULT));
-    for chain in &diagnostic.message_chain {
+    for chain in ast_diagnostic_message_chain(diagnostic).iter() {
         flatten_diagnostic_message_chain(writer, chain, newline, 1);
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:271 flattenDiagnosticMessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:130 (*ASTDiagnostic).MessageChain
+// PORT: Go wraps each chain entry in `ASTDiagnostic`; the entries are the
+// diagnostics themselves here.
+fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
+    // #4712
+    if !resolve_diagnostic_location(d).synthesized {
+        return Cow::Borrowed(&d.message_chain);
+    }
+    let mut result = Vec::with_capacity(d.message_chain.len() + 1);
+    result.extend(d.message_chain.iter().cloned());
+    // The diagnostic points into synthesized virtual code; make clear the shown location is not in the
+    // original file, and which content mapper produced it.
+    result.push(new_compiler_diagnostic(
+        diag::This_location_is_in_virtual_code_produced_by_the_content_mapper_0_and_has_no_corresponding_location_in_the_original_file,
+        args![source_file_content_mapper(d.file)],
+    ));
+    Cow::Owned(result)
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:350 flattenDiagnosticMessageChain
 fn flatten_diagnostic_message_chain(
     writer: &mut String,
     chain: &Diagnostic,
@@ -5191,7 +5426,7 @@ fn flatten_diagnostic_message_chain(
         writer.push_str("  ");
     }
     writer.push_str(&chain.localize(&crate::locale::DEFAULT));
-    for child in &chain.message_chain {
+    for child in ast_diagnostic_message_chain(chain).iter() {
         flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
     }
 }
