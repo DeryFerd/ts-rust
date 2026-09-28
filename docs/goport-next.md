@@ -18,4 +18,4 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 - **Free language server program shells and file versions per edit** (lsmem2 diagnosis steps 2 and 3: about 1 to 3 MiB per edit, the long-session growth limit). Owns: program/ls_program.rs, program/go_frontend.rs, project/*, core.rs. Waits for: int12, and coordination with bump B's server lane.
 - **Multiprog M8 to M11 (parallel tsc -b).** tsc -b is 1.55x to 1.87x of Go. Waits for: the bump B lanes that own its files (plan-int11.md section 3), and the perf11 tsc -b profile.
 - **S6-003 watcher ids** (Go timing dependent) and **workspace/symbol first call** (language server). Waits for: bump B server lane.
-
+- **Free dispatch-thread synthetic nodes in idle time.** lsmem3 (b1489a5a6) frees them during the next edit: +3.6 to +4.3 ms per edit in the Hono new-expression state (lsmem3/verify.md). Drop them after the answers, in idle work. Owns: ast/synthetic.rs, the owner scope in lsp/server.rs. Waits for: int12 part 2.
