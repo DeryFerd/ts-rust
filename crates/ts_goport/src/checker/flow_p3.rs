@@ -1071,8 +1071,9 @@ impl Checker {
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
                 // A branching point is reachable if any branch is reachable.
-                let antecedents = get_branch_label_antecedents(flow, &f.borrow().reduce_labels);
-                for antecedent in antecedents {
+                let antecedents =
+                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                for &antecedent in antecedents {
                     if self
                         .is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
                     {
@@ -1101,7 +1102,7 @@ impl Checker {
                 self.last_flow_node = FlowNodeId::NIL;
                 f.borrow_mut()
                     .reduce_labels
-                    .push(flow_data.as_flow_reduce_label_data());
+                    .push(ReduceLabel::of(flow_data));
                 let result = self.is_reachable_flow_node_worker(
                     f,
                     flow_data.antecedent,
@@ -1181,8 +1182,9 @@ impl Checker {
                 }
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
-                let antecedents = get_branch_label_antecedents(flow, &f.borrow().reduce_labels);
-                for antecedent in antecedents {
+                let antecedents =
+                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                for &antecedent in antecedents {
                     if !self
                         .is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
                     {
@@ -1196,7 +1198,7 @@ impl Checker {
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
                 f.borrow_mut()
                     .reduce_labels
-                    .push(flow_data.as_flow_reduce_label_data());
+                    .push(ReduceLabel::of(flow_data));
                 let result = self.is_post_super_flow_node_worker(
                     f,
                     flow_data.antecedent,
@@ -1289,8 +1291,12 @@ impl Checker {
     // as the assignment position (this is more conservative than full control flow analysis, but requires
     // only a single walk over the AST).
     // Go: checker/flow.go:2673 markNodeAssignmentsWorker
+    // PERF: the kind is read once, and the walk calls this worker directly.
+    // `c.markNodeAssignments` is always this worker (`checker_p02`), so the
+    // `Rc` closure clone and call per node are not needed.
     pub fn mark_node_assignments_worker(&mut self, node: Node) -> bool {
-        match node.kind() {
+        let kind = node.kind();
+        match kind {
             SyntaxKind::Identifier => {
                 let assignment_kind = get_assignment_target_kind(node);
                 if assignment_kind != AssignmentKind::NONE {
@@ -1355,11 +1361,10 @@ impl Checker {
             }
             _ => {}
         }
-        if is_type_node(node) {
+        if is_type_node_kind(kind) {
             return false;
         }
-        let mark_node_assignments = self.mark_node_assignments.clone();
-        node.for_each_child(&mut |child: Node| -> bool { mark_node_assignments(self, child) })
+        node.for_each_child(&mut |child: Node| -> bool { self.mark_node_assignments_worker(child) })
     }
 
     // Extend the position of the given assignment target node to the end of any intervening variable statement,

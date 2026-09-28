@@ -161,12 +161,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1046 getTypeAtSwitchClause
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_switch_clause(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_node: &'static FlowNode,
     ) -> FlowType {
-        let flow_node = flow.get_flow();
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
         let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
@@ -456,11 +456,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1232 getTypeAtFlowBranchLabel
-    // PORT: Go `*ast.FlowList` is the antecedent slice in list order.
+    // PORT: Go `*ast.FlowList` is the antecedent slice in list order. Go's
+    // `flow` parameter is not read, so it is left out.
     pub fn get_type_at_flow_branch_label(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
         antecedents: &[FlowNodeId],
     ) -> FlowType {
         let antecedent_start = self.antecedent_types.len();
@@ -590,10 +590,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1304 getTypeAtFlowLoopLabel
+    // PERF: `flow_data` is `flow.get_flow()`, which the caller has read.
     pub fn get_type_at_flow_loop_label(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
+        flow_data: &'static FlowNode,
     ) -> FlowType {
         if f.borrow().ref_key.is_zero() {
             let ref_key = self.get_flow_reference_key(f);
@@ -647,8 +649,7 @@ impl Checker {
             t: TypeId::NIL,
             incomplete: false,
         };
-        let antecedents = flow.get_flow().antecedents.clone();
-        for antecedent in antecedents {
+        for &antecedent in &flow_data.antecedents {
             let flow_type;
             if first_antecedent_type.t.is_nil() {
                 // The first antecedent of a loop junction is always the non-looping control
@@ -728,14 +729,14 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1383 getTypeAtFlowArrayMutation
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_array_mutation(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_node: &'static FlowNode,
     ) -> FlowType {
         let declared_type = f.borrow().declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
-            let flow_node = flow.get_flow();
             let node = flow_node.node;
             let expr = if is_call_expression(node) {
                 node.expression().expression()
@@ -1038,8 +1039,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1576 isMatchingReference
+    // PERF: the kind of `target` is read once (`target_kind`). This runs
+    // about 2.2M times on effect, mostly with an identifier `source`.
     pub fn is_matching_reference(&mut self, source: Node, target: Node) -> bool {
-        match target.kind() {
+        let target_kind = target.kind();
+        match target_kind {
             SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression => {
                 return self.is_matching_reference(source, target.expression());
             }
@@ -1059,16 +1063,30 @@ impl Checker {
                     && source.name().text() == target.name().text();
             }
             SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
-                if is_this_in_type_query(source) {
-                    return target.kind() == SyntaxKind::ThisKeyword;
+                // PERF: every answer below is false for a target of another
+                // kind, and `is_this_in_type_query` only reads the tree, so
+                // such a target returns before it.
+                if !matches!(
+                    target_kind,
+                    SyntaxKind::ThisKeyword
+                        | SyntaxKind::Identifier
+                        | SyntaxKind::VariableDeclaration
+                        | SyntaxKind::BindingElement
+                ) {
+                    return false;
                 }
-                if is_identifier(target) {
+                if is_this_in_type_query(source) {
+                    return target_kind == SyntaxKind::ThisKeyword;
+                }
+                if target_kind == SyntaxKind::Identifier {
                     let source_symbol = self.get_resolved_symbol(source);
                     if source_symbol == self.get_resolved_symbol(target) {
                         return true;
                     }
                 }
-                if is_variable_declaration(target) || is_binding_element(target) {
+                if target_kind == SyntaxKind::VariableDeclaration
+                    || target_kind == SyntaxKind::BindingElement
+                {
                     let resolved = self.get_resolved_symbol(source);
                     let export_symbol =
                         self.get_export_symbol_of_value_symbol_if_exported(resolved);
@@ -1077,10 +1095,10 @@ impl Checker {
                 return false;
             }
             SyntaxKind::ThisKeyword => {
-                return target.kind() == SyntaxKind::ThisKeyword;
+                return target_kind == SyntaxKind::ThisKeyword;
             }
             SyntaxKind::SuperKeyword => {
-                return target.kind() == SyntaxKind::SuperKeyword;
+                return target_kind == SyntaxKind::SuperKeyword;
             }
             SyntaxKind::NonNullExpression
             | SyntaxKind::ParenthesizedExpression
