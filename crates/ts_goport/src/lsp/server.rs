@@ -70,8 +70,7 @@
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
 //! request is dropped. The LS loops check the request context. The checker
-//! does not (`Checker::is_canceled` is always false), so a canceled
-//! diagnostic request answers `-32800` only after the full check.
+//! checks it at each top-level statement and deferred node, like Go.
 //!
 //! When the `run` context ends (Go `signal.NotifyContext` in
 //! `cmd/tsgo/lsp.go`), every loop returns `context canceled`, as in Go. A

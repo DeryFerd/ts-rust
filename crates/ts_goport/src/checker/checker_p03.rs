@@ -1,5 +1,6 @@
 //! Port of Go `checker/checker.go` lines 2056-2967.
 
+use crate::gostd::Context;
 use crate::prelude::*;
 
 // Go: checker/checker.go:2056 isImmediatelyUsedInInitializerOfBlockScopedVariable
@@ -223,10 +224,8 @@ impl Checker {
     }
 
     // Go: checker/checker.go:2180 checkSourceFile
-    // PORT: the Go `ctx context.Context` parameter and the `c.ctx` assignments are
-    // dropped (cancellation is concurrency plumbing). `is_canceled` is still called
-    // in the same places.
-    pub fn check_source_file(&mut self, source_file: Node, check_unused: bool) {
+    pub fn check_source_file(&mut self, ctx: &Context, source_file: Node, check_unused: bool) {
+        self.ctx = Some(ctx.clone());
         // Go `defer tr.Push(...)()` inside the block: the event ends when the
         // function returns.
         let mut _trace: Option<crate::tracing::Pop> = None;
@@ -273,6 +272,7 @@ impl Checker {
         if self.is_canceled() {
             self.was_canceled = true;
         }
+        self.ctx = None;
     }
 
     // Go: checker/checker.go:2218 checkSourceElements

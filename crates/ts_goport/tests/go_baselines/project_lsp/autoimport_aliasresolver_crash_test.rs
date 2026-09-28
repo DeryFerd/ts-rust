@@ -19,6 +19,7 @@ use ts_goport::ls::autoimport::registry::RegistryCloneHost;
 use ts_goport::options::CompilerOptions;
 
 use super::projecttestutil::{self, files};
+use super::util::bg;
 
 // Go: aliasresolver_crash_test.go:19 fakeCloneHost
 struct FakeCloneHost {
@@ -94,6 +95,6 @@ child_test! {
         let (ch, _scope) = r.new_checker(&[]);
 
         // Type-checking this file's diagnostics must not panic.
-        ch.borrow_mut().get_diagnostics(root, false);
+        ch.borrow_mut().get_diagnostics_exported(&bg(), root);
     }
 }

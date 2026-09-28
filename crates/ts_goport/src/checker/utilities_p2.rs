@@ -1255,10 +1255,8 @@ impl Checker {
     }
 
     // Go: checker/utilities.go:1635 isCanceled
-    // PORT: the Rust checker has no `context.Context` (`ctx` is dropped, see
-    // checker_p01), so it is never canceled.
     pub fn is_canceled(&self) -> bool {
-        false
+        self.ctx.as_ref().is_some_and(|ctx| ctx.err().is_some())
     }
 
     // Go: checker/utilities.go:1639 checkNotCanceled
