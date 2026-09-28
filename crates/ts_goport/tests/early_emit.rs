@@ -121,10 +121,10 @@ fn build_early_emit_writes_what_the_barrier_writes() {
     );
     assert!(
         barrier.files.contains_key("tsconfig.tsbuildinfo")
-            && barrier
-                .files
-                .keys()
-                .any(|name| name.ends_with(".js") || name.ends_with(".d.ts")),
+            && barrier.files.keys().any(|name| std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "js")
+                || name.ends_with(".d.ts")),
         "the build must write outputs and build info: {:?}",
         barrier.files.keys()
     );
