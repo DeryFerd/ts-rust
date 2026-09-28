@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-09-28T11:51:22.621646+00:00",
-  "reason": "R126 measured: auditor PASS, reviewer STOP (clippy missing); clippy then showed 1 warning in a test. Not accepted; R127 = R126 + the test fix.",
+  "updated": "2026-09-28T13:08:31.955525+00:00",
+  "reason": "R127 bound in batch recovery-continuation-go-checker-port-14.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -608,12 +608,12 @@
       "rule": null,
       "note": "same pin as recovery-continuation-go-checker-port-13"
     },
-    "recoveryRevision": 126,
-    "hypothesis": "Editor memory and latency (import-edit leak, cancelled warm, dispatch-thread synthetic nodes, per-request threads), synthetic node chunks, emit J2 and early emit. Byte-identical to tsgo at 52168999f3dc on every gated suite; LSP, edit and API oracles unchanged or better; no protected loss (roster carried forward from R125).",
-    "sourceFingerprint": "11aa77dbf47551b11c98e118f4c0a1bfaff916a698fa3da1c19d10beca483bca",
-    "beforeEditingSourceFingerprint": "6b56a8d25e151b6ca5349e6060193e076373dbaab87fd594450b74a422fd475f",
+    "recoveryRevision": 127,
+    "hypothesis": "R126 plus the early_emit test fix for clippy (test only). Same results as R126 at Go pin 52168999f3dc; rustfmt and clippy clean; roster carried forward from R125.",
+    "sourceFingerprint": "9733673761a376e1a99cb31630263fb1fbe66b7277d3b0267cc36d1c548755e0",
+    "beforeEditingSourceFingerprint": "11aa77dbf47551b11c98e118f4c0a1bfaff916a698fa3da1c19d10beca483bca",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "937be5dce",
+    "commit": "9d3fe78a9",
     "rosterFingerprint": "e0e05da6684ba748087917d478ee00cbae7bf3349d95b57a6356fe61d20a5cb1",
     "fullResult": null,
     "fullOutcome": null,
@@ -632,7 +632,7 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R126 pipeline.",
+    "nextPermittedAction": "Run the R127 pipeline.",
     "openDefects": [
       {
         "id": "lsp-sigsegv-alvin-r125",
