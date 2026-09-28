@@ -13,7 +13,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Waiting
 
-- **Bump B wave 2 and 3.** program-core, server, ls-autoimport, contentmapper and the late PRs of the wave 1 lanes (upstream/bumpB/plan-int11.md). Waits for: int12 in main, and wave 1 checks (workflow bumpB-wave1-check).
+- **Bump B wave 2 and 3.** program-core, server, ls-autoimport, contentmapper and the late PRs of the wave 1 lanes (upstream/bumpB/plan-int11.md). Waits for: int12 in main, and wave 1 checks (workflow bumpB-wave1-check). Plan: `target/continuation-r97-goport/upstream/bumpB/plan-wave2.md` (merge goport-bumpB into a new goport-bumpB2 from int12, 3 conflict hunks). API battery `ext` (52 traces) is recorded at pin 16c25522e123 (`upstream/bumpB/api-battery/record.md`); on wave 1 it shows `getConfigSourceFile` failing ("unported Go code: SourceFile.ParseOptions" on the root config, "file N is not published" on an extended config) for the config/api lanes, and the encoder version byte for wave 3.
 - **Free language server program shells and file versions per edit** (lsmem2 diagnosis steps 2 and 3: about 1 to 3 MiB per edit, the long-session growth limit). Owns: program/ls_program.rs, program/go_frontend.rs, project/*, core.rs. Waits for: int12, and coordination with bump B's server lane.
 - **Multiprog M8 to M11 (parallel tsc -b).** tsc -b is 1.55x to 1.87x of Go. Waits for: the bump B lanes that own its files (plan-int11.md section 3), and the perf11 tsc -b profile.
 - **S6-003 watcher ids** (Go timing dependent) and **workspace/symbol first call** (language server). Waits for: bump B server lane.
