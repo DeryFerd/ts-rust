@@ -244,11 +244,13 @@ free_name() { local n=$2 i=2; while [[ -e $1/$n ]]; do n=$2-$i i=$((i + 1)); don
 # side_unit <label> <checkout> <pin|-> <host|local> <name map|->: body of the side unit. Each finished step
 # is a file in the cache dir (bins/, testbin/, tests-run/, tests.json, bound.json, gate.json,
 # gate-compare.json, lsp.json, api.json, quality.json) and is reused. A failed compare writes tests-fail.json,
-# gate-compare-fail.json, lsp-fail.json or api-fail.json instead. The gate record then moves to
-# gate-fail.json, so the next run runs the gate again (move it back to gate.json to compare the same gate
-# again). The test run (tests-run/) and the oracle runs (lsp-run, api-run: the label) stay, so the next run
-# only compares them again. The other steps still run, so the verdict request has all the evidence. Last
-# log line: SIDE DONE or SIDE FAIL rc=<N>.
+# lsp-fail.json or api-fail.json instead. The test run (tests-run/) and the oracle runs (lsp-run, api-run: the
+# label) stay, so the next run only compares them again. A failed gate compare keeps that run for good
+# (repeat-run rule): gate.json becomes gate-fail-<gate label>.json and its compare gate-compare-fail-<gate
+# label>.json. They are never removed or replaced; the next run runs a new gate with a new label. To compare
+# the same gate again (for example after a state fix), copy gate-fail-<label>.json to gate.json. The
+# verdict request lists every failed run, and accept_revision.py refuses one without a flake note. The other
+# steps still run, so the verdict request has all the evidence. Last log line: SIDE DONE or SIDE FAIL rc=<N>.
 side_unit() {
   local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll al rc oracle lock synced=0 g l fails='' base
   local bt bts bg bgs bl ba
@@ -380,16 +382,24 @@ side_unit() {
   fi
 
   # Gate compare: each item against the base gate manifest (a MATCH stays MATCH, no new FAIL, no removed id,
-  # the open editor long-growth items within the noise rule).
+  # the open editor long-growth items under their fixed caps). A failed run is kept under its label.
   if [[ -f $C/gate-compare.json ]]; then say "reuse gate compare $(jq -c .counts "$C/gate-compare.json")"; else
     say "gate compare with the base"
     rc=0
     run_sh "python3 $G/gate-compare.py $bg \$(jq -r .manifest $C/gate.json) --out $C/gate-compare.json > /dev/null" || rc=$?
-    if [[ $DRY == 0 ]] && ((rc == 0)); then rm -f "$C/gate-compare-fail.json"; fi
     if [[ $DRY == 0 ]] && ((rc)); then
-      mv "$C/gate-compare.json" "$C/gate-compare-fail.json"
-      mv "$C/gate.json" "$C/gate-fail.json"
-      fails+="${fails:+; }gate compare rc $rc: $(jq -r '[.regressions[] | "\(.id) (\(.why))"] | .[:10] | join(", ")' "$C/gate-compare-fail.json")"
+      # Exit 2 is bad input, not a failed run: nothing moves, and the next run compares the same gate again.
+      [[ $rc == 1 && -f $C/gate-compare.json ]] || { rm -f "$C/gate-compare.json"; die "gate-compare.py rc $rc (bad input)"; }
+      gl=$(jq -r .label "$C/gate.json")
+      fails+="${fails:+; }gate $gl compare rc $rc (kept as gate-fail-$gl.json): $(jq -r '[.regressions[] | "\(.id) (\(.why))"] | .[:10] | join(", ")' "$C/gate-compare.json")"
+      if [[ -e $C/gate-fail-$gl.json ]]; then
+        # The same run compared again (a copy of gate-fail-$gl.json): that run and its first compare stay kept.
+        cmp -s "$C/gate.json" "$C/gate-fail-$gl.json" || die "$C/gate.json is not the kept run gate-fail-$gl.json"
+        rm -f "$C/gate.json" "$C/gate-compare.json"
+      else
+        mv "$C/gate-compare.json" "$C/gate-compare-fail-$gl.json"
+        mv "$C/gate.json" "$C/gate-fail-$gl.json"
+      fi
     fi
   fi
 
@@ -501,8 +511,8 @@ PY
   fi
 
   say "$(date -u +%FT%TZ) evidence $C"
-  for g in tests tests-fail bound gate gate-fail gate-compare gate-compare-fail lsp lsp-fail api api-fail quality; do
-    if [[ -f $C/$g.json ]]; then echo "   $g: $(jq -c 'del(.manifests, .failing, .knownOpen, .reallowed, .newAllowEntries, .regressions, .newIds, .fixed, .base, .new, .classes)' "$C/$g.json")"; fi
+  for g in "$C"/{tests,tests-fail,bound,gate,gate-compare,lsp,lsp-fail,api,api-fail,quality}.json "$C"/gate-fail-*.json "$C"/gate-compare-fail-*.json; do
+    if [[ -f $g ]]; then echo "   $(basename "$g" .json): $(jq -c 'del(.manifests, .failing, .knownOpen, .longCaps, .reallowed, .newAllowEntries, .regressions, .newIds, .fixed, .base, .new, .classes)' "$g")"; fi
   done
   [[ -z $fails ]] || die "$fails"
 }
@@ -515,10 +525,12 @@ cmd_verdict() {
   [[ $(st .batch.protectedSet) == goport ]] || die "batch $(st .batch.id) is not a goport batch (protectedSet goport)"
   wt=$ROOT/$(st .batch.checkout)
   key=$(evidence_key "$wt" "$(st '.batch.upstreamPin.to // empty')")
-  python3 - "$STATE" "$rev" "$EVIDENCE/$key" <<'PY'
+  python3 - "$STATE" "$rev" "$EVIDENCE/$key" "$G" <<'PY'
 import json, os, shlex, subprocess, sys
 ROOT = '/home/theo/Code/sandbox/ts-rust'
 s, rev, cache = json.load(open(sys.argv[1])), int(sys.argv[2]), sys.argv[3]
+sys.path.insert(0, sys.argv[4])
+from accept_revision import failed_gate_runs  # the same flake-note rule that the accept step applies
 b = s['batch']
 row, rows = b['recoveryHistory'][-1], b['recoveryHistory'][:-1]
 wt = os.path.join(ROOT, b['checkout'])
@@ -552,25 +564,39 @@ if bound:
               f"bins {rel(cache)}/bins (bins.sha256 there, release profile).")
 else:
     missing.append('bound runs (candidate.sh side)')
-gate = load('gate') or load('gate-fail')
+gate = load('gate')
 if gate:
     ev.append(f"Gate {gate['label']} ({gate['host']}{', pin ' + gate['upstreamPin'] if gate.get('upstreamPin') else ''}), manifest {rel(gate['manifest'])} "
               f"sha256 {gate['sha256']}: {gate['verdict']}, " + ', '.join(f'{gate["counts"][k]:,} {k}' for k in ('MATCH', 'ALLOWED', 'FAIL') if k in gate['counts'])
               + f"{other(gate['commit'])}." + (' FAIL items: ' + '; '.join(f"{f['id']}: {f['detail']}" for f in gate['failing']) + '.' if gate['failing'] else ''))
 else:
     missing.append('gate (candidate.sh side)')
-gc = load('gate-compare') or load('gate-compare-fail')
+gc = load('gate-compare')
 if gc:
     n = gc['counts']
     ev.append(f"Gate compare with base {base['batch']} R{base['revision']} {base['gate']['path']} ({gc['base']['label']}): "
-              f"{n['regressions']} regressions, {n['knownOpen']} open-defect items within noise, {n['fixed']} fixed; "
+              f"{n['regressions']} regressions, {n['knownOpen']} open-defect items under their caps, {n['fixed']} fixed; "
               f"pin changed {gc['pinChanged']}, allow list changed {gc['allowListChanged']}, new allow entries {len(gc['newAllowEntries'])}. "
-              f"Noise rule: {gc['noiseRule']}." + (' Open-defect items: ' + '; '.join(f"{k['id']} growth {k['growth']:.2f} (base {k['baseGrowth']:.2f})" for k in gc['knownOpen']) + '.' if gc['knownOpen'] else ''))
+              f"Cap rule: {gc['capRule']}. Caps now: " + ', '.join(f"{p} {c['cap']:.2f}{' (lowered)' if c['lowered'] else ''}" for p, c in gc['longCaps'].items())
+              + '.' + (' Open-defect items: ' + '; '.join(f"{k['id']} growth {k['growth']:.2f} (cap {k['cap']:.2f}, base {k['baseGrowth']:.2f})" for k in gc['knownOpen']) + '.' if gc['knownOpen'] else ''))
     if gc['regressions']:
         ev.append('Gate regressions: ' + '; '.join(f"{r['id']} {r['base']} -> {r['new']} ({r['why']})" for r in gc['regressions'][:20]) + '.')
         missing.append('gate compare without a regression')
 else:
     missing.append('gate compare (candidate.sh side)')
+# Every failed gate run of this source (repeat-run rule): each regressed item needs a flake note.
+fruns = failed_gate_runs(s, rev, cache, gate and gate['label'])
+if fruns:
+    ev.append(f"Failed gate runs of this source ({len(fruns)}; a loss in any run counts unless the reviewer accepts its flake note "
+              f"flake-r{rev}-<name>, which names the item and the run): " + ' '.join(
+                  f"{r['label']} (manifest {rel(r['manifest'])} sha256 {r['sha256']}, compare {rel(r['compare'])}): " + '; '.join(
+                      f"{x['id']} {x['base']} -> {x['new']} ({x['why']}), flake note {x['flake'] or 'MISSING'}" for x in r['regressions'][:20]) + '.'
+                  for r in fruns))
+    nf = [f"{r['label']} {x['id']}" for r in fruns for x in r['regressions'] if not x['flake']]
+    if nf:
+        missing.append('a flake note for each item of a failed gate run: ' + ', '.join(nf[:10]))
+else:
+    ev.append('Failed gate runs of this source: none.')
 for name, k in (('LSP', 'lsp'), ('API', 'api')):
     x = load(k) or load(f'{k}-fail')
     if not x:
@@ -597,7 +623,8 @@ head = (f"Batch {b['id']} (protected set goport), revision {rev}, source fingerp
         f"({b['checkout']} commit {b['commit']}, crates tree {git('rev-parse', 'HEAD:crates')[:12]})."
         + (f' Go pin {pin} (GOPORT_PIN for every Go comparison).' if pin else ''))
 evidence = '\n'.join(f'- {e}' for e in ev)
-bind = f"naming the batch, the source fingerprint and the goport tests sha256 {t['sha256'] if t else '<missing>'}"
+bind = (f"naming the batch, the source fingerprint, the goport tests sha256 {t['sha256'] if t else '<missing>'}, the gate manifest "
+        f"sha256 {gate['sha256'] if gate else '<missing>'} and the name map sha256 {((t or {}).get('nameMap') or {}).get('sha256', 'none')}")
 prev = next((r.get('commit') for r in reversed(rows) if r.get('commit')), None)
 spec = ['--', '.', ':(exclude)docs/typechecker-state', ':(exclude)docs/typechecker-batches']
 diff = git('diff', '--shortstat', prev, 'HEAD', *spec) if prev else 'unknown'

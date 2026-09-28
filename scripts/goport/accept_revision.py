@@ -6,8 +6,11 @@ Run after `candidate.sh side` finished (SIDE DONE) and both independent agents r
 verdict request. It reads the side evidence in --evidence (the cache dir that `candidate.sh
 verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, lsp.json, api.json
 and quality.json. The LSP and API records must compare with the base results of protectedBase and
-show no lost, unrun or absent request. It sets the state to ready/PASS, runs the local check, and records the acceptance only
-when the check passes.
+show no lost, unrun or absent request. Every failed gate run of the source that side kept
+(gate-compare-fail-<label>.json) needs a flake note for each regressed item (failed_gate_runs), or
+the acceptance is refused. The history row and both verdicts carry goportTestsSha256, gateSha256 and
+nameMapSha256 (null without a name map). It sets the state to ready/PASS, runs the local check, and
+records the acceptance only when the check passes.
 
 Usage:
   scripts/goport/accept_revision.py --revision 132 --evidence <cache dir>
@@ -15,7 +18,7 @@ Usage:
 Run from the repository root. --extra is a JSON object merged into the batch (e.g. cliAudit).
 --profile names the cargo profile of the bound runs (release for correctness evidence).
 """
-import argparse, datetime, hashlib, json, os, subprocess, sys
+import argparse, datetime, glob, hashlib, json, os, re, subprocess, sys
 
 ROOT = os.getcwd()  # the repository root (run from there)
 AUDITOR = 'aae6dbb734c07335a'
@@ -31,6 +34,34 @@ def rel(path):
     """A path under the repository root as the state writes it (relative); others stay absolute."""
     path = os.path.abspath(path)
     return os.path.relpath(path, ROOT) if path.startswith(ROOT + '/') else path
+
+
+def named(text, name, path=False):
+    """True when text names name as a whole word: 'r132-full' does not match 'r132-full-2', and an item id
+    does not match a longer id. With path, name may also be one segment of a path (a gate label)."""
+    before, after = (r'(?<![\w.-])', r'(?![\w.-])') if path else (r'(?<![\w./-])', r'(?![\w.-]|/\w)')
+    return re.search(before + re.escape(name) + after, text) is not None
+
+
+def failed_gate_runs(state, rev, cache, used=None):
+    """The failed gate runs of this source that candidate.sh side kept in the evidence cache
+    (gate-compare-fail-<label>.json, next to gate-fail-<label>.json), oldest first. The run with label
+    used (the batch's own gate, compared again) is left out. Each regressed item gets the key of a flake
+    note (scripts/state record note flake-r<rev>-<name>) whose text names the item id and the run label,
+    or None. The repeat-run rule: a failed run is a loss unless the reviewer accepts its flake note."""
+    notes = {k: json.dumps(v) for k, v in state.items() if k.startswith(f'flake-r{rev}-')}
+    runs = []
+    for path in sorted(glob.glob(f'{cache}/gate-compare-fail-*.json'), key=os.path.getmtime):
+        label = os.path.basename(path)[len('gate-compare-fail-'):-len('.json')]
+        if label == used:
+            continue
+        out = json.load(open(path))
+        regs = [{'id': r['id'], 'base': r['base'], 'new': r['new'], 'why': r['why'],
+                 'flake': next((k for k, t in sorted(notes.items()) if named(t, r['id']) and named(t, label, True)), None)}
+                for r in out['regressions']]
+        runs.append({'label': label, 'manifest': out['new']['manifest'], 'sha256': out['new']['sha256'], 'compare': path,
+                     'regressions': regs})
+    return runs
 
 
 def export():
@@ -88,6 +119,11 @@ def main():
     for k, c in (('tests', tests['commit']), ('gate', gate['commit'])):
         if not b['commit'].startswith(c[:9]) and not c.startswith(b['commit']):
             print(f'note: {k} evidence ran on commit {c[:9]}, the batch commit is {b["commit"][:9]} (same crates tree)')
+    for run in failed_gate_runs(s, a.revision, C, gate['label']):
+        for r in run['regressions']:
+            if not r['flake']:
+                problems.append(f"failed gate run {run['label']}: {r['id']} {r['base']} -> {r['new']} ({r['why']}) has no flake note "
+                                f"flake-r{a.revision}-<name> that names {r['id']} and {run['label']}")
     if problems:
         sys.exit('refused:\n  ' + '\n  '.join(problems))
 
@@ -104,7 +140,8 @@ def main():
     b['gate'] = {'manifest': rel(gate['manifest']), 'sha256': gate['sha256']}
     b['gateCompare'] = {'base': base['gate']['path'], 'baseSha256': base['gate']['sha256'], 'new': rel(gate['manifest']),
                         'sha256': gate['sha256'], 'regressions': gc['counts']['regressions'],
-                        'knownOpen': [f"{k['id']} growth {k['growth']:.2f} (base {k['baseGrowth']:.2f})" for k in gc['knownOpen']],
+                        'knownOpen': [f"{k['id']} growth {k['growth']:.2f} (cap {k['cap']:.2f}, base {k['baseGrowth']:.2f})"
+                                      for k in gc['knownOpen']],
                         'output': {'path': rel(f'{C}/gate-compare.json'), 'sha256': sha(f'{C}/gate-compare.json')}}
     b['gateVerdict'] = {'label': gate['label'], 'verdict': gate['verdict'], 'host': gate['host'], 'counts': gate['counts'],
                         'failing': [f"{f['id']} {f['detail']}" for f in gate['failing']]}
@@ -121,12 +158,15 @@ def main():
     b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': rel(C)}
     if a.extra:
         b.update(json.load(open(a.extra)))
+    # The three evidence hashes that the check binds in the history row and both verdicts.
+    hashes = {'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'],
+              'nameMapSha256': (tests.get('nameMap') or {}).get('sha256')}
     verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'], 'sourceFingerprint': fp,
-                                   'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'], 'utc': now}
+                                   **hashes, 'utc': now}
     b['auditor'] = verdict('audit_accepted_roster', AUDITOR)
     b['reviewer'] = verdict('independent_reviewer', REVIEWER)
     b.setdefault('verdictHistory', []).extend([b['auditor'], b['reviewer']])
-    row.update({'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'], 'status': 'full_measured', 'outcome': a.outcome,
+    row.update({**hashes, 'status': 'full_measured', 'outcome': a.outcome,
                 'ordinaryQuery': 'complete, 0 diagnostics, matches tsgo-oracle', 'hono': 'complete, 0 diagnostics, matches tsgo-oracle'})
     s['status'], s['decision'], s['updated'] = 'ready', 'PASS', now
     put(s, f'{rev}-a')

@@ -23,23 +23,43 @@ Usage:
 Writes through scripts/state (export, then import). --dry-run runs the checks and prints the new
 history row, but writes nothing. Run from the repository root.
 """
-import argparse, copy, datetime, hashlib, json, os, subprocess, sys
+import argparse, copy, datetime, hashlib, json, os, re, subprocess, sys
 
 GOPORT_RULE = 'goport-protected-set'
 KEEP = ['checkout', 'writerOutputDirectory', 'phase', 'implementer', 'carryForward', 'openDefects']
+HERE = os.path.dirname(os.path.abspath(__file__))  # scripts/goport of this checkout
+REPO = os.path.dirname(os.path.dirname(HERE))
+
+
+def runner_scripts():
+    """The repository files that the gate and the bound runs run or read, read from gate.sh and bound2.sh
+    themselves: each $HERE/<name> (a file next to gate.sh) and each scripts/... path in their text that
+    exists. A new gate stage script is protected with no edit here. Their stages under target/ are
+    outside every batch scope (target/**)."""
+    found = set()
+    for runner in ('gate.sh', 'bound2.sh'):
+        text = open(os.path.join(HERE, runner)).read()
+        found.update(f'scripts/goport/{m}' for m in re.findall(r'\$HERE/([\w.-]+)', text))
+        found.update(re.findall(r'(?<![\w.-])(scripts/[\w./-]+\.(?:sh|py|mjs|txt))', text))
+    return sorted(p for p in found if os.path.isfile(os.path.join(REPO, p)))
+
+
 # Paths that judge the protected set: the check and state tools, the pipeline, the runners, the
-# compare tools, the gate and its allow list, the oracles, the baseline and the rules. A candidate that
-# edits one would be judged by the edited copy after its merge, so a loss could pass in two steps.
+# compare tools, the gate, its stage scripts and its allow list, remote.sh (it copies the scripts and
+# bins that the gate and the oracles run on a host), the oracles, the baseline and the rules. A candidate
+# that edits one would be judged by the edited copy after its merge, so a loss could pass in two steps.
 # candidate.sh check fails when the candidate branch changes one (git diff from its merge base with
 # main), unless the batch's allowedChangedFiles lists that exact path (a batch that must change a
 # tool, with Theo's approval).
-PROTECTED = ['AGENTS.md', 'docs/typechecker-accountability.md', 'docs/goport-protected/**',
-             'scripts/check-typechecker-batch.mjs', 'scripts/state.mjs', 'scripts/state', 'scripts/upstream/pin.py',
-             *(f'scripts/goport/{f}' for f in ('candidate.sh', 'open_revision.py', 'accept_revision.py', 'fp.py',
-                                               'build-goport-tests.sh', 'goport-tests.sh', 'compare-tests.py',
-                                               'gate.sh', 'gate-allow.txt', 'gate-compare.py', 'ls_edit_bench.py',
-                                               'bound2.sh', 'lsp_oracle.py', 'api_oracle.py', 'oracle-compare.py',
-                                               'np-suite.sh'))]
+PROTECTED = list(dict.fromkeys([
+    'AGENTS.md', 'docs/typechecker-accountability.md', 'docs/goport-protected/**',
+    'scripts/check-typechecker-batch.mjs', 'scripts/state.mjs', 'scripts/state', 'scripts/upstream/pin.py',
+    *(f'scripts/goport/{f}' for f in ('candidate.sh', 'open_revision.py', 'accept_revision.py', 'fp.py',
+                                      'build-goport-tests.sh', 'goport-tests.sh', 'compare-tests.py',
+                                      'gate.sh', 'gate-allow.txt', 'gate-compare.py', 'ls_edit_bench.py',
+                                      'bound2.sh', 'lsp_oracle.py', 'api_oracle.py', 'oracle-compare.py',
+                                      'np-suite.sh', 'remote.sh')),
+    *runner_scripts()]))
 # Scope of a goport batch: the whole repository except the saved state, target/ and PROTECTED.
 # candidate.sh check and open read it through --allowed. "!" entries exclude.
 ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '!target/**', *(f'!{p}' for p in PROTECTED)]

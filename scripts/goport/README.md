@@ -41,7 +41,7 @@ runs it first (the oracle sweeps write their build info under `/tmp/port`), and 
 
 The protected set is goport's own tests and the gate items (`docs/typechecker-accountability.md`,
 "Protected set"). The base of a candidate is the last accepted revision: its goport test results
-(for the first goport batch, `docs/goport-protected/tests-r131.json`), its gate manifest and its LSP
+(for the first goport batch, `docs/goport-protected/tests-r131.json.gz`), its gate manifest and its LSP
 and API oracle results (for the first goport batch, the R131 LSP run `lsp-r131` and the rule's
 `apiBaseline`, an API run of the R131 bins). `open_revision.py --base` prints it. The legacy roster
 drive is retired.
@@ -50,8 +50,9 @@ drive is retired.
    `target/worktrees/checker-port`. A goport batch may change every path except
    `docs/typechecker-state`, `docs/typechecker-batches`, `target/` and the protected paths
    (`open_revision.py --protected`: the tools, runners, oracles, baseline and rules that judge the
-   protected set). The check fails when the branch changes a protected path since its merge base
-   with `main`, unless the batch lists that exact path (with Theo's approval).
+   protected set, `remote.sh`, and every script that `gate.sh` and `bound2.sh` run from the
+   repository, which it reads from their text). The check fails when the branch changes a protected
+   path since its merge base with `main`, unless the batch lists that exact path (with Theo's approval).
 2. `candidate.sh open <rev> <branch> --hypothesis TEXT --change TEXT --new-batch <id> --origin TEXT`:
    applies the branch to the checkout in one commit and records the revision (`open_revision.py`,
    the only state write). Leave out `--new-batch` for a later revision of an open batch. Then commit
@@ -63,21 +64,34 @@ drive is retired.
    batteries) each compared per request with the base results (`oracle-compare.py`), and rustfmt
    and clippy on `ts_goport` and the kept crates. Wait for `SIDE DONE`. A pin bump that
    renames Go tests, or a moved test, needs `--name-map` (old suite, old name, new suite, new name,
-   then the evidence).
-4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, then the
-   accept command.
+   then the evidence). A gate run that fails its compare stays in the evidence cache for good, as
+   `gate-fail-<gate label>.json` and `gate-compare-fail-<gate label>.json`, and the next `side` runs a
+   new gate with a new label (repeat-run rule). Before the verdicts, root records a flake note
+   `flake-r<rev>-<name>` for each item of a failed run, naming the item id and the run label, with
+   the evidence that the flake rule asks for.
+4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, with every
+   failed gate run of the source and its flake notes, then the accept command. The texts ask for a
+   verdict that names the goport tests, gate manifest and name map sha256.
 5. After two PASS verdicts: `accept_revision.py --revision <rev> --evidence <cache dir> --scope TEXT
-   --outcome TEXT`. It records the evidence and the verdicts, runs `check-typechecker-batch.mjs`,
-   and records the acceptance only when the check passes.
+   --outcome TEXT`. It refuses a failed gate run that has no flake note for an item. It records the
+   evidence and the verdicts (the history row and both verdicts carry `goportTestsSha256`,
+   `gateSha256` and `nameMapSha256`), runs `check-typechecker-batch.mjs`, and records the
+   acceptance only when the check passes.
 
 `gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
 MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
 single-threaded-equal items change between MATCH and ALLOWED on the same bins). An ALLOWED item needs
 a verified allow condition, and a removed id or a new FAIL is a regression. The open editor
-long-growth items (`editor/*/long`) may FAIL while the batch has the open defect `editor-long-growth`
-and the Rust growth is at most the base's Rust growth + 0.15 MiB/edit, whether the base item was
-MATCH or FAIL (the limit follows Go's slope, so the same bins can give either; a base MATCH item's
-growth is in the base gate's `runs/editor/result.json`).
+long-growth items (`editor/*/long`) may FAIL only while the batch has the open defect
+`editor-long-growth`, only on growth, and only up to a fixed cap per project: query-core 1.58 and
+hono 1.28 MiB/edit (`LONG_CAP` in `gate-compare.py`, the one place of the caps; the output lists them
+in `longCaps`). Each cap is the highest growth of a good build + 0.15, and it does not follow the base,
+so growth cannot add up over revisions. Caps only go down. A batch that fixes some growth can lower
+`LONG_CAP` (a protected path the batch lists; the reviewer checks the value). A cap also goes down by
+itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the base Rust growth of that
+project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
+at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
+can then FAIL.
 
 `oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,

@@ -3,8 +3,8 @@
 
 usage: scripts/goport/gate-compare.py <base manifest.json> <new manifest.json> [--state FILE] [--out FILE]
 
-Rules (docs/typechecker-accountability.md, "Protected set"; the same as compareGate in
-scripts/check-typechecker-batch.mjs, plus the noise rule and the allow-list check):
+Rules (docs/typechecker-accountability.md, "Protected set"). This file is their one implementation:
+candidate.sh side and scripts/check-typechecker-batch.mjs both run it.
 - Every base id must be in the new run. A removed id is a regression.
 - A base MATCH item must be MATCH, or ALLOWED by an allow entry (same id and condition) that the base
   manifest's allow list has too. The single-threaded-equal entries exist because the oracle's trace order
@@ -20,12 +20,27 @@ Open defect editor-long-growth (items editor/<project>/long). A FAIL passes only
 - the batch in --state (default docs/typechecker-state/current.json) has an openDefects record
   with that id and a status that starts with "open",
 - the new failure is growth only (no rss, no answers), and
-- noise rule: the Rust growth is at most the base's Rust growth + 0.15 MiB/edit, whatever the base
-  status. The limit follows Go's slope in that run, so the same bins can be MATCH or FAIL
-  (editor/hono/long on b2b7dca1f: MATCH in r131-full at limit 1.88, FAIL in r131-full-2 at limit 1.00,
-  both 1.13 MiB/edit). A base MATCH item has its growth in the base gate's runs/editor/result.json.
-  0.15 covers the spread of the Rust growth over the R126 to R131 and bump B gates on good builds:
-  query-core 1.32 to 1.43, hono 1.05 to 1.13 MiB/edit.
+- the Rust growth is at most the fixed cap of that project in LONG_CAP below (no ratchet on the base
+  value). LONG_CAP is the one place of the caps; candidate.sh side and the batch check both run this
+  file, and the output lists them in longCaps. Each cap is the highest Rust growth of a good build in the
+  R126 to R131 and bump B gates + 0.15 MiB/edit: query-core 1.43 + 0.15 = 1.58, hono 1.13 + 0.15 = 1.28.
+  The gate's own limit follows Go's slope, so the same bins can be MATCH or FAIL (editor/hono/long on
+  b2b7dca1f: MATCH in r131-full at limit 1.88, FAIL in r131-full-2 at limit 1.00, both 1.13 MiB/edit).
+  A project without a cap has no allowance: its FAIL is a regression.
+
+How a cap is lowered (caps only go down; only Theo can raise one):
+- By hand: a batch that lowers the growth of a project (a fix) can lower its LONG_CAP value to that
+  growth + 0.15. This file is a protected path, so the batch lists it in allowedChangedFiles, and the
+  reviewer checks the value against the gate runs. The new value applies from the next revision.
+- By itself: the gate's normal limit (2 x Go + 1 MiB/edit, ls_edit_bench.py) is never under
+  NORMAL_LIMIT (1.00, at Go growth 0), so a Rust growth at or under 1.00 passes it in every run. When the
+  base gate's Rust growth of a project is at or under 1.00, the cap of that project is 1.00 in this
+  compare: its item must be MATCH, and its Rust growth must stay at or under 1.00. Each accepted
+  revision then keeps the cap lowered for the next one. A MATCH at a higher growth (a steep Go slope)
+  does not lower the cap, because the next run of the same bins can FAIL.
+The base growth comes from a growth FAIL detail, or else from the base gate's runs/editor/result.json
+(for a MATCH item). When it is unknown, a FAIL is a regression. When every project's cap is 1.00, root
+closes the openDefects record, and from then on every FAIL is a regression.
 
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
@@ -33,7 +48,11 @@ Exit 1: regressions. Exit 2: bad input.
 import argparse, fnmatch, hashlib, json, os, re, sys
 
 ROOT = '/home/theo/Code/sandbox/ts-rust'
-NOISE = 0.15  # MiB/edit
+# The fixed Rust growth cap (MiB/edit) of editor/<project>/long while the open defect editor-long-growth
+# is in the batch: the highest growth of a good build + 0.15 (see the docstring).
+LONG_CAP = {'query-core': 1.58, 'hono': 1.28}
+# The lowest value of the gate's normal growth limit (2 x Go + 1 MiB/edit, at Go growth 0).
+NORMAL_LIMIT = 1.0
 OPEN_DEFECTS = {'editor-long-growth': 'editor/*/long'}
 GROWTH = re.compile(r'^growth (-?[0-9.]+) MiB/edit \(limit ([0-9.]+)')
 RUST_GROWTH = re.compile(r'^(-?[0-9.]+) MiB/edit')
@@ -123,6 +142,13 @@ def main():
     # Allow entries of the base allow list, by (entry id, condition).
     base_allow = {(e['id'], e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])}
     regressions, fixed, known_open, reallowed = [], [], [], []
+    # The cap of each project for this compare: LONG_CAP, or NORMAL_LIMIT once the base growth is at or under it.
+    caps = {}
+    for project, cap in LONG_CAP.items():
+        b = base.get(f'editor/{project}/long')
+        bg = run_growth(a.base, bm, b) if b else None
+        lowered = bg is not None and bg <= NORMAL_LIMIT + 1e-9
+        caps[project] = {'cap': NORMAL_LIMIT if lowered else cap, 'openCap': cap, 'baseGrowth': bg, 'lowered': lowered}
 
     def regress(i, b, n, why):
         regressions.append({'id': i, 'base': b['status'] if b else 'NEW', 'new': n['status'] if n else 'REMOVED', 'why': why,
@@ -153,26 +179,45 @@ def main():
             elif growth(n) is None or not all(x.startswith('growth ') for x in judged(n['detail'])):
                 regress(i, b, n, 'fails on more than growth')
             else:
-                g, bg = growth(n), run_growth(a.base, bm, b)
-                if bg is None:
+                g, project = growth(n), i.split('/')[1]
+                c = caps.get(project)
+                if c is None:
+                    regress(i, b, n, f'no long-growth cap for {project} in gate-compare.py LONG_CAP')
+                elif c['baseGrowth'] is None:
                     regress(i, b, n, 'base growth unknown (no growth FAIL detail and no runs/editor/result.json of these bins)')
-                elif g > bg + NOISE + 1e-9:
-                    regress(i, b, n, f'growth {g:.2f} > base {bg:.2f} + noise {NOISE}')
+                elif c['lowered']:
+                    regress(i, b, n, f'cap lowered to {NORMAL_LIMIT:.2f}: base growth {c["baseGrowth"]:.2f} is at or under the '
+                                     'normal limit, so the item must be MATCH')
+                elif g > c['cap'] + 1e-9:
+                    regress(i, b, n, f'growth {g:.2f} > cap {c["cap"]:.2f} of {project}')
                 else:
-                    known_open.append({'id': i, 'defect': defect, 'growth': g, 'baseGrowth': bg, 'baseStatus': b['status'],
-                                       'detail': n['detail']})
+                    known_open.append({'id': i, 'defect': defect, 'growth': g, 'cap': c['cap'], 'baseGrowth': c['baseGrowth'],
+                                       'baseStatus': b['status'], 'detail': n['detail']})
         elif b is not None and b['status'] == 'FAIL':
             fixed.append(i)
     for i, b in base.items():
         if i not in new:
             regress(i, b, None, 'removed id')
+    # A lowered cap stays lowered while the defect is open: a MATCH item of that project must keep its growth at
+    # or under NORMAL_LIMIT, so the next compare, with this run as its base, lowers it again.
+    for project, c in caps.items():
+        i = f'editor/{project}/long'
+        n = new.get(i)
+        if 'editor-long-growth' in defects and c['lowered'] and n is not None and n['status'] != 'FAIL':
+            c['newGrowth'] = g = run_growth(a.new, nm, n)
+            if g is None or g > NORMAL_LIMIT + 1e-9:
+                regress(i, base[i], n, f'growth {"unknown" if g is None else f"{g:.2f}"} after the cap of {project} was lowered '
+                                       f'to {NORMAL_LIMIT:.2f} (base growth {c["baseGrowth"]:.2f})')
 
     # Allow entries the new run used that the base allow list did not have. The reviewer checks them.
     used = {(e['id'], e['condition']) for r in new.values() for e in r.get('allowedBy') or []}
     out = {'base': bhead, 'new': nhead,
-           'noiseRule': f'editor/*/long FAIL passes while openDefects has editor-long-growth (status open), the new failure is '
-                        f'growth only and its Rust growth <= the base Rust growth + {NOISE} MiB/edit (base MATCH or FAIL; a base '
-                        f'MATCH growth comes from the base runs/editor/result.json)',
+           'capRule': f'editor/<project>/long FAIL passes while openDefects has editor-long-growth (status open), the new '
+                      f'failure is growth only and its Rust growth <= the fixed cap of the project (gate-compare.py LONG_CAP: '
+                      + ', '.join(f'{p} {c:.2f}' for p, c in LONG_CAP.items()) + ' MiB/edit). A cap is lowered to '
+                      f'{NORMAL_LIMIT:.2f} (item must be MATCH) once the base Rust growth of that project is at or under '
+                      f'{NORMAL_LIMIT:.2f}, the lowest normal limit',
+           'longCaps': caps,
            'pinChanged': bhead['upstreamPin'] != nhead['upstreamPin'], 'modeChanged': bhead['mode'] != nhead['mode'],
            'allowListChanged': (nm.get('allowList') or {}).get('sha256') != (bm.get('allowList') or {}).get('sha256'),
            'newAllowEntries': [{'id': i, 'condition': c} for i, c in sorted(used - base_allow)],
