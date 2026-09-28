@@ -82,7 +82,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
     {
         use std::os::unix::process::CommandExt;
         // A build with `JEMALLOC_CONF` built into jemalloc
-        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set in `.cargo/config.toml`)
+        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
         // needs no exec: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]

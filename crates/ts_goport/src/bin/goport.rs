@@ -63,7 +63,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// The jemalloc settings that `set_malloc_tunables` sets. `tsgo.rs` and
 /// `goport_build.rs` have the same value, and `scripts/build-release.sh`
-/// reads it from this line for its BOLT runs. `.cargo/config.toml` builds
+/// reads it from this line for its BOLT runs. `scripts/build-release.sh` builds
 /// the same value into jemalloc (`JEMALLOC_SYS_WITH_MALLOC_CONF`); with
 /// another value there, the bins exec themselves to set it.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
@@ -169,7 +169,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
     {
         use std::os::unix::process::CommandExt;
         // A build with `JEMALLOC_CONF` built into jemalloc
-        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set in `.cargo/config.toml`)
+        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
         // needs no exec: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
