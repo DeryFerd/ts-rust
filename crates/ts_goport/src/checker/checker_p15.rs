@@ -170,6 +170,7 @@ impl Checker {
             // is nothing to check here.
             return result;
         }
+        self.check_node_deferred(node);
         let in_destructuring_pattern = is_assignment_target(node);
         // Grammar checking
         self.check_grammar_object_literal_expression(node, in_destructuring_pattern);
@@ -320,9 +321,6 @@ impl Checker {
                 if all_properties_table.is_some() {
                     let prop_name = self.sym(prop).name.clone();
                     self.symbols.set(all_properties_table, prop_name, prop);
-                }
-                if is_identifier(member_decl.name()) {
-                    self.check_deprecated_property(member_decl.name(), contextual_type);
                 }
                 if contextual_type.is_some()
                     && check_mode.intersects(CheckMode::INFERENTIAL)
@@ -512,9 +510,25 @@ impl Checker {
         result
     }
 
+    // Go: checker/checker.go:13447 checkContextualDeprecations
+    // Runs as a deferred check of an object literal or JSX attributes node, so
+    // each property is checked once and not on every inference pass.
+    pub fn check_contextual_deprecations(&mut self, node: Node) {
+        let contextual_type = self.get_apparent_type_of_contextual_type(node, ContextFlags::NONE);
+        for property in node.properties().to_vec() {
+            if self.is_canceled() {
+                return;
+            }
+            let name = property.name();
+            if name.is_some() && !is_computed_property_name(name) {
+                self.check_deprecated_property(name, contextual_type);
+            }
+        }
+    }
+
     // Go: checker/checker.go:13459 checkDeprecatedProperty
     pub fn check_deprecated_property(&mut self, name: Node, contextual_type: TypeId) {
-        if contextual_type.is_nil() || name.is_nil() {
+        if contextual_type.is_nil() {
             return;
         }
         let prop = self.get_property_of_type(contextual_type, name.text());
@@ -1655,12 +1669,12 @@ impl Checker {
         if self.was_canceled {
             return Vec::new();
         }
-        let file_name = source_file_file_name(source_file).to_string();
+        // Go (#4825) passes the source file, not its name.
         if is_suggestion {
             self.suggestion_diagnostics
-                .get_diagnostics_for_file(&file_name)
+                .get_diagnostics_for_file(source_file)
         } else {
-            self.diagnostics.get_diagnostics_for_file(&file_name)
+            self.diagnostics.get_diagnostics_for_file(source_file)
         }
     }
 
@@ -1685,24 +1699,33 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13909 addDiagnostic
-    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
+    // PORT: Go (#4825) returns the stored `*ast.Diagnostic`: an equal one that is
+    // already in the collection, or this one. A caller that changes the result
+    // changes the stored diagnostic. Here `Some` is the stored diagnostic. `None`
+    // means it was discarded: Go then returns it unstored, and a change to it is
+    // not seen.
+    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) -> Option<&mut Diagnostic> {
         // Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
         if self.serialization_level < MAX_SERIALIZATION_LEVEL {
-            self.diagnostics.add(diagnostic);
+            return Some(self.diagnostics.add(diagnostic));
         }
+        None
     }
 
     // Go: checker/checker.go:13916 addSuggestionDiagnostic
-    pub fn add_suggestion_diagnostic(&mut self, diagnostic: Diagnostic) {
+    // PORT: the stored diagnostic, or `None` when discarded (see `add_diagnostic`).
+    pub fn add_suggestion_diagnostic(&mut self, diagnostic: Diagnostic) -> Option<&mut Diagnostic> {
         // Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
         if self.serialization_level < MAX_SERIALIZATION_LEVEL {
-            self.suggestion_diagnostics.add(diagnostic);
+            return Some(self.suggestion_diagnostics.add(diagnostic));
         }
+        None
     }
 
     // Go: checker/checker.go:13923 error
-    // PORT: Go returns the shared `*ast.Diagnostic` that was added. Here a clone is added
-    // and the value is returned, so callers that mutate the result must re-add it themselves.
+    // PORT: Go (#4825) returns `c.addDiagnostic(...)`, the stored diagnostic or the
+    // discarded one. Here the result is a clone of it. A caller that changes the
+    // stored diagnostic calls `add_diagnostic` and changes the one it returns.
     pub fn error(
         &mut self,
         location: Node,
@@ -1710,7 +1733,10 @@ impl Checker {
         args: Vec<String>,
     ) -> Diagnostic {
         let diagnostic = new_diagnostic_for_node(location, message, args);
-        self.add_diagnostic(diagnostic.clone());
+        // Inlined `c.addDiagnostic`, so the discarded diagnostic can be returned.
+        if self.serialization_level < MAX_SERIALIZATION_LEVEL {
+            return self.diagnostics.add(diagnostic).clone();
+        }
         diagnostic
     }
 }

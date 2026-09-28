@@ -161,6 +161,7 @@ impl Checker {
 
     // Go: checker/jsx.go:128 checkJsxAttributes
     pub fn check_jsx_attributes(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
+        self.check_node_deferred(node);
         self.create_jsx_attributes_type_from_attributes_property(node.parent(), check_mode)
     }
 
@@ -1412,9 +1413,6 @@ impl Checker {
                     }
                     if attribute_decl.name().text() == jsx_children_property_name {
                         explicitly_specify_children_attribute = true;
-                    }
-                    if is_identifier(attribute_decl.name()) {
-                        self.check_deprecated_property(attribute_decl.name(), contextual_type);
                     }
                     if contextual_type.is_some()
                         && check_mode.intersects(CheckMode::INFERENTIAL)

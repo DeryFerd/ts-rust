@@ -2,18 +2,22 @@
 //!
 //! PORT: Go `c.error(...)` returns the `*ast.Diagnostic` it already added, and
 //! some Go callers mutate it afterwards (`AddRelatedInfo`). Our `Diagnostic`
-//! is owned, so those callers build the diagnostic with
-//! `new_diagnostic_for_node`, finish it, then call `add_diagnostic`. That is
-//! exactly what Go `c.error` does, with the same final state. Functions that
-//! return the Go `*ast.Diagnostic` return a clone of the added diagnostic.
+//! is owned, so most of those callers build the diagnostic with
+//! `new_diagnostic_for_node`, finish it, then call `add_diagnostic`. Functions
+//! that return the Go `*ast.Diagnostic` return a clone of the stored one.
+//! Since tsgo#4825, `add` returns an equal stored diagnostic when there is one,
+//! and Go compares the diagnostic before the caller changes it. The functions
+//! that #4825 changed, and the helpers here whose change depends on a caller
+//! value, add first and then change the stored diagnostic that `add` returns.
 
 use crate::prelude::*;
 use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:13929 errorSkippedOnNoEmit
-    // PORT: `SetSkippedOnNoEmit` is set before the diagnostic is added (the
-    // diagnostic is owned); Go sets it on the added pointer. Same final state.
+    // PORT: Go sets the flag on the diagnostic that `c.error` returns: the stored
+    // one (#4825: it can be an equal one added before). `c.error` is inlined so
+    // the flag goes on the stored diagnostic. The result is a clone of it.
     pub fn error_skipped_on_no_emit(
         &mut self,
         location: Node,
@@ -21,8 +25,12 @@ impl Checker {
         args: Vec<String>,
     ) -> Diagnostic {
         let mut diagnostic = new_diagnostic_for_node(location, message, args);
+        if self.serialization_level < MAX_SERIALIZATION_LEVEL {
+            let stored = self.diagnostics.add(diagnostic);
+            stored.set_skipped_on_no_emit();
+            return stored.clone();
+        }
         diagnostic.set_skipped_on_no_emit();
-        self.add_diagnostic(diagnostic.clone());
         diagnostic
     }
 
@@ -38,8 +46,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13939 errorAndMaybeSuggestAwait
-    // PORT: the related info is attached before the diagnostic is added (see
-    // the file comment).
+    // PORT: Go adds the related info to the diagnostic that `c.error` returns:
+    // the stored one (#4825: it can be an equal one added before). `c.error` is
+    // inlined so the related info goes on the stored diagnostic. The result is a
+    // clone of it.
     pub fn error_and_maybe_suggest_await(
         &mut self,
         location: Node,
@@ -48,14 +58,15 @@ impl Checker {
         args: Vec<String>,
     ) -> Diagnostic {
         let mut diagnostic = new_diagnostic_for_node(location, message, args);
-        if maybe_missing_await {
-            diagnostic.add_related_info(Some(create_diagnostic_for_node(
-                location,
-                diag::Did_you_forget_to_use_await,
-                args![],
-            )));
+        let related = maybe_missing_await.then(|| {
+            create_diagnostic_for_node(location, diag::Did_you_forget_to_use_await, args![])
+        });
+        if self.serialization_level < MAX_SERIALIZATION_LEVEL {
+            let stored = self.diagnostics.add(diagnostic);
+            stored.add_related_info(related);
+            return stored.clone();
         }
-        self.add_diagnostic(diagnostic.clone());
+        diagnostic.add_related_info(related);
         diagnostic
     }
 
@@ -100,7 +111,9 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13966 addDeprecatedSuggestionWorker
-    // PORT: takes the diagnostic by value and returns a clone of the added one.
+    // PORT: takes the diagnostic by value. Go (#4825) returns
+    // `c.addSuggestionDiagnostic(diagnostic)`, the stored diagnostic or the
+    // discarded one. Here the result is a clone of it.
     pub fn add_deprecated_suggestion_worker(
         &mut self,
         declarations: &[Node],
@@ -117,7 +130,10 @@ impl Checker {
                 break;
             }
         }
-        self.add_suggestion_diagnostic(diagnostic.clone());
+        // Inlined `c.addSuggestionDiagnostic`, so the discarded diagnostic can be returned.
+        if self.serialization_level < MAX_SERIALIZATION_LEVEL {
+            return self.suggestion_diagnostics.add(diagnostic).clone();
+        }
         diagnostic
     }
 
@@ -426,12 +442,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:14152 addDuplicateDeclarationError
-    // PORT: Go mutates the diagnostic returned by `lookupOrIssueError`, which
-    // is either the stored diagnostic found by `Lookup` or the newly added one.
-    // Diagnostics are owned here, so an existing diagnostic is mutated in place
-    // inside `c.diagnostics`, and a new one is completed before it is added.
-    // The loop body only reads the diagnostic and the AST, so the final state
-    // matches Go.
+    // PORT: Go changes the diagnostic that `lookupOrIssueError` returns. Since
+    // #4825 that is the stored one: an equal diagnostic added before, or the new
+    // one. Here the call is inlined so the loop changes the stored entry in
+    // `c.diagnostics`. When the diagnostic is discarded, Go changes a diagnostic
+    // that is not stored, so nothing is done here.
     pub fn add_duplicate_declaration_error(
         &mut self,
         node: Node,
@@ -445,18 +460,9 @@ impl Checker {
         }
         // Inlined `c.lookupOrIssueError(errorNode, message, symbolName)`.
         let diagnostic = new_diagnostic_for_node(error_node, message, args![symbol_name]);
-        if let Some(existing) = lookup_stored_diagnostic(&mut self.diagnostics, &diagnostic) {
-            add_duplicate_declaration_related_info(
-                existing,
-                error_node,
-                symbol_name,
-                related_nodes,
-            );
-            return;
+        if let Some(err) = self.add_diagnostic(diagnostic) {
+            add_duplicate_declaration_related_info(err, error_node, symbol_name, related_nodes);
         }
-        let mut err = diagnostic;
-        add_duplicate_declaration_related_info(&mut err, error_node, symbol_name, related_nodes);
-        self.add_diagnostic(err);
     }
 }
 
@@ -496,25 +502,6 @@ fn add_duplicate_declaration_related_info(
     }
 }
 
-// PORT: Go `DiagnosticsCollection.Lookup` returns the stored pointer, which
-// Go callers may mutate. `DiagnosticsCollection::lookup` returns a clone, so
-// this finds the stored entry after `lookup` has sorted the list.
-fn lookup_stored_diagnostic<'a>(
-    collection: &'a mut DiagnosticsCollection,
-    diagnostic: &Diagnostic,
-) -> Option<&'a mut Diagnostic> {
-    collection.lookup(diagnostic)?;
-    let list: &mut Vec<Diagnostic> = if diagnostic.file().is_some() {
-        collection
-            .file_diagnostics
-            .get_mut(source_file_file_name(diagnostic.file()))?
-    } else {
-        &mut collection.non_file_diagnostics
-    };
-    let i = list.partition_point(|d| compare_diagnostics(d, diagnostic) < 0);
-    list.get_mut(i)
-}
-
 // Go: checker/checker.go:14178 createDiagnosticForNode
 pub fn create_diagnostic_for_node(
     node: Node,
@@ -535,8 +522,10 @@ pub fn get_adjusted_node_for_error(node: Node) -> Node {
 
 impl Checker {
     // Go: checker/checker.go:14190 lookupOrIssueError
-    // PORT: returns a clone of the stored or added diagnostic. Callers that
-    // mutate the result must mutate the stored entry (see
+    // PORT: Go (#4825) returns `c.addDiagnostic(NewDiagnosticForNode(...))`:
+    // `Add` finds an equal stored diagnostic, so there is no `Lookup`. That is
+    // the body of `error`, which returns a clone of the stored diagnostic. A
+    // caller that changes the stored entry inlines this call (see
     // `add_duplicate_declaration_error`).
     pub fn lookup_or_issue_error(
         &mut self,
@@ -544,13 +533,7 @@ impl Checker {
         message: &'static Message,
         args: Vec<String>,
     ) -> Diagnostic {
-        let diagnostic = new_diagnostic_for_node(location, message, args);
-        let existing = self.diagnostics.lookup(&diagnostic);
-        if let Some(existing) = existing {
-            return existing;
-        }
-        self.add_diagnostic(diagnostic.clone());
-        diagnostic
+        self.error(location, message, args)
     }
 
     // Go: checker/checker.go:14200 getFirstDeclaration

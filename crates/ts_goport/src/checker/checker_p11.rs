@@ -1200,9 +1200,9 @@ impl Checker {
     }
 
     // Go: checker/checker.go:9974 invocationError
-    // PORT: Go adds the diagnostic, then `invocationErrorRecovery` mutates it through the
-    // pointer. The port runs the recovery first so the owned diagnostic that gets added
-    // carries the same related information. The recovery only adds related information.
+    // PORT: Go (#4825) adds the diagnostic, then `invocationErrorRecovery` adds
+    // related info to the stored one (an equal diagnostic added before, or this
+    // one). See `invocation_error_recovery` for the order here.
     pub fn invocation_error(
         &mut self,
         error_target: Node,
@@ -1214,20 +1214,28 @@ impl Checker {
         if related_information.is_some() {
             diagnostic.add_related_info(related_information);
         }
-        self.invocation_error_recovery(apparent_type, kind, &mut diagnostic);
-        self.add_diagnostic(diagnostic);
+        let recovery = self.invocation_error_recovery(apparent_type, kind);
+        if let Some(diagnostic) = self.add_diagnostic(diagnostic) {
+            diagnostic.add_related_info(recovery);
+        }
     }
 
     // Go: checker/checker.go:9983 invocationErrorRecovery
+    // PORT: Go adds the related info to the diagnostic that `addDiagnostic`
+    // returned. The stored `&mut Diagnostic` cannot be kept across the checker
+    // calls here, so this returns the related info, and the caller runs it before
+    // the add and adds the info to the stored diagnostic after it. The add still
+    // compares the diagnostic without this info, as in Go. This only resolves
+    // types, and a diagnostic it adds cannot equal the caller's, so the dedup and
+    // the sorted lists are the same.
     pub fn invocation_error_recovery(
         &mut self,
         apparent_type: TypeId,
         kind: SignatureKind,
-        diagnostic: &mut Diagnostic,
-    ) {
+    ) -> Option<Diagnostic> {
         let symbol = self.ty(apparent_type).symbol;
         if symbol.is_nil() {
-            return;
+            return None;
         }
         let import_node = self.export_type_links.get(symbol).originating_import;
         // Create a diagnostic on the originating import if possible onto which we can attach a quickfix
@@ -1237,14 +1245,15 @@ impl Checker {
             let target_type = self.get_type_of_symbol(target);
             let sigs = self.get_signatures_of_type(target_type, kind);
             if sigs.is_empty() {
-                return;
+                return None;
             }
-            diagnostic.add_related_info(Some(new_diagnostic_for_node(
+            return Some(new_diagnostic_for_node(
                 import_node,
                 diag::Type_originates_at_this_import_A_namespace_style_import_cannot_be_called_or_constructed_and_will_cause_a_failure_at_runtime_Consider_using_a_default_import_or_import_require_here_instead,
                 args![],
-            )));
+            ));
         }
+        None
     }
 
     // Go: checker/checker.go:9999 isGenericFunctionReturningFunction

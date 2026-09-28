@@ -93,6 +93,8 @@ impl Checker {
     // reach the checker, so the callback records each report in order and the
     // same `lastError` logic runs on the recorded reports after the scan. No
     // other diagnostic is added during the scan, so the order is the same.
+    // Since #4825 Go `lastError` is the stored diagnostic that `addDiagnostic`
+    // returns, and a spelling suggestion goes on that stored diagnostic.
     pub fn check_grammar_regular_expression_literal(&mut self, node: Node) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
@@ -116,19 +118,15 @@ impl Checker {
             reg_exp_scanner.set_on_error(None);
             debug_assert!(token_is_regular_expression_literal);
 
-            // Replay of the Go `SetOnError` callback. `lastError` is an index
-            // into `pending`; entries are added to the checker in order below.
-            let mut pending: Vec<Diagnostic> = Vec::new();
-            let mut last_error: Option<usize> = None;
+            // Replay of the Go `SetOnError` callback. `last_error` is Go
+            // `lastError`: its position, its length, and the stored diagnostic
+            // (`None` when `addDiagnostic` discarded it).
+            let mut last_error: Option<(i32, i32, Option<&mut Diagnostic>)> = None;
             for (message, start, length, args) in reports.take() {
-                let matches_last = last_error.is_some_and(|i| {
-                    let e = &pending[i];
-                    start == e.pos() && length == e.len()
-                });
-                if message.category() == ts_diagnostics::Category::Message
-                    && last_error.is_some()
-                    && matches_last
-                {
+                let matches_last = last_error
+                    .as_ref()
+                    .is_some_and(|&(pos, len, _)| start == pos && length == len);
+                if message.category() == ts_diagnostics::Category::Message && matches_last {
                     // For providing spelling suggestions.
                     let err = new_diagnostic(
                         Node::NIL,
@@ -136,23 +134,21 @@ impl Checker {
                         message,
                         args,
                     );
-                    let i = last_error.unwrap();
-                    pending[i].add_related_info(Some(err));
-                } else if last_error.is_none() || start != pending[last_error.unwrap()].pos() {
-                    pending.push(new_diagnostic(
+                    if let Some((_, _, Some(stored))) = &mut last_error {
+                        stored.add_related_info(Some(err));
+                    }
+                } else if last_error.as_ref().is_none_or(|&(pos, _, _)| start != pos) {
+                    let diagnostic = new_diagnostic(
                         source_file,
                         TextRange::new(start, start + length),
                         message,
                         args,
-                    ));
-                    last_error = Some(pending.len() - 1);
+                    );
+                    // Go (#4825): `lastError = c.addDiagnostic(lastError)`.
+                    last_error = Some((start, length, self.add_diagnostic(diagnostic)));
                 }
             }
-            let has_error = last_error.is_some();
-            for d in pending {
-                self.add_diagnostic(d);
-            }
-            return has_error;
+            return last_error.is_some();
         }
         false
     }

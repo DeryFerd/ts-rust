@@ -933,27 +933,27 @@ impl Checker {
                 let error_node = self.get_constraint_declaration(t);
                 if error_node.is_some() {
                     let type_string = self.type_to_string_exported(t);
-                    let count_before = self.diagnostics.count;
-                    let diagnostic = self.error(
+                    let current_node = self.current_node;
+                    let add_related = current_node.is_some()
+                        && !is_node_descendant_of(error_node, current_node)
+                        && !is_node_descendant_of(current_node, error_node);
+                    // Inlined `c.error`, so the related info goes on the stored
+                    // diagnostic (#4825: it can be an equal one added before).
+                    // When it is discarded, Go changes a diagnostic that is not
+                    // stored, so nothing is done.
+                    let diagnostic = new_diagnostic_for_node(
                         error_node,
                         diag::Type_parameter_0_has_a_circular_constraint,
                         args![type_string],
                     );
-                    let current_node = self.current_node;
-                    if current_node.is_some()
-                        && !is_node_descendant_of(error_node, current_node)
-                        && !is_node_descendant_of(current_node, error_node)
+                    if let Some(diagnostic) = self.add_diagnostic(diagnostic)
+                        && add_related
                     {
-                        let related = new_diagnostic_for_node(
+                        diagnostic.add_related_info(Some(new_diagnostic_for_node(
                             current_node,
                             diag::Circularity_originates_in_type_at_this_location,
                             args![],
-                        );
-                        self.p30_add_related_info_to_stored_error(
-                            &diagnostic,
-                            count_before,
-                            related,
-                        );
+                        )));
                     }
                 }
             }
@@ -967,35 +967,6 @@ impl Checker {
             constrained.resolved_base_constraint = constraint;
         }
         constraint
-    }
-
-    // PORT: Go calls `AddRelatedInfo` on the `*ast.Diagnostic` that `c.error` already
-    // added to `c.diagnostics`. Diagnostics are owned values here (`error` adds a
-    // clone), so this finds the stored copy (the last diagnostic added for the same
-    // file, since nothing is added in between) and appends to it. When `addDiagnostic`
-    // discarded the diagnostic (maximum serialization level), the count did not change
-    // and Go's mutation is unobservable, so nothing is done.
-    fn p30_add_related_info_to_stored_error(
-        &mut self,
-        reported: &Diagnostic,
-        count_before: i32,
-        related: Diagnostic,
-    ) {
-        if self.diagnostics.count == count_before {
-            return;
-        }
-        let stored = if reported.file().is_some() {
-            let file_name = source_file_file_name(reported.file()).to_string();
-            self.diagnostics
-                .file_diagnostics
-                .get_mut(&file_name)
-                .and_then(|list| list.last_mut())
-        } else {
-            self.diagnostics.non_file_diagnostics.last_mut()
-        };
-        if let Some(stored) = stored {
-            stored.add_related_info(Some(related));
-        }
     }
 
     // Go: checker/checker.go:27350 computeBaseConstraint

@@ -623,7 +623,8 @@ impl Checker {
             self.check_deferred_node(node);
             i += 1;
         }
-        self.source_file_links.get(context).deferred_nodes.clear();
+        // Go (#4825) replaces the set so its storage is freed.
+        self.source_file_links.get(context).deferred_nodes = IndexSet::default();
     }
 
     // Go: checker/checker.go:2489 checkDeferredNode
@@ -680,6 +681,9 @@ impl Checker {
                 if is_instance_of_expression(node) {
                     self.resolve_untyped_call(node);
                 }
+            }
+            SyntaxKind::ObjectLiteralExpression | SyntaxKind::JsxAttributes => {
+                self.check_contextual_deprecations(node);
             }
             _ => {}
         }

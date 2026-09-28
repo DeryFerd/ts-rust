@@ -1054,44 +1054,33 @@ impl Checker {
             // We defer the diagnostic because TypeToString may attempt to resolve symbols that are already being
             // resolved, possibly causing circularities.
             self.add_deferred_diagnostic(Rc::new(move |c: &mut Checker| {
-                let count_before = c.diagnostics.count;
                 let diagnostic = c.report_type_not_iterable_error(
                     error_node,
                     t,
                     use_.intersects(IterationUse::ALLOWS_ASYNC_ITERABLES_FLAG),
                 );
-                c.add_related_info_to_reported_diagnostic(&diagnostic, count_before, diags.clone());
+                c.add_related_info_to_reported_diagnostic(&diagnostic, diags.clone());
             }));
         }
         IterationTypes::default()
     }
 
     // PORT: Go appends related info to the `*ast.Diagnostic` that
-    // `reportTypeNotIterableError` already added to `c.diagnostics`. Diagnostics
-    // are owned values here, so this finds the stored copy (the last diagnostic
-    // added for the same file, since nothing else is added in between) and
-    // appends to it. If the diagnostic was discarded (`addDiagnostic` drops it
-    // at the maximum serialization level), the count did not change and there
-    // is nothing to update, like Go where the mutation is unobservable.
+    // `reportTypeNotIterableError` returned: the stored one (#4825: it can be an
+    // equal one added before). `reported` is a clone of it, so `lookup` finds
+    // the stored diagnostic (or an identical one). If the diagnostic was
+    // discarded (`addDiagnostic` drops it at the maximum serialization level,
+    // which is the same here as when it was added), Go changes a diagnostic that
+    // is not stored, so nothing is done.
     fn add_related_info_to_reported_diagnostic(
         &mut self,
         reported: &Diagnostic,
-        count_before: i32,
         related: Vec<Diagnostic>,
     ) {
-        if self.diagnostics.count == count_before {
+        if self.serialization_level >= MAX_SERIALIZATION_LEVEL {
             return;
         }
-        let stored = if reported.file().is_some() {
-            let file_name = source_file_file_name(reported.file()).to_string();
-            self.diagnostics
-                .file_diagnostics
-                .get_mut(&file_name)
-                .and_then(|list| list.last_mut())
-        } else {
-            self.diagnostics.non_file_diagnostics.last_mut()
-        };
-        if let Some(stored) = stored {
+        if let Some(stored) = self.diagnostics.lookup(reported) {
             for d in related {
                 stored.add_related_info(Some(d));
             }
