@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, INHERITED_PIN, checkBatch, readPinnedJson } from "./check-typechecker-batch.mjs";
+import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, GOPORT_RULE, INHERITED_PIN, checkBatch, readEvidenceFile } from "./check-typechecker-batch.mjs";
 
 const SOURCE = "a".repeat(64);
 const RESULT = "b".repeat(64);
@@ -96,8 +96,8 @@ test("missing evidence and different same-size baseline identity stop", () => {
 });
 
 test("real evidence loader rejects missing files and hash mismatches", () => {
-  assert.throws(() => readPinnedJson({ path: "scripts/does-not-exist-guard-fixture.json", sha256: RESULT }), /Missing evidence/);
-  assert.throws(() => readPinnedJson({ path: "scripts/check-typechecker-batch.mjs", sha256: RESULT }), /hash mismatch/);
+  assert.throws(() => readEvidenceFile({ path: "scripts/does-not-exist-guard-fixture.json", sha256: RESULT }), /Missing evidence/);
+  assert.throws(() => readEvidenceFile({ path: "scripts/check-typechecker-batch.mjs", sha256: RESULT }), /hash mismatch/);
 });
 
 test("one exact accepted PASS loss is counted in both overlapping baselines", () => {
@@ -418,4 +418,283 @@ test("roster carry-forward stops without the rule, equal fingerprints or an earl
 test("only the carry-forward rule may use batchId *", () => {
   const f = optInFixture(); f.state.acceptanceRuleChanges[0].batchId = "*";
   assert.match(checkBatch(f.state, f.read, PIN).reasons.join(" "), /original accepted PASS names are FAIL or ABSENT\./);
+});
+
+// A goport batch (protectedSet "goport") after an accepted legacy batch-0. The test base is
+// the rule baseline; the gate base is batch-0's gate. case_* roster evidence is not present.
+const GO_PIN = "52168999f3dc", COMMIT = "0123456789abcdef0123456789abcdef01234567";
+const NOTE = "legacy-removal-rule-approval-2026-09-28";
+const BASELINE_PATH = "docs/goport-protected/tests-r131.json";
+function goportFixture() {
+  const f = continuationFixture();
+  const { state } = f;
+  for (const field of ["acceptedBaseline", "originalAccepted", "laterPassBaseline"]) delete state[field];
+  state[NOTE] = { quote: "i approve any rule changes that allow removing the legacy code" };
+  state.acceptanceRuleChanges = [{ id: GOPORT_RULE, batchId: "*", standing: true, approvedBy: "Theo", date: "2026-09-28T22:00:00Z",
+    instruction: "i approve any rule changes that allow removing the legacy code", scope: "Every batch with protectedSet goport.",
+    protectedSet: "goport", baseline: { path: BASELINE_PATH, sha256: "1".repeat(64) }, approvalNote: NOTE }];
+  const batch = state.batch;
+  delete batch.fullResult;
+  const bound = { goportTestsSha256: "2".repeat(64), gateSha256: "7".repeat(64) };
+  Object.assign(batch.recoveryHistory.at(-1), { fullResultSha256: null, status: "full_measured", ...bound });
+  for (const verdict of [batch.auditor, batch.reviewer]) {
+    delete verdict.fullResultSha256;
+    Object.assign(verdict, bound);
+  }
+  const files = {};
+  const put = (path, digit, value) => { files[path] = { sha256: digit.repeat(64), value }; return { path, sha256: digit.repeat(64) }; };
+  const base = { source: { commit: "50b0593b5", tree: "a4aae8d62022", testbinSha256: "9".repeat(64) }, pin: GO_PIN, suites: {
+    "ts_goport lib": { "api::t1": "ok", "api::t2": "ok", "api::slow": "ignored" },
+    "go_baselines default": { "b::one": "ok", "b::two": "failed" },
+    "ts_scanner lib": { "scan::a": "ok" } } };
+  const results = structuredClone(base);
+  results.source.commit = COMMIT.slice(0, 9);
+  results.suites["go_baselines default"]["b::two"] = "ok";
+  results.suites["ts_goport lib"]["api::t3"] = "ok";
+  const gateItems = [["measure/query", "MATCH"], ["typesyms/effect", "ALLOWED"], ["editor/query-core/long", "FAIL"], ["corpus-diag/00001", "MATCH"]]
+    .map(([id, status]) => ({ stage: id.split("/")[0], id, status }));
+  const gateBase = { commit: "b2b7dca1fc694b34dcf2303c8b013d544b043374", upstreamPin: GO_PIN, results: gateItems };
+  const gateNew = { commit: COMMIT, upstreamPin: GO_PIN, results: [...structuredClone(gateItems), { stage: "sweep", id: "sweep/new", status: "MATCH" }] };
+  put(BASELINE_PATH, "1", base);
+  const manifest = put("measure/r40/manifest.json", "4", { sourceFingerprint: SOURCE });
+  put("quality.json", "5", { sourceFingerprint: SOURCE, rustfmtExit: 0, clippyExit: 0, tsGoportWarnings: 0, fingerprintUnchanged: true });
+  put("lsp/summary.md", "6", "summary");
+  const run = { complete: true, exitCode: 0, diagnostics: 0, matchesOracle: true, sourceFingerprint: SOURCE,
+    runs: [{ manifest: manifest.path, sha256: manifest.sha256 }] };
+  const tests = put("tests-new.json", "2", results);
+  const gate = put("gate-new.json", "7", gateNew);
+  const previousGate = put("gate-base.json", "8", gateBase);
+  const archive = put("docs/typechecker-batches/batch-0.json", "3", { id: "batch-0", compilerAccepted: true,
+    gate: { manifest: previousGate.path, sha256: previousGate.sha256 } });
+  Object.assign(batch, { protectedSet: "goport", commit: COMMIT.slice(0, 9), upstreamPin: { from: GO_PIN, to: GO_PIN },
+    previousBatch: { id: "batch-0", archive },
+    protectedBase: { batch: "batch-0", revision: 6, tests: { path: BASELINE_PATH, sha256: "1".repeat(64) }, gate: previousGate },
+    goportTests: { results: tests.path, sha256: tests.sha256, base: BASELINE_PATH, baseSha256: "1".repeat(64),
+      compare: { lost: 0, absent: [], unrun: 0, retained: 4, recovered: 1 } },
+    gate: { manifest: gate.path, sha256: gate.sha256 },
+    gateCompare: { base: previousGate.path, baseSha256: previousGate.sha256, new: gate.path, sha256: gate.sha256, regressions: 0 },
+    ordinaryQuery: run, latestHono: structuredClone(run),
+    languageServerOracle: { summary: "lsp/summary.md", result: "257,129 requests: 0 diff, 0 crash, 0 timeout, 0 goport_error", host: "cup2" },
+    quality: { record: "quality.json", result: "rustfmt 0, clippy 0" }, qualityEvidence: { sourceFingerprint: SOURCE },
+    openDefects: [{ id: "editor-long-growth", status: "open; lsshells M2 running" }] });
+  const read = (ref, { pinned = true } = {}) => {
+    const file = files[ref?.path];
+    if (!file) throw new Error(`Missing evidence: ${ref?.path}.`);
+    if (pinned && ref.sha256 !== file.sha256) throw new Error(`Evidence hash mismatch: ${ref.path}.`);
+    return file.value;
+  };
+  return { state, files, put, results, gateNew, read };
+}
+
+test("goport batch passes on its own tests and gate, without roster evidence", () => {
+  const f = goportFixture(), result = checkBatch(f.state, f.read);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.equal(result.protectedSet, "goport");
+  assert.equal(result.rule, GOPORT_RULE);
+  assert.deepEqual(result.counts, {
+    goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
+    gate: { baseItems: 4, items: 5, regressions: 0, knownOpen: 1 } });
+  assert.deepEqual(result.base, { batch: "batch-0", tests: BASELINE_PATH, gate: "gate-base.json" });
+  assert.deepEqual(result.knownOpenGateItems, [{ id: "editor/query-core/long", base: "FAIL", now: "FAIL" }]);
+  assert.match(result.scope, /goport protected set/);
+});
+
+test("a legacy batch ignores the goport rule and keeps the roster check", () => {
+  const f = fixture(), g = goportFixture();
+  f.state.acceptanceRuleChanges = g.state.acceptanceRuleChanges;
+  const result = checkBatch(f.state, f.read);
+  assert.equal(result.verdict, "PASS");
+  assert.equal(result.counts.originalRetained, 6055);
+  f.candidate.versusFullBaseline.exactLedger[0].current.status = "FAIL";
+  f.candidate.originalAccepted6055.exactLedger[0].current.status = "FAIL";
+  refresh(f.candidate);
+  stopped(f, /original accepted PASS names/);
+});
+
+test("a planted lost goport name stops even when the saved compare shows none", () => {
+  const f = goportFixture();
+  f.results.suites["ts_goport lib"]["api::t1"] = "failed";
+  const result = stopped(f, /1 base ok goport test names are lost/);
+  assert.deepEqual(result.losses.goportTests, [{ suite: "ts_goport lib", name: "api::t1", status: "failed" }]);
+  assert.equal(result.counts.goportTests.lost, 1);
+});
+
+test("an absent goport name stops", () => {
+  const f = goportFixture();
+  delete f.results.suites["go_baselines default"]["b::one"];
+  const result = stopped(f, /are absent/);
+  assert.deepEqual(result.losses.goportTests, [{ suite: "go_baselines default", name: "b::one", status: "absent" }]);
+});
+
+test("an unrun suite, an unrun name or an incomplete suite stops; ignored is lost", () => {
+  let f = goportFixture();
+  delete f.results.suites["ts_scanner lib"];
+  assert.deepEqual(stopped(f, /are unrun/).losses.goportTests, [{ suite: "ts_scanner lib", name: "scan::a", status: "unrun" }]);
+  f = goportFixture();
+  f.results.suites["ts_goport lib"]["api::t2"] = "unrun";
+  assert.deepEqual(stopped(f, /are unrun/).losses.goportTests, [{ suite: "ts_goport lib", name: "api::t2", status: "unrun" }]);
+  f = goportFixture();
+  delete f.results.suites["ts_scanner lib"]["scan::a"];
+  f.results.incomplete = ["ts_scanner lib"];
+  assert.deepEqual(stopped(f, /are unrun/).losses.goportTests, [{ suite: "ts_scanner lib", name: "scan::a", status: "unrun" }]);
+  f = goportFixture();
+  f.results.suites["ts_goport lib"]["api::t2"] = "ignored";
+  assert.deepEqual(stopped(f, /are lost/).losses.goportTests, [{ suite: "ts_goport lib", name: "api::t2", status: "ignored" }]);
+});
+
+test("a saved compare that reports a loss stops", () => {
+  for (const [field, value] of [["lost", 1], ["absent", ["b::one"]], ["unrun", 2]]) {
+    const f = goportFixture();
+    f.state.batch.goportTests.compare[field] = value;
+    stopped(f, new RegExp(`goportTests.compare reports ${field}`));
+  }
+  const f = goportFixture(); delete f.state.batch.goportTests.compare.unrun;
+  stopped(f, /compare.unrun needs a count/);
+});
+
+// Binds the current history row and both verdicts to the batch goport test and gate hashes again.
+function rebind(f) {
+  const { batch } = f.state;
+  for (const item of [batch.recoveryHistory.at(-1), batch.auditor, batch.reviewer]) {
+    Object.assign(item, { goportTestsSha256: batch.goportTests.sha256, gateSha256: batch.gate.sha256 });
+  }
+}
+
+test("a wrong sha256 or a base that is not the pinned baseline stops", () => {
+  for (const [change, pattern] of [
+    [f => { f.state.batch.goportTests.sha256 = "e".repeat(64); }, /Current history row does not match/],
+    [f => { f.state.batch.goportTests.sha256 = "e".repeat(64); rebind(f); }, /hash mismatch: tests-new.json/],
+    [f => { f.state.batch.goportTests.baseSha256 = "e".repeat(64); }, /base must be the protected baseline/],
+    [f => { f.state.batch.goportTests.base = "tests-new.json"; f.state.batch.goportTests.baseSha256 = "2".repeat(64); }, /base must be the protected baseline/],
+    [f => { f.state.acceptanceRuleChanges[0].baseline.sha256 = "e".repeat(64); }, /protectedBase differs/],
+    [f => { f.state.acceptanceRuleChanges[0].baseline.sha256 = f.state.batch.goportTests.baseSha256 = f.state.batch.protectedBase.tests.sha256 = "e".repeat(64); },
+      /hash mismatch: docs\/goport-protected/],
+    [f => { f.state.batch.gateCompare.sha256 = "e".repeat(64); }, /must be batch.gate/],
+    [f => { f.state.batch.gate.sha256 = f.state.batch.gateCompare.sha256 = "e".repeat(64); rebind(f); }, /hash mismatch: gate-new.json/],
+    [f => { f.state.batch.previousBatch.archive.sha256 = "e".repeat(64); }, /hash mismatch: docs\/typechecker-batches/],
+    [f => { f.state.batch.ordinaryQuery.runs[0].sha256 = "e".repeat(64); }, /hash mismatch: measure/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+});
+
+test("a gate regression stops", () => {
+  const item = (f, id) => f.gateNew.results.find(row => row.id === id);
+  for (const [change, regression] of [
+    [f => { item(f, "measure/query").status = "FAIL"; }, { id: "measure/query", base: "MATCH", now: "FAIL" }],
+    [f => { item(f, "corpus-diag/00001").status = "ALLOWED"; }, { id: "corpus-diag/00001", base: "MATCH", now: "ALLOWED" }],
+    [f => { item(f, "typesyms/effect").status = "FAIL"; }, { id: "typesyms/effect", base: "ALLOWED", now: "FAIL" }],
+    [f => { f.gateNew.results = f.gateNew.results.filter(row => row.id !== "measure/query"); }, { id: "measure/query", base: "MATCH", now: "REMOVED" }],
+    [f => { item(f, "sweep/new").status = "FAIL"; }, { id: "sweep/new", base: "NEW", now: "FAIL" }],
+  ]) {
+    const f = goportFixture(); change(f);
+    assert.deepEqual(stopped(f, /1 gate items regressed/).losses.gate, [regression]);
+  }
+  const f = goportFixture(); f.state.batch.gateCompare.regressions = [{ id: "editor/query-core/long" }];
+  stopped(f, /gateCompare reports gate regressions/);
+});
+
+test("the editor long-growth FAIL passes only while its open defect is recorded", () => {
+  for (const defects of [[], [{ id: "editor-long-growth", status: "closed" }], undefined]) {
+    const f = goportFixture(); f.state.batch.openDefects = defects;
+    assert.deepEqual(stopped(f, /gate items regressed/).losses.gate, [{ id: "editor/query-core/long", base: "FAIL", now: "FAIL" }]);
+  }
+});
+
+test("the base is the previous accepted batch: its goport results when it had them", () => {
+  let f = goportFixture();
+  f.files["docs/typechecker-batches/batch-0.json"].value.compilerAccepted = false;
+  stopped(f, /accepted batch/);
+  f = goportFixture();
+  const archive = f.files["docs/typechecker-batches/batch-0.json"].value;
+  archive.protectedSet = "goport";
+  archive.goportTests = { results: "tests-prev.json", sha256: "a".repeat(64) };
+  f.put("tests-prev.json", "a", structuredClone(f.files[BASELINE_PATH].value));
+  stopped(f, /protectedBase differs from the base that accepted batch batch-0 gives/);
+  f.state.batch.protectedBase.tests = { path: "tests-prev.json", sha256: "a".repeat(64) };
+  stopped(f, /base must be the results of accepted batch batch-0/);
+  Object.assign(f.state.batch.goportTests, { base: "tests-prev.json", baseSha256: "a".repeat(64) });
+  assert.equal(checkBatch(f.state, f.read).verdict, "PASS");
+  delete f.state.batch.protectedBase;
+  assert.equal(checkBatch(f.state, f.read).verdict, "PASS");
+  f.state.batch.gateCompare.base = "gate-new.json";
+  stopped(f, /gateCompare base must be the gate manifest of accepted batch batch-0/);
+});
+
+test("a checked name map covers renamed and removed names, never two names in one", () => {
+  const f = goportFixture();
+  const suite = f.results.suites["go_baselines default"];
+  suite["b::uno"] = suite["b::one"]; delete suite["b::one"];
+  stopped(f, /are absent/);
+  f.put("map.tsv", "c", "oldSuite\toldName\tnewSuite\tnewName\ngo_baselines default\tb::one\tgo_baselines default\tb::uno\n");
+  f.state.batch.goportTests.nameMap = { path: "map.tsv", sha256: "c".repeat(64) };
+  const result = checkBatch(f.state, f.read);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.equal(result.counts.goportTests.newNames, 1);
+  f.put("map.tsv", "c", "# pin bump\ngo_baselines default\tb::one\t-\t-\tremoved at N: evidence.txt\n");
+  assert.equal(checkBatch(f.state, f.read).counts.goportTests.removedByMap, 1);
+  f.put("map.tsv", "c", "go_baselines default\tb::one\tts_scanner lib\tscan::a\n");
+  stopped(f, /Two base names map to ts_scanner lib scan::a/);
+  f.put("map.tsv", "c", "go_baselines default\tb::one\n");
+  stopped(f, /Name map line 1 needs/);
+  f.state.batch.goportTests.nameMap.sha256 = "e".repeat(64);
+  stopped(f, /hash mismatch: map.tsv/);
+});
+
+test("goport results and gate must come from the batch commit and Go pin", () => {
+  for (const [change, pattern] of [
+    [f => { f.results.source.commit = "fedcba987"; }, /goportTests results come from another commit/],
+    [f => { f.results.pin = "dc37b5249ab6"; }, /goportTests results are not at the batch Go pin/],
+    [f => { delete f.results.pin; }, /goportTests results are not at the batch Go pin/],
+    [f => { f.gateNew.commit = "fedcba9876543210"; }, /Gate manifest comes from another commit/],
+    [f => { f.gateNew.upstreamPin = "dc37b5249ab6"; }, /Gate manifest is not at the batch Go pin/],
+    [f => { delete f.state.batch.commit; }, /needs its commit/],
+    [f => { f.results.suites["ts_goport lib"]["api::t1"] = "FAILED"; }, /has status "FAILED"/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+});
+
+test("goport batch needs bound runs, the LSP oracle, quality and bound verdicts", () => {
+  for (const [change, pattern] of [
+    [f => { delete f.state.batch.ordinaryQuery; }, /ordinaryQuery: bound run/],
+    [f => { f.state.batch.latestHono.matchesOracle = false; }, /latestHono: bound run/],
+    [f => { f.state.batch.latestHono.sourceFingerprint = RESULT; }, /latestHono: bound run/],
+    [f => { f.files["measure/r40/manifest.json"].value.sourceFingerprint = RESULT; }, /names another source/],
+    [f => { f.state.batch.languageServerOracle.result = "257,129 requests: 3 diff, 0 crash"; }, /0 diff and 0 crash/],
+    [f => { f.state.batch.languageServerOracle.result = "257,129 requests: 0 diff, 10 crash"; }, /0 diff and 0 crash/],
+    [f => { f.state.batch.languageServerOracle.summary = "lsp/missing.md"; }, /Missing evidence: lsp\/missing.md/],
+    [f => { f.state.batch.qualityEvidence.sourceFingerprint = RESULT; }, /Quality needs/],
+    [f => { f.files["quality.json"].value.clippyExit = 1; }, /Quality record/],
+    [f => { f.state.batch.reviewer.verdict = "STOP"; }, /Missing independent PASS verdict/],
+    [f => { f.state.batch.reviewer.sourceFingerprint = RESULT; }, /Verdict is not bound/],
+    [f => { f.state.batch.auditor.batchId = "batch-0"; }, /Verdict is not bound/],
+    [f => { f.state.batch.reviewer.agent = "writer"; }, /implementer/],
+    [f => { f.state.batch.recoveryHistory.at(-1).sourceFingerprint = RESULT; }, /Current history row does not match/],
+    [f => { f.state.batch.recoveryHistory.at(-1).goportTestsSha256 = RESULT; }, /Current history row does not match .* goport test and gate hashes/],
+    [f => { delete f.state.batch.recoveryHistory.at(-1).gateSha256; }, /Current history row does not match/],
+    [f => { f.state.batch.auditor.gateSha256 = RESULT; }, /Verdict is not bound to this batch, source, and goport test and gate hashes/],
+    [f => { delete f.state.batch.reviewer.goportTestsSha256; }, /Verdict is not bound/],
+    [f => { f.state.batch.gateCompare.baseSha256 = RESULT; }, /gateCompare base must be/],
+    [f => { f.state.batch.rosterCarryForward = { fromRevision: 6 }; }, /no roster carry-forward/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+});
+
+test("goport mode needs Theo's standing rule that cites a saved approval note", () => {
+  for (const [change, pattern] of [
+    [f => { f.state.acceptanceRuleChanges = []; }, /standing goport-protected-set rule/],
+    [f => { f.state.acceptanceRuleChanges[0].batchId = "batch-1"; }, /standing goport-protected-set rule/],
+    [f => { f.state.acceptanceRuleChanges[0].standing = false; }, /standing goport-protected-set rule/],
+    [f => { delete f.state.acceptanceRuleChanges[0].approvedBy; }, /standing goport-protected-set rule/],
+    [f => { delete f.state.acceptanceRuleChanges[0].baseline; }, /baseline path and SHA-256/],
+    [f => { f.state.acceptanceRuleChanges[0].protectedSet = "roster"; }, /protectedSet "goport"/],
+    [f => { delete f.state[NOTE]; }, /saved approval note/],
+    [f => { f.state.batch.protectedSet = "goport2"; }, /Unknown protectedSet/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+});
+
+test("goport unbound history rows come from the standing rule list, never the current row", () => {
+  const f = goportFixture();
+  Object.assign(f.state.batch.recoveryHistory[5], { sourceFingerprint: null, fullResultSha256: null });
+  stopped(f, /Invalid or reset recovery history. A goport batch lists unbound rows in goport-protected-set unboundRevisions/);
+  f.state.acceptanceRuleChanges[0].unboundRevisions = [6, 7];
+  assert.equal(checkBatch(f.state, f.read).verdict, "PASS");
+  f.state.batch.recoveryHistory[6].sourceFingerprint = null;
+  stopped(f, /Invalid or reset recovery history/);
 });
