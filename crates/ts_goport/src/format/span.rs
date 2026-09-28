@@ -610,7 +610,7 @@ impl FormatSpanWorker {
         if child.kind() == SyntaxKind::Decorator {
             effective_parent_start_line = child_start_line;
         }
-        let mut child_indentation = 0;
+        let child_indentation;
         let mut delta = 0;
         if is_error_member_list_element {
             child_indentation = self.get_current_indentation_at_position(child_start_pos);
