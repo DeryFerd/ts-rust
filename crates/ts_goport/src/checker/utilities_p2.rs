@@ -1274,7 +1274,7 @@ impl Checker {
     // map is recomputed to the same empty result, so behavior is the same.
     pub fn get_packages_map(&mut self) -> &FxHashMap<String, bool> {
         if self.packages_map.is_empty() {
-            self.packages_map = compute_packages_map();
+            self.packages_map = crate::program::get_packages_map();
         }
         &self.packages_map
     }
@@ -1304,28 +1304,6 @@ pub fn value_to_string(value: &LiteralValue) -> String {
         LiteralValue::Bool(value) => if *value { "true" } else { "false" }.to_string(),
         LiteralValue::PseudoBigInt(value) => format!("{value}n"),
     }
-}
-
-// PORT: shared body of Go `Checker.getPackagesMap` (utilities.go:1645) and
-// `Program.GetPackagesMap` (compiler/program.go:517). Both build the same map
-// from `GetResolvedModules()`. Go ranges over maps, but the result does not
-// depend on order because each value is an OR.
-fn compute_packages_map() -> FxHashMap<String, bool> {
-    let mut packages_map: FxHashMap<String, bool> = FxHashMap::default();
-    let resolved_modules = get_resolved_modules();
-    for resolved_modules_in_file in resolved_modules.values() {
-        for module in resolved_modules_in_file.values() {
-            if !module.package_id.name.is_empty() {
-                let name = module.package_id.name.to_string();
-                let previous = packages_map.get(&name).copied().unwrap_or(false);
-                packages_map.insert(
-                    name,
-                    previous || module.extension == tspath_up2::EXTENSION_DTS,
-                );
-            }
-        }
-    }
-    packages_map
 }
 
 // Go: checker/utilities.go:1686 nodeStartsNewLexicalEnvironment
@@ -1446,7 +1424,7 @@ pub struct DiagnosticDetails {
 // Mirrors createModuleNotFoundChain in the TypeScript compiler's utilities.ts.
 // PORT: Go `program Program` is the installed `&'static GoProgram`. Its
 // methods are the program.rs free functions, so the parameter is unused.
-// `program.GetPackagesMap()` is `compute_packages_map()` (same body).
+// `program.GetPackagesMap()` is `program::get_packages_map()`.
 pub fn create_module_not_found_chain(
     _program: &GoProgram,
     file: Node,
@@ -1476,7 +1454,7 @@ pub fn create_module_not_found_chain(
         };
     }
 
-    let packages_map = compute_packages_map();
+    let packages_map = crate::program::get_packages_map();
     if packages_map.contains_key(&tspath_up2::get_types_package_name(&package_name)) {
         let mangled = tspath_up2::mangle_scoped_package_name(&package_name);
         return DiagnosticDetails {

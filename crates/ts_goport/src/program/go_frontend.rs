@@ -1100,6 +1100,19 @@ impl GoSharedState {
             .map(|&(_, resolved)| resolved)
     }
 
+    // Go: compiler/program.go:516 GetResolvedModules (ranged over: every
+    // resolution of every file)
+    // PERF: borrows the version's own map, as Go returns `p.resolvedModules`
+    // with no copy. The order is the map order; Go ranges over maps in a
+    // random order.
+    pub(super) fn resolved_modules(&self) -> impl Iterator<Item = &'static ResolvedModule> + '_ {
+        self.resolved_modules
+            .values()
+            .flat_map(|by_name| by_name.values())
+            .flatten()
+            .map(|&(_, resolved)| resolved)
+    }
+
     // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
     pub(super) fn get_jsx_runtime_import_specifier(&self, path: &str) -> (String, Node) {
         self.jsx_runtime_import_specifiers

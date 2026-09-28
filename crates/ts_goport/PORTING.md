@@ -601,7 +601,16 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   snapshot `programCounter.Deref`). It frees the checker pools of `p` and
   its program version now, or when the last guard of `p` drops. The
   `NewProgram`, the `GoProgram` shell and the file versions stay leaked
-  (multi-program M2, M3).
+  (multi-program M2, M3). A compiler host drops its data
+  (`CompilerHost::release`, not in Go) when no live program uses it. A
+  program uses its own host and the host of the load that made its files:
+  a clone shares the old program's processed files (Go `UpdateProgram`),
+  whose resolver reads that load's host. When that load host has no live
+  program, the load's resolver caches go too
+  (`NewProgram::release_resolver_caches`).
+- Parse workers (`CompilerHost::prefetch_parses`, not in Go) run only for
+  the first program load of a project. A later load gets its files from
+  the parse cache.
 - Go `*ast.SourceFile` is `Node` (the file root). An `Rc<ParsedSourceFile>`
   from a `NewProgram` method becomes `file.root`.
 - Go `p.X(..)` on a program: call `NewProgram::x` when it exists; else

@@ -3431,20 +3431,33 @@ fn needs_import_helpers_import_specifier(file: Node) -> bool {
 }
 
 // Go: compiler/program.go:517 GetPackagesMap
+// Go: checker/utilities.go:1645 getPackagesMap (the same body)
+// PORT: Go caches the map on the program (and on the checker); this builds
+// it on each call. Go ranges over `GetResolvedModules()`, the program's own
+// map. With the Go frontend that is the version's map in `GoSharedState`,
+// borrowed, so no owned copy of every resolution stays with the version.
+// The legacy loader and an alias resolver program (no resolutions) use
+// `get_resolved_modules`. The result does not depend on the order: each
+// value is an OR.
 pub fn get_packages_map() -> FxHashMap<String, bool> {
     let mut packages_map: FxHashMap<String, bool> = FxHashMap::default();
-    for resolved_modules_in_file in get_resolved_modules().values() {
-        for module in resolved_modules_in_file.values() {
-            if !module.package_id.name.is_empty() {
-                let previous = packages_map
-                    .get(&module.package_id.name)
-                    .copied()
-                    .unwrap_or(false);
-                packages_map.insert(
-                    module.package_id.name.clone(),
-                    previous || module.extension == ".d.ts",
-                );
-            }
+    let mut add = |module: &ResolvedModule| {
+        if !module.package_id.name.is_empty() {
+            let previous = packages_map
+                .get(&module.package_id.name)
+                .copied()
+                .unwrap_or(false);
+            packages_map.insert(
+                module.package_id.name.clone(),
+                previous || module.extension == ".d.ts",
+            );
+        }
+    };
+    if let Some(go) = &state().go {
+        go.resolved_modules().for_each(&mut add);
+    } else {
+        for resolved_modules_in_file in get_resolved_modules().values() {
+            resolved_modules_in_file.values().for_each(&mut add);
         }
     }
     packages_map

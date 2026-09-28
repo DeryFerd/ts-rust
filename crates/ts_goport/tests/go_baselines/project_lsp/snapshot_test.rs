@@ -1,10 +1,11 @@
 //! Port of Go `internal/project/snapshot_test.go` (`TestSnapshot`; the
 //! benchmark is not ported).
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
+use ts_goport::frontend::compiler::{self, NewProgram};
 use ts_goport::lsp::lsproto;
-use ts_goport::project::{ProgramUpdateKind, Session};
+use ts_goport::project::{CompilerHost, FileSource, ProgramUpdateKind, Session};
 
 use super::projecttestutil::{FileMap, files};
 use super::util::*;
@@ -197,5 +198,162 @@ child_test! {
 
         session.did_change_file(&bg(), &uri(other_uri), 2, &[whole("export const other = 2;")]);
         let _ = language_service(&session, other_uri);
+    }
+}
+
+// The memory tests below: one configured project. A body edit of index.ts
+// clones the program; an edit that adds an import loads it again.
+const P1_INDEX_URI: &str = "file:///home/projects/TS/p1/index.ts";
+const P1_INDEX_TEXT: &str = "import { a } from './a';\nexport const x = a + 1;";
+
+fn p1_files() -> FileMap {
+    files(&[
+        ("/home/projects/TS/p1/tsconfig.json", "{}"),
+        ("/home/projects/TS/p1/index.ts", P1_INDEX_TEXT),
+        ("/home/projects/TS/p1/a.ts", "export const a = 1;"),
+        ("/home/projects/TS/p1/b.ts", "export const b = 1;"),
+    ])
+}
+
+/// Replaces the `1` of `P1_INDEX_TEXT` (a body edit) and loads the program.
+fn p1_body_edit(session: &Rc<Session>, version: i32, digit: &str) {
+    edit(session, P1_INDEX_URI, version, (1, 21), (1, 22), digit);
+    let _ = language_service(session, P1_INDEX_URI);
+}
+
+/// Adds an import to index.ts (a new program load) and loads the program.
+fn p1_import_edit(session: &Rc<Session>, version: i32) {
+    edit(
+        session,
+        P1_INDEX_URI,
+        version,
+        (0, 0),
+        (0, 0),
+        "import { b } from './b';\n",
+    );
+    let _ = language_service(session, P1_INDEX_URI);
+}
+
+/// The number of module resolutions that the resolver of `p`'s load keeps.
+fn cached_resolutions(p: &NewProgram) -> usize {
+    p.resolver
+        .as_ref()
+        .expect("program resolver")
+        .caches
+        .module_resolution_cache
+        .cache
+        .borrow()
+        .len()
+}
+
+/// The compiler host and the program update kind of the p1 project in the
+/// current snapshot.
+fn p1_host(session: &Rc<Session>) -> (Rc<CompilerHost>, ProgramUpdateKind) {
+    let project = session
+        .snapshot()
+        .project_collection
+        .configured_project(&path("/home/projects/ts/p1/tsconfig.json"))
+        .expect("configured project");
+    let project = project.borrow();
+    (
+        project.host.clone().expect("project host"),
+        project.program_update_kind,
+    )
+}
+
+/// True when `host` dropped its data (`compiler::CompilerHost::release`).
+/// Until then a frozen host keeps the config registry, and a tracking host
+/// its seen files.
+fn is_released(host: &CompilerHost) -> bool {
+    host.config_file_registry.borrow().is_none() && host.source_fs.seen_files.borrow().is_none()
+}
+
+child_test! {
+    // PORT: no Go counterpart (Go has no parse workers). Only the first
+    // program load of a project lets parse workers parse ahead
+    // (`compiler::CompilerHost::prefetch_parses`). A later load gets its
+    // files from the parse cache, which uses a worker parse only on a miss,
+    // so the workers parsed the whole program again for nothing, and those
+    // parses stayed in the workers' AST arenas.
+    fn only_first_program_load_of_project_prefetches_parses() {
+        let session = setup(p1_files());
+        open(&session, P1_INDEX_URI, P1_INDEX_TEXT);
+        let _ = language_service(&session, P1_INDEX_URI);
+        let (first, _) = p1_host(&session);
+        assert!(compiler::CompilerHost::prefetch_parses(&*first));
+
+        // Adding an import loads the program again (no clone).
+        p1_import_edit(&session, 2);
+        let (second, kind) = p1_host(&session);
+        assert!(!Rc::ptr_eq(&first, &second));
+        assert_ne!(kind, ProgramUpdateKind::CLONED);
+        assert!(!compiler::CompilerHost::prefetch_parses(&*second));
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (Go's GC frees a host and a resolver with
+    // their last program). A host drops its data when no live program uses
+    // it (`ls_program::release_now`). A clone shares the processed files of
+    // the program it was cloned from (Go `UpdateProgram`), and their
+    // resolver reads the first host's file system, so that host and the
+    // resolver's caches stay until the last clone is released.
+    fn released_program_hosts_drop_their_data() {
+        let session = setup(p1_files());
+        open(&session, P1_INDEX_URI, P1_INDEX_TEXT);
+        let _ = language_service(&session, P1_INDEX_URI);
+        let (h1, _) = p1_host(&session);
+
+        p1_body_edit(&session, 2, "2");
+        let (h2, kind) = p1_host(&session);
+        let p2 = program(&session, P1_INDEX_URI);
+        assert_eq!(kind, ProgramUpdateKind::CLONED);
+        p1_body_edit(&session, 3, "3");
+        let (h3, kind) = p1_host(&session);
+        assert_eq!(kind, ProgramUpdateKind::CLONED);
+
+        // The first two programs are released. The first host stays for the
+        // second clone; the first clone's own host goes.
+        assert!(!is_released(&h1));
+        assert!(is_released(&h2));
+        assert!(!is_released(&h3));
+        // A released program still finds its files by name (Go
+        // `GetSourceFile` reads the host's case sensitivity).
+        assert!(has_file(p2, "/home/projects/TS/p1/a.ts"));
+        // The second clone still uses the first load's resolver.
+        assert!(cached_resolutions(p2) > 0);
+
+        // Adding an import loads the program again. The last clone is
+        // released, and with it the first host and the first load's
+        // resolver caches.
+        p1_import_edit(&session, 4);
+        let (h4, kind) = p1_host(&session);
+        assert_ne!(kind, ProgramUpdateKind::CLONED);
+        assert!(is_released(&h1));
+        assert!(is_released(&h3));
+        assert!(!is_released(&h4));
+        assert_eq!(cached_resolutions(p2), 0);
+        assert!(cached_resolutions(program(&session, P1_INDEX_URI)) > 0);
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart. The snapshot file system that a released
+    // program's host kept (overlays, the disk file map, cachedvfs results)
+    // is freed with the host's data, as Go frees it with the host.
+    fn released_program_host_frees_its_snapshot_fs() {
+        let session = setup(p1_files());
+        open(&session, P1_INDEX_URI, P1_INDEX_TEXT);
+        let _ = language_service(&session, P1_INDEX_URI);
+        p1_body_edit(&session, 2, "2");
+        let (h2, _) = p1_host(&session);
+        let fs2: Weak<dyn FileSource> = Rc::downgrade(&*h2.source_fs.source.borrow());
+
+        // The next edit releases the program of `h2`. The background tasks
+        // of the snapshot changes hold the old snapshots until they run.
+        p1_body_edit(&session, 3, "3");
+        session.wait_for_background_tasks();
+        assert!(is_released(&h2));
+        assert!(fs2.upgrade().is_none());
     }
 }

@@ -52,6 +52,15 @@ pub trait CompilerHost {
     fn cached_source_file_names(&self) -> FxHashSet<String> {
         FxHashSet::default()
     }
+
+    /// Drops the data that the host keeps for its programs (for example a
+    /// snapshot file system). `ls_program` calls it when the last live
+    /// program that uses this host is released. The host must not read
+    /// files after this.
+    // PORT: not in Go. Go's GC frees the host with its last program. The
+    // port keeps each program shell (multiprog M2), and the shell keeps its
+    // host, so the host lets go of its data instead.
+    fn release(&self) {}
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.
