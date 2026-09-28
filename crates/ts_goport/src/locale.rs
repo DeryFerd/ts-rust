@@ -57,6 +57,18 @@ pub struct Locale(pub language::Tag);
 // (`und`).
 pub const DEFAULT: Locale = Locale(language::Tag::UND);
 
+impl Locale {
+    // Go: locale/locale.go:15 (Locale).String (tsgo#4712)
+    /// The locale tag text, or "" for the default locale.
+    #[must_use]
+    pub fn string(&self) -> String {
+        if *self == DEFAULT {
+            return String::new();
+        }
+        self.0.string()
+    }
+}
+
 // Go: locale/locale.go:24 Parse
 pub fn parse(locale_str: &str) -> (Locale, bool) {
     // Parse gracefully fails.

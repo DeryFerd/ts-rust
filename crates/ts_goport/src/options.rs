@@ -261,6 +261,8 @@ pub struct CompilerOptions {
     pub build: Tristate,
     pub help: Tristate,
     pub all: Tristate,
+    // tsgo#4712
+    pub run_external_code: Tristate,
 
     pub pprof_dir: String,
     pub single_threaded: Tristate,
@@ -720,9 +722,10 @@ impl std::fmt::Display for LanguageVariant {
 }
 
 impl ScriptKind {
-    // Go: core/scriptkind_stringer_generated.go String
-    // PORT: matches the named constants, so it follows whatever value
-    // `crate::flags` gives `ScriptKind::DEFERRED`. Go iota makes it 7.
+    // Go: core/scriptkind_stringer_generated.go:25 String
+    // tsgo#4712: values 5 (formerly ScriptKindExternal) and 7 (formerly
+    // ScriptKindDeferred) are reserved and print as "ScriptKind(5)" and
+    // "ScriptKind(7)".
     #[must_use]
     pub fn string(self) -> String {
         let name = match self {
@@ -731,9 +734,7 @@ impl ScriptKind {
             ScriptKind::JSX => "ScriptKindJSX",
             ScriptKind::TS => "ScriptKindTS",
             ScriptKind::TSX => "ScriptKindTSX",
-            ScriptKind::EXTERNAL => "ScriptKindExternal",
             ScriptKind::JSON => "ScriptKindJSON",
-            ScriptKind::DEFERRED => "ScriptKindDeferred",
             _ => return format!("ScriptKind({})", self.0),
         };
         name.to_string()

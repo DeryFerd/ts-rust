@@ -1,3 +1,5 @@
+use crate::contentmapper::Mapper;
+use crate::frontend::json_ext::JsonValue;
 use crate::frontend::prelude::*;
 
 // Port of tsoptions/parsinghelpers.go.
@@ -107,7 +109,84 @@ pub fn parse_project_reference(json: &CompilerOptionsValue) -> Option<ProjectRef
     None
 }
 
-// Go: tsoptions/parsinghelpers.go:88 parseJsonToStringKey
+// Go: tsoptions/parsinghelpers.go:105 parseContentMapper (tsgo#4712)
+// PORT: Go returns a nilable `*contentmapper.Mapper`; that is an owned
+// `Option<Mapper>`, which the caller changes and then puts in an `Rc`.
+pub fn parse_content_mapper(value: &CompilerOptionsValue) -> (Option<Mapper>, Vec<Diagnostic>) {
+    let CompilerOptionsValue::Map(v) = value else {
+        return (None, Vec::new());
+    };
+    let mut errors: Vec<Diagnostic> = Vec::new();
+    let mut mapper = Mapper::default();
+    if let Some(pkg) = v.get("package") {
+        match pkg {
+            CompilerOptionsValue::String(str) if !str.is_empty() => {
+                mapper.definition.package = str.clone();
+            }
+            _ => errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.package", "string"],
+            )),
+        }
+    } else {
+        errors.push(new_compiler_diagnostic(
+            diag::Compiler_option_0_requires_a_value_of_type_1,
+            args!["contentMapper.package", "string"],
+        ));
+    }
+    if let Some(extensions) = v.get("extensions") {
+        if let Some(strs) = parse_string_array_strict(extensions) {
+            mapper.definition.extensions = strs;
+        } else {
+            errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.extensions", "string[]"],
+            ));
+        }
+    } else {
+        errors.push(new_compiler_diagnostic(
+            diag::Compiler_option_0_requires_a_value_of_type_1,
+            args!["contentMapper.extensions", "string[]"],
+        ));
+    }
+    if let Some(options) = v.get("options") {
+        if !matches!(options, CompilerOptionsValue::Map(_)) {
+            errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.options", "object"],
+            ));
+        } else {
+            // Go: `mapper.Options, _ = json.Marshal(options)` (compact JSON v2).
+            let mut json = String::new();
+            super::tsconfig_p2::stringify_json(options, &mut json);
+            mapper.definition.options = JsonValue(json.into_bytes());
+        }
+    }
+    if !errors.is_empty() {
+        return (None, errors);
+    }
+    (Some(mapper), errors)
+}
+
+// Go: tsoptions/parsinghelpers.go:145 parseStringArrayStrict (tsgo#4712)
+// parseStringArrayStrict returns the string slice and true only if value is an array whose
+// elements are all strings. A missing element or wrong element type yields false.
+// PORT: Go `([]string, bool)` is `Option<Vec<String>>`.
+pub fn parse_string_array_strict(value: &CompilerOptionsValue) -> Option<Vec<String>> {
+    let CompilerOptionsValue::List(arr) = value else {
+        return None;
+    };
+    let mut result = Vec::with_capacity(arr.len());
+    for v in arr {
+        let CompilerOptionsValue::String(str) = v else {
+            return None;
+        };
+        result.push(str.clone());
+    }
+    Some(result)
+}
+
+// Go: tsoptions/parsinghelpers.go:161 parseJsonToStringKey
 // PORT: Go returns a map pointer that is never nil. It is `Option` so it
 // can go straight to the nilable `json` argument of
 // `parseJsonConfigFileContentWorker`; it is always `Some`.
@@ -127,6 +206,10 @@ pub fn parse_json_to_string_key(
         }
         if let Some(v) = m.get("references") {
             result.insert("references".to_string(), v.clone());
+        }
+        // tsgo#4712
+        if let Some(v) = m.get("contentMappers") {
+            result.insert("contentMappers".to_string(), v.clone());
         }
         if let Some(v) = m.get("extends") {
             if let CompilerOptionsValue::String(str) = v {
@@ -433,6 +516,7 @@ fn parse_compiler_options_worker(
         "singleThreaded" => all_options.single_threaded = parse_tristate(value),
         "quiet" => all_options.quiet = parse_tristate(value),
         "checkers" => all_options.checkers = parse_number(value),
+        "runExternalCode" => all_options.run_external_code = parse_tristate(value),
         _ => {
             // different than any key above
             return false;
@@ -718,6 +802,7 @@ pub fn merge_compiler_options<'a>(
         build => "build",
         help => "help",
         all => "all",
+        run_external_code => "runExternalCode",
         pprof_dir => "pprofDir",
         single_threaded => "singleThreaded",
         quiet => "quiet",

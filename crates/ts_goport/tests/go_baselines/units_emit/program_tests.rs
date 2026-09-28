@@ -1,5 +1,6 @@
 //! Ports of internal/compiler/program_test.go (TestProgram,
 //! TestIncludeProcessorDiagnosticsWithMissingFileCasing),
+//! internal/compiler/contentmapper_test.go (tsgo#4712),
 //! internal/checker/checker_test.go (TestGetSymbolAtLocation) and
 //! internal/checker/tracer_test.go (TestTracerPushPreservesEndArgMutations).
 //! The Go benchmarks are not ported.
@@ -12,15 +13,25 @@ use super::childprog::{
     in_child, install_map_fs, new_program, new_program_with_config, source_file,
 };
 use crate::support::vfstest::{MapFile, MapFs};
+use std::sync::Arc;
+use ts_goport::contentmapper;
+use ts_goport::diagnostics_loc;
 use ts_goport::frontend::bundled;
-use ts_goport::frontend::compiler::{CompilerHost, new_compiler_host};
+use ts_goport::frontend::compiler::{
+    CompilerHost, NewProgram, ProgramOptions, content_mapper_project_error_diagnostic,
+    new_compiler_host,
+};
 use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::json_ext::LspAny;
 use ts_goport::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
-use ts_goport::frontend::vfs::{FileMode, Fs};
+use ts_goport::frontend::tsoptions::{ParsedCommandLine, ParsedOptions};
+use ts_goport::frontend::vfs::{FileMode, Fs, os_override_installed};
 use ts_goport::gostd::context;
+use ts_goport::gostd::{GoError, errors};
+use ts_goport::locale;
 use ts_goport::prelude::*;
 use ts_goport::program::ls_program;
+use ts_goport::spanmap;
 use ts_goport::tracing::{Arg, Phase, new_tracer, start_tracing};
 
 // Go: compiler/program_test.go:33 esnextLibs
@@ -337,7 +348,7 @@ foo.bar;";
         let fs = bundled::wrap_fs(map_fs.fs());
 
         let cd = "/";
-        let host = new_compiler_host(cd, fs, &bundled::lib_path(), None, None);
+        let host = new_compiler_host(cd, fs, &bundled::lib_path(), None, None, None);
 
         // PORT: Go passes the compiler host, which is also a
         // `tsoptions.ParseConfigHost`; `HostAsParseConfigHost` forwards the
@@ -476,4 +487,363 @@ fn test_tracer_push_preserves_end_arg_mutations() {
             assert_eq!(variances, &vec![LspAny::String("out".to_string())]);
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// compiler/contentmapper_test.go (tsgo#4712)
+// ---------------------------------------------------------------------------
+
+type FakeTransform = Rc<dyn Fn(&str, &str) -> std::result::Result<contentmapper::Result, GoError>>;
+
+/// Go `func(fileName string, content string) (contentmapper.Result, error)`.
+fn fake_transform(
+    transform: impl Fn(&str, &str) -> std::result::Result<contentmapper::Result, GoError> + 'static,
+) -> FakeTransform {
+    Rc::new(transform)
+}
+
+// Go: compiler/contentmapper_test.go:22 fakeContentMapperHost
+struct FakeContentMapperHost {
+    transform: FakeTransform,
+}
+
+impl contentmapper::Project for FakeContentMapperHost {
+    fn refresh(&self) -> std::result::Result<(), GoError> {
+        Ok(())
+    }
+    fn identities(&self) -> std::result::Result<Vec<String>, GoError> {
+        Ok(Vec::new())
+    }
+    fn identity(
+        &self,
+        _mapper: &Rc<contentmapper::Mapper>,
+    ) -> std::result::Result<String, GoError> {
+        Ok("test".to_string())
+    }
+    fn watched_files(&self) -> std::result::Result<Vec<String>, GoError> {
+        Ok(Vec::new())
+    }
+    fn diagnostics(&self) -> Vec<contentmapper::OptionDiagnostic> {
+        Vec::new()
+    }
+    fn transform(
+        &self,
+        _mapper: &Rc<contentmapper::Mapper>,
+        request: contentmapper::Request,
+    ) -> std::result::Result<contentmapper::Result, GoError> {
+        (self.transform)(&request.file_name, &request.content)
+    }
+    fn close(&self) -> std::result::Result<(), GoError> {
+        Ok(())
+    }
+}
+
+// Go: compiler/contentmapper_test.go:38 newContentMapperProgram
+fn new_content_mapper_program(
+    transform: FakeTransform,
+    files: &[(&str, &str)],
+    root_files: &[&str],
+) -> &'static NewProgram {
+    new_content_mapper_program_with_options(
+        transform,
+        files,
+        root_files,
+        CompilerOptions {
+            skip_lib_check: Tristate::True,
+            module: ModuleKind::ES_NEXT,
+            module_resolution: ModuleResolutionKind::BUNDLER,
+            ..Default::default()
+        },
+    )
+}
+
+// Go: compiler/contentmapper_test.go:46 newContentMapperProgramWithOptions
+// PORT: Go writes the files into an empty case-insensitive map file system;
+// `MapFs::from_map` makes the same files and parent directories. The first
+// map file system of the test process is also its OS file system (see
+// `childprog`); a process installs one override only. The load is single
+// threaded, so it reads the files through the host, not the OS file system.
+fn new_content_mapper_program_with_options(
+    transform: FakeTransform,
+    files: &[(&str, &str)],
+    root_files: &[&str],
+    options: CompilerOptions,
+) -> &'static NewProgram {
+    let map_fs = MapFs::from_map(
+        files
+            .iter()
+            .map(|(name, content)| ((*name).to_string(), MapFile::from(*content))),
+        false, /*useCaseSensitiveFileNames*/
+    );
+    if !os_override_installed() {
+        install_map_fs(&map_fs, "/src");
+    }
+    let fs = bundled::wrap_fs(map_fs.fs());
+
+    let config = ParsedCommandLine {
+        parsed_config: ParsedOptions {
+            file_names: root_files.iter().map(|name| (*name).to_string()).collect(),
+            compiler_options: Rc::new(options),
+            content_mappers: vec![Rc::new(contentmapper::Mapper {
+                definition: contentmapper::Definition {
+                    package: "vue".to_string(),
+                    extensions: vec![".vue".to_string()],
+                    ..Default::default()
+                },
+                manifest: contentmapper::Manifest {
+                    name: "vue-mapper".to_string(),
+                    version: "1.0.0".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let project: Rc<dyn contentmapper::Project> = Rc::new(FakeContentMapperHost { transform });
+    ls_program::new_program(
+        ProgramOptions {
+            host: new_compiler_host("/src", fs, &bundled::lib_path(), None, None, Some(project)),
+            config: Rc::new(config),
+            use_source_of_project_reference: false,
+            // Load files on the calling goroutine for deterministic diagnostics ordering.
+            single_threaded: Tristate::True,
+            typings_location: String::new(),
+            project_name: String::new(),
+        },
+        None,
+    )
+}
+
+/// A transform result with `text`, `virtual_extension` and `mappings`.
+fn transform_result(
+    text: &str,
+    virtual_extension: &str,
+    mappings: Arc<spanmap::SpanMap>,
+) -> contentmapper::Result {
+    contentmapper::Result {
+        text: text.to_string(),
+        virtual_extension: virtual_extension.to_string(),
+        mappings: Some(mappings),
+        ..Default::default()
+    }
+}
+
+// Go: compiler/contentmapper_test.go:73 TestContentMapperVirtualExtensionSetsImpliedNodeFormat
+#[test]
+fn test_content_mapper_virtual_extension_sets_implied_node_format() {
+    in_child(
+        module_path!(),
+        "test_content_mapper_virtual_extension_sets_implied_node_format",
+        || {
+            let program = new_content_mapper_program_with_options(
+                fake_transform(|_file_name, _content| {
+                    Ok(transform_result(
+                        "export {};",
+                        ".mts",
+                        Arc::new(spanmap::new(&[])),
+                    ))
+                }),
+                &[("/src/Component.vue", "<template />")],
+                &["/src/Component.vue"],
+                CompilerOptions {
+                    skip_lib_check: Tristate::True,
+                    module: ModuleKind::NODE_NEXT,
+                    module_resolution: ModuleResolutionKind::NODE_NEXT,
+                    ..Default::default()
+                },
+            );
+
+            let file = source_file(program, "/src/Component.vue");
+            assert_eq!(
+                program
+                    .get_source_file_meta_data(file.path())
+                    .implied_node_format,
+                RESOLUTION_MODE_ESM
+            );
+        },
+    );
+}
+
+// Go: compiler/contentmapper_test.go:94 collectContentMapperDiagnostics
+// PORT: Go collects the syntactic, semantic and program diagnostics through
+// the program. The loader puts the content mapper diagnostics in the parse
+// diagnostics of the file (Go `SetDiagnostics`) and in the program's
+// content mapper diagnostics, so this reads those two lists.
+fn collect_content_mapper_diagnostics(program: &NewProgram) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = program
+        .source_files()
+        .iter()
+        .flat_map(|file| file.diagnostics.iter().cloned())
+        .collect();
+    diagnostics.extend(program.content_mapper_diagnostics.iter().cloned());
+    diagnostics
+}
+
+// Go: compiler/contentmapper_test.go:103 TestContentMapperInvalidMappings
+#[test]
+fn test_content_mapper_invalid_mappings() {
+    in_child(
+        module_path!(),
+        "test_content_mapper_invalid_mappings",
+        || {
+            const TRANSFORMED: &str = "export const x = 1;\n";
+            const ORIGINAL: &str = "<template>x</template>\n";
+            let mappings = Arc::new(spanmap::new(&[
+                spanmap::Segment {
+                    virtual_start: 0,
+                    virtual_end: 10,
+                    original_start: 0,
+                    original_end: 0,
+                    kind: spanmap::Kind::ATOM,
+                    ..Default::default()
+                },
+                spanmap::Segment {
+                    virtual_start: 5,
+                    virtual_end: TRANSFORMED.len() as i32,
+                    original_start: 0,
+                    original_end: 0,
+                    kind: spanmap::Kind::ATOM,
+                    ..Default::default()
+                },
+            ]));
+            let program = new_content_mapper_program(
+                fake_transform(move |_file_name, _content| {
+                    Ok(transform_result(TRANSFORMED, ".ts", mappings.clone()))
+                }),
+                &[
+                    ("/src/app.ts", r#"import "./Component.vue";"#),
+                    ("/src/Component.vue", ORIGINAL),
+                ],
+                &["/src/app.ts"],
+            );
+            let program_diagnostics = collect_content_mapper_diagnostics(program);
+            let code = diag::The_content_mapper_0_produced_overlapping_or_out_of_order_position_mappings_near_virtual_offset_1.code() as i32;
+            let found = program_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code);
+            assert!(
+                found,
+                "expected an invalid mapping diagnostic, got: {program_diagnostics:?}"
+            );
+        },
+    );
+}
+
+// Go: compiler/contentmapper_test.go:131 TestContentMapperSourceFileState
+#[test]
+fn test_content_mapper_source_file_state() {
+    in_child(
+        module_path!(),
+        "test_content_mapper_source_file_state",
+        || {
+            let mut t = Subtests::new("TestContentMapperSourceFileState");
+
+            t.run("successful synthesized empty file", || {
+                let program = new_content_mapper_program(
+                    fake_transform(|_file_name, _content| {
+                        Ok(transform_result(
+                            "export {};",
+                            ".ts",
+                            Arc::new(spanmap::new(&[])),
+                        ))
+                    }),
+                    &[("/src/empty.vue", "")],
+                    &["/src/empty.vue"],
+                );
+                let file = source_file(program, "/src/empty.vue");
+                assert_eq!(file.original_text(), "");
+                assert_eq!(file.content_mapper(), "vue-mapper@1.0.0");
+                assert!(!file.is_content_mapper_failure_stub());
+                Ok(())
+            });
+
+            t.run("failed transform", || {
+                let program = new_content_mapper_program(
+                    fake_transform(|_file_name, _content| Err(errors::new("failed"))),
+                    &[("/src/fail.vue", "original")],
+                    &["/src/fail.vue"],
+                );
+                let file = source_file(program, "/src/fail.vue");
+                assert_eq!(file.original_text(), "original");
+                assert_eq!(file.content_mapper(), "vue-mapper@1.0.0");
+                assert!(file.is_content_mapper_failure_stub());
+                Ok(())
+            });
+
+            t.run("project error is localized", || {
+                let program = new_content_mapper_program(
+                    fake_transform(|_file_name, _content| {
+                        Err(contentmapper::new_transform_error(
+                            contentmapper::TransformErrorKind::PROJECT,
+                            Some(
+                                contentmapper::ProjectError {
+                                    kind: contentmapper::ProjectErrorKind::MALFORMED_RESPONSE,
+                                }
+                                .to_go_error(),
+                            ),
+                        )
+                        .to_go_error())
+                    }),
+                    &[("/src/fail.vue", "original")],
+                    &["/src/fail.vue"],
+                );
+                let program_diagnostics = collect_content_mapper_diagnostics(program);
+                let code =
+                    diag::The_content_mapper_returned_a_project_response_that_could_not_be_decoded
+                        .code() as i32;
+                let found = program_diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message_chain
+                        .iter()
+                        .any(|message| message.code == code)
+                });
+                assert!(
+                    found,
+                    "expected a localized project response diagnostic, got: {program_diagnostics:?}"
+                );
+                Ok(())
+            });
+
+            t.finish();
+        },
+    );
+}
+
+// Go: compiler/contentmapper_test.go:180 TestContentMapperProjectErrorDiagnostics
+#[test]
+fn test_content_mapper_project_error_diagnostics() {
+    let tests = [
+        (
+            contentmapper::ProjectErrorKind::MISSING_CONFIG_IDENTITY,
+            diag::The_content_mapper_did_not_return_configIdentity_which_is_required_when_the_content_mapper_has_dynamicConfig_Colon_true_in_its_package_json,
+            r#"The content mapper did not return 'configIdentity', which is required when the content mapper has '"dynamicConfig": true' in its package.json."#,
+        ),
+        (
+            contentmapper::ProjectErrorKind::UNEXPECTED_CONFIG_IDENTITY,
+            diag::The_content_mapper_returned_configIdentity_which_is_only_allowed_when_it_declares_dynamicConfig_Colon_true_in_its_package_json,
+            r#"The content mapper returned 'configIdentity', which is only allowed when it declares '"dynamicConfig": true' in its package.json."#,
+        ),
+        (
+            contentmapper::ProjectErrorKind::UNEXPECTED_WATCHED_FILES,
+            diag::The_content_mapper_returned_watchedFiles_which_is_only_allowed_when_it_declares_dynamicConfig_Colon_true_in_its_package_json,
+            r#"The content mapper returned 'watchedFiles', which is only allowed when it declares '"dynamicConfig": true' in its package.json."#,
+        ),
+    ];
+    let mut t = Subtests::new("TestContentMapperProjectErrorDiagnostics");
+    for (kind, want, text) in tests {
+        t.run(text, || {
+            let message = content_mapper_project_error_diagnostic(
+                &contentmapper::ProjectError { kind }.to_go_error(),
+            );
+            assert_eq!(message.code(), want.code());
+            assert_eq!(
+                diagnostics_loc::localize(&locale::DEFAULT, Some(message), message.key(), &[]),
+                text
+            );
+            Ok(())
+        });
+    }
+    t.finish();
 }

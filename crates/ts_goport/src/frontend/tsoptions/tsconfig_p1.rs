@@ -22,6 +22,8 @@ pub struct ExtendsResult {
     pub include: Option<Vec<CompilerOptionsValue>>,
     pub exclude: Option<Vec<CompilerOptionsValue>>,
     pub files: Option<Vec<CompilerOptionsValue>>,
+    // tsgo#4712
+    pub content_mappers: Option<Vec<CompilerOptionsValue>>,
     pub compile_on_save: bool,
     pub extended_source_files: FxHashSet<String>,
 }
@@ -78,6 +80,12 @@ pub static TSCONFIG_ROOT_OPTIONS_MAP: LazyLock<&'static CommandLineOption> = Laz
                 name: "references",
                 kind: CommandLineOptionKind::LIST, // should be a list of projectReference
                 // Category: diagnostics.Projects,
+                ..Default::default()
+            }),
+            // tsgo#4712
+            leak_option(CommandLineOption {
+                name: "contentMappers",
+                kind: CommandLineOptionKind::LIST, // list of content mapper objects
                 ..Default::default()
             }),
             leak_option(CommandLineOption {
@@ -205,12 +213,7 @@ impl ConfigFileSpecs {
 }
 
 // Go: tsoptions/tsconfigparsing.go:148 FileExtensionInfo
-#[derive(Clone, Debug, Default)]
-pub struct FileExtensionInfo {
-    pub extension: String,
-    pub is_mixed_content: bool,
-    pub script_kind: ScriptKind,
-}
+// tsgo#4712 removes it: extra extensions are plain strings now.
 
 // Go: tsoptions/tsconfigparsing.go:154 ExtendedConfigCache
 // PORT: Go returns a shared `*ExtendedConfigCacheEntry`, so this returns
@@ -1247,7 +1250,6 @@ pub fn parse_json_source_file_config_file_content(
     existing_options_raw: Option<&IndexMap<String, CompilerOptionsValue>>,
     config_file_name: &str,
     resolution_stack: &[Path],
-    extra_file_extensions: &[FileExtensionInfo],
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ParsedCommandLine {
     // tracing?.push(tracing.Phase.Parse, "parseJsonSourceFileConfigFileContent", { path: sourceFile.fileName });
@@ -1261,7 +1263,6 @@ pub fn parse_json_source_file_config_file_content(
         existing_options_raw,
         config_file_name,
         resolution_stack,
-        extra_file_extensions,
         extended_config_cache,
     )
 }
@@ -1488,7 +1489,6 @@ pub fn parse_json_config_file_content(
     existing_options: Option<&CompilerOptions>,
     config_file_name: &str,
     resolution_stack: &[Path],
-    extra_file_extensions: &[FileExtensionInfo],
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ParsedCommandLine {
     // PORT: Go changes a caller's ordered map in place; the port normalizes a
@@ -1507,7 +1507,6 @@ pub fn parse_json_config_file_content(
         None, /*existingOptionsRaw*/
         config_file_name,
         resolution_stack,
-        extra_file_extensions,
         extended_config_cache,
     )
 }

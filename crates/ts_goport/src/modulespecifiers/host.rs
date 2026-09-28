@@ -217,6 +217,11 @@ impl OutputPathsHost for ProgramHost {
     fn use_case_sensitive_file_names(&self) -> bool {
         crate::program::use_case_sensitive_file_names()
     }
+
+    // tsgo#4712: Go `Program.ContentMapperExtensions` (program.go:508).
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        crate::program::content_mapper_extensions()
+    }
 }
 
 impl ModuleSpecifierGenerationHost for ProgramHost {
@@ -316,6 +321,11 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
 
     fn common_source_directory(&self) -> String {
         crate::program::common_source_directory().to_string()
+    }
+
+    // Go: compiler/program.go:508 ContentMapperExtensions (tsgo#4712)
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        crate::program::content_mapper_extensions()
     }
 
     // Go: compiler/program.go:132 GetGlobalTypingsCacheLocation

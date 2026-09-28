@@ -14,6 +14,7 @@
 //! - Go `*collections.OrderedMap` is `Rc<IndexMap>`. Go slices and pointers
 //!   share their data on copy, so `Rc` keeps that.
 
+use crate::frontend::json_ext::unmarshal_struct_fields;
 use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 use std::sync::LazyLock;
@@ -695,6 +696,73 @@ pub struct Fields {
     pub header_fields: HeaderFields,
     pub path_fields: PathFields,
     pub dependency_fields: DependencyFields,
+    // tsgo#4712. json:"-": only `parse` sets it, from
+    // "typescript.contentMapper".
+    pub content_mapper: Expected<ContentMapperFields>,
+}
+
+// Go: packagejson.go:117 ContentMapperFields (tsgo#4712)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContentMapperFields {
+    pub exec: Expected<Vec<String>>,
+    pub compiler_options: Expected<Vec<String>>,
+    pub dynamic_config: Expected<bool>,
+}
+
+// PORT: the JSON v2 struct arshaler for `ContentMapperFields` (tags `exec`,
+// `compilerOptions`, `dynamicConfig`).
+impl UnmarshalerFrom for ContentMapperFields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "packagejson.ContentMapperFields", |name, dec| {
+                match name {
+                    "exec" => json_unmarshal_decode(dec, &mut self.exec)?,
+                    "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                    "dynamicConfig" => json_unmarshal_decode(dec, &mut self.dynamic_config)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = ContentMapperFields::default();
+        }
+        Ok(())
+    }
+}
+
+// Go `reflect.Struct` falls to the "unknown" default.
+impl ExpectedJsonKind for ContentMapperFields {
+    const JSON_TYPE: &'static str = "unknown";
+}
+
+// Go: packagejson.go:123 typeScriptFields (tsgo#4712)
+#[derive(Clone, Debug, Default)]
+struct TypeScriptFields {
+    content_mapper: Expected<ContentMapperFields>,
+}
+
+// PORT: the JSON v2 struct arshaler for `typeScriptFields` (tag
+// `contentMapper`).
+impl UnmarshalerFrom for TypeScriptFields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "packagejson.typeScriptFields", |name, dec| {
+                if name != "contentMapper" {
+                    return Ok(false);
+                }
+                json_unmarshal_decode(dec, &mut self.content_mapper)?;
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = TypeScriptFields::default();
+        }
+        Ok(())
+    }
+}
+
+// Go `reflect.Struct` falls to the "unknown" default.
+impl ExpectedJsonKind for TypeScriptFields {
+    const JSON_TYPE: &'static str = "unknown";
 }
 
 impl Fields {
@@ -714,92 +782,134 @@ impl Fields {
     pub fn get_runtime_dependency_names(&self) -> FxHashSet<String> {
         self.dependency_fields.get_runtime_dependency_names()
     }
+
+    /// Decodes the member `name` of the embedded field groups; false for a
+    /// name that is not one of their `json:"..."` tags.
+    fn unmarshal_member(
+        &mut self,
+        name: &str,
+        dec: &mut JsonDecoder<'_>,
+    ) -> Result<bool, JsonError> {
+        match name {
+            "name" => json_unmarshal_decode(dec, &mut self.header_fields.name)?,
+            "version" => json_unmarshal_decode(dec, &mut self.header_fields.version)?,
+            "type" => json_unmarshal_decode(dec, &mut self.header_fields.type_)?,
+            "tsconfig" => json_unmarshal_decode(dec, &mut self.path_fields.ts_config)?,
+            "main" => json_unmarshal_decode(dec, &mut self.path_fields.main)?,
+            "types" => json_unmarshal_decode(dec, &mut self.path_fields.types)?,
+            "typings" => json_unmarshal_decode(dec, &mut self.path_fields.typings)?,
+            "typesVersions" => json_unmarshal_decode(dec, &mut self.path_fields.types_versions)?,
+            "imports" => json_unmarshal_decode(dec, &mut self.path_fields.imports)?,
+            "exports" => json_unmarshal_decode(dec, &mut self.path_fields.exports)?,
+            "dependencies" => json_unmarshal_decode(dec, &mut self.dependency_fields.dependencies)?,
+            "devDependencies" => {
+                json_unmarshal_decode(dec, &mut self.dependency_fields.dev_dependencies)?
+            }
+            "peerDependencies" => {
+                json_unmarshal_decode(dec, &mut self.dependency_fields.peer_dependencies)?
+            }
+            "optionalDependencies" => {
+                json_unmarshal_decode(dec, &mut self.dependency_fields.optional_dependencies)?
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
 }
 
-// PORT: the JSON v2 struct arshaler for `Fields` with its `json:"..."` tags.
-// Null sets the zero value. Names match case-sensitively. Unknown members
-// are skipped. Duplicate names are errors unless `AllowDuplicateNames` is
-// set; then the field is decoded again into the same value.
-impl UnmarshalerFrom for Fields {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        match dec.peek_kind() {
-            b'n' => {
-                dec.read_token()?;
-                *self = Fields::default();
-                Ok(())
-            }
-            b'{' => {
-                dec.read_token()?;
-                dec.disable_namespace();
-                let mut seen: Option<FxHashSet<String>> = if dec.options.allow_duplicate_names {
-                    None
-                } else {
-                    Some(FxHashSet::default())
+/// The JSON v2 struct arshaler loop shared by `Fields` and the `parse`
+/// target: null sets the zero value, names match case-sensitively, unknown
+/// members are skipped (`member` returns false), and duplicate names are
+/// errors unless `AllowDuplicateNames` is set (then the field is decoded
+/// again into the same value).
+fn unmarshal_fields_object<T: Default>(
+    target: &mut T,
+    dec: &mut JsonDecoder<'_>,
+    go_type: &str,
+    member: impl Fn(&mut T, &str, &mut JsonDecoder<'_>) -> Result<bool, JsonError>,
+) -> Result<(), JsonError> {
+    match dec.peek_kind() {
+        b'n' => {
+            dec.read_token()?;
+            *target = T::default();
+            Ok(())
+        }
+        b'{' => {
+            dec.read_token()?;
+            dec.disable_namespace();
+            let mut seen: Option<FxHashSet<String>> = if dec.options.allow_duplicate_names {
+                None
+            } else {
+                Some(FxHashSet::default())
+            };
+            while dec.peek_kind() != b'}' {
+                let JsonToken::String(name) = dec.read_token()? else {
+                    unreachable!("the decoder only reads strings as object names")
                 };
-                while dec.peek_kind() != b'}' {
-                    let JsonToken::String(name) = dec.read_token()? else {
-                        unreachable!("the decoder only reads strings as object names")
-                    };
-                    if let Some(seen) = &mut seen
-                        && !seen.insert(name.clone())
-                    {
-                        return Err(JsonError {
-                            message: format!("duplicate object member name {name:?}"),
-                        });
-                    }
-                    match name.as_str() {
-                        "name" => json_unmarshal_decode(dec, &mut self.header_fields.name)?,
-                        "version" => json_unmarshal_decode(dec, &mut self.header_fields.version)?,
-                        "type" => json_unmarshal_decode(dec, &mut self.header_fields.type_)?,
-                        "tsconfig" => json_unmarshal_decode(dec, &mut self.path_fields.ts_config)?,
-                        "main" => json_unmarshal_decode(dec, &mut self.path_fields.main)?,
-                        "types" => json_unmarshal_decode(dec, &mut self.path_fields.types)?,
-                        "typings" => json_unmarshal_decode(dec, &mut self.path_fields.typings)?,
-                        "typesVersions" => {
-                            json_unmarshal_decode(dec, &mut self.path_fields.types_versions)?
-                        }
-                        "imports" => json_unmarshal_decode(dec, &mut self.path_fields.imports)?,
-                        "exports" => json_unmarshal_decode(dec, &mut self.path_fields.exports)?,
-                        "dependencies" => {
-                            json_unmarshal_decode(dec, &mut self.dependency_fields.dependencies)?
-                        }
-                        "devDependencies" => json_unmarshal_decode(
-                            dec,
-                            &mut self.dependency_fields.dev_dependencies,
-                        )?,
-                        "peerDependencies" => json_unmarshal_decode(
-                            dec,
-                            &mut self.dependency_fields.peer_dependencies,
-                        )?,
-                        "optionalDependencies" => {
-                            json_unmarshal_decode(
-                                dec,
-                                &mut self.dependency_fields.optional_dependencies,
-                            )?;
-                        }
-                        _ => dec.skip_value()?,
-                    }
+                if let Some(seen) = &mut seen
+                    && !seen.insert(name.clone())
+                {
+                    return Err(JsonError {
+                        message: format!("duplicate object member name {name:?}"),
+                    });
                 }
-                dec.read_token()?;
-                Ok(())
+                if !member(target, &name, dec)? {
+                    dec.skip_value()?;
+                }
             }
-            _ => {
-                dec.skip_value()?;
-                Err(JsonError {
-                    message: "cannot unmarshal JSON value into Go packagejson.Fields".to_string(),
-                })
-            }
+            dec.read_token()?;
+            Ok(())
+        }
+        _ => {
+            dec.skip_value()?;
+            Err(JsonError {
+                message: format!("cannot unmarshal JSON value into Go {go_type}"),
+            })
         }
     }
 }
 
-// Go: packagejson.go:116 Parse
+// PORT: the JSON v2 struct arshaler for `Fields` with its `json:"..."` tags.
+// `ContentMapper` is `json:"-"`, so "contentMapper" is an unknown member.
+impl UnmarshalerFrom for Fields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        unmarshal_fields_object(self, dec, "packagejson.Fields", Fields::unmarshal_member)
+    }
+}
+
+// Go: packagejson.go:127 Parse
 // PORT: Go returns `(Fields{}, err)` on error. The `Result` carries the same
 // information; callers use `unwrap_or_default()` for the zero `Fields`.
+// tsgo#4712: Go decodes into an anonymous struct that embeds the three field
+// groups and adds `TypeScript Expected[typeScriptFields] json:"typescript"`.
 pub fn parse(data: &[u8]) -> Result<Fields, JsonError> {
-    let mut f = Fields::default();
-    json_unmarshal(data, &mut f, &[json_allow_duplicate_names(true)])?;
+    let mut parsed = ParsedFields::default();
+    json_unmarshal(data, &mut parsed, &[json_allow_duplicate_names(true)])?;
+    // Go `typeScript, _ := parsed.TypeScript.GetValue()`: the value is used
+    // even when it is not valid.
+    let (type_script, _) = parsed.type_script.get_value();
+    let mut f = parsed.fields;
+    f.content_mapper = type_script.content_mapper;
     Ok(f)
+}
+
+/// The anonymous Go struct that `Parse` decodes into (tsgo#4712).
+#[derive(Default)]
+struct ParsedFields {
+    fields: Fields,
+    type_script: Expected<TypeScriptFields>,
+}
+
+impl UnmarshalerFrom for ParsedFields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        unmarshal_fields_object(self, dec, "struct", |this, name, dec| {
+            if name == "typescript" {
+                json_unmarshal_decode(dec, &mut this.type_script)?;
+                return Ok(true);
+            }
+            this.fields.unmarshal_member(name, dec)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

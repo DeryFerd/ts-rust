@@ -3,6 +3,7 @@
 //! The `Program` type is `NewProgram` (the loader contract name), so it does
 //! not clash with the legacy program in program.rs.
 
+use crate::contentmapper::{Mapper, Project};
 use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 
@@ -132,6 +133,11 @@ impl NewProgram {
     // Go: program.go:122 (*Program).FileExists
     pub fn file_exists(&self, path: &str) -> bool {
         self.host().fs().file_exists(path)
+    }
+
+    // Go: program.go:134 (*Program).ContentMapperProject (tsgo#4712)
+    pub fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
+        self.opts.host.content_mapper_project()
     }
 
     // Go: program.go:127 (*Program).GetCurrentDirectory
@@ -302,8 +308,10 @@ impl NewProgram {
         // Still, without the failed lookup reporting that only the loader does, this isn't terribly complicated
 
         let file_name = resolve_path(&get_directory_path(origin.file_name()), &[&r.file_name]);
-        let supported_extensions_base =
-            get_supported_extensions(self.options(), &[] /*extraFileExtensions*/);
+        let supported_extensions_base = get_supported_extensions(
+            self.options(),
+            &self.command_line().content_mapper_extensions(),
+        );
         let supported_extensions = get_supported_extensions_with_json_if_resolve_json_module(
             Some(self.options()),
             supported_extensions_base,
@@ -417,6 +425,9 @@ impl NewProgram {
     // Go: program.go:320 (*Program).ReuseProgram
     // PORT: Go nil `*Program` is `None`. The `createCheckerPool` parameter is
     // dropped with the option.
+    // PORT: tsgo#4712 Go copies `contentMapperOptionDiagnostics` into the new
+    // program. `NewProgram` has no field for them: the program version keeps
+    // them (`program/go_frontend.rs` `content_mapper_option_diagnostics_of`).
     pub fn reuse_program(
         &self,
         changed_file_path: &Path,
@@ -431,7 +442,34 @@ impl NewProgram {
             .get(changed_file_path)
             .cloned()
             .expect("changed file is not in the program");
-        let new_file = new_host.get_source_file(old_file.parse_options());
+        // tsgo#4712
+        let new_file;
+        let mut old_supplemental_files: Vec<Rc<ParsedSourceFile>> = Vec::new();
+        let mut new_supplemental_files: Vec<Rc<ParsedSourceFile>> = Vec::new();
+        if !old_file.content_mapper().is_empty() {
+            // Content-mapped files are produced by running an external transform, which a plain reparse can't
+            // reproduce. Re-run the transform through the host; any failure (or a missing file) falls back to
+            // a full rebuild so the file loader's failure policy runs.
+            // PORT: Go passes a nil mapper to the host when the new config
+            // has none for the file, and the transform then fails; here that
+            // is the same fallback.
+            let Some(mapper) = new_opts
+                .config
+                .get_content_mapper_for_file_name(old_file.file_name())
+            else {
+                return (None, None, false);
+            };
+            match new_host.get_content_mapped_source_files(old_file.parse_options(), &mapper) {
+                Ok(files) => {
+                    new_file = files.canonical;
+                    old_supplemental_files = old_file.supplemental_source_files();
+                    new_supplemental_files = files.supplemental;
+                }
+                Err(_) => return (None, None, false),
+            }
+        } else {
+            new_file = new_host.get_source_file(old_file.parse_options());
+        }
 
         // If this file is part of a package redirect group (same package installed in multiple
         // node_modules locations), we need to rebuild the program because the redirect targets
@@ -453,13 +491,42 @@ impl NewProgram {
             return (None, new_file, false);
         }
         let new_file = new_file.expect("checked by can_replace_file_in_program");
-        let old_needs_import_helpers = self
-            .import_helpers_import_specifiers
-            .as_ref()
-            .and_then(|specifiers| specifiers.get(old_file.path()))
-            .is_some_and(|specifier| specifier.is_some());
-        if old_needs_import_helpers != self.needs_import_helpers_import_specifier(&new_file) {
+        // Cloning does not recompute synthetic helper or JSX-runtime import bookkeeping. Fall back to a full
+        // build whenever either version requires those imports.
+        // tsgo#4712
+        if self.has_import_helpers_import_specifier(old_file.path())
+            || self.needs_import_helpers_import_specifier(&new_file)
+        {
             return (None, Some(new_file), false);
+        }
+        if self.has_jsx_runtime_import_specifier(old_file.path())
+            || !self.jsx_runtime_import_specifier(&new_file).is_empty()
+        {
+            return (None, Some(new_file), false);
+        }
+        if old_supplemental_files.len() != new_supplemental_files.len() {
+            return (None, Some(new_file), false);
+        }
+        for (old_supplemental, new_supplemental) in
+            old_supplemental_files.iter().zip(&new_supplemental_files)
+        {
+            if old_supplemental.path() != new_supplemental.path()
+                || !self.can_replace_file_in_program(old_supplemental, Some(&**new_supplemental))
+            {
+                return (None, Some(new_file), false);
+            }
+            if self.has_import_helpers_import_specifier(old_supplemental.path())
+                || self.needs_import_helpers_import_specifier(new_supplemental)
+            {
+                return (None, Some(new_file), false);
+            }
+            if self.has_jsx_runtime_import_specifier(old_supplemental.path())
+                || !self
+                    .jsx_runtime_import_specifier(new_supplemental)
+                    .is_empty()
+            {
+                return (None, Some(new_file), false);
+            }
         }
         // TODO: reverify compiler options when config has changed?
         // PORT: Go copies the `processedFiles` struct and shares its maps.
@@ -495,6 +562,22 @@ impl NewProgram {
             .processed_files
             .files_by_path
             .insert(new_file.path().clone(), new_file.clone());
+        // tsgo#4712
+        for (old_supplemental, new_supplemental) in
+            old_supplemental_files.iter().zip(&new_supplemental_files)
+        {
+            // PORT: Go `core.FindIndex` returns -1 and the index panics; so does this.
+            let supplemental_index = result
+                .files
+                .iter()
+                .position(|file| Rc::ptr_eq(file, old_supplemental))
+                .expect("supplemental file is not in the file list");
+            result.processed_files.files[supplemental_index] = new_supplemental.clone();
+            result
+                .processed_files
+                .files_by_path
+                .insert(new_supplemental.path().clone(), new_supplemental.clone());
+        }
         update_file_include_processor(&mut result);
         (Some(result), Some(new_file), true)
     }
@@ -518,6 +601,10 @@ impl NewProgram {
             return false;
         };
         file1.parse_options() == file2.parse_options()
+            // tsgo#4712
+            && file1.script_kind == file2.script_kind
+            && is_external_or_common_js_module_of(file1)
+                == is_external_or_common_js_module_of(file2)
             && file1.uses_uri_style_node_core_modules == file2.uses_uri_style_node_core_modules
             && slices_equal_func(&file1.imports, &file2.imports, |n1, n2| {
                 equal_module_specifiers(*n1, *n2)
@@ -552,6 +639,19 @@ impl NewProgram {
     }
 }
 
+/// Go `ast.IsExternalOrCommonJSModule(file)` for a file of the loader
+/// (tsgo#4712 `canReplaceFileInProgram`).
+// PORT: the binder sets Go `SourceFile.CommonJSModuleIndicator`. A
+// published file reads the indicators from its `source_file_info`, which has
+// the bind result once the file is bound (nil before, as in Go). A file that
+// is not published yet is not bound; its parse has both indicators.
+fn is_external_or_common_js_module_of(file: &ParsedSourceFile) -> bool {
+    if crate::ast::is_published(file.store) {
+        return is_external_or_common_js_module(file.root);
+    }
+    file.external_module_indicator.is_some() || file.common_js_module_indicator.is_some()
+}
+
 /// Go `slices.EqualFunc`.
 fn slices_equal_func<T>(s1: &[T], s2: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
     s1.len() == s2.len() && s1.iter().zip(s2).all(|(v1, v2)| eq(v1, v2))
@@ -582,6 +682,41 @@ impl NewProgram {
             return false;
         }
         true
+    }
+
+    /// Go `p.importHelpersImportSpecifiers[path] != nil`.
+    fn has_import_helpers_import_specifier(&self, path: &Path) -> bool {
+        self.import_helpers_import_specifiers
+            .as_ref()
+            .and_then(|specifiers| specifiers.get(path))
+            .is_some_and(|specifier| specifier.is_some())
+    }
+
+    /// Go `p.jsxRuntimeImportSpecifiers[path] != nil`.
+    fn has_jsx_runtime_import_specifier(&self, path: &Path) -> bool {
+        self.jsx_runtime_import_specifiers
+            .as_ref()
+            .is_some_and(|specifiers| specifiers.contains_key(path))
+    }
+
+    // Go: program.go:466 (*Program).jsxRuntimeImportSpecifier (tsgo#4712)
+    // PORT: as `needs_import_helpers_import_specifier`, this reads the
+    // `ParsedSourceFile` fields (`get_jsx_implicit_import_base_of_file`).
+    pub fn jsx_runtime_import_specifier(&self, file: &ParsedSourceFile) -> String {
+        if !file.is_js() && file.script_kind != ScriptKind::TSX {
+            return String::new();
+        }
+        let (redirect, _) = self.mapper().get_redirect_for_resolution(file);
+        let options_for_file = get_compiler_options_with_redirect(
+            self.opts.config.compiler_options(),
+            redirect
+                .as_deref()
+                .map(|r| r as &dyn ModuleResolvedProjectReference),
+        );
+        get_jsx_runtime_import(
+            &super::file_loader::get_jsx_implicit_import_base_of_file(&options_for_file, file),
+            &options_for_file,
+        )
     }
 }
 
@@ -628,6 +763,28 @@ impl NewProgram {
     // Go: program.go:399 (*Program).Options
     pub fn options(&self) -> &CompilerOptions {
         self.opts.config.compiler_options()
+    }
+
+    // Go: program.go:497 (*Program).GetContentMapper (tsgo#4712)
+    // GetContentMapper returns the content mapper that produced the given source file, or nil if the
+    // file was not produced by a content mapper.
+    pub fn get_content_mapper(&self, file: &ParsedSourceFile) -> Option<Rc<Mapper>> {
+        if file.content_mapper().is_empty() {
+            return None;
+        }
+        let mapper = self
+            .opts
+            .config
+            .get_content_mapper_for_file_name(file.file_name())?;
+        if mapper.identity() == file.content_mapper() {
+            return Some(mapper);
+        }
+        None
+    }
+
+    // Go: program.go:508 (*Program).ContentMapperExtensions (tsgo#4712)
+    pub fn content_mapper_extensions(&self) -> Vec<String> {
+        self.opts.config.content_mapper_extensions()
     }
 
     // Go: program.go:400 (*Program).CommandLine

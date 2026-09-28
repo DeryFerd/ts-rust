@@ -261,6 +261,15 @@ pub static COMMAND_LINE_OPTION_ELEMENTS: LazyLock<
                 ..Default::default()
             }),
         ),
+        // tsgo#4712
+        (
+            "contentMappers",
+            opt(CommandLineOption {
+                name: "contentMappers",
+                kind: CommandLineOptionKind::OBJECT,
+                ..Default::default()
+            }),
+        ),
         (
             "files",
             opt(CommandLineOption {

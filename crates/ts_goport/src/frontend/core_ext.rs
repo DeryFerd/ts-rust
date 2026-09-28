@@ -89,6 +89,18 @@ pub fn get_script_kind_from_file_name(file_name: &str) -> ScriptKind {
     ScriptKind::UNKNOWN
 }
 
+// Go: core/core.go:546 GetDefaultExtensionForScriptKind (tsgo#4712)
+#[must_use]
+pub fn get_default_extension_for_script_kind(script_kind: ScriptKind) -> &'static str {
+    match script_kind {
+        ScriptKind::JS => EXTENSION_JS,
+        ScriptKind::JSX => EXTENSION_JSX,
+        ScriptKind::TSX => EXTENSION_TSX,
+        ScriptKind::JSON => EXTENSION_JSON,
+        _ => EXTENSION_TS,
+    }
+}
+
 // EnsureScriptKindFromFileName is like GetScriptKindFromFileName, but defaults to
 // ScriptKindTS when the file name has no recognized extension (e.g. files included
 // with allowNonTsExtensions), so the result is always safe to hand to the parser.

@@ -177,6 +177,11 @@ pub fn get_resolution_diagnostic(
         Some(diag::Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set)
     };
 
+    // tsgo#4712
+    if resolved_module.resolved_using_extra_extensions {
+        return None;
+    }
+
     // PORT: Go string `switch` is an if/else chain.
     let ext = resolved_module.extension.as_str();
     if ext == EXTENSION_TS

@@ -200,6 +200,45 @@ fn test_get_directory_path() {
     );
 }
 
+// Go: path_test.go:171 TestGetLongestExtensionFromPath (tsgo#4712)
+#[test]
+fn test_get_longest_extension_from_path() {
+    let extensions = [".z", ".y.z", ".other"];
+    assert_eq!(
+        tspath::get_longest_extension_from_path("/src/Component.y.z", &extensions, false),
+        ".y.z"
+    );
+    assert_eq!(
+        tspath::get_longest_extension_from_path("/src/Component.z", &extensions, false),
+        ".z"
+    );
+    assert_eq!(
+        tspath::get_longest_extension_from_path("/src/Component.y.Z", &extensions, false),
+        ""
+    );
+    assert_eq!(
+        tspath::get_longest_extension_from_path("/src/Component.y.Z", &extensions, true),
+        ".y.Z"
+    );
+}
+
+// Go: path_test.go:180 TestRemoveAnyFileExtension (tsgo#4712)
+#[test]
+fn test_remove_any_file_extension() {
+    assert_eq!(
+        tspath::remove_any_file_extension("/src/Component.vue"),
+        "/src/Component"
+    );
+    assert_eq!(
+        tspath::remove_any_file_extension("/src/Component.d.ts"),
+        "/src/Component"
+    );
+    assert_eq!(
+        tspath::remove_any_file_extension("/src/Component"),
+        "/src/Component"
+    );
+}
+
 // Go: path_test.go:175 TestGetPathComponents
 #[test]
 fn test_get_path_components() {

@@ -54,13 +54,13 @@ fn bundler_options() -> Rc<CompilerOptions> {
     })
 }
 
-/// Go `module.NewResolver(host, opts, "", "")` over `fs` with cwd `/repo`.
+/// Go `module.NewResolver(host, opts, "", "", nil)` over `fs` with cwd `/repo`.
 fn new_repo_resolver(fs: Rc<dyn Fs>) -> Resolver {
     let host: Rc<dyn ResolutionHost> = Rc::new(ResolutionHostStub {
         fs,
         cwd: "/repo".to_string(),
     });
-    new_resolver(host, bundler_options(), "", "")
+    new_resolver(host, bundler_options(), "", "", Vec::new())
 }
 
 /// Go `r, _ := resolver.ResolveModuleName(name, containingFile,
@@ -474,6 +474,8 @@ fn test_resolve_peer_dependency_nil_contents_race() {
 // Go: modulespecifiers/specifiers_test.go:16 mockModuleSpecifierGenerationHost
 struct MockModuleSpecifierGenerationHost {
     current_dir: String,
+    // tsgo#4712
+    content_mapper_extensions: Vec<String>,
     use_case_sensitive_file_names: bool,
     symlink_cache: Option<Rc<KnownSymlinks>>,
 }
@@ -488,6 +490,10 @@ impl OutputPathsHost for MockModuleSpecifierGenerationHost {
     fn use_case_sensitive_file_names(&self) -> bool {
         self.use_case_sensitive_file_names
     }
+    // tsgo#4712
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        self.content_mapper_extensions.clone()
+    }
 }
 
 impl ModuleSpecifierGenerationHost for MockModuleSpecifierGenerationHost {
@@ -496,6 +502,10 @@ impl ModuleSpecifierGenerationHost for MockModuleSpecifierGenerationHost {
     }
     fn common_source_directory(&self) -> String {
         self.current_dir.clone()
+    }
+    // Go: specifiers_test.go:47 ContentMapperExtensions (tsgo#4712)
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        self.content_mapper_extensions.clone()
     }
     fn get_global_typings_cache_location(&self) -> String {
         String::new()
@@ -548,6 +558,7 @@ impl ModuleSpecifierGenerationHost for MockModuleSpecifierGenerationHost {
 fn mock_host(symlink_cache: KnownSymlinks) -> MockModuleSpecifierGenerationHost {
     MockModuleSpecifierGenerationHost {
         current_dir: "/project".to_string(),
+        content_mapper_extensions: Vec::new(),
         use_case_sensitive_file_names: true,
         symlink_cache: Some(Rc::new(symlink_cache)),
     }

@@ -69,6 +69,34 @@ pub fn new_vfs_parse_config_host(
     }
 }
 
+// Go: tsoptionstest/vfsparseconfighost.go:45 NewVFSParseConfigHostWithSymlinks (tsgo#4712)
+// NewVFSParseConfigHostWithSymlinks builds a parse-config host whose vfs also contains the given symlinks
+// (link path -> target path), so config parsing resolves packages through symlinks as it would on disk.
+pub fn new_vfs_parse_config_host_with_symlinks(
+    files: &BTreeMap<String, String>,
+    symlinks: &BTreeMap<String, String>,
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+) -> VfsParseConfigHost {
+    if symlinks.is_empty() {
+        return new_vfs_parse_config_host(files, current_directory, use_case_sensitive_file_names);
+    }
+    let mut entries: BTreeMap<String, MapFile> = files
+        .iter()
+        .map(|(name, content)| (name.clone(), MapFile::from(content.as_str())))
+        .collect();
+    for (link, target) in symlinks {
+        entries.insert(
+            get_normalized_absolute_path(link, current_directory),
+            vfstest::symlink(&get_normalized_absolute_path(target, current_directory)),
+        );
+    }
+    VfsParseConfigHost {
+        vfs: vfstest::from_map(entries, use_case_sensitive_file_names),
+        current_directory: current_directory.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tsoptionstest/parsedcommandline.go
 // ---------------------------------------------------------------------------
@@ -99,7 +127,6 @@ pub fn get_parsed_command_line(
         None,
         None,
         &config_file_name,
-        &[],
         &[],
         None,
     )

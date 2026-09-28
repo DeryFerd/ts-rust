@@ -20,12 +20,15 @@ impl FileIncludeKind {
     pub const ROOT_FILE: FileIncludeKind = FileIncludeKind(4);
     pub const LIB_FILE: FileIncludeKind = FileIncludeKind(5);
     pub const AUTOMATIC_TYPE_DIRECTIVE_FILE: FileIncludeKind = FileIncludeKind(6);
+    // tsgo#4712
+    pub const CONTENT_MAPPER_SUPPLEMENTAL: FileIncludeKind = FileIncludeKind(7);
 }
 
 /// Go `FileIncludeReason.data any`.
 // PORT: Go stores an `int`, a `*referencedFileData`, a
-// `*automaticTypeDirectiveFileData` or nil in an `any` field. `None` is the
-// Go nil (a default lib file reason has no index).
+// `*automaticTypeDirectiveFileData`, a `tspath.Path` (the canonical file of
+// a content mapper supplemental file, tsgo#4712) or nil in an `any` field.
+// `None` is the Go nil (a default lib file reason has no index).
 #[derive(Clone, Debug, Default)]
 pub enum FileIncludeData {
     #[default]
@@ -33,6 +36,7 @@ pub enum FileIncludeData {
     Index(i32),
     ReferencedFile(ReferencedFileData),
     AutomaticTypeDirectiveFile(AutomaticTypeDirectiveFileData),
+    Path(Path),
 }
 
 // Go: fileInclude.go:29 FileIncludeReason
@@ -364,6 +368,19 @@ impl FileIncludeReason {
                     new_compiler_diagnostic(diag::Default_library, args![])
                 }
             }
+            // tsgo#4712
+            FileIncludeKind::CONTENT_MAPPER_SUPPLEMENTAL => {
+                let FileIncludeData::Path(canonical_path) = &self.data else {
+                    panic!("interface conversion: FileIncludeReason data is not tspath.Path");
+                };
+                let canonical = program
+                    .get_source_file_by_path(canonical_path)
+                    .expect("nil pointer dereference: canonical source file");
+                new_compiler_diagnostic(
+                    diag::Supplemental_virtual_file_produced_by_the_content_mapper_for_file_0,
+                    args![to_file_name(canonical.file_name())],
+                )
+            }
             _ => panic!("unknown reason: {}", self.kind.0),
         }
     }
@@ -579,6 +596,8 @@ impl FileIncludeReason {
                     }
                 }
             }
+            // tsgo#4712
+            FileIncludeKind::CONTENT_MAPPER_SUPPLEMENTAL => return None,
             _ => panic!("unknown reason: {}", self.kind.0),
         }
         None

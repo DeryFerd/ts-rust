@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use ts_goport::contentmapper::OptionPathSegment;
 use ts_goport::execute::tsc::diagnostics::FormattingOptions;
 use ts_goport::frontend::json::{JsonError, MarshalerTo};
 use ts_goport::frontend::prelude::*;
@@ -33,6 +34,8 @@ struct TestConfig {
     config_file_name: &'static str,
     base_path: &'static str,
     all_file_list: BTreeMap<String, String>,
+    // tsgo#4712
+    existing_options: Option<CompilerOptions>,
 }
 
 // Go: tsconfigparsing_test.go:38 parseConfigFileTextToJsonTests (element type)
@@ -141,7 +144,6 @@ fn parse_project_json(json: &CompilerOptionsValue, host: &VfsParseConfigHost) ->
         None,
         "/project/tsconfig.json",
         /*resolutionStack*/ &[],
-        /*extraFileExtensions*/ &[],
         /*extendedConfigCache*/ None,
     )
 }
@@ -325,10 +327,9 @@ fn get_parsed_with_json_api(
         &parsed,
         host,
         base_path,
-        None,
+        config.existing_options.as_ref(),
         &config_file_name,
         /*resolutionStack*/ &[],
-        /*extraFileExtensions*/ &[],
         /*extendedConfigCache*/ None,
     )
 }
@@ -386,7 +387,6 @@ fn parse_json_source_file_config_file_content_reports_invalid_extended_config() 
         None,
         None,
         config_file_name,
-        &[],
         &[],
         None,
     );
@@ -450,7 +450,6 @@ fn parse_json_source_file_config_file_content_with_empty_extended_config() {
         None,
         None,
         config_file_name,
-        &[],
         &[],
         None,
     );
@@ -523,6 +522,7 @@ fn parse_null_enum_compiler_options() {
         config_file_name: "tsconfig.json",
         base_path: "/",
         all_file_list: file_map(&[("/app.ts", "")]),
+        existing_options: None,
     };
     // PORT: Go ranges over a map, so the subtest order is random.
     let get_parsed_functions: [(&str, GetParsed); 2] = [
@@ -543,6 +543,399 @@ fn parse_null_enum_compiler_options() {
             assert_eq!(parsed_config_file_content.errors.len(), 0);
             Ok(())
         });
+    }
+    t.finish();
+}
+
+// The two config APIs that the content mapper tests run, in the Go map
+// order the tests list them.
+// PORT: Go ranges over a map, so the subtest order is random.
+const CONFIG_APIS: [(&str, GetParsed); 2] = [
+    ("json api", get_parsed_with_json_api),
+    ("jsonSourceFile api", get_parsed_with_json_source_file_api),
+];
+
+/// Go `RunExternalCode: core.TSTrue` as the existing options.
+fn run_external_code_options() -> Option<CompilerOptions> {
+    Some(CompilerOptions {
+        run_external_code: Tristate::True,
+        ..Default::default()
+    })
+}
+
+// Go: tsconfigparsing_test.go:1144 TestContentMappers (tsgo#4712)
+#[test]
+fn content_mappers() {
+    let config = TestConfig {
+        json_text: "{\n\t\t\t\"contentMappers\": [\n\t\t\t\t{ \"package\": \"vue-mapper\", \"extensions\": [\".vue\"], \"options\": { \"strictTemplates\": true } }\n\t\t\t],\n\t\t\t\"include\": [\"src\"]\n\t\t}",
+        config_file_name: "tsconfig.json",
+        base_path: "/",
+        all_file_list: file_map(&[
+            ("/src/app.ts", "export {}"),
+            ("/src/Component.vue", "<template></template>"),
+            (
+                "/node_modules/vue-mapper/package.json",
+                r#"{ "name": "vue-mapper", "version": "1.2.3", "typescript": { "contentMapper": { "exec": ["node", "./mapper.js"], "dynamicConfig": true } } }"#,
+            ),
+        ]),
+        existing_options: run_external_code_options(),
+    };
+    let mut t = Subtests::new("TestContentMappers");
+    for (name, get_parsed) in CONFIG_APIS {
+        t.run(name, || {
+            let mut all_file_lists = config.all_file_list.clone();
+            all_file_lists.insert("/tsconfig.json".to_string(), config.json_text.to_string());
+            let host = new_vfs_parse_config_host(
+                &all_file_lists,
+                config.base_path,
+                true, /*useCaseSensitiveFileNames*/
+            );
+            let parsed = get_parsed(&config, &host, config.base_path);
+
+            assert_eq!(parsed.errors.len(), 0);
+
+            let mappers = parsed.content_mappers();
+            assert_eq!(mappers.len(), 1);
+            assert_eq!(mappers[0].definition.package, "vue-mapper");
+            assert_eq!(mappers[0].definition.extensions, vec![".vue".to_string()]);
+            assert_eq!(
+                String::from_utf8_lossy(&mappers[0].definition.options.0),
+                r#"{"strictTemplates":true}"#
+            );
+            assert_eq!(parsed.content_mapper_extensions(), vec![".vue".to_string()]);
+
+            // The package.json is resolved during parsing, populating name, version, and exec.
+            assert_eq!(mappers[0].manifest.name, "vue-mapper");
+            assert_eq!(mappers[0].manifest.version, "1.2.3");
+            assert_eq!(
+                mappers[0].manifest.exec,
+                vec!["node".to_string(), "./mapper.js".to_string()]
+            );
+            assert!(mappers[0].manifest.dynamic_config);
+            assert_eq!(mappers[0].package_directory, "/node_modules/vue-mapper");
+
+            // The .vue file is picked up by the include glob because its extension is registered.
+            assert!(
+                parsed
+                    .file_names()
+                    .contains(&"/src/Component.vue".to_string()),
+                "expected /src/Component.vue in {:?}",
+                parsed.file_names()
+            );
+            assert!(
+                parsed.file_names().contains(&"/src/app.ts".to_string()),
+                "expected /src/app.ts in {:?}",
+                parsed.file_names()
+            );
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:1199 TestContentMapperOptionDiagnosticLocation (tsgo#4712)
+#[test]
+fn content_mapper_option_diagnostic_location() {
+    let config = TestConfig {
+        json_text: "{\n\t\t\t\"contentMappers\": [{\n\t\t\t\t\"package\": \"mapper\",\n\t\t\t\t\"extensions\": [\".vue\"],\n\t\t\t\t\"options\": { \"plugins\": [{ \"name\": 1 }] }\n\t\t\t}]\n\t\t}",
+        config_file_name: "tsconfig.json",
+        base_path: "/",
+        all_file_list: file_map(&[
+            ("/index.ts", "export {};"),
+            (
+                "/node_modules/mapper/package.json",
+                r#"{ "name": "mapper", "version": "1.0.0", "typescript": { "contentMapper": { "exec": ["mapper"] } } }"#,
+            ),
+        ]),
+        existing_options: run_external_code_options(),
+    };
+    let host = new_vfs_parse_config_host(
+        &config.all_file_list,
+        config.base_path,
+        true, /*useCaseSensitiveFileNames*/
+    );
+    let parsed = get_parsed_with_json_source_file_api(&config, &host, config.base_path);
+    let (file, loc) = tsoptions::get_content_mapper_option_diagnostic_location(
+        Some(&parsed),
+        &parsed.content_mappers()[0],
+        &[
+            OptionPathSegment {
+                property: "plugins".to_string(),
+                ..Default::default()
+            },
+            OptionPathSegment {
+                index: 0,
+                is_index: true,
+                ..Default::default()
+            },
+            OptionPathSegment {
+                property: "name".to_string(),
+                ..Default::default()
+            },
+        ],
+    );
+    assert_eq!(
+        &source_file_text(file)[loc.pos() as usize..loc.end() as usize],
+        "1"
+    );
+}
+
+// Go: tsconfigparsing_test.go:1227 TestContentMappersAreInheritedFromExtendedConfig (tsgo#4712)
+#[test]
+fn content_mappers_are_inherited_from_extended_config() {
+    let config = TestConfig {
+        json_text: r#"{ "extends": "./base.json" }"#,
+        config_file_name: "tsconfig.json",
+        base_path: "/project",
+        all_file_list: file_map(&[
+            (
+                "/project/base.json",
+                r#"{ "contentMappers": [{ "package": "vue-mapper", "extensions": [".vue"] }], "include": ["src"] }"#,
+            ),
+            ("/project/src/index.ts", "export {};"),
+            ("/project/src/component.vue", "<template></template>"),
+            (
+                "/project/node_modules/vue-mapper/package.json",
+                r#"{ "name": "vue-mapper", "version": "1.2.3", "typescript": { "contentMapper": { "exec": ["node", "./mapper.js"] } } }"#,
+            ),
+        ]),
+        existing_options: run_external_code_options(),
+    };
+    let mut t = Subtests::new("TestContentMappersAreInheritedFromExtendedConfig");
+    for (name, get_parsed) in CONFIG_APIS {
+        t.run(name, || {
+            let host = new_vfs_parse_config_host(
+                &config.all_file_list,
+                config.base_path,
+                true, /*useCaseSensitiveFileNames*/
+            );
+            let parsed = get_parsed(&config, &host, config.base_path);
+            assert_eq!(parsed.errors.len(), 0);
+            assert_eq!(parsed.content_mappers().len(), 1);
+            assert_eq!(parsed.content_mappers()[0].definition.package, "vue-mapper");
+            assert_eq!(parsed.content_mapper_extensions(), vec![".vue".to_string()]);
+            assert!(
+                parsed
+                    .file_names()
+                    .contains(&"/project/src/component.vue".to_string())
+            );
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:1258 TestContentMappersRequireFlag (tsgo#4712)
+#[test]
+fn content_mappers_require_flag() {
+    let config = TestConfig {
+        json_text: r#"{ "contentMappers": [{ "package": "vue-mapper", "extensions": [".vue"] }] }"#,
+        config_file_name: "tsconfig.json",
+        base_path: "/",
+        all_file_list: file_map(&[("/app.ts", "export {}")]),
+        // existingOptions omitted: --runExternalCode is not set.
+        existing_options: None,
+    };
+    let expected_code =
+        diag::Content_mappers_require_the_runExternalCode_command_line_flag_to_be_enabled.code()
+            as i32;
+    let mut t = Subtests::new("TestContentMappersRequireFlag");
+    for (name, get_parsed) in CONFIG_APIS {
+        t.run(name, || {
+            let mut all_file_lists = file_map(&[("/tsconfig.json", config.json_text)]);
+            all_file_lists.extend(config.all_file_list.clone());
+            let host = new_vfs_parse_config_host(
+                &all_file_lists,
+                config.base_path,
+                true, /*useCaseSensitiveFileNames*/
+            );
+            let parsed = get_parsed(&config, &host, config.base_path);
+            let found = parsed.errors.iter().any(|d| d.code == expected_code);
+            assert!(
+                found,
+                "expected diagnostic {expected_code}, got errors: {:?}",
+                parsed.errors
+            );
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:1287 TestUnresolvedContentMapperDoesNotRegisterExtensions (tsgo#4712)
+#[test]
+fn unresolved_content_mapper_does_not_register_extensions() {
+    let config = TestConfig {
+        json_text: r#"{ "contentMappers": [{ "package": "missing-mapper", "extensions": [".vue"] }], "include": ["src"] }"#,
+        config_file_name: "tsconfig.json",
+        base_path: "/",
+        all_file_list: file_map(&[
+            ("/src/app.ts", "export {}"),
+            ("/src/Component.vue", "<template />"),
+        ]),
+        existing_options: run_external_code_options(),
+    };
+    let mut t = Subtests::new("TestUnresolvedContentMapperDoesNotRegisterExtensions");
+    for (name, get_parsed) in CONFIG_APIS {
+        t.run(name, || {
+            let host = new_vfs_parse_config_host(&config.all_file_list, config.base_path, true);
+            let parsed = get_parsed(&config, &host, config.base_path);
+
+            assert_eq!(parsed.content_mappers().len(), 0);
+            assert_eq!(parsed.content_mapper_extensions().len(), 0);
+            assert!(
+                !parsed
+                    .file_names()
+                    .contains(&"/src/Component.vue".to_string())
+            );
+            assert!(parsed.file_names().contains(&"/src/app.ts".to_string()));
+            Ok(())
+        });
+    }
+    t.finish();
+}
+
+// Go: tsconfigparsing_test.go:1314 TestContentMappersValidation (tsgo#4712)
+#[test]
+fn content_mappers_validation() {
+    struct ValidationTest {
+        name: &'static str,
+        content_mappers: &'static str,
+        expected_code: i32,
+    }
+    let requires_type = diag::Compiler_option_0_requires_a_value_of_type_1.code() as i32;
+    let tests = [
+        ValidationTest {
+            name: "extension without leading dot",
+            content_mappers: r#"[{ "package": "vue-mapper", "extensions": ["vue"] }]"#,
+            expected_code: diag::Content_mapper_file_extension_0_must_begin_with_a.code() as i32,
+        },
+        ValidationTest {
+            name: "built-in extension",
+            content_mappers: r#"[{ "package": "x", "extensions": [".ts"] }]"#,
+            expected_code: diag::Content_mapper_file_extension_0_is_a_built_in_extension_and_cannot_be_registered_by_a_content_mapper.code() as i32,
+        },
+        ValidationTest {
+            name: "missing extensions",
+            content_mappers: r#"[{ "package": "x" }]"#,
+            expected_code: requires_type,
+        },
+        ValidationTest {
+            name: "duplicate extension across mappers",
+            content_mappers: r#"[{ "package": "a", "extensions": [".vue"] }, { "package": "b", "extensions": [".vue"] }]"#,
+            expected_code: diag::Content_mapper_file_extension_0_is_registered_by_more_than_one_content_mapper.code() as i32,
+        },
+        ValidationTest {
+            name: "extensions is not an array",
+            content_mappers: r#"[{ "package": "x", "extensions": ".vue" }]"#,
+            expected_code: requires_type,
+        },
+        ValidationTest {
+            name: "extensions contains a non-string",
+            content_mappers: r#"[{ "package": "x", "extensions": [".vue", 1] }]"#,
+            expected_code: requires_type,
+        },
+        ValidationTest {
+            name: "package is not a string",
+            content_mappers: r#"[{ "package": ["x"], "extensions": [".vue"] }]"#,
+            expected_code: requires_type,
+        },
+        ValidationTest {
+            name: "missing package",
+            content_mappers: r#"[{ "extensions": [".vue"] }]"#,
+            expected_code: requires_type,
+        },
+        ValidationTest {
+            name: "options is not an object",
+            content_mappers: r#"[{ "package": "x", "extensions": [".vue"], "options": ["strict"] }]"#,
+            expected_code: requires_type,
+        },
+    ];
+
+    let mut t = Subtests::new("TestContentMappersValidation");
+    for test in &tests {
+        // PORT: the parser keeps `&'static str` text, so the config text is leaked.
+        let json_text: &'static str = Box::leak(
+            format!(r#"{{ "contentMappers": {} }}"#, test.content_mappers).into_boxed_str(),
+        );
+        let mut config = TestConfig {
+            json_text,
+            config_file_name: "tsconfig.json",
+            base_path: "/",
+            all_file_list: file_map(&[("/app.ts", "export {}")]),
+            existing_options: run_external_code_options(),
+        };
+        if test.name == "duplicate extension across mappers" {
+            config.all_file_list.insert(
+                "/node_modules/a/package.json".to_string(),
+                r#"{ "name": "a", "version": "1.0.0", "typescript": { "contentMapper": { "exec": ["a"] } } }"#.to_string(),
+            );
+            config.all_file_list.insert(
+                "/node_modules/b/package.json".to_string(),
+                r#"{ "name": "b", "version": "1.0.0", "typescript": { "contentMapper": { "exec": ["b"] } } }"#.to_string(),
+            );
+        }
+        for (api_name, get_parsed) in CONFIG_APIS {
+            t.run(&format!("{}/{api_name}", test.name), || {
+                let mut all_file_lists = file_map(&[("/tsconfig.json", config.json_text)]);
+                all_file_lists.extend(config.all_file_list.clone());
+                let host = new_vfs_parse_config_host(
+                    &all_file_lists,
+                    config.base_path,
+                    true, /*useCaseSensitiveFileNames*/
+                );
+                let parsed = get_parsed(&config, &host, config.base_path);
+                let diagnostic = parsed
+                    .errors
+                    .iter()
+                    .find(|d| d.code == test.expected_code)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected diagnostic {}, got errors: {:?}",
+                            test.expected_code, parsed.errors
+                        )
+                    });
+                match test.name {
+                    "built-in extension" => {
+                        assert_eq!(parsed.content_mappers().len(), 0);
+                        assert_eq!(parsed.content_mapper_extensions().len(), 0);
+                    }
+                    "duplicate extension across mappers" => {
+                        assert_eq!(parsed.content_mappers().len(), 2);
+                        assert_eq!(
+                            parsed.content_mappers()[0].definition.extensions,
+                            vec![".vue".to_string()]
+                        );
+                        assert_eq!(parsed.content_mappers()[1].definition.extensions.len(), 0);
+                        assert_eq!(parsed.content_mapper_extensions(), vec![".vue".to_string()]);
+                    }
+                    "missing extensions"
+                    | "extensions is not an array"
+                    | "extensions contains a non-string"
+                    | "package is not a string"
+                    | "missing package"
+                    | "options is not an object" => {
+                        assert_eq!(parsed.content_mappers().len(), 0);
+                    }
+                    _ => {}
+                }
+
+                // With the jsonSourceFile API the diagnostic is located at the offending tsconfig syntax.
+                if api_name == "jsonSourceFile api" {
+                    assert!(
+                        diagnostic.file.is_some(),
+                        "expected diagnostic {} to have a source file",
+                        test.expected_code
+                    );
+                    assert!(
+                        diagnostic.end - diagnostic.pos > 0,
+                        "expected diagnostic {} to have a non-empty location",
+                        test.expected_code
+                    );
+                }
+                Ok(())
+            });
+        }
     }
     t.finish();
 }
@@ -573,11 +966,10 @@ fn get_parsed_with_json_source_file_api(
         ts_config_source_file,
         host,
         &host.get_current_directory(),
-        None,
+        config.existing_options.as_ref(),
         None,
         &config_file_name,
         /*resolutionStack*/ &[],
-        /*extraFileExtensions*/ &[],
         /*extendedConfigCache*/ None,
     )
 }
@@ -716,6 +1108,7 @@ fn parse_type_acquisition() {
             config_file_name: test.config_name,
             base_path: "/apath",
             all_file_list: file_map(&[("/apath/a.ts", ""), ("/apath/b.ts", "")]),
+            existing_options: None,
         }];
         t.run(&with_json_api_name, || {
             baseline_parse_config_with(
@@ -807,7 +1200,6 @@ fn parse_src_compiler() {
         None,
         &tsconfig_file_name,
         /*resolutionStack*/ &[],
-        /*extraFileExtensions*/ &[],
         /*extendedConfigCache*/ None,
     );
 
@@ -1082,7 +1474,6 @@ fn parse_config_with_cache(
         None,
         config_file_name,
         &[],
-        &[],
         Some(cache),
     )
 }
@@ -1239,6 +1630,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/apath/.b.ts", ""),
                     ("/apath/..c.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1256,6 +1648,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/apath/.b.ts", ""),
                     ("/apath/..c.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1272,6 +1665,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/d.ts", ""),
                     ("/folder/e.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1284,6 +1678,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1297,6 +1692,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1308,6 +1704,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.js", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1320,6 +1717,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "tests/cases/unittests",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1332,6 +1730,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/main.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1365,6 +1764,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/apath/node_modules/module.ts", ""),
                     ("/apath/dist/output.js", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1379,6 +1779,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1392,6 +1793,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1407,6 +1809,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     config_file_name: "tsconfig.json",
                     base_path: "/",
                     all_file_list: file_map(&[("/bin/a.ts", ""), ("/b.ts", "")]),
+                    existing_options: None,
                 },
                 TestConfig {
                     json_text: r#"{
@@ -1418,6 +1821,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     config_file_name: "tsconfig.json",
                     base_path: "/",
                     all_file_list: file_map(&[("/bin/a.ts", ""), ("/b.ts", "")]),
+                    existing_options: None,
                 },
             ],
         },
@@ -1434,6 +1838,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     config_file_name: "tsconfig.json",
                     base_path: "/",
                     all_file_list: file_map(&[("/declarations/a.d.ts", ""), ("/a.ts", "")]),
+                    existing_options: None,
                 },
                 TestConfig {
                     json_text: r#"{
@@ -1445,6 +1850,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     config_file_name: "tsconfig.json",
                     base_path: "/",
                     all_file_list: file_map(&[("/declarations/a.d.ts", ""), ("/a.ts", "")]),
+                    existing_options: None,
                 },
             ],
         },
@@ -1460,6 +1866,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1475,6 +1882,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1491,6 +1899,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1510,6 +1919,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "/apath/tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/a.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1530,6 +1940,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                         ("/bin/a.ts", ""),
                         ("/b.ts", ""),
                     ]),
+                    existing_options: None,
                 },
                 TestConfig {
                     json_text: r#"{
@@ -1542,6 +1953,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                         ("/bin/a.ts", ""),
                         ("/b.ts", ""),
                     ]),
+                    existing_options: None,
                 },
             ],
         },
@@ -1560,6 +1972,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/apath",
                 all_file_list: file_map(&[("/apath/test.ts", ""), ("/apath/foge.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1584,6 +1997,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/node_modules/module.ts", ""),
                     ("/dist/output.js", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1602,6 +2016,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                     ("/node_modules/module.ts", ""),
                     ("/dist/output.js", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1616,6 +2031,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/",
                 all_file_list: file_map(&[("/app.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1630,6 +2046,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/",
                 all_file_list: file_map(&[("/app.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1646,6 +2063,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/",
                 all_file_list: file_map(&[("/app.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1669,6 +2087,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/",
                 all_file_list: file_map(&[("/app.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1683,6 +2102,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
                 config_file_name: "tsconfig.json",
                 base_path: "/",
                 all_file_list: file_map(&[("/app.ts", "")]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1762,6 +2182,7 @@ export {}",
                     ("/src/main.ts", "export {}"),
                     ("/src/utils.ts", "export {}"),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1791,6 +2212,7 @@ export {}",
                     ),
                     ("/app.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1820,6 +2242,7 @@ export {}",
                     ),
                     ("/app.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1854,6 +2277,7 @@ export {}",
                     ),
                     ("/app.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1893,6 +2317,7 @@ export {}",
                     ),
                     ("/app.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
         ParseJsonConfigTestCase {
@@ -1932,6 +2357,7 @@ export {}",
                     ),
                     ("/app.ts", ""),
                 ]),
+                existing_options: None,
             }],
         },
     ]

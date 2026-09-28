@@ -894,6 +894,16 @@ pub fn source_file_may_be_emitted(
         return false;
     }
 
+    // Runtime output for content-mapped files is owned by the external content mapper or build tool. Only
+    // include them in the emit set when their transformed TypeScript can produce declarations.
+    // tsgo#4712
+    if !source_file.content_mapper().is_empty()
+        && !force_dts_emit
+        && !options.get_emit_declarations()
+    {
+        return false;
+    }
+
     // Source file from node_modules are not emitted
     if host.is_source_file_from_external_library(source_file) {
         return false;
@@ -992,6 +1002,10 @@ impl OutputPathsHost for NewProgram {
     }
     fn use_case_sensitive_file_names(&self) -> bool {
         NewProgram::use_case_sensitive_file_names(self)
+    }
+    // tsgo#4712
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        NewProgram::content_mapper_extensions(self)
     }
 }
 

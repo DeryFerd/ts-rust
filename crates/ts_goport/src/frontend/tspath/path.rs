@@ -1054,6 +1054,29 @@ pub fn get_any_extension_from_path(path: &str, extensions: &[&str], ignore_case:
     String::new()
 }
 
+// Go: tspath/path.go:917 GetLongestExtensionFromPath (tsgo#4712)
+/// The longest of `extensions` that ends `path`, as it is written in
+/// `path`, or "" when none does.
+pub fn get_longest_extension_from_path<S: AsRef<str>>(
+    path: &str,
+    extensions: &[S],
+    ignore_case: bool,
+) -> String {
+    let path = remove_trailing_directory_separator(path);
+    let comparer = get_string_equality_comparer(ignore_case);
+    let mut longest = String::new();
+    for extension in extensions {
+        let extension = extension.as_ref();
+        if extension.len() > longest.len() {
+            let matched = try_get_extension_from_path_worker(path, extension, comparer);
+            if !matched.is_empty() {
+                longest = matched;
+            }
+        }
+    }
+    longest
+}
+
 // Go: tspath/path.go:881 getAnyExtensionFromPathWorker
 fn get_any_extension_from_path_worker(
     path: &str,

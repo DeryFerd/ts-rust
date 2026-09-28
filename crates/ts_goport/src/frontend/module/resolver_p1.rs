@@ -45,6 +45,8 @@ pub struct Resolved {
     pub package_id: PackageId,
     pub original_path: String,
     pub resolved_using_ts_extension: bool,
+    // tsgo#4712
+    pub resolved_using_extra_extensions: bool,
 }
 
 // Go: module/resolver.go:28 resolved.shouldContinueSearching
@@ -241,6 +243,8 @@ pub struct Resolver {
     pub compiler_options: Rc<CompilerOptions>,
     pub typings_location: String,
     pub project_name: String,
+    // tsgo#4712: the content mapper extensions.
+    pub extra_extensions: Vec<String>,
     // reportDiagnostic: DiagnosticReporter
 }
 
@@ -257,6 +261,7 @@ pub fn new_resolver(
     options: Rc<CompilerOptions>,
     typings_location: &str,
     project_name: &str,
+    extra_extensions: Vec<String>,
 ) -> Resolver {
     let caches = new_caches(
         host.get_current_directory(),
@@ -269,6 +274,7 @@ pub fn new_resolver(
         compiler_options: options,
         typings_location: typings_location.to_string(),
         project_name: project_name.to_string(),
+        extra_extensions,
     }
 }
 
@@ -296,6 +302,7 @@ pub fn new_resolver_with_options(
         compiler_options,
         typings_location: typings_location.to_string(),
         project_name: project_name.to_string(),
+        extra_extensions: Vec::new(),
     }
 }
 
@@ -1358,6 +1365,7 @@ impl ResolutionState<'_> {
                                 package_id: result.package_id,
                                 original_path: result.original_path,
                                 resolved_using_ts_extension: result.resolved_using_ts_extension,
+                                ..Default::default()
                             });
                         }
                         return continue_searching();
