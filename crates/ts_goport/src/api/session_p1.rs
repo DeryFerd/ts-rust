@@ -3,8 +3,9 @@ use crate::api::prelude::*;
 // Port of Go `internal/api/session.go`, lines 1-1271: the snapshot
 // registries, `Session`, `NewSession`, the checker and language service
 // setup, the `HandleRequest` dispatch and the snapshot, project, symbol and
-// type handlers up to `handleGetTargetOfSignature`. Lines 1272-2484 are
-// `session_p2.rs`.
+// type handlers up to `handleGetTargetOfSignature`, then
+// `handleGetImportAdderEdits` and `toAPITextEdits` (tsgo#3881). Lines
+// 1272-2484 are `session_p2.rs`.
 //
 // PORT notes for both files:
 // - Go `*ast.Symbol`, `*checker.Type` and `*checker.Signature` carry their
@@ -45,6 +46,7 @@ use crate::frontend::vfs;
 use crate::frontend::vfs::Fs as _;
 use crate::gostd::{self, Context, GoError, errors};
 use crate::ls;
+use crate::ls::autoimport;
 use crate::program::ls_program;
 use crate::project;
 use std::cell::Cell;
@@ -847,6 +849,37 @@ impl Session {
         Ok(sd)
     }
 
+    // Go: api/session.go:463 retainSnapshotData (tsgo#4642)
+    // retainSnapshotData pins snapshot data while an operation builds a derived snapshot.
+    pub fn retain_snapshot_data(&self, handle: SnapshotID) -> Result<Rc<SnapshotData>, GoError> {
+        let sd = self.snapshots.borrow().get(&handle).cloned();
+        let Some(sd) = sd else {
+            return Err(errors::errorf(
+                format!("{}: snapshot {} not found", *ERR_CLIENT_ERROR, handle.0),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        sd.ref_count.set(sd.ref_count.get() + 1);
+        Ok(sd)
+    }
+
+    // Go: api/session.go:474 releaseSnapshot (tsgo#4642)
+    pub fn release_snapshot(&self, handle: SnapshotID) -> Result<(), GoError> {
+        let sd = self.snapshots.borrow().get(&handle).cloned();
+        let Some(sd) = sd else {
+            return Err(errors::errorf(
+                format!("{}: snapshot {} not found", *ERR_CLIENT_ERROR, handle.0),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        sd.ref_count.set(sd.ref_count.get() - 1);
+        if sd.ref_count.get() <= 0 {
+            self.snapshots.borrow_mut().remove(&handle);
+            project::Snapshot::deref(&sd.snapshot, &self.project_session);
+        }
+        Ok(())
+    }
+
     // Go: api/session.go:342 setupChecker
     // setupChecker resolves snapshot, program, and type checker for a project.
     // Callers must defer setup.done() to release the checker.
@@ -957,6 +990,9 @@ impl Handler for Session {
             m if m == Method::INITIALIZE.0 => self.handle_initialize(ctx).map(to_any),
             m if m == Method::UPDATE_SNAPSHOT.0 => self
                 .handle_update_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::UPDATE_TEMPORARY_SNAPSHOT.0 => self
+                .handle_update_temporary_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::PARSE_COMMAND_LINE.0 => self
                 .handle_parse_command_line(ctx, assert_params(&parsed))
@@ -1206,6 +1242,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_TYPE_ARGUMENTS.0 => self
                 .handle_get_type_arguments(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_IMPORT_ADDER_EDITS.0 => self
+                .handle_get_import_adder_edits(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_CONSTANT_VALUE.0 => {
                 self.handle_get_constant_value(ctx, assert_params(&parsed))
@@ -1598,6 +1637,81 @@ impl Session {
         })
     }
 
+    // Go: api/session.go:1076 handleUpdateTemporarySnapshot (tsgo#4642)
+    // handleUpdateTemporarySnapshot creates a temporary snapshot that overrides the
+    // content of a single file, without opening/closing any projects or files and
+    // without advancing the session's latest snapshot.
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
+    // body runs in a closure, and the release runs after it on every path.
+    pub fn handle_update_temporary_snapshot(
+        &self,
+        ctx: &Context,
+        params: &UpdateTemporarySnapshotParams,
+    ) -> Result<UpdateSnapshotResponse, GoError> {
+        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        let result = (|| {
+            let uri = params
+                .file
+                .to_uri(&self.project_session.get_current_directory());
+
+            let snapshot = match self.project_session.api_update_temporary(
+                ctx,
+                &base_sd.snapshot,
+                &uri,
+                params.new_text.clone(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return Err(errors::errorf(
+                        format!(
+                            "{}: failed to update temporary snapshot: {}",
+                            *ERR_CLIENT_ERROR, err
+                        ),
+                        vec![ERR_CLIENT_ERROR.clone(), err],
+                    ));
+                }
+            };
+
+            let handle = snapshot_handle(&snapshot);
+            let existing = self.snapshots.borrow().get(&handle).cloned();
+            if let Some(sd) = existing {
+                project::Snapshot::deref(&snapshot, &self.project_session);
+                sd.ref_count.set(sd.ref_count.get() + 1);
+            } else {
+                let sd = Rc::new(SnapshotData {
+                    snapshot: snapshot.clone(),
+                    ref_count: Cell::new(1),
+                    symbol_registry: RefCell::new(FxHashMap::default()),
+                    symbol_canonical_projects: RefCell::new(FxHashMap::default()),
+                    project_registries: RefCell::new(FxHashMap::default()),
+                });
+                self.snapshots.borrow_mut().insert(handle, sd);
+            }
+
+            // Build projects list
+            let projects = snapshot.project_collection.projects();
+            let mut project_responses = Vec::with_capacity(projects.len());
+            for proj in &projects {
+                if proj.borrow().command_line.is_none() {
+                    continue;
+                }
+                project_responses.push(new_project_response(&proj.borrow()));
+            }
+
+            // Compute changes from the requested base snapshot so the client can retain
+            // cached source files for unchanged files.
+            let changes = compute_snapshot_changes(&base_sd.snapshot, &snapshot);
+
+            Ok(UpdateSnapshotResponse {
+                snapshot: handle,
+                projects: project_responses,
+                changes: Some(changes),
+            })
+        })();
+        let _ = self.release_snapshot(params.snapshot);
+        result
+    }
+
     // Go: api/session.go:699 handleRelease
     // handleRelease decrements the ref count for a snapshot.
     // The snapshot and its registries are only cleaned up when the ref count reaches zero.
@@ -1613,22 +1727,7 @@ impl Session {
             ));
         };
 
-        let sd = self.snapshots.borrow().get(&params.snapshot).cloned();
-        let Some(sd) = sd else {
-            return Err(errors::errorf(
-                format!(
-                    "{}: snapshot {} not found",
-                    *ERR_CLIENT_ERROR, params.snapshot.0
-                ),
-                vec![ERR_CLIENT_ERROR.clone()],
-            ));
-        };
-        sd.ref_count.set(sd.ref_count.get() - 1);
-        if sd.ref_count.get() <= 0 {
-            self.snapshots.borrow_mut().remove(&params.snapshot);
-            // Release the API session's ref on the project snapshot.
-            project::Snapshot::deref(&sd.snapshot, &self.project_session);
-        }
+        self.release_snapshot(params.snapshot)?;
         Ok(to_any(true))
     }
 
@@ -2756,4 +2855,192 @@ impl Session {
             c.sig(sig).target()
         })
     }
+
+    // Go: api/session.go:1953 handleGetImportAdderEdits (tsgo#3881)
+    // PORT: Go `defer preparedSnapshot.Deref(s.projectSession)` is the
+    // `Release` guard `_deref_prepared`. It is declared before the checker
+    // lease, so the lease (`defer done()`) ends first, as in Go. Go passes
+    // `ch` to `NewImportAdder`; the port's adder takes the checker in
+    // `AddImportFromExportedSymbol` (import_adder.rs header). A symbol handle
+    // indexes the arena of the checker that made it, so `checker_symbol` maps
+    // it into `ch` (file header).
+    pub fn handle_get_import_adder_edits(
+        &self,
+        ctx: &Context,
+        params: &GetImportAdderEditsParams,
+    ) -> Result<Vec<TextEdit>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let project_path = parse_project_handle(&params.project);
+        let mut working_snapshot = sd.snapshot.clone();
+        let mut program = sd.get_program(&params.project)?;
+        let mut source_file = program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    params.file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let mut user_preferences = working_snapshot.user_preferences();
+        let mut _deref_prepared = ls_program::Release::noop();
+        let registry = working_snapshot.auto_import_registry();
+        if registry.is_none()
+            || !autoimport::Registry::is_prepared_for_importing_file(
+                registry.as_deref(),
+                source_file_file_name(source_file),
+                &project_path,
+                &user_preferences,
+            )
+        {
+            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+                ctx,
+                &working_snapshot,
+                &params
+                    .file
+                    .to_uri(&self.project_session.get_current_directory()),
+            );
+            _deref_prepared = {
+                let (snapshot, session) = (prepared_snapshot.clone(), self.project_session.clone());
+                ls_program::Release::new(move || project::Snapshot::deref(&snapshot, &session))
+            };
+
+            working_snapshot = prepared_snapshot;
+            let proj = working_snapshot
+                .project_collection
+                .get_project_by_path(&project_path);
+            let Some(proj) = proj else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: project {} not found",
+                        *ERR_CLIENT_ERROR,
+                        project_path.as_str()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let proj_program = proj.borrow().get_program();
+            let Some(proj_program) = proj_program else {
+                return Err(errors::errorf(
+                    format!("{}: project has no program", *ERR_CLIENT_ERROR),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            program = proj_program;
+            source_file = program
+                .get_source_file(&params.file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        params.file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            user_preferences = working_snapshot.user_preferences();
+        }
+
+        let registry = working_snapshot.auto_import_registry();
+        let Some(registry) = registry else {
+            return Ok(Vec::new());
+        };
+
+        let (ch, _done) = ls_program::get_type_checker(program, ctx);
+
+        let view = autoimport::new_view(
+            registry,
+            source_file,
+            project_path,
+            program,
+            user_preferences.module_specifier_preferences(),
+        );
+        let mut import_adder = autoimport::new_import_adder(
+            ctx,
+            program,
+            source_file,
+            Rc::new(view),
+            working_snapshot
+                .get_preferences(source_file_file_name(source_file))
+                .format_code_settings,
+            working_snapshot.converters(),
+            user_preferences,
+        );
+
+        for (i, action) in params.actions.iter().enumerate() {
+            match action.kind.0.as_str() {
+                IMPORT_ADDER_ACTION_KIND_IMPORT_SYMBOL => {
+                    if action.symbol.0 == 0 {
+                        return Err(errors::errorf(
+                            format!(
+                                "{}: import adder action {} missing symbol",
+                                *ERR_CLIENT_ERROR, i
+                            ),
+                            vec![ERR_CLIENT_ERROR.clone()],
+                        ));
+                    }
+                    let (owner, symbol) = sd.resolve_symbol_handle(action.symbol)?;
+                    let symbol = checker_symbol(&ch, &owner, symbol);
+                    let mut is_valid_type_only_use_site = true;
+                    if let Some(value) = action.is_valid_type_only_use_site {
+                        is_valid_type_only_use_site = value;
+                    }
+                    import_adder.add_import_from_exported_symbol(
+                        &mut ch.borrow_mut(),
+                        symbol,
+                        is_valid_type_only_use_site,
+                    );
+                }
+                _ => {
+                    return Err(errors::errorf(
+                        format!(
+                            "{}: unknown import adder action kind {}",
+                            *ERR_CLIENT_ERROR,
+                            gostd::strconv::quote(&action.kind.0)
+                        ),
+                        vec![ERR_CLIENT_ERROR.clone()],
+                    ));
+                }
+            }
+        }
+
+        if !import_adder.has_fixes() {
+            return Ok(Vec::new());
+        }
+        Ok(to_api_text_edits(
+            source_file,
+            &working_snapshot.converters(),
+            &import_adder.edits(),
+        ))
+    }
+}
+
+// Go: api/session.go:2044 toAPITextEdits (tsgo#3881)
+// PORT: this is the tsgo#3881 form (converters and the position map).
+// tsgo#4712 (wave 3) reads the original text of the file instead.
+pub fn to_api_text_edits(
+    source_file: Node,
+    converters: &lsconv::Converters,
+    edits: &[lsproto::TextEdit],
+) -> Vec<TextEdit> {
+    let position_map = source_file_get_position_map(source_file);
+    let mut result = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let start = converters.line_and_character_to_position(&source_file, &edit.range.start);
+        let end = converters.line_and_character_to_position(&source_file, &edit.range.end);
+        result.push(TextEdit {
+            pos: position_map.utf8_to_utf16(start),
+            end: position_map.utf8_to_utf16(end),
+            new_text: edit.new_text.clone(),
+        });
+    }
+    result
 }

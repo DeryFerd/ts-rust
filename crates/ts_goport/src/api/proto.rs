@@ -237,6 +237,8 @@ impl Method {
 
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
+    // tsgo#4642
+    pub const UPDATE_TEMPORARY_SNAPSHOT: Method = Method(Cow::Borrowed("updateTemporarySnapshot"));
     pub const PARSE_COMMAND_LINE: Method = Method(Cow::Borrowed("parseCommandLine"));
     pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
     pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
@@ -346,6 +348,8 @@ impl Method {
     pub const GET_BASE_CONSTRAINT_OF_TYPE: Method =
         Method(Cow::Borrowed("getBaseConstraintOfType"));
     pub const GET_TYPE_ARGUMENTS: Method = Method(Cow::Borrowed("getTypeArguments"));
+    // tsgo#3881
+    pub const GET_IMPORT_ADDER_EDITS: Method = Method(Cow::Borrowed("getImportAdderEdits"));
     pub const GET_TRUE_TYPE_OF_CONDITIONAL_TYPE: Method =
         Method(Cow::Borrowed("getTrueTypeOfConditionalType"));
     pub const GET_FALSE_TYPE_OF_CONDITIONAL_TYPE: Method =
@@ -636,6 +640,25 @@ proto_json!(both UpdateSnapshotParams {
     close_files: "closeFiles" omitempty,
 });
 
+// UpdateTemporarySnapshotParams are the parameters for creating a temporary
+// snapshot that overrides a single file's content.
+// Go: proto.go:360 UpdateTemporarySnapshotParams (tsgo#4642)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateTemporarySnapshotParams {
+    // Snapshot is the current client snapshot on which to layer the temporary update.
+    pub snapshot: SnapshotID,
+    // File identifies the file whose content is temporarily overridden.
+    pub file: DocumentIdentifier,
+    // NewText is the temporary content for the file.
+    pub new_text: String,
+}
+
+proto_json!(both UpdateTemporarySnapshotParams {
+    snapshot: "snapshot" plain,
+    file: "file" plain,
+    new_text: "newText" plain,
+});
+
 // ProjectFileChanges describes what source files changed within a single project.
 // Go: proto.go:278 ProjectFileChanges
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -742,6 +765,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::UPDATE_SNAPSHOT,
         unmarshaller_for::<UpdateSnapshotParams>,
+    );
+    m.insert(
+        Method::UPDATE_TEMPORARY_SNAPSHOT,
+        unmarshaller_for::<UpdateTemporarySnapshotParams>,
     );
     m.insert(
         Method::PARSE_COMMAND_LINE,
@@ -1067,6 +1094,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_TYPE_ARGUMENTS,
         unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
+        Method::GET_IMPORT_ADDER_EDITS,
+        unmarshaller_for::<GetImportAdderEditsParams>,
     );
     m.insert(
         Method::GET_CONSTANT_VALUE,
@@ -2483,6 +2514,60 @@ proto_json!(both GetTypesAtPositionsParams {
     project: "project" plain,
     file: "file" plain,
     positions: "positions" plain,
+});
+
+// Go: proto.go:1234 ImportAdderActionKind (tsgo#3881)
+// PORT: a Go string type, a newtype as the handles are (see `handle_json!`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImportAdderActionKind(pub String);
+
+handle_json!(string: ImportAdderActionKind);
+
+// Go: proto.go:1237 ImportAdderActionKindImportSymbol (tsgo#3881)
+pub const IMPORT_ADDER_ACTION_KIND_IMPORT_SYMBOL: &str = "importSymbol";
+
+// Go: proto.go:1240 ImportAdderAction (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImportAdderAction {
+    pub kind: ImportAdderActionKind,
+    pub symbol: SymbolID,
+    pub is_valid_type_only_use_site: Option<bool>,
+}
+
+proto_json!(both ImportAdderAction {
+    kind: "kind" plain,
+    symbol: "symbol" omitempty,
+    is_valid_type_only_use_site: "isValidTypeOnlyUseSite" omitempty,
+});
+
+// Go: proto.go:1246 GetImportAdderEditsParams (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetImportAdderEditsParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub actions: Vec<ImportAdderAction>,
+}
+
+proto_json!(both GetImportAdderEditsParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    actions: "actions" plain,
+});
+
+// Go: proto.go:1253 TextEdit (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextEdit {
+    pub pos: i32,
+    pub end: i32,
+    pub new_text: String,
+}
+
+proto_json!(marshal TextEdit {
+    pos: "pos" plain,
+    end: "end" plain,
+    new_text: "newText" plain,
 });
 
 // TypeToTypeNodeParams are the parameters for the typeToTypeNode method.

@@ -12,7 +12,6 @@ use crate::api::transport::{Transport, new_pipe_transport, new_stdio_transport};
 use crate::frontend::bundled;
 use crate::frontend::vfs::{self, Fs};
 use crate::gostd::{Context, GoError, errors};
-use crate::locale;
 use crate::lsp::lsproto;
 use crate::project;
 use std::io::{Read, Write};
@@ -129,7 +128,6 @@ impl StdioServer {
                 telemetry_enabled: false,
                 push_diagnostics_enabled: false,
                 debounce_delay: Duration::ZERO,
-                locale: locale::Locale::default(),
                 checker_pool_options: project::CheckerPoolOptions::default(),
             }),
             client: None,
