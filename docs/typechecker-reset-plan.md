@@ -166,7 +166,7 @@ First prove the smallest complete operation. Do not approve a checker-wide rewri
 2. Execute focused positive, negative, recursive and repeated-call cases. Compare the semantic cases with pinned Go.
 3. Run unchanged ordinary Query on the same source. Keep configs, roots, libraries and inputs fixed.
 4. Run the goport tests (`scripts/goport/goport-tests.sh`) before another semantic batch that changes shared planning, caches, mapped state or request transport.
-5. Before accepting a batch, run the whole goport protected set and compare it with the last accepted revision, per test name (`compare-tests.py`) and per gate item (`gate-compare.py`). Run formatting and lint checks required by the repository.
+5. Before accepting a batch, run the whole goport protected set and compare it with the last accepted revision, per test name (`compare-tests.py`), per gate item (`gate-compare.py`), per API oracle request and per np-suite test. Every run of the source counts. Run formatting and lint checks required by the repository.
 6. Commit an accepted batch before starting the next operation. Keep one integration owner and one integration branch.
 
 Reuse existing logs and result parsers. Each batch needs one record: source identity, commands, normal completion, exact comparison and review result. One owner performs each mechanical check. Retain actual tool permissions, read restrictions and resource limits. Remove duplicate internal permission handoffs.
