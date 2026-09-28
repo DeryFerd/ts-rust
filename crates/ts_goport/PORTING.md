@@ -232,11 +232,12 @@ The batch that adds it is not accepted until Theo approves.
   from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
-- `program::release_program` frees the checker pool and the frontend of a
-  version. Each checker worker frees its checker and the synthetic nodes
-  it made (`free_synthetic_nodes`). The program shell and the file
-  versions stay leaked for now. A one-program process forgets its
-  checkers and their synthetic nodes at the end, like Go.
+- `program::release_program` frees the checker pool, the emit pool and the
+  frontend of a version. Each checker worker frees its checker and the
+  synthetic nodes it made (`free_synthetic_nodes`), and each emit thread
+  frees its synthetic nodes. The program shell and the file versions stay
+  leaked for now. A one-program process forgets its checkers and the
+  synthetic nodes of both pools at the end, like Go.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
@@ -254,9 +255,10 @@ The batch that adds it is not accepted until Theo approves.
   (`program::release_program_in_background`). So the pools of up to 4
   started projects work at the same time, like Go's goroutines. The
   started projects still emit one at a time in build order, and a
-  project's emit runs on its own checker threads only: the emit resolver
-  needs the file's checker, which lives on its worker thread, and
-  synthetic nodes are thread-local (`ast/synthetic.rs`).
+  project's emit runs on its own checker threads and its own emit pool
+  (see Threads): the emit resolver needs the file's checker, which lives
+  on its worker thread, and synthetic nodes are thread-local
+  (`ast/synthetic.rs`).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -325,6 +327,27 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   runs each file on its checker's thread with no checker borrowed
   (`program::run_on_checker_threads_for_files`); the emit resolver borrows
   the checker itself.
+- Each program also has an emit pool (not in Go; `program::send_emit_pool_jobs`):
+  up to 32 threads with no checker, one per core, made on the first emit
+  that uses it. There is no pool when the cores are not more than the
+  checkers: then it has no spare core and only slows the checker threads.
+  The JS part of a file goes there when its transforms make no checker
+  call (`emitter::emitter::js_emit_needs_checker`: Go's binder
+  reference resolver case of `getScriptTransformers`, and no enum in the
+  file). The d.ts part, and a JS part that needs the checker, stay on the
+  checker thread, so each checker gets the same calls in the same order.
+  The pool's emit resolver panics on every call
+  (`emitter::no_checker`), so a wrong rule ends the run (exit 70) and
+  cannot change an output. The binder reference resolver reads the
+  program's binder symbols (`transformers::reference_resolver::BinderSymbols`),
+  on every thread. A d.ts part waits for its file's JS part before it
+  writes, so a file's outputs are written in Go's order. The pool is off
+  with `--singleThreaded`, `--generateTrace`, an emit called on a checker
+  thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count,
+  also when no core is spare).
+  With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
+  moves no JS part runs as with the pool off and makes no pool. The
+  language server does not emit through `program_emit`.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,

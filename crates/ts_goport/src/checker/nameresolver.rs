@@ -6,6 +6,11 @@
 //! resolver's own methods take `&self` so a resolver kept in an `Rc` can be
 //! re-entered from its callbacks (Go calls `Resolve` recursively through the
 //! checker). The only mutable resolver field, `ArgumentsSymbol`, is a `Cell`.
+//!
+//! PORT: Go reads symbols through their pointers. Here `resolve` reads them
+//! through a `NameResolverHost`: the checker, or the program's binder
+//! symbols for the binder reference resolver of JS emit, which runs on
+//! threads with no checker (`transformers::reference_resolver`).
 
 use crate::prelude::*;
 use std::cell::Cell;
@@ -62,9 +67,42 @@ impl NameNotFound {
     }
 }
 
+/// The symbols that `NameResolver::resolve` reads, and the checker that its
+/// callbacks take. The checker is its own host. A host with no checker
+/// (`transformers::reference_resolver::BinderSymbols`) serves a resolver
+/// with no callbacks, which never asks for it.
+// PORT: not in Go. The method names differ from `CheckerShape::symbols` so
+// that both traits can be in scope for a `Checker`.
+pub trait NameResolverHost {
+    /// The arena that holds the symbols and tables the names resolve to.
+    fn symbol_arena(&self) -> &SymbolArena;
+    /// The same arena, for the transient `arguments` symbol.
+    fn symbol_arena_mut(&mut self) -> &mut SymbolArena;
+    /// The checker for a resolver callback.
+    fn hook_checker(&mut self) -> &mut Checker;
+}
+
+impl NameResolverHost for Checker {
+    #[inline(always)]
+    fn symbol_arena(&self) -> &SymbolArena {
+        &self.symbols
+    }
+
+    #[inline(always)]
+    fn symbol_arena_mut(&mut self) -> &mut SymbolArena {
+        &mut self.symbols
+    }
+
+    #[inline(always)]
+    fn hook_checker(&mut self) -> &mut Checker {
+        self
+    }
+}
+
 /// Go `binder.NameResolver`. The checker builds one with
 /// `create_name_resolver` / `create_name_resolver_for_suggestion` and calls
-/// `resolve(c, ...)` on it.
+/// `resolve(c, ...)` on it. The binder reference resolver builds one with no
+/// callbacks and calls it with the binder symbols.
 pub struct NameResolver {
     pub compiler_options: &'static CompilerOptions,
     pub get_symbol_of_declaration: Option<NameResolverGetSymbolOfDeclarationFn>,
@@ -110,9 +148,9 @@ impl NameResolver {
     // `Option<NameNotFound>`.
     // PERF: `name` is interned once here (see `resolve_name`), or taken from
     // the note of `resolver_name_text`.
-    pub fn resolve(
+    pub fn resolve<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         location: Node,
         name: &str,
         meaning: SymbolFlags,
@@ -141,9 +179,9 @@ impl NameResolver {
     // PERF: each scope lookup below uses `name_key`, so a table lookup reads
     // the hash the interner keeps and compares name ids, with no hashing
     // and no text compare per scope.
-    pub fn resolve_name(
+    pub fn resolve_name<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         location: Node,
         name_key: &Name,
         meaning: SymbolFlags,
@@ -194,7 +232,7 @@ impl NameResolver {
                         // - parameters are only in the scope of function body
                         // This restriction does not apply to JSDoc comment types because they are parented
                         // at a higher level than type parameters would normally be
-                        let result_flags = c.sym(result).flags;
+                        let result_flags = c.symbol_arena().sym(result).flags;
                         if (meaning & result_flags).intersects(SymbolFlags::TYPE)
                             && last_location.kind() != SyntaxKind::JsDoc
                         {
@@ -223,7 +261,8 @@ impl NameResolver {
                                 // technically for parameter list case here we might mix parameters and variables declared in function,
                                 // however it is detected separately when checking initializers of parameters
                                 // to make sure that they reference no variables declared after them.
-                                let value_declaration = c.sym(result).value_declaration;
+                                let value_declaration =
+                                    c.symbol_arena().sym(result).value_declaration;
                                 use_result = last_location.kind() == SyntaxKind::Parameter
                                     || last_location.flags().intersects(NodeFlags::SYNTHESIZED)
                                     || last_location == location.type_()
@@ -261,7 +300,7 @@ impl NameResolver {
                         if module_symbol.is_nil() {
                             break 'switch_;
                         }
-                        let module_exports = c.sym(module_symbol).exports;
+                        let module_exports = c.symbol_arena().sym(module_symbol).exports;
                         if is_source_file(location)
                             || (is_module_declaration(location)
                                 && location.flags().intersects(NodeFlags::AMBIENT)
@@ -269,13 +308,15 @@ impl NameResolver {
                         {
                             // It's an external module. First see if the module has an export default and if the local
                             // name of that export default matches.
-                            result = c.symbols.get(module_exports, INTERNAL_SYMBOL_NAME_DEFAULT);
+                            result = c
+                                .symbol_arena()
+                                .get(module_exports, INTERNAL_SYMBOL_NAME_DEFAULT);
                             if result.is_some() {
                                 let local_symbol =
-                                    get_local_symbol_for_export_default(&c.symbols, result);
+                                    get_local_symbol_for_export_default(c.symbol_arena(), result);
                                 if local_symbol.is_some()
-                                    && c.sym(result).flags.intersects(meaning)
-                                    && c.sym(local_symbol).name == name_key
+                                    && c.symbol_arena().sym(result).flags.intersects(meaning)
+                                    && c.symbol_arena().sym(local_symbol).name == name_key
                                 {
                                     break 'loop_;
                                 }
@@ -292,17 +333,18 @@ impl NameResolver {
                             //     2. We check === SymbolFlags.Alias in order to check that the symbol is *purely*
                             //        an alias. If we used &, we'd be throwing out symbols that have non alias aspects,
                             //        which is not the desired behavior.
-                            let module_export = c.symbols.get_name(module_exports, &name_key);
+                            let module_export =
+                                c.symbol_arena().get_name(module_exports, &name_key);
                             if module_export.is_some()
-                                && c.sym(module_export).flags == SymbolFlags::ALIAS
+                                && c.symbol_arena().sym(module_export).flags == SymbolFlags::ALIAS
                                 && (get_declaration_of_kind(
-                                    &c.symbols,
+                                    c.symbol_arena(),
                                     module_export,
                                     SyntaxKind::ExportSpecifier,
                                 )
                                 .is_some()
                                     || get_declaration_of_kind(
-                                        &c.symbols,
+                                        c.symbol_arena(),
                                         module_export,
                                         SyntaxKind::NamespaceExport,
                                     )
@@ -323,7 +365,11 @@ impl NameResolver {
                                     && source_file_info(location)
                                         .common_js_module_indicator
                                         .is_some()
-                                    && !c.sym(result).flags.intersects(SymbolFlags::TYPE)
+                                    && !c
+                                        .symbol_arena()
+                                        .sym(result)
+                                        .flags
+                                        .intersects(SymbolFlags::TYPE)
                                 {
                                     result = SymbolId::NIL;
                                 } else {
@@ -337,7 +383,7 @@ impl NameResolver {
                         if enum_symbol.is_nil() {
                             break 'switch_;
                         }
-                        let enum_exports = c.sym(enum_symbol).exports;
+                        let enum_exports = c.symbol_arena().sym(enum_symbol).exports;
                         result = self.lookup(
                             c,
                             enum_exports,
@@ -349,7 +395,9 @@ impl NameResolver {
                                 && self.compiler_options.get_isolated_modules()
                                 && !location.flags().intersects(NodeFlags::AMBIENT)
                                 && get_source_file_of_node(location)
-                                    != get_source_file_of_node(c.sym(result).value_declaration)
+                                    != get_source_file_of_node(
+                                        c.symbol_arena().sym(result).value_declaration,
+                                    )
                             {
                                 let isolated_modules_like_flag_name =
                                     if self.compiler_options.verbatim_module_syntax
@@ -359,7 +407,8 @@ impl NameResolver {
                                     } else {
                                         "isolatedModules"
                                     };
-                                let qualified = c.sym(enum_symbol).name.to_string() + "." + name;
+                                let qualified =
+                                    c.symbol_arena().sym(enum_symbol).name.to_string() + "." + name;
                                 self.error(
                                     c,
                                     original_location,
@@ -393,11 +442,13 @@ impl NameResolver {
                     | SyntaxKind::ClassExpression
                     | SyntaxKind::InterfaceDeclaration => {
                         let decl_symbol = self.get_symbol_of_declaration(c, location);
-                        let members = c.sym(decl_symbol).members;
+                        let members = c.symbol_arena().sym(decl_symbol).members;
                         result = self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                         if result.is_some() {
                             if !is_type_parameter_symbol_declared_in_container(
-                                &c.symbols, result, location,
+                                c.symbol_arena(),
+                                result,
+                                location,
                             ) {
                                 // ignore type parameters not declared in this container
                                 result = SymbolId::NIL;
@@ -435,7 +486,7 @@ impl NameResolver {
                             let container = location.parent().parent();
                             if is_class_like(container) {
                                 let container_symbol = self.get_symbol_of_declaration(c, container);
-                                let members = c.sym(container_symbol).members;
+                                let members = c.symbol_arena().sym(container_symbol).members;
                                 result =
                                     self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                                 if result.is_some() {
@@ -459,7 +510,7 @@ impl NameResolver {
                         if is_class_like(grandparent) || is_interface_declaration(grandparent) {
                             // A reference to this grandparent's type parameters would be an error
                             let grandparent_symbol = self.get_symbol_of_declaration(c, grandparent);
-                            let members = c.sym(grandparent_symbol).members;
+                            let members = c.symbol_arena().sym(grandparent_symbol).members;
                             result =
                                 self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                             if result.is_some() {
@@ -598,7 +649,7 @@ impl NameResolver {
                 || result != last_self_reference_location.symbol())
         {
             if let Some(symbol_referenced) = &self.symbol_referenced {
-                symbol_referenced(c, result, meaning);
+                symbol_referenced(c.hook_checker(), result, meaning);
             }
         }
         if result.is_nil() && !exclude_globals {
@@ -628,7 +679,7 @@ impl NameResolver {
                     &self.on_property_with_invalid_initializer
                 {
                     if on_property_with_invalid_initializer(
-                        c,
+                        c.hook_checker(),
                         original_location,
                         name,
                         property_with_invalid_initializer,
@@ -640,9 +691,9 @@ impl NameResolver {
             }
             if result.is_nil() {
                 if let Some(on_failed_to_resolve_symbol) = &self.on_failed_to_resolve_symbol {
-                    let name_not_found_message = name_not_found_message.message(c);
+                    let name_not_found_message = name_not_found_message.message(c.hook_checker());
                     on_failed_to_resolve_symbol(
-                        c,
+                        c.hook_checker(),
                         original_location,
                         name,
                         meaning,
@@ -653,7 +704,7 @@ impl NameResolver {
                 &self.on_successfully_resolved_symbol
             {
                 on_successfully_resolved_symbol(
-                    c,
+                    c.hook_checker(),
                     original_location,
                     result,
                     meaning,
@@ -667,16 +718,16 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:346 useOuterVariableScopeInParameter
-    pub fn use_outer_variable_scope_in_parameter(
+    pub fn use_outer_variable_scope_in_parameter<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         result: SymbolId,
         location: Node,
         last_location: Node,
     ) -> bool {
         if is_parameter_declaration(last_location) {
             let body = location.body();
-            let value_declaration = c.sym(result).value_declaration;
+            let value_declaration = c.symbol_arena().sym(result).value_declaration;
             if body.is_some()
                 && value_declaration.is_some()
                 && value_declaration.pos() >= body.pos()
@@ -692,7 +743,7 @@ impl NameResolver {
                 if let Some(get_requires_scope_change_cache) = &self.get_requires_scope_change_cache
                 {
                     declaration_requires_scope_change =
-                        get_requires_scope_change_cache(c, function_location);
+                        get_requires_scope_change_cache(c.hook_checker(), function_location);
                 }
                 if declaration_requires_scope_change == Tristate::Unknown {
                     declaration_requires_scope_change = if function_location
@@ -708,7 +759,7 @@ impl NameResolver {
                         &self.set_requires_scope_change_cache
                     {
                         set_requires_scope_change_cache(
-                            c,
+                            c.hook_checker(),
                             function_location,
                             declaration_requires_scope_change,
                         );
@@ -762,23 +813,27 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:402 error
-    pub fn error(
+    pub fn error<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         location: Node,
         message: &'static Message,
         args: Vec<String>,
     ) {
         if let Some(error) = &self.error {
-            error(c, location, message, args);
+            error(c.hook_checker(), location, message, args);
         }
         // Default implementation does not report errors
     }
 
     // Go: binder/nameresolver.go:409 getSymbolOfDeclaration
-    pub fn get_symbol_of_declaration(&self, c: &mut Checker, node: Node) -> SymbolId {
+    pub fn get_symbol_of_declaration<H: NameResolverHost>(
+        &self,
+        c: &mut H,
+        node: Node,
+    ) -> SymbolId {
         if let Some(get_symbol_of_declaration) = &self.get_symbol_of_declaration {
-            return get_symbol_of_declaration(c, node);
+            return get_symbol_of_declaration(c.hook_checker(), node);
         }
 
         // Default implementation does not support merged symbols
@@ -787,21 +842,21 @@ impl NameResolver {
 
     // Go: binder/nameresolver.go:418 lookup
     // PORT: takes the name interned (see `resolve`).
-    pub fn lookup(
+    pub fn lookup<H: NameResolverHost>(
         &self,
-        c: &mut Checker,
+        c: &mut H,
         symbols: SymbolTable,
         name: &Name,
         meaning: SymbolFlags,
     ) -> SymbolId {
         if let Some(lookup) = &self.lookup {
-            return lookup(c, symbols, TableKey::Name(name), meaning);
+            return lookup(c.hook_checker(), symbols, TableKey::Name(name), meaning);
         }
         // Default implementation does not support following aliases or merged symbols
         if meaning != SymbolFlags::NONE {
-            let symbol = c.symbols.get_name(symbols, name);
+            let symbol = c.symbol_arena().get_name(symbols, name);
             if symbol.is_some() {
-                if c.sym(symbol).flags.intersects(meaning) {
+                if c.symbol_arena().sym(symbol).flags.intersects(meaning) {
                     return symbol;
                 }
             }
@@ -810,12 +865,13 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:434 argumentsSymbol
-    pub fn arguments_symbol(&self, c: &mut Checker) -> SymbolId {
+    pub fn arguments_symbol<H: NameResolverHost>(&self, c: &mut H) -> SymbolId {
         if self.arguments_symbol.get().is_nil() {
             // Default implementation synthesizes a transient symbol for `arguments`
-            // PORT: Go allocates a free-standing `&ast.Symbol`; here it lives in the checker's arena.
+            // PORT: Go allocates a free-standing `&ast.Symbol`; here it lives in the
+            // host's arena (the checker's, or the binder copy of `BinderSymbols`).
             let symbol = c
-                .symbols
+                .symbol_arena_mut()
                 .new_symbol(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT, "arguments");
             self.arguments_symbol.set(symbol);
         }

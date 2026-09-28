@@ -258,6 +258,9 @@ impl Deref for LateSourceFileInfo {
 struct CheckerPool {
     workers: Vec<std::sync::mpsc::Sender<Job>>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// The program's emit pool, made on its first job
+    /// (`send_emit_pool_jobs`). It stops with the checkers.
+    emit: Option<EmitPool>,
 }
 
 impl CheckerPool {
@@ -280,21 +283,197 @@ impl CheckerPool {
 
     /// Sends each worker the job that drops its checker and frees its
     /// synthetic nodes, closes the job queues and returns the worker
-    /// threads.
+    /// threads, with the threads of the emit pool.
     fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
+        let CheckerPool {
+            workers,
+            mut threads,
+            emit,
+        } = self;
         // A pool that only ends with the process forgets its checkers and
         // synthetic nodes (see `create_checkers`); a released program frees
         // them here.
-        for worker in &self.workers {
+        for worker in &workers {
             let _ = worker.send(Box::new(|| {
                 drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                 free_synthetic_nodes();
                 WORKER_RELEASED.with(|released| released.set(true));
             }));
         }
-        drop(self.workers);
+        drop(workers);
+        if let Some(emit) = emit {
+            threads.extend(emit.stop());
+        }
+        threads
+    }
+}
+
+/// PORT: not in Go. The emit pool of a program: threads with no checker
+/// that run the JS part of each file whose JS transforms make no checker
+/// call (`emitter::emitter::js_emit_needs_checker`). Go runs every file's
+/// emit on its own goroutine (`Program.Emit` queues one task per file on a
+/// `core.WorkGroup`) and locks the checker only for each resolver call. A
+/// Rust checker stays on its thread, so the rest of the emit stays there.
+///
+/// The threads take jobs from one shared queue, in the order they are
+/// sent. Each thread starts from a `WorkerSeed`, like a checker worker.
+struct EmitPool {
+    queue: std::sync::mpsc::Sender<Job>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// Set by `stop`: when the queue closes, the threads free their
+    /// synthetic nodes. Else they end with the process and leak them, as
+    /// the checker workers do.
+    released: Arc<std::sync::atomic::AtomicBool>,
+    /// The jobs sent so far (`emit_pool_job_count`).
+    jobs: usize,
+}
+
+impl EmitPool {
+    /// Closes the queue and returns the threads. Each thread ends after the
+    /// jobs already sent and frees its synthetic nodes.
+    fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(self.queue);
         self.threads
     }
+}
+
+/// The most threads of an emit pool.
+const MAX_EMIT_THREADS: usize = 32;
+
+/// The threads of a new emit pool of the current program: one per core (Go
+/// runs the emit on GOMAXPROCS goroutines), at most `MAX_EMIT_THREADS`, but
+/// 0 (no pool) when the cores are not more than the checkers. With no spare
+/// core the pool only competes with the checker threads, and each d.ts part
+/// loses the caches that its JS part warmed (effect at 4 cores and 4
+/// checkers: +1.6% wall, +30 MiB). `GOPORT_EMIT_THREADS` sets the count at
+/// any core count (same maximum); 0 turns the pool off, so every emit runs
+/// on the checker threads as before the pool.
+fn emit_thread_count() -> usize {
+    static SET: OnceLock<Option<usize>> = OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("GOPORT_EMIT_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    });
+    let cores = available_cores();
+    set.unwrap_or(if cores > checker_count() { cores } else { 0 })
+        .min(MAX_EMIT_THREADS)
+}
+
+/// Makes the emit pool of the current program with `count` threads.
+fn create_emit_pool(count: usize) -> EmitPool {
+    let (queue, receiver) = std::sync::mpsc::channel::<Job>();
+    let receiver = Arc::new(Mutex::new(receiver));
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let threads = (0..count)
+        .map(|index| {
+            let seed = WorkerSeed::take();
+            let receiver = Arc::clone(&receiver);
+            let released = Arc::clone(&released);
+            std::thread::Builder::new()
+                .name(format!("emit-{index}"))
+                .stack_size(CHECKER_STACK_SIZE)
+                .spawn(move || {
+                    seed.install();
+                    loop {
+                        // Hold the lock only to take a job.
+                        let job = receiver
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .recv();
+                        let Ok(job) = job else { break };
+                        job();
+                    }
+                    // Like a checker worker (see `create_checkers`): a
+                    // released program frees the synthetic nodes, the end of
+                    // the process leaks them.
+                    if released.load(std::sync::atomic::Ordering::Acquire) {
+                        free_synthetic_nodes();
+                    } else {
+                        forget_synthetic_nodes();
+                    }
+                })
+                .expect("cannot start an emit thread")
+        })
+        .collect();
+    EmitPool {
+        queue,
+        threads,
+        released,
+        jobs: 0,
+    }
+}
+
+/// True when this emit can send JS parts to the emit pool: the pool is on
+/// (`emit_thread_count`), the program is not `--singleThreaded` (Go's
+/// single-threaded work group runs the emits last-queued-first on one
+/// goroutine), no trace is written (a trace keeps each file's emit events
+/// on one thread, as today), and the caller is not a checker thread.
+/// Only the compile path emits through `program_emit`; the language server
+/// does not.
+pub fn emit_pool_enabled() -> bool {
+    emit_thread_count() > 0
+        && !single_threaded()
+        && crate::tracing::get().is_none()
+        && worker_index().is_none()
+}
+
+/// The result of a job on the emit pool (`send_emit_pool_jobs`).
+pub struct EmitPoolJob<R>(std::sync::mpsc::Receiver<JobResult<R>>);
+
+impl<R> EmitPoolJob<R> {
+    /// Waits for the job. `Err` holds the payload of its panic.
+    pub fn join(self) -> std::thread::Result<R> {
+        self.0.recv().expect("emit thread stopped")
+    }
+}
+
+/// Sends `jobs` to the emit pool of the current program, in order, and
+/// returns where each result arrives. The first call makes the pool (and
+/// the checker pool, which binds the program) with one thread per job, up
+/// to `emit_thread_count`. A job must not use a checker. Loading thread
+/// only.
+pub fn send_emit_pool_jobs<R: Send + 'static>(
+    jobs: Vec<impl FnOnce() -> R + Send + 'static>,
+) -> Vec<EmitPoolJob<R>> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let id = prog().id;
+    POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        let pool = pools.entry(id).or_insert_with(create_checkers);
+        let emit = pool
+            .emit
+            .get_or_insert_with(|| create_emit_pool(emit_thread_count().clamp(1, jobs.len())));
+        emit.jobs += jobs.len();
+        jobs.into_iter()
+            .map(|f| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let job: Job = Box::new(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    let _ = sender.send(result);
+                });
+                emit.queue.send(job).expect("emit thread stopped");
+                EmitPoolJob(receiver)
+            })
+            .collect()
+    })
+}
+
+/// The number of jobs sent to the emit pool of the current program so far.
+/// Tests use it to see that the pool ran.
+pub fn emit_pool_job_count() -> usize {
+    let id = prog().id;
+    POOLS.with(|pools| {
+        pools
+            .borrow()
+            .get(&id)
+            .and_then(|pool| pool.emit.as_ref())
+            .map_or(0, |emit| emit.jobs)
+    })
 }
 
 /// Work for one checker worker. It runs on the worker thread, where
@@ -3588,7 +3767,11 @@ fn create_checkers() -> CheckerPool {
             (sender, thread)
         })
         .unzip();
-    CheckerPool { workers, threads }
+    CheckerPool {
+        workers,
+        threads,
+        emit: None,
+    }
 }
 
 /// Starts `f` with checker `index` on its thread and returns where the
@@ -4177,8 +4360,6 @@ fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Dia
 // NOTE: emitHost operations must be thread-safe
 pub struct EmitHost {
     emit_resolver: Rc<dyn crate::printer::EmitResolver>,
-    /// Pool index of the checker that owns the file being emitted.
-    pub checker_index: usize,
 }
 
 // Go: compiler/emitHost.go:38 newEmitHost
@@ -4189,9 +4370,15 @@ pub fn new_emit_host(file: Node) -> Rc<EmitHost> {
     let checker_index = checker_index_for_file(file);
     let emit_resolver: Rc<dyn crate::printer::EmitResolver> =
         with_checker_at(checker_index, Checker::get_emit_resolver);
+    Rc::new(EmitHost { emit_resolver })
+}
+
+/// PORT: not in Go. The emit host of a JS part on the emit pool
+/// (`send_emit_pool_jobs`), which has no checker. Its emit resolver panics
+/// on every call (`emitter::no_checker`).
+pub fn new_emit_host_without_checker() -> Rc<EmitHost> {
     Rc::new(EmitHost {
-        emit_resolver,
-        checker_index,
+        emit_resolver: Rc::new(crate::emitter::no_checker::NoCheckerEmitResolver),
     })
 }
 
