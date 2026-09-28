@@ -292,24 +292,44 @@ mkdir -p "$profiles"
 build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
 gen="$out/target-gen/$host/goport"
 
-# 2. PGO training. Exit codes are ignored: some inputs have diagnostics on purpose.
+# 2. PGO training. Exit codes 1 and 2 are expected: some inputs have diagnostics on
+# purpose. A run killed by a signal (a crash, a stack overflow) writes no profile, so
+# it stops the build: a release trained on part of the runs is slower and looks fine.
+killed=0
+train() {
+  local rc=0
+  "$@" > /dev/null 2>&1 || rc=$?
+  if ((rc > 128 && rc != 124)); then
+    killed=$((killed + 1))
+    echo "training run killed (exit $rc): $*" >&2
+  fi
+}
 for name in query hono zod effect elysia; do
-  "$gen/goport" -p "${projects[$name]}" > /dev/null 2>&1 || true
-  "$gen/tsgo" -p "${projects[$name]}" --noEmit --tsBuildInfoFile "$tmp/$name.tsbuildinfo" > /dev/null 2>&1 || true
+  train "$gen/goport" -p "${projects[$name]}"
+  train "$gen/tsgo" -p "${projects[$name]}" --noEmit --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
 done
 for name in query hono; do
-  "$gen/goport_emit" -p "${projects[$name]}" --outDir "$tmp/out" > /dev/null 2>&1 || true
+  train "$gen/goport_emit" -p "${projects[$name]}" --outDir "$tmp/out"
   rm -rf "$tmp/out"
 done
 cases="$data_root/target/continuation-r97-goport/corpus-full/cases"
 n=0 i=0
 for dir in "$cases"/*/; do
   if ((i++ % corpus_step == 0)) && [[ -f "$dir/tsconfig.json" ]]; then
-    (cd "$dir" && timeout 60 "$gen/goport" -p tsconfig.json > /dev/null 2>&1) || true
+    train env -C "$dir" timeout 60 "$gen/goport" -p tsconfig.json
     n=$((n + 1))
   fi
 done
-echo "trained on 5 projects and $n corpus cases, $(find "$profiles" -name '*.profraw' | wc -l) profraw files"
+nprof=$(find "$profiles" -name '*.profraw' | wc -l)
+echo "trained on 5 projects and $n corpus cases, $nprof profraw files"
+if ((killed > 0)); then
+  echo "error: $killed PGO training runs were killed by a signal (see above)" >&2
+  exit 1
+fi
+if ((nprof < 3)); then
+  echo "error: $nprof profraw files, expected one per trained bin (goport, tsgo, goport_emit)" >&2
+  exit 1
+fi
 
 # 3. Merge. The file name holds the profile hash: cargo does not track the
 # profile content, but it rebuilds when RUSTFLAGS change.
