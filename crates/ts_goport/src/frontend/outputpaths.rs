@@ -52,19 +52,29 @@ impl crate::declarations::OutputPaths for OutputPaths {
     }
 }
 
+// Go: outputpaths/outputpaths.go:41 ForceEmitPaths
+/// Output paths to compute even when the options turn that output off (#4699).
+/// The API emit and the builder signature emit set them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ForceEmitPaths {
+    pub dts: bool,
+    pub js: bool,
+    pub declaration_map: bool,
+}
+
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor
 pub fn get_output_paths_for(
     source_file: &ParsedSourceFile,
     options: &CompilerOptions,
     host: &dyn OutputPathsHost,
-    force_dts_emit: bool,
+    force: ForceEmitPaths,
 ) -> OutputPaths {
     get_output_paths_for_file(
         source_file.file_name(),
         source_file.script_kind,
         options,
         host,
-        force_dts_emit,
+        force,
     )
 }
 
@@ -75,7 +85,7 @@ pub fn get_output_paths_for_file(
     script_kind: ScriptKind,
     options: &CompilerOptions,
     host: &dyn OutputPathsHost,
-    force_dts_emit: bool,
+    force: ForceEmitPaths,
 ) -> OutputPaths {
     let own_output_file_path = get_own_emit_output_file_path(
         file_name,
@@ -95,16 +105,21 @@ pub fn get_output_paths_for_file(
             },
         ) == 0;
     let mut paths = OutputPaths::default();
-    if options.emit_declaration_only != Tristate::True && !is_json_emitted_to_same_location {
+    // #4699: `force.js`, `force.dts` and `force.declaration_map` (Go `ForceEmitPaths`).
+    if (force.js || options.emit_declaration_only != Tristate::True)
+        && !is_json_emitted_to_same_location
+    {
         paths.js_file_path = own_output_file_path;
         if script_kind != ScriptKind::JSON {
             paths.source_map_file_path = get_source_map_file_path(&paths.js_file_path, options);
         }
     }
-    if force_dts_emit || options.get_emit_declarations() && !is_json_file {
+    if force.dts || options.get_emit_declarations() && !is_json_file {
         paths.declaration_file_path =
             get_declaration_emit_output_file_path(file_name, options, host);
-        if options.get_are_declaration_maps_enabled() {
+        if options.get_are_declaration_maps_enabled()
+            || force.declaration_map && options.declaration_map.is_true()
+        {
             paths.declaration_map_path = format!("{}.map", paths.declaration_file_path);
         }
     }
@@ -120,8 +135,17 @@ pub fn for_each_emitted_file(
     force_dts_emit: bool,
 ) -> bool {
     for source_file in source_files {
+        // #4699: Go `ForceEmitPaths{Dts: forceDtsEmit}`.
         if action(
-            &get_output_paths_for(source_file, options, host, force_dts_emit),
+            &get_output_paths_for(
+                source_file,
+                options,
+                host,
+                ForceEmitPaths {
+                    dts: force_dts_emit,
+                    ..ForceEmitPaths::default()
+                },
+            ),
             Some(source_file),
         ) {
             return true;
