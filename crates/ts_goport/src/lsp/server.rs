@@ -79,11 +79,13 @@
 
 use crate::lsp::prelude::*;
 
+use crate::emitter::program_emit;
 use crate::frontend::compiler;
 use crate::frontend::json_ext::{self, AnyValue};
 use crate::gostd::context::{self, CancelCauseFunc, CancelFunc};
 use crate::gostd::errors;
 use crate::lsp::lsproto::{ErrorCode, HasTextDocumentPosition, HasTextDocumentURI};
+use crate::program::ls_program;
 use crate::project::logging::{self, Logger as _};
 use crate::project::{Snapshot, ata};
 use std::any::Any;
@@ -2932,17 +2934,27 @@ impl Server {
             return ls.provide_diagnostics(&ctx, &params.text_document.uri);
         }
         let direct = ls.provide_diagnostics(&ctx, &params.text_document.uri)?;
-        // Go:
-        //	ls.GetProgram().Emit(ctx, compiler.EmitOptions{
-        //		WriteFile: func(fileName, text string, data *compiler.WriteFileData) error {
-        //			// do nothing
-        //			return nil
-        //		},
-        //	})
-        // PORT: the language service program (`NewProgram`) has no `Emit`
-        // yet (program-core, #4699), so this emit is not run. The second
-        // `ProvideDiagnostics` below still runs, so a flake that does not
-        // come from emit is still found.
+        // #4710: Go `languageService.GetProgram().Emit(ctx, ...)`. The emit
+        // uses the checkers of the language service program
+        // (`ls_program::emit`), so a diagnostic that the emit changes shows
+        // up in the second `ProvideDiagnostics`.
+        let write_file: program_emit::WriteFile = Arc::new(
+            |_file_name: &str,
+             _text: &str,
+             _data: &mut program_emit::WriteFileData|
+             -> Result<(), String> {
+                // do nothing
+                Ok(())
+            },
+        );
+        ls_program::emit(
+            ls.get_program(),
+            &ctx,
+            program_emit::EmitOptions {
+                write_file: Some(write_file),
+                ..program_emit::EmitOptions::default()
+            },
+        );
         let Ok(secondary) = ls.provide_diagnostics(&ctx, &params.text_document.uri) else {
             return Ok(direct);
         };

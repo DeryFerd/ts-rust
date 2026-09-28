@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use ts_goport::diag;
 use ts_goport::lsp::lsproto;
+use ts_goport::program::ls_program;
 use ts_goport::project::{ProgramUpdateKind, Session};
 
 use super::projecttestutil::{self, ProgressCall, TypingsInstallerOptions, files};
@@ -64,6 +65,70 @@ child_test! {
         edit(&session, SRC_INDEX, 2, (0, 20), (0, 20), "\n");
         let _ = language_service(&session, SRC_INDEX);
         assert_eq!(configured_update_kind(&session, "/src/tsconfig.json"), ProgramUpdateKind::CLONED);
+    }
+}
+
+child_test! {
+    // Go: project_test.go:83 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
+    // #4792
+    fn program_update_kind_new_files_when_import_resolution_mode_changes() {
+        let index = r#"import type { Value } from "pkg" with { "resolution-mode": "require" };
+const value: Value = { mode: "require" };"#;
+        let (session, _) = projecttestutil::setup(files(&[
+            (
+                "/src/tsconfig.json",
+                r#"{
+				"compilerOptions":{"module":"preserve","moduleResolution":"bundler","noEmit":true},
+				"files":["index.ts"]
+			}"#,
+            ),
+            ("/src/index.ts", index),
+            (
+                "/src/node_modules/pkg/package.json",
+                r#"{
+				"name": "pkg",
+				"version": "1.0.0",
+				"exports": {
+					".": {
+						"import": "./index.mjs",
+						"require": "./index.js"
+					}
+				}
+			}"#,
+            ),
+            ("/src/node_modules/pkg/index.d.mts", r#"export interface Value { mode: "import" }"#),
+            ("/src/node_modules/pkg/index.d.ts", r#"export interface Value { mode: "require" }"#),
+        ]));
+        open(&session, SRC_INDEX, index);
+        let p = program(&session, SRC_INDEX);
+        assert_eq!(sem_diag_count(p, "/src/index.ts"), 0);
+
+        session.did_change_file(
+            &bg(),
+            &uri(SRC_INDEX),
+            2,
+            &[lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                partial: None,
+                whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                    text: r#"import type { Value } from "pkg" with { "resolution-mode": "import" };
+const value: Value = { mode: "require" };"#
+                        .to_string(),
+                }),
+            }],
+        );
+        let p = program(&session, SRC_INDEX);
+        let file = p
+            .get_source_file("/src/index.ts")
+            .expect("no source file /src/index.ts");
+        let diags = ls_program::get_semantic_diagnostics(
+            p,
+            &projecttestutil::with_request_id(&bg()),
+            file.root,
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code(), diag::Type_0_is_not_assignable_to_type_1.code() as i32);
+
+        assert_eq!(configured_update_kind(&session, "/src/tsconfig.json"), ProgramUpdateKind::NEW_FILES);
     }
 }
 
