@@ -137,6 +137,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "goport_lsproto"
+version = "7.0.0-dev"
+dependencies = [
+ "goport_util",
+ "indexmap",
+ "rustc-hash",
+]
+
+[[package]]
+name = "goport_util"
+version = "7.0.0-dev"
+dependencies = [
+ "indexmap",
+ "memchr",
+ "name-to-handle-at",
+ "nix",
+ "rustc-hash",
+ "rustix",
+ "ts_ast",
+ "ts_core",
+ "ts_diagnostics",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,6 +773,8 @@ version = "7.0.0-dev"
 dependencies = [
  "bumpalo",
  "flate2",
+ "goport_lsproto",
+ "goport_util",
  "indexmap",
  "jiff",
  "memchr",

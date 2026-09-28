@@ -285,35 +285,6 @@ fn unmarshal_any(dec: &mut JsonDecoder<'_>, value: &mut JsonAny) -> Result<(), J
     }
 }
 
-// Go: collections/ordered_map.go:263 (*OrderedMap).UnmarshalJSONFrom
-// PORT: Go `collections.OrderedMap` is `IndexMap`. `IndexMap::insert` keeps
-// the first position and replaces the value, like `OrderedMap.Set`. This
-// impl lives here because packagejson is its only decode user.
-impl<V: UnmarshalerFrom + Default> UnmarshalerFrom for IndexMap<String, V> {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        let token = dec.read_token()?;
-        if token.kind() == b'n' {
-            // By convention, to approximate the behavior of Unmarshal itself,
-            // Unmarshalers implement UnmarshalJSON([]byte("null")) as a no-op.
-            return Ok(());
-        }
-        if token.kind() != b'{' {
-            return Err(JsonError {
-                message: "cannot unmarshal non-object JSON value into Map".to_string(),
-            });
-        }
-        while dec.peek_kind() != b'}' {
-            let mut key = String::new();
-            let mut value = V::default();
-            json_unmarshal_decode(dec, &mut key)?;
-            json_unmarshal_decode(dec, &mut value)?;
-            self.insert(key, value);
-        }
-        dec.read_token()?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // expected.go
 // ---------------------------------------------------------------------------

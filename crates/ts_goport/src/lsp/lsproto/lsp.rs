@@ -2,7 +2,8 @@
 //!
 //! PORT: `DocumentUri`, `URI` and `Method` are Go string types; their JSON
 //! impls are the v2 string arshaler. `IndexMap<DocumentUri, V>` (Go
-//! `map[DocumentUri]V`) gets the v2 map arshaler here.
+//! `map[DocumentUri]V`) gets the v2 map arshaler here, through the
+//! goport_util trait `JsonMapKey`.
 //!
 //! The `err*` helpers make the plain errors that generated `UnmarshalJSONFrom`
 //! methods return. Each one records where the method left the decoder, so
@@ -11,6 +12,7 @@
 use crate::lsp::lsproto::prelude::*;
 
 use crate::frontend::bundled::is_bundled;
+use crate::frontend::json_indexmap::JsonMapKey;
 use std::marker::PhantomData;
 
 // Go: lsp.go:17 DocumentUri
@@ -176,12 +178,18 @@ impl IsZero for Method {
     }
 }
 
-// Go v2 map arshaler (arshal_default.go:794) for `map[DocumentUri]V`.
-// PORT: members write in insertion order; Go map order is random.
-impl<V: MarshalerTo> MarshalerTo for IndexMap<DocumentUri, V> {
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+// PORT: the JSON impls of `IndexMap<DocumentUri, V>` (Go `map[DocumentUri]V`).
+// The orphan rule keeps `MarshalerTo` and `UnmarshalerFrom` for `IndexMap`
+// in goport_util, which calls these through `JsonMapKey`.
+impl JsonMapKey for DocumentUri {
+    // Go v2 map arshaler (arshal_default.go:794) for `map[DocumentUri]V`.
+    // PORT: members write in insertion order; Go map order is random.
+    fn marshal_map<V: MarshalerTo>(
+        map: &IndexMap<Self, V>,
+        enc: &mut String,
+    ) -> Result<(), JsonError> {
         enc.push('{');
-        for (i, (k, v)) in self.iter().enumerate() {
+        for (i, (k, v)) in map.iter().enumerate() {
             if i > 0 {
                 enc.push(',');
             }
@@ -192,20 +200,21 @@ impl<V: MarshalerTo> MarshalerTo for IndexMap<DocumentUri, V> {
         enc.push('}');
         Ok(())
     }
-}
 
-// Go v2 map arshaler (arshal_default.go:955) for `map[DocumentUri]V`: null
-// sets nil; an object merges into the existing map (a value for a key that
-// is already present decodes into a copy of the old value); a name repeated
-// in this object is an error unless duplicates are allowed. A plain error of
-// the method of `V` gets the Go type `V`.
-// PORT: Go sets a nil map for null; the Rust zero value is an empty map.
-impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<DocumentUri, V> {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+    // Go v2 map arshaler (arshal_default.go:955) for `map[DocumentUri]V`: null
+    // sets nil; an object merges into the existing map (a value for a key that
+    // is already present decodes into a copy of the old value); a name repeated
+    // in this object is an error unless duplicates are allowed. A plain error of
+    // the method of `V` gets the Go type `V`.
+    // PORT: Go sets a nil map for null; the Rust zero value is an empty map.
+    fn unmarshal_map<V: UnmarshalerFrom + Default + Clone>(
+        map: &mut IndexMap<Self, V>,
+        dec: &mut JsonDecoder<'_>,
+    ) -> Result<(), JsonError> {
         let tok = dec.read_token()?;
         match tok {
             JsonToken::Null => {
-                self.clear();
+                map.clear();
                 Ok(())
             }
             JsonToken::BeginObject => {
@@ -215,7 +224,7 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                     dec.disable_namespace();
                 }
                 let allow_dup = dec.options.allow_duplicate_names;
-                let mut seen: Option<FxHashMap<DocumentUri, ()>> = if !allow_dup && !self.is_empty()
+                let mut seen: Option<FxHashMap<DocumentUri, ()>> = if !allow_dup && !map.is_empty()
                 {
                     Some(FxHashMap::default())
                 } else {
@@ -225,7 +234,7 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                     let mut k = DocumentUri::default();
                     json_unmarshal_decode(dec, &mut k)?;
                     let mut v = V::default();
-                    if let Some(existing) = self.get(&k) {
+                    if let Some(existing) = map.get(&k) {
                         if !allow_dup && seen.as_ref().is_none_or(|s| s.contains_key(&k)) {
                             return Err(JsonError {
                                 message: format!("duplicate object member name {:?}", k.0),
@@ -237,7 +246,7 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                     if let Some(s) = &mut seen {
                         s.insert(k.clone(), ());
                     }
-                    self.insert(k, v);
+                    map.insert(k, v);
                     err.map_err(wrap_method_error::<V>)?;
                 }
                 dec.read_token()?;
@@ -251,7 +260,10 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<Document
                     }
                     dec.read_token()?;
                 }
-                Err(unmarshal_kind_error(tok.kind(), &go_type_name::<Self>()))
+                Err(unmarshal_kind_error(
+                    tok.kind(),
+                    &go_type_name::<IndexMap<Self, V>>(),
+                ))
             }
         }
     }
