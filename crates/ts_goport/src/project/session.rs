@@ -112,6 +112,10 @@ pub struct Session {
     // parseCache is the ref-counted cache of source files used when
     // creating programs during snapshot cloning.
     pub parse_cache: Rc<ParseCache>,
+    // PORT: the parse cache references that auto-import registry clones
+    // keep after the clone, one per path (see
+    // `AutoImportRegistryCloneHost::dispose`). No Go counterpart.
+    pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
     // extendedConfigCache is the ref-counted cache of tsconfig ASTs
     // that are used in the "extends" of another tsconfig.
     pub extended_config_cache: Rc<ExtendedConfigCache>,
@@ -230,6 +234,7 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         npm_executor: init.npm_executor.clone(),
         fs: overlay_fs,
         parse_cache: parse_cache.expect(NIL_DEREF),
+        auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
         extended_config_cache,
         program_counter: Rc::new(ProgramCounter::default()),
         background_queue: background::new_queue(),
