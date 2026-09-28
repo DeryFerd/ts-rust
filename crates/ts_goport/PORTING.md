@@ -348,6 +348,26 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
+- `tsc -p` with an incremental program starts its emit with the check (not
+  in Go; `incremental::Program::start_check_and_emit`). Go waits for the
+  whole check, reads the global diagnostics again, then emits. Here the
+  loading thread sends each checker its check job, its global diagnostics
+  job and its emit jobs in that order, with no wait between them, and the
+  pool jobs go out at the same time. Each checker thread runs the same jobs
+  in the same order as with the waits, so each checker emits when its own
+  check ends and the pool emits the JS parts during the check. All state
+  that emit writes is per thread, per checker, per emit, loading thread
+  only or a pure cache, except the file system: a check can probe files
+  (the TS2834/TS2835 import extension suggestion, module specifiers in type
+  text). `program_emit::emit_can_start_with_check` starts early only when
+  no such probe can reach an output (no extensionless relative import in a
+  checked file with node16 or nodenext, no program file in `outDir` or
+  `declarationDir`, no `node_modules` in them, no `preserveSymlinks`, no
+  `outFile`). `noEmit`, `noEmitOnError`, `--singleThreaded`, a trace and
+  `GOPORT_EARLY_EMIT=0` keep Go's order. `tsc -b`, watch, the plain
+  program and the goport bins do not start early. With the early start,
+  `--extendedDiagnostics` "Check time" is the wait for the check and "Emit
+  time" the wait for the rest of the emit after it.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,
@@ -379,6 +399,10 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   elysia) adds up to 3 parse workers at 8 or more cores, and the budget
   has one spare arena for each (9 in `goport`, 10 in `tsgo`). The bind
   mallocs little: a large program binds on 8 threads, which share arenas.
+  When the process may run on 16 or more physical cores (the CPUs of
+  `Cpus_allowed_list` with SMT siblings counted once), a large program
+  parses on 16 threads (15 workers) and binds on 16 threads; the arenas do
+  not change.
   A program that is not large (query) binds on 4 threads when there are
   spare arenas, so its bind threads take the arenas of the ended parse
   workers and it makes no more arenas than with 6 or 7 (query at 16

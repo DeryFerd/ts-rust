@@ -7,7 +7,9 @@
 //! runs on the checker threads, so what it reads from the snapshot is
 //! copied into it, and what it records (Go `signatures`, `emitSignatures`,
 //! `latestChangedDtsFiles` SyncMaps) goes to `EmitFilesShared` behind a
-//! mutex. Go `ctx` is dropped.
+//! mutex. Go `ctx` is dropped. `start_emit_files` and `finish_emit_files`
+//! split the emit of all affected files at the wait for the emit jobs, so
+//! `Program::start_check_and_emit` can send them behind the check.
 
 use super::affected_files::collect_all_affected_files;
 use super::hash::FileInfo;
@@ -16,7 +18,8 @@ use super::program::{Program, SignatureUpdateKind};
 use super::snapshot::*;
 use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{
-    EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit, emit_batch,
+    EmitOptions, EmitResult, PendingEmitBatch, WriteFile, WriteFileData, combine_emit_results,
+    emit, start_emit_batch,
 };
 use crate::frontend::prelude::*;
 use crate::program::source_file_may_be_emitted;
@@ -37,6 +40,10 @@ pub struct EmitFilesShared {
     pub emit_signatures: IndexMap<Path, EmitSignature>,
     pub latest_changed_dts_files: IndexMap<Path, String>,
 }
+
+/// One file that `emit_files_incremental` emits: its path, its pending
+/// emit kind, the kind it emits now, and the file.
+type QueuedEmit = (Path, FileEmitKind, FileEmitKind, Node);
 
 // Go: incremental/emitfileshandler.go:20 emitFilesHandler
 pub struct EmitFilesHandler<'a> {
@@ -125,11 +132,7 @@ impl<'a> EmitFilesHandler<'a> {
                 }
                 combine_emit_results(results)
             } else {
-                // Combine results and update buildInfo
-                let mut result = combine_emit_results(results);
-                self.update_has_emit_diagnostics(Some(&result));
-                self.emit_build_info(&options, &mut result);
-                result
+                self.combine_results_and_emit_build_info(results, &options)
             }
         } else if !self.is_for_dts_errors {
             let emit_options = self.get_emit_options(options.clone());
@@ -152,6 +155,20 @@ impl<'a> EmitFilesHandler<'a> {
         }
     }
 
+    /// The end of `emitAllAffectedFiles` with the incremental state, not
+    /// for d.ts errors.
+    fn combine_results_and_emit_build_info(
+        &mut self,
+        results: Vec<EmitResult>,
+        options: &EmitOptions,
+    ) -> EmitResult {
+        // Combine results and update buildInfo
+        let mut result = combine_emit_results(results);
+        self.update_has_emit_diagnostics(Some(&result));
+        self.emit_build_info(options, &mut result);
+        result
+    }
+
     // Go: incremental/emitfileshandler.go:91 updateHasEmitDiagnostics
     fn update_has_emit_diagnostics(&mut self, result: Option<&EmitResult>) {
         if result.is_some_and(|result| !result.diagnostics.is_empty()) {
@@ -168,62 +185,18 @@ impl<'a> EmitFilesHandler<'a> {
     }
 
     // Go: incremental/emitfileshandler.go:105 emitFilesIncremental
+    // PORT: perf. Go queues one job per file on a WorkGroup. Pass 1 is the
+    // loop body before `wg.Queue`, in the order Go queues
+    // (`queue_affected_files`). Pass 2 runs all jobs at once (`emit_batch`,
+    // or one declaration diagnostics job per file); each checker thread runs
+    // its files in pass 1 order, as the old one-file-at-a-time loop did.
+    // Pass 3 is the job tail, in the same order
+    // (`finish_emit_files_incremental`). `start_emit_files` runs pass 1 and
+    // sends pass 2 early; `finish_emit_files` does the rest.
     fn emit_files_incremental(&mut self, options: &EmitOptions) -> Vec<EmitResult> {
-        // Get all affected files
-        collect_all_affected_files(self.program);
-
-        let pending: Vec<(Path, FileEmitKind)> = self
-            .program
-            .snapshot
-            .borrow()
-            .affected_files_pending_emit
-            .iter()
-            .map(|(path, kind)| (path.clone(), *kind))
-            .collect();
-
-        // PORT: perf. Go queues one job per file on a WorkGroup. Pass 1 is
-        // the loop body before `wg.Queue`, in the order Go queues. Pass 2
-        // runs all jobs at once (`emit_batch`, or one declaration diagnostics
-        // job per file); each checker thread runs its files in pass 1 order,
-        // as the old one-file-at-a-time loop did. Pass 3 is the job tail, in
-        // the same order.
-        let mut queued: Vec<(Path, FileEmitKind, FileEmitKind, Node)> = Vec::new();
-        for (path, emit_kind) in pending {
-            let affected_file = get_source_file_by_path(&path);
-            if affected_file.is_nil() || !source_file_may_be_emitted(affected_file, false) {
-                self.deleted_pending_kinds.insert(path);
-                continue;
-            }
-            let pending_kind = self.get_pending_emit_kind_for_emit_options(emit_kind, options);
-            if !pending_kind.is_empty() {
-                queued.push((path, emit_kind, pending_kind, affected_file));
-            }
-        }
-
+        let queued = self.queue_affected_files(options);
         let results: Vec<EmitResult> = if !self.is_for_dts_errors {
-            let targets = queued
-                .iter()
-                .map(|&(_, _, pending_kind, affected_file)| {
-                    // Determine if we can do partial emit
-                    let mut emit_only = EmitOnly::All;
-                    if pending_kind.intersects(FileEmitKind::ALL_JS) {
-                        emit_only = EmitOnly::Js;
-                    }
-                    if pending_kind.intersects(FileEmitKind::ALL_DTS) {
-                        if emit_only == EmitOnly::Js {
-                            emit_only = EmitOnly::All;
-                        } else {
-                            emit_only = EmitOnly::Dts;
-                        }
-                    }
-                    self.get_emit_options(EmitOptions {
-                        target_source_file: affected_file,
-                        emit_only,
-                        write_file: options.write_file.clone(),
-                    })
-                })
-                .collect();
-            emit_batch(targets)
+            self.send_emit_batch(&queued, options).wait()
         } else {
             // Go `GetDeclarationDiagnostics(ctx, affectedFile)`. Send every
             // job first, then wait for each in order.
@@ -239,7 +212,74 @@ impl<'a> EmitFilesHandler<'a> {
                 })
                 .collect()
         };
+        self.finish_emit_files_incremental(queued, results)
+    }
 
+    /// Pass 1 of `emit_files_incremental`: handles the affected files and
+    /// returns the files to emit, in the order Go queues them.
+    fn queue_affected_files(&mut self, options: &EmitOptions) -> Vec<QueuedEmit> {
+        // Get all affected files
+        collect_all_affected_files(self.program);
+
+        let pending: Vec<(Path, FileEmitKind)> = self
+            .program
+            .snapshot
+            .borrow()
+            .affected_files_pending_emit
+            .iter()
+            .map(|(path, kind)| (path.clone(), *kind))
+            .collect();
+
+        let mut queued: Vec<QueuedEmit> = Vec::new();
+        for (path, emit_kind) in pending {
+            let affected_file = get_source_file_by_path(&path);
+            if affected_file.is_nil() || !source_file_may_be_emitted(affected_file, false) {
+                self.deleted_pending_kinds.insert(path);
+                continue;
+            }
+            let pending_kind = self.get_pending_emit_kind_for_emit_options(emit_kind, options);
+            if !pending_kind.is_empty() {
+                queued.push((path, emit_kind, pending_kind, affected_file));
+            }
+        }
+        queued
+    }
+
+    /// Pass 2 of `emit_files_incremental` (not for d.ts errors) without the
+    /// wait: sends the emit of the `queued` files.
+    fn send_emit_batch(&self, queued: &[QueuedEmit], options: &EmitOptions) -> PendingEmitBatch {
+        let targets = queued
+            .iter()
+            .map(|&(_, _, pending_kind, affected_file)| {
+                // Determine if we can do partial emit
+                let mut emit_only = EmitOnly::All;
+                if pending_kind.intersects(FileEmitKind::ALL_JS) {
+                    emit_only = EmitOnly::Js;
+                }
+                if pending_kind.intersects(FileEmitKind::ALL_DTS) {
+                    if emit_only == EmitOnly::Js {
+                        emit_only = EmitOnly::All;
+                    } else {
+                        emit_only = EmitOnly::Dts;
+                    }
+                }
+                self.get_emit_options(EmitOptions {
+                    target_source_file: affected_file,
+                    emit_only,
+                    write_file: options.write_file.clone(),
+                })
+            })
+            .collect();
+        start_emit_batch(targets)
+    }
+
+    /// Pass 3 of `emit_files_incremental` with the pass 2 `results` of the
+    /// `queued` files, then the rest of Go `emitFilesIncremental`.
+    fn finish_emit_files_incremental(
+        &mut self,
+        queued: Vec<QueuedEmit>,
+        results: Vec<EmitResult>,
+    ) -> Vec<EmitResult> {
         debug_assert_eq!(results.len(), queued.len(), "one result per queued file");
         for ((path, emit_kind, pending_kind, _), result) in queued.into_iter().zip(results) {
             self.update_has_emit_diagnostics(Some(&result));
@@ -561,4 +601,96 @@ pub fn emit_files(program: &Program, options: EmitOptions, is_for_dts_errors: bo
 
     // Emit only affected files if using builder for emit
     emit_handler.emit_all_affected_files(options)
+}
+
+/// PORT: not in Go (perf). The emit that `start_emit_files` sent:
+/// `emit_files` of all affected files (no target file, `EmitOnly::All`)
+/// up to the wait for the emit jobs, and the handler state that the rest
+/// needs.
+pub(crate) struct StartedEmit {
+    shared: Arc<Mutex<EmitFilesShared>>,
+    deleted_pending_kinds: IndexSet<Path>,
+    queued: Vec<QueuedEmit>,
+    batch: PendingEmitBatch,
+    /// The `WriteFile` of the start. `finish_emit_files` must get the same.
+    write_file: Option<WriteFile>,
+    /// `program::bind_thread_fingerprint` of this thread after the start.
+    /// The emit pool starts from a copy of this thread's state, so between
+    /// the start and the finish this thread must not change it, else the
+    /// pool would start from other state than without the early start.
+    fingerprint: (usize, (u64, u64), usize),
+}
+
+/// PORT: not in Go (perf). The first half of `emit_files(program, options,
+/// false)` for `Program::start_check_and_emit`: pass 1 of
+/// `emit_files_incremental`, then the emit jobs are sent without a wait.
+/// Each checker thread runs them after the jobs sent to it before (the
+/// check and the second global diagnostics read). The caller has the
+/// incremental state (`can_use_incremental_state`), and `options` name no
+/// target file and emit all.
+///
+/// Pass 1 reads the pending emit set, the file infos, the emit signatures
+/// and the options, and `get_emit_options` copies them into the write
+/// callbacks. The check commit (`Program::commit_semantic_diagnostics`)
+/// changes none of them, and the affected-file walk has already run in
+/// `start_check` (its second run here is a no-op), so the jobs are the
+/// jobs that `emit_files` would send after the check.
+pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> StartedEmit {
+    debug_assert!(
+        program.snapshot.borrow().can_use_incremental_state()
+            && options.target_source_file.is_nil()
+            && options.emit_only == EmitOnly::All,
+        "start_emit_files: only the emit of all affected files starts early"
+    );
+    let mut handler = EmitFilesHandler::new(program, false);
+    let queued = handler.queue_affected_files(&options);
+    let batch = handler.send_emit_batch(&queued, &options);
+    StartedEmit {
+        shared: handler.shared,
+        deleted_pending_kinds: handler.deleted_pending_kinds,
+        queued,
+        batch,
+        write_file: options.write_file,
+        fingerprint: crate::program::bind_thread_fingerprint(),
+    }
+}
+
+/// PORT: not in Go (perf). The second half of `emit_files(program,
+/// options, false)` for the emit that `start_emit_files` sent: waits for
+/// the emit jobs, then does the rest of `emit_files_incremental` and
+/// `emitAllAffectedFiles` (the snapshot update and the build info).
+/// `options` must be the options of the start.
+pub(crate) fn finish_emit_files(
+    program: &Program,
+    started: StartedEmit,
+    options: &EmitOptions,
+) -> EmitResult {
+    debug_assert!(
+        options.target_source_file.is_nil()
+            && options.emit_only == EmitOnly::All
+            && match (&options.write_file, &started.write_file) {
+                (Some(write_file), Some(started_write_file)) => {
+                    Arc::ptr_eq(write_file, started_write_file)
+                }
+                (None, None) => true,
+                _ => false,
+            },
+        "finish_emit_files: the emit options differ from the started ones"
+    );
+    debug_assert_eq!(
+        crate::program::bind_thread_fingerprint(),
+        started.fingerprint,
+        "the loading thread changed its synthetic nodes, ids or lazy JSDoc during the early emit"
+    );
+    let mut handler = EmitFilesHandler {
+        program,
+        is_for_dts_errors: false,
+        shared: started.shared,
+        deleted_pending_kinds: started.deleted_pending_kinds,
+        emit_updates: IndexMap::default(),
+        has_emit_diagnostics: false,
+    };
+    let results = started.batch.wait();
+    let results = handler.finish_emit_files_incremental(started.queued, results);
+    handler.combine_results_and_emit_build_info(results, options)
 }

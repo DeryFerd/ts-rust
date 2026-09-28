@@ -24,14 +24,14 @@ use crate::frontend::prelude::*;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::emitter::program_emit::{WriteFile, WriteFileData};
+use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::parse_build_command_line;
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::build::orchestrator::{Options as OrchestratorOptions, new_orchestrator};
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::incremental::incremental::{create_host, new_build_info_reader};
 use crate::execute::incremental::program::{
-    new_program as new_incremental_program, read_build_info_program,
+    Program as IncrementalProgram, new_program as new_incremental_program, read_build_info_program,
 };
 use crate::execute::tsc::{
     CommandLineResult, CompileTimes, CompilerProgram, DiagnosticReporter, DiagnosticsReporter,
@@ -549,6 +549,12 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // to them. Their steps are still timed (empty), so the statistics table
 // has the same rows as Go. Without the incremental program there is no
 // `testing.OnProgram` (only a bin replaces it, and bins pass no testing).
+// PORT: perf. The incremental program sends its check, and when it can,
+// the second global diagnostics read and the emit, before
+// `EmitAndReportStatistics` (`Program::start_check_and_emit`). Each checker
+// then emits when its own check ends. `EmitAndReportStatistics` makes the
+// same calls as in Go and waits for that work. Its check time is the wait
+// for the check, and its emit time the wait for the rest of the emit.
 fn perform_incremental_compilation(
     sys: &dyn System,
     config: ParsedCommandLine,
@@ -596,6 +602,14 @@ fn perform_incremental_compilation(
         stop_tracing(sys);
         return result(status);
     }
+    let write_file = hooks.write_file();
+    if let Some(incremental_program) = &incremental_program {
+        // The options of the emit call in `EmitFilesAndReportErrors`.
+        incremental_program.start_check_and_emit(EmitOptions {
+            write_file: write_file.clone(),
+            ..EmitOptions::default()
+        });
+    }
     let program_like: &dyn ProgramLike = match &incremental_program {
         Some(incremental_program) => incremental_program,
         None => replacement.expect("a bin without an incremental program replaces it"),
@@ -607,11 +621,17 @@ fn perform_incremental_compilation(
         report_diagnostic,
         report_error_summary,
         writer: sys.writer(),
-        write_file: hooks.write_file(),
+        write_file,
         compile_times,
         testing: testing.clone(),
         testing_m_times_cache: None,
     });
+    debug_assert!(
+        incremental_program
+            .as_ref()
+            .is_none_or(IncrementalProgram::start_check_used),
+        "the emit did not use the check and emit that started with the program"
+    );
 
     stop_tracing(sys);
 

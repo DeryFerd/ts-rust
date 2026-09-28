@@ -965,8 +965,10 @@ fn trace_bind_source_file(file: Node) -> Option<crate::tracing::Pop> {
 
 /// The state of this thread that binding must not change: synthetic nodes,
 /// ids and lazy JSDoc. A bind thread starts from a copy of the loading
-/// thread's state, so anything it adds would be lost.
-fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
+/// thread's state, so anything it adds would be lost. The early emit
+/// (`execute::incremental::Program::start_check_and_emit`) also reads it:
+/// an emit pool starts from a copy of the same state.
+pub(crate) fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     (
         synthetic_slot_count(),
         next_ids(),
@@ -1017,6 +1019,68 @@ pub(crate) fn note_program_load(root_tasks: usize) -> bool {
 pub fn available_cores() -> usize {
     static CORES: OnceLock<usize> = OnceLock::new();
     *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+}
+
+/// From this many physical cores on (`wide_cores`), a large program load
+/// of a one-program process parses and binds on this many threads
+/// (`ThreadBudget::one_program`).
+const WIDE_CORES: usize = 16;
+
+/// True when this process may run on at least `WIDE_CORES` CPUs and
+/// `WIDE_CORES` physical cores. Read once. The physical cores are read only
+/// when `available_cores` is at least `WIDE_CORES`.
+fn wide_cores() -> bool {
+    static WIDE: OnceLock<bool> = OnceLock::new();
+    *WIDE.get_or_init(|| {
+        available_cores() >= WIDE_CORES && physical_cores().is_some_and(|cores| cores >= WIDE_CORES)
+    })
+}
+
+/// The physical cores that this process may run on: the CPUs of
+/// `Cpus_allowed_list` in `/proc/self/status`, where the SMT siblings of one
+/// core (`topology/thread_siblings_list` in sysfs) count once. None when a
+/// file cannot be read or does not parse (not Linux, no sysfs).
+fn physical_cores() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let allowed = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+    let mut covered: Vec<usize> = Vec::new();
+    let mut cores = 0;
+    for cpu in parse_cpu_list(allowed.trim())? {
+        if covered.contains(&cpu) {
+            continue;
+        }
+        let siblings = std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))
+        .ok()?;
+        covered.extend(parse_cpu_list(siblings.trim())?);
+        covered.push(cpu);
+        cores += 1;
+    }
+    Some(cores)
+}
+
+/// The CPUs of a Linux CPU list such as `0-3,8,10-11`. None when it does
+/// not parse or names a CPU at or above 65,536.
+fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    const MAX_CPU: usize = 1 << 16;
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        let (first, last): (usize, usize) = match part.split_once('-') {
+            Some((first, last)) => (first.parse().ok()?, last.parse().ok()?),
+            None => {
+                let cpu = part.parse().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if first > last || last >= MAX_CPU {
+            return None;
+        }
+        cpus.extend(first..=last);
+    }
+    Some(cpus)
 }
 
 /// The most parse threads (the loading thread included) and bind threads
@@ -1075,7 +1139,11 @@ impl ThreadBudget {
     /// - A load that is not large parses on as many threads as the check (4
     ///   workers and the loading thread), which fit the check arenas.
     /// - A large load adds up to 3 parse workers, which use the spare
-    ///   arenas, and binds on 8 threads.
+    ///   arenas, and binds on 8 threads. When the process may run on
+    ///   `WIDE_CORES` physical cores or more (`wide_cores`), a large load
+    ///   parses and binds on `WIDE_CORES` threads (15 parse workers and the
+    ///   loading thread). The arenas do not change: `tsgo` and `goport`
+    ///   use jemalloc, which does not read `arena_max`.
     /// - With spare arenas, a load that is not large binds on as many
     ///   threads as it had parse workers. The bind threads then take the
     ///   arenas of the parse workers, which ended, and make no new ones.
@@ -1094,15 +1162,22 @@ impl ThreadBudget {
     // bind threads makes 10 arenas and 135 MB, with 4 bind threads 7 arenas
     // and 129 MB (5 bind threads: 8 arenas). At 4 cores nothing changes:
     // the counts are the core count there, so there are no spare arenas.
+    // PERF (perf10 fix #4, effect-highcore.md section 8, env runs on dbook,
+    // check mode): at 32 threads on 16 cores, 15 parse workers
+    // (`GOPORT_PARSE_THREADS=15`) cut effect's parse from 38 to 31 ms and 16
+    // bind threads its changes step from 20 to 16 ms (wall -6 to -10 ms).
+    // At 16 threads on 8 cores (mini-743d) more threads gave nothing, so the
+    // rule counts physical cores. Query is not a large load.
     pub fn one_program(extra: usize) -> Self {
         let cores = available_cores();
         let parse = DEFAULT_CHECKERS + 1;
         let parse_large = parse + 3;
         let spare = cores.min(parse_large) - cores.min(parse);
+        let wide = wide_cores();
         ThreadBudget {
             parse,
-            parse_large,
-            bind: 8,
+            parse_large: if wide { WIDE_CORES } else { parse_large },
+            bind: if wide { WIDE_CORES } else { 8 },
             bind_small: if spare > 0 { parse - 1 } else { 8 },
             arena_max: DEFAULT_CHECKERS + 2 + extra + spare,
         }
@@ -3909,10 +3984,28 @@ pub fn for_each_checker_parallel<R: Send + 'static>(cb: fn(usize, &mut Checker) 
 }
 
 // Go: compiler/checkerpool.go:136 GetGlobalDiagnostics
-fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
-    let global_diagnostics =
-        for_each_checker_parallel(|_, checker| checker.get_global_diagnostics());
-    sort_and_deduplicate_diagnostics(global_diagnostics.into_iter().flatten().collect())
+// PORT: split in a send half (this: the `forEachCheckerParallel` jobs) and
+// a wait half (`PendingGlobalDiagnostics::wait`), so that the early emit
+// can send the read behind the check and wait for it later
+// (`start_global_diagnostics`).
+fn pool_start_global_diagnostics() -> PendingGlobalDiagnostics {
+    PendingGlobalDiagnostics(
+        (0..checker_count())
+            .map(|index| send_job(index, |checker| checker.get_global_diagnostics()))
+            .collect(),
+    )
+}
+
+/// A `get_global_diagnostics` read whose checker jobs are sent and not
+/// waited for yet (`start_global_diagnostics`).
+pub struct PendingGlobalDiagnostics(Vec<std::sync::mpsc::Receiver<JobResult<Vec<Diagnostic>>>>);
+
+impl PendingGlobalDiagnostics {
+    /// Waits for every checker. Same result as `get_global_diagnostics`.
+    #[must_use]
+    pub fn wait(self) -> Vec<Diagnostic> {
+        sort_and_deduplicate_diagnostics(wait_jobs(self.0).into_iter().flatten().collect())
+    }
 }
 
 // Go: compiler/checkerpool.go:148 forEachCheckerGroupDo
@@ -4216,10 +4309,18 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics
 pub fn get_global_diagnostics() -> Vec<Diagnostic> {
+    start_global_diagnostics().wait()
+}
+
+/// `get_global_diagnostics` without the wait: sends one job to each checker
+/// of the current program and returns. Each checker runs it after the jobs
+/// sent to it before, so the read sees what those jobs added. Loading
+/// thread only.
+pub fn start_global_diagnostics() -> PendingGlobalDiagnostics {
     if prog().source_file_order.is_empty() {
-        return Vec::new();
+        return PendingGlobalDiagnostics(Vec::new());
     }
-    pool_get_global_diagnostics()
+    pool_start_global_diagnostics()
 }
 
 // Go: compiler/program.go:1302 GetDeclarationDiagnostics
@@ -4988,18 +5089,60 @@ pub fn run_on_checker_threads_for_files<R: Send + 'static>(
     files: &[Node],
     f: impl Fn(Node) -> R + Send + Sync + 'static,
 ) -> Vec<R> {
+    send_on_checker_threads_for_files(files, f).wait()
+}
+
+/// `run_on_checker_threads_for_files` without the wait: sends `f(file)` for
+/// each file to the thread of the file's checker and returns. Each checker
+/// thread runs its jobs in the order they are sent, after the jobs sent to
+/// it before. On a checker thread the jobs run here, at once.
+pub fn send_on_checker_threads_for_files<R: Send + 'static>(
+    files: &[Node],
+    f: impl Fn(Node) -> R + Send + Sync + 'static,
+) -> PendingCheckerJobs<R> {
     if worker_index().is_some() {
-        return files.iter().map(|&file| f(file)).collect();
+        return PendingCheckerJobs(
+            files
+                .iter()
+                .map(|&file| CheckerJob::Inline(f(file)))
+                .collect(),
+        );
     }
     let f = Arc::new(f);
-    let receivers = files
-        .iter()
-        .map(|&file| {
-            let f = Arc::clone(&f);
-            send_thread_job(checker_index_for_file(file), move || f(file))
-        })
-        .collect();
-    wait_jobs(receivers)
+    PendingCheckerJobs(
+        files
+            .iter()
+            .map(|&file| {
+                let f = Arc::clone(&f);
+                CheckerJob::Sent(send_thread_job(checker_index_for_file(file), move || {
+                    f(file)
+                }))
+            })
+            .collect(),
+    )
+}
+
+/// The jobs of `send_on_checker_threads_for_files`, one per file.
+pub struct PendingCheckerJobs<R>(Vec<CheckerJob<R>>);
+
+impl<R> PendingCheckerJobs<R> {
+    /// Waits for every job, then returns the results in file order. The
+    /// first panic, in file order, continues on this thread after all jobs
+    /// end (as `wait_jobs`).
+    pub fn wait(self) -> Vec<R> {
+        let results: Vec<JobResult<R>> = self
+            .0
+            .into_iter()
+            .map(|job| match job {
+                CheckerJob::Sent(receiver) => receiver.recv().expect("checker thread stopped"),
+                CheckerJob::Inline(value) => Ok(value),
+            })
+            .collect();
+        results
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+            .collect()
+    }
 }
 
 /// The pool index of the checker for `file` (Go `fileAssociations[file]`).
