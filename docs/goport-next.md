@@ -6,7 +6,8 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **int12 (after R125 is accepted).** Merge into main: goport-lsmem2 `6797d48f0`, goport-lswarm `cf8e4c465`, goport-synmem `729b1f823`, goport-lsmem3 (when verified), goport-emitj `b9c9556b9`, goport-perf10 `ee91415e8`, goport-perf11 (when verified). Verify at pin 52168999f3dc, then R126 (roster carry-forward if roster_fp.py is equal). Owns: worktree goport-int12.
+- **int12 part 2.** Add goport-lsmem3, goport-reqclean and goport-perf11 to goport-int12 when each is verified, then R126 (roster carry-forward if roster_fp.py is equal to R125). Waits for: int12 part 1 (workflow int12-part1) and those three branches.
+- **Default pin switch.** UPSTREAM.json current, ~/.local/bin/tsgo-oracle and the default Go checkout still point at dc37b5249; R125 accepted 52168999f3dc. Switch when no running work compares at the old pin (perf11 does), on zbook and every host. Owns: UPSTREAM.json, scripts/upstream/pin.py.
 
 - **Split the `ts_goport` crate.** It is one crate of 605k lines in 677 files, so every build compiles all of it on few threads, and the build cache cannot reuse any part. Start with parts that have few dependencies back into the rest: the generated `lsp/lsproto/lsp_generated/` code (about 50k lines), then `ast` and `scanner`. Measure the release build time before and after. Owns: `crates/ts_goport/Cargo.toml`, a new `crates/ts_goport_*` crate per part, workspace `Cargo.toml`. Waits for: a quiet window with no open lane in the moved files. Every open lane must rebase after it merges.
 - **Archive old rule extensions in `current.json`.** `acceptanceRuleChanges` holds 26 copies of two rules, one per batch (38 KB of 86 KB). The check reads only the entry for the current batch. Move the entries of closed batches to history with `scripts/state record note`, and keep the batch records as the archive. Owns: `docs/typechecker-state/*` (root only).
