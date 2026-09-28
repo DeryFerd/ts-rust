@@ -14,6 +14,9 @@ PROJECTS = os.path.expanduser('~/.claude/projects/-home-theo-Code-sandbox-ts-rus
 REPO = '/home/theo/Code/sandbox/ts-rust'
 POLL = re.compile(r'\b(until|while)\b[^\n]*\bdo\b[^\n]*\bsleep\b|for \w+ in[^\n]*;\s*do[^\n]*sleep|^\s*sleep \d')
 FINISHED = re.compile(r'Finished `([\w-]+)` profile \[[^\]]*\] target\(s\) in ((\d+)m )?([\d.]+)s')
+# A Bash call that writes outside /tmp or starts a job. Verifiers and profilers work in Bash and write a report
+# only at the end, so their first Edit/Write measures their work, not their setup; the first action measures setup.
+ACTION = re.compile(r"""(?<![0-9&])>{1,2}\s*(?!/dev/|/tmp/|/proc/|&)["$\w./~]|\btee\b|sed -i|open\([^)]*['"][wa]['"]|\.write_text\(|systemd-run|remote\.sh (run|job)\b|run-cargo-capped|\bcargo (build|test|run)|git worktree add|git merge\b(?!-)|git commit|git add|git push|\bstrace\b|perf (record|stat|trace)|hyperfine|/bin/tsgo\s|tsgo-oracle\s+-p|\brustfmt\b(?!.*--(check|version))""")
 
 
 def ts(s):
@@ -67,8 +70,9 @@ def main():
             files.setdefault(os.path.basename(p), p)  # one copy per transcript
     m = dict(transcripts=0, subagents=0, toolCalls=0, subagentHours=0.0, pollCalls=0, shortPollCalls=0, pollHours=0.0,
              waitGuardDenials=0, goalNoAskDenials=0, askUserQuestions=0, askBlockedHours=0.0,
-             rawSsh=0, remoteShRun=0, journalParses=0, wfstatus=0, perfSh=0, candidateSh=0)
-    builds, first_edit = {}, []
+             rawSsh=0, rawRsync=0, remoteShRun=0, remoteShLook=0, remoteShJob=0, journalParses=0, wfstatus=0,
+             facts=0, perfSh=0, candidateSh=0)
+    builds, first_edit, first_action = {}, [], []
     for name, path in files.items():
         calls, active = scan(path, lo, hi)
         if not calls:
@@ -82,6 +86,10 @@ def main():
             edits = [i for i, c in enumerate(calls) if c[0] in ('Edit', 'Write')]
             if edits:
                 first_edit.append(edits[0])
+            acts = [i for i, c in enumerate(calls) if c[0] in ('Edit', 'Write') or
+                    (c[0] == 'Bash' and ACTION.search(c[1].get('command', '') if isinstance(c[1], dict) else ''))]
+            if acts:
+                first_action.append(acts[0])
         for tool, inp, res, err, secs in calls:
             cmd = inp.get('command', '') if isinstance(inp, dict) else ''
             if tool == 'Bash' and sub and POLL.search(cmd):
@@ -96,7 +104,11 @@ def main():
                 m['askBlockedHours'] += secs / 3600
             if tool == 'Bash':
                 m['rawSsh'] += bool(re.search(r'(^|[;&|(]\s*)ssh\s', cmd))
+                m['rawRsync'] += bool(re.search(r'(^|[;&|(]\s*)rsync\s[^|;&]*\s[\w.-]+:/', cmd))
                 m['remoteShRun'] += bool(re.search(r'remote\.sh run\b', cmd))
+                m['remoteShLook'] += bool(re.search(r'remote\.sh (look|status)\b', cmd))
+                m['remoteShJob'] += bool(re.search(r'remote\.sh job\b', cmd))
+                m['facts'] += bool(re.search(r'goport/facts\b', cmd))
                 m['journalParses'] += 'journal.jsonl' in cmd
                 m['wfstatus'] += 'wfstatus' in cmd
                 m['perfSh'] += bool(re.search(r'perf\.sh\b', cmd))
@@ -107,6 +119,7 @@ def main():
                     b[1] += (int(f.group(3) or 0) * 60 + float(f.group(4))) / 3600
     m['shortPollsPerSubagentHour'] = round(m['shortPollCalls'] / m['subagentHours'], 2) if m['subagentHours'] else None
     m['medianCallsBeforeFirstEdit'] = statistics.median(first_edit) if first_edit else None
+    m['medianCallsBeforeFirstAction'] = statistics.median(first_action) if first_action else None
     m['builds'] = {k: {'count': n, 'hours': round(h, 1)} for k, (n, h) in sorted(builds.items())}
     revs = {}
     for line in open(f'{REPO}/docs/typechecker-state/history.jsonl'):

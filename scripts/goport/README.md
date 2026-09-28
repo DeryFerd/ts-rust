@@ -11,6 +11,10 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   for a quiet host). zbook is rarely quiet: run it on dbook-lan or mini-abf9.
 - `roster_fp.py <checkout>`: fingerprint of every file outside `crates/ts_goport`. Equal values
   allow the goport-only roster carry-forward (docs/typechecker-accountability.md).
+- `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
+  against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
+  the Go pins with checkouts and oracles, the project tsconfigs, the newest lane bins, active `goport-*`
+  worktrees and the last gates. Local reads only, about 2 s.
 - `wfstatus [--all]`: one line per workflow of the newest ts-rust session (state, agents done,
   running labels, age). `wfstatus <run-id>` prints that run's agent results. Use it instead of
   parsing `journal.jsonl` by hand.
@@ -96,25 +100,55 @@ How to read the result:
 
 ## Remote runners
 
-`remote.sh` copies binaries and scripts to a remote host, runs a command there in the repo root
-and fetches the results. zbook builds. Prefer `remote.sh run auto <command>`: it picks the first
-host whose lock is free and whose load is low, and holds that lock for the run. Do not wrap
-`run auto` in flock. Raw `ssh <host>` skips the locks and the path checks; use it only to look. Each host keeps a mirror at zbook's absolute paths
-(manifests and setup notes in `target/continuation-r97-goport/remote/`).
+`remote.sh` copies binaries and scripts to a remote host, runs a command there in the repo root and
+fetches the results. zbook builds. Each host keeps a mirror at zbook's absolute paths (manifests and
+setup notes in `target/continuation-r97-goport/remote/`). The header of `remote.sh` has the usage.
 
-- alvin, cup2: cloud hosts for gates, corpus suites, sweeps and oracle checks.
+| command | use | lock |
+|---|---|---|
+| `status [host...]` | per host: load, free RAM, busiest process, and the zbook lock (holder, age, waiters) | none |
+| `look <host> <cmd>` | a quick look: logs, files, hashes, tools. Same route and paths as `run`, 120 s limit | none |
+| `run <host\|auto> <cmd>` | a job in the repo root. stdin passes through: `run <host> bash -s <<'EOF'` | holds it |
+| `job <host\|auto> <cmd>` | a zbook script that does several steps on `$REMOTE_HOST` (sync, run, fetch) | holds it for the whole script |
+| `sync-bins`, `sync-scripts`, `sync-pin`, `push` | copy to the host (`all`: every host at once) | none |
+| `fetch <host> <dir>` | copy results back; never replaces a file | none |
+
+Locks:
+
+- `run` and `job` take the zbook lock `/tmp/goport-remote-<host>.lock` (dbook-lan: `goport-remote-dbook.lock`)
+  and wait for it. While one waits, it prints the holder.
+- A caller that holds the lock passes the open lock file on to its children. `run` finds it in
+  `/proc/$$/fd` and does not lock again. So `flock /tmp/goport-remote-<host>.lock remote.sh run <host> ...`
+  and scripts that do `exec 9>LOCK; flock 9` still work. The flock wrapper is optional now.
+- A script under `job` must not take the lock itself: it would wait for its own lock (`status` then shows
+  the job as holder with 1 waiting).
+- The lock does not pass through `systemd-run`. Take it inside the unit, not around `systemd-run`.
+- `auto` takes the first host in order whose lock is free, whose load is under half its cores and whose
+  mirror paths are right. When no host is free, it checks again every 30 s.
+- Until 2026-09-28, `run auto` released its lock when the command started (ssh closes inherited file
+  descriptors), and `run <host>` took no lock. `run` now keeps its shell alive as the lock holder.
+
+Do not use raw `ssh` or `rsync`. `look` reaches the host over the right route (the minis by their LAN
+names) with zbook's paths (alvin through its `zbook-paths` wrapper, dbook with `HOME=/home/theo`).
+`pin.py sync <host>` uses the ssh config route, which is Tailscale for the minis: use `remote.sh sync-pin`.
+
+Root: name a host in an agent prompt only for timing that needs zbook-class hardware (dbook-lan). Other
+jobs use `auto`. Record each package install or other host change in
+`target/continuation-r97-goport/remote/<host>-setup.md`.
+
+- alvin, cup2: cloud hosts for gates, corpus suites, sweeps and oracle checks. alvin has no sudo. cup2
+  has `sudo -n` and `/usr/local/sbin/fleet-pkg-install`.
 - dbook (ssh host `dbook-lan`): LAN host with zbook's CPU (Ryzen AI Max+ 395, 32 threads) but
   only 26 GB RAM. It runs gates and checks, and quiet timing on zbook-class hardware when no gate
-  runs. Every dbook job takes the same lock on zbook, timing included, so the two never overlap:
-  `flock /tmp/goport-remote-dbook.lock scripts/goport/remote.sh run dbook-lan <command>`.
+  runs. Every dbook job takes the same lock, timing included, so the two never overlap.
   dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
   name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
 - mini-743d (Ryzen 7 8845HS) and mini-abf9 (ssh alias `mini-abf9-1`, Ryzen 7 255): LAN minis with
   16 threads and 28 GB RAM each. They run gates and checks. Both are wired since 2026-09-28
   (mini-743d about 215 MB/s over ssh), so both are also good for quiet timing and the editor
-  benchmark (`ls_edit_bench.py`, every side on the same host). Every job
-  takes the host's own lock on zbook, timing included:
-  `flock /tmp/goport-remote-mini-743d.lock scripts/goport/remote.sh run mini-743d <command>`, and
-  `/tmp/goport-remote-mini-abf9.lock` with `run mini-abf9`. `remote.sh` always reaches them by the
-  LAN names mini-743d.local and mini-abf9.local, never Tailscale. It maps `mini-abf9-1` and the `-ts`
-  names to `mini-abf9` and `mini-743d`.
+  benchmark (`ls_edit_bench.py`, every side on the same host). Every job takes the host's own lock,
+  timing included. `remote.sh` always reaches them by the LAN names mini-743d.local and
+  mini-abf9.local, never Tailscale. It maps `mini-abf9-1` and the `-ts` names to `mini-abf9` and
+  `mini-743d`.
+- dbook-lan and the minis: `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and
+  perf, bpftrace and strace installed.

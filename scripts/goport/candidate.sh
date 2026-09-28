@@ -319,7 +319,7 @@ side_unit() {
   remote_sync() {
     [[ $host != local && $synced == 0 ]] || return 0
     synced=1
-    [[ -z $pin ]] || run_sh "python3 scripts/upstream/pin.py sync $host $pin >> $C/sync.log 2>&1"
+    [[ -z $pin ]] || run_sh "scripts/goport/remote.sh sync-pin $host $pin >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-scripts $host >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-bins $host $B >> $C/sync.log 2>&1"
   }

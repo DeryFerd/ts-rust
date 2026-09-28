@@ -1,16 +1,32 @@
 # Workflow agent brief
 
-Root pastes this text at the start of every workflow agent prompt. It replaces about 30 setup calls per agent.
+Root pastes this text word for word at the start of every workflow agent prompt, then gives the agent its lane file sections and its bins, testbin and pin paths. Root names a host only for timing that needs zbook-class hardware.
+
+This prompt holds the whole brief. Do not read `docs/goport-agent-brief.md` or AGENTS.md again unless your prompt says so.
 
 - Edit only the files your prompt gives you. Do not edit `docs/typechecker-state/*`. Do not commit unless your prompt says so. Project inputs under `target/project-inputs*` are read-only.
 - Build in your worktree with `scripts/run-cargo-capped.sh build --release -p ts_goport --bins`. Do not set `CARGO_TARGET_DIR`. Use `--profile goport` (fat LTO, 7 to 20 minutes) only when your prompt asks for timing or a release binary.
 - Before you report, run `rustfmt --edition 2024` on every `.rs` file you changed. Unformatted code costs a whole new revision.
 - You are a subagent. When you end your turn, you stop, and your background jobs stop with you. To wait for a build or a job, block in the foreground with a Bash timeout up to 600000 ms, for example `timeout 590 bash -c 'until grep -qE "^(DONE|FAIL)" LOG; do sleep 10; done'`. Do not poll in 2-minute steps.
 - A job that runs longer than 10 minutes goes under `systemd-run --user --collect --unit=<name>`, writes a log, and ends the log with one line: `DONE` or `FAIL rc=<N>`.
-- Timing: use `scripts/goport/perf.sh <label> <bin>...` on a quiet host. It refuses above load 1.5. Compare numbers only within one run.
-- Remote hosts: use `scripts/goport/remote.sh run auto <command>`. It picks a free, quiet host and holds its lock.
-- Go reference: `~/.explore/repos/microsoft__typescript-go` at the pin in `UPSTREAM.json`. `main` is at a newer accepted pin (saved state `batch.upstreamPin.to`, now `52168999f3dc`): for `main`-based work run every Go comparison with `GOPORT_PIN=52168999f3dc` through `scripts/upstream/pin.py exec`, until the default pin is switched. Port notes: `crates/ts_goport/PORTING.md`. Read only the sections you need.
-- Remote jobs always hold the host lock: `scripts/goport/remote.sh run auto <command>`. Raw `ssh` is only for a quick look, never for a run.
-- Tools in `/tmp` can vanish. Use scripts under `scripts/`.
+- Read long files (decisions.md, plan*.md, base.md, timing.md) with `grep -n` and `sed -n` ranges, not `cat`. Keep each command's output under 20 KB: bigger output spills to a file that you must then read again.
+- Tools in `/tmp` can vanish. Put tools under `scripts/` or your lane dir.
 - Return your findings as text in your final answer. Root saves them.
 - If you need a decision, choose the safe option, say which one in your answer and continue.
+
+Where things are:
+
+- `scripts/goport/facts` prints, in one call: main, the accepted revision (commit, bins, gate, evidence), the Go pins, the project tsconfigs, the newest lane bins, active worktrees and the last gates. Run it before you search for any of these.
+- Go: `main` is at pin 52168999f3dc (`facts pins` shows the live value). Its Go source is `~/.explore/repos/microsoft__typescript-go@52168999f` and its oracle `~/.local/bin/tsgo-oracle-52168999f3dc`. The checkout without `@` and the plain `tsgo-oracle` are the old default pin dc37b5249ab6: do not read Go source there for `main` work. Run each Go comparison for `main` work with `GOPORT_PIN=52168999f3dc scripts/upstream/pin.py exec -- <command>`. Port notes: `crates/ts_goport/PORTING.md` (read only the sections you need).
+- Lane bins are in `<lane>/bin`, test bins in `<lane>/tests/bin` or `<lane>/testbin`, each with `COMMIT` and `bins.sha256`. Release bins keep their symbols, so perf can resolve them.
+- Gates: the header of `scripts/goport/gate.sh` gives the usage and the stages. Results: `target/continuation-r97-goport/compat/gate/<label>/manifest.json` (verdict, binsDir, commit, upstreamPin, results).
+- The lib blobs (`lib_parse.bin`, `lib_bind.bin`) go stale after a change to the parser, scanner, factory, store, ts_ast, binder, core.rs, flags or a bundled lib. A stale blob costs time, not output. `GOPORT_LIB_PARSE_SNAPSHOT=0` and `GOPORT_LIB_SNAPSHOT=0` turn them off for A/B timing.
+
+Remote hosts (all through `scripts/goport/remote.sh`, never raw `ssh` or `rsync`):
+
+- Hosts: alvin and cup2 (cloud), dbook-lan, mini-743d and mini-abf9 (LAN). `remote.sh status` shows each host's lock holder, load and free RAM.
+- To look (logs, files, hashes, tools): `remote.sh look <host> <command>`. It takes no lock and stops after 120 s.
+- To run a job: `remote.sh run auto <command>`. It picks a free, quiet host, waits when none is free, and holds that host's lock until the command ends. For several steps on one host (sync, run, fetch), write a zbook script that uses `$REMOTE_HOST` and start it with `remote.sh job auto <script>`. The script must not take the lock itself. Name a host only when your prompt names one.
+- To copy: `remote.sh sync-bins <host> <dir>` (top-level files), `push <host> <path>` (files or trees), `sync-pin <host> <pin>`, and `fetch <host> <dir>` for results.
+- Timing: `scripts/goport/perf.sh <label> <bin>...` on a quiet host (dbook-lan or a mini), every side in one run on one host. It refuses above load 1.5. Do not time on zbook.
+- Machines: dbook-lan and the minis have `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and perf, bpftrace and strace. dbook-lan has zbook's CPU and 26 GB RAM. cup2 has `sudo -n` and `/usr/local/sbin/fleet-pkg-install`; alvin has no sudo. zbook has no passwordless sudo, paranoid 2, THP always, and a load that is often over 10.
