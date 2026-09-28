@@ -436,6 +436,25 @@ impl Checker {
         diagnostic: Option<Diagnostic>,
     ) -> TypeId {
         let symbol = self.resolve_symbol(symbol);
+        if !self.resolving_explicit_type_of_symbol.insert(symbol) {
+            return TypeId::NIL;
+        }
+        // PORT: Go `defer c.resolvingExplicitTypeOfSymbol.Delete(symbol)`. The
+        // body is in `get_explicit_type_of_symbol_worker`, so every return path
+        // deletes the symbol here. A panic skips the delete, as it skips the
+        // pops of the other checker stacks (`type_resolutions`).
+        let result = self.get_explicit_type_of_symbol_worker(symbol, diagnostic);
+        self.resolving_explicit_type_of_symbol.remove(&symbol);
+        result
+    }
+
+    // PORT: Rust-only: the part of Go `getExplicitTypeOfSymbol` after the
+    // `resolvingExplicitTypeOfSymbol` guard. `symbol` is already resolved.
+    fn get_explicit_type_of_symbol_worker(
+        &mut self,
+        symbol: SymbolId,
+        diagnostic: Option<Diagnostic>,
+    ) -> TypeId {
         let flags = self.sym(symbol).flags;
         if flags.intersects(
             SymbolFlags::FUNCTION

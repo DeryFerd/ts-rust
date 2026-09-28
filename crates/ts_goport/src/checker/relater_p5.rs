@@ -66,8 +66,8 @@ impl Checker {
                         related = self.compare_types_identical(s, t);
                     }
                 } else {
-                    // Propagate unreliable variance flag
-                    if self.in_variance_computation
+                    // Propagate unreliable variance flag in variance computations
+                    if !self.variance_stack.is_empty()
                         && variance_flags.intersects(VarianceFlags::UNRELIABLE)
                     {
                         let m = self.report_unreliable_mapper;

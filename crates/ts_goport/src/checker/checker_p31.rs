@@ -449,22 +449,16 @@ impl Checker {
                         &[
                             is_meta_property,
                             is_decorator,
-                            is_yield_expression,
                             is_for_in_or_of_statement,
                             is_computed_property_name,
                             is_heritage_clause,
-                            is_export_assignment,
-                            is_return_statement,
                         ],
                     );
                     let meta_property = res[0];
                     let decorator = res[1];
-                    let yield_expr = res[2];
-                    let for_node = res[3];
-                    let computed_name = res[4];
-                    let heritage_clause = res[5];
-                    let export_assignment = res[6];
-                    let return_statement = res[7];
+                    let for_node = res[2];
+                    let computed_name = res[3];
+                    let heritage_clause = res[4];
                     if meta_property.is_some() {
                         return; // identifiers in meta properties shouldn't be resolved, but are expressions, so must be filtered
                     }
@@ -481,18 +475,6 @@ impl Checker {
                                 decorated.parent(),
                                 decorated.parent().parent(),
                             )
-                        {
-                            return;
-                        }
-                    }
-                    // The operand of a 'yield' expression is only checked when the containing function is a
-                    // generator. Outside a generator (or outside any function), checkYieldExpression returns
-                    // early and never checks the operand, so resolving identifiers in it here would report a
-                    // spurious "Cannot find name" diagnostic.
-                    if yield_expr.is_some() {
-                        let func = get_containing_function(yield_expr);
-                        if func.is_nil()
-                            || !get_function_flags(func).intersects(FunctionFlags::GENERATOR)
                         {
                             return;
                         }
@@ -536,29 +518,13 @@ impl Checker {
                             && heritage_clause.token() == SyntaxKind::ExtendsKeyword
                         {
                             let first_extends =
-                                get_extends_heritage_clause_element(heritage_clause.parent());
+                                get_class_extends_heritage_element(heritage_clause.parent());
                             if first_extends.is_some()
                                 && location != first_extends
                                 && !is_node_descendant_of(location, first_extends)
                             {
                                 return;
                             }
-                        }
-                    }
-                    // An `export =` / `export default` inside a namespace/module block is a grammar error;
-                    // checkExportAssignment reports it and returns without resolving the expression, so
-                    // resolving identifiers in it here would report a spurious "Cannot find name" diagnostic.
-                    if export_assignment.is_some() && is_contained_by_namespace(export_assignment) {
-                        return;
-                    }
-                    // A `return` statement outside of any function body (or inside a class static block) is a
-                    // grammar error; checkReturnStatement reports it and returns without checking the return
-                    // expression, so resolving identifiers in it here would report a spurious diagnostic.
-                    if return_statement.is_some() {
-                        let container =
-                            get_containing_function_or_class_static_block(return_statement);
-                        if container.is_nil() || is_class_static_block_declaration(container) {
-                            return;
                         }
                     }
                     // Identifiers in expression contexts are emitted, so we need to follow their referenced aliases and mark them as used

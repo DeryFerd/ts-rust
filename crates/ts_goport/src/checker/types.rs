@@ -587,6 +587,13 @@ pub struct TypeNodeLinks {
     pub flow_steps: Option<Rc<[FlowStep]>>,
 }
 
+// Go: checker/types.go:385 ComputedNameNodeLinks
+#[derive(Clone, Debug, Default)]
+pub struct ComputedNameNodeLinks {
+    pub has_name: Option<bool>, // If the node has a computable name. Go `*bool`; nil is `None`.
+    pub name: String,           // Resolved name associated with the type of the node
+}
+
 /// One ancestor in the `getConditionalFlowTypeOfType` parent walk where a
 /// branch of the loop body can add a constraint. Only the tests on the
 /// type are left for each call.

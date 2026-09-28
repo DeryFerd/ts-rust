@@ -339,6 +339,14 @@ impl Checker {
 
     // Go: checker/checker.go:4070 checkReturnStatement
     pub fn check_return_statement(&mut self, node: Node) {
+        // Always check the return expression so its identifiers are resolved even when the
+        // return statement is misplaced (grammar error), keeping diagnostics stable
+        // regardless of traversal order.
+        let expr_node = node.expression();
+        let mut expr_type = self.undefined_type;
+        if expr_node.is_some() {
+            expr_type = self.check_expression_cached(expr_node);
+        }
         if self.check_grammar_statement_in_ambient_context(node) {
             return;
         }
@@ -362,15 +370,10 @@ impl Checker {
         let signature = self.get_signature_from_declaration(container);
         let return_type = self.get_return_type_of_signature(signature);
         let function_flags = get_function_flags(container);
-        let expr_node = node.expression();
         if self.strict_null_checks
             || expr_node.is_some()
             || self.ty(return_type).flags.intersects(TypeFlags::NEVER)
         {
-            let mut expr_type = self.undefined_type;
-            if expr_node.is_some() {
-                expr_type = self.check_expression_cached(expr_node);
-            }
             if is_set_accessor_declaration(container) {
                 if expr_node.is_some() {
                     self.error(node, diag::Setters_cannot_return_a_value, args![]);
@@ -723,7 +726,7 @@ impl Checker {
             self.check_class_for_static_property_name_conflicts(node);
         }
 
-        let base_type_node = get_extends_heritage_clause_element(node);
+        let base_type_node = get_class_extends_heritage_element(node);
         if base_type_node.is_some() {
             self.check_source_elements(&base_type_node.type_arguments().to_vec());
             let base_types = self.get_base_types(class_type);
@@ -840,13 +843,15 @@ impl Checker {
         self.check_members_for_override_modifier(node, class_type, type_with_this, static_type);
         let implemented_type_nodes = get_implements_heritage_clause_elements(node);
         for type_ref_node in implemented_type_nodes {
-            let expr = type_ref_node.expression();
-            if !is_entity_name_expression(expr) || is_optional_chain(expr) {
-                self.error(
-                    expr,
-                    diag::A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments,
-                    args![],
-                );
+            if is_expression_with_type_arguments(type_ref_node) {
+                let expr = type_ref_node.expression();
+                if !is_entity_name_expression(expr) || is_optional_chain(expr) {
+                    self.error(
+                        expr,
+                        diag::A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments,
+                        args![],
+                    );
+                }
             }
             self.check_type_reference_node(type_ref_node);
             let from_node = self.get_type_from_type_node(type_ref_node);
@@ -1485,7 +1490,7 @@ impl Checker {
         static_type: TypeId,
     ) {
         let mut base_with_this = TypeId::NIL;
-        let base_type_node = get_extends_heritage_clause_element(node);
+        let base_type_node = get_class_extends_heritage_element(node);
         if base_type_node.is_some() {
             let base_types = self.get_base_types(t);
             if !base_types.is_empty() {

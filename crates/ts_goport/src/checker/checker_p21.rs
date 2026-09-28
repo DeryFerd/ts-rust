@@ -118,8 +118,17 @@ impl Checker {
         if name != INTERNAL_SYMBOL_NAME_MISSING {
             return (name, true);
         } else if is_computed_property_name(node) {
+            // This is cached so `getTypeOfExpression` isn't constantly reinvoked for every property name lookup
+            let links = self.computed_name_links.get(node);
+            if let Some(has_name) = links.has_name {
+                return (links.name.clone(), has_name);
+            }
             let t = self.get_type_of_expression(node.expression());
-            return self.try_get_name_from_type(t);
+            let (name, exists) = self.try_get_name_from_type(t);
+            let links = self.computed_name_links.get(node);
+            links.name = name.clone();
+            links.has_name = Some(exists);
+            return (name, exists);
         }
         (String::new(), false)
     }
@@ -1130,7 +1139,7 @@ impl Checker {
     pub fn get_base_type_node_of_class(&self, t: TypeId) -> Node {
         let decl = get_class_like_declaration_of_symbol(&self.symbols, self.ty(t).symbol);
         if decl.is_some() {
-            return get_extends_heritage_clause_element(decl);
+            return get_class_extends_heritage_element(decl);
         }
         Node::NIL
     }

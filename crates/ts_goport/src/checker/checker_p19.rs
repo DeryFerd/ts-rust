@@ -948,9 +948,10 @@ impl Checker {
                 }
                 let base_type_nodes = get_extends_heritage_clause_elements(declaration);
                 for node in base_type_nodes {
-                    if is_entity_name_expression(node.expression()) {
+                    let name = get_heritage_clause_element_name(node);
+                    if is_entity_name(name) || is_entity_name_expression(name) {
                         let base_symbol = self.resolve_entity_name(
-                            node.expression(),
+                            name,
                             SymbolFlags::TYPE,
                             true, /*ignoreErrors*/
                             false,

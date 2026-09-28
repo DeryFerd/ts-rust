@@ -232,7 +232,7 @@ impl Checker {
         diagnostic_message: &'static Message,
     ) {
         let containing_class_decl = container.parent();
-        let base_type_node = get_extends_heritage_clause_element(containing_class_decl);
+        let base_type_node = get_class_extends_heritage_element(containing_class_decl);
         // If a containing class does not have extends clause or the class extends null
         // skip checking whether super statement is called before "this" accessing.
         if base_type_node.is_some() && !self.class_declaration_extends_null(containing_class_decl) {
@@ -290,6 +290,10 @@ impl Checker {
         }
         let type_node = node.type_();
         let expr_type = self.check_expression_ex(node.expression(), check_mode);
+        // Always check the type node so its identifiers are resolved. resolveName knows not
+        // to resolve (or report an error for) the `const` in a `const` assertion, so this is
+        // safe even for `x as const` and keeps diagnostics stable regardless of traversal order.
+        self.check_source_element(type_node);
         if is_const_type_reference(type_node) {
             if !self.is_valid_const_assertion_argument(node.expression()) {
                 self.error(
@@ -301,7 +305,6 @@ impl Checker {
             return self.get_regular_type_of_literal_type(expr_type);
         }
         self.assertion_links.get(node).expr_type = expr_type;
-        self.check_source_element(type_node);
         self.check_node_deferred(node);
         self.get_type_from_type_node(type_node)
     }

@@ -550,6 +550,8 @@ impl Checker {
                     args![],
                 );
             }
+            // The `intrinsic` keyword is a leaf type node with no child nodes to check,
+            // so skipping the checkSourceElement below visits nothing.
             return;
         }
         self.check_source_element(type_node);

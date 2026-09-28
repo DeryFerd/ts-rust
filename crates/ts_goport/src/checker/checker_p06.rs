@@ -550,9 +550,11 @@ impl Checker {
         }
         self.check_object_type_for_duplicate_declarations(node, false /*checkPrivateNames*/);
         for heritage_element in get_extends_heritage_clause_elements(node) {
-            let expr = heritage_element.expression();
-            if !is_entity_name_expression(expr) || is_optional_chain(expr) {
-                self.error(expr, diag::An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments, args![]);
+            if is_expression_with_type_arguments(heritage_element) {
+                let expr = heritage_element.expression();
+                if !is_entity_name_expression(expr) || is_optional_chain(expr) {
+                    self.error(expr, diag::An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments, args![]);
+                }
             }
             self.check_type_reference_node(heritage_element);
         }
@@ -1493,6 +1495,10 @@ impl Checker {
     // Go: checker/checker.go:5572 checkExportAssignment
     pub fn check_export_assignment(&mut self, node: Node) {
         let is_export_equals = node.is_export_equals();
+        // Always check the exported expression so its identifiers are resolved even when the
+        // export assignment is misplaced (grammar error), keeping diagnostics stable
+        // regardless of traversal order.
+        let expr_type = self.check_expression_cached(node.expression());
         let illegal_context_message = if is_export_equals {
             diag::An_export_assignment_must_be_at_the_top_level_of_a_file_or_module_declaration
         } else {
@@ -1565,7 +1571,6 @@ impl Checker {
                 // If not a value, we're interpreting the identifier as a type export, along the lines of (`export { Id as default }`)
                 if self.get_symbol_flags(sym).intersects(SymbolFlags::VALUE) {
                     // However if it is a value, we need to check it's being used correctly
-                    self.check_expression_cached(id);
                     if !is_illegal_export_default_in_cjs
                         && !node.flags().intersects(NodeFlags::AMBIENT)
                         && self.compiler_options.verbatim_module_syntax.is_true()
@@ -1640,12 +1645,7 @@ impl Checker {
                         self.add_diagnostic(diagnostic);
                     }
                 }
-            } else {
-                self.check_expression_cached(id);
-                // doesn't resolve, check as expression to mark as error
             }
-        } else {
-            self.check_expression_cached(node.expression());
         }
         if is_illegal_export_default_in_cjs {
             self.error(
@@ -1662,9 +1662,8 @@ impl Checker {
         let type_node = node.type_();
         if type_node.is_some() && node.kind() == SyntaxKind::ExportAssignment {
             let t = self.get_type_from_type_node(type_node);
-            let initializer_type = self.check_expression_cached(node.expression());
             self.check_type_assignable_to_and_optionally_elaborate(
-                initializer_type,
+                expr_type,
                 t,
                 node.expression(),
                 node.expression(),

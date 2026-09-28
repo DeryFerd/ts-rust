@@ -615,7 +615,7 @@ impl Checker {
         }
         // at this point the only legal case for parent is ClassLikeDeclaration
         let class_like_declaration = container.parent();
-        if get_extends_heritage_clause_element(class_like_declaration).is_nil() {
+        if get_class_extends_heritage_element(class_like_declaration).is_nil() {
             self.error(
                 node,
                 diag::X_super_can_only_be_referenced_in_a_derived_class,
@@ -1218,6 +1218,7 @@ impl Checker {
         self.check_grammar_import_call_expression(node);
         let args = node.arguments().to_vec();
         if args.is_empty() {
+            // No call arguments exist, so there are no child expressions to check.
             return self.create_promise_return_type(node, self.any_type);
         }
         let specifier = args[0];

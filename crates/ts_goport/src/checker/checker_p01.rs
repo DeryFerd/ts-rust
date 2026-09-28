@@ -351,8 +351,6 @@ pub struct InferenceInfo {
     pub type_parameter: TypeId,
     /// Candidates in covariant positions in decreasing depth order
     pub candidates: Vec<TypeId>,
-    /// Type argument depths of covariant inferences
-    pub candidate_depths: Vec<i32>,
     /// Candidates in contravariant positions
     pub contra_candidates: Vec<TypeId>,
     /// Cache for resolved inferred type
@@ -434,6 +432,13 @@ pub struct WideningContext {
     pub resolved_properties: Vec<SymbolId>,
     pub child_contexts: FxHashMap<String, Rc<RefCell<WideningContext>>>,
     pub widened_types: FxHashMap<TypeId, TypeId>,
+}
+
+// Go: checker/checker.go:546 VarianceStackEntry
+#[derive(Clone, Debug, Default)]
+pub struct VarianceStackEntry {
+    pub symbol: SymbolId,
+    pub type_parameters: Vec<TypeId>,
 }
 
 // Go: checker/checker.go:553 maxSerializationLevel
@@ -734,7 +739,6 @@ pub struct Checker {
     pub can_collect_symbol_alias_accessibility_data: bool,
     pub emit_resolver: Option<Rc<crate::checker::emit_resolver_p1::EmitResolver>>,
     pub was_canceled: bool,
-    pub save_deferred_diagnostics: bool,
     pub array_variances: SharedList<VarianceFlags>,
     pub globals: SymbolTable,
     pub evaluate: Evaluator,
@@ -763,6 +767,7 @@ pub struct Checker {
     pub reverse_homomorphic_mapped_cache: FxHashMap<ReverseMappedTypeKey, TypeId>,
     pub iteration_types_cache: FxHashMap<IterationTypesKey, IterationTypes>,
     pub marker_types: FxHashSet<TypeId>,
+    pub resolving_explicit_type_of_symbol: FxHashSet<SymbolId>,
     pub undefined_symbol: SymbolId,
     pub arguments_symbol: SymbolId,
     pub require_symbol: SymbolId,
@@ -786,15 +791,16 @@ pub struct Checker {
     pub factory: NodeFactory,
     pub node_links: LinkStore<Node, NodeLinks>,
     pub signature_links: LinkStore<Node, SignatureLinks>,
-    pub symbol_node_links: LinkStore<Node, SymbolNodeLinks>,
+    pub symbol_node_links: NodeLinkStore<SymbolNodeLinks>,
     pub type_node_links: LinkStore<Node, TypeNodeLinks>,
     pub enum_member_links: LinkStore<Node, EnumMemberLinks>,
     pub assertion_links: LinkStore<Node, AssertionLinks>,
     pub array_literal_links: LinkStore<Node, ArrayLiteralLinks>,
     pub switch_statement_links: LinkStore<Node, SwitchStatementLinks>,
     pub jsx_element_links: LinkStore<Node, JsxElementLinks>,
+    pub computed_name_links: LinkStore<Node, ComputedNameNodeLinks>,
     pub symbol_reference_links: LinkStore<SymbolId, SymbolReferenceLinks>,
-    pub value_symbol_links: LinkStore<SymbolId, ValueSymbolLinks>,
+    pub value_symbol_links: SymbolArenaLinkStore<ValueSymbolLinks>,
     pub mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>,
     pub deferred_symbol_links: LinkStore<SymbolId, DeferredSymbolLinks>,
     pub alias_symbol_links: LinkStore<SymbolId, AliasSymbolLinks>,
@@ -904,7 +910,7 @@ pub struct Checker {
     pub typeof_type: TypeId,
     pub type_resolutions: Vec<TypeResolution>,
     pub resolution_start: i32,
-    pub in_variance_computation: bool,
+    pub variance_stack: Vec<VarianceStackEntry>,
     /// Go `*int`; nil is `None`.
     pub apparent_argument_count: Option<i32>,
     pub last_get_combined_node_flags_node: Node,
@@ -1200,7 +1206,6 @@ impl Checker {
                 .is_false_or_unknown(),
             emit_resolver: None,
             was_canceled: false,
-            save_deferred_diagnostics: false,
             array_variances: vec![VarianceFlags::COVARIANT].into(),
             globals: SymbolTable::NIL,
             evaluate: nil_evaluator(),
@@ -1229,6 +1234,7 @@ impl Checker {
             reverse_homomorphic_mapped_cache: FxHashMap::default(),
             iteration_types_cache: FxHashMap::default(),
             marker_types: FxHashSet::default(),
+            resolving_explicit_type_of_symbol: FxHashSet::default(),
             undefined_symbol: SymbolId::NIL,
             arguments_symbol: SymbolId::NIL,
             require_symbol: SymbolId::NIL,
@@ -1260,6 +1266,7 @@ impl Checker {
             array_literal_links: LinkStore::default(),
             switch_statement_links: LinkStore::default(),
             jsx_element_links: LinkStore::default(),
+            computed_name_links: LinkStore::default(),
             symbol_reference_links: LinkStore::default(),
             value_symbol_links: LinkStore::default(),
             mapped_symbol_links: LinkStore::default(),
@@ -1370,7 +1377,7 @@ impl Checker {
             typeof_type: TypeId::NIL,
             type_resolutions: Vec::new(),
             resolution_start: 0,
-            in_variance_computation: false,
+            variance_stack: Vec::new(),
             apparent_argument_count: None,
             last_get_combined_node_flags_node: Node::NIL,
             last_get_combined_node_flags_result: NodeFlags::default(),

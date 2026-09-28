@@ -1351,16 +1351,13 @@ impl Checker {
     // Go: checker/checker.go:22977 getSymbolFromTypeReference
     pub fn get_symbol_from_type_reference(&mut self, node: Node) -> SymbolId {
         if self.symbol_node_links.get(node).resolved_symbol.is_nil() {
-            let resolved =
-                if is_const_type_reference(node) && is_assertion_expression(node.parent()) {
-                    self.unknown_symbol
-                } else {
-                    self.resolve_type_reference_name(
-                        node,
-                        SymbolFlags::TYPE,
-                        false, /*ignoreErrors*/
-                    )
-                };
+            // The `const` in a `const` assertion resolves to nothing; resolveName knows not to
+            // report an error for it, so no special-casing is needed here.
+            let resolved = self.resolve_type_reference_name(
+                node,
+                SymbolFlags::TYPE,
+                false, /*ignoreErrors*/
+            );
             self.symbol_node_links.get(node).resolved_symbol = resolved;
         }
         self.symbol_node_links.get(node).resolved_symbol

@@ -1413,20 +1413,8 @@ impl Checker {
                     if attribute_decl.name().text() == jsx_children_property_name {
                         explicitly_specify_children_attribute = true;
                     }
-                    if contextual_type.is_some() {
-                        let prop = self.get_property_of_type(contextual_type, &member_name);
-                        if prop.is_some()
-                            && !self.sym(prop).declarations.is_empty()
-                            && self.is_deprecated_symbol(prop)
-                            && is_identifier(attribute_decl.name())
-                        {
-                            let prop_declarations = self.sym(prop).declarations.clone();
-                            self.add_deprecated_suggestion(
-                                attribute_decl.name(),
-                                &prop_declarations,
-                                attribute_decl.name().text(),
-                            );
-                        }
+                    if is_identifier(attribute_decl.name()) {
+                        self.check_deprecated_property(attribute_decl.name(), contextual_type);
                     }
                     if contextual_type.is_some()
                         && check_mode.intersects(CheckMode::INFERENTIAL)

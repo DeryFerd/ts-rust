@@ -1257,9 +1257,6 @@ pub fn clone_inference_info(info: &InferenceInfo) -> InferenceInfo {
     InferenceInfo {
         type_parameter: info.type_parameter,
         candidates: info.candidates.clone(),
-        // PORT: Go removed `candidateDepths` (tsgo#4591). The field stays in
-        // `checker_p01.rs` (held by int12) and is always empty.
-        candidate_depths: Vec::new(),
         contra_candidates: info.contra_candidates.clone(),
         inferred_type: info.inferred_type,
         priority: info.priority,

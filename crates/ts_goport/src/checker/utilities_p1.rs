@@ -175,6 +175,36 @@ pub fn checker_is_const_type_reference(node: Node) -> bool {
         && node.type_name().text() == "const"
 }
 
+// Go: checker/utilities.go:134 isConstTypeReferenceName
+// isConstTypeReferenceName reports whether node is the `const` type name of a `const`
+// assertion (`x as const` / `<const>x`), which must not be resolved as a real name.
+pub fn is_const_type_reference_name(node: Node) -> bool {
+    node.is_some()
+        && is_identifier(node)
+        && node.parent().is_some()
+        && is_const_type_reference(node.parent())
+        && node.parent().parent().is_some()
+        && is_assertion_expression(node.parent().parent())
+}
+
+// Go: checker/utilities.go:144 isExportAssignmentExpressionName
+// isExportAssignmentExpressionName reports whether node is (the root entity name of) the
+// expression of an `export =` / `export default` assignment. Referencing a namespace or
+// type-only name there is legal, and checkExportAssignment decides whether it is an error,
+// so checkIdentifier must not report a value-usage error for it.
+pub fn is_export_assignment_expression_name(node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
+    let mut current = node;
+    while current.parent().is_some() && is_property_access_or_qualified_name(current.parent()) {
+        current = current.parent();
+    }
+    current.parent().is_some()
+        && is_export_assignment(current.parent())
+        && current.parent().expression() == current
+}
+
 // Go: checker/utilities.go:132 GetSingleVariableOfVariableStatement
 pub fn get_single_variable_of_variable_statement(node: Node) -> Node {
     if !is_variable_statement(node) {

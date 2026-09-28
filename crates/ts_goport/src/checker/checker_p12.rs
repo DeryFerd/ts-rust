@@ -548,6 +548,8 @@ impl Checker {
     // Go: checker/checker.go:10596 checkNonNullAssertion
     pub fn check_non_null_assertion(&mut self, node: Node) -> TypeId {
         if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
+            // checkNonNullChain checks the same operand expression (node.Expression()),
+            // so the child is still visited on this branch.
             return self.check_non_null_chain(node);
         }
         let t = self.check_expression(node.expression());
@@ -1170,6 +1172,14 @@ impl Checker {
     // Go: checker/checker.go:10924 checkYieldExpression
     pub fn check_yield_expression(&mut self, node: Node) -> TypeId {
         self.check_grammar_yield_expression(node);
+        // Always check the operand so its identifiers are resolved even when the yield is
+        // outside a generator, keeping diagnostics stable regardless of traversal order.
+        let yield_expression_type;
+        if node.expression().is_some() {
+            yield_expression_type = self.check_expression(node.expression());
+        } else {
+            yield_expression_type = self.undefined_widening_type;
+        }
         let fn_ = get_containing_function(node);
         if fn_.is_nil() {
             return self.any_type;
@@ -1219,12 +1229,6 @@ impl Checker {
         } else {
             self.any_type
         };
-        let yield_expression_type;
-        if node.expression().is_some() {
-            yield_expression_type = self.check_expression(node.expression());
-        } else {
-            yield_expression_type = self.undefined_widening_type;
-        }
         let yielded_type = self.get_yielded_type_of_yield_expression(
             node,
             yield_expression_type,

@@ -317,12 +317,15 @@ impl Checker {
                 if !right.text().is_empty()
                     && !self.check_and_report_error_for_extending_interface(node)
                 {
-                    let containing_type = if self.is_this_type_parameter(left_type) {
-                        apparent_type
-                    } else {
-                        left_type
-                    };
-                    self.report_nonexistent_property(right, containing_type, is_unchecked_js);
+                    self.add_deferred_diagnostic(Rc::new(move |c: &mut Checker| {
+                        // must be deferred because reporting this error can cause us to materialize the containing type completely (to print it), leading to erroneous circularity errors
+                        let containing_type = if c.is_this_type_parameter(left_type) {
+                            apparent_type
+                        } else {
+                            left_type
+                        };
+                        c.report_nonexistent_property(right, containing_type, is_unchecked_js);
+                    }));
                 }
                 return self.error_type;
             }
@@ -968,14 +971,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11646 getEntityNameForExtendingInterface
-    // Climbs up parents to an ExpressionWithTypeArguments, and returns its expression,
-    // but returns undefined if that expression is not an EntityNameExpression.
+    // Climbs up parents to a heritage clause element and returns its entity name.
     pub fn get_entity_name_for_extending_interface(&mut self, node: Node) -> Node {
         match node.kind() {
-            SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression => {
+            SyntaxKind::Identifier
+            | SyntaxKind::QualifiedName
+            | SyntaxKind::PropertyAccessExpression => {
                 if node.parent().is_some() {
                     return self.get_entity_name_for_extending_interface(node.parent());
                 }
+            }
+            SyntaxKind::TypeReference => {
+                return node.type_name();
             }
             SyntaxKind::ExpressionWithTypeArguments => {
                 if is_entity_name_expression(node.expression()) {

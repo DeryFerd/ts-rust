@@ -394,13 +394,18 @@ pub fn is_import_type_qualifier_part(mut node: Node) -> Node {
     Node::NIL
 }
 
-// Go: checker/utilities.go:1122 isInNameOfExpressionWithTypeArguments
-pub fn is_in_name_of_expression_with_type_arguments(mut node: Node) -> bool {
-    while node.parent().kind() == SyntaxKind::PropertyAccessExpression {
+// Go: checker/utilities.go:1145 isInNameOfExpressionWithTypeArgumentsOrHeritageTypeReference
+pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(
+    mut node: Node,
+) -> bool {
+    while node.parent().kind() == SyntaxKind::PropertyAccessExpression
+        || node.parent().kind() == SyntaxKind::QualifiedName
+    {
         node = node.parent();
     }
 
     node.parent().kind() == SyntaxKind::ExpressionWithTypeArguments
+        || is_name_of_heritage_clause_type_reference(node)
 }
 
 impl Checker {

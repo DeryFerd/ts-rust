@@ -46,8 +46,7 @@ impl Checker {
             if !self.is_error_type(super_type) {
                 // In super call, the candidate signatures are the matching arity signatures of the base constructor function instantiated
                 // with the type arguments specified in the extends clause.
-                let base_type_node =
-                    get_extends_heritage_clause_element(get_containing_class(node));
+                let base_type_node = get_class_extends_heritage_element(get_containing_class(node));
                 if base_type_node.is_some() {
                     let base_constructors = self.get_instantiated_constructors_for_type_arguments(
                         super_type,
