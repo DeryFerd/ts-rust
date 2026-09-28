@@ -13,6 +13,8 @@
 //! PORT: the compiler runs in this process with the OS override for the
 //! test system, which is for the whole process. So each test runs in a
 //! child process of its own (`run_test_in_child`).
+//! `watcher_starts_from_existing_build_info` runs two commands, so it runs
+//! each in a command child, as the tsc runner does (`command_line_in_child`).
 
 use std::rc::Rc;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -24,9 +26,12 @@ use ts_goport::execute::tsc::{CommandLineResult, ExitStatus, Watcher};
 use ts_goport::fswatch::{Event, EventKind};
 use ts_goport::gostd::{Context, context};
 
-use crate::support::child::{command_line_in_process, new_in_process_test_sys, run_test_in_child};
+use crate::support::child::{
+    ChildRun, command_line_in_process, new_in_process_test_sys, run_command_in_child,
+    run_test_in_child,
+};
 use crate::support::runner::{FileMap, TscInput};
-use crate::support::test_sys::TestSys;
+use crate::support::test_sys::{TestSys, new_test_sys};
 use crate::support::vfstest::MapFile;
 
 /// The stack of the thread that runs the build in
@@ -45,6 +50,22 @@ fn file_map<const N: usize>(entries: [(&str, MapFile); N]) -> FileMap {
 fn command_line(ctx: &Context, sys: &Rc<TestSys>, args: &[&str]) -> CommandLineResult {
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
     command_line_in_process(ctx, sys, &args)
+}
+
+/// Go `execute.CommandLine(context.Background(), sys, args, sys)` in a
+/// command child of its own (child.rs), for a runner `sys`. A child with no
+/// response (a panic) or with unported code fails the test.
+fn command_line_in_child(sys: &TestSys, args: &[&str]) -> ChildRun {
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    let result = run_command_in_child(sys, &args)
+        .unwrap_or_else(|err| panic!("tsgo {}: {err}", args.join(" ")));
+    assert!(
+        result.unported.is_none(),
+        "tsgo {}: unported {:?}",
+        args.join(" "),
+        result.unported
+    );
+    result
 }
 
 /// PORT: `n` `DoCycle` calls of Go goroutines, run on the test thread (the
@@ -377,49 +398,42 @@ fn counts(w: &dyn Watcher) -> (i32, i32) {
 
 // Go: watcher_race_test.go:296 TestWatcherStartsFromExistingBuildInfo
 ///
-/// PORT: Go recovers a panic of the watch start and fails the test; a
-/// Rust panic fails the child test itself.
+/// PORT: Go runs both commands in the test process. Here the plain compile
+/// installs one program for its process (`core::set_prog`), and watch mode
+/// registers program versions, which such a process refuses. So each
+/// command runs in a command child of its own, as in the tsc runner
+/// (`command_line_in_child`). `sys` keeps the state between them, so the
+/// watcher starts with the build info that the first command wrote. Go
+/// recovers a panic of the watch start and fails the test; here a child
+/// that panics fails it.
 #[test]
 fn watcher_starts_from_existing_build_info() {
-    run_test_in_child(
-        "tsctests::watcher_race::watcher_starts_from_existing_build_info",
-        || {
-            let input = TscInput {
-                files: file_map([
-                    (
-                        "/home/src/workspaces/project/index.ts",
-                        "export const x: number = 1;".into(),
-                    ),
-                    (
-                        "/home/src/workspaces/project/tsconfig.json",
-                        r#"{"compilerOptions":{"composite":true},"files":["index.ts"]}"#.into(),
-                    ),
-                ]),
-                ..Default::default()
-            };
-            let sys = new_in_process_test_sys(&input);
+    let input = TscInput {
+        files: file_map([
+            (
+                "/home/src/workspaces/project/index.ts",
+                "export const x: number = 1;".into(),
+            ),
+            (
+                "/home/src/workspaces/project/tsconfig.json",
+                r#"{"compilerOptions":{"composite":true},"files":["index.ts"]}"#.into(),
+            ),
+        ]),
+        ..Default::default()
+    };
+    let sys = new_test_sys(&input, false);
 
-            let result = command_line(
-                &context::background(),
-                &sys,
-                &["-p", "tsconfig.json", "--pretty", "false"],
-            );
-            assert_eq!(result.status, ExitStatus::Success);
-            assert!(
-                sys.fs_from_file_map()
-                    .file_exists("/home/src/workspaces/project/tsconfig.tsbuildinfo")
-            );
-
-            sys.clear_output();
-            let result = command_line(
-                &context::background(),
-                &sys,
-                &["--watch", "--noEmit", "--pretty", "false"],
-            );
-            assert_eq!(result.status, ExitStatus::Success);
-            assert!(result.watcher.is_some());
-        },
+    let result = command_line_in_child(&sys, &["-p", "tsconfig.json", "--pretty", "false"]);
+    assert_eq!(result.status, ExitStatus::Success);
+    assert!(
+        sys.fs_from_file_map()
+            .file_exists("/home/src/workspaces/project/tsconfig.tsbuildinfo")
     );
+
+    sys.clear_output();
+    let result = command_line_in_child(&sys, &["--watch", "--noEmit", "--pretty", "false"]);
+    assert_eq!(result.status, ExitStatus::Success);
+    assert!(result.watcher.is_some());
 }
 
 // Go: watcher_race_test.go:321 TestWatcherRebuildsWhenJsxImportSourcePragmaChanges
