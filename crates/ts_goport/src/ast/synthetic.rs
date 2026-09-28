@@ -4,10 +4,10 @@
 //! a `Node` handle whose file index is `SYNTHETIC_NODE_FILE`. Its low 32 bits
 //! index a thread-local slot list (like `SYNTHETIC_FLOW_FILE` for flow nodes).
 //!
-//! Each node slot holds a leaked `ts_ast::Node` (kind and `NodeData`), so every
-//! accessor in `node.rs` and `fields.rs` that matches on `NodeData` works on
-//! synthetic nodes without changes. Child ids inside that data are ids in the
-//! synthetic id space:
+//! Each node slot holds a leaked `ts_ast::Node` (kind and `NodeData`), so the
+//! accessors in `node.rs` and `fields.rs` that match on `NodeData` work on
+//! synthetic nodes too. Child ids inside that data are ids in the synthetic
+//! id space:
 //! - a synthetic child uses its own slot index;
 //! - a parsed child (Go shares the pointer) uses an alias slot. `Node::new`
 //!   resolves an alias slot to the parsed node, so identity is kept:
@@ -19,6 +19,14 @@
 //! `node.Flags |= f`, `node.FlowNodeData().FlowNode = f`,
 //! `node.AsX().Symbol = s`). Those fields live in the slot, not in the leaked
 //! `ts_ast::Node`, and `node.rs` reads them through the hooks below.
+//!
+//! Reads of node data are scoped: data is read inside a closure
+//! (`with_ast_node`, `with_ast_data`, or the `with_data!` macro in hot code),
+//! and a list field through a selector (`list_of!`, `modifiers_of!`). Only
+//! a parsed node gives `&'static` data (`static_ast_node`). Synthetic data
+//! is still leaked: only this file makes a `&'static` reference into it (the
+//! list handles of `synthetic_node_list_of` and the texts of
+//! `synthetic_text`), so a later change can free it in one place.
 //!
 //! PORT: parsed nodes are immutable. The setters panic on a parsed node,
 //! except on a node of a ported-parser file that the parser has not finished
@@ -205,57 +213,230 @@ fn with_node_mut<R>(n: Node, f: impl FnOnce(&mut SyntheticNode) -> R) -> R {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Read hooks for node.rs / fields.rs
+// Node data reads
 // ──────────────────────────────────────────────────────────────────────
 
-/// Hook for `raw(n)`: the ts_ast node (kind and data) of a synthetic node.
-#[must_use]
-pub fn synthetic_ast_node(n: Node) -> &'static ts_ast::Node {
+/// The ts_ast node (kind and data) of synthetic node `n`.
+// PORT: synthetic data is leaked for now, so this is `&'static`. Only this
+// file uses it: the scoped reads below, and the list handles and texts that
+// still point into the leaked data (see the module comment).
+#[cold]
+#[inline(never)]
+fn synthetic_ast_node(n: Node) -> &'static ts_ast::Node {
     with_node(n, |s| s.node)
 }
 
-/// The ts_ast node of any node, parsed or synthetic. Go dereferences the
-/// pointer, so nil panics. `node.rs` reads node data through this (`raw`).
+/// The ts_ast node of a parsed node (store or legacy), or `None` for a
+/// synthetic node. Go dereferences the pointer, so nil panics.
 // In a one-program process almost every read after the publish is a tier 0
 // store node, so only that path is inlined into callers. The synthetic file
-// index is never a tier 0 store id, so checking the tier 0 table first gives
-// the same result as the old order (synthetic, store, legacy) that
-// `ast_node_of_slow` keeps.
+// index is never a store id, so checking the store tables first gives the
+// same result as the order that `static_ast_node_slow` keeps (synthetic,
+// store, legacy).
 #[inline]
 #[must_use]
-pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
+pub fn static_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
     assert!(n.is_some(), "nil node dereference");
     match frozen_store_ast_node(n) {
-        Some(node) => node,
-        None => ast_node_of_slow(n),
+        Some(node) => Some(node),
+        None => static_ast_node_slow(n),
     }
 }
 
-/// `ast_node_of` for a node that is not a tier 0 store node: a synthetic
-/// node, a tier 1 or unpublished (built or detached) store node or a legacy
-/// node.
+/// `static_ast_node` for a node that is not a published store node: a
+/// synthetic node (`None`), an unpublished (built or detached) store node or
+/// a legacy node.
 #[cold]
 #[inline(never)]
-fn ast_node_of_slow(n: Node) -> &'static ts_ast::Node {
+fn static_ast_node_slow(n: Node) -> Option<&'static ts_ast::Node> {
     if n.file_index() == SYNTHETIC_NODE_FILE {
-        return synthetic_ast_node(n);
+        return None;
     }
     if let Some(node) = try_store_ast_node(n) {
-        return node;
+        return Some(node);
     }
-    crate::ast::go_file(n.file_index())
-        .legacy_source()
-        .parse
-        .arena
-        .get(n.node_id())
-        .expect("node is not in its file arena")
+    Some(
+        crate::ast::go_file(n.file_index())
+            .legacy_source()
+            .parse
+            .arena
+            .get(n.node_id())
+            .expect("node is not in its file arena"),
+    )
 }
 
-/// The ts_ast data of any node, parsed or synthetic.
+/// The ts_ast data of parsed node `n`, for code that reads parsed nodes
+/// only: the binder, which loads the data of a node once and passes it to
+/// the `_in` field reads (`data_accessor!`). Panics on a synthetic node.
 #[inline]
 #[must_use]
-pub fn ast_data_of(n: Node) -> &'static NodeData {
-    &ast_node_of(n).data
+pub fn parsed_node_data(n: Node) -> &'static NodeData {
+    match static_ast_node(n) {
+        Some(node) => &node.data,
+        None => panic!("synthetic node where a parsed node is read"),
+    }
+}
+
+/// Calls `f` with the ts_ast node (kind and data) of any node, parsed or
+/// synthetic. Go dereferences the pointer, so nil panics. `f` cannot keep a
+/// reference into the node. Hot node reads use the `with_data!` macro
+/// instead.
+#[inline]
+pub fn with_ast_node<R>(n: Node, f: impl FnOnce(&ts_ast::Node) -> R) -> R {
+    let node = match static_ast_node(n) {
+        Some(node) => node,
+        None => synthetic_ast_node(n),
+    };
+    f(node)
+}
+
+/// Calls `f` with the ts_ast data of any node, parsed or synthetic.
+#[inline]
+pub fn with_ast_data<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
+    with_ast_node(n, |node| f(&node.data))
+}
+
+/// `with_ast_node` for a synthetic node, out of line.
+#[cold]
+#[inline(never)]
+pub fn with_synthetic_ast_node<R>(n: Node, f: impl FnOnce(&ts_ast::Node) -> R) -> R {
+    f(synthetic_ast_node(n))
+}
+
+/// `$body` with `$d` bound to the ts_ast data (`&NodeData`) of node `$n`,
+/// parsed or synthetic, like `with_ast_data`. Go dereferences the pointer, so
+/// nil panics. `$body` cannot keep a reference into the data, and it cannot
+/// `return` from the caller.
+// PERF: the macro writes `$body` twice: inline for a parsed node (the
+// `&'static` read, with no closure call) and in a closure that runs out of
+// line for a synthetic node. A closure with two call sites is not inlined,
+// which cost about 1% of instructions in multiprog. To write `$body` once
+// instead, make this `with_ast_data($n, |$d| $body)`; no call site changes.
+macro_rules! with_data {
+    ($n:expr, |$d:ident| $body:expr) => {{
+        let n__: $crate::core::Node = $n;
+        match $crate::ast::synthetic::static_ast_node(n__) {
+            Some(node__) => {
+                let $d: &ts_ast::NodeData = &node__.data;
+                $body
+            }
+            None => $crate::ast::synthetic::with_synthetic_ast_node(n__, |node__| {
+                let $d: &ts_ast::NodeData = &node__.data;
+                $body
+            }),
+        }
+    }};
+}
+pub(crate) use with_data;
+
+/// The `NodeList` that the selector `|$d| $body` (a `ListSel` body) finds in
+/// the data of node `$n` (nil for a Go `nil` field), or `None` when the kind
+/// of `$n` has no such field. Like `with_data!`, the selector runs inline for
+/// a parsed node; a synthetic node gets it as a `ListSel`.
+macro_rules! list_of {
+    ($n:expr, |$d:ident| $body:expr) => {{
+        let n__: $crate::core::Node = $n;
+        match $crate::ast::synthetic::static_ast_node(n__) {
+            Some(node__) => {
+                let $d: &'static ts_ast::NodeData = &node__.data;
+                let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
+                found.map(|l| {
+                    $crate::ast::NodeList::from_ts(
+                        n__.file_index(),
+                        l.map($crate::ast::synthetic::AnyList::nodes),
+                    )
+                })
+            }
+            None => $crate::ast::synthetic::synthetic_node_list_of(n__, |$d| $body),
+        }
+    }};
+}
+pub(crate) use list_of;
+
+/// `list_of!` for a modifier list field.
+macro_rules! modifiers_of {
+    ($n:expr, |$d:ident| $body:expr) => {{
+        let n__: $crate::core::Node = $n;
+        match $crate::ast::synthetic::static_ast_node(n__) {
+            Some(node__) => {
+                let $d: &'static ts_ast::NodeData = &node__.data;
+                let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
+                found.map(|m| {
+                    $crate::ast::ModifierList::from_ts(
+                        n__.file_index(),
+                        m.map($crate::ast::synthetic::AnyList::modifiers),
+                    )
+                })
+            }
+            None => $crate::ast::synthetic::synthetic_modifiers_of(n__, |$d| $body),
+        }
+    }};
+}
+pub(crate) use modifiers_of;
+
+/// A list or modifier list read from node data.
+#[derive(Clone, Copy)]
+pub enum AnyList<'a> {
+    Nodes(&'a ts_ast::NodeList),
+    Modifiers(&'a ts_ast::ModifierList),
+}
+
+impl<'a> AnyList<'a> {
+    /// The node list (for a modifier list, its `NodeList`).
+    #[must_use]
+    pub fn nodes(self) -> &'a ts_ast::NodeList {
+        match self {
+            Self::Nodes(l) => l,
+            Self::Modifiers(m) => &m.list,
+        }
+    }
+
+    /// The modifier list. Panics on a node list.
+    #[must_use]
+    pub fn modifiers(self) -> &'a ts_ast::ModifierList {
+        match self {
+            Self::Modifiers(m) => m,
+            Self::Nodes(_) => panic!("a NodeList is not a ModifierList"),
+        }
+    }
+}
+
+/// Finds a list field in node data. `None`: the data has no such field (a
+/// kind without it). `Some(None)`: the field is Go `nil`.
+pub type ListSel = for<'a> fn(&'a NodeData) -> Option<Option<AnyList<'a>>>;
+
+/// `list_of!` for a synthetic node.
+#[cold]
+#[inline(never)]
+#[must_use]
+pub fn synthetic_node_list_of(n: Node, sel: ListSel) -> Option<NodeList> {
+    sel(&synthetic_ast_node(n).data)
+        .map(|l| NodeList::from_ts(SYNTHETIC_NODE_FILE, l.map(AnyList::nodes)))
+}
+
+/// `modifiers_of!` for a synthetic node.
+#[cold]
+#[inline(never)]
+#[must_use]
+pub fn synthetic_modifiers_of(n: Node, sel: ListSel) -> Option<ModifierList> {
+    sel(&synthetic_ast_node(n).data)
+        .map(|m| ModifierList::from_ts(SYNTHETIC_NODE_FILE, m.map(AnyList::modifiers)))
+}
+
+/// Go `node.Text()` (and the `RawText` of template literals) of synthetic
+/// node `n`: the text that `text` finds in its data, or "" for `None`.
+// PORT: the data is leaked for now, so the text lives for the process.
+#[must_use]
+pub fn synthetic_text(n: Node, text: impl FnOnce(&NodeData) -> Option<&str>) -> &'static str {
+    text(&synthetic_ast_node(n).data).unwrap_or("")
+}
+
+/// A synthetic list with a copy of `list`, a list of synthetic node data
+/// that a read has in place (the `Node::for_each_child_and_lists` hook).
+#[must_use]
+pub fn copy_synthetic_list(list: &ts_ast::NodeList) -> NodeList {
+    let copy: &'static ts_ast::NodeList = crate::ast::store::leak_in_ast_arena(list.clone());
+    NodeList::from_ts(SYNTHETIC_NODE_FILE, Some(copy))
 }
 
 /// Hook for `Node::flags` on a synthetic node.
@@ -373,7 +554,7 @@ pub fn set_node_kind(n: Node, kind: SyntaxKind) {
 // BinaryExpression); other kinds do nothing, like Go `NodeDefault`.
 pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
     let mods = synthetic_modifiers_value(modifiers);
-    let mut data = ast_data_of(n).clone();
+    let mut data = with_ast_data(n, Clone::clone);
     match &mut data {
         NodeData::ArrowFunction(d) => d.modifiers = mods,
         NodeData::BinaryExpression(d) => d.modifiers = mods,

@@ -19,15 +19,11 @@
 //! - Unexported Go fields (`name`, `modifiers`, `facts`, `text`) are only
 //!   reachable through Go `*Node` methods, so they are not generated.
 
+// Node data is read with `with_data!` (Go reads node fields without a
+// context; we reach the parsed arena through the installed program).
+use crate::ast::synthetic::{list_of, with_data};
 use crate::prelude::*;
 use ts_ast::NodeData;
-
-/// The ts_ast data for `n`. Go reads node fields without a context; we reach
-/// the parsed arena through the installed program.
-fn node_data(n: Node) -> &'static NodeData {
-    debug_assert!(n.is_some(), "nil node dereference");
-    ast_data_of(n)
-}
 
 /// Go `nil` for an optional child.
 fn opt_node(file: usize, id: Option<ts_ast::NodeId>) -> Node {
@@ -35,15 +31,6 @@ fn opt_node(file: usize, id: Option<ts_ast::NodeId>) -> Node {
         Some(id) => Node::new(file, id),
         None => Node::NIL,
     }
-}
-
-/// Builds the `NodeList` handle for a ts_ast list. `None` is Go `nil`.
-// PORT: PORTING.md gives `NodeList` only as an example shape
-// (`{ file: u32, list: Option<&'static ts_ast::NodeList> }`). The handle is
-// `NodeList::from_ts` of that pair (U1 (e) adds a pending form for parser
-// lists that no node holds yet).
-fn make_node_list(file: usize, list: Option<&'static ts_ast::NodeList>) -> NodeList {
-    NodeList::from_ts(file, list)
 }
 
 /// Go panics with a failed type assertion when `AsX()` gets the wrong kind.
@@ -65,7 +52,7 @@ impl Node {
     #[must_use]
     pub fn full_signature(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::FunctionDeclaration(d) => opt_node(file, d.full_signature),
             NodeData::CallSignatureDeclaration(d) => opt_node(file, d.full_signature),
             NodeData::ConstructSignatureDeclaration(d) => opt_node(file, d.full_signature),
@@ -81,7 +68,7 @@ impl Node {
             NodeData::ConstructorTypeNode(d) => opt_node(file, d.full_signature),
             NodeData::JsDocSignature(d) => opt_node(file, d.full_signature),
             _ => field_panic(self, "FullSignature"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:164 AsteriskToken
@@ -89,7 +76,7 @@ impl Node {
     #[must_use]
     pub fn asterisk_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::FunctionDeclaration(d) => opt_node(file, d.asterisk_token),
             NodeData::ConstructorDeclaration(d) => opt_node(file, d.asterisk_token),
             NodeData::GetAccessorDeclaration(d) => opt_node(file, d.asterisk_token),
@@ -100,27 +87,28 @@ impl Node {
             NodeData::FunctionExpression(d) => opt_node(file, d.asterisk_token),
             NodeData::ModuleDeclaration(d) => opt_node(file, d.asterisk_token),
             _ => field_panic(self, "AsteriskToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:182 HeritageClauses
     /// Go `node.AsX().HeritageClauses` for: ClassDeclaration, ClassExpression, InterfaceDeclaration.
     #[must_use]
     pub fn heritage_clauses(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::ClassDeclaration(d) => make_node_list(file, d.heritage_clauses.as_ref()),
-            NodeData::ClassExpression(d) => make_node_list(file, d.heritage_clauses.as_ref()),
-            NodeData::InterfaceDeclaration(d) => make_node_list(file, d.heritage_clauses.as_ref()),
-            _ => field_panic(self, "HeritageClauses"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::ClassDeclaration(d) => Some(d.heritage_clauses.as_ref().map(AnyList::Nodes)),
+            NodeData::ClassExpression(d) => Some(d.heritage_clauses.as_ref().map(AnyList::Nodes)),
+            NodeData::InterfaceDeclaration(d) =>
+                Some(d.heritage_clauses.as_ref().map(AnyList::Nodes)),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "HeritageClauses"))
     }
 
     // Go: ast/ast_generated.go:188 TokenFlags
     /// Go `node.AsX().TokenFlags` for: StringLiteral, NumericLiteral, BigIntLiteral, RegularExpressionLiteral, NoSubstitutionTemplateLiteral, TemplateHead, TemplateMiddle, TemplateTail, JsxText.
     #[must_use]
     pub fn token_flags(self) -> TokenFlags {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::StringLiteral(d) => TokenFlags(d.token_flags.0 as i32),
             NodeData::NumericLiteral(d) => TokenFlags(d.token_flags.0 as i32),
             NodeData::BigIntLiteral(d) => TokenFlags(d.token_flags.0 as i32),
@@ -131,65 +119,66 @@ impl Node {
             NodeData::TemplateTail(d) => TokenFlags(d.token_flags.0 as i32),
             NodeData::JsxText(d) => TokenFlags(d.token_flags.0 as i32),
             _ => field_panic(self, "TokenFlags"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:199 TemplateFlags
     /// Go `node.AsX().TemplateFlags` for: NoSubstitutionTemplateLiteral, TemplateHead, TemplateMiddle, TemplateTail.
     #[must_use]
     pub fn template_flags(self) -> TokenFlags {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::NoSubstitutionTemplateLiteral(d) => TokenFlags(d.template_flags.0 as i32),
             NodeData::TemplateHead(d) => TokenFlags(d.template_flags.0 as i32),
             NodeData::TemplateMiddle(d) => TokenFlags(d.template_flags.0 as i32),
             NodeData::TemplateTail(d) => TokenFlags(d.template_flags.0 as i32),
             _ => field_panic(self, "TemplateFlags"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:2321 Types
     /// Go `node.AsX().Types` for: HeritageClause, UnionTypeNode, IntersectionTypeNode.
     #[must_use]
     pub fn types(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::HeritageClause(d) => make_node_list(file, Some(&d.types)),
-            NodeData::UnionTypeNode(d) => make_node_list(file, Some(&d.types)),
-            NodeData::IntersectionTypeNode(d) => make_node_list(file, Some(&d.types)),
-            _ => field_panic(self, "Types"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::HeritageClause(d) => Some(Some(AnyList::Nodes(&d.types))),
+            NodeData::UnionTypeNode(d) => Some(Some(AnyList::Nodes(&d.types))),
+            NodeData::IntersectionTypeNode(d) => Some(Some(AnyList::Nodes(&d.types))),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "Types"))
     }
 
     // Go: ast/ast_generated.go:7053 Comment
     /// Go `node.AsX().Comment` for: JSDoc, JSDocTypeTag, JSDocUnknownTag, JSDocTemplateTag, JSDocReturnTag, JSDocPublicTag, JSDocPrivateTag, JSDocProtectedTag, JSDocReadonlyTag, JSDocOverrideTag, JSDocDeprecatedTag, JSDocSeeTag, JSDocImplementsTag, JSDocAugmentsTag, JSDocSatisfiesTag, JSDocThrowsTag, JSDocThisTag, JSDocImportTag, JSDocCallbackTag, JSDocOverloadTag, JSDocTypedefTag, JSDocParameterOrPropertyTag.
     #[must_use]
     pub fn comment(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::JsDoc(d) => make_node_list(file, Some(&d.comment)),
-            NodeData::JsDocTypeTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocUnknownTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocTemplateTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocReturnTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocPublicTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocPrivateTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocProtectedTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocReadonlyTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocOverrideTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocDeprecatedTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocSeeTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocImplementsTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocAugmentsTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocSatisfiesTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocThrowsTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocThisTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocImportTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocCallbackTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocOverloadTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocTypedefTag(d) => make_node_list(file, d.comment.as_ref()),
-            NodeData::JsDocParameterOrPropertyTag(d) => make_node_list(file, d.comment.as_ref()),
-            _ => field_panic(self, "Comment"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::JsDoc(d) => Some(Some(AnyList::Nodes(&d.comment))),
+            NodeData::JsDocTypeTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocUnknownTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocTemplateTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocReturnTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocPublicTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocPrivateTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocProtectedTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocReadonlyTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocOverrideTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocDeprecatedTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocSeeTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocImplementsTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocAugmentsTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocSatisfiesTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocThrowsTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocThisTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocImportTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocCallbackTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocOverloadTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocTypedefTag(d) => Some(d.comment.as_ref().map(AnyList::Nodes)),
+            NodeData::JsDocParameterOrPropertyTag(d) =>
+                Some(d.comment.as_ref().map(AnyList::Nodes)),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "Comment"))
     }
 
     // Go: ast/ast_generated.go:839 Left
@@ -197,11 +186,11 @@ impl Node {
     #[must_use]
     pub fn left(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::QualifiedName(d) => Node::new(file, d.left),
             NodeData::BinaryExpression(d) => Node::new(file, d.left),
             _ => field_panic(self, "Left"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:840 Right
@@ -209,11 +198,11 @@ impl Node {
     #[must_use]
     pub fn right(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::QualifiedName(d) => Node::new(file, d.right),
             NodeData::BinaryExpression(d) => Node::new(file, d.right),
             _ => field_panic(self, "Right"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:989 ThenStatement
@@ -221,10 +210,10 @@ impl Node {
     #[must_use]
     pub fn then_statement(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::IfStatement(d) => Node::new(file, d.then_statement),
             _ => field_panic(self, "ThenStatement"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:990 ElseStatement
@@ -232,10 +221,10 @@ impl Node {
     #[must_use]
     pub fn else_statement(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::IfStatement(d) => opt_node(file, d.else_statement),
             _ => field_panic(self, "ElseStatement"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1129 Condition
@@ -243,11 +232,11 @@ impl Node {
     #[must_use]
     pub fn condition(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ForStatement(d) => opt_node(file, d.condition),
             NodeData::ConditionalExpression(d) => Node::new(file, d.condition),
             _ => field_panic(self, "Condition"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1130 Incrementor
@@ -255,10 +244,10 @@ impl Node {
     #[must_use]
     pub fn incrementor(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ForStatement(d) => opt_node(file, d.incrementor),
             _ => field_panic(self, "Incrementor"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1183 AwaitModifier
@@ -266,10 +255,10 @@ impl Node {
     #[must_use]
     pub fn await_modifier(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ForInOrOfStatement(d) => opt_node(file, d.await_modifier),
             _ => field_panic(self, "AwaitModifier"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1397 CaseBlock
@@ -277,21 +266,21 @@ impl Node {
     #[must_use]
     pub fn case_block(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::SwitchStatement(d) => Node::new(file, d.case_block),
             _ => field_panic(self, "CaseBlock"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1443 Clauses
     /// Go `node.AsX().Clauses` for: CaseBlock.
     #[must_use]
     pub fn clauses(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::CaseBlock(d) => make_node_list(file, Some(&d.clauses)),
-            _ => field_panic(self, "Clauses"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::CaseBlock(d) => Some(Some(AnyList::Nodes(&d.clauses))),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "Clauses"))
     }
 
     // Go: ast/ast_generated.go:1488 FallthroughFlowNode
@@ -302,10 +291,10 @@ impl Node {
     /// slot. The ts_ast value is not a Go flow node id and is not read.
     #[must_use]
     pub fn fallthrough_flow_node(self) -> FlowNodeId {
-        match node_data(self) {
-            NodeData::CaseOrDefaultClause(_) => self.bind().flow_node,
+        with_data!(self, |d| match d {
+            NodeData::CaseOrDefaultClause(_) => self.flow_node(),
             _ => field_panic(self, "FallthroughFlowNode"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1580 TryBlock
@@ -313,10 +302,10 @@ impl Node {
     #[must_use]
     pub fn try_block(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TryStatement(d) => Node::new(file, d.try_block),
             _ => field_panic(self, "TryBlock"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1581 CatchClause
@@ -324,10 +313,10 @@ impl Node {
     #[must_use]
     pub fn catch_clause(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TryStatement(d) => opt_node(file, d.catch_clause),
             _ => field_panic(self, "CatchClause"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1582 FinallyBlock
@@ -335,10 +324,10 @@ impl Node {
     #[must_use]
     pub fn finally_block(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TryStatement(d) => opt_node(file, d.finally_block),
             _ => field_panic(self, "FinallyBlock"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1630 VariableDeclaration
@@ -346,10 +335,10 @@ impl Node {
     #[must_use]
     pub fn variable_declaration(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::CatchClause(d) => opt_node(file, d.variable_declaration),
             _ => field_panic(self, "VariableDeclaration"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1631 Block
@@ -357,23 +346,23 @@ impl Node {
     #[must_use]
     pub fn block(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::CatchClause(d) => Node::new(file, d.block),
             _ => field_panic(self, "Block"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1781 MultiLine
     /// Go `node.AsX().MultiLine` for: Block, ArrayLiteralExpression, ObjectLiteralExpression, ImportAttributes.
     #[must_use]
     pub fn multi_line(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::Block(d) => d.multi_line,
             NodeData::ArrayLiteralExpression(d) => d.multi_line,
             NodeData::ObjectLiteralExpression(d) => d.multi_line,
             NodeData::ImportAttributes(d) => d.multi_line,
             _ => field_panic(self, "MultiLine"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1826 DeclarationList
@@ -381,10 +370,10 @@ impl Node {
     #[must_use]
     pub fn declaration_list(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::VariableStatement(d) => Node::new(file, d.declaration_list),
             _ => field_panic(self, "DeclarationList"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1869 ExclamationToken
@@ -392,21 +381,21 @@ impl Node {
     #[must_use]
     pub fn exclamation_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::VariableDeclaration(d) => opt_node(file, d.exclamation_token),
             _ => field_panic(self, "ExclamationToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:1920 Declarations
     /// Go `node.AsX().Declarations` for: VariableDeclarationList.
     #[must_use]
     pub fn declarations(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::VariableDeclarationList(d) => make_node_list(file, Some(&d.declarations)),
-            _ => field_panic(self, "Declarations"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::VariableDeclarationList(d) => Some(Some(AnyList::Nodes(&d.declarations))),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "Declarations"))
     }
 
     // Go: ast/ast_generated.go:2006 DotDotDotToken
@@ -414,7 +403,7 @@ impl Node {
     #[must_use]
     pub fn dot_dot_dot_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ParameterDeclaration(d) => opt_node(file, d.dot_dot_dot_token),
             NodeData::BindingElement(d) => opt_node(file, d.dot_dot_dot_token),
             // PORT: an array binding hole, Go `BindingElement` with nil fields.
@@ -424,28 +413,28 @@ impl Node {
             NodeData::NamedTupleMember(d) => opt_node(file, d.dot_dot_dot_token),
             NodeData::JsxExpression(d) => opt_node(file, d.dot_dot_dot_token),
             _ => field_panic(self, "DotDotDotToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:2320 Token
     /// Go `node.AsX().Token` for: HeritageClause, ImportAttributes.
     #[must_use]
     pub fn token(self) -> SyntaxKind {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::HeritageClause(d) => d.token,
             NodeData::ImportAttributes(d) => d.token,
             _ => field_panic(self, "Token"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:2898 IsExportEquals
     /// Go `node.AsX().IsExportEquals` for: ExportAssignment.
     #[must_use]
     pub fn is_export_equals(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ExportAssignment(d) => d.is_export_equals,
             _ => field_panic(self, "IsExportEquals"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:3889 OperatorToken
@@ -453,22 +442,22 @@ impl Node {
     #[must_use]
     pub fn operator_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::BinaryExpression(d) => Node::new(file, d.operator_token),
             _ => field_panic(self, "OperatorToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:3936 Operator
     /// Go `node.AsX().Operator` for: PrefixUnaryExpression, PostfixUnaryExpression, TypeOperatorNode.
     #[must_use]
     pub fn operator(self) -> SyntaxKind {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::PrefixUnaryExpression(d) => d.operator,
             NodeData::PostfixUnaryExpression(d) => d.operator,
             NodeData::TypeOperatorNode(d) => d.operator,
             _ => field_panic(self, "Operator"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:3937 Operand
@@ -476,11 +465,11 @@ impl Node {
     #[must_use]
     pub fn operand(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::PrefixUnaryExpression(d) => Node::new(file, d.operand),
             NodeData::PostfixUnaryExpression(d) => Node::new(file, d.operand),
             _ => field_panic(self, "Operand"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4069 EqualsGreaterThanToken
@@ -488,10 +477,10 @@ impl Node {
     #[must_use]
     pub fn equals_greater_than_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ArrowFunction(d) => Node::new(file, d.equals_greater_than_token),
             _ => field_panic(self, "EqualsGreaterThanToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4264 WhenTrue
@@ -499,10 +488,10 @@ impl Node {
     #[must_use]
     pub fn when_true(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalExpression(d) => Node::new(file, d.when_true),
             _ => field_panic(self, "WhenTrue"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4265 ColonToken
@@ -510,10 +499,10 @@ impl Node {
     #[must_use]
     pub fn colon_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalExpression(d) => Node::new(file, d.colon_token),
             _ => field_panic(self, "ColonToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4266 WhenFalse
@@ -521,10 +510,10 @@ impl Node {
     #[must_use]
     pub fn when_false(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalExpression(d) => Node::new(file, d.when_false),
             _ => field_panic(self, "WhenFalse"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4374 ArgumentExpression
@@ -532,20 +521,20 @@ impl Node {
     #[must_use]
     pub fn argument_expression(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ElementAccessExpression(d) => Node::new(file, d.argument_expression),
             _ => field_panic(self, "ArgumentExpression"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4518 KeywordToken
     /// Go `node.AsX().KeywordToken` for: MetaProperty.
     #[must_use]
     pub fn keyword_token(self) -> SyntaxKind {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::MetaProperty(d) => d.keyword_token,
             _ => field_panic(self, "KeywordToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4641 Head
@@ -553,23 +542,23 @@ impl Node {
     #[must_use]
     pub fn head(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TemplateExpression(d) => Node::new(file, d.head),
             NodeData::TemplateLiteralTypeNode(d) => Node::new(file, d.head),
             _ => field_panic(self, "Head"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4642 TemplateSpans
     /// Go `node.AsX().TemplateSpans` for: TemplateExpression, TemplateLiteralTypeNode.
     #[must_use]
     pub fn template_spans(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::TemplateExpression(d) => make_node_list(file, Some(&d.template_spans)),
-            NodeData::TemplateLiteralTypeNode(d) => make_node_list(file, Some(&d.template_spans)),
-            _ => field_panic(self, "TemplateSpans"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::TemplateExpression(d) => Some(Some(AnyList::Nodes(&d.template_spans))),
+            NodeData::TemplateLiteralTypeNode(d) => Some(Some(AnyList::Nodes(&d.template_spans))),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "TemplateSpans"))
     }
 
     // Go: ast/ast_generated.go:4687 Literal
@@ -577,12 +566,12 @@ impl Node {
     #[must_use]
     pub fn literal(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TemplateSpan(d) => Node::new(file, d.literal),
             NodeData::LiteralTypeNode(d) => Node::new(file, d.literal),
             NodeData::TemplateLiteralTypeSpan(d) => Node::new(file, d.literal),
             _ => field_panic(self, "Literal"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4732 Tag
@@ -590,10 +579,10 @@ impl Node {
     #[must_use]
     pub fn tag(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TaggedTemplateExpression(d) => Node::new(file, d.tag),
             _ => field_panic(self, "Tag"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:4735 Template
@@ -601,10 +590,10 @@ impl Node {
     #[must_use]
     pub fn template(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TaggedTemplateExpression(d) => Node::new(file, d.template),
             _ => field_panic(self, "Template"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5012 EqualsToken
@@ -612,10 +601,10 @@ impl Node {
     #[must_use]
     pub fn equals_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ShorthandPropertyAssignment(d) => opt_node(file, d.equals_token),
             _ => field_panic(self, "EqualsToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5013 ObjectAssignmentInitializer
@@ -623,12 +612,12 @@ impl Node {
     #[must_use]
     pub fn object_assignment_initializer(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ShorthandPropertyAssignment(d) => {
                 opt_node(file, d.object_assignment_initializer)
             }
             _ => field_panic(self, "ObjectAssignmentInitializer"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5382 CheckType
@@ -636,10 +625,10 @@ impl Node {
     #[must_use]
     pub fn check_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalTypeNode(d) => Node::new(file, d.check_type),
             _ => field_panic(self, "CheckType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5383 ExtendsType
@@ -647,10 +636,10 @@ impl Node {
     #[must_use]
     pub fn extends_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalTypeNode(d) => Node::new(file, d.extends_type),
             _ => field_panic(self, "ExtendsType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5384 TrueType
@@ -658,10 +647,10 @@ impl Node {
     #[must_use]
     pub fn true_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalTypeNode(d) => Node::new(file, d.true_type),
             _ => field_panic(self, "TrueType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5385 FalseType
@@ -669,10 +658,10 @@ impl Node {
     #[must_use]
     pub fn false_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ConditionalTypeNode(d) => Node::new(file, d.false_type),
             _ => field_panic(self, "FalseType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5469 TypeParameter
@@ -680,11 +669,11 @@ impl Node {
     #[must_use]
     pub fn type_parameter(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::InferTypeNode(d) => Node::new(file, d.type_parameter),
             NodeData::MappedTypeNode(d) => Node::new(file, d.type_parameter),
             _ => field_panic(self, "TypeParameter"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5507 ElementType
@@ -692,10 +681,10 @@ impl Node {
     #[must_use]
     pub fn element_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ArrayTypeNode(d) => Node::new(file, d.element_type),
             _ => field_panic(self, "ElementType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5545 ObjectType
@@ -703,10 +692,10 @@ impl Node {
     #[must_use]
     pub fn object_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::IndexedAccessTypeNode(d) => Node::new(file, d.object_type),
             _ => field_panic(self, "ObjectType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5546 IndexType
@@ -714,10 +703,10 @@ impl Node {
     #[must_use]
     pub fn index_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::IndexedAccessTypeNode(d) => Node::new(file, d.index_type),
             _ => field_panic(self, "IndexType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5585 TypeName
@@ -730,17 +719,17 @@ impl Node {
     pub fn type_name(self) -> Node {
         if let Some(type_name) = frozen_store_child(self, StoreChild::TypeName) {
             debug_assert!(
-                matches!(node_data(self), NodeData::TypeReferenceNode(d)
-                    if Node::new(self.file_index(), d.type_name) == type_name),
+                with_data!(self, |d| matches!(d, NodeData::TypeReferenceNode(d)
+                    if Node::new(self.file_index(), d.type_name) == type_name)),
                 "C2 type name column"
             );
             return type_name;
         }
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TypeReferenceNode(d) => Node::new(file, d.type_name),
             _ => field_panic(self, "TypeName"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5724 AssertsModifier
@@ -748,10 +737,10 @@ impl Node {
     #[must_use]
     pub fn asserts_modifier(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TypePredicateNode(d) => opt_node(file, d.asserts_modifier),
             _ => field_panic(self, "AssertsModifier"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5725 ParameterName
@@ -759,10 +748,10 @@ impl Node {
     #[must_use]
     pub fn parameter_name(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TypePredicateNode(d) => Node::new(file, d.parameter_name),
             _ => field_panic(self, "ParameterName"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5768 Value
@@ -770,10 +759,10 @@ impl Node {
     #[must_use]
     pub fn value(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportAttribute(d) => Node::new(file, d.value),
             _ => field_panic(self, "Value"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5863 ExprName
@@ -781,10 +770,10 @@ impl Node {
     #[must_use]
     pub fn expr_name(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TypeQueryNode(d) => Node::new(file, d.expr_name),
             _ => field_panic(self, "ExprName"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5904 ReadonlyToken
@@ -792,10 +781,10 @@ impl Node {
     #[must_use]
     pub fn readonly_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::MappedTypeNode(d) => opt_node(file, d.readonly_token),
             _ => field_panic(self, "ReadonlyToken"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:5906 NameType
@@ -803,20 +792,20 @@ impl Node {
     #[must_use]
     pub fn name_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::MappedTypeNode(d) => opt_node(file, d.name_type),
             _ => field_panic(self, "NameType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6443 IsSpread
     /// Go `node.AsX().IsSpread` for: SyntheticExpression.
     #[must_use]
     pub fn is_spread(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::SyntheticExpression(d) => d.is_spread,
             _ => field_panic(self, "IsSpread"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6444 TupleNameSource
@@ -824,10 +813,10 @@ impl Node {
     #[must_use]
     pub fn tuple_name_source(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::SyntheticExpression(d) => opt_node(file, d.tuple_name_source),
             _ => field_panic(self, "TupleNameSource"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6527 OpeningElement
@@ -835,10 +824,10 @@ impl Node {
     #[must_use]
     pub fn opening_element(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxElement(d) => Node::new(file, d.opening_element),
             _ => field_panic(self, "OpeningElement"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6529 ClosingElement
@@ -846,10 +835,10 @@ impl Node {
     #[must_use]
     pub fn closing_element(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxElement(d) => Node::new(file, d.closing_element),
             _ => field_panic(self, "ClosingElement"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6610 Namespace
@@ -857,10 +846,10 @@ impl Node {
     #[must_use]
     pub fn namespace(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxNamespacedName(d) => Node::new(file, d.namespace),
             _ => field_panic(self, "Namespace"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6741 OpeningFragment
@@ -868,10 +857,10 @@ impl Node {
     #[must_use]
     pub fn opening_fragment(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxFragment(d) => Node::new(file, d.opening_fragment),
             _ => field_panic(self, "OpeningFragment"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6743 ClosingFragment
@@ -879,31 +868,31 @@ impl Node {
     #[must_use]
     pub fn closing_fragment(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxFragment(d) => Node::new(file, d.closing_fragment),
             _ => field_panic(self, "ClosingFragment"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:6989 ContainsOnlyTriviaWhiteSpaces
     /// Go `node.AsX().ContainsOnlyTriviaWhiteSpaces` for: JsxText.
     #[must_use]
     pub fn contains_only_trivia_white_spaces(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsxText(d) => d.contains_only_trivia_white_spaces,
             _ => field_panic(self, "ContainsOnlyTriviaWhiteSpaces"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:7054 Tags
     /// Go `node.AsX().Tags` for: JSDoc.
     #[must_use]
     pub fn tags(self) -> NodeList {
-        let file = self.file_index();
-        match node_data(self) {
-            NodeData::JsDoc(d) => make_node_list(file, d.tags.as_ref()),
-            _ => field_panic(self, "Tags"),
-        }
+        list_of!(self, |d| match d {
+            NodeData::JsDoc(d) => Some(d.tags.as_ref().map(AnyList::Nodes)),
+            _ => None,
+        })
+        .unwrap_or_else(|| field_panic(self, "Tags"))
     }
 
     // Go: ast/ast_generated.go:7382 Constraint
@@ -911,11 +900,11 @@ impl Node {
     #[must_use]
     pub fn constraint(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocTemplateTag(d) => Node::new(file, d.constraint),
             NodeData::TypeParameterDeclaration(d) => opt_node(file, d.constraint),
             _ => field_panic(self, "Constraint"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:7695 NameExpression
@@ -923,20 +912,20 @@ impl Node {
     #[must_use]
     pub fn name_expression(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocSeeTag(d) => Node::new(file, d.name_expression),
             _ => field_panic(self, "NameExpression"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8218 Keyword
     /// Go `node.AsX().Keyword` for: ModuleDeclaration.
     #[must_use]
     pub fn keyword(self) -> SyntaxKind {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ModuleDeclaration(d) => d.keyword,
             _ => field_panic(self, "Keyword"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8270 ModuleReference
@@ -944,10 +933,10 @@ impl Node {
     #[must_use]
     pub fn module_reference(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportEqualsDeclaration(d) => Node::new(file, d.module_reference),
             _ => field_panic(self, "ModuleReference"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8319 ExportClause
@@ -955,20 +944,20 @@ impl Node {
     #[must_use]
     pub fn export_clause(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ExportDeclaration(d) => opt_node(file, d.export_clause),
             _ => field_panic(self, "ExportClause"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8366 IsTypeOf
     /// Go `node.AsX().IsTypeOf` for: ImportTypeNode.
     #[must_use]
     pub fn is_type_of(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportTypeNode(d) => d.is_type_of,
             _ => field_panic(self, "IsTypeOf"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8367 Argument
@@ -976,10 +965,10 @@ impl Node {
     #[must_use]
     pub fn argument(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportTypeNode(d) => Node::new(file, d.argument),
             _ => field_panic(self, "Argument"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8369 Qualifier
@@ -987,20 +976,20 @@ impl Node {
     #[must_use]
     pub fn qualifier(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportTypeNode(d) => opt_node(file, d.qualifier),
             _ => field_panic(self, "Qualifier"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8417 PhaseModifier
     /// Go `node.AsX().PhaseModifier` for: ImportClause.
     #[must_use]
     pub fn phase_modifier(self) -> SyntaxKind {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportClause(d) => d.phase_modifier.unwrap_or(SyntaxKind::Unknown),
             _ => field_panic(self, "PhaseModifier"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8419 NamedBindings
@@ -1008,10 +997,10 @@ impl Node {
     #[must_use]
     pub fn named_bindings(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::ImportClause(d) => opt_node(file, d.named_bindings),
             _ => field_panic(self, "NamedBindings"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8673 DefaultType
@@ -1019,10 +1008,10 @@ impl Node {
     #[must_use]
     pub fn default_type(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::TypeParameterDeclaration(d) => opt_node(file, d.default_type),
             _ => field_panic(self, "DefaultType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8724 ThisArg
@@ -1030,10 +1019,10 @@ impl Node {
     #[must_use]
     pub fn this_arg(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::SyntheticReferenceExpression(d) => Node::new(file, d.this_arg),
             _ => field_panic(self, "ThisArg"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8769 JSDocPropertyTags
@@ -1041,7 +1030,7 @@ impl Node {
     #[must_use]
     pub fn js_doc_property_tags(self) -> Vec<Node> {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocTypeLiteral(d) => d
                 .js_doc_property_tags
                 .as_ref()
@@ -1049,37 +1038,37 @@ impl Node {
                     ids.iter().map(|&id| Node::new(file, id)).collect()
                 }),
             _ => field_panic(self, "JSDocPropertyTags"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8770 IsArrayType
     /// Go `node.AsX().IsArrayType` for: JSDocTypeLiteral.
     #[must_use]
     pub fn is_array_type(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocTypeLiteral(d) => d.is_array_type,
             _ => field_panic(self, "IsArrayType"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8811 IsBracketed
     /// Go `node.AsX().IsBracketed` for: JSDocParameterOrPropertyTag.
     #[must_use]
     pub fn is_bracketed(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocParameterOrPropertyTag(d) => d.is_bracketed,
             _ => field_panic(self, "IsBracketed"),
-        }
+        })
     }
 
     // Go: ast/ast_generated.go:8813 IsNameFirst
     /// Go `node.AsX().IsNameFirst` for: JSDocParameterOrPropertyTag.
     #[must_use]
     pub fn is_name_first(self) -> bool {
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::JsDocParameterOrPropertyTag(d) => d.is_name_first,
             _ => field_panic(self, "IsNameFirst"),
-        }
+        })
     }
 
     // Go: ast/ast.go:2478 EndOfFileToken
@@ -1087,10 +1076,10 @@ impl Node {
     #[must_use]
     pub fn end_of_file_token(self) -> Node {
         let file = self.file_index();
-        match node_data(self) {
+        with_data!(self, |d| match d {
             NodeData::SourceFile(d) => Node::new(file, d.end_of_file_token),
             _ => field_panic(self, "EndOfFileToken"),
-        }
+        })
     }
 }
 

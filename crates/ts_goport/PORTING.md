@@ -196,9 +196,13 @@ methods reach the AST through it.
   `ast/node.rs` (for example `{ file: u32, list: Option<&'static ts_ast::NodeList> }`).
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
-- New code reads node data through `by_data!`, `data_accessor!` or the
-  binder `_in` pair. Do not add `ast_data_of` call sites: the multiprog D3
-  to D5 port removes `ast_data_of`.
+- Node data reads are scoped, so that a thread can later free its
+  synthetic nodes (`ast/synthetic.rs`). Read a field with `by_data!`,
+  `with_data!` or `with_ast_data(n, |d| ...)`, and a list field with
+  `list_of!` or `modifiers_of!` (`list_by_data!` in `node.rs`). Nothing
+  returns a reference into node data. Only parsed data is `&'static`
+  (`static_ast_node`): the binder, which binds parsed nodes only, loads it
+  once with `parsed_node_data` for the `_in` reads (`data_accessor!`).
 - Store columns and the other registry tables of a published file are read
   through one file lookup (`frozen_of` in `ast/store.rs`), not
   `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,

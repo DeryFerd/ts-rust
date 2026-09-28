@@ -22,8 +22,8 @@ use ts_goport::api::encoder::{
     encode_node, encode_source_file, go_kind_string,
 };
 use ts_goport::ast::{
-    NodeVisitor, NodeVisitorHooks, ast_data_of, new_node_visitor, source_file_file_name,
-    source_file_text,
+    NodeVisitor, NodeVisitorHooks, new_node_visitor, source_file_file_name, source_file_text,
+    with_ast_data,
 };
 use ts_goport::core::Node;
 use ts_goport::flags::{NodeFlags, ScriptKind};
@@ -578,10 +578,10 @@ fn test_decode_source_file_keyword_expressions() {
     assert_eq!(this_expr.kind(), SyntaxKind::ThisKeyword);
     // This would panic if decoded as Token instead of KeywordExpression
     // PORT: Go `thisExpr.AsKeywordExpression() != nil` checks the node data type.
-    assert!(matches!(
-        ast_data_of(this_expr),
+    assert!(with_ast_data(this_expr, |d| matches!(
+        d,
         NodeData::KeywordExpression(_)
-    ));
+    )));
 }
 
 // Go: api/encoder/decoder_test.go:302 TestDecodeSourceFile_EmptyModuleBlock

@@ -2014,7 +2014,7 @@ pub fn frozen_store_parent(n: Node) -> Option<Node> {
 }
 
 /// The ts_ast node of a published store node: the inlined fast path of
-/// `ast_node_of`. `None` as for `frozen_store_kind`. Panics like
+/// `static_ast_node`. `None` as for `frozen_store_kind`. Panics like
 /// `try_store_ast_node` on a nil or alias slot.
 #[inline]
 #[must_use]

@@ -92,13 +92,13 @@ pub fn is_property_immediately_referenced_within_declaration(
 // method panics on type parameters, and fields.rs skips the clashing field name, so
 // the field is read from the ts_ast data directly.
 fn type_parameter_declaration_expression(node: Node) -> Node {
-    match ast_data_of(node) {
+    with_ast_data(node, |d| match d {
         ts_ast::NodeData::TypeParameterDeclaration(d) => match d.expression {
             Some(id) => Node::new(node.file_index(), id),
             None => Node::NIL,
         },
         _ => panic!("AsTypeParameterDeclaration on {:?}", node.kind()),
-    }
+    })
 }
 
 impl Checker {
