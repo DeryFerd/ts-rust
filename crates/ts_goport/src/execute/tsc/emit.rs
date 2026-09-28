@@ -239,7 +239,7 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
 }
 
 // Go: execute/tsc/emit.go:136 listFiles
-// PORT: Go `fmt.Fprintln(w, "TSFILE: ", x)` puts a space between operands.
+// PORT: Go `fmt.Fprintln(w, "TSFILE:", x)` puts a space between operands.
 fn list_files(input: &EmitInput, emit_result: &EmitResult) {
     // PORT: testing. Go `defer input.Testing.OnListFilesEnd(input.Writer)`
     // is at the end (this function has no early return).
@@ -252,7 +252,7 @@ fn list_files(input: &EmitInput, emit_result: &EmitResult) {
             write_str(
                 &input.writer,
                 &format!(
-                    "TSFILE:  {}\n",
+                    "TSFILE: {}\n",
                     crate::frontend::tspath::get_normalized_absolute_path(
                         file,
                         get_current_directory()

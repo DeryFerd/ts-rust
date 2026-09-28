@@ -115,6 +115,7 @@ pub fn bool_to_tristate(b: bool) -> Tristate {
 // ---------------------------------------------------------------------------
 
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
+/// Upstream keeps this struct in sync with the API's `compilerOptions.ts`.
 // Go: core/compileroptions.go:16 CompilerOptions
 // PORT: Go `noCopy` is dropped. Go `[]string` fields are
 // `Option<Vec<String>>`: a nil slice is `None` and an empty non-nil slice is

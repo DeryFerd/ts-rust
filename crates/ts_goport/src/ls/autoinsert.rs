@@ -13,6 +13,9 @@ impl LanguageService {
         _ctx: &Context,
         params: &lsproto::VSOnAutoInsertParams,
     ) -> Result<lsproto::VSOnAutoInsertResponse, GoError> {
+        if self.user_preferences().enable_auto_closing_tags.is_false() {
+            return Ok(lsproto::VSOnAutoInsertResponse::default());
+        }
         if params.vs_ch != ">" {
             return Ok(lsproto::VSOnAutoInsertResponse::default());
         }

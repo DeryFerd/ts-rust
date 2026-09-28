@@ -1225,12 +1225,60 @@ fn tsc_extends_inputs() -> Vec<TscInput> {
         }
     }
 
+    // Go: tsc_test.go:1074 getTscExtendsNonStringPathTestCase (tsgo#4384)
+    fn get_tsc_extends_non_string_path_test_case(property_name: &str) -> TscInput {
+        TscInput {
+            sub_scenario: format!("extends config with non-string {property_name}"),
+            files: file_map! {
+                "/home/src/projects/project/tsconfig.json" => dedent(r#"
+					{
+						"extends": "./base.json",
+					}"#),
+                "/home/src/projects/project/base.json" => dedent(&(r#"
+					{
+						""#.to_string() + property_name + r#"": [1],
+					}"#)),
+                "/home/src/projects/project/main.ts" => "export const x = 1;",
+            },
+            cwd: "/home/src/projects/project".into(),
+            command_line_args: args!["-p", "tsconfig.json", "--pretty", "false"],
+            ..Default::default()
+        }
+    }
+
+    // Go: tsc_test.go:1092 getTscExtendsBase (tsgo#4384)
+    fn get_tsc_extends_base(base_contents: &str) -> FileMap {
+        file_map! {
+            "/home/src/projects/project/tsconfig.json" => dedent(r#"
+				{
+					"extends": "./base.json",
+				}"#),
+            "/home/src/projects/project/base.json" => dedent(base_contents),
+            "/home/src/projects/project/main.ts" => "export const x = 1;",
+        }
+    }
+
     vec![
         TscInput {
             sub_scenario: "when building solution with projects extends config with include".into(),
             files: get_build_config_file_extends_file_map(),
             cwd: "/home/src/workspaces/solution".into(),
             command_line_args: args!["--b", "--v", "--listFiles"],
+            ..Default::default()
+        },
+        get_tsc_extends_non_string_path_test_case("include"),
+        get_tsc_extends_non_string_path_test_case("exclude"),
+        get_tsc_extends_non_string_path_test_case("files"),
+        TscInput {
+            sub_scenario: "extends config with mixed valid and non-string include".into(),
+            files: get_tsc_extends_base(
+                r#"
+				{
+					"include": ["main.ts", 1],
+				}"#,
+            ),
+            cwd: "/home/src/projects/project".into(),
+            command_line_args: args!["-p", "tsconfig.json", "--pretty", "false"],
             ..Default::default()
         },
         TscInput {

@@ -1089,42 +1089,13 @@ impl Checker {
             );
             return self.get_next_base_constraint(indexed, stack);
         } else if flags.intersects(TypeFlags::CONDITIONAL) {
-            let (is_distributive, root_check_type, d_check_type, d_mapper) = {
-                let d = self.ty(t).as_conditional_type();
-                let root = d.root.borrow();
-                (
-                    root.is_distributive,
-                    root.check_type,
-                    d.check_type,
-                    d.mapper,
-                )
-            };
-            let restrictive = self
-                .cached_types
-                .get(&CachedTypeKey {
-                    kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION,
-                    type_id: t,
-                })
-                .copied()
-                .unwrap_or_default();
-            if is_distributive && restrictive != t {
-                let mut constraint = self.get_simplified_type(d_check_type, false /*writing*/);
-                if constraint == d_check_type {
-                    constraint = self.get_next_base_constraint(constraint, stack);
-                }
-                if constraint.is_some() && constraint != d_check_type {
-                    let mapper = self.prepend_type_mapping(root_check_type, constraint, d_mapper);
-                    let instantiated = self.get_conditional_type_instantiation(
-                        t, mapper, true, /*forConstraint*/
-                        None,
-                    );
-                    if !self.ty(instantiated).flags.intersects(TypeFlags::NEVER) {
-                        return self.get_next_base_constraint(instantiated, stack);
-                    }
-                }
+            if self.conditional_constraint_depth >= 100 {
+                return TypeId::NIL;
             }
-            let default_constraint = self.get_default_constraint_of_conditional_type(t);
-            return self.get_next_base_constraint(default_constraint, stack);
+            self.conditional_constraint_depth += 1;
+            let constraint = self.get_constraint_from_conditional_type(t);
+            self.conditional_constraint_depth -= 1;
+            return self.get_next_base_constraint(constraint, stack);
         } else if flags.intersects(TypeFlags::SUBSTITUTION) {
             let intersection = self.get_substitution_intersection(t);
             return self.get_next_base_constraint(intersection, stack);

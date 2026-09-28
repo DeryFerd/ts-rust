@@ -292,6 +292,10 @@ pub fn compile_and_emit_worker(
         testing_m_times_cache: Some(&*host.m_times),
     });
     WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
+    // Go: build/buildtask.go:236 `t.packageJsons = t.result.program.PackageJsonLookupPaths()`.
+    // It runs before the cache state below is taken, so its realpath lookups
+    // go back to the orchestrator's cache, as in Go.
+    let package_jsons = program.package_json_lookup_paths();
     // PORT: testing (see above)
     if let Some(testing) = &testing {
         testing.on_program(&program);
@@ -321,6 +325,7 @@ pub fn compile_and_emit_worker(
         fs_cache: host
             .cached_fs
             .state_excluding(&[fs_cache, &program_fs_cache]),
+        package_jsons,
     }
 }
 
@@ -501,6 +506,8 @@ impl MarshalerTo for WorkerCompileResult {
         enc.push(']');
         enc.push_str(",\"fsCache\":");
         marshal_cached_fs_state(&self.fs_cache, enc)?;
+        enc.push_str(",\"packageJsons\":");
+        append_json_quote_port_form_list(enc, &self.package_jsons);
         enc.push('}');
         Ok(())
     }
@@ -672,6 +679,7 @@ fn decode_worker_compile_result(
         statistics: None,
         output_time_stamps: Vec::new(),
         fs_cache: CachedFsState::default(),
+        package_jsons: Vec::new(),
     };
     if dec.read_token()? != JsonToken::BeginObject {
         return Err(invalid());
@@ -744,6 +752,17 @@ fn decode_worker_compile_result(
                 dec.read_token()?;
             }
             "fsCache" => result.fs_cache = decode_cached_fs_state(dec)?,
+            "packageJsons" => {
+                if dec.read_token()? != JsonToken::BeginArray {
+                    return Err(invalid());
+                }
+                while dec.peek_kind() != b']' {
+                    let mut package_json = String::new();
+                    json_unmarshal_decode(dec, &mut package_json)?;
+                    result.package_jsons.push(package_json);
+                }
+                dec.read_token()?;
+            }
             _ => dec.skip_value()?,
         }
     }
@@ -904,6 +923,7 @@ impl WorkerLauncher {
                 statistics: None,
                 output_time_stamps: Vec::new(),
                 fs_cache: CachedFsState::default(),
+                package_jsons: Vec::new(),
             }
         };
         let output = match output {
@@ -1069,6 +1089,7 @@ mod tests {
             statistics: None,
             output_time_stamps: Vec::new(),
             fs_cache: CachedFsState::default(),
+            package_jsons: vec!["/p/node_modules/x/package.json".to_string()],
         };
         let line = marshal_worker_compile_result(&result);
         let back = parse_worker_compile_result(&line).expect("the result line parses");
@@ -1086,6 +1107,7 @@ mod tests {
         assert_eq!(related[0].file_name.as_deref(), Some("/p/b.ts"));
         assert_eq!(back.build_info_emit, result.build_info_emit);
         assert_eq!(back.diagnostic_file_texts, result.diagnostic_file_texts);
+        assert_eq!(back.package_jsons, result.package_jsons);
         assert_eq!(marshal_worker_compile_result(&back), line);
     }
 }

@@ -452,7 +452,17 @@ impl LanguageService {
         }
 
         let mut call_target_display_parts = String::new();
-        if call_target_symbol.is_some() {
+        // A contextual signature for an anonymous inline function type (e.g. a callback
+        // argument) has a synthetic symbol whose name is an internal marker such as
+        // "\xFEtype". There is no meaningful name to show, so render the signature with
+        // no prefix (as we already do when there is no call target symbol) rather than
+        // leaking the internal name.
+        if call_target_symbol.is_some()
+            && !c
+                .sym(call_target_symbol)
+                .name
+                .starts_with(INTERNAL_SYMBOL_NAME_PREFIX)
+        {
             if use_full_prefix {
                 call_target_display_parts.push_str(&c.symbol_to_string_ex(
                     call_target_symbol,

@@ -348,8 +348,10 @@ impl Default for InferenceContext {
 pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
-    /// Candidates in covariant positions
+    /// Candidates in covariant positions in decreasing depth order
     pub candidates: Vec<TypeId>,
+    /// Type argument depths of covariant inferences
+    pub candidate_depths: Vec<i32>,
     /// Candidates in contravariant positions
     pub contra_candidates: Vec<TypeId>,
     /// Cache for resolved inferred type
@@ -704,6 +706,7 @@ pub struct Checker {
     pub total_instantiation_count: u32,
     pub instantiation_count: u32,
     pub instantiation_depth: u32,
+    pub conditional_constraint_depth: u32,
     pub inline_level: i32,
     pub serialization_level: i32,
     pub current_node: Node,
@@ -1157,6 +1160,7 @@ impl Checker {
             total_instantiation_count: 0,
             instantiation_count: 0,
             instantiation_depth: 0,
+            conditional_constraint_depth: 0,
             inline_level: 0,
             serialization_level: 0,
             current_node: Node::NIL,

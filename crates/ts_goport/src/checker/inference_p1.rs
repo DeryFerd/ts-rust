@@ -234,6 +234,7 @@ pub struct InferenceState {
     pub source_stack: InferenceStack,
     pub target_stack: InferenceStack,
     pub next: Option<Rc<RefCell<InferenceState>>>,
+    pub depth: i32,
 }
 
 impl Checker {
@@ -513,6 +514,7 @@ impl Checker {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
                             info.candidates = Vec::new();
+                            info.candidate_depths = Vec::new();
                             info.contra_candidates = Vec::new();
                             info.top_level = true;
                             info.priority = priority;
@@ -531,14 +533,28 @@ impl Checker {
                                     .push(candidate);
                                 self.clear_cached_inferences(ctx);
                             }
-                        } else if !self.inference_context(ctx).inferences[inference]
-                            .candidates
-                            .contains(&candidate)
-                        {
-                            self.inference_context_mut(ctx).inferences[inference]
-                                .candidates
-                                .push(candidate);
-                            self.clear_cached_inferences(ctx);
+                        } else {
+                            let depth = n.borrow().depth;
+                            let info = &mut self.inference_context_mut(ctx).inferences[inference];
+                            let found = info.candidates.iter().position(|&c| c == candidate);
+                            if found.is_none_or(|i| info.candidate_depths[i] < depth) {
+                                // Candidate isn't present or is present with lower depth
+                                if let Some(i) = found {
+                                    // Remove candidate with lower depth
+                                    info.candidates.remove(i);
+                                    info.candidate_depths.remove(i);
+                                }
+                                let index = info
+                                    .candidate_depths
+                                    .iter()
+                                    .position(|&d| d < depth)
+                                    .unwrap_or(info.candidate_depths.len());
+                                // Insert candidate at end or immediately before first candidate with lower depth.
+                                // This ensures candidates with the highest depth are stored first.
+                                info.candidates.insert(index, candidate);
+                                info.candidate_depths.insert(index, depth);
+                                self.clear_cached_inferences(ctx);
+                            }
                         }
                     }
                     if !priority.intersects(InferencePriority::RETURN_TYPE)
@@ -722,6 +738,7 @@ impl Checker {
         target_types: &[TypeId],
         variances: &[VarianceFlags],
     ) {
+        n.borrow_mut().depth += 1;
         for i in 0..std::cmp::min(source_types.len(), target_types.len()) {
             if i < variances.len()
                 && variances[i] & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
@@ -731,6 +748,7 @@ impl Checker {
                 self.infer_from_types(n, source_types[i], target_types[i]);
             }
         }
+        n.borrow_mut().depth -= 1;
     }
 
     // Go: checker/inference.go:294 inferWithPriority

@@ -674,11 +674,22 @@ impl FilesParser {
             redirect_targets_map: &'a mut Option<FxHashMap<Path, Vec<String>>>,
             redirect_files_by_path: &'a mut Option<FxHashMap<Path, RedirectsFile>>,
             package_id_to_source_file: &'a mut Option<FxHashMap<PackageId, Rc<ParsedSourceFile>>>,
+            // recordedDuplicates tracks, per task data, the set of file-name casings that
+            // have already been recorded in duplicateSourceFiles. A file that is reached
+            // from multiple import sites is walked once per site, but each distinct casing
+            // is only parsed and acquired in the parse cache once. Recording the same casing
+            // as a duplicate more than once would cause it to be released more times than it
+            // was acquired when the snapshot is disposed, leaving a dangling cache entry that
+            // panics the next time it is referenced.
+            //
+            // PORT: Go `map[*parseTaskData]*collections.Set[string]`, made on first use.
+            // The key is the `Rc` pointer of the task data, as for `seen`.
+            recorded_duplicates: FxHashMap<*const RefCell<ParseTaskData>, FxHashSet<String>>,
             total_file_count: usize,
         }
 
         impl Collector<'_> {
-            // Go: filesparser.go:347 collectFiles
+            // Go: filesparser.go:355 collectFiles
             fn collect_files(&mut self, tasks: &[ParseTaskRef]) {
                 let loader = self.loader;
                 for task in tasks {
@@ -722,7 +733,13 @@ impl FilesParser {
                     // ensure we only walk each task once
                     if let Some(checked_name) = self.seen.get(&data_key).cloned() {
                         if let Some(file) = task.borrow().file.clone() {
-                            if checked_name != normalized_file_path {
+                            if checked_name != normalized_file_path
+                                && self
+                                    .recorded_duplicates
+                                    .entry(data_key)
+                                    .or_default()
+                                    .insert(normalized_file_path.clone())
+                            {
                                 self.duplicate_source_files.push(DuplicateSourceFile {
                                     parse_options: file.parse_options().clone(),
                                     text: file.text,
@@ -966,6 +983,7 @@ impl FilesParser {
             redirect_targets_map: &mut redirect_targets_map,
             redirect_files_by_path: &mut redirect_files_by_path,
             package_id_to_source_file: &mut package_id_to_source_file,
+            recorded_duplicates: FxHashMap::default(),
             total_file_count,
         };
         collector.collect_files(&loader.root_tasks);
@@ -1034,7 +1052,7 @@ impl FilesParser {
         }
     }
 
-    // Go: filesparser.go:539 (*filesParser).addIncludeReason
+    // Go: filesparser.go:557 (*filesParser).addIncludeReason
     // PORT: Go can append a nil reason. Only the automatic type directive
     // root task has no reason, and `collectFiles` never passes it here, so a
     // nil reason is skipped.

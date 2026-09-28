@@ -1762,7 +1762,7 @@ pub fn get_containing_object_literal_element_worker(node: Node) -> Node {
             // fallthrough
             identifier_case()
         }
-        SyntaxKind::Identifier => identifier_case(),
+        SyntaxKind::Identifier | SyntaxKind::JsxNamespacedName => identifier_case(),
         _ => Node::NIL,
     }
 }

@@ -172,7 +172,7 @@ impl ts_goport::printer::EmitResolver for NilResolver {
     fn is_optional_parameter(&self, node: Node) -> bool {
         nil_emit_resolver()
     }
-    fn get_base_declarations_for_property_declaration(&self, node: Node) -> Vec<Node> {
+    fn is_this_property_assignment_declaration_redundant(&self, node: Node) -> bool {
         nil_emit_resolver()
     }
     fn get_properties_of_container_function(&self, node: Node) -> Vec<SymbolId> {
@@ -184,6 +184,9 @@ impl ts_goport::printer::EmitResolver for NilResolver {
         symbol: SymbolId,
         enclosing_declaration: Node,
     ) -> bool {
+        nil_emit_resolver()
+    }
+    fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node {
         nil_emit_resolver()
     }
     fn create_type_of_declaration(
@@ -456,10 +459,6 @@ fn test_import_elision() {
 
                 let (c, release) = ls_program::get_type_checker(p, &context::background());
                 let emit_resolver = get_emit_resolver_of_shared_checker(&c);
-                ts_goport::printer::EmitResolver::mark_linked_references_recursively(
-                    &*emit_resolver,
-                    file,
-                );
                 let emit_resolver: Rc<dyn ts_goport::printer::EmitResolver> = emit_resolver;
 
                 let opts = TransformOptions {

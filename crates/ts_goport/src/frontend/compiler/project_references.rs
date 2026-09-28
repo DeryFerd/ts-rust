@@ -781,6 +781,15 @@ impl ProjectReferenceDtsFakingVfs {
             return result == Tristate::True;
         }
 
+        let file_or_directory_path = self.to_path(file_or_directory);
+        if !file_or_directory_path.contains("/node_modules/") {
+            return false;
+        }
+        // Check if the directory or file is a symlinked package
+        let package_root = parse_node_module_from_path(file_or_directory, true /*isFolder*/);
+        if !package_root.is_empty() {
+            self.handle_directory_could_be_symlink(&package_root);
+        }
         // PORT: Go stores `*KnownDirectoryLink`; a nil link would panic at
         // the `RealPath` read, and this code never stores one.
         let known_directory_links: Vec<(Path, KnownDirectoryLink)> = self
@@ -796,10 +805,6 @@ impl ProjectReferenceDtsFakingVfs {
             })
             .collect();
         if known_directory_links.is_empty() {
-            return false;
-        }
-        let file_or_directory_path = self.to_path(file_or_directory);
-        if !file_or_directory_path.contains("/node_modules/") {
             return false;
         }
         if is_file

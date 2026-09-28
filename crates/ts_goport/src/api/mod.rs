@@ -13,6 +13,7 @@ pub mod server;
 pub mod session_p1;
 pub mod session_p2;
 pub mod stringer_generated;
+pub mod timing;
 pub mod transport;
 #[cfg(unix)]
 pub mod transport_unix;
@@ -29,6 +30,7 @@ pub use server::*;
 pub use session_p1::*;
 pub use session_p2::*;
 pub use stringer_generated::*;
+pub use timing::*;
 pub use transport::*;
 #[cfg(unix)]
 pub use transport_unix::*;
@@ -40,7 +42,7 @@ pub mod prelude {
     pub use super::{
         callbackfs::*, conn::*, conn_async::*, conn_sync::*, proto::*, protocol::*,
         protocol_jsonrpc::*, protocol_msgpack::*, server::*, session_p1::*, session_p2::*,
-        stringer_generated::*, transport::*,
+        stringer_generated::*, timing::*, transport::*,
     };
     pub use crate::api::encoder;
     pub use crate::astnav;

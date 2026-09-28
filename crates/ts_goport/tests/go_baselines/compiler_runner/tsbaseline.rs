@@ -640,8 +640,13 @@ fn prepare_declaration_compilation_context(
 ) -> Option<DeclarationCompilationContext> {
     if options.declaration.is_true() && result.diagnostics.is_empty() {
         if options.emit_declaration_only.is_true() {
-            if !result.js.is_empty() || (result.dts.is_empty() && !options.no_emit.is_true()) {
+            if !result.js.is_empty() {
                 panic!("Only declaration files should be generated when emitDeclarationOnly:true");
+            }
+            if result.dts.is_empty() && !options.no_emit.is_true() {
+                panic!(
+                    "Expected at least one declaration file to be emitted when emitDeclarationOnly:true and no errors were generated"
+                );
             }
         } else if result.dts.len() != result.get_number_of_js_files(false /*includeJson*/) {
             panic!(

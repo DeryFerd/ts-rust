@@ -881,7 +881,7 @@ pub fn create_get_isolated_declaration_errors(
             }
         };
         if !add_undefined && node.initializer().is_some() {
-            return create_expression_error(node);
+            return create_expression_error(node.initializer());
         }
         let mut msg = get_error_by_declaration_kind(node.kind());
         if add_undefined {

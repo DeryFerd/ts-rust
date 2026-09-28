@@ -84,6 +84,16 @@ impl Checker {
         self.unknown_symbol
     }
 
+    // Go: checker/exports.go:65 GetUndefinedSymbol
+    pub fn get_undefined_symbol(&self) -> SymbolId {
+        self.undefined_symbol
+    }
+
+    // Go: checker/exports.go:69 GetArgumentsSymbol
+    pub fn get_arguments_symbol(&self) -> SymbolId {
+        self.arguments_symbol
+    }
+
     // Go: checker/exports.go:65 GetUnionType
     pub fn get_union_type_exported(&mut self, types: &[TypeId]) -> TypeId {
         self.get_union_type(types)
@@ -245,6 +255,16 @@ impl Checker {
         self.get_constraint_of_type_parameter(type_parameter)
     }
 
+    // Go: checker/exports.go:172 GetTrueTypeOfConditionalType
+    pub fn get_true_type_of_conditional_type(&mut self, t: TypeId) -> TypeId {
+        self.get_true_type_from_conditional_type(t)
+    }
+
+    // Go: checker/exports.go:176 GetFalseTypeOfConditionalType
+    pub fn get_false_type_of_conditional_type(&mut self, t: TypeId) -> TypeId {
+        self.get_false_type_from_conditional_type(t)
+    }
+
     // Go: checker/exports.go:172 GetDefaultFromTypeParameter
     pub fn get_default_from_type_parameter_exported(&mut self, type_parameter: TypeId) -> TypeId {
         self.get_default_from_type_parameter(type_parameter)
@@ -284,6 +304,11 @@ impl Checker {
     // Go: checker/exports.go:192 IsTupleType
     pub fn is_tuple_type_exported(&self, t: TypeId) -> bool {
         self.is_tuple_type(t)
+    }
+
+    // Go: checker/exports.go:196 IsArrayType
+    pub fn is_array_type_exported(&self, t: TypeId) -> bool {
+        self.is_array_type(t)
     }
 
     // Go: checker/exports.go:196 GetReturnTypeOfSignature
@@ -503,5 +528,10 @@ impl Checker {
     // Go: checker/exports.go:329 GetWidenedType
     pub fn get_widened_type_exported(&mut self, t: TypeId) -> TypeId {
         self.get_widened_type(t)
+    }
+
+    // Go: checker/exports.go:353 CompareSymbols
+    pub fn compare_symbols_exported(&mut self, s1: SymbolId, s2: SymbolId) -> i32 {
+        self.compare_symbols(s1, s2)
     }
 }

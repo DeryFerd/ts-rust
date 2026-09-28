@@ -34,7 +34,7 @@ use crate::execute::build::host::BuildHost;
 use crate::execute::build::worker::{
     WorkerLauncher, compare_paths_options_of_sys, marshal_worker_fs_cache,
 };
-use crate::execute::incremental::build_info::BuildInfo;
+use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::new_build_info_reader;
 use crate::execute::tsc::compile::{
     CommandLineResult, ExitStatus, System, Watcher, Writer, write_str,
@@ -159,7 +159,7 @@ impl Orchestrator {
 
     // Go: build/orchestrator.go:91 (*Orchestrator).resolveBuildInfoFileName
     pub fn resolve_build_info_file_name(&self, file_name: &str, build_info_dir: &str) -> String {
-        if !file_name.starts_with('.') {
+        if is_build_info_file_name_default_library(file_name) {
             return combine_paths(
                 &CompilerHost::default_library_path(&*self.host),
                 &[file_name],

@@ -1197,6 +1197,7 @@ pub fn run_build_worker(
             statistics: None,
             output_time_stamps: Vec::new(),
             fs_cache: CachedFsState::default(),
+            package_jsons: Vec::new(),
         }
     };
 

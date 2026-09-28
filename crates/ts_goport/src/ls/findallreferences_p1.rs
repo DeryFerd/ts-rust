@@ -1011,7 +1011,10 @@ impl LanguageService {
             }
         } else {
             options.use_ = ReferenceUse::RENAME;
-            options.use_aliases_for_rename = true;
+            options.use_aliases_for_rename = self
+                .user_preferences()
+                .use_aliases_for_rename
+                .is_true_or_unknown();
         }
         // PORT: Go `*ast.SourceFile` is the file root `Node`.
         let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();

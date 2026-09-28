@@ -79,7 +79,10 @@ impl ParsedSourceFile {
             language_variant: LanguageVariant::default(),
             script_kind: ScriptKind::default(),
             is_declaration_file: false,
-            contains_non_ascii: false,
+            // Go: NewSourceFile sets `ContainsNonASCII` from the text
+            // (`stringutil.ContainsNonASCII`: a byte >= 0x80). A Go byte
+            // >= 0x80 is not ASCII in the port form either.
+            contains_non_ascii: !text.is_ascii(),
             uses_uri_style_node_core_modules: Tristate::Unknown,
             identifier_count: 0,
             imports: Vec::new(),

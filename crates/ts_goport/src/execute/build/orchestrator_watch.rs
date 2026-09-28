@@ -99,10 +99,10 @@ impl Orchestrator {
         needs_config_update: &mut bool,
         needs_update: &mut bool,
     ) {
-        let mut normalized_paths: FxHashSet<Path> =
-            FxHashSet::with_capacity_and_hasher(changed_paths.len(), Default::default());
-        for event_path in changed_paths.keys() {
-            normalized_paths.insert(self.to_path(event_path));
+        let mut normalized_paths: FxHashMap<Path, fswatch::EventKind> =
+            FxHashMap::with_capacity_and_hasher(changed_paths.len(), Default::default());
+        for (event_path, kind) in changed_paths {
+            normalized_paths.insert(self.to_path(event_path), *kind);
         }
 
         for config in &self.order {
@@ -111,7 +111,7 @@ impl Orchestrator {
             let mut task = task.borrow_mut();
 
             let config_path = self.to_path(&task.config);
-            if normalized_paths.contains(&config_path) {
+            if normalized_paths.contains_key(&config_path) {
                 task.reset_config(self, &path);
                 *needs_config_update = true;
                 *needs_update = true;
@@ -125,7 +125,7 @@ impl Orchestrator {
             let mut config_changed = false;
             for file in resolved.extended_source_files() {
                 let fp = self.to_path(file);
-                if normalized_paths.contains(&fp) {
+                if normalized_paths.contains_key(&fp) {
                     task.reset_config(self, &path);
                     *needs_config_update = true;
                     *needs_update = true;
@@ -144,7 +144,7 @@ impl Orchestrator {
             for file in file_names {
                 let fp = self.to_path(file);
                 roots.insert(fp.clone());
-                if !root_changed && normalized_paths.contains(&fp) {
+                if !root_changed && normalized_paths.contains_key(&fp) {
                     task.reset_status();
                     *needs_update = true;
                     root_changed = true;
@@ -165,12 +165,34 @@ impl Orchestrator {
                             if roots.contains(&fp) {
                                 continue;
                             }
-                            if normalized_paths.contains(&fp) {
+                            if normalized_paths.contains_key(&fp) {
                                 task.reset_status();
                                 *needs_update = true;
                                 break;
                             }
                         }
+                        for package_json in build_info.get_package_jsons(&build_info_dir) {
+                            if self.package_json_lookup_changed(&package_json, &normalized_paths) {
+                                task.reset_status();
+                                *needs_update = true;
+                                break;
+                            }
+                        }
+                        for package_json in build_info.get_missing_package_jsons(&build_info_dir) {
+                            if self.package_json_lookup_changed(&package_json, &normalized_paths) {
+                                task.reset_status();
+                                *needs_update = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let package_jsons = task.package_jsons.clone();
+                for package_json in &package_jsons {
+                    if self.package_json_lookup_changed(package_json, &normalized_paths) {
+                        task.reset_status();
+                        *needs_update = true;
+                        break;
                     }
                 }
             }
@@ -210,7 +232,33 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:384 (*Orchestrator).computeDesiredWatches
+    // Go: build/orchestrator.go:406 (*Orchestrator).packageJsonLookupChanged
+    // PORT: Go ranges over a map (random order); the result does not depend
+    // on the order.
+    fn package_json_lookup_changed(
+        &self,
+        package_json: &str,
+        changed_paths: &FxHashMap<Path, fswatch::EventKind>,
+    ) -> bool {
+        let package_json_path = self.to_path(package_json);
+        if changed_paths.contains_key(&package_json_path) {
+            return true;
+        }
+        for (changed_path, kind) in changed_paths {
+            if *kind == fswatch::EventKind::Delete
+                && contains_path(
+                    changed_path.as_str(),
+                    package_json_path.as_str(),
+                    &self.compare_paths_options,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: build/orchestrator.go:419 (*Orchestrator).computeDesiredWatches
     // PORT: Go ranges over `WildcardDirectories()` (a map, random order);
     // the result does not depend on the order.
     pub fn compute_desired_watches(&self) -> FxHashMap<String, bool> {
@@ -276,8 +324,9 @@ impl Orchestrator {
                         .map(|file_name| self.to_path(file_name))
                         .collect();
                     for file_name in build_info.file_names.iter().flatten() {
-                        let abs_path =
-                            self.resolve_build_info_file_name(file_name, &build_info_dir);
+                        let abs_path = fs.realpath(
+                            &self.resolve_build_info_file_name(file_name, &build_info_dir),
+                        );
                         let fp = self.to_path(&abs_path);
                         if roots.contains(&fp) {
                             continue;
@@ -292,11 +341,65 @@ impl Orchestrator {
                             desired_dirs.insert(dir, false);
                         }
                     }
+                    for package_json in build_info.get_package_jsons(&build_info_dir) {
+                        self.add_package_json_watch_dirs(&mut desired_dirs, &package_json);
+                    }
+                    for package_json in build_info.get_missing_package_jsons(&build_info_dir) {
+                        self.add_package_json_watch_dirs(&mut desired_dirs, &package_json);
+                    }
                 }
+            }
+            for package_json in &task.package_jsons {
+                self.add_package_json_watch_dirs(&mut desired_dirs, package_json);
             }
         }
 
         self.wm.borrow().resolve_desired_dirs(&desired_dirs)
+    }
+
+    // Go: build/orchestrator.go:503 (*Orchestrator).addWatchDir
+    fn add_watch_dir(&self, desired_dirs: &mut FxHashMap<String, bool>, dir: &str) {
+        if !is_dir_covered_by_watch(desired_dirs, dir, &self.compare_paths_options)
+            && can_watch_directory(dir)
+        {
+            desired_dirs.insert(dir.to_string(), false);
+        }
+    }
+
+    // Go: build/orchestrator.go:509 (*Orchestrator).addPackageJsonWatchDirs
+    fn add_package_json_watch_dirs(
+        &self,
+        desired_dirs: &mut FxHashMap<String, bool>,
+        package_json: &str,
+    ) {
+        let dir = get_directory_path(package_json);
+        let mut dirs = vec![dir.clone()];
+        let mut found_node_modules = false;
+        let mut current = dir.clone();
+        loop {
+            let parent = get_directory_path(&current);
+            if parent.is_empty() || parent == current {
+                break;
+            }
+            dirs.push(parent.clone());
+            if get_base_file_name(&parent) == "node_modules" {
+                found_node_modules = true;
+                let grandparent = get_directory_path(&parent);
+                if !grandparent.is_empty() && grandparent != parent {
+                    dirs.push(grandparent);
+                }
+                break;
+            }
+            current = parent;
+        }
+
+        if !found_node_modules {
+            self.add_watch_dir(desired_dirs, &dir);
+            return;
+        }
+        for dir in &dirs {
+            self.add_watch_dir(desired_dirs, dir);
+        }
     }
 
     // Go: build/orchestrator.go:459 (*Orchestrator).DoCycle

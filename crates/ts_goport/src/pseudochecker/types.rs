@@ -153,26 +153,33 @@ pub fn new_pseudo_type_direct(type_node: Node) -> Rc<PseudoType> {
 pub struct PseudoTypeInferred {
     pub expression: Node,
     pub error_nodes: Vec<Node>,
+    pub is_signature_return: bool,
 }
 
-// Go: pseudochecker/type.go:105 NewPseudoTypeInferred
-pub fn new_pseudo_type_inferred(expr: Node) -> Rc<PseudoType> {
+// Go: pseudochecker/type.go:106 NewPseudoTypeInferred
+pub fn new_pseudo_type_inferred(expr: Node, is_signature_return: bool) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::INFERRED,
         PseudoTypeData::Inferred(PseudoTypeInferred {
             expression: expr,
             error_nodes: Vec::new(),
+            is_signature_return,
         }),
     )
 }
 
-// Go: pseudochecker/type.go:109 NewPseudoTypeInferredWithErrors
-pub fn new_pseudo_type_inferred_with_errors(expr: Node, error_nodes: Vec<Node>) -> Rc<PseudoType> {
+// Go: pseudochecker/type.go:110 NewPseudoTypeInferredWithErrors
+pub fn new_pseudo_type_inferred_with_errors(
+    expr: Node,
+    is_signature_return: bool,
+    error_nodes: Vec<Node>,
+) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::INFERRED,
         PseudoTypeData::Inferred(PseudoTypeInferred {
             expression: expr,
             error_nodes,
+            is_signature_return,
         }),
     )
 }

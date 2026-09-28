@@ -277,7 +277,7 @@ go_enum!(CompletionKind, i32 {
 });
 
 // Go: ls/completions.go:189 TriggerCharacters
-pub static TRIGGER_CHARACTERS: [&str; 9] = [".", "\"", "'", "`", "/", "@", "<", "#", " "];
+pub static TRIGGER_CHARACTERS: [&str; 10] = [".", "\"", "'", "`", "/", "@", "<", "#", " ", "*"];
 
 // Go: ls/completions.go:192 allCommitCharacters
 // All commit characters, valid when `isNewIdentifierLocation` is false.
@@ -505,6 +505,12 @@ impl LanguageService {
                 }));
             }
             return Ok(None);
+        }
+
+        if let Some(js_doc_snippet_completion) =
+            self.get_js_doc_snippet_completion(ctx, file, position)
+        {
+            return Ok(Some(js_doc_snippet_completion));
         }
 
         let compiler_options = self.get_program().options();

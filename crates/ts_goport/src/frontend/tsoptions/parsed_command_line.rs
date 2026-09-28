@@ -488,12 +488,10 @@ pub struct SourceOutputAndProjectReference {
 
 impl ParsedCommandLine {
     // Go: tsoptions/parsedcommandline.go:85 (*ParsedCommandLine).ConfigName
-    // PORT: Go panics when `ConfigFile` is nil; `expect` does the same.
     pub fn config_name(&self) -> &'static str {
-        let config_file = self
-            .config_file
-            .as_ref()
-            .expect("nil pointer dereference: ConfigFile");
+        let Some(config_file) = &self.config_file else {
+            return "";
+        };
         source_file_file_name(config_file.source_file)
     }
 

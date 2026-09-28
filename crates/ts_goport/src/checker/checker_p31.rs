@@ -424,6 +424,12 @@ impl Checker {
                 self.mark_decorator_alias_referenced(location);
             }
             ReferenceHint::UNSPECIFIED => {
+                if is_jsx_tag_name(location) && is_jsx_intrinsic_tag_name(location) {
+                    return; // builtin JSX tag names aren't real type refs by most metrics, but are expressions, so must be filtered
+                }
+                if find_ancestor(location, is_meta_property).is_some() {
+                    return; // identifiers in meta properties shouldn't be resolved, but are expressions, so must be filtered
+                }
                 // Identifiers in expression contexts are emitted, so we need to follow their referenced aliases and mark them as used
                 // Some non-expression identifiers are also treated as expression identifiers for this purpose, eg, `a` in `b = {a}` or `q` in `import r = q`
                 // This is the exception, rather than the rule - most non-expression identifiers are declaration names.

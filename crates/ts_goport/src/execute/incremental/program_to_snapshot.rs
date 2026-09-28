@@ -76,6 +76,12 @@ impl ToProgramSnapshot<'_> {
             self.snapshot.build_info_emit_pending = old_snapshot.build_info_emit_pending;
             self.snapshot.has_errors_from_old_state = old_snapshot.has_errors;
             self.snapshot.has_semantic_errors_from_old_state = old_snapshot.has_semantic_errors;
+            self.snapshot.package_jsons_from_old_state =
+                old_snapshot.package_jsons.clone().unwrap_or_default();
+            self.snapshot.missing_package_jsons_from_old_state = old_snapshot
+                .missing_package_jsons
+                .clone()
+                .unwrap_or_default();
         } else {
             self.snapshot.build_info_emit_pending = self.snapshot.options.is_incremental();
         }

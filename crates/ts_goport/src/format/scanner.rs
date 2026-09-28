@@ -154,10 +154,31 @@ pub fn should_rescan_jsx_identifier(node: Node) -> bool {
                 // May parse an identifier like `module-layout`; that will be scanned as a keyword at first, but we should parse the whole thing to get an identifier.
                 return is_keyword_kind(node.kind()) || node.kind() == SyntaxKind::Identifier;
             }
+            SyntaxKind::PropertyAccessExpression => {
+                // The leftmost name of a dotted JSX tag name (e.g. `a-b` in `<a-b.c>`) may contain hyphens, so rescan it as a JSX identifier.
+                return (is_keyword_kind(node.kind()) || node.kind() == SyntaxKind::Identifier)
+                    && is_leftmost_jsx_tag_name(node);
+            }
             _ => {}
         }
     }
     false
+}
+
+// Go: format/scanner.go:129 isLeftmostJsxTagName
+fn is_leftmost_jsx_tag_name(node: Node) -> bool {
+    find_ancestor_or_quit(node, |n| {
+        if n.parent().is_nil() {
+            FindAncestorResult::FIND_ANCESTOR_QUIT
+        } else if is_jsx_tag_name(n) {
+            FindAncestorResult::FIND_ANCESTOR_TRUE
+        } else if is_property_access_expression(n.parent()) && n.parent().expression() == n {
+            FindAncestorResult::FIND_ANCESTOR_FALSE
+        } else {
+            FindAncestorResult::FIND_ANCESTOR_QUIT
+        }
+    })
+    .is_some()
 }
 
 impl FormattingScanner {

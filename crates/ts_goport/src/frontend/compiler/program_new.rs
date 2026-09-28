@@ -168,6 +168,12 @@ impl NewProgram {
         None
     }
 
+    // Go: program.go:156 (*Program).PackageJsonCacheEntries (tsgo#4301)
+    // PackageJsonCacheEntries iterates on all package json cache entries.
+    pub fn package_json_cache_entries(&self, f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+        self.resolver_ref().package_json_cache_entries(f);
+    }
+
     // Go: program.go:157 (*Program).GetRedirectTargets
     // GetRedirectTargets returns the list of file paths that redirect to the given path.
     // These are files from the same package (same name@version) installed in different locations.

@@ -1099,43 +1099,12 @@ impl Node {
 // ──────────────────────────────────────────────────────────────────────
 
 // Go: ast/ast_generated.go:608 IsToken
+// PORT: Go lists every kind from KindUnknown to KindDeferKeyword in one
+// `case`. They are one range of the kind enum (ts_ast has the same order), so
+// this checks the range.
 #[must_use]
 pub fn is_token(node: Node) -> bool {
-    // PORT: Go lists 166 more `case` labels with empty bodies before the
-    // last one. Go `switch` does not fall through, so those kinds reach
-    // `return false`. We keep that behavior. Empty-case kinds:
-    //   KindUnknown, KindEndOfFile, KindSingleLineCommentTrivia, KindMultiLineCommentTrivia, KindNewLineTrivia, KindWhitespaceTrivia
-    //   KindConflictMarkerTrivia, KindNonTextFileMarkerTrivia, KindNumericLiteral, KindBigIntLiteral, KindStringLiteral, KindJsxText
-    //   KindJsxTextAllWhiteSpaces, KindRegularExpressionLiteral, KindNoSubstitutionTemplateLiteral, KindTemplateHead, KindTemplateMiddle, KindTemplateTail
-    //   KindOpenBraceToken, KindCloseBraceToken, KindOpenParenToken, KindCloseParenToken, KindOpenBracketToken, KindCloseBracketToken
-    //   KindDotToken, KindDotDotDotToken, KindSemicolonToken, KindCommaToken, KindQuestionDotToken, KindLessThanToken
-    //   KindLessThanSlashToken, KindGreaterThanToken, KindLessThanEqualsToken, KindGreaterThanEqualsToken, KindEqualsEqualsToken, KindExclamationEqualsToken
-    //   KindEqualsEqualsEqualsToken, KindExclamationEqualsEqualsToken, KindEqualsGreaterThanToken, KindPlusToken, KindMinusToken, KindAsteriskToken
-    //   KindAsteriskAsteriskToken, KindSlashToken, KindPercentToken, KindPlusPlusToken, KindMinusMinusToken, KindLessThanLessThanToken
-    //   KindGreaterThanGreaterThanToken, KindGreaterThanGreaterThanGreaterThanToken, KindAmpersandToken, KindBarToken, KindCaretToken, KindExclamationToken
-    //   KindTildeToken, KindAmpersandAmpersandToken, KindBarBarToken, KindQuestionToken, KindColonToken, KindAtToken
-    //   KindQuestionQuestionToken, KindBacktickToken, KindHashToken, KindEqualsToken, KindPlusEqualsToken, KindMinusEqualsToken
-    //   KindAsteriskEqualsToken, KindAsteriskAsteriskEqualsToken, KindSlashEqualsToken, KindPercentEqualsToken, KindLessThanLessThanEqualsToken, KindGreaterThanGreaterThanEqualsToken
-    //   KindGreaterThanGreaterThanGreaterThanEqualsToken, KindAmpersandEqualsToken, KindBarEqualsToken, KindBarBarEqualsToken, KindAmpersandAmpersandEqualsToken, KindQuestionQuestionEqualsToken
-    //   KindCaretEqualsToken, KindIdentifier, KindPrivateIdentifier, KindJSDocCommentTextToken, KindBreakKeyword, KindCaseKeyword
-    //   KindCatchKeyword, KindClassKeyword, KindConstKeyword, KindContinueKeyword, KindDebuggerKeyword, KindDefaultKeyword
-    //   KindDeleteKeyword, KindDoKeyword, KindElseKeyword, KindEnumKeyword, KindExportKeyword, KindExtendsKeyword
-    //   KindFalseKeyword, KindFinallyKeyword, KindForKeyword, KindFunctionKeyword, KindIfKeyword, KindImportKeyword
-    //   KindInKeyword, KindInstanceOfKeyword, KindNewKeyword, KindNullKeyword, KindReturnKeyword, KindSuperKeyword
-    //   KindSwitchKeyword, KindThisKeyword, KindThrowKeyword, KindTrueKeyword, KindTryKeyword, KindTypeOfKeyword
-    //   KindVarKeyword, KindVoidKeyword, KindWhileKeyword, KindWithKeyword, KindImplementsKeyword, KindInterfaceKeyword
-    //   KindLetKeyword, KindPackageKeyword, KindPrivateKeyword, KindProtectedKeyword, KindPublicKeyword, KindStaticKeyword
-    //   KindYieldKeyword, KindAbstractKeyword, KindAccessorKeyword, KindAsKeyword, KindAssertsKeyword, KindAssertKeyword
-    //   KindAnyKeyword, KindAsyncKeyword, KindAwaitKeyword, KindBooleanKeyword, KindConstructorKeyword, KindDeclareKeyword
-    //   KindGetKeyword, KindImmediateKeyword, KindInferKeyword, KindIntrinsicKeyword, KindIsKeyword, KindKeyOfKeyword
-    //   KindModuleKeyword, KindNamespaceKeyword, KindNeverKeyword, KindOutKeyword, KindReadonlyKeyword, KindRequireKeyword
-    //   KindNumberKeyword, KindObjectKeyword, KindSatisfiesKeyword, KindSetKeyword, KindStringKeyword, KindSymbolKeyword
-    //   KindTypeKeyword, KindUndefinedKeyword, KindUniqueKeyword, KindUnknownKeyword, KindUsingKeyword, KindFromKeyword
-    //   KindGlobalKeyword, KindBigIntKeyword, KindOverrideKeyword, KindOfKeyword
-    match node.kind() {
-        SyntaxKind::DeferKeyword => true,
-        _ => false,
-    }
+    (SyntaxKind::Unknown as u16..=SyntaxKind::DeferKeyword as u16).contains(&(node.kind() as u16))
 }
 
 // Go: ast/ast_generated.go:803 IsIdentifier
@@ -1558,17 +1527,18 @@ pub fn is_omitted_expression(node: Node) -> bool {
     node.kind() == SyntaxKind::OmittedExpression
 }
 
-// Go: ast/ast_generated.go:3743 IsKeywordExpression
+// Go: ast/ast_generated.go:3577 IsKeywordExpression
 #[must_use]
 pub fn is_keyword_expression(node: Node) -> bool {
-    // PORT: Go lists 5 more `case` labels with empty bodies before the
-    // last one. Go `switch` does not fall through, so those kinds reach
-    // `return false`. We keep that behavior. Empty-case kinds:
-    //   KindNullKeyword, KindTrueKeyword, KindFalseKeyword, KindThisKeyword, KindSuperKeyword
-    match node.kind() {
-        SyntaxKind::ImportKeyword => true,
-        _ => false,
-    }
+    matches!(
+        node.kind(),
+        SyntaxKind::NullKeyword
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::ThisKeyword
+            | SyntaxKind::SuperKeyword
+            | SyntaxKind::ImportKeyword
+    )
 }
 
 // Go: ast/ast_generated.go:3776 IsStringLiteral
@@ -1781,18 +1751,24 @@ pub fn is_type_assertion(node: Node) -> bool {
     node.kind() == SyntaxKind::TypeAssertionExpression
 }
 
-// Go: ast/ast_generated.go:5280 IsKeywordTypeNode
+// Go: ast/ast_generated.go:5109 IsKeywordTypeNode
 #[must_use]
 pub fn is_keyword_type_node(node: Node) -> bool {
-    // PORT: Go lists 11 more `case` labels with empty bodies before the
-    // last one. Go `switch` does not fall through, so those kinds reach
-    // `return false`. We keep that behavior. Empty-case kinds:
-    //   KindAnyKeyword, KindBigIntKeyword, KindBooleanKeyword, KindIntrinsicKeyword, KindNeverKeyword, KindNumberKeyword
-    //   KindObjectKeyword, KindStringKeyword, KindSymbolKeyword, KindUndefinedKeyword, KindUnknownKeyword
-    match node.kind() {
-        SyntaxKind::VoidKeyword => true,
-        _ => false,
-    }
+    matches!(
+        node.kind(),
+        SyntaxKind::AnyKeyword
+            | SyntaxKind::BigIntKeyword
+            | SyntaxKind::BooleanKeyword
+            | SyntaxKind::IntrinsicKeyword
+            | SyntaxKind::NeverKeyword
+            | SyntaxKind::NumberKeyword
+            | SyntaxKind::ObjectKeyword
+            | SyntaxKind::StringKeyword
+            | SyntaxKind::SymbolKeyword
+            | SyntaxKind::UndefinedKeyword
+            | SyntaxKind::UnknownKeyword
+            | SyntaxKind::VoidKeyword
+    )
 }
 
 // Go: ast/ast_generated.go:5333 IsUnionTypeNode

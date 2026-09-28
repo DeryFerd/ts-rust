@@ -11,7 +11,7 @@ use crate::project::prelude::*;
 use crate::frontend::{core_bfs, core_ls_ext};
 use std::cell::OnceCell;
 
-// Go: project/projectcollection.go:14 ProjectCollection
+// Go: project/projectcollection.go:15 ProjectCollection
 pub struct ProjectCollection {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     // PORT: nil in the collection that NewSnapshot makes.
@@ -31,13 +31,41 @@ pub struct ProjectCollection {
     // inferredProject is a fallback project that is used when no configured
     // project can be found for an open file.
     pub inferred_project: Option<Rc<RefCell<Project>>>,
-    // apiOpenedProjects is the set of projects that should be kept open for
-    // API clients.
-    pub api_opened_projects: FxHashSet<tspath::Path>,
+    // apiState tracks the projects and files that API clients have explicitly
+    // opened so they are kept loaded across snapshots.
+    pub api_state: APIState,
 
     // PORT: Go `openConfiguredProjectsOnce sync.Once` and
     // `openConfiguredProjects *collections.Set[tspath.Path]` are one `OnceCell`.
     pub open_configured_projects: OnceCell<Rc<FxHashSet<tspath::Path>>>,
+}
+
+// Go: project/projectcollection.go:44 APIState
+// APIState tracks the projects and files that API clients have explicitly opened.
+// Opens and closes are ref-counted so multiple API clients don't clobber each
+// other, and it is carried across snapshots so API-opened resources stay loaded.
+// PORT: Go maps iterate in random order; `IndexMap` keeps insertion order.
+// Go `clone` (projectcollection.go:55) and `equals` (projectcollection.go:62)
+// are the derived `Clone` and `PartialEq`; `IndexMap` equality ignores order,
+// like `maps.Equal`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct APIState {
+    // openProjects is the ref-counted set of projects to keep open for API
+    // clients, keyed by config file path. The value is the number of outstanding
+    // API opens.
+    pub open_projects: IndexMap<tspath::Path, i32>,
+    // openFiles is the ref-counted set of files to keep open for API clients,
+    // keyed by file path. Files with no configured project are loaded into the
+    // inferred project.
+    pub open_files: IndexMap<tspath::Path, APIOpenedFile>,
+}
+
+// Go: project/projectcollection.go:67 apiOpenedFile
+// apiOpenedFile tracks a file kept open by API clients along with its ref count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct APIOpenedFile {
+    pub file_name: String,
+    pub ref_count: i32,
 }
 
 /// Go `tspath.Path(inferredProjectName)`.
@@ -352,7 +380,7 @@ impl ProjectCollection {
         fallback
     }
 
-    // Go: project/projectcollection.go:266 clone
+    // Go: project/projectcollection.go:298 clone
     // clone creates a shallow copy of the project collection.
     // PORT: Go shares the maps; the port copies them (neither side writes
     // them after the copy). `openConfiguredProjectsOnce` starts fresh, as in
@@ -366,7 +394,7 @@ impl ProjectCollection {
             open_files: self.open_files.clone(),
             inferred_project: self.inferred_project.clone(),
             file_default_projects: self.file_default_projects.clone(),
-            api_opened_projects: self.api_opened_projects.clone(),
+            api_state: self.api_state.clone(),
             open_configured_projects: OnceCell::new(),
         }
     }

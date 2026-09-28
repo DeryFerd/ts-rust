@@ -1061,4 +1061,22 @@ impl InfoCache {
         );
         self.cache.borrow_mut().entry(key).or_insert(info).clone()
     }
+
+    // Go: cache.go:196 Range
+    // PORT: Go `SyncMap.Range` allows writes to the map from `f`. The entries
+    // are copied first, so `f` can call `set` without a `RefCell` panic. The
+    // order is not defined, as in Go. The cache holds no nil entry.
+    pub fn range(&self, mut f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+        let entries: Vec<(Path, Rc<InfoCacheEntry>)> = self
+            .cache
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for (key, value) in &entries {
+            if !f(key, value) {
+                return;
+            }
+        }
+    }
 }

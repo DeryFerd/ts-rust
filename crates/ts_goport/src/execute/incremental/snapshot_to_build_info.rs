@@ -59,6 +59,7 @@ pub fn snapshot_to_build_info(snapshot: &Snapshot, build_info_file_name: &str) -
     to.build_info.errors = snapshot.has_errors.is_true();
     to.build_info.semantic_errors = snapshot.has_semantic_errors;
     to.build_info.check_pending = snapshot.check_pending;
+    to.set_package_jsons();
     to.build_info
 }
 
@@ -566,6 +567,29 @@ impl ToBuildInfo<'_> {
             })
             .collect();
         self.build_info.root = Some(roots);
+    }
+
+    // Go: incremental/snapshottobuildinfo.go:374 setPackageJsons
+    fn set_package_jsons(&mut self) {
+        let snapshot = self.snapshot;
+        if let Some(package_jsons) = &snapshot.package_jsons
+            && !package_jsons.is_empty()
+        {
+            let package_jsons = package_jsons
+                .iter()
+                .map(|package_json| self.relative_to_build_info(package_json))
+                .collect();
+            self.build_info.package_jsons = Some(package_jsons);
+        }
+        if let Some(missing_package_jsons) = &snapshot.missing_package_jsons
+            && !missing_package_jsons.is_empty()
+        {
+            let missing_package_jsons = missing_package_jsons
+                .iter()
+                .map(|package_json| self.relative_to_build_info(package_json))
+                .collect();
+            self.build_info.missing_package_jsons = Some(missing_package_jsons);
+        }
     }
 }
 

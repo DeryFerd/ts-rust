@@ -3021,7 +3021,7 @@ pub fn prog() -> &'static GoProgram {
 // Go: core/version.go:8 version
 // PORT: Go keeps this in a var that ldflags can override. The pinned
 // reference build does not override it.
-const VERSION: &str = "7.0.0-dev";
+const VERSION: &str = "7.1.0-dev";
 
 // Go: core/version.go:10 Version
 pub fn version() -> &'static str {

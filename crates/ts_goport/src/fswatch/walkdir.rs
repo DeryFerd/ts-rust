@@ -81,6 +81,6 @@ pub fn walk_dir_generic_visit(
 }
 
 // PORT: Go `*fs.PathError` (`op path: err`) for a `std::io::Error`.
-fn path_error(op: &str, path: &str, err: &std::io::Error) -> GoError {
+pub(crate) fn path_error(op: &str, path: &str, err: &std::io::Error) -> GoError {
     errors::new(format!("{op} {path}: {err}"))
 }

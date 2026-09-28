@@ -339,6 +339,10 @@ impl BuildInfoReader for BuildHost {
 
 // Go: build/host.go:31 `_ incremental.Host = (*host)(nil)`
 impl incremental::Host for BuildHost {
+    fn fs(&self) -> Rc<dyn Fs> {
+        CompilerHost::fs(self)
+    }
+
     fn get_m_time(&self, file_name: &str) -> Option<SystemTime> {
         BuildHost::get_m_time(self, file_name)
     }

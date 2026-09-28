@@ -6,6 +6,7 @@
 
 use std::rc::Rc;
 
+use ts_goport::frontend::compiler::DuplicateSourceFile;
 use ts_goport::frontend::parser::ParsedSourceFile;
 use ts_goport::lsp::lsproto;
 use ts_goport::project::{
@@ -27,6 +28,15 @@ fn key(f: &ParsedSourceFile) -> ParseCacheKey {
         f.parse_options(),
         xxhash_rust::xxh3::xxh3_128(f.text.as_bytes()),
         f.script_kind,
+    )
+}
+
+/// Go `NewParseCacheKey(dup.ParseOptions, dup.Hash, dup.ScriptKind)`.
+fn dup_key(dup: &DuplicateSourceFile) -> ParseCacheKey {
+    new_parse_cache_key(
+        &dup.parse_options,
+        xxhash_rust::xxh3::xxh3_128(dup.text.as_bytes()),
+        dup.script_kind,
     )
 }
 
@@ -237,7 +247,115 @@ child_test! {
     }
 }
 
-// Go: refcountcache_test.go:256 files (extendedConfigCache)
+const ENTRY: &str = "/user/username/projects/myproject/src/entry.ts";
+const ENTRY_URI: &str = "file:///user/username/projects/myproject/src/entry.ts";
+
+/// Go `session.DidChangeFile(ctx, entryURI, version, ...)` with one whole-document change.
+fn change_entry(session: &Rc<Session>, version: i32, text: &str) {
+    session.did_change_file(
+        &bg(),
+        &uri(ENTRY_URI),
+        version,
+        &[lsproto::TextDocumentContentChangePartialOrWholeDocument {
+            partial: None,
+            whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                text: text.to_string(),
+            }),
+        }],
+    );
+}
+
+child_test! {
+    // Go: refcountcache_test.go:256 TestRefCountingCaches/parseCache/case-only duplicate imported from multiple files is refcounted once
+    fn parse_cache_case_only_duplicate_imported_from_multiple_files_is_refcounted_once() {
+        // A file reached through a case-only-different file name from more than one
+        // import site is parsed and acquired in the parse cache exactly once (same-casing
+        // loads dedupe), but it must also be recorded as a duplicate exactly once.
+        // Recording it once per import site would release it from the parse cache more
+        // times than it was acquired, deleting the live entry out from under a program
+        // that still references it and panicking the next time it is ref'd during a clone.
+        let entry_text =
+            "import { dep } from './sub/dep';\nimport './a';\nimport './b';\nexport const e = dep;";
+        let session = setup(files(&[
+            // entry.ts imports the canonical casing first, then pulls in a.ts and b.ts,
+            // which both import the same file through an upper-cased name.
+            (ENTRY, entry_text),
+            (
+                "/user/username/projects/myproject/src/a.ts",
+                "import { dep } from './sub/DEP';\nexport const a = dep;",
+            ),
+            (
+                "/user/username/projects/myproject/src/b.ts",
+                "import { dep } from './sub/DEP';\nexport const b = dep;",
+            ),
+            ("/user/username/projects/myproject/src/sub/dep.ts", "export const dep = 1;"),
+            ("/user/username/projects/myproject/src/c.ts", "export const c = 1;"),
+        ]));
+        open(&session, ENTRY_URI, entry_text);
+
+        // The upper-cased name is recorded as a duplicate, and it should appear exactly once.
+        let program = language_service(&session, ENTRY_URI).get_program();
+        let dup_keys: Vec<ParseCacheKey> = program
+            .duplicate_source_files()
+            .iter()
+            .filter(|dup| dup.parse_options.file_name.ends_with("/sub/DEP.ts"))
+            .map(dup_key)
+            .collect();
+        assert_eq!(dup_keys.len(), 1, "case-only duplicate should be recorded exactly once");
+        let dup_entry =
+            load(&session, &dup_keys[0]).expect("duplicate entry should exist in the parse cache");
+        assert_eq!(ref_count(&dup_entry), 1);
+
+        // Force a full program rebuild (adding an import changes the file's module
+        // structure). The old snapshot is disposed, releasing each of its source and
+        // duplicate files exactly once. If the duplicate were recorded twice, the
+        // shared cache entry would be released to zero and deleted here even though
+        // the new program still references it.
+        change_entry(
+            &session,
+            2,
+            "import { dep } from \"./sub/dep\";\nimport \"./a\";\nimport \"./b\";\nimport \"./c\";\nexport const e = dep;",
+        );
+        let rebuilt_program = language_service(&session, ENTRY_URI).get_program();
+        session.wait_for_background_tasks();
+
+        // Every parse-cache key referenced by the live program must still exist.
+        let assert_key_alive = |key: ParseCacheKey| {
+            assert!(
+                load(&session, &key).is_some(),
+                "live program references a deleted parse-cache entry: {}",
+                key.file_name
+            );
+        };
+        for file in rebuilt_program.source_files() {
+            assert_key_alive(key(file));
+        }
+        for dup in rebuilt_program.duplicate_source_files() {
+            assert_key_alive(dup_key(dup));
+        }
+
+        // An incremental (clone) update re-references the duplicate files; this must
+        // not panic with "cache entry not found".
+        change_entry(
+            &session,
+            3,
+            "import { dep } from './sub/dep';\nimport './a';\nimport './b';\nimport './c';\nexport const e = dep + 0;",
+        );
+        let _ = language_service(&session, ENTRY_URI);
+        session.wait_for_background_tasks();
+
+        // Closing the project releases everything cleanly.
+        // (The configured project is not disposed until another file in another project is opened,
+        // so we open an untitled file to trigger that.)
+        close(&session, ENTRY_URI);
+        open(&session, "untitled:Untitled-1", "");
+        session.wait_for_background_tasks();
+
+        assert_eq!(project_entries(&session), 0);
+    }
+}
+
+// Go: refcountcache_test.go:355 files (extendedConfigCache)
 fn extended_config_files() -> FileMap {
     files(&[
         (
@@ -266,7 +384,7 @@ fn extended_owners(session: &Session, p: &str) -> Option<usize> {
 }
 
 child_test! {
-    // Go: refcountcache_test.go:268 TestRefCountingCaches/extendedConfigCache/release extended configs with project close
+    // Go: refcountcache_test.go:365 TestRefCountingCaches/extendedConfigCache/release extended configs with project close
     fn extended_config_cache_release_extended_configs_with_project_close() {
         let session = setup(extended_config_files());
         open(&session, MAIN_URI, "const x = 1;");
@@ -295,7 +413,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: refcountcache_test.go:286 TestRefCountingCaches/extendedConfigCache/release cache entries for unretained clone
+    // Go: refcountcache_test.go:383 TestRefCountingCaches/extendedConfigCache/release cache entries for unretained clone
     fn extended_config_cache_release_cache_entries_for_unretained_clone() {
         let session = setup(extended_config_files());
         let u = uri(MAIN_URI);

@@ -1203,13 +1203,13 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:2722 shouldWriteTypeOfFunctionSymbol
+    // Go: checker/nodebuilderimpl.go:2733 shouldWriteTypeOfFunctionSymbol
     pub fn should_write_type_of_function_symbol(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
-        symbol: SymbolId,
+        mut symbol: SymbolId,
         type_id: TypeId,
-    ) -> bool {
+    ) -> (bool, SymbolId) {
         let declarations = self.sym(symbol).declarations.clone();
         let mut is_static_method_symbol = false;
         if self.sym(symbol).flags.intersects(SymbolFlags::METHOD) {
@@ -1223,6 +1223,7 @@ impl Checker {
             }
         }
         let mut is_non_local_function_symbol = false;
+        let mut is_function_expression_symbol = false;
         if self.sym(symbol).flags.intersects(SymbolFlags::FUNCTION) {
             if self.sym(symbol).parent.is_some() {
                 is_non_local_function_symbol = true;
@@ -1235,20 +1236,43 @@ impl Checker {
                         is_non_local_function_symbol = true;
                         break;
                     }
+                    if is_function_expression_or_arrow_function(declaration)
+                        && is_variable_declaration(declaration.parent())
+                        && is_variable_declaration_list(declaration.parent().parent())
+                        && is_variable_statement(declaration.parent().parent().parent())
+                        && declaration.parent().parent().parent().parent().is_some()
+                        && matches!(
+                            declaration.parent().parent().parent().parent().kind(),
+                            SyntaxKind::SourceFile | SyntaxKind::ModuleBlock
+                        )
+                    {
+                        is_non_local_function_symbol = true;
+                        is_function_expression_symbol = true;
+                        break;
+                    }
                 }
             }
         }
         if is_static_method_symbol || is_non_local_function_symbol {
+            let value_declaration = self.sym(symbol).value_declaration;
+            if is_function_expression_symbol
+                && value_declaration.is_some()
+                && value_declaration.parent().is_some()
+                && value_declaration.parent() != nb_ctx(b, |c| c.enclosing_declaration)
+            {
+                symbol = self.get_merged_symbol(value_declaration.parent().symbol());
+            }
             // typeof is allowed only for static/non local functions
             let flags = nb_ctx(b, |c| c.flags);
             let visited = nb_ctx(b, |c| c.visited_types.contains(&type_id));
-            return (flags.intersects(NodeBuilderFlags::USE_TYPE_OF_FUNCTION) || visited) // it is type of the symbol uses itself recursively
+            let result = (flags.intersects(NodeBuilderFlags::USE_TYPE_OF_FUNCTION) || visited) // it is type of the symbol uses itself recursively
                 && (!flags.intersects(NodeBuilderFlags::USE_STRUCTURAL_FALLBACK) || {
                     let enclosing_declaration = nb_ctx(b, |c| c.enclosing_declaration);
                     self.is_value_symbol_accessible(symbol, enclosing_declaration)
                 }); // And the build is going to succeed without visibility error or there is no structural fallback allowed
+            return (result, symbol);
         }
-        false
+        (false, symbol)
     }
 
     // Go: checker/nodebuilderimpl.go:2747 createAnonymousTypeNode
@@ -1258,6 +1282,52 @@ impl Checker {
         t: TypeId,
     ) -> Node {
         self.create_anonymous_type_node_ex(b, t, false, false)
+    }
+
+    // Go: checker/nodebuilderimpl.go:2779 shouldEmitTypeOfSymbol
+    pub fn should_emit_type_of_symbol(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        force_expansion: bool,
+        force_class_expansion: bool,
+        is_instance_type: SymbolFlags,
+        symbol: SymbolId,
+        type_id: TypeId,
+    ) -> (bool, SymbolId) {
+        if force_expansion {
+            return (false, symbol);
+        }
+        let non_function_result = (self.sym(symbol).flags.intersects(SymbolFlags::CLASS)
+            && !force_class_expansion
+            && self.get_base_type_variable_of_class(symbol).is_nil()
+            && !{
+                let value_declaration = self.sym(symbol).value_declaration;
+                value_declaration.is_some()
+                    && is_class_like(value_declaration)
+                    && nb_ctx(b, |c| {
+                        c.flags
+                            .intersects(NodeBuilderFlags::WRITE_CLASS_EXPRESSION_AS_TYPE_LITERAL)
+                    })
+                    && (!is_class_declaration(value_declaration) || {
+                        let enclosing_declaration = nb_ctx(b, |c| c.enclosing_declaration);
+                        self.is_symbol_accessible(
+                            symbol,
+                            enclosing_declaration,
+                            is_instance_type,
+                            false, /*shouldComputeAliasesToMakeVisible*/
+                        )
+                        .accessibility
+                            != SymbolAccessibility::ACCESSIBLE
+                    })
+            })
+            || self
+                .sym(symbol)
+                .flags
+                .intersects(SymbolFlags::ENUM | SymbolFlags::VALUE_MODULE);
+        if non_function_result {
+            return (true, symbol);
+        }
+        self.should_write_type_of_function_symbol(b, symbol, type_id)
     }
 
     // Go: checker/nodebuilderimpl.go:2751 createAnonymousTypeNodeEx
@@ -1328,41 +1398,24 @@ impl Checker {
             // 	// Instance and static types share the same symbol; only add 'typeof' for the static side.
             // 	return b.symbolToTypeNode(symbol, isInstanceType, nil)
             // } else
-            if !force_expansion
-                && ((self.sym(symbol).flags.intersects(SymbolFlags::CLASS)
-                    && !force_class_expansion
-                    && self.get_base_type_variable_of_class(symbol).is_nil()
-                    && !{
-                        let value_declaration = self.sym(symbol).value_declaration;
-                        value_declaration.is_some()
-                            && is_class_like(value_declaration)
-                            && nb_ctx(b, |c| {
-                                c.flags.intersects(
-                                    NodeBuilderFlags::WRITE_CLASS_EXPRESSION_AS_TYPE_LITERAL,
-                                )
-                            })
-                            && (!is_class_declaration(value_declaration) || {
-                                let enclosing_declaration = nb_ctx(b, |c| c.enclosing_declaration);
-                                self.is_symbol_accessible(
-                                    symbol,
-                                    enclosing_declaration,
-                                    is_instance_type,
-                                    false, /*shouldComputeAliasesToMakeVisible*/
-                                )
-                                .accessibility
-                                    != SymbolAccessibility::ACCESSIBLE
-                            })
-                    })
-                    || self
-                        .sym(symbol)
-                        .flags
-                        .intersects(SymbolFlags::ENUM | SymbolFlags::VALUE_MODULE)
-                    || self.should_write_type_of_function_symbol(b, symbol, type_id))
-            {
+            let (ok, typeof_symbol) = self.should_emit_type_of_symbol(
+                b,
+                force_expansion,
+                force_class_expansion,
+                is_instance_type,
+                symbol,
+                type_id,
+            );
+            if ok {
                 if self.should_expand_type(b, t, false /*isAlias*/) {
                     nb_ctx_mut(b, |c| c.depth += 1);
                 } else {
-                    return self.symbol_to_type_node(b, symbol, is_instance_type, NodeList::NIL);
+                    return self.symbol_to_type_node(
+                        b,
+                        typeof_symbol,
+                        is_instance_type,
+                        NodeList::NIL,
+                    );
                 }
             }
             if nb_ctx(b, |c| c.visited_types.contains(&type_id)) {

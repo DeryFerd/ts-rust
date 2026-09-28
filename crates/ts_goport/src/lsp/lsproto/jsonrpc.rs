@@ -2,15 +2,17 @@
 //!
 //! PORT: Go `any` fields (`Message.msg`, `RequestMessage.Params`,
 //! `ResponseMessage.Result`) are `Option<Box<dyn AnyValue>>` (`None` is
-//! nil). Go `UnmarshalJSON` methods are kept as `unmarshal_json`, which
-//! returns the `GoError` chain (`errors::is(&err, &from_value(ErrorCode::X))`
-//! works on it). The `UnmarshalerFrom` impls call them and keep only the
-//! error text, so callers that test the error code call `unmarshal_json`.
+//! nil). An inbound message keeps its params as the raw `JsonValue`; the
+//! handler decodes them (`lsp.rs` `unmarshal_params`). Go `UnmarshalJSON`
+//! methods are kept as `unmarshal_json`, which returns the `GoError` chain
+//! (`errors::is(&err, &from_value(ErrorCode::X))` works on it). The
+//! `UnmarshalerFrom` impls call them and keep only the error text, so
+//! callers that test the error code call `unmarshal_json`.
 
 use crate::lsp::lsproto::prelude::*;
 
 // Go: `fmt.Errorf("%w: %w", code, err)`.
-fn wrap_error_code(code: ErrorCode, err: GoError) -> GoError {
+pub(crate) fn wrap_error_code(code: ErrorCode, err: GoError) -> GoError {
     let code = gostd::errors::from_value(code);
     gostd::errors::errorf(
         format!("{}: {}", code.error(), err.error()),
@@ -100,15 +102,9 @@ impl Message {
             return Ok(());
         }
 
-        let mut params = None;
-        let mut err = None;
+        let mut params: Option<Box<dyn AnyValue>> = None;
         if !raw.params.0.is_empty() {
-            match unmarshal_params(&raw.method, &raw.params.0) {
-                Ok(p) => params = p,
-                // PORT: Go keeps the typed nil pointer in `Params`; Rust
-                // keeps `None`.
-                Err(e) => err = Some(e),
-            }
+            params = Some(Box::new(raw.params));
         }
 
         if raw.id.is_none() {
@@ -124,9 +120,6 @@ impl Message {
             ..RequestMessage::default()
         }));
 
-        if let Some(err) = err {
-            return Err(wrap_error_code(ErrorCode::INVALID_PARAMS, err));
-        }
         Ok(())
     }
 
@@ -227,15 +220,8 @@ impl RequestMessage {
 
         self.id = raw.id;
         self.method = raw.method;
-
-        match unmarshal_params(&self.method, &raw.params.0) {
-            Ok(params) => self.params = params,
-            Err(err) => {
-                // PORT: Go keeps the typed nil pointer in `Params`; Rust
-                // keeps `None`.
-                self.params = None;
-                return Err(wrap_error_code(ErrorCode::INVALID_REQUEST, err));
-            }
+        if !raw.params.0.is_empty() {
+            self.params = Some(Box::new(raw.params));
         }
 
         Ok(())
