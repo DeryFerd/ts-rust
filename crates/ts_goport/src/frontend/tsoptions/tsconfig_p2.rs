@@ -60,12 +60,16 @@ fn convert_type_acquisition_from_json_worker(
 // Go: tsoptions/tsconfigparsing.go:924 parseOwnConfigOfJson
 // PORT: Go stores a `[]string` (maybe nil) in the `any` field, so the field
 // is never Go nil. It is always `Some` here.
+// PORT: Go sets the converted `compileOnSave` in the caller's map, which
+// becomes `raw`. The port changes its own copy, which becomes `raw`; the
+// caller does not read `json` again.
 fn parse_own_config_of_json(
     json: &IndexMap<String, CompilerOptionsValue>,
     host: &dyn ParseConfigHost,
     base_path: &str,
     config_file_name: &str,
 ) -> (ParsedTsconfig, Vec<Diagnostic>) {
+    let mut json = json.clone();
     let nil = CompilerOptionsValue::Nil;
     let mut errors: Vec<Diagnostic> = Vec::new();
     if json.contains_key("excludes") {
@@ -86,8 +90,18 @@ fn parse_own_config_of_json(
     );
     errors.extend(err);
     errors.extend(err2);
-    // watchOptions := convertWatchOptionsFromJsonWorker(json.watchOptions, basePath, errors)
-    // json.compileOnSave = convertCompileOnSaveOptionFromJson(json, basePath, errors)
+    if let Some(compile_on_save) = json.get("compileOnSave").cloned() {
+        let (converted, compile_on_save_errors) = convert_json_option(
+            *COMPILE_ON_SAVE_COMMAND_LINE_OPTION,
+            compile_on_save,
+            base_path,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        errors.extend(compile_on_save_errors);
+        json.insert("compileOnSave".to_string(), converted);
+    }
     let mut extended_config_path: Vec<String> = Vec::new();
     let extends = json.get("extends").unwrap_or(&nil);
     if !extends.is_nil() && *extends != CompilerOptionsValue::String(String::new()) {
@@ -104,7 +118,7 @@ fn parse_own_config_of_json(
         errors.extend(err);
     }
     let parsed_config = ParsedTsconfig {
-        raw: CompilerOptionsValue::Map(json.clone()),
+        raw: CompilerOptionsValue::Map(json),
         options: Some(options),
         type_acquisition: Some(type_acquisition),
         extended_config_path: Some(extended_config_path),
@@ -483,9 +497,6 @@ pub fn parse_config(
             raw_as_map(&own_config.raw),
         );
         own_config.options = Some(result.options);
-        // ownConfig.watchOptions = ownConfig.watchOptions && result.watchOptions ?
-        //     assignWatchOptions(result, ownConfig.watchOptions) :
-        //     ownConfig.watchOptions || result.watchOptions;
     }
     (own_config, errors)
 }
@@ -502,10 +513,9 @@ struct PropOfRaw {
 
 // Go: tsoptions/tsconfigparsing.go:1210 getPropFromRaw (closure in parseJsonConfigFileContentWorker)
 // PORT: the Go closure is a private function. `is_json` is Go
-// `sourceFile == nil`. Go `reflect.TypeOf(nil).Kind()` panics on a nil
-// element; JSON conversion drops nil elements, so `validate_element` sees
-// no `Nil`. A Go `[]string` value makes the `.([]any)` assertion panic;
-// so does this port.
+// `sourceFile == nil`. A nil element fails both element checks, as in Go.
+// A Go `[]string` value makes the `.([]any)` assertion panic; so does this
+// port.
 fn get_prop_from_raw(
     raw_config: &IndexMap<String, CompilerOptionsValue>,
     is_json: bool,
@@ -558,8 +568,8 @@ fn is_map_element(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::Map(_))
 }
 
-/// Go `reflect.TypeOf(element).Kind() == reflect.String`.
-fn is_string_element(element: &CompilerOptionsValue) -> bool {
+// Go: tsoptions/tsconfigparsing.go:1226 isStringValue
+fn is_string_value(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::String(_))
 }
 
@@ -701,7 +711,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "files",
-        is_string_element,
+        is_string_value,
         "string",
     );
     if file_specs.slice_value.is_some() || file_specs.wrong_value.is_empty() {
@@ -748,7 +758,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "include",
-        is_string_element,
+        is_string_value,
         "string",
     );
     let mut exclude_specs = get_prop_from_raw(
@@ -756,7 +766,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "exclude",
-        is_string_element,
+        is_string_value,
         "string",
     );
     let mut is_default_include_spec = false;
@@ -888,6 +898,12 @@ pub fn parse_json_config_file_content_worker(
         }
         (file_names, literal_file_names_len)
     };
+    let mut compile_on_save = false;
+    if let CompilerOptionsValue::Map(raw) = &parsed_config.raw
+        && let Some(CompilerOptionsValue::Bool(value)) = raw.get("compileOnSave")
+    {
+        compile_on_save = *value;
+    }
 
     // Go: getProjectReferences(basePathForFileNames)
     // PORT: Go nil is `None`. A `references` list, even `[]`, is `Some`.
@@ -902,23 +918,44 @@ pub fn parse_json_config_file_content_worker(
     );
     if let Some(references) = &new_references_of_raw.slice_value {
         let project_references = project_references.insert(Vec::new());
-        for reference in references {
-            for r in parse_project_reference(reference) {
-                if r.path.is_empty() {
-                    if is_json {
-                        errors.push(new_compiler_diagnostic(
-                            diag::Compiler_option_0_requires_a_value_of_type_1,
-                            args!["reference.path", "string"],
-                        ));
-                    }
-                } else {
-                    project_references.push(ProjectReference {
-                        path: get_normalized_absolute_path(&r.path, &base_path_for_file_names),
-                        original_path: r.path.clone(),
-                        circular: r.circular,
-                    });
-                }
+        for (index, reference) in references.iter().enumerate() {
+            let Some(r) = parse_project_reference(reference) else {
+                continue;
+            };
+            if !r.has_path || !r.path_valid {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "path",
+                    diag::Compiler_option_0_requires_a_value_of_type_1,
+                    args!["reference.path", "string"],
+                ));
+                continue;
             }
+            if r.reference.path.is_empty() {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "path",
+                    diag::Compiler_option_0_cannot_be_given_an_empty_string,
+                    args!["reference.path"],
+                ));
+                continue;
+            }
+            if r.has_circular && !r.circular_valid {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "circular",
+                    diag::Compiler_option_0_requires_a_value_of_type_1,
+                    args!["reference.circular", "boolean"],
+                ));
+            }
+            project_references.push(ProjectReference {
+                path: get_normalized_absolute_path(&r.reference.path, &base_path_for_file_names),
+                original_path: r.reference.path.clone(),
+                circular: r.reference.circular,
+            });
         }
     }
 
@@ -927,13 +964,13 @@ pub fn parse_json_config_file_content_worker(
             // PORT: Go nil options become the default options.
             compiler_options: Rc::new(parsed_config.options.unwrap_or_default()),
             type_acquisition: parsed_config.type_acquisition,
-            // WatchOptions:      nil,
             file_names,
             project_references,
         },
         config_file: source_file.map(Rc::new),
         raw: parsed_config.raw,
         errors,
+        compile_on_save: Some(compile_on_save),
 
         extra_file_extensions: extra_file_extensions.to_vec(),
         compare_paths_options: ComparePathsOptions {
@@ -980,8 +1017,8 @@ fn validate_specs(
     };
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut final_specs: Vec<String> = Vec::new();
-    for spec in specs {
-        let CompilerOptionsValue::String(spec) = spec else {
+    for value in specs {
+        let CompilerOptionsValue::String(spec) = value else {
             continue;
         };
         let diag = spec_to_diagnostic(spec, disallow_trailing_recursion);
@@ -1102,6 +1139,45 @@ pub fn create_diagnostic_at_reference_syntax(
         }
         None
     })
+}
+
+// Go: tsoptions/tsconfigparsing.go:1636 createDiagnosticAtProjectReferenceProperty
+// PORT: Go `*TsConfigSourceFile` is `Option<&TsConfigSourceFile>`; the Go
+// variadic `args` is a `Vec`.
+fn create_diagnostic_at_project_reference_property(
+    source_file: Option<&TsConfigSourceFile>,
+    index: usize,
+    property_name: &str,
+    message: &'static Message,
+    args: Vec<String>,
+) -> Diagnostic {
+    let mut node = Node::NIL;
+    if let Some(source_file) = source_file {
+        node = for_each_tsconfig_prop_array(source_file.source_file, "references", |property| {
+            if is_array_literal_expression(property.initializer()) {
+                let elements = property.initializer().elements();
+                if elements.len() > index && is_object_literal_expression(elements.get(index)) {
+                    if let Some(property_node) = for_each_property_assignment(
+                        elements.get(index),
+                        property_name,
+                        |property| Some(property.initializer()),
+                        &[],
+                    ) {
+                        return Some(property_node);
+                    }
+                    return Some(elements.get(index));
+                }
+            }
+            None
+        })
+        .unwrap_or(Node::NIL);
+    }
+    create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+        tsconfig_to_source_file(source_file),
+        node,
+        message,
+        args,
+    )
 }
 
 // Go: tsoptions/tsconfigparsing.go:1493 GetCallbackForFindingPropertyAssignmentByValue

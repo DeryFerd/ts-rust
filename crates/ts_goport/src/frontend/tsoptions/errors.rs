@@ -70,11 +70,20 @@ impl CommandLineParser {
             node,
             source_file,
             self.alternate_mode(),
+            Some(self.unknown_did_you_mean_diagnostic()),
+            Some(&command_line_options_to_map(
+                self.worker_diagnostics.did_you_mean.option_declarations,
+            )),
         )
     }
 }
 
-// Go: tsoptions/errors.go:56 createUnknownOptionError
+// createUnknownOptionError creates a diagnostic for an unknown option. If
+// unknownDidYouMeanDiagnostic and optionsNameMap are provided, it also checks
+// for a spelling suggestion and emits a "did you mean" diagnostic instead.
+// Go: tsoptions/errors.go:60 createUnknownOptionError
+// PORT: Go nil `unknownDidYouMeanDiagnostic` and `optionsNameMap` are `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_unknown_option_error(
     unknown_option: &str,
     unknown_option_diagnostic: &'static Message,
@@ -82,6 +91,8 @@ pub fn create_unknown_option_error(
     node: Node,                                        // optional
     source_file: Node,                                 // optional
     alternate_mode: Option<&AlternateModeDiagnostics>, // optional
+    unknown_did_you_mean_diagnostic: Option<&'static Message>, // optional; nil skips suggestion
+    options_name_map: Option<&CommandLineOptionNameMap>, // optional; nil skips suggestion
 ) -> Diagnostic {
     if let Some(alternate_mode) = alternate_mode
         && let Some(options_name_map) = alternate_mode.options_name_map
@@ -105,7 +116,17 @@ pub fn create_unknown_option_error(
     if unknown_option_error_text.is_empty() {
         unknown_option_error_text = unknown_option;
     }
-    // TODO: possibleOption := spelling suggestion
+    if let Some(unknown_did_you_mean_diagnostic) = unknown_did_you_mean_diagnostic
+        && let Some(options_name_map) = options_name_map
+        && let Some(possible_option) = options_name_map.get_spelling_suggestion(unknown_option)
+    {
+        return create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+            source_file,
+            node,
+            unknown_did_you_mean_diagnostic,
+            args![unknown_option_error_text, possible_option.name],
+        );
+    }
     create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
         source_file,
         node,

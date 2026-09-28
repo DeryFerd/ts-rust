@@ -137,6 +137,7 @@ pub fn parse_command_line_test_worker(
         options: IndexMap::default(),
         errors: Vec::new(),
         options_map: NameMap::default(),
+        response_file_stack: FxHashSet::default(),
     };
     if !decls.is_empty() {
         parser.worker_diagnostics = get_test_parse_command_line_worker_diagnostics(decls);

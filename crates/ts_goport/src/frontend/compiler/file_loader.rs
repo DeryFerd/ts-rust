@@ -384,6 +384,7 @@ impl FileLoader {
         };
         if let Some(diagnostic) = diagnostic {
             root_task.normalized_file_path = abs_path;
+            root_task.failed_lookup = true;
             root_task.processing_diagnostics = vec![new_explaining_processing_diagnostic(
                 Some(include_reason),
                 diagnostic.message,
@@ -914,7 +915,7 @@ impl FileLoader {
             }
         }
 
-        if file.script_kind == ScriptKind::JSX || file.script_kind == ScriptKind::TSX {
+        if is_java_script_file || file.script_kind == ScriptKind::TSX {
             let jsx_import = get_jsx_runtime_import(
                 &get_jsx_implicit_import_base_of_file(&options_for_file, &file),
                 &options_for_file,
@@ -1377,7 +1378,7 @@ pub(crate) fn guess_import_mode(
 // `source_file_info`, which does not exist during load. This is the same Go
 // logic (ast/utilities.go GetJSXImplicitImportBase and
 // GetPragmaFromSourceFile) on the `ParsedSourceFile` pragmas.
-fn get_jsx_implicit_import_base_of_file(
+pub(crate) fn get_jsx_implicit_import_base_of_file(
     compiler_options: &CompilerOptions,
     file: &ParsedSourceFile,
 ) -> String {

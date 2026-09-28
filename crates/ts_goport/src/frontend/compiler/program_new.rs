@@ -398,6 +398,30 @@ impl NewProgram {
         changed_file_path: &Path,
         new_host: Rc<dyn CompilerHost>,
     ) -> (NewProgram, Option<Rc<ParsedSourceFile>>, bool) {
+        match self.reuse_program(changed_file_path, new_host.clone()) {
+            (Some(result), new_file, true) => (result, new_file, true),
+            (_, new_file, _) => {
+                let mut new_opts = self.opts.clone();
+                new_opts.host = new_host;
+                (new_program(new_opts), new_file, false)
+            }
+        }
+    }
+
+    // ReuseProgram attempts to produce a new program by replacing only
+    // changedFilePath in place, reusing the rest of p. It returns
+    // (newProgram, newFile, true) on success, or (nil, newFile, false) when the
+    // file cannot be replaced in place. Unlike UpdateProgram, it never constructs a
+    // full fallback program, so callers that build their own fallback (e.g. with a
+    // different host) do not pay for a discarded program build.
+    // Go: program.go:320 (*Program).ReuseProgram
+    // PORT: Go nil `*Program` is `None`. The `createCheckerPool` parameter is
+    // dropped with the option.
+    pub fn reuse_program(
+        &self,
+        changed_file_path: &Path,
+        new_host: Rc<dyn CompilerHost>,
+    ) -> (Option<NewProgram>, Option<Rc<ParsedSourceFile>>, bool) {
         let mut new_opts = self.opts.clone();
         new_opts.host = new_host.clone();
 
@@ -421,11 +445,11 @@ impl NewProgram {
             .as_ref()
             .is_some_and(|targets| targets.contains_key(changed_file_path));
         if in_redirect_files || is_redirect_target {
-            return (new_program(new_opts), new_file, false);
+            return (None, new_file, false);
         }
 
         if !can_replace_file_in_program(&old_file, new_file.as_deref()) {
-            return (new_program(new_opts), new_file, false);
+            return (None, new_file, false);
         }
         let new_file = new_file.expect("checked by can_replace_file_in_program");
         let old_needs_import_helpers = self
@@ -434,7 +458,7 @@ impl NewProgram {
             .and_then(|specifiers| specifiers.get(old_file.path()))
             .is_some_and(|specifier| specifier.is_some());
         if old_needs_import_helpers != self.needs_import_helpers_import_specifier(&new_file) {
-            return (new_program(new_opts), Some(new_file), false);
+            return (None, Some(new_file), false);
         }
         // TODO: reverify compiler options when config has changed?
         // PORT: Go copies the `processedFiles` struct and shares its maps.
@@ -471,7 +495,7 @@ impl NewProgram {
             .files_by_path
             .insert(new_file.path().clone(), new_file.clone());
         update_file_include_processor(&mut result);
-        (result, Some(new_file), true)
+        (Some(result), Some(new_file), true)
     }
 
     // Go: program.go:335 (*Program).initCheckerPool

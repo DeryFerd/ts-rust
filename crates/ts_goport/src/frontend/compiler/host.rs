@@ -158,7 +158,7 @@ impl CompilerHost for CompilerHostImpl {
     // data points into the text), so a file text is leaked for the program
     // lifetime.
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let script_kind = get_script_kind_from_file_name(&opts.file_name);
+        let script_kind = ensure_script_kind_from_file_name(&opts.file_name);
         let text: &'static str = if self.plain_os_fs {
             // PERF: on the plain OS file system a worker read the same
             // bytes, so the file is read once, as in Go. A bundled lib is

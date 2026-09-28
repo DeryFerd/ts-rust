@@ -202,7 +202,13 @@ pub fn get_allowed_endings_in_preferred_order(
         && module_resolution <= ModuleResolutionKind::NODE_NEXT;
     let allow_importing_ts_extension =
         should_allow_importing_ts_extension(compiler_options, &importing_source_file.file_name());
-    if syntax_implied_node_format == RESOLUTION_MODE_ESM && module_resolution_is_node_next {
+    // TypeScript uses `(syntaxImpliedNodeFormat ?? impliedNodeFormat)` here - fall back to the
+    // file's default resolution mode when no syntax-implied mode is given.
+    let mut effective_syntax_mode = syntax_implied_node_format;
+    if effective_syntax_mode == RESOLUTION_MODE_NONE {
+        effective_syntax_mode = resolution_mode;
+    }
+    if effective_syntax_mode == RESOLUTION_MODE_ESM && module_resolution_is_node_next {
         if allow_importing_ts_extension {
             return vec![TsExtension, JsExtension];
         }
