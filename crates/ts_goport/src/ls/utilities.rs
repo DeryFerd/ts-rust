@@ -599,11 +599,15 @@ pub fn find_reference_in_position(refs: &[FileReference], pos: i32) -> Option<&F
 
 // Go: ls/utilities.go:431 getContainingNodeIfInHeritageClause
 pub fn get_containing_node_if_in_heritage_clause(node: Node) -> Node {
-    if node.kind() == SyntaxKind::Identifier || node.kind() == SyntaxKind::PropertyAccessExpression
+    if node.kind() == SyntaxKind::Identifier
+        || node.kind() == SyntaxKind::QualifiedName
+        || node.kind() == SyntaxKind::PropertyAccessExpression
     {
         return get_containing_node_if_in_heritage_clause(node.parent());
     }
-    if node.kind() == SyntaxKind::ExpressionWithTypeArguments
+    if (node.kind() == SyntaxKind::ExpressionWithTypeArguments
+        || node.kind() == SyntaxKind::TypeReference)
+        && is_heritage_clause(node.parent())
         && (is_class_like(node.parent().parent())
             || node.parent().parent().kind() == SyntaxKind::InterfaceDeclaration)
     {
@@ -798,7 +802,7 @@ pub fn get_adjusted_location(node: Node, for_rename: bool, source_file: Node) ->
             // /**/extends [|name|]
             // /**/implements [|name|]
             if node.types().nodes().len() == 1 {
-                return node.types().nodes().get(0).expression();
+                return get_heritage_clause_element_name(node.types().nodes().get(0));
             }
 
             // fall through `getAdjustedLocation`
@@ -1220,6 +1224,8 @@ pub fn get_intersecting_meaning_from_declarations(
 
 // Go: ls/utilities.go:915 getAllSuperTypeNodes
 // Returns the node in an `extends` or `implements` clause of a class or interface.
+// PORT: Go returns `[]*ast.HeritageClauseElement` (ExpressionWithTypeArguments
+// or TypeReference nodes, tsgo#4797).
 pub fn get_all_super_type_nodes(node: Node) -> Vec<Node> {
     if is_interface_declaration(node) {
         return get_heritage_elements(node, SyntaxKind::ExtendsKeyword);
@@ -1231,7 +1237,7 @@ pub fn get_all_super_type_nodes(node: Node) -> Vec<Node> {
         if extends.is_some() {
             result.push(extends);
         }
-        result.extend(get_implements_type_nodes(node));
+        result.extend(get_implements_heritage_clause_elements(node));
         return result;
     }
     Vec::new()

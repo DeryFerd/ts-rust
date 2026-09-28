@@ -815,6 +815,7 @@ fn fill_non_zero_values() -> UserPreferences {
         disable_line_text_in_references: f,
         display_parts_for_js_doc: f,
         report_style_checks_as_warnings: f,
+        locale: "test".to_string(),
         disable_automatic_type_acquisition: f,
         automatic_type_acquisition_enabled: f,
         custom_config_file_name: "test".to_string(),
@@ -972,6 +973,20 @@ fn items(entries: &[(&str, LspAny)]) -> IndexMap<String, LspAny> {
         LspAny::Object(m) => m,
         _ => unreachable!(),
     }
+}
+
+// Go: ls/lsutil/userpreferences_test.go:429 TestUserPreferencesLocale
+#[test]
+fn test_user_preferences_locale() {
+    let prefs = parse_user_preferences(&items(&[
+        (
+            "typescript",
+            obj(&[("locale", LspAny::String("de".into()))]),
+        ),
+        ("js/ts", obj(&[("locale", LspAny::String("fr".into()))])),
+    ]));
+
+    assert_eq!(prefs.locale, "fr");
 }
 
 // Go: ls/lsutil/userpreferences_test.go:427 TestUserPreferencesReportStyleChecksAsWarnings

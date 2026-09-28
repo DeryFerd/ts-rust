@@ -186,6 +186,7 @@ pub struct UserPreferences {
     pub disable_line_text_in_references: Tristate, // !!!
     pub display_parts_for_js_doc: Tristate,        // !!!
     pub report_style_checks_as_warnings: Tristate,
+    pub locale: String,
 
     // ------- ATA -------
 
@@ -1479,6 +1480,7 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
         Tristate,
         report_style_checks_as_warnings
     ),
+    pref_field!("Locale", "", "locale", String, locale),
     pref_field!(
         "DisableAutomaticTypeAcquisition",
         "disableAutomaticTypeAcquisition",

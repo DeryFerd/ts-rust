@@ -49,7 +49,7 @@ fn get_code_actions_to_fix_class_incorrectly_implements_interface(
         return Ok(Vec::new());
     }
 
-    let implements_types = get_implements_type_nodes(class_declaration);
+    let implements_types = get_implements_heritage_clause_elements(class_declaration);
     let locale = locale::from_context(context);
 
     let (type_checker, _done) = ls_program::get_type_checker_for_file(
@@ -142,7 +142,7 @@ fn get_all_code_actions_to_fix_class_incorrectly_implements_interface(
             }
             // Go: seenClassDeclarations.AddIfAbsent(classDeclaration)
             if seen_class_declarations.insert(class_declaration) {
-                let implements_types = get_implements_type_nodes(class_declaration);
+                let implements_types = get_implements_heritage_clause_elements(class_declaration);
                 for implemented_type_node in implements_types {
                     let mut checker_ref = type_checker.borrow_mut();
                     add_changes(

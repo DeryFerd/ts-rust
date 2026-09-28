@@ -345,15 +345,24 @@ impl LanguageService {
             let mut is_snippet = false;
             let mut sort_text: SortText = SORT_TEXT_AUTO_IMPORT_SUGGESTIONS.to_string();
 
-            if data.import_statement_completion.is_some() {
-                // PORT: tsgo#3949 fills `insertText`, `replacementSpan`,
-                // `filterText` and `sortText` here with
-                // `getInsertTextAndReplacementSpanForImportCompletion` and the
-                // new `autoimport.GetImportKindForImportStatement`. That
-                // helper is in the ls-autoimport lane, which ports it after
-                // int12 (bump B plan section 5). Until then this keeps the pin
-                // O behavior: skip the entry.
-                continue;
+            if let Some(import_statement_completion) = &data.import_statement_completion {
+                is_snippet = client_supports_item_snippet(ctx);
+                (insert_text, replacement_span) =
+                    get_insert_text_and_replacement_span_for_import_completion(
+                        &auto_import.fix,
+                        autoimport::get_import_kind_for_import_statement(
+                            file,
+                            &auto_import.export,
+                            self.get_program(),
+                        ),
+                        import_statement_completion,
+                        use_semicolons,
+                        file,
+                        &preferences,
+                        is_snippet,
+                    );
+                filter_text = auto_import.fix.name.clone();
+                sort_text = SORT_TEXT_LOCATION_PRIORITY.to_string();
             }
 
             // Non-contextual keywords (e.g., `function`, `class`, `const`) cannot be used as identifiers,
@@ -447,8 +456,6 @@ pub fn completion_name_for_literal(
 }
 
 // Go: ls/completions.go:2065 getInsertTextAndReplacementSpanForImportCompletion
-// PORT: tsgo#3949. Its only caller waits for the ls-autoimport lane (see
-// `getCompletionEntriesFromSymbols`).
 pub fn get_insert_text_and_replacement_span_for_import_completion(
     fix: &autoimport::Fix,
     import_kind: lsproto::ImportKind,
