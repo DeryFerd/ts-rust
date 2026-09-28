@@ -2,7 +2,7 @@ use crate::api::prelude::*;
 
 // Port of Go `internal/api/session.go`, lines 1272-2484: the
 // `resolve*PropertyOf*` helpers, the checker query handlers, node building
-// and printing, intrinsic types, diagnostics, `resolveNodeHandle`,
+// and printing, emit (tsgo#4699), intrinsic types, diagnostics, `resolveNodeHandle`,
 // `computeSnapshotChanges`, `Close`, and the references, signature usage and
 // completion handlers. The file header of `session_p1.rs` holds the PORT
 // notes for both files (registry entries keep the owning checker; handles
@@ -10,6 +10,9 @@ use crate::api::prelude::*;
 // and `checker_signature`).
 
 use crate::api::encoder;
+use crate::emitter::emitter::EmitOnly;
+use crate::emitter::program_emit::{self, EmitOptions, EmitResult, WriteFile, WriteFileData};
+use crate::execute::incremental::emit_files::fs_error_text;
 use crate::frontend::compiler;
 use crate::frontend::core_context::{self, CheckerLifetime};
 use crate::frontend::core_ls_ext::{diff_maps, diff_ordered_maps};
@@ -20,6 +23,7 @@ use crate::frontend::vfs::Fs as _;
 use crate::gostd::{self, Context, GoError, errors};
 use crate::program::ls_program;
 use crate::project;
+use std::sync::{Arc, Mutex, PoisonError};
 
 impl Session {
     // Go: api/session.go:1273 resolveTypePropertyOfType
@@ -661,6 +665,210 @@ impl Session {
         Ok(p.emit(node, Node::NIL))
     }
 
+    // Go: api/session.go:2625 handleEmit (tsgo#4699)
+    // PORT: Go writes each output through the project session FS from the
+    // emit goroutines. Here the write callback runs on the checker threads
+    // and the FS belongs to this thread (`Rc`), so the callback keeps the
+    // outputs and this thread writes them after the emit, in the order they
+    // came. A failed write adds the Go "Could not write file" diagnostic
+    // (named after the output that a `.map` file belongs to, as Go does)
+    // at the end of the list, not in the file's own list, and the file
+    // leaves `emittedFiles`.
+    pub fn handle_emit(&self, ctx: &Context, params: &EmitParams) -> Result<EmitResponse, GoError> {
+        let (program, mut options) = self.get_emit_options(params)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+        let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let pending = Arc::clone(&writes);
+        let write_file: WriteFile = Arc::new(
+            move |file_name: &str, text: &str, _data: &mut WriteFileData| {
+                pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((file_name.to_string(), text.to_string()));
+                Ok(())
+            },
+        );
+        options.write_file = Some(write_file);
+        let mut result = emit_program(ctx, program, options)?;
+        let writes = std::mem::take(&mut *writes.lock().unwrap_or_else(PoisonError::into_inner));
+        let fs = self.project_session.fs();
+        for (file_name, text) in writes {
+            if let Err(err) = fs.write_file(&file_name, &text) {
+                let output_file = file_name.strip_suffix(".map").unwrap_or(&file_name);
+                result.diagnostics.push(new_compiler_diagnostic(
+                    diag::Could_not_write_file_0_Colon_1,
+                    args![output_file, fs_error_text(&err)],
+                ));
+                result.emitted_files.retain(|emitted| *emitted != file_name);
+            }
+        }
+        // Go clones `EmittedFiles` and makes a nil one `[]string{}`; an empty
+        // `Vec` marshals as `[]`.
+        Ok(EmitResponse {
+            emit_skipped: result.emit_skipped,
+            diagnostics: non_nil_diagnostics(&result.diagnostics),
+            emitted_files: result.emitted_files,
+        })
+    }
+
+    // Go: api/session.go:2648 handleEmitToString (tsgo#4699)
+    pub fn handle_emit_to_string(
+        &self,
+        ctx: &Context,
+        params: &EmitParams,
+    ) -> Result<EmitOutputResponse, GoError> {
+        let (program, options) = self.get_emit_options(params)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+        emit_to_output(ctx, program, options)
+    }
+
+    // Go: api/session.go:2656 handleSelectedFilesEmit (tsgo#4699)
+    pub fn handle_selected_files_emit(
+        &self,
+        ctx: &Context,
+        params: &SelectedFilesEmitParams,
+        emit_only: EmitOnly,
+    ) -> Result<EmitOutputResponse, GoError> {
+        let program = self.get_emit_program(params.snapshot, &params.project)?;
+        // Current for the whole handler (session_p1.rs header).
+        let _program = ls_program::enter(program);
+        let Some(files) = &params.files else {
+            return Err(errors::errorf(
+                format!("{}: files is required", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let mut target_source_files = Vec::with_capacity(files.len());
+        for file in files {
+            let source_file = self.resolve_optional_source_file(program, Some(file))?;
+            target_source_files.push(source_file);
+        }
+        emit_to_output(
+            ctx,
+            program,
+            EmitOptions {
+                target_source_files: Some(target_source_files),
+                emit_only,
+                force_emit: true,
+                write_file: None,
+            },
+        )
+    }
+}
+
+// Go: api/session.go:2679 emitToOutput (tsgo#4699)
+// PORT: the write callback runs on the checker threads, so the outputs are
+// in an `Arc<Mutex>` (Go `mu`). The caller keeps `program` current.
+fn emit_to_output(
+    ctx: &Context,
+    program: &'static compiler::NewProgram,
+    mut options: EmitOptions,
+) -> Result<EmitOutputResponse, GoError> {
+    let output_files: Arc<Mutex<Vec<EmitOutputFile>>> = Arc::default();
+    let outputs = Arc::clone(&output_files);
+    let write_file: WriteFile = Arc::new(
+        move |file_name: &str, text: &str, data: &mut WriteFileData| {
+            let mut source_file_name = None;
+            if data.source_file.is_some() {
+                source_file_name = Some(source_file_file_name(data.source_file).to_string());
+            }
+            outputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(EmitOutputFile {
+                    file_name: file_name.to_string(),
+                    text: text.to_string(),
+                    source_file_name,
+                });
+            Ok(())
+        },
+    );
+    options.write_file = Some(write_file);
+
+    let result = emit_program(ctx, program, options)?;
+    let mut output_files =
+        std::mem::take(&mut *output_files.lock().unwrap_or_else(PoisonError::into_inner));
+    // Go `strings.Compare`: byte order, as `String` compares.
+    output_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    Ok(EmitOutputResponse {
+        emit_skipped: result.emit_skipped,
+        diagnostics: non_nil_diagnostics(&result.diagnostics),
+        output_files,
+    })
+}
+
+impl Session {
+    // Go: api/session.go:2708 getEmitOptions (tsgo#4699)
+    pub fn get_emit_options(
+        &self,
+        params: &EmitParams,
+    ) -> Result<(&'static compiler::NewProgram, EmitOptions), GoError> {
+        let program = self.get_emit_program(params.snapshot, &params.project)?;
+        let emit_only = get_emit_only(params.emit_only)?;
+        Ok((
+            program,
+            EmitOptions {
+                emit_only,
+                ..EmitOptions::default()
+            },
+        ))
+    }
+
+    // Go: api/session.go:2722 getEmitProgram (tsgo#4699)
+    pub fn get_emit_program(
+        &self,
+        snapshot: SnapshotID,
+        project_id: &ProjectID,
+    ) -> Result<&'static compiler::NewProgram, GoError> {
+        let sd = self.get_snapshot_data(snapshot)?;
+        sd.get_program(project_id)
+    }
+}
+
+// Go: api/session.go:2730 getEmitOnly (tsgo#4699)
+// PORT: Go converts the number to `compiler.EmitOnly` (EmitAll 0,
+// EmitOnlyJs 1, EmitOnlyDts 2); the port matches it to the enum.
+fn get_emit_only(value: Option<u32>) -> Result<EmitOnly, GoError> {
+    let Some(value) = value else {
+        return Ok(EmitOnly::All);
+    };
+    match value {
+        0 => Ok(EmitOnly::All),
+        1 => Ok(EmitOnly::Js),
+        2 => Ok(EmitOnly::Dts),
+        _ => Err(errors::errorf(
+            format!("{}: invalid emitOnly value: {}", *ERR_CLIENT_ERROR, value),
+            vec![ERR_CLIENT_ERROR.clone()],
+        )),
+    }
+}
+
+// Go: api/session.go:2741 emitProgram (tsgo#4699)
+// PORT: Go `program.Emit` of the project program. The port runs the compile
+// emit (`program_emit::emit`) with the program current (`ls_program::enter`).
+// The first emit of a program version makes its compile checker pool;
+// `ls_program` frees it with the program.
+// `program_emit::emit` takes no context and always returns a result, so
+// Go's nil result branches (a canceled `ctx`) do not happen here.
+fn emit_program(
+    _ctx: &Context,
+    program: &'static compiler::NewProgram,
+    options: EmitOptions,
+) -> Result<EmitResult, GoError> {
+    let _program = ls_program::enter(program);
+    Ok(program_emit::emit(options))
+}
+
+// Go: api/session.go:2752 nonNilDiagnostics (tsgo#4699)
+// PORT: a Rust `Vec` has no nil. An empty list marshals as `[]`, the same as
+// Go's non-nil empty slice.
+fn non_nil_diagnostics(diags: &[Diagnostic]) -> Vec<DiagnosticResponse> {
+    new_diagnostic_responses(diags)
+}
+
+impl Session {
     // Go: api/session.go:2125 handleGetWellKnownSymbols
     // handleGetWellKnownSymbols returns the handle ids of the per-checker singleton
     // symbols (unknown, undefined, arguments) so the client can identify them by id.

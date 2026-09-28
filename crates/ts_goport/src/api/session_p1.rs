@@ -3,9 +3,9 @@ use crate::api::prelude::*;
 // Port of Go `internal/api/session.go`, lines 1-1271: the snapshot
 // registries, `Session`, `NewSession`, the checker and language service
 // setup, the `HandleRequest` dispatch and the snapshot, project, symbol and
-// type handlers up to `handleGetTargetOfSignature`, then
-// `handleGetImportAdderEdits` and `toAPITextEdits` (tsgo#3881). Lines
-// 1272-2484 are `session_p2.rs`.
+// type handlers up to `handleGetTargetOfSignature`, the transpile handlers
+// (tsgo#4849), then `handleGetImportAdderEdits` and `toAPITextEdits`
+// (tsgo#3881). Lines 1272-2484 are `session_p2.rs`.
 //
 // PORT notes for both files:
 // - Go `*ast.Symbol`, `*checker.Type` and `*checker.Signature` carry their
@@ -37,6 +37,7 @@ use crate::api::prelude::*;
 
 use crate::api::encoder;
 use crate::astnav;
+use crate::emitter::emitter::EmitOnly;
 use crate::frontend::compiler;
 use crate::frontend::core_context::{self, CheckerLifetime};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
@@ -49,6 +50,7 @@ use crate::ls;
 use crate::ls::autoimport;
 use crate::program::ls_program;
 use crate::project;
+use crate::transpile;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1006,6 +1008,19 @@ impl Handler for Session {
             m if m == Method::PARSE_CONFIG_FILE.0 => self
                 .handle_parse_config_file(ctx, assert_params(&parsed))
                 .map(to_any),
+            // tsgo#4849
+            m if m == Method::TRANSPILE_MODULE.0 => self
+                .handle_transpile(ctx, assert_params(&parsed), false)
+                .map(to_any),
+            m if m == Method::TRANSPILE_MODULE_FROM_FILE.0 => self
+                .handle_transpile_from_file(ctx, assert_params(&parsed), false)
+                .map(to_any),
+            m if m == Method::TRANSPILE_DECLARATION.0 => self
+                .handle_transpile(ctx, assert_params(&parsed), true)
+                .map(to_any),
+            m if m == Method::TRANSPILE_DECLARATION_FROM_FILE.0 => self
+                .handle_transpile_from_file(ctx, assert_params(&parsed), true)
+                .map(to_any),
             m if m == Method::GET_DEFAULT_PROJECT_FOR_FILE.0 => self
                 .handle_get_default_project_for_file(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1200,6 +1215,17 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::FORMAT_NODE_FOR_INSERTION.0 => self
                 .handle_format_node_for_insertion(ctx, assert_params(&parsed))
+                .map(to_any),
+            // tsgo#4699
+            m if m == Method::EMIT.0 => self.handle_emit(ctx, assert_params(&parsed)).map(to_any),
+            m if m == Method::EMIT_TO_STRING.0 => self
+                .handle_emit_to_string(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_JAVA_SCRIPT_EMIT.0 => self
+                .handle_selected_files_emit(ctx, assert_params(&parsed), EmitOnly::Js)
+                .map(to_any),
+            m if m == Method::GET_DECLARATION_EMIT.0 => self
+                .handle_selected_files_emit(ctx, assert_params(&parsed), EmitOnly::Dts)
                 .map(to_any),
             m if m == Method::IS_CONTEXT_SENSITIVE.0 => self
                 .handle_is_context_sensitive(ctx, assert_params(&parsed))
@@ -1891,6 +1917,75 @@ impl Session {
             .expect("NewConfigFileResponse of a parsed command line"))
     }
 
+    // Go: api/session.go:1242 handleTranspile (tsgo#4849)
+    pub fn handle_transpile(
+        &self,
+        ctx: &Context,
+        params: &TranspileParams,
+        declaration: bool,
+    ) -> Result<TranspileOutputResponse, GoError> {
+        transpile_output(ctx, &params.input, &params.options, declaration)
+    }
+
+    // Go: api/session.go:1246 handleTranspileFromFile (tsgo#4849)
+    pub fn handle_transpile_from_file(
+        &self,
+        ctx: &Context,
+        params: &TranspileFromFileParams,
+        declaration: bool,
+    ) -> Result<TranspileOutputResponse, GoError> {
+        let file_name = tspath::get_normalized_absolute_path(
+            &params.file_name,
+            &self.project_session.get_current_directory(),
+        );
+        let (input, ok) = self.project_session.fs().read_file(&file_name);
+        if !ok {
+            return Err(errors::errorf(
+                format!(
+                    "{}: could not read file {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(&file_name)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let mut options = params.options.clone();
+        options.file_name = file_name;
+        transpile_output(ctx, &input, &options, declaration)
+    }
+}
+
+// Go: api/session.go:1257 transpileOutput (tsgo#4849)
+fn transpile_output(
+    ctx: &Context,
+    input: &str,
+    options: &TranspileOptions,
+    declaration: bool,
+) -> Result<TranspileOutputResponse, GoError> {
+    let transpile_options = transpile::Options {
+        compiler_options: options.compiler_options.clone(),
+        file_name: options.file_name.clone(),
+        report_diagnostics: options.report_diagnostics,
+    };
+    let output = if declaration {
+        transpile::transpile_declaration(ctx, input, transpile_options)
+    } else {
+        transpile::transpile_module(ctx, input, transpile_options)
+    };
+    let Some(output) = output else {
+        if let Some(err) = ctx.err() {
+            return Err(err);
+        }
+        return Err(errors::new("transpilation produced no output"));
+    };
+    Ok(TranspileOutputResponse {
+        output_text: output.output_text,
+        diagnostics: new_diagnostic_responses(&output.diagnostics),
+        source_map_text: output.source_map_text,
+    })
+}
+
+impl Session {
     // Go: api/session.go:769 handleGetSourceFile
     // handleGetSourceFile returns a source file from a project within a snapshot.
     pub fn handle_get_source_file(

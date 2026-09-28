@@ -243,6 +243,12 @@ impl Method {
     pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
     pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
+    // tsgo#4849
+    pub const TRANSPILE_MODULE: Method = Method(Cow::Borrowed("transpileModule"));
+    pub const TRANSPILE_MODULE_FROM_FILE: Method = Method(Cow::Borrowed("transpileModuleFromFile"));
+    pub const TRANSPILE_DECLARATION: Method = Method(Cow::Borrowed("transpileDeclaration"));
+    pub const TRANSPILE_DECLARATION_FROM_FILE: Method =
+        Method(Cow::Borrowed("transpileDeclarationFromFile"));
     pub const GET_DEFAULT_PROJECT_FOR_FILE: Method =
         Method(Cow::Borrowed("getDefaultProjectForFile"));
     pub const GET_SYMBOL_AT_POSITION: Method = Method(Cow::Borrowed("getSymbolAtPosition"));
@@ -398,6 +404,11 @@ impl Method {
     // Emitter methods
     pub const PRINT_NODE: Method = Method(Cow::Borrowed("printNode"));
     pub const FORMAT_NODE_FOR_INSERTION: Method = Method(Cow::Borrowed("formatNodeForInsertion"));
+    // tsgo#4699
+    pub const EMIT: Method = Method(Cow::Borrowed("emit"));
+    pub const EMIT_TO_STRING: Method = Method(Cow::Borrowed("emitToString"));
+    pub const GET_JAVA_SCRIPT_EMIT: Method = Method(Cow::Borrowed("getJavaScriptEmit"));
+    pub const GET_DECLARATION_EMIT: Method = Method(Cow::Borrowed("getDeclarationEmit"));
 
     // Intrinsic type getters
     pub const GET_ANY_TYPE: Method = Method(Cow::Borrowed("getAnyType"));
@@ -786,6 +797,23 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         Method::PARSE_CONFIG_FILE,
         unmarshaller_for::<ParseConfigFileParams>,
     );
+    // tsgo#4849
+    m.insert(
+        Method::TRANSPILE_MODULE,
+        unmarshaller_for::<TranspileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_MODULE_FROM_FILE,
+        unmarshaller_for::<TranspileFromFileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_DECLARATION,
+        unmarshaller_for::<TranspileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_DECLARATION_FROM_FILE,
+        unmarshaller_for::<TranspileFromFileParams>,
+    );
     m.insert(
         Method::GET_DEFAULT_PROJECT_FOR_FILE,
         unmarshaller_for::<GetDefaultProjectForFileParams>,
@@ -1162,6 +1190,17 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         Method::FORMAT_NODE_FOR_INSERTION,
         unmarshaller_for::<FormatNodeForInsertionParams>,
     );
+    // tsgo#4699
+    m.insert(Method::EMIT, unmarshaller_for::<EmitParams>);
+    m.insert(Method::EMIT_TO_STRING, unmarshaller_for::<EmitParams>);
+    m.insert(
+        Method::GET_JAVA_SCRIPT_EMIT,
+        unmarshaller_for::<SelectedFilesEmitParams>,
+    );
+    m.insert(
+        Method::GET_DECLARATION_EMIT,
+        unmarshaller_for::<SelectedFilesEmitParams>,
+    );
     m.insert(
         Method::GET_ANY_TYPE,
         unmarshaller_for::<GetIntrinsicTypeParams>,
@@ -1332,6 +1371,95 @@ pub fn json_value_to_any(value: &LspAny) -> tsoptions::CompilerOptionsValue {
         }
     }
 }
+
+// Go: proto.go:589 TranspileOptions (tsgo#4849)
+// PORT: Go `*core.CompilerOptions` is `Option<CompilerOptions>` (nil is
+// `None`). Its JSON form is the Go struct default (`CompilerOptionsJSON` to
+// write, the `CompilerOptions` `UnmarshalerFrom` below to read).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileOptions {
+    pub compiler_options: Option<CompilerOptions>,
+    pub file_name: String,
+    pub report_diagnostics: bool,
+}
+
+impl MarshalerTo for TranspileOptions {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &self.compiler_options.as_ref().map(CompilerOptionsJSON),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "fileName", &self.file_name)?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "reportDiagnostics",
+            &self.report_diagnostics,
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl UnmarshalerFrom for TranspileOptions {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.TranspileOptions", |name, dec| {
+            match name {
+                "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                "fileName" => json_unmarshal_decode(dec, &mut self.file_name)?,
+                "reportDiagnostics" => json_unmarshal_decode(dec, &mut self.report_diagnostics)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = TranspileOptions::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go:595 TranspileParams (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileParams {
+    pub input: String,
+    pub options: TranspileOptions,
+}
+
+proto_json!(both TranspileParams {
+    input: "input" plain,
+    options: "options" plain,
+});
+
+// Go: proto.go:600 TranspileFromFileParams (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileFromFileParams {
+    pub file_name: String,
+    pub options: TranspileOptions,
+}
+
+proto_json!(both TranspileFromFileParams {
+    file_name: "fileName" plain,
+    options: "options" plain,
+});
+
+// Go: proto.go:605 TranspileOutputResponse (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileOutputResponse {
+    pub output_text: String,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub source_map_text: String,
+}
+
+proto_json!(marshal TranspileOutputResponse {
+    output_text: "outputText" plain,
+    diagnostics: "diagnostics" omitempty,
+    source_map_text: "sourceMapText" omitempty,
+});
 
 // ReleaseParams are the parameters for the release method.
 // Go: proto.go:410 ReleaseParams
@@ -2627,6 +2755,79 @@ proto_json!(both PrintNodeParams {
     terminate_unterminated_literals: "terminateUnterminatedLiterals" omitempty,
 });
 
+// Go: proto.go:1286 EmitParams (tsgo#4699)
+// PORT: Go `*uint32` is `Option<u32>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub emit_only: Option<u32>,
+}
+
+proto_json!(both EmitParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    emit_only: "emitOnly" omitempty,
+});
+
+// Go: proto.go:1292 SelectedFilesEmitParams (tsgo#4699)
+// PORT: Go tells a nil `Files` (absent or `null`) from an empty one, so it
+// is `Option<Vec>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectedFilesEmitParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub files: Option<Vec<DocumentIdentifier>>,
+}
+
+proto_json!(both SelectedFilesEmitParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    files: "files" plain,
+});
+
+// Go: proto.go:1298 EmitResponse (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitResponse {
+    pub emit_skipped: bool,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub emitted_files: Vec<String>,
+}
+
+proto_json!(marshal EmitResponse {
+    emit_skipped: "emitSkipped" plain,
+    diagnostics: "diagnostics" plain,
+    emitted_files: "emittedFiles" plain,
+});
+
+// Go: proto.go:1304 EmitOutputFile (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitOutputFile {
+    pub file_name: String,
+    pub text: String,
+    pub source_file_name: Option<String>,
+}
+
+proto_json!(marshal EmitOutputFile {
+    file_name: "fileName" plain,
+    text: "text" plain,
+    source_file_name: "sourceFileName" omitempty,
+});
+
+// Go: proto.go:1310 EmitOutputResponse (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitOutputResponse {
+    pub emit_skipped: bool,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub output_files: Vec<EmitOutputFile>,
+}
+
+proto_json!(marshal EmitOutputResponse {
+    emit_skipped: "emitSkipped" plain,
+    diagnostics: "diagnostics" plain,
+    output_files: "outputFiles" plain,
+});
+
 // FormatNodeForInsertionParams are the parameters for the formatNodeForInsertion method.
 // Go: proto.go:1317 FormatNodeForInsertionParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -3357,6 +3558,251 @@ impl MarshalerTo for CompilerOptionsJSON<'_> {
     }
 }
 
+/// Go v2 default unmarshal of `core.CompilerOptions`
+/// (`TranspileOptions.CompilerOptions`, tsgo#4849).
+/// PORT: Go decodes the struct by reflection over its `json` tags
+/// (core/compileroptions.go:16). This matches the same member names, in Go
+/// order, case-sensitive; unknown names are skipped and `null` sets the zero
+/// struct. A `Tristate` calls its legacy `UnmarshalJSON` with the raw value
+/// (core/tristate.go:43), the enum types are Go `int32` types, a `[]string`
+/// is `None` for `null`, and `Paths` (`*collections.OrderedMap`) uses the
+/// `IndexMap` impl of `OrderedMap.UnmarshalJSONFrom`. `runExternalCode` is
+/// tsgo#4712 (wave 3): the port has no field yet, so it is skipped.
+impl UnmarshalerFrom for CompilerOptions {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let o = &mut *self;
+        let is_object = unmarshal_struct_fields(dec, "core.CompilerOptions", |name, dec| {
+            match name {
+                "allowJs" => unmarshal_tristate(dec, &mut o.allow_js)?,
+                "allowArbitraryExtensions" => {
+                    unmarshal_tristate(dec, &mut o.allow_arbitrary_extensions)?
+                }
+                "allowImportingTsExtensions" => {
+                    unmarshal_tristate(dec, &mut o.allow_importing_ts_extensions)?
+                }
+                "allowNonTsExtensions" => unmarshal_tristate(dec, &mut o.allow_non_ts_extensions)?,
+                "allowUmdGlobalAccess" => unmarshal_tristate(dec, &mut o.allow_umd_global_access)?,
+                "allowUnreachableCode" => unmarshal_tristate(dec, &mut o.allow_unreachable_code)?,
+                "allowUnusedLabels" => unmarshal_tristate(dec, &mut o.allow_unused_labels)?,
+                "assumeChangesOnlyAffectDirectDependencies" => {
+                    unmarshal_tristate(dec, &mut o.assume_changes_only_affect_direct_dependencies)?
+                }
+                "checkJs" => unmarshal_tristate(dec, &mut o.check_js)?,
+                "customConditions" => json_unmarshal_decode(dec, &mut o.custom_conditions)?,
+                "composite" => unmarshal_tristate(dec, &mut o.composite)?,
+                "emitDeclarationOnly" => unmarshal_tristate(dec, &mut o.emit_declaration_only)?,
+                "emitBOM" => unmarshal_tristate(dec, &mut o.emit_bom)?,
+                "emitDecoratorMetadata" => unmarshal_tristate(dec, &mut o.emit_decorator_metadata)?,
+                "declaration" => unmarshal_tristate(dec, &mut o.declaration)?,
+                "declarationDir" => json_unmarshal_decode(dec, &mut o.declaration_dir)?,
+                "declarationMap" => unmarshal_tristate(dec, &mut o.declaration_map)?,
+                "deduplicatePackages" => unmarshal_tristate(dec, &mut o.deduplicate_packages)?,
+                "disableSizeLimit" => unmarshal_tristate(dec, &mut o.disable_size_limit)?,
+                "disableSourceOfProjectReferenceRedirect" => {
+                    unmarshal_tristate(dec, &mut o.disable_source_of_project_reference_redirect)?
+                }
+                "disableSolutionSearching" => {
+                    unmarshal_tristate(dec, &mut o.disable_solution_searching)?
+                }
+                "disableReferencedProjectLoad" => {
+                    unmarshal_tristate(dec, &mut o.disable_referenced_project_load)?
+                }
+                "erasableSyntaxOnly" => unmarshal_tristate(dec, &mut o.erasable_syntax_only)?,
+                "exactOptionalPropertyTypes" => {
+                    unmarshal_tristate(dec, &mut o.exact_optional_property_types)?
+                }
+                "experimentalDecorators" => {
+                    unmarshal_tristate(dec, &mut o.experimental_decorators)?
+                }
+                "forceConsistentCasingInFileNames" => {
+                    unmarshal_tristate(dec, &mut o.force_consistent_casing_in_file_names)?
+                }
+                "isolatedModules" => unmarshal_tristate(dec, &mut o.isolated_modules)?,
+                "isolatedDeclarations" => unmarshal_tristate(dec, &mut o.isolated_declarations)?,
+                "ignoreConfig" => unmarshal_tristate(dec, &mut o.ignore_config)?,
+                "ignoreDeprecations" => json_unmarshal_decode(dec, &mut o.ignore_deprecations)?,
+                "importHelpers" => unmarshal_tristate(dec, &mut o.import_helpers)?,
+                "inlineSourceMap" => unmarshal_tristate(dec, &mut o.inline_source_map)?,
+                "inlineSources" => unmarshal_tristate(dec, &mut o.inline_sources)?,
+                "init" => unmarshal_tristate(dec, &mut o.init)?,
+                "incremental" => unmarshal_tristate(dec, &mut o.incremental)?,
+                "jsx" => unmarshal_core_int(dec, &mut o.jsx.0, "core.JsxEmit")?,
+                "jsxFactory" => json_unmarshal_decode(dec, &mut o.jsx_factory)?,
+                "jsxFragmentFactory" => json_unmarshal_decode(dec, &mut o.jsx_fragment_factory)?,
+                "jsxImportSource" => json_unmarshal_decode(dec, &mut o.jsx_import_source)?,
+                "lib" => json_unmarshal_decode(dec, &mut o.lib)?,
+                "libReplacement" => unmarshal_tristate(dec, &mut o.lib_replacement)?,
+                "locale" => json_unmarshal_decode(dec, &mut o.locale)?,
+                "mapRoot" => json_unmarshal_decode(dec, &mut o.map_root)?,
+                "module" => unmarshal_core_int(dec, &mut o.module.0, "core.ModuleKind")?,
+                "moduleResolution" => unmarshal_core_int(
+                    dec,
+                    &mut o.module_resolution.0,
+                    "core.ModuleResolutionKind",
+                )?,
+                "moduleSuffixes" => json_unmarshal_decode(dec, &mut o.module_suffixes)?,
+                "moduleDetection" => {
+                    unmarshal_core_int(dec, &mut o.module_detection.0, "core.ModuleDetectionKind")?
+                }
+                "newLine" => unmarshal_core_int(dec, &mut o.new_line.0, "core.NewLineKind")?,
+                "noEmit" => unmarshal_tristate(dec, &mut o.no_emit)?,
+                "noCheck" => unmarshal_tristate(dec, &mut o.no_check)?,
+                "noErrorTruncation" => unmarshal_tristate(dec, &mut o.no_error_truncation)?,
+                "noFallthroughCasesInSwitch" => {
+                    unmarshal_tristate(dec, &mut o.no_fallthrough_cases_in_switch)?
+                }
+                "noImplicitAny" => unmarshal_tristate(dec, &mut o.no_implicit_any)?,
+                "noImplicitThis" => unmarshal_tristate(dec, &mut o.no_implicit_this)?,
+                "noImplicitReturns" => unmarshal_tristate(dec, &mut o.no_implicit_returns)?,
+                "noEmitHelpers" => unmarshal_tristate(dec, &mut o.no_emit_helpers)?,
+                "noLib" => unmarshal_tristate(dec, &mut o.no_lib)?,
+                "noPropertyAccessFromIndexSignature" => {
+                    unmarshal_tristate(dec, &mut o.no_property_access_from_index_signature)?
+                }
+                "noUncheckedIndexedAccess" => {
+                    unmarshal_tristate(dec, &mut o.no_unchecked_indexed_access)?
+                }
+                "noEmitOnError" => unmarshal_tristate(dec, &mut o.no_emit_on_error)?,
+                "noUnusedLocals" => unmarshal_tristate(dec, &mut o.no_unused_locals)?,
+                "noUnusedParameters" => unmarshal_tristate(dec, &mut o.no_unused_parameters)?,
+                "noResolve" => unmarshal_tristate(dec, &mut o.no_resolve)?,
+                "noImplicitOverride" => unmarshal_tristate(dec, &mut o.no_implicit_override)?,
+                "noUncheckedSideEffectImports" => {
+                    unmarshal_tristate(dec, &mut o.no_unchecked_side_effect_imports)?
+                }
+                "outDir" => json_unmarshal_decode(dec, &mut o.out_dir)?,
+                "paths" => json_unmarshal_decode(dec, &mut o.paths)?,
+                "preserveConstEnums" => unmarshal_tristate(dec, &mut o.preserve_const_enums)?,
+                "preserveSymlinks" => unmarshal_tristate(dec, &mut o.preserve_symlinks)?,
+                "project" => json_unmarshal_decode(dec, &mut o.project)?,
+                "resolveJsonModule" => unmarshal_tristate(dec, &mut o.resolve_json_module)?,
+                "resolvePackageJsonExports" => {
+                    unmarshal_tristate(dec, &mut o.resolve_package_json_exports)?
+                }
+                "resolvePackageJsonImports" => {
+                    unmarshal_tristate(dec, &mut o.resolve_package_json_imports)?
+                }
+                "removeComments" => unmarshal_tristate(dec, &mut o.remove_comments)?,
+                "rewriteRelativeImportExtensions" => {
+                    unmarshal_tristate(dec, &mut o.rewrite_relative_import_extensions)?
+                }
+                "reactNamespace" => json_unmarshal_decode(dec, &mut o.react_namespace)?,
+                "rootDir" => json_unmarshal_decode(dec, &mut o.root_dir)?,
+                "rootDirs" => json_unmarshal_decode(dec, &mut o.root_dirs)?,
+                "skipLibCheck" => unmarshal_tristate(dec, &mut o.skip_lib_check)?,
+                "stableTypeOrdering" => unmarshal_tristate(dec, &mut o.stable_type_ordering)?,
+                "strict" => unmarshal_tristate(dec, &mut o.strict)?,
+                "strictBindCallApply" => unmarshal_tristate(dec, &mut o.strict_bind_call_apply)?,
+                "strictBuiltinIteratorReturn" => {
+                    unmarshal_tristate(dec, &mut o.strict_builtin_iterator_return)?
+                }
+                "strictFunctionTypes" => unmarshal_tristate(dec, &mut o.strict_function_types)?,
+                "strictNullChecks" => unmarshal_tristate(dec, &mut o.strict_null_checks)?,
+                "strictPropertyInitialization" => {
+                    unmarshal_tristate(dec, &mut o.strict_property_initialization)?
+                }
+                "stripInternal" => unmarshal_tristate(dec, &mut o.strip_internal)?,
+                "skipDefaultLibCheck" => unmarshal_tristate(dec, &mut o.skip_default_lib_check)?,
+                "sourceMap" => unmarshal_tristate(dec, &mut o.source_map)?,
+                "sourceRoot" => json_unmarshal_decode(dec, &mut o.source_root)?,
+                "suppressOutputPathCheck" => {
+                    unmarshal_tristate(dec, &mut o.suppress_output_path_check)?
+                }
+                "target" => unmarshal_core_int(dec, &mut o.target.0, "core.ScriptTarget")?,
+                "traceResolution" => unmarshal_tristate(dec, &mut o.trace_resolution)?,
+                "tsBuildInfoFile" => json_unmarshal_decode(dec, &mut o.ts_build_info_file)?,
+                "typeRoots" => json_unmarshal_decode(dec, &mut o.type_roots)?,
+                "types" => json_unmarshal_decode(dec, &mut o.types)?,
+                "useDefineForClassFields" => {
+                    unmarshal_tristate(dec, &mut o.use_define_for_class_fields)?
+                }
+                "useUnknownInCatchVariables" => {
+                    unmarshal_tristate(dec, &mut o.use_unknown_in_catch_variables)?
+                }
+                "verbatimModuleSyntax" => unmarshal_tristate(dec, &mut o.verbatim_module_syntax)?,
+                "maxNodeModuleJsDepth" => {
+                    unmarshal_go_int_ptr(dec, &mut o.max_node_module_js_depth)?
+                }
+                "allowSyntheticDefaultImports" => {
+                    unmarshal_tristate(dec, &mut o.allow_synthetic_default_imports)?
+                }
+                "alwaysStrict" => unmarshal_tristate(dec, &mut o.always_strict)?,
+                "baseUrl" => json_unmarshal_decode(dec, &mut o.base_url)?,
+                "downlevelIteration" => unmarshal_tristate(dec, &mut o.downlevel_iteration)?,
+                "esModuleInterop" => unmarshal_tristate(dec, &mut o.es_module_interop)?,
+                "outFile" => json_unmarshal_decode(dec, &mut o.out_file)?,
+                "configFilePath" => json_unmarshal_decode(dec, &mut o.config_file_path)?,
+                "noDtsResolution" => unmarshal_tristate(dec, &mut o.no_dts_resolution)?,
+                "pathsBasePath" => json_unmarshal_decode(dec, &mut o.paths_base_path)?,
+                "diagnostics" => unmarshal_tristate(dec, &mut o.diagnostics)?,
+                "extendedDiagnostics" => unmarshal_tristate(dec, &mut o.extended_diagnostics)?,
+                "generateCpuProfile" => json_unmarshal_decode(dec, &mut o.generate_cpu_profile)?,
+                "generateTrace" => json_unmarshal_decode(dec, &mut o.generate_trace)?,
+                "listEmittedFiles" => unmarshal_tristate(dec, &mut o.list_emitted_files)?,
+                "listFiles" => unmarshal_tristate(dec, &mut o.list_files)?,
+                "explainFiles" => unmarshal_tristate(dec, &mut o.explain_files)?,
+                "listFilesOnly" => unmarshal_tristate(dec, &mut o.list_files_only)?,
+                "noEmitForJsFiles" => unmarshal_tristate(dec, &mut o.no_emit_for_js_files)?,
+                "preserveWatchOutput" => unmarshal_tristate(dec, &mut o.preserve_watch_output)?,
+                "pretty" => unmarshal_tristate(dec, &mut o.pretty)?,
+                "version" => unmarshal_tristate(dec, &mut o.version)?,
+                "watch" => unmarshal_tristate(dec, &mut o.watch)?,
+                "showConfig" => unmarshal_tristate(dec, &mut o.show_config)?,
+                "build" => unmarshal_tristate(dec, &mut o.build)?,
+                "help" => unmarshal_tristate(dec, &mut o.help)?,
+                "all" => unmarshal_tristate(dec, &mut o.all)?,
+                "pprofDir" => json_unmarshal_decode(dec, &mut o.pprof_dir)?,
+                "singleThreaded" => unmarshal_tristate(dec, &mut o.single_threaded)?,
+                "quiet" => unmarshal_tristate(dec, &mut o.quiet)?,
+                "checkers" => unmarshal_go_int_ptr(dec, &mut o.checkers)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = CompilerOptions::default();
+        }
+        Ok(())
+    }
+}
+
+// Go v2 calls the legacy `Tristate.UnmarshalJSON` with the raw value, also
+// for `null` (arshal_methods.go:286). It never fails.
+fn unmarshal_tristate(dec: &mut JsonDecoder<'_>, t: &mut Tristate) -> Result<(), JsonError> {
+    let val = dec.read_value()?;
+    t.unmarshal_json(val);
+    Ok(())
+}
+
+// Go v2 int arshaler for a Go named `int32` type (`core.ModuleKind`): the
+// `int32` decode, with errors that name `go_type`.
+fn unmarshal_core_int(
+    dec: &mut JsonDecoder<'_>,
+    v: &mut i32,
+    go_type: &str,
+) -> Result<(), JsonError> {
+    v.unmarshal_json_from(dec)
+        .map_err(|err| match SemanticError::of(&err) {
+            Some(mut s) => {
+                s.go_type = go_type.to_string();
+                s.into_json_error()
+            }
+            None => err,
+        })
+}
+
+// Go v2 pointer arshaler for a `*int` member: `null` sets nil.
+// PORT: the port stores `Option<i32>`, so a value outside the `int32` range
+// fails here while Go (64-bit `int`) takes it. Errors name Go `int`.
+fn unmarshal_go_int_ptr(dec: &mut JsonDecoder<'_>, v: &mut Option<i32>) -> Result<(), JsonError> {
+    if dec.peek_kind() == b'n' {
+        dec.read_token()?;
+        *v = None;
+        return Ok(());
+    }
+    unmarshal_core_int(dec, v.get_or_insert(0), "int")
+}
+
 #[cfg(test)]
 mod unmarshal_error_tests {
     use super::*;
@@ -3389,5 +3835,34 @@ mod unmarshal_error_tests {
             err_text::<GetSourceFileParams>(r#"{"snapshot":1,"file":5}"#),
             r#"failed to unmarshal *api.GetSourceFileParams: json: cannot unmarshal into Go api.DocumentIdentifier within "/file": DocumentIdentifier: expected string or object, got number"#
         );
+    }
+
+    // tsgo#4849: the client sends back the `compilerOptions` that the API
+    // wrote (`CompilerOptionsJSON`). Decoding them and writing them again
+    // gives the same text. The options are those of the hono-ext traces.
+    #[test]
+    fn transpile_compiler_options_round_trip() {
+        let options = r#"{"composite":true,"declaration":true,"forceConsistentCasingInFileNames":true,"module":6,"moduleResolution":100,"noUnusedLocals":true,"noUnusedParameters":true,"outDir":"/p/dist/types","paths":{"a/*":["b/*"],"c":["d"]},"rootDir":"/p/src","skipLibCheck":true,"strict":true,"target":9,"types":["node"],"esModuleInterop":true,"configFilePath":"/p/tsconfig.build.json"}"#;
+        let data = format!(
+            r#"{{"fileName":"/p/src/a.ts","options":{{"compilerOptions":{options},"reportDiagnostics":true}}}}"#
+        );
+        let parsed = unmarshaller_for::<TranspileFromFileParams>(data.as_bytes())
+            .expect("valid params")
+            .expect("params value");
+        let params = parsed
+            .downcast_ref::<TranspileFromFileParams>()
+            .expect("TranspileFromFileParams");
+        assert!(params.options.report_diagnostics);
+        let compiler_options = params
+            .options
+            .compiler_options
+            .as_ref()
+            .expect("compilerOptions");
+        assert_eq!(compiler_options.module, ModuleKind(6));
+        assert_eq!(compiler_options.strict, Tristate::True);
+        let written =
+            crate::frontend::json::json_marshal(&CompilerOptionsJSON(compiler_options), &[])
+                .expect("marshal");
+        assert_eq!(written, options);
     }
 }
