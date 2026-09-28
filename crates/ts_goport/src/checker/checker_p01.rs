@@ -9,6 +9,7 @@
 //! `TypeFacts`, `IterationUse`, `IterationTypeKind`) are generated in
 //! `crate::flags` and are not repeated here.
 
+use crate::gostd::Context;
 use crate::prelude::*;
 use std::sync::LazyLock;
 use ts_diagnostics::Message;
@@ -682,10 +683,11 @@ impl FlatKey for TypeId {
 // - `symbolArena`, `signatureArena`, `indexInfoArena` are replaced by the
 //   arenas at the end (`symbols`, `types`, `signatures`, `index_infos`,
 //   `type_predicates`, `mappers`, `inference_contexts`), see `PORTING.md`.
-// - `regExpScanner` (Go scanner), `ctx` and `mu` are out of scope
-//   (scanner object, cancellation, concurrency) and are not fields.
-//   `tracer` is the last field (see `crate::tracing`). `emitResolver` plus `emitResolverOnce` is the
-//   `Option<Rc<EmitResolver>>` field `emit_resolver`.
+// - `regExpScanner` (Go scanner) and `mu` are out of scope (scanner object,
+//   concurrency) and are not fields. The nil-able Go `ctx` is
+//   `Option<Context>`. `tracer` is the last field (see `crate::tracing`).
+//   `emitResolver` plus `emitResolverOnce` is the `Option<Rc<EmitResolver>>`
+//   field `emit_resolver`.
 // - `sync.Once` fields become `bool` "done" flags.
 // - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
@@ -1003,6 +1005,7 @@ pub struct Checker {
     pub _jsx_namespace: String,
     pub _jsx_factory_entity: Node,
     pub skip_direct_inference_nodes: FxHashSet<Node>,
+    pub ctx: Option<Context>,
     pub packages_map: FxHashMap<String, bool>,
     pub active_mappers: Vec<MapperId>,
     pub active_type_mappers_caches: Vec<ActiveMapperCache>,
@@ -1461,6 +1464,7 @@ impl Checker {
             _jsx_namespace: String::new(),
             _jsx_factory_entity: Node::NIL,
             skip_direct_inference_nodes: FxHashSet::default(),
+            ctx: None,
             packages_map: FxHashMap::default(),
             active_mappers: Vec::new(),
             active_type_mappers_caches: Vec::new(),

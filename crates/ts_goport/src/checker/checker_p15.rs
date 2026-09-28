@@ -1,5 +1,6 @@
 //! Port of typescript-go `internal/checker/checker.go` lines 13025-13928.
 
+use crate::gostd::Context;
 use crate::prelude::*;
 use ts_diagnostics::Message;
 
@@ -1587,27 +1588,37 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13873 GetDiagnostics
-    // PORT: the Go `ctx context.Context` parameter is dropped.
-    pub fn get_diagnostics_exported(&mut self, source_file: Node) -> Vec<Diagnostic> {
-        self.get_diagnostics(source_file, false)
+    pub fn get_diagnostics_exported(
+        &mut self,
+        ctx: &Context,
+        source_file: Node,
+    ) -> Vec<Diagnostic> {
+        self.get_diagnostics(ctx, source_file, false)
     }
 
     // Go: checker/checker.go:13877 GetSuggestionDiagnostics
-    // PORT: the Go `ctx context.Context` parameter is dropped.
-    pub fn get_suggestion_diagnostics(&mut self, source_file: Node) -> Vec<Diagnostic> {
-        self.get_diagnostics(source_file, true)
+    pub fn get_suggestion_diagnostics(
+        &mut self,
+        ctx: &Context,
+        source_file: Node,
+    ) -> Vec<Diagnostic> {
+        self.get_diagnostics(ctx, source_file, true)
     }
 
     // Go: checker/checker.go:13881 getDiagnostics
     // PORT: the Go `collection *ast.DiagnosticsCollection` pointer is `is_suggestion`
     // (true selects `suggestion_diagnostics`, false selects `diagnostics`).
-    // The Go `ctx context.Context` parameter is dropped.
-    pub fn get_diagnostics(&mut self, source_file: Node, is_suggestion: bool) -> Vec<Diagnostic> {
+    pub fn get_diagnostics(
+        &mut self,
+        ctx: &Context,
+        source_file: Node,
+        is_suggestion: bool,
+    ) -> Vec<Diagnostic> {
         self.check_not_canceled();
         let check_unused = self.compiler_options.no_unused_locals.is_true()
             || self.compiler_options.no_unused_parameters.is_true()
             || is_suggestion;
-        self.check_source_file(source_file, check_unused);
+        self.check_source_file(ctx, source_file, check_unused);
         if self.was_canceled {
             return Vec::new();
         }

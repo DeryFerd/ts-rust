@@ -724,9 +724,7 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message
-  boundaries. The checker is never canceled, so a canceled diagnostic
-  request answers `-32800` after the full check. The results are Go's; only
-  order and timing differ.
+  boundaries. The results are Go's; only order and timing differ.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of

@@ -159,7 +159,11 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
 
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
     match catch_unwind(AssertUnwindSafe(|| {
-        get_semantic_diagnostics_with_checker(checker, file)
+        get_semantic_diagnostics_with_checker(
+            &ts_goport::gostd::context::background(),
+            checker,
+            file,
+        )
     })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {

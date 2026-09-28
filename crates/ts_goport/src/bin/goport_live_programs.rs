@@ -283,7 +283,11 @@ fn check_on_this_thread(lives: &[Live]) -> Vec<[Checker; 2]> {
 fn check_file(checker: &mut Checker, file: Node, text: &mut String) {
     let info = source_file_info(file);
     let _ = writeln!(text, "== {}", info.file_name);
-    for diagnostic in get_semantic_diagnostics_with_checker(checker, file) {
+    for diagnostic in get_semantic_diagnostics_with_checker(
+        &ts_goport::gostd::context::background(),
+        checker,
+        file,
+    ) {
         let _ = writeln!(text, "{}", format_diagnostic(&diagnostic));
     }
     if info.is_declaration_file {
@@ -412,7 +416,7 @@ fn release(out: &Path, p_config: &str, q_config: &str) {
 /// The formatted semantic diagnostics of `file`, with the checker of its
 /// program on a worker thread.
 fn diagnostics_text(checker: &mut Checker, file: Node) -> String {
-    get_semantic_diagnostics_with_checker(checker, file)
+    get_semantic_diagnostics_with_checker(&ts_goport::gostd::context::background(), checker, file)
         .iter()
         .map(|diagnostic| format_diagnostic(diagnostic) + "\n")
         .collect()
