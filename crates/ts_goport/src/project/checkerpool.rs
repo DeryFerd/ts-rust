@@ -2,7 +2,7 @@
 //!
 //! PORT: the pool lives on the LSP dispatch thread (PORTING.md "Threads").
 //! `p.mu` is dropped: every Go `p.mu.Lock()` is `self.mu_lock()`, which
-//! only runs the request cleanups that wait for the lock (see
+//! only runs the request cleanups whose context is done (see
 //! `register_request_cleanup`). Fields that Go changes under the lock are
 //! `Cell`/`RefCell`. Go `*checker.Checker` is `Rc<RefCell<Checker>>` from
 //! `ls_program::new_checker`; the caller's `borrow_mut` is the exclusive
@@ -17,7 +17,6 @@ use crate::frontend::core_context::{self, CheckerLifetime};
 use crate::program::ls_program::{self, Release};
 use std::cell::Cell;
 use std::rc::Weak;
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // Go: project/checkerpool.go:20 checkerHeldAnonymous
@@ -130,11 +129,10 @@ pub struct CheckerPool {
     // per-checker count of globals last seen
     pub global_diag_checker_count: RefCell<Vec<i32>>,
 
-    /// Request ids whose context finished: the `context.AfterFunc`
-    /// callbacks of `register_request_cleanup` post them here from their
-    /// own threads, and `mu_lock` runs their deletes.
-    // PORT: `gostd::local` has no queue that another thread can post to.
-    request_cleanups: Arc<Mutex<Vec<String>>>,
+    /// The `context.AfterFunc` callbacks of `register_request_cleanup` that
+    /// have not run: each request id with the done channel of its request
+    /// context. `mu_lock` runs the callbacks whose channel is closed.
+    request_cleanups: RefCell<Vec<(String, gostd::context::Done)>>,
     /// The Go pointer `p`, for the release and timer closures.
     this: Weak<CheckerPool>,
 }
@@ -182,7 +180,7 @@ pub fn new_checker_pool(
         global_diag_accumulated: RefCell::new(Vec::new()),
         global_diag_changed: Cell::new(false),
         global_diag_checker_count: RefCell::new(vec![0; max_checkers]),
-        request_cleanups: Arc::new(Mutex::new(Vec::new())),
+        request_cleanups: RefCell::new(Vec::new()),
         this: this.clone(),
     })
 }
@@ -194,11 +192,6 @@ pub fn hold_tag(request_id: &str) -> String {
         return CHECKER_HELD_ANONYMOUS.to_string();
     }
     request_id.to_string()
-}
-
-// PORT: Go mutexes do not poison.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // Go: project/checkerpool.go:82 `var _ compiler.CheckerPool = (*checkerPool)(nil)`
@@ -230,19 +223,24 @@ impl CheckerPool {
         self.this.upgrade().expect("checkerPool: pool dropped")
     }
 
-    /// Go `p.mu.Lock()`.
+    /// Go `p.mu.Lock()`. Tests call it where Go tests lock `pool.mu`.
     // PORT: the mutex is dropped (one thread). In Go, a request cleanup
     // (`register_request_cleanup`) whose context is done waits for `p.mu`
-    // and then deletes its request association. Here the context thread
-    // posts the request id, and the next lock point runs the delete first:
-    // the Go schedule in which the waiting cleanup gets the lock next. Only
-    // lock holders read `requestAssociations`, so no reader can tell.
-    fn mu_lock(&self) {
-        let pending: Vec<String> = std::mem::take(&mut *lock(&self.request_cleanups));
-        for request_id in pending {
-            // Go: the registerRequestCleanup callback body.
-            self.request_associations.borrow_mut().remove(&request_id);
-        }
+    // and then deletes its request association. Here each lock point first
+    // runs the deletes of all requests whose context is done: the Go
+    // schedule in which the waiting cleanups get the lock next. Only lock
+    // holders read `requestAssociations`, so no reader can tell.
+    pub fn mu_lock(&self) {
+        self.request_cleanups
+            .borrow_mut()
+            .retain(|(request_id, done)| {
+                if !done.is_closed() {
+                    return true;
+                }
+                // Go: the registerRequestCleanup callback body.
+                self.request_associations.borrow_mut().remove(request_id);
+                false
+            });
     }
 
     // Go: project/checkerpool.go:157 checkerPool.tryReacquireForRequest
@@ -557,15 +555,18 @@ impl CheckerPool {
     // association when the request context is done. This prevents the map
     // from growing unboundedly with completed request IDs.
     // Must be called with p.mu held; the cleanup runs asynchronously.
-    // PORT: `gostd::context::after_func` runs the callback on its own
-    // thread, which can not touch the pool. The callback posts the request
-    // id; the delete runs at the next `mu_lock` (see there).
+    // PORT: `gostd::context::after_func` starts an OS thread when the
+    // context is done, which is one thread per request. The pool keeps the
+    // request's done channel instead, and the next `mu_lock` after the
+    // channel closes runs the delete (see there). A context with no done
+    // channel is never canceled, so Go never runs the callback; the port
+    // keeps nothing.
     pub fn register_request_cleanup(&self, ctx: &Context, request_id: &str) {
-        let request_cleanups = self.request_cleanups.clone();
-        let request_id = request_id.to_string();
-        let _stop = gostd::context::after_func(ctx, move || {
-            lock(&request_cleanups).push(request_id);
-        });
+        if let Some(done) = ctx.done() {
+            self.request_cleanups
+                .borrow_mut()
+                .push((request_id.to_string(), done));
+        }
     }
 
     // Go: project/checkerpool.go:396 checkerPool.scheduleCleanupLocked
