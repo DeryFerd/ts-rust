@@ -596,6 +596,8 @@ impl SourceDefResolver<'_> {
         let mut source_file = Node::NIL;
         let (text, ok) = self.ls.read_file(file_name);
         if ok {
+            // The file is published for good, so its nodes belong to the thread.
+            let _base = crate::ast::enter_base_synthetic_owner();
             let text: &'static str = Box::leak(text.into_boxed_str());
             let file = Rc::new(crate::frontend::parser::parse_source_file(
                 &crate::frontend::parser::SourceFileParseOptions {

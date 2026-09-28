@@ -24,6 +24,11 @@ pub struct CompilerHost {
     pub project: RefCell<Option<Rc<RefCell<Project>>>>,
     pub builder: RefCell<Option<Rc<ProjectCollectionBuilder>>>,
     pub logger: RefCell<Option<Rc<logging::LogTree>>>,
+
+    /// True when the project had no program when this host was made (its
+    /// first load). `compiler::CompilerHost::prefetch_parses` returns it.
+    // PORT: not in Go (see `compiler::CompilerHost::prefetch_parses`).
+    pub first_load: bool,
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -36,7 +41,10 @@ pub fn new_compiler_host(
     builder: &Rc<ProjectCollectionBuilder>,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<CompilerHost> {
-    let config_file_path = project.borrow().config_file_path.clone();
+    let (config_file_path, first_load) = {
+        let project = project.borrow();
+        (project.config_file_path.clone(), project.program.is_none())
+    };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
     Rc::new(CompilerHost {
         config_file_path,
@@ -49,6 +57,8 @@ pub fn new_compiler_host(
         project: RefCell::new(Some(project.clone())),
         builder: RefCell::new(Some(builder.clone())),
         logger: RefCell::new(logger),
+
+        first_load,
     })
 }
 
@@ -166,5 +176,28 @@ impl compiler::CompilerHost for CompilerHost {
             &locale::DEFAULT,
             &args,
         ));
+    }
+
+    // PORT: not in Go (see `compiler::CompilerHost::prefetch_parses`). A
+    // rebuild gets almost every file from the parse cache, which uses a
+    // worker parse only on a miss. Parse workers would parse the whole
+    // program again for nothing, and those parses stay in the workers' AST
+    // arenas (about 30 MiB for each Query core rebuild). The first load of
+    // a project still parses ahead.
+    fn prefetch_parses(&self) -> bool {
+        self.first_load
+    }
+
+    // PORT: not in Go (see `compiler::CompilerHost::release`). Go frees the
+    // host when the last program that uses it is freed. The port keeps the
+    // program shell (multiprog M2), so the host drops its data here: the
+    // snapshot file system (disk file map copy, overlays, cachedvfs
+    // results), the seen files and missing directories, and the config
+    // registry. A later file read panics, like a use after `freeze` does
+    // for the builder.
+    fn release(&self) {
+        self.source_fs.release();
+        let config_file_registry = self.config_file_registry.borrow_mut().take();
+        drop(config_file_registry);
     }
 }

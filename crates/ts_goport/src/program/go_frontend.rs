@@ -307,6 +307,8 @@ pub(super) fn publish_parsed_files(cwd: &str) {
 /// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
 /// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
 fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
+    // The cache outlives program versions, so the nodes belong to the thread.
+    let _base = crate::ast::enter_base_synthetic_owner();
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
@@ -1097,6 +1099,19 @@ impl GoSharedState {
             .get(module_reference)?
             .iter()
             .find(|(entry_mode, _)| *entry_mode == mode)
+            .map(|&(_, resolved)| resolved)
+    }
+
+    // Go: compiler/program.go:516 GetResolvedModules (ranged over: every
+    // resolution of every file)
+    // PERF: borrows the version's own map, as Go returns `p.resolvedModules`
+    // with no copy. The order is the map order; Go ranges over maps in a
+    // random order.
+    pub(super) fn resolved_modules(&self) -> impl Iterator<Item = &'static ResolvedModule> + '_ {
+        self.resolved_modules
+            .values()
+            .flat_map(|by_name| by_name.values())
+            .flatten()
             .map(|&(_, resolved)| resolved)
     }
 

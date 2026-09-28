@@ -173,6 +173,9 @@ fn get_doc_comment_template_at_position(
         && !has_closing_doc_comment_at_position
     {
         let text = source_file_text(source_file);
+        // The reparse is published for good (and its lazy JSDoc is cached
+        // before that), so its nodes belong to the thread.
+        let _base = crate::ast::enter_base_synthetic_owner();
         // PORT: the parser takes `&'static str` (node data points into the
         // text), so the text is leaked.
         let reparse_text: &'static str = Box::leak(
