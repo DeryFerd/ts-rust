@@ -21,6 +21,7 @@ use super::incremental::{BuildInfoReader, Host, marshal_build_info};
 use super::program_to_snapshot::program_to_snapshot;
 use super::snapshot::*;
 use super::snapshot_to_build_info::snapshot_to_build_info;
+use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{
     EmitOptions, EmitResult, WriteFileData, check_cannot_see_outputs, early_emit_options_allow,
 };
@@ -499,7 +500,7 @@ impl Program {
         result
     }
 
-    // Go: incremental/program.go:183 GetDeclarationDiagnostics
+    // Go: incremental/program.go:225 GetDeclarationDiagnostics
     // GetDeclarationDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -507,7 +508,8 @@ impl Program {
         let result = emit_files(
             self,
             EmitOptions {
-                target_source_file: file,
+                // #4699: Go `core.SingleElementSlice(file)`: nil for a nil file.
+                target_source_files: file.is_some().then(|| vec![file]),
                 ..EmitOptions::default()
             },
             true,
@@ -523,7 +525,7 @@ impl Program {
         get_suggestion_diagnostics(file) // TODO: incremental suggestion diagnostics (only relevant in editor incremental builder?)
     }
 
-    // Go: incremental/program.go:202 Emit
+    // Go: incremental/program.go:243 Emit
     // GetModeForUsageLocation implements compiler.AnyProgram interface.
     // PORT: with an emit that `start_emit` sent, this waits for it
     // and finishes it. That emit started only without `noEmit` and
@@ -536,16 +538,19 @@ impl Program {
             return finish_emit_files(self, started, &options);
         }
 
-        let result = if self.snapshot.borrow().options.no_emit.is_true() {
-            Some(EmitResult {
-                emit_skipped: true,
-                ..EmitResult::default()
-            })
-        } else {
-            handle_no_emit_on_error(self, options.target_source_file)
-        };
+        let mut result = None;
+        // #4407: Go `HandleNoEmitOptions` with `emitBuildInfo` under noEmit.
+        if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
+            let emit_build_info: &dyn Fn() -> Option<EmitResult> =
+                &|| self.emit_build_info(&options);
+            result = handle_no_emit_options(
+                self,
+                options.target_source_files.as_deref(),
+                self.options().no_emit.is_true().then_some(emit_build_info),
+            );
+        }
         if let Some(mut result) = result {
-            if options.target_source_file.is_some() {
+            if options.target_source_files.is_some() || self.options().no_emit.is_true() {
                 return result;
             }
 
@@ -899,33 +904,53 @@ fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
     package_jsons
 }
 
-// Go: compiler/program.go:1728 HandleNoEmitOnError
-// PORT: `emitter::program_emit::handle_no_emit_on_error` reads the plain
-// program. Go passes the `ProgramLike`, whose bind and semantic
-// diagnostics are the incremental ones here, so this is the same body over
-// `ProgramLike`.
+// Go: compiler/program.go:1905 HandleNoEmitOptions
+// HandleNoEmitOptions mirrors tsc's handleNoEmitOptions.
+// PORT: #4407 replaced Go `HandleNoEmitOnError`.
+// `emitter::program_emit::handle_no_emit_options` is the plain program form
+// (nil `emitBuildInfo`). Go passes the `ProgramLike`, whose bind and
+// semantic diagnostics are the incremental ones here, so this is the same
+// body over `ProgramLike`. Go `files` nil is `None`.
 #[must_use]
-pub fn handle_no_emit_on_error(program: &dyn ProgramLike, file: Node) -> Option<EmitResult> {
-    if !program.options().no_emit_on_error.is_true() {
-        return None; // No emit on error is not set, so we can proceed with emitting
-    }
+pub fn handle_no_emit_options(
+    program: &dyn ProgramLike,
+    files: Option<&[Node]>,
+    emit_build_info: Option<&dyn Fn() -> Option<EmitResult>>,
+) -> Option<EmitResult> {
+    if !program.options().no_emit.is_true() {
+        if !program.options().no_emit_on_error.is_true() {
+            return None; // NoEmit is false and NoEmitOnError is also false, so we can proceed with normal emit
+        }
 
-    let diagnostics = get_diagnostics_of_any_program(
-        file,
-        true,
-        &mut |file| program.get_bind_diagnostics(file),
-        &mut |file| program.get_semantic_diagnostics(file),
-        &mut || program.get_global_diagnostics(),
-        &mut |file| program.get_declaration_diagnostics(file),
-    );
-    if diagnostics.is_empty() {
-        return None; // No diagnostics, so we can proceed with emitting
+        let diagnostics = get_diagnostics_of_any_program(
+            files,
+            true,
+            &mut |file| program.get_bind_diagnostics(file),
+            &mut |file| program.get_semantic_diagnostics(file),
+            &mut || program.get_global_diagnostics(),
+            &mut |file| program.get_declaration_diagnostics(file),
+        );
+        if diagnostics.is_empty() {
+            return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting
+        }
+        return Some(EmitResult {
+            diagnostics,
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
     }
-    Some(EmitResult {
-        diagnostics,
-        emit_skipped: true,
-        ..EmitResult::default()
-    })
+    if files.is_some() {
+        return Some(EmitResult {
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
+    }
+    if let Some(emit_build_info) = emit_build_info
+        && let Some(result) = emit_build_info()
+    {
+        return Some(result);
+    }
+    Some(EmitResult::default())
 }
 
 // Go: compiler/program.go:1710 ProgramLike (var _ compiler.ProgramLike = (*Program)(nil))

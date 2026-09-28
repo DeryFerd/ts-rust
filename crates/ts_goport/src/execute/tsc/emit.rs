@@ -174,7 +174,7 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
     let times = result.times.clone();
 
     let mut all_diagnostics = get_diagnostics_of_any_program(
-        Node::NIL,
+        None, // #4699: Go nil files
         false,
         &mut |file| {
             // Options diagnostics include global diagnostics (even though we collect them separately),

@@ -148,7 +148,7 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
 /// checker, as in `goport`, so the walk sees the `goport` checker state.
 fn collect_all_diagnostics() -> Vec<Diagnostic> {
     get_diagnostics_of_any_program(
-        Node::NIL,
+        None, // #4699: Go nil files
         false,
         &mut |file| guard(|| get_bind_diagnostics(file)),
         &mut |file| collect_checker_diagnostics_with(file, check_file_guarded),

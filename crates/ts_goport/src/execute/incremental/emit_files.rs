@@ -100,7 +100,7 @@ impl<'a> EmitFilesHandler<'a> {
         pending_kind
     }
 
-    // Go: incremental/emitfileshandler.go:47 emitAllAffectedFiles
+    // Go: incremental/emitfileshandler.go:48 emitAllAffectedFiles
     // Emits the next affected file's emit result (EmitResult and sourceFiles emitted) or returns undefined if iteration is complete
     // The first of writeFile if provided, writeFile of BuilderProgramHost if provided, writeFile of compiler host
     // in that order would be used to write the files
@@ -109,16 +109,21 @@ impl<'a> EmitFilesHandler<'a> {
         if self.program.snapshot.borrow().can_use_incremental_state() {
             let results = self.emit_files_incremental(&options);
             if self.is_for_dts_errors {
-                if options.target_source_file.is_some() {
+                if let Some(target_files) = &options.target_source_files {
                     // Result from cache
-                    let diagnostics = self
-                        .program
-                        .snapshot
-                        .borrow_mut()
-                        .emit_diagnostics_per_file
-                        .get_mut(&path_of(options.target_source_file))
-                        .expect("emit diagnostics of the target file")
-                        .get_diagnostics(options.target_source_file);
+                    // #4699: Go `core.FlatMap` over the target files.
+                    let mut snapshot = self.program.snapshot.borrow_mut();
+                    let diagnostics = target_files
+                        .iter()
+                        .flat_map(|&target_file| {
+                            snapshot
+                                .emit_diagnostics_per_file
+                                .get_mut(&path_of(target_file))
+                                .expect("emit diagnostics of the target file")
+                                .get_diagnostics(target_file)
+                        })
+                        .collect();
+                    drop(snapshot);
                     let result = EmitResult {
                         emit_skipped: true,
                         diagnostics,
@@ -142,9 +147,18 @@ impl<'a> EmitFilesHandler<'a> {
             self.emit_build_info(&options, &mut result);
             result
         } else {
+            // #4699: Go nil targets ask for all files; else `core.FlatMap`
+            // over the target files.
+            let diagnostics = match &options.target_source_files {
+                None => get_declaration_diagnostics(Node::NIL),
+                Some(target_files) => target_files
+                    .iter()
+                    .flat_map(|&target_source_file| get_declaration_diagnostics(target_source_file))
+                    .collect(),
+            };
             let result = EmitResult {
                 emit_skipped: true,
-                diagnostics: get_declaration_diagnostics(options.target_source_file),
+                diagnostics,
                 ..EmitResult::default()
             };
             if !result.diagnostics.is_empty() {
@@ -184,7 +198,7 @@ impl<'a> EmitFilesHandler<'a> {
         }
     }
 
-    // Go: incremental/emitfileshandler.go:105 emitFilesIncremental
+    // Go: incremental/emitfileshandler.go:117 emitFilesIncremental
     // PORT: perf. Go queues one job per file on a WorkGroup. Pass 1 is the
     // loop body before `wg.Queue`, in the order Go queues
     // (`queue_affected_files`). Pass 2 runs all jobs at once (`emit_batch`,
@@ -264,9 +278,12 @@ impl<'a> EmitFilesHandler<'a> {
                     }
                 }
                 self.get_emit_options(EmitOptions {
-                    target_source_file: affected_file,
+                    // #4699: Go `core.SingleElementSlice(affectedFile)`; the
+                    // file is not nil.
+                    target_source_files: Some(vec![affected_file]),
                     emit_only,
                     write_file: options.write_file.clone(),
+                    ..EmitOptions::default()
                 })
             })
             .collect();
@@ -341,10 +358,12 @@ impl<'a> EmitFilesHandler<'a> {
         self.update_snapshot()
     }
 
-    // Go: incremental/emitfileshandler.go:176 getEmitOptions
-    // PORT: the callback runs on the checker thread of the target file. It
-    // gets copies of the target's file info and old emit signature (Go reads
-    // them from the snapshot, which does not change during emit). Go
+    // Go: incremental/emitfileshandler.go:196 getEmitOptions
+    // PORT: the callback runs on the checker thread of the emitted file. It
+    // gets copies of the file infos and old emit signatures of the files that
+    // the emit can write (Go reads them from the snapshot, which does not
+    // change during emit). #4699: Go reads them for `data.SourceFile`, not
+    // for the target file. Go
     // `h.program.host.GetMTime`/`SetMTime` go through the compiler host file
     // system; the incremental `Host` is not thread-safe, so the callback
     // uses this thread's OS file system (`osvfs_fs`), which is what the
@@ -357,19 +376,29 @@ impl<'a> EmitFilesHandler<'a> {
             return options;
         }
         let can_use_incremental_state = snapshot.can_use_incremental_state();
-        let target_source_file = options.target_source_file;
-        let target_path = if target_source_file.is_some() {
-            path_of(target_source_file)
+        // Only the incremental state reads the files. The emit writes only
+        // files of `target_source_files` (Go nil is all files).
+        let files: FxHashMap<Path, DtsWriteFile> = if can_use_incremental_state {
+            let copy = |file: Node| {
+                let path = path_of(file);
+                let entry = DtsWriteFile {
+                    old_emit_signature: snapshot.emit_signatures.get(&path).cloned(),
+                    file_info: snapshot.file_infos.get(&path).cloned(),
+                };
+                (path, entry)
+            };
+            match &options.target_source_files {
+                Some(target_files) => target_files.iter().copied().map(copy).collect(),
+                None => source_files().into_iter().map(copy).collect(),
+            }
         } else {
-            Path::default()
+            FxHashMap::default()
         };
         let context = DtsWriteContext {
             composite: snapshot.options.composite.is_true(),
             build: snapshot.options.build.is_true(),
             hash_with_text: snapshot.hash_with_text,
-            old_emit_signature: snapshot.emit_signatures.get(&target_path).cloned(),
-            file_info: snapshot.file_infos.get(&target_path).cloned(),
-            path: target_path,
+            files,
             shared: Arc::clone(&self.shared),
         };
         drop(snapshot);
@@ -379,13 +408,19 @@ impl<'a> EmitFilesHandler<'a> {
                 let mut differs_only_in_map = false;
                 if is_declaration_file_name(file_name) && can_use_incremental_state {
                     let mut emit_signature = String::new();
-                    let info = context
+                    // #4699: the file of `data.SourceFile`.
+                    let path = path_of(data.source_file);
+                    let file = context
+                        .files
+                        .get(&path)
+                        .expect("the emitted file is an emit target");
+                    let info = file
                         .file_info
                         .as_ref()
                         .expect("file info of the emitted file");
                     if info.signature == info.version {
                         let signature = compute_signature_with_diagnostics(
-                            target_source_file,
+                            data.source_file,
                             text,
                             data,
                             context.hash_with_text,
@@ -401,7 +436,7 @@ impl<'a> EmitFilesHandler<'a> {
                                 .lock()
                                 .expect("emit files lock")
                                 .signatures
-                                .insert(context.path.clone(), signature);
+                                .insert(path.clone(), signature);
                         }
                     }
 
@@ -410,6 +445,8 @@ impl<'a> EmitFilesHandler<'a> {
                     // and would need their d.ts change time in --build mode
                     if skip_dts_output_of_composite(
                         &context,
+                        &path,
+                        file,
                         file_name,
                         text,
                         data,
@@ -438,8 +475,10 @@ impl<'a> EmitFilesHandler<'a> {
             },
         );
         EmitOptions {
-            target_source_file,
+            target_source_files: options.target_source_files,
             emit_only: options.emit_only,
+            // #4407
+            force_emit: options.force_emit,
             write_file: Some(write_file),
         }
     }
@@ -514,22 +553,31 @@ impl<'a> EmitFilesHandler<'a> {
 }
 
 /// What Go `getEmitOptions`' `WriteFile` closure and
-/// `skipDtsOutputOfComposite` read through `h`, copied for the target file.
+/// `skipDtsOutputOfComposite` read through `h`, copied for the files that
+/// the emit can write.
 struct DtsWriteContext {
     composite: bool,
     build: bool,
     hash_with_text: bool,
-    old_emit_signature: Option<EmitSignature>,
-    file_info: Option<FileInfo>,
-    path: Path,
+    /// The snapshot entries of each file, by path.
+    files: FxHashMap<Path, DtsWriteFile>,
     shared: Arc<Mutex<EmitFilesShared>>,
 }
 
-// Go: incremental/emitfileshandler.go:236 skipDtsOutputOfComposite
+/// The snapshot entries of one file in `DtsWriteContext`.
+struct DtsWriteFile {
+    old_emit_signature: Option<EmitSignature>,
+    file_info: Option<FileInfo>,
+}
+
+// Go: incremental/emitfileshandler.go:252 skipDtsOutputOfComposite
 // Compare to existing computed signature and store it or handle the changes in d.ts map option from before
 // returning undefined means that, we dont need to emit this d.ts file since its contents didnt change
+// PORT: Go `file` is `path` (its path) and `entry` (its snapshot entries).
 fn skip_dts_output_of_composite(
     context: &DtsWriteContext,
+    path: &Path,
+    entry: &DtsWriteFile,
     output_file_name: &str,
     text: &str,
     data: &mut WriteFileData,
@@ -540,7 +588,7 @@ fn skip_dts_output_of_composite(
         return false;
     }
     let mut old_signature = String::new();
-    let old_signature_format = context.old_emit_signature.as_ref();
+    let old_signature_format = entry.old_emit_signature.as_ref();
     if let Some(format) = old_signature_format {
         if !format.signature.is_empty() {
             old_signature = format.signature.clone();
@@ -573,10 +621,10 @@ fn skip_dts_output_of_composite(
     } else {
         shared
             .latest_changed_dts_files
-            .insert(context.path.clone(), output_file_name.to_string());
+            .insert(path.clone(), output_file_name.to_string());
     }
     shared.emit_signatures.insert(
-        context.path.clone(),
+        path.clone(),
         EmitSignature {
             signature: new_signature,
             signature_with_different_options: None,
@@ -585,13 +633,13 @@ fn skip_dts_output_of_composite(
     false
 }
 
-// Go: incremental/emitfileshandler.go:327 emitFiles
+// Go: incremental/emitfileshandler.go:338 emitFiles
 #[must_use]
 pub fn emit_files(program: &Program, options: EmitOptions, is_for_dts_errors: bool) -> EmitResult {
     let mut emit_handler = EmitFilesHandler::new(program, is_for_dts_errors);
 
     // Single file emit - do direct from program
-    if !is_for_dts_errors && options.target_source_file.is_some() {
+    if !is_for_dts_errors && options.target_source_files.is_some() {
         let emit_options = emit_handler.get_emit_options(options);
         let result = emit(emit_options);
         emit_handler.update_has_emit_diagnostics(Some(&result));
@@ -638,7 +686,7 @@ pub(crate) struct StartedEmit {
 pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> StartedEmit {
     debug_assert!(
         program.snapshot.borrow().can_use_incremental_state()
-            && options.target_source_file.is_nil()
+            && options.target_source_files.is_none()
             && options.emit_only == EmitOnly::All,
         "start_emit_files: only the emit of all affected files starts early"
     );
@@ -666,7 +714,7 @@ pub(crate) fn finish_emit_files(
     options: &EmitOptions,
 ) -> EmitResult {
     debug_assert!(
-        options.target_source_file.is_nil()
+        options.target_source_files.is_none()
             && options.emit_only == EmitOnly::All
             && match (&options.write_file, &started.write_file) {
                 (Some(write_file), Some(started_write_file)) => {

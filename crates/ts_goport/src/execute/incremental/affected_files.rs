@@ -130,9 +130,12 @@ impl<'a> AffectedFilesHandler<'a> {
             },
         );
         emit(EmitOptions {
-            target_source_file: file,
-            emit_only: EmitOnly::ForcedDts,
+            // #4699: Go `core.SingleElementSlice(file)`; `file` is not nil.
+            target_source_files: Some(vec![file]),
+            // #4849: renamed from Go `EmitOnlyForcedDts`.
+            emit_only: EmitOnly::BuilderSignature,
             write_file: Some(write_file),
+            ..EmitOptions::default()
         });
         let result = signature.lock().expect("signature lock").clone();
         // Go: defer done()
