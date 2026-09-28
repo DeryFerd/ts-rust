@@ -5,6 +5,8 @@ use crate::frontend::prelude::*;
 // Go: outputpaths/outputpaths.go:11 OutputPathsHost
 pub trait OutputPathsHost {
     fn common_source_directory(&self) -> String;
+    /// #4712: the file extensions of the configured content mappers.
+    fn content_mapper_extensions(&self) -> Vec<String>;
     fn get_current_directory(&self) -> String;
     fn use_case_sensitive_file_names(&self) -> bool;
 }
@@ -72,17 +74,21 @@ pub fn get_output_paths_for(
     get_output_paths_for_file(
         source_file.file_name(),
         source_file.script_kind,
+        &source_file.content_mapper(),
         options,
         host,
         force,
     )
 }
 
-/// Go `GetOutputPathsFor` with the two source file fields it reads. Checker
-/// threads have no `ParsedSourceFile`, only the file name and script kind.
+/// Go `GetOutputPathsFor` with the three source file fields it reads.
+/// Checker threads have no `ParsedSourceFile`, only the file name, the
+/// script kind and the content mapper (Go `sourceFile.ContentMapper()`,
+/// "" when no content mapper made the file).
 pub fn get_output_paths_for_file(
     file_name: &str,
     script_kind: ScriptKind,
+    content_mapper: &str,
     options: &CompilerOptions,
     host: &dyn OutputPathsHost,
     force: ForceEmitPaths,
@@ -106,7 +112,9 @@ pub fn get_output_paths_for_file(
         ) == 0;
     let mut paths = OutputPaths::default();
     // #4699: `force.js`, `force.dts` and `force.declaration_map` (Go `ForceEmitPaths`).
-    if (force.js || options.emit_declaration_only != Tristate::True)
+    // #4712: a content-mapped file gets no JS output and no declaration map.
+    if content_mapper.is_empty()
+        && (force.js || options.emit_declaration_only != Tristate::True)
         && !is_json_emitted_to_same_location
     {
         paths.js_file_path = own_output_file_path;
@@ -117,8 +125,9 @@ pub fn get_output_paths_for_file(
     if force.dts || options.get_emit_declarations() && !is_json_file {
         paths.declaration_file_path =
             get_declaration_emit_output_file_path(file_name, options, host);
-        if options.get_are_declaration_maps_enabled()
-            || force.declaration_map && options.declaration_map.is_true()
+        if content_mapper.is_empty()
+            && (options.get_are_declaration_maps_enabled()
+                || force.declaration_map && options.declaration_map.is_true())
         {
             paths.declaration_map_path = format!("{}.map", paths.declaration_file_path);
         }
@@ -160,7 +169,9 @@ pub fn get_output_js_file_name(
     options: &CompilerOptions,
     host: &dyn OutputPathsHost,
 ) -> String {
-    if options.emit_declaration_only.is_true() {
+    // #4712: a content-mapped file has no JS output.
+    if options.emit_declaration_only.is_true() || is_content_mapped_file_name(input_file_name, host)
+    {
         return String::new();
     }
     let output_file_name = get_output_js_file_name_worker(input_file_name, options, host);
@@ -177,6 +188,16 @@ pub fn get_output_js_file_name(
         return output_file_name;
     }
     String::new()
+}
+
+// Go: outputpaths/outputpaths.go:97 isContentMappedFileName (#4712)
+fn is_content_mapped_file_name(file_name: &str, host: &dyn OutputPathsHost) -> bool {
+    !get_longest_extension_from_path(
+        file_name,
+        &host.content_mapper_extensions(),
+        !host.use_case_sensitive_file_names(),
+    )
+    .is_empty()
 }
 
 // Go: outputpaths/outputpaths.go:91 GetOutputJSFileNameWorker
@@ -201,9 +222,10 @@ pub fn get_output_declaration_file_name_worker(
     if dir.is_empty() {
         dir = options.out_dir.as_str();
     }
-    change_extension(
+    // #4712: Go `ChangeToDeclarationExtension`, not `ChangeExtension`.
+    change_to_declaration_extension(
         &get_output_path_without_changing_extension(input_file_name, dir, host),
-        &get_declaration_emit_extension_for_path(input_file_name),
+        host,
     )
 }
 
@@ -249,8 +271,30 @@ pub fn get_declaration_emit_output_file_path(
     } else {
         file.to_string()
     };
-    let declaration_extension = get_declaration_emit_extension_for_path(&path);
-    format!("{}{}", remove_file_extension(&path), declaration_extension)
+    // #4712
+    change_to_declaration_extension(&path, host)
+}
+
+// Go: outputpaths/outputpaths.go:148 ChangeToDeclarationExtension (#4712)
+/// A content mapper extension `.ext` becomes `.d.ext.ts`. Other paths get
+/// their declaration extension (Go `GetDeclarationEmitExtensionForPath`).
+pub fn change_to_declaration_extension(path: &str, host: &dyn OutputPathsHost) -> String {
+    let extension = get_longest_extension_from_path(path, &host.content_mapper_extensions(), false);
+    if !extension.is_empty() {
+        return format!("{}.d{}.ts", remove_extension(path, &extension), extension);
+    }
+    let mut path_without_extension = remove_file_extension(path);
+    if path_without_extension == path {
+        let extension = get_any_extension_from_path(path, &[], false);
+        if !extension.is_empty() {
+            path_without_extension = remove_extension(path, &extension);
+        }
+    }
+    format!(
+        "{}{}",
+        path_without_extension,
+        get_declaration_emit_extension_for_path(path)
+    )
 }
 
 // Go: outputpaths/outputpaths.go:142 GetSourceFilePathInNewDir

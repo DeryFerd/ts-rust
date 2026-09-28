@@ -2,6 +2,7 @@
 //! transformer and the diagnostics it reports.
 
 pub mod diagnostics;
+pub mod supplementalreferences;
 pub mod tracker;
 pub mod transform;
 pub mod transform_p2;
@@ -10,6 +11,7 @@ pub mod transform_p4;
 pub mod util;
 
 pub use diagnostics::*;
+pub use supplementalreferences::*;
 pub use tracker::*;
 // The crate prelude also exports the checker `SymbolTrackerImpl`.
 pub use tracker::SymbolTrackerImpl;
@@ -35,6 +37,8 @@ pub trait DeclarationEmitHost {
     fn get_source_file_from_reference(&self, origin: Node, r#ref: &FileReference) -> Node;
 
     fn get_output_paths_for(&self, file: Node, force_dts_paths: bool) -> Box<dyn OutputPaths>;
+    /// #4712
+    fn source_file_may_be_emitted(&self, file: Node, force_dts_emit: bool) -> bool;
     fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode;
     fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags;
     fn get_emit_resolver(&self) -> Rc<dyn EmitResolver>;
