@@ -1079,7 +1079,7 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
         };
         let old_program = read_build_info_program(&config, &reader, &*host);
         let incremental_program =
-            new_incremental_program(old_program.as_ref(), create_host(host), false);
+            new_incremental_program(old_program.as_ref(), create_host(host), None, false);
         return ProgramLike::Incremental(Box::new(incremental_program));
     }
     ProgramLike::Program(program)

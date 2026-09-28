@@ -92,7 +92,16 @@ pub fn do_error_baseline(
         get_error_baseline(&mut checks, input_files, errors, pretty)
     };
     let result = baseline::run(&baseline_path, &error_baseline, opts);
-    finish_checks(result, checks)
+    let result = finish_checks(result, checks);
+    // PORT: Go `t.Fatalf` after the comparison, so its message comes last.
+    if errors.iter().any(|d| d.code() == -1) {
+        let message = "Found diagnostic with code -1, which is used to log critical assertion violations in the baseline. Inspect and fix those failures.";
+        return Err(match result {
+            Ok(()) => message.to_string(),
+            Err(previous) => format!("{previous}\n{message}"),
+        });
+    }
+    result
 }
 
 /// Joins a comparison result with the Go `assert.Check` failures.
@@ -107,7 +116,7 @@ fn finish_checks(result: Result<(), String>, checks: Vec<String>) -> Result<(), 
     Err(messages.join("\n"))
 }
 
-// Go: error_baseline.go:46 minimalDiagnosticsToString
+// Go: error_baseline.go:51 minimalDiagnosticsToString
 fn minimal_diagnostics_to_string(diagnostics: &[Diagnostic], pretty: bool) -> String {
     let mut output = String::new();
     if pretty {
@@ -118,7 +127,7 @@ fn minimal_diagnostics_to_string(diagnostics: &[Diagnostic], pretty: bool) -> St
     output
 }
 
-// Go: error_baseline.go:56 GetErrorBaseline
+// Go: error_baseline.go:61 GetErrorBaseline
 pub fn get_error_baseline(
     checks: &mut Vec<String>,
     input_files: &[TestFile],
@@ -149,7 +158,7 @@ fn write_plain(output: &Writer, text: &str, _format_style: &str) {
     write_str(output, text);
 }
 
-// Go: error_baseline.go:256 formatLocation
+// Go: error_baseline.go:261 formatLocation
 fn format_location(file: Node, pos: i32, format_opts: &FormattingOptions) -> String {
     capture_writer(|w| write_location(w, file, pos, Some(format_opts), write_plain))
 }
@@ -177,7 +186,7 @@ fn slice(line: &str, a: usize, b: usize) -> &str {
     line.get(a..b).unwrap_or("")
 }
 
-// Go: error_baseline.go:71 iterateErrorBaseline
+// Go: error_baseline.go:78 iterateErrorBaseline
 fn iterate_error_baseline(
     checks: &mut Vec<String>,
     input_files: &[TestFile],
