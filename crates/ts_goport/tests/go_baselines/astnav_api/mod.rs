@@ -7,6 +7,7 @@
 //! - `api_proto`: internal/api/proto_test.go.
 //! - `api_timing`: internal/api/timing_test.go.
 //! - `api_encoder`: internal/api/encoder/{encoder,decoder}_test.go (api baselines).
+//! - `api_jsonvalue`: internal/api/jsonvalue_test.go.
 //!
 //! PORT: Go `t.Run` subtests run in order through `Subtests` (Go
 //! `t.Parallel()` is dropped). Each Go `Test` function is one `#[test]`.
@@ -14,6 +15,7 @@
 //! ported.
 
 mod api_encoder;
+mod api_jsonvalue;
 mod api_proto;
 mod api_timing;
 mod astnav_tokens;
