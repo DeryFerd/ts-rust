@@ -709,6 +709,7 @@ impl Snapshot {
             fs.clone(),
             &self.session_options.current_directory,
             self.to_path.clone(),
+            session.auto_import_parse_keys.clone(),
         );
         let mut open_files: FxHashMap<tspath::Path, String> =
             FxHashMap::with_capacity_and_hasher(overlays.len(), Default::default());

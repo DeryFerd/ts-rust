@@ -355,6 +355,48 @@ child_test! {
     }
 }
 
+/// The reference counts of the parse cache entries whose file name ends
+/// with `suffix`.
+fn ref_counts_of(session: &Session, suffix: &str) -> Vec<i32> {
+    session
+        .parse_cache
+        .entries
+        .borrow()
+        .iter()
+        .filter(|(key, _)| key.file_name.ends_with(suffix))
+        .map(|(_, entry)| ref_count(entry))
+        .collect()
+}
+
+child_test! {
+    // PORT: no Go counterpart. An auto-import registry clone keeps one
+    // reference to each file that it parsed
+    // (`AutoImportRegistryCloneHost::dispose`), so a later clone gets the
+    // same parse from the cache. Before, each clone released the entry, and
+    // a cancelled idle warm parsed, bound and kept the same node_modules
+    // files again on every edit.
+    fn parse_cache_keeps_auto_import_files_after_clone() {
+        let session = setup(files(&[
+            ("/home/projects/app/tsconfig.json", "{}"),
+            ("/home/projects/app/index.ts", ""),
+            ("/home/projects/node_modules/foo/package.json", r#"{ "types": "index.d.ts" }"#),
+            ("/home/projects/node_modules/foo/index.d.ts", "export const foo = 0;"),
+        ]));
+        let index_uri = "file:///home/projects/app/index.ts";
+        open(&session, index_uri, "");
+        assert!(ref_counts_of(&session, "/node_modules/foo/index.d.ts").is_empty());
+
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri(index_uri))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+
+        // The program does not include the file, so the only reference is
+        // the one the session keeps.
+        assert_eq!(ref_counts_of(&session, "/node_modules/foo/index.d.ts"), vec![1]);
+        session.close();
+    }
+}
+
 // Go: refcountcache_test.go:355 files (extendedConfigCache)
 fn extended_config_files() -> FileMap {
     files(&[
