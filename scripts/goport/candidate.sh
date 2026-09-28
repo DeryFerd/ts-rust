@@ -504,7 +504,7 @@ while (($#)); do
     --origin) ORIGIN=${2:?--origin needs a value}; shift 2 ;;
     --resume) RESUME=${2:?--resume needs a value}; shift 2 ;;
     --checkout) CHECKOUT=${2:?--checkout needs a value}; shift 2 ;;
-    --gate-host) HOST=${2:?--gate-host needs a value}; shift 2 ;;
+    --gate-host) HOST=${2:?--gate-host needs a value}; [[ $HOST != auto ]] || die "--gate-host auto is not supported (sync-pin and fetch need one host); pick a free one with remote.sh status"; shift 2 ;;
     --*) die "unknown option $1" ;;
     *) args+=("$1"); shift ;;
   esac
