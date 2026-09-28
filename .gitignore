@@ -2,3 +2,4 @@ target/
 *.tsbuildinfo
 .claude
 
+__pycache__/
