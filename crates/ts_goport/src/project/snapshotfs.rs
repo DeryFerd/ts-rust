@@ -21,6 +21,13 @@ pub trait FileSource {
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>>;
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool;
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries;
+
+    /// Go `source.FS().UseCaseSensitiveFileNames()`. A released source
+    /// (`SourceFS::release`) answers it with no file system.
+    // PORT: not in Go.
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs().use_case_sensitive_file_names()
+    }
 }
 
 // Go: project/snapshotfs.go:34 realpathAliasSet
@@ -948,6 +955,71 @@ impl SourceFS {
         self.track(file_name);
         self.source().get_file_by_path(file_name, path)
     }
+
+    /// Drops the file source and the tracked sets when the host of this file
+    /// system is released (`compiler::CompilerHost::release`). Only the case
+    /// sensitivity stays, so a file name lookup on a released program still
+    /// works (Go `Program.GetSourceFile` makes a path first). Any file
+    /// access panics after this. `seen_files` can be shared with the host of
+    /// a program cloned from this host's program; only this reference goes.
+    // PORT: not in Go. Go's GC frees the `sourceFS` with its host.
+    pub fn release(&self) {
+        self.tracking.set(false);
+        let released: Rc<dyn FileSource> = Rc::new(ReleasedFileSource {
+            use_case_sensitive_file_names: self.source().use_case_sensitive_file_names(),
+        });
+        // PORT: the old values drop after the borrows end.
+        let source = std::mem::replace(&mut *self.source.borrow_mut(), released);
+        let seen_files = self.seen_files.borrow_mut().take();
+        let missing_directories = self
+            .missing_directories
+            .as_ref()
+            .map(|missing| std::mem::take(&mut *missing.borrow_mut()));
+        drop(source);
+        drop(seen_files);
+        drop(missing_directories);
+    }
+}
+
+/// The file source of a released `SourceFS` (`SourceFS::release`). It keeps
+/// only the case sensitivity; every file access panics.
+// PORT: not in Go.
+struct ReleasedFileSource {
+    use_case_sensitive_file_names: bool,
+}
+
+fn released_file_source_used() -> ! {
+    panic!("the file system of a released program's compiler host was used");
+}
+
+impl FileSource for ReleasedFileSource {
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        released_file_source_used()
+    }
+
+    fn get_file(&self, _file_name: &str) -> Option<Rc<dyn FileHandle>> {
+        released_file_source_used()
+    }
+
+    fn get_file_by_path(
+        &self,
+        _file_name: &str,
+        _path: &tspath::Path,
+    ) -> Option<Rc<dyn FileHandle>> {
+        released_file_source_used()
+    }
+
+    fn file_exists(&self, _file_name: &str, _path: &tspath::Path) -> bool {
+        released_file_source_used()
+    }
+
+    fn get_accessible_entries(&self, _path: &str) -> vfs::Entries {
+        released_file_source_used()
+    }
+
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.use_case_sensitive_file_names
+    }
 }
 
 // Go: project/snapshotfs.go:664 `var _ vfs.FS = (*sourceFS)(nil)`
@@ -955,7 +1027,9 @@ impl vfs::Fs for SourceFS {
     // Go: project/snapshotfs.go:753 sourceFS.UseCaseSensitiveFileNames
     // UseCaseSensitiveFileNames implements vfs.FS.
     fn use_case_sensitive_file_names(&self) -> bool {
-        self.source().fs().use_case_sensitive_file_names()
+        // PORT: through the source, so a released source can answer it
+        // (`SourceFS::release`).
+        self.source().use_case_sensitive_file_names()
     }
 
     // Go: project/snapshotfs.go:724 sourceFS.FileExists

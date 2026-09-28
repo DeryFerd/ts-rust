@@ -1079,4 +1079,11 @@ impl InfoCache {
             }
         }
     }
+
+    /// Drops every entry (`module::Caches::release`).
+    // PORT: not in Go. Go's GC frees the cache with its last resolver.
+    pub fn clear(&self) {
+        let entries = std::mem::take(&mut *self.cache.borrow_mut());
+        drop(entries);
+    }
 }

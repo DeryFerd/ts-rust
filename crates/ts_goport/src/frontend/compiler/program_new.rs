@@ -611,6 +611,18 @@ impl NewProgram {
         &self.opts.host
     }
 
+    /// Empties the caches of the resolver of this program's load
+    /// (`module::Caches::release`). `ls_program` calls it when no live
+    /// program shares this load's processed files: Go `UpdateProgram`
+    /// shares them, resolver included, with each clone.
+    // PORT: not in Go. Go's GC frees the resolver with its last program; the
+    // port keeps the program shell (multiprog M2).
+    pub fn release_resolver_caches(&self) {
+        if let Some(resolver) = &self.resolver {
+            resolver.caches.release();
+        }
+    }
+
     // Go: program.go:402 (*Program).Tracing
     // PORT: the session is the process global `crate::tracing::get`.
 
