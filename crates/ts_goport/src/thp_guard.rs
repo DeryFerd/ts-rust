@@ -11,17 +11,59 @@
 //! (`prctl(PR_SET_THP_DISABLE)`), the faults take 4 KiB pages and do not
 //! wait, even where jemalloc asked for huge pages.
 //!
+//! The guard has two parts:
+//! - The start check turns THP off at once when less than the limit is free
+//!   in 2 MiB blocks.
+//! - Else a watcher thread reads the free memory every `POLL` and turns THP
+//!   off the first time it drops below the limit. The huge pages that the
+//!   run faulted before stay. The flag changes only the later faults.
+//!
+//! The limit is low (`DEFAULT_MIN_FREE_MIB`) because a run that finds
+//! enough free 2 MiB blocks is faster with THP. perf13 on dbook, with only
+//! a start check at 1 GiB, fragmented memory: query and hono started with
+//! a median of 223 to 284 MiB free, and THP off made them 6% to 16%
+//! slower. zod started with 272 MiB but faults about 900 MiB, and THP kept
+//! made it 39% slower: the watcher is for that case. With 10 to 148 MiB
+//! free at start, THP kept made effect 41% to 49% slower and query check 8
+//! 3% to 12% slower.
+//!
+//! perf13b, a watcher at 128 MiB on fragmented memory: hono emit faulted
+//! about 66 huge pages before it fired, where THP kept got all 144 with a
+//! few compaction stalls, so hono was 2.2% slower than with THP kept. The
+//! watcher fires later than the limit (see `POLL`); 64 MiB keeps enough
+//! margin for that. In two more grids (more fragmented: most runs started
+//! below 64 MiB) 64 MiB was within noise of 128 MiB or faster in every
+//! cell, and tsgo -b query chain got about 90 to 130 huge pages, not 56 to
+//! 99, with no compaction stall.
+//!
 //! `GOPORT_THP_GUARD` selects the mode: `0` does nothing, `force` always
-//! turns THP off, and any other value (or no value) checks the memory.
-//! `GOPORT_THP_GUARD_MIB` changes the limit (`DEFAULT_MIN_FREE_MIB`; a
-//! value that does not parse keeps the default). `GOPORT_THP_GUARD_DEBUG=1`
-//! prints the decision and its inputs as one line on stderr.
+//! turns THP off, `start` does the start check but starts no watcher, and
+//! any other value (or no value) does both. `GOPORT_THP_GUARD_MIB` changes
+//! the limit of both (a value that does not parse keeps the default).
+//! `GOPORT_THP_GUARD_DEBUG=1` prints each decision and its inputs as one
+//! line on stderr.
+
+use std::time::Duration;
 
 /// The guard turns THP off when less than this many MiB are free in
-/// blocks of 2 MiB or more. An effect emit faults about 700 huge pages
-/// (1.4 GiB). In perf11's state with 0.4 to 1.3 GB free in such blocks,
-/// THP was 4% to 13% slower than 4 KiB pages.
-const DEFAULT_MIN_FREE_MIB: u64 = 1024;
+/// blocks of 2 MiB or more. See the module comment for the perf13 and
+/// perf13b data.
+const DEFAULT_MIN_FREE_MIB: u64 = 64;
+
+/// How often the watcher reads `/proc/buddyinfo`. A run faults huge pages
+/// fastest at its start: in perf13b the free memory fell up to 36 MiB
+/// between two reads (effect emit and query check), so the watcher must
+/// fire that far above zero to beat the first compaction stall.
+const POLL: Duration = Duration::from_millis(5);
+
+/// The watcher stops after this time, so a long `--lsp` or `--watch`
+/// process does not read the memory for its whole life. The longest run of
+/// the perf13 grid took 1.2 s.
+const WATCH_FOR: Duration = Duration::from_secs(60);
+
+/// The buffer for `/proc/buddyinfo`: about 110 bytes per zone, so room for
+/// 70 nodes of 4 zones.
+const BUDDYINFO_BYTES: usize = 32 << 10;
 
 /// The smallest `/proc/buddyinfo` order that holds a whole 2 MiB huge page
 /// (512 pages of 4 KiB). The guard runs only on x86-64, where both sizes
@@ -32,9 +74,10 @@ const HUGE_ORDER: usize = 9;
 const PAGE_BYTES: u64 = 4096;
 
 /// Call first in `main`, before the first heap allocation: jemalloc maps
-/// and touches its first memory at that allocation. The default path
+/// and touches its first memory at that allocation. The start check
 /// allocates nothing (stack buffers only). Setting a `GOPORT_THP_GUARD*`
-/// variable allocates its value first.
+/// variable allocates its value first. The watcher thread start allocates,
+/// after the start check.
 ///
 /// Checks, in order, and stops at the first that says to keep THP:
 /// 1. `GOPORT_THP_GUARD` (see the module comment).
@@ -42,65 +85,194 @@ const PAGE_BYTES: u64 = 4096;
 ///    or this run is the exec of `set_malloc_tunables`: the flag stays set
 ///    across `execve`).
 /// 3. `enabled` and `defrag` in `/sys/kernel/mm/transparent_hugepage`
-///    (`thp_goes_off`).
+///    (`start_step`).
 /// 4. `/proc/buddyinfo`: the free memory in blocks of 2 MiB or more, in
-///    all nodes and zones, against the limit.
+///    all nodes and zones, against the limit. Below it, THP goes off. Else
+///    the watcher starts (`watch`).
 ///
-/// A file that cannot be read keeps THP on. The flag stays set for the
-/// whole process and its children. The memory is read only at start, so a
-/// long `--lsp` or `--watch` run keeps the first decision.
+/// A file that cannot be read keeps THP on and starts no watcher. The flag
+/// stays set for the whole process and its children.
 pub fn thp_guard() {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         use nix::sys::prctl::{get_thp_disable, set_thp_disable};
         let debug = std::env::var_os("GOPORT_THP_GUARD_DEBUG").is_some_and(|v| v != "0");
-        let say = |args: std::fmt::Arguments<'_>| {
-            if debug {
-                eprintln!("goport thp_guard: {args}");
+        let watcher = match std::env::var_os("GOPORT_THP_GUARD") {
+            Some(mode) if mode == "0" => {
+                return say(debug, format_args!("THP kept (GOPORT_THP_GUARD=0)"));
             }
-        };
-        match std::env::var_os("GOPORT_THP_GUARD") {
-            Some(mode) if mode == "0" => return say(format_args!("THP kept (GOPORT_THP_GUARD=0)")),
             Some(mode) if mode == "force" => {
                 let ok = set_thp_disable(true).is_ok();
-                return say(format_args!(
-                    "THP off (GOPORT_THP_GUARD=force, prctl ok {ok})"
-                ));
+                return say(
+                    debug,
+                    format_args!("THP off (GOPORT_THP_GUARD=force, prctl ok {ok})"),
+                );
             }
-            _ => {}
-        }
+            Some(mode) => mode != "start",
+            None => true,
+        };
         let min_free_mib: u64 = std::env::var_os("GOPORT_THP_GUARD_MIB")
             .and_then(|mib| mib.to_str()?.parse().ok())
             .unwrap_or(DEFAULT_MIN_FREE_MIB);
         if get_thp_disable().unwrap_or(true) {
-            return say(format_args!("THP already off at start"));
+            return say(debug, format_args!("THP already off at start"));
         }
         let mut enabled = [0; 128];
         let mut defrag = [0; 128];
-        // About 110 bytes per zone: room for 70 nodes of 4 zones.
-        let mut buddyinfo = [0; 32 << 10];
+        let mut buddyinfo = [0; BUDDYINFO_BYTES];
         let (Some(enabled), Some(defrag), Some(buddyinfo)) = (
             read_small("/sys/kernel/mm/transparent_hugepage/enabled", &mut enabled),
             read_small("/sys/kernel/mm/transparent_hugepage/defrag", &mut defrag),
             read_small("/proc/buddyinfo", &mut buddyinfo),
         ) else {
-            return say(format_args!(
-                "THP kept (a THP file or /proc/buddyinfo cannot be read)"
-            ));
+            return say(
+                debug,
+                format_args!("THP kept (a THP file or /proc/buddyinfo cannot be read)"),
+            );
         };
         let Some(free) = free_huge_bytes(buddyinfo) else {
-            return say(format_args!("THP kept (/proc/buddyinfo does not parse)"));
+            return say(
+                debug,
+                format_args!("THP kept (/proc/buddyinfo does not parse)"),
+            );
         };
-        let off = thp_goes_off(enabled, defrag, free, min_free_mib.saturating_mul(1 << 20));
-        let failed = off && set_thp_disable(true).is_err();
-        say(format_args!(
-            "THP {} (enabled {}, defrag {}, {} MiB free in 2 MiB blocks, limit {min_free_mib} MiB{})",
-            if off { "off" } else { "kept" },
-            selected_mode(enabled).unwrap_or("?"),
-            selected_mode(defrag).unwrap_or("?"),
-            free >> 20,
-            if failed { ", prctl failed" } else { "" },
-        ));
+        let min_free = min_free_mib.saturating_mul(1 << 20);
+        let step = start_step(enabled, defrag, free, min_free);
+        let failed = step == Start::Off && set_thp_disable(true).is_err();
+        let watching = step == Start::Watch && watcher && start_watcher(min_free, debug);
+        say(
+            debug,
+            format_args!(
+                "THP {} (enabled {}, defrag {}, {} MiB free in 2 MiB blocks, limit {min_free_mib} MiB{}{})",
+                if step == Start::Off { "off" } else { "kept" },
+                selected_mode(enabled).unwrap_or("?"),
+                selected_mode(defrag).unwrap_or("?"),
+                free >> 20,
+                if failed { ", prctl failed" } else { "" },
+                if watching { ", watcher started" } else { "" },
+            ),
+        );
+    }
+}
+
+/// Prints `args` as one `goport thp_guard:` line on stderr when `debug`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn say(debug: bool, args: std::fmt::Arguments<'_>) {
+    if debug {
+        eprintln!("goport thp_guard: {args}");
+    }
+}
+
+/// Starts the `watch` thread. False when the thread cannot start. The
+/// buddyinfo buffer is made here, on the heap: glibc puts the static TLS
+/// (79 to 99 KiB in perf13b) at the top of each thread stack, so a small
+/// stack (a 128 KiB one, or `RUST_MIN_STACK`) had too little room for it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn start_watcher(min_free: u64, debug: bool) -> bool {
+    let buddyinfo = vec![0; BUDDYINFO_BYTES];
+    std::thread::Builder::new()
+        .name("thp-guard".into())
+        .spawn(move || watch(min_free, debug, buddyinfo))
+        .is_ok()
+}
+
+/// The watcher thread: reads `/proc/buddyinfo` into `buddyinfo` every
+/// `POLL` and follows `watch_step`. It turns THP off at most once, then
+/// ends. It allocates nothing.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn watch(min_free: u64, debug: bool, mut buddyinfo: Vec<u8>) {
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::sleep(POLL);
+        let free = read_small("/proc/buddyinfo", &mut buddyinfo).and_then(free_huge_bytes);
+        let elapsed = start.elapsed();
+        match (watch_step(elapsed, free, min_free), free) {
+            (Watch::Wait, _) => {}
+            (Watch::Off, free) => {
+                let ok = nix::sys::prctl::set_thp_disable(true).is_ok();
+                return say(
+                    debug,
+                    format_args!(
+                        "THP off by the watcher after {} ms ({} MiB free in 2 MiB blocks, prctl ok {ok})",
+                        elapsed.as_millis(),
+                        free.unwrap_or(0) >> 20,
+                    ),
+                );
+            }
+            (Watch::Stop, None) => {
+                return say(
+                    debug,
+                    format_args!(
+                        "watcher stopped, THP kept (/proc/buddyinfo cannot be read or does not parse)"
+                    ),
+                );
+            }
+            (Watch::Stop, Some(free)) => {
+                return say(
+                    debug,
+                    format_args!(
+                        "watcher stopped after {} s, THP kept ({} MiB free in 2 MiB blocks)",
+                        elapsed.as_secs(),
+                        free >> 20,
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// What the start check does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// Keep THP and start no watcher: a fault never waits for compaction,
+    /// or a THP text does not parse.
+    Keep,
+    /// Turn THP off now.
+    Off,
+    /// Keep THP and start the watcher.
+    Watch,
+}
+
+/// The start decision. A huge page fault of `MADV_HUGEPAGE` memory can
+/// wait in direct compaction when `enabled` is `always` or `madvise` and
+/// `defrag` is `always`, `madvise` or `defer+madvise` (the texts of the
+/// sysfs files, with the mode in brackets). With `defer` or `never`, it
+/// takes a 4 KiB page when no 2 MiB block is free, so THP can stay on. When
+/// a fault can wait: `Off` when `free` (the bytes free in blocks of 2 MiB
+/// or more) is less than `min_free`, else `Watch`.
+fn start_step(enabled: &str, defrag: &str, free: u64, min_free: u64) -> Start {
+    let can_wait = matches!(selected_mode(enabled), Some("always" | "madvise"))
+        && matches!(
+            selected_mode(defrag),
+            Some("always" | "madvise" | "defer+madvise")
+        );
+    match (can_wait, free < min_free) {
+        (false, _) => Start::Keep,
+        (true, true) => Start::Off,
+        (true, false) => Start::Watch,
+    }
+}
+
+/// What the watcher does after one read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watch {
+    /// Read again after `POLL`.
+    Wait,
+    /// Turn THP off and stop.
+    Off,
+    /// Stop and keep THP.
+    Stop,
+}
+
+/// The watcher decision after `elapsed` since it started. `free` is the
+/// bytes free in blocks of 2 MiB or more, None when `/proc/buddyinfo`
+/// cannot be read or does not parse. Low memory wins over the time limit.
+fn watch_step(elapsed: Duration, free: Option<u64>, min_free: u64) -> Watch {
+    match free {
+        None => Watch::Stop,
+        Some(free) if free < min_free => Watch::Off,
+        Some(_) if elapsed >= WATCH_FOR => Watch::Stop,
+        Some(_) => Watch::Wait,
     }
 }
 
@@ -121,23 +293,6 @@ fn read_small<'a>(path: &str, buf: &'a mut [u8]) -> Option<&'a str> {
         }
     }
     std::str::from_utf8(&buf[..len]).ok()
-}
-
-/// True when THP must go off: a huge page fault of `MADV_HUGEPAGE` memory
-/// can wait in direct compaction, and `free` (the bytes free in blocks of
-/// 2 MiB or more) is less than `min_free`. `enabled` and `defrag` are the
-/// text of the sysfs files, with the mode in brackets. The fault can wait
-/// when `enabled` is `always` or `madvise` and `defrag` is `always`,
-/// `madvise` or `defer+madvise`. With `defer` or `never`, it takes a 4 KiB
-/// page when no 2 MiB block is free, so THP can stay on. False when a text
-/// does not parse.
-fn thp_goes_off(enabled: &str, defrag: &str, free: u64, min_free: u64) -> bool {
-    matches!(selected_mode(enabled), Some("always" | "madvise"))
-        && matches!(
-            selected_mode(defrag),
-            Some("always" | "madvise" | "defer+madvise")
-        )
-        && free < min_free
 }
 
 /// The mode in brackets in a THP sysfs file: `madvise` in
@@ -208,36 +363,52 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
     }
 
     #[test]
-    fn thp_goes_off_only_when_a_fault_can_wait_and_memory_is_low() {
+    fn start_step_turns_thp_off_only_below_the_limit_and_else_watches() {
         let enabled = "always [madvise] never\n";
         let defrag = "always defer defer+madvise [madvise] never\n";
-        // 1,066 MiB, from BUDDYINFO.
-        let free = (1 + 29 + 477) * 2 * MIB + 13 * 4 * MIB;
-        assert!(thp_goes_off(enabled, defrag, free, free + 1));
-        assert!(!thp_goes_off(enabled, defrag, free, free));
-        assert!(!thp_goes_off(enabled, defrag, free, 1024 * MIB));
-        assert!(thp_goes_off(enabled, defrag, free, 2048 * MIB));
-        // No THP, or faults that do not wait for compaction.
+        let limit = DEFAULT_MIN_FREE_MIB * MIB;
+        assert_eq!(start_step(enabled, defrag, limit - 1, limit), Start::Off);
+        assert_eq!(start_step(enabled, defrag, 0, limit), Start::Off);
+        assert_eq!(start_step(enabled, defrag, limit, limit), Start::Watch);
+        // perf13 fragd1: query started with 290 to 314 MiB free.
+        assert_eq!(start_step(enabled, defrag, 300 * MIB, limit), Start::Watch);
+        // No THP, or faults that do not wait for compaction: no watcher.
         let never = "always madvise [never]\n";
-        assert!(!thp_goes_off(never, defrag, free, 2048 * MIB));
+        assert_eq!(start_step(never, defrag, 0, limit), Start::Keep);
         for defrag in [
             "always [defer] madvise never",
             "always defer madvise [never]",
         ] {
-            assert!(!thp_goes_off(enabled, defrag, free, 2048 * MIB));
+            assert_eq!(start_step(enabled, defrag, 0, limit), Start::Keep);
         }
         for defrag in [
             "[always] defer madvise never",
             "defer [defer+madvise] madvise",
         ] {
-            assert!(thp_goes_off(
-                "[always] madvise never",
-                defrag,
-                free,
-                2048 * MIB
-            ));
+            assert_eq!(
+                start_step("[always] madvise never", defrag, 0, limit),
+                Start::Off
+            );
         }
         // A text that does not parse keeps THP on.
-        assert!(!thp_goes_off("madvise", defrag, free, 2048 * MIB));
+        assert_eq!(start_step("madvise", defrag, 0, limit), Start::Keep);
+    }
+
+    #[test]
+    fn watch_step_turns_thp_off_below_the_limit_until_the_time_limit() {
+        let limit = DEFAULT_MIN_FREE_MIB * MIB;
+        let early = POLL;
+        assert_eq!(watch_step(early, Some(limit), limit), Watch::Wait);
+        assert_eq!(watch_step(early, Some(10_000 * MIB), limit), Watch::Wait);
+        assert_eq!(watch_step(early, Some(limit - 1), limit), Watch::Off);
+        // A file that cannot be read stops the watcher.
+        assert_eq!(watch_step(early, None, limit), Watch::Stop);
+        // After the time limit it stops, but low memory still turns THP off.
+        assert_eq!(watch_step(WATCH_FOR, Some(limit), limit), Watch::Stop);
+        assert_eq!(watch_step(WATCH_FOR, Some(0), limit), Watch::Off);
+        assert_eq!(
+            watch_step(WATCH_FOR - Duration::from_millis(1), Some(limit), limit),
+            Watch::Wait
+        );
     }
 }
