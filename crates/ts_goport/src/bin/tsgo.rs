@@ -88,13 +88,22 @@ fn main() {
 /// it is 7 here, and 10 at 8 or more cores (3 spare arenas for the parse
 /// workers that a large program adds). At 6, two checkers share one arena
 /// lock (zod: 3.9k voluntary context switches, 0.5k at 7). The variable
-/// stays set, so the exec runs once.
+/// stays set, so the exec runs once. A jemalloc build with `JEMALLOC_CONF`
+/// built in does not exec.
 fn set_malloc_tunables(budget: &ThreadBudget) {
     // Unused off Linux and with jemalloc.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        // A build with `JEMALLOC_CONF` built into jemalloc
+        // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set in `.cargo/config.toml`)
+        // needs no exec: jemalloc reads it at its start, and
+        // `_RJEM_MALLOC_CONF` still overrides it.
+        #[cfg(feature = "jemalloc")]
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
+            return;
+        }
         #[cfg(not(feature = "jemalloc"))]
         let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
         #[cfg(feature = "jemalloc")]
