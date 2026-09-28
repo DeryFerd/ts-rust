@@ -969,19 +969,14 @@ pub(crate) fn is_class_extending_null(node: Node) -> bool {
     if node.is_nil() {
         return false;
     }
-    let heritage = node.heritage_clauses();
-    if heritage.is_nil() {
+    let extends_clause = get_heritage_clause(node, SyntaxKind::ExtendsKeyword);
+    if extends_clause.is_nil() {
         return false;
     }
-    let heritage_nodes = heritage.nodes();
-    if heritage_nodes.len() > 1 || heritage_nodes.is_empty() {
+    let types = extends_clause.types();
+    if types.is_nil() || types.nodes().len() != 1 {
         return false;
     }
-    for exp_a in heritage_nodes.get(0).types().nodes().iter() {
-        let expr = exp_a.expression();
-        if expr.is_some() && expr.kind() == SyntaxKind::NullKeyword {
-            return true;
-        }
-    }
-    false
+    let expr = types.nodes().get(0).expression();
+    expr.is_some() && expr.kind() == SyntaxKind::NullKeyword
 }

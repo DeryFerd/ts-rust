@@ -922,8 +922,12 @@ impl DeclarationTransformer {
         let retained_clauses: Vec<Node> = types
             .iter()
             .filter(|&t| {
-                is_entity_name_expression(t.expression())
+                // Go: the element is an ExpressionWithTypeArguments or a TypeReference (tsgo#4797).
+                let name = get_heritage_clause_element_name(t);
+                is_entity_name(name)
+                    || is_entity_name_expression(name)
                     || (clause.token() == SyntaxKind::ExtendsKeyword
+                        && is_expression_with_type_arguments(t)
                         && t.expression().kind() == SyntaxKind::NullKeyword)
             })
             .collect();

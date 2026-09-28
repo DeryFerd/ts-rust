@@ -1033,12 +1033,25 @@ impl Printer {
         self.emit_token(node.token(), node.pos(), WriteKind::KEYWORD, node);
         self.write_space();
         self.emit_list(
-            Printer::emit_expression_with_type_arguments_node,
+            Printer::emit_heritage_clause_element,
             node,
             node.types(),
             ListFormat::HERITAGE_CLAUSE_TYPES,
         );
         self.exit_node(node, state);
+    }
+
+    // Go: printer.go:4500 emitHeritageClauseElement
+    /// Prints one element of a heritage clause: an ExpressionWithTypeArguments, or a
+    /// TypeReference in an interface `extends` or a class `implements` clause (tsgo#4797).
+    pub(crate) fn emit_heritage_clause_element(&mut self, node: Node) {
+        match node.kind() {
+            SyntaxKind::ExpressionWithTypeArguments => {
+                self.emit_expression_with_type_arguments(node)
+            }
+            SyntaxKind::TypeReference => self.emit_type_reference(node),
+            kind => panic!("unhandled HeritageClauseElement: {kind:?}"),
+        }
     }
 
     // Go: printer.go:4487 emitHeritageClauseNode
