@@ -102,6 +102,12 @@
         "go": "go1.26.4",
         "version": "Version 7.1.0-dev",
         "build": "CGO_ENABLED=0 GOAMD64=v1 go build ./cmd/tsgo"
+      },
+      "typesymDumper": {
+        "path": "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/pins/16c25522e123/target/continuation-r97-goport/typesyms/typesymdump-go",
+        "sha256": "f1c295a0c515c5a034f9970ff3013b4955867dff0c3a717bc1172d549a833d41",
+        "go": "go1.26.8",
+        "build": "go build -overlay with typesyms/tools/typesymdump-main-16c25522e123.go (sha256 ab0d134280b1): typesymdump-main.go plus the new contentMapperProject argument of compiler.NewCompilerHost, nil as tsgo passes for a config without contentMappers. Then scripts/upstream/record.py typesyms."
       }
     }
   }
