@@ -1312,3 +1312,114 @@ pub fn rotate_func<T, F: FnMut(&T, &T) -> bool>(
     // i == j
     swap_range_func(data, m - i, m, i);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `(file, pos, id)` key and the comparator shape of Go
+    /// `compareSymbolsWorker`: files 0 and 1 are in the file index map
+    /// (indexes 0 and 1), files 2 and 3 are not and read as index 0. So keys
+    /// in files 0, 2 and 3 compare by position in one file and by id across
+    /// files, which is not transitive.
+    #[derive(Clone, Copy)]
+    struct Key {
+        file: i32,
+        pos: i32,
+        id: i32,
+    }
+
+    fn file_index(file: i32) -> i32 {
+        i32::from(file == 1)
+    }
+
+    fn cmp_keys(a: &Key, b: &Key) -> i32 {
+        if a.id == b.id {
+            return 0;
+        }
+        if a.file != b.file {
+            let r = file_index(a.file) - file_index(b.file);
+            if r != 0 {
+                return r;
+            }
+        } else if a.pos != b.pos {
+            return a.pos - b.pos;
+        }
+        a.id - b.id
+    }
+
+    fn keys(n: i32) -> Vec<Key> {
+        let mut seed: u32 = 12345;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as i32
+        };
+        (0..n)
+            .map(|i| {
+                let file = next() % 4;
+                let pos = next() % 100;
+                Key {
+                    file,
+                    pos,
+                    id: n - i,
+                }
+            })
+            .collect()
+    }
+
+    fn ids(keys: &[Key]) -> Vec<i32> {
+        keys.iter().map(|k| k.id).collect()
+    }
+
+    // Rust std `sort_by` and `sort_unstable_by` (1.93.0) panic on these 64
+    // keys: "user-provided comparison function does not correctly implement
+    // a total order". The expected orders are the output of Go 1.26.8
+    // `slices.SortFunc`, `slices.SortStableFunc` and `sort.Slice` on the same
+    // keys and comparator.
+    #[test]
+    fn non_total_order_sorts_as_go() {
+        let go_unstable = [
+            13, 5, 1, 9, 3, 29, 14, 12, 16, 10, 17, 18, 24, 31, 4, 19, 2, 21, 28, 27, 32, 11, 37,
+            26, 20, 41, 7, 35, 44, 39, 34, 46, 60, 47, 45, 51, 48, 57, 58, 36, 59, 62, 49, 54, 53,
+            64, 25, 30, 22, 50, 40, 15, 8, 33, 43, 52, 55, 42, 56, 6, 61, 38, 23, 63,
+        ];
+        let go_stable = [
+            13, 5, 1, 9, 3, 14, 12, 16, 10, 4, 2, 17, 18, 32, 11, 20, 7, 24, 35, 28, 27, 36, 37,
+            26, 41, 44, 29, 59, 51, 48, 39, 31, 34, 19, 21, 60, 47, 45, 58, 62, 49, 46, 54, 57, 53,
+            64, 25, 30, 22, 50, 40, 15, 8, 33, 43, 52, 55, 42, 56, 6, 61, 38, 23, 63,
+        ];
+
+        let mut a = keys(64);
+        sort_func(&mut a, cmp_keys);
+        assert_eq!(ids(&a), go_unstable);
+
+        let mut b = keys(64);
+        sort_stable_func(&mut b, cmp_keys);
+        assert_eq!(ids(&b), go_stable);
+
+        let mut c = keys(64);
+        sort_slice(&mut c, |x, y| cmp_keys(x, y) < 0);
+        assert_eq!(ids(&c), go_unstable);
+    }
+
+    /// A comparator with a random answer on every call, at sizes that reach
+    /// insertion sort, pdqsort, the heapsort fallback and symMerge. The sorts
+    /// must not panic and must return a permutation.
+    #[test]
+    fn random_comparator_does_not_panic() {
+        let mut rng = Xorshift(7);
+        for n in [0, 1, 2, 12, 13, 20, 21, 50, 100, 300] {
+            let input: Vec<u32> = (0..n).collect();
+            let mut a = input.clone();
+            sort_func(&mut a, |_, _| (rng.next() % 3) as i32 - 1);
+            let mut b = input.clone();
+            sort_stable_func(&mut b, |_, _| (rng.next() % 3) as i32 - 1);
+            let mut c = input.clone();
+            sort_slice(&mut c, |_, _| rng.next() % 2 == 0);
+            for mut out in [a, b, c] {
+                out.sort_unstable();
+                assert_eq!(out, input);
+            }
+        }
+    }
+}

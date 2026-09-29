@@ -484,10 +484,8 @@ impl Checker {
     // Go: checker/utilities.go:339 sortSymbols
     // PORT: Go sorts with `c.compareSymbols`, which is always
     // `c.compareSymbolsWorker` ("closure optimization"), so this needs only
-    // `&self`. Go `slices.SortFunc` is not stable, but the comparator is a
-    // total order (it falls back to symbol ids), so a stable sort gives the
-    // same result. Each symbol's first declaration, file index and position
-    // are read once into a `SymbolSortKey`; `compare_symbol_sort_keys` is
+    // `&self`. Each symbol's first declaration, file index and position are
+    // read once into a `SymbolSortKey`; `compare_symbol_sort_keys` is
     // `compareSymbolsWorker` on those cached values.
     pub fn sort_symbols(&self, symbols: &mut [SymbolId]) {
         if symbols.len() < 2 {
@@ -510,20 +508,27 @@ impl Checker {
     /// uses it with its reusable key buffer. The sort and the comparator are
     /// the ones `sort_symbols` uses, so the comparisons (and the lazy
     /// `get_symbol_id` calls in them) happen in the same order.
+    // Go: checker/utilities.go:340 slices.SortFunc(symbols, c.compareSymbols)
+    // PORT: the comparator is not a total order. A file that is not in
+    // `file_index_map` reads as index 0, as in Go, so it ties with the file at
+    // index 0 and the order is not transitive (the auto-import registry
+    // checks package files that are not in the program). Rust std `sort_by`
+    // can panic on that; `gostd::slices::sort_func` is Go's pdqsort, which
+    // does not, and gives Go's order (and Go's order of the `get_symbol_id`
+    // calls) for any comparator.
     pub(crate) fn sort_symbol_sort_keys(&self, keys: &mut [SymbolSortKey]) {
-        keys.sort_by(|a, b| {
+        crate::gostd::slices::sort_func(keys, |a, b| {
             // PERF: two different packed orders give the sign that the full
             // comparator gets from `compare_nodes` (see `SymbolSortKey::order`),
             // and the full comparator returns there before its name and id
-            // steps. So every comparison has the same result, the stable sort
-            // makes the same comparisons, and `get_symbol_id` runs in the same
-            // order.
+            // steps. So every comparison has the same sign, the sort makes the
+            // same comparisons, and `get_symbol_id` runs in the same order.
             if a.order != b.order && a.order != NO_SORT_ORDER && b.order != NO_SORT_ORDER {
                 let r = a.order.cmp(&b.order);
                 debug_assert_eq!(r, self.compare_symbol_sort_keys(a, b).cmp(&0));
-                return r;
+                return r as i32;
             }
-            self.compare_symbol_sort_keys(a, b).cmp(&0)
+            self.compare_symbol_sort_keys(a, b)
         });
     }
 

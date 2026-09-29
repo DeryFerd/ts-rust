@@ -146,11 +146,15 @@ impl Session {
         for sub in subs {
             symbols.push(checker_symbol(&setup.checker, &checker, sub));
         }
-        // PORT: Go `slices.SortFunc` is not stable; `compareSymbols` gives
-        // distinct symbols distinct places, so the order is the same.
+        // Go: api/session.go:1713 slices.SortFunc(symbols, setup.checker.CompareSymbols)
+        // PORT: `CompareSymbols` is not a total order (see
+        // `sort_symbol_sort_keys`), so this is Go's pdqsort, not std `sort_by`,
+        // which can panic.
         {
             let mut c = setup.checker.borrow_mut();
-            symbols.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+            crate::gostd::slices::sort_func(&mut symbols, |&a, &b| {
+                c.compare_symbols_exported(a, b)
+            });
         }
 
         let mut results = Vec::with_capacity(symbols.len());
@@ -1186,9 +1190,12 @@ impl Session {
         if exports.is_empty() {
             return Ok(Vec::new());
         }
+        // Go: api/session.go:2621 slices.SortFunc(exports, setup.checker.CompareSymbols)
         {
             let mut c = setup.checker.borrow_mut();
-            exports.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+            crate::gostd::slices::sort_func(&mut exports, |&a, &b| {
+                c.compare_symbols_exported(a, b)
+            });
         }
 
         let mut results = Vec::with_capacity(exports.len());
