@@ -679,7 +679,7 @@ pub fn filepath_clean(path: &str) -> String {
 pub fn filepath_clean(path: &str) -> String {
     const SEPARATOR: u8 = b'\\';
     let original_path = path;
-    let vol_len = win_volume_name_len(path.as_bytes());
+    let vol_len = filepath_volume_name_len(path.as_bytes());
     let p = &path.as_bytes()[vol_len..];
     if p.is_empty() {
         let o = original_path.as_bytes();
@@ -793,13 +793,13 @@ pub fn filepath_clean(path: &str) -> String {
 
 // Go: internal/filepathlite/path_windows.go IsPathSeparator
 #[cfg(windows)]
-fn win_is_path_separator(c: u8) -> bool {
+pub fn win_is_path_separator(c: u8) -> bool {
     c == b'\\' || c == b'/'
 }
 
 // Go: internal/filepathlite/path_windows.go volumeNameLen
 #[cfg(windows)]
-fn win_volume_name_len(path: &[u8]) -> usize {
+pub fn filepath_volume_name_len(path: &[u8]) -> usize {
     if path.len() >= 2 && path[1] == b':' {
         // Path starts with a drive letter.
         //

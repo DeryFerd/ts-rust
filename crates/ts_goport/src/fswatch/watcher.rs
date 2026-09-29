@@ -883,13 +883,54 @@ pub fn validate_watch_directory(dir: &str) -> Result<(), GoError> {
 
 // Go: path/filepath/path_unix.go IsAbs
 // PORT: Go standard library (unix). The crate's `filepath_clean` is the
-// unix `filepath.Clean` too.
+// unix `filepath.Clean` too (the Windows one on Windows).
+#[cfg(not(windows))]
 fn filepath_is_abs(path: &str) -> bool {
     path.starts_with('/')
 }
 
+// Go: internal/filepathlite/path_windows.go IsAbs
+// PORT: Go standard library (windows).
+#[cfg(windows)]
+fn filepath_is_abs(path: &str) -> bool {
+    use crate::frontend::vfs::osvfs::{filepath_volume_name_len, win_is_path_separator};
+    let b = path.as_bytes();
+    let l = filepath_volume_name_len(b);
+    if l == 0 {
+        return false;
+    }
+    // If the volume name starts with a double slash, this is an absolute path.
+    if win_is_path_separator(b[0]) && win_is_path_separator(b[1]) {
+        return true;
+    }
+    let rest = &b[l..];
+    !rest.is_empty() && win_is_path_separator(rest[0])
+}
+
+// Go: path/filepath/path.go Dir
+// PORT: Go standard library (windows: `VolumeName` is the volume prefix
+// with slashes made separators).
+#[cfg(windows)]
+fn filepath_dir(path: &str) -> String {
+    use crate::frontend::vfs::osvfs::{filepath_volume_name_len, win_is_path_separator};
+    let vol_len = filepath_volume_name_len(path.as_bytes());
+    let vol = path[..vol_len].replace('/', "\\");
+    let bytes = path.as_bytes();
+    let mut i = bytes.len() as isize - 1;
+    while i >= vol_len as isize && !win_is_path_separator(bytes[i as usize]) {
+        i -= 1;
+    }
+    let dir = filepath_clean(&path[vol_len..(i + 1) as usize]);
+    if dir == "." && vol.len() > 2 {
+        // must be UNC
+        return vol;
+    }
+    format!("{vol}{dir}")
+}
+
 // Go: path/filepath/path.go Dir
 // PORT: Go standard library (unix: `VolumeName` is empty).
+#[cfg(not(windows))]
 fn filepath_dir(path: &str) -> String {
     let vol = "";
     let bytes = path.as_bytes();
