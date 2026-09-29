@@ -5,8 +5,8 @@
 //! (`crate::tracing::get`).
 
 use crate::contentmapper::{
-    self, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
-    InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
+    DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError, InitializeErrorKind,
+    InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
     SupplementalFileCollisionError, TransformError, TransformErrorKind,
 };
 use crate::frontend::prelude::*;
@@ -384,14 +384,6 @@ fn content_mapper_transform_diagnostic(file: Node, label: &str, err: &GoError) -
             TransformErrorKind::INITIALIZE => {
                 if let Some(initialize_error) = errors::as_type::<InitializeError>(&transform_err) {
                     match initialize_error.kind {
-                        InitializeErrorKind::PROTOCOL_VERSION => {
-                            return content_mapper_transform_diagnostic_chain(
-                                file,
-                                label,
-                                diag::The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1,
-                                args![initialize_error.protocol_version, contentmapper::PROTOCOL_VERSION],
-                            );
-                        }
                         InitializeErrorKind::POSITION_ENCODING => {
                             return content_mapper_transform_diagnostic_chain(
                                 file,
@@ -612,12 +604,6 @@ fn content_mapper_mapping_diagnostic(
             diag::The_content_mapper_0_produced_a_position_mapping_with_an_invalid_kind_near_virtual_offset_1,
             args![label, problem.virtual_pos],
         ),
-        MappingErrorKind::ORIGINAL_OVERLAP => new_diagnostic(
-            file,
-            loc,
-            diag::The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_original_offset_1,
-            args![label, problem.original_pos],
-        ),
         MappingErrorKind::FEATURE => new_diagnostic(
             file,
             loc,
@@ -665,10 +651,6 @@ pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> D
         InitializeErrorKind::REQUEST => Some(new_compiler_diagnostic(
             diag::The_content_mapper_s_initialize_request_failed_Colon_0,
             args![initialize_error.detail],
-        )),
-        InitializeErrorKind::PROTOCOL_VERSION => Some(new_compiler_diagnostic(
-            diag::The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1,
-            args![initialize_error.protocol_version, contentmapper::PROTOCOL_VERSION],
         )),
         InitializeErrorKind::POSITION_ENCODING => Some(new_compiler_diagnostic(
             diag::The_content_mapper_selected_unsupported_position_encoding_0,
