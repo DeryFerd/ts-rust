@@ -567,19 +567,14 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
     }
 
     // Handle type reference directives
-    // PORT: perf. The map key is a `Path`; `Borrow<str>` looks it up without
-    // a copy of the path.
-    if let Some(type_refs_in_file) =
-        get_resolved_type_reference_directives().get(source_file_info(file).path.as_str())
-    {
-        for type_ref in type_refs_in_file.values() {
-            if !type_ref.resolved_file_name.is_empty() {
-                add_referenced_file_from_file_name(
-                    &type_ref.resolved_file_name,
-                    &mut referenced_files,
-                    &source_file_directory,
-                );
-            }
+    let path = source_file_info(file).path.as_str();
+    for type_ref in get_resolved_type_reference_directives_in_file(path) {
+        if !type_ref.resolved_file_name.is_empty() {
+            add_referenced_file_from_file_name(
+                &type_ref.resolved_file_name,
+                &mut referenced_files,
+                &source_file_directory,
+            );
         }
     }
     referenced_files

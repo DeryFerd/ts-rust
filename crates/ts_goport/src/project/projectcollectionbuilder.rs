@@ -613,7 +613,7 @@ impl ProjectCollectionBuilder {
                 // PORT: Go `project.GetProgram()` is the field read.
                 let (config_file_path, program) = {
                     let project = project.borrow();
-                    (project.config_file_path.clone(), project.program)
+                    (project.config_file_path.clone(), project.program.clone())
                 };
                 to_remove_projects.shift_remove(&config_file_path);
                 if let Some(program) = program {
@@ -970,7 +970,7 @@ impl ProjectCollectionBuilder {
         };
 
         // PORT: Go `project.GetProgram()` is the field read.
-        let Some(program) = project.borrow().program else {
+        let Some(program) = project.borrow().program.clone() else {
             return;
         };
 
@@ -996,6 +996,7 @@ impl ProjectCollectionBuilder {
             };
             let wg_inner = wg.clone();
             let logger = logger.clone();
+            let program = Rc::clone(&program);
             wg.queue(Box::new(move || {
                 if !project_tree_request.is_all_projects()
                     && program.range_resolved_project_reference_in_child_config(
@@ -1915,7 +1916,7 @@ impl ProjectCollectionBuilder {
                         let p = project.borrow();
                         (
                             p.host.clone(),
-                            p.program,
+                            p.program.clone(),
                             p.checker_pool.clone(),
                             p.current_directory.clone(),
                         )
@@ -1994,7 +1995,7 @@ impl ProjectCollectionBuilder {
                         WatchedFiles::clone_(p.content_mapper_watch.as_deref(), watched_files);
                     p.content_mapper_watch = content_mapper_watch;
                     p.content_mapper_watched_files = Some(Rc::new(content_mapper_watched_files));
-                    p.program = Some(result.program);
+                    p.program = Some(Rc::clone(&result.program));
                     p.checker_pool = Some(checker_pool);
                     p.program_update_kind = result.update_kind;
                     p.program_last_update = self.new_snapshot_id;
@@ -2023,8 +2024,8 @@ impl ProjectCollectionBuilder {
                     let project_path = p.config_file_path.clone();
                     drop(p);
                     self.release_dropped_project_references(
-                        old_program,
-                        Some(result.program),
+                        old_program.as_deref(),
+                        Some(&*result.program),
                         &project_path,
                     );
                     if let Some(old_checker_pool) = old_checker_pool {
@@ -2134,7 +2135,7 @@ impl ProjectCollectionBuilder {
             (
                 value.config_file_path.clone(),
                 value.config_file_name.clone(),
-                value.program,
+                value.program.clone(),
             )
         };
         if logger.is_some() {
@@ -2164,8 +2165,8 @@ impl ProjectCollectionBuilder {
     // only the dropped references need to be released here.
     pub fn release_dropped_project_references(
         &self,
-        old_program: Option<&'static compiler::NewProgram>,
-        new_program: Option<&'static compiler::NewProgram>,
+        old_program: Option<&compiler::NewProgram>,
+        new_program: Option<&compiler::NewProgram>,
         project_path: &tspath::Path,
     ) {
         let Some(old_program) = old_program else {
@@ -2228,7 +2229,7 @@ fn is_referenced_by(
                 }
             }
         }
-    } else if let Some(program) = project.program {
+    } else if let Some(program) = &project.program {
         // PORT: Go `project.GetProgram()` is the field read.
         if !program.range_resolved_project_reference(
             |reference_path: &tspath::Path, _, _, _| -> bool { reference_path != ref_path },

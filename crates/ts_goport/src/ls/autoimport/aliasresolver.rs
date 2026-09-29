@@ -24,6 +24,7 @@ use crate::frontend::vfs::Fs as _;
 use crate::modulespecifiers::symlinks::KnownSymlinks;
 use crate::program::{AliasResolverProgram, AliasResolverProgramScope};
 use std::cell::Cell;
+use std::sync::Arc;
 
 // Go: ls/autoimport/aliasresolver.go:16 pathAndFileName
 #[derive(Clone, Debug, Default)]
@@ -48,13 +49,13 @@ pub struct AliasResolver {
     pub resolved_modules: RefCell<
         FxHashMap<
             tspath::Path,
-            Rc<RefCell<FxHashMap<module::ModeAwareCacheKey, Rc<ResolvedModule>>>>,
+            Rc<RefCell<FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
         >,
     >,
     /// The resolutions that `new_checker` made before the checker, by file
     /// path (`prefetch_resolved_module`).
     pub prefetched_modules:
-        RefCell<FxHashMap<tspath::Path, FxHashMap<module::ModeAwareCacheKey, Rc<ResolvedModule>>>>,
+        RefCell<FxHashMap<tspath::Path, FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
     /// The program of the checker, once `new_checker` made it.
     pub checker_program: Cell<Option<&'static GoProgram>>,
 }
@@ -265,7 +266,7 @@ impl AliasResolver {
     /// `module_reference` in `file` (the mode is Go `GetModeForUsageLocation`,
     /// always ESNext), made before the checker. It does not fill the Go
     /// cache or report a failed lookup.
-    fn prefetch_resolved_module(&self, file: Node, module_reference: &str) -> Rc<ResolvedModule> {
+    fn prefetch_resolved_module(&self, file: Node, module_reference: &str) -> Arc<ResolvedModule> {
         let info = source_file_info(file);
         let path = tspath::Path(info.path.clone());
         let key = module::ModeAwareCacheKey {
@@ -401,7 +402,7 @@ impl AliasResolver {
         current_source_file: &dyn HasFileName,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> Rc<ResolvedModule> {
+    ) -> Arc<ResolvedModule> {
         // Go: r.resolvedModules.LoadOrStore(currentSourceFile.Path(), &collections.SyncMap{})
         let cache = self
             .resolved_modules
@@ -456,7 +457,7 @@ impl AliasResolver {
     // PORT: the Go nil map is an empty map.
     pub fn get_resolved_modules(
         &self,
-    ) -> FxHashMap<tspath::Path, module::ModeAwareCache<Rc<ResolvedModule>>> {
+    ) -> FxHashMap<tspath::Path, module::ModeAwareCache<Arc<ResolvedModule>>> {
         // only used when producing diagnostics, which hopefully the checker won't do
         FxHashMap::default()
     }
@@ -566,7 +567,7 @@ impl AliasResolver {
         &self,
         file: &dyn HasFileName,
         module_specifier: Node,
-    ) -> Option<Rc<ResolvedModule>> {
+    ) -> Option<Arc<ResolvedModule>> {
         go_panic("unimplemented".to_string())
     }
 
@@ -621,9 +622,9 @@ impl AliasResolverProgram for AliasResolver {
         file: Node,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> ResolvedModule {
+    ) -> Arc<ResolvedModule> {
         let info = source_file_info(file);
         let current_source_file = new_has_file_name(&info.file_name, &info.path);
-        (*self.get_resolved_module(&current_source_file, module_reference, mode)).clone()
+        self.get_resolved_module(&current_source_file, module_reference, mode)
     }
 }

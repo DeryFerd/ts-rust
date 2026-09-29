@@ -16,7 +16,7 @@ pub(crate) fn constant_expression(value: &LiteralValue, factory: &PrinterNodeFac
 }
 
 /// The Go `jsnum.Number` case of `constantExpression` (it recurses on `-value`).
-fn constant_number_expression(value: ts_jsnum::Number, factory: &PrinterNodeFactory) -> Node {
+fn constant_number_expression(value: crate::jsnum::Number, factory: &PrinterNodeFactory) -> Node {
     if value.is_infinite() {
         if value.0 > 0.0 {
             return factory.new_identifier("Infinity");

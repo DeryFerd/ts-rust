@@ -69,13 +69,7 @@ impl LanguageService {
         }
         let source_file = positions[0].script;
         let pos = positions[0].position;
-        let items = self.get_signature_help_items(
-            ctx,
-            pos,
-            program,
-            source_file,
-            context,
-        );
+        let items = self.get_signature_help_items(ctx, pos, program, source_file, context);
         Ok(lsproto::SignatureHelpOrNull {
             signature_help: items,
         })
@@ -86,7 +80,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         position: i32,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         source_file: Node,
         context: Option<&lsproto::SignatureHelpContext>,
     ) -> Option<lsproto::SignatureHelp> {
@@ -333,7 +327,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         argument_info: &ArgumentListInfo,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         c: &mut Checker,
     ) -> Option<lsproto::SignatureHelp> {
         if argument_info.invocation.contextual_invocation.is_some() {

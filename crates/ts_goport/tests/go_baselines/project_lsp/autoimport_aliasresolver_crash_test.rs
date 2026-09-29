@@ -37,10 +37,10 @@ impl module::ResolutionHost for FakeCloneHost {
 }
 
 impl RegistryCloneHost for FakeCloneHost {
-    fn get_default_project(&self, _path: &Path) -> (Path, Option<&'static NewProgram>) {
+    fn get_default_project(&self, _path: &Path) -> (Path, Option<Rc<NewProgram>>) {
         (Path(String::new()), None)
     }
-    fn get_program_for_project(&self, _project_path: &Path) -> Option<&'static NewProgram> {
+    fn get_program_for_project(&self, _project_path: &Path) -> Option<Rc<NewProgram>> {
         None
     }
     fn get_package_json(&self, _file_name: &str) -> Option<Rc<InfoCacheEntry>> {

@@ -9,8 +9,8 @@
 //! `get_locals`, `flow`, `flow_mut`, ...), not through `Node::symbol()` and
 //! friends, which only see the data after binding finishes.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // Go: binder/binder.go:44 ExpandoAssignmentInfo
 #[derive(Clone, Copy, Debug, Default)]
@@ -645,7 +645,7 @@ impl Binder {
                     // Assignment declarations are allowed to merge with variables, no matter what other flags they have.
                     // Report errors every position with duplicate declaration
                     // Report errors on previous encountered declarations
-                    let mut message: &'static ts_diagnostics::Message =
+                    let mut message: &'static crate::diagnostics::Message =
                         if symbol_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
                             diag::Cannot_redeclare_block_scoped_variable_0
                         } else {

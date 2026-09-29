@@ -337,14 +337,13 @@ impl Checker {
 
     // Go: checker/nodebuilderimpl.go:1136 sortByBestName
     // PORT: the Go receiver is NodeBuilderImpl but only `b_.ch` is used, so
-    // this is a Checker method without `b`. Go `tspath.PathIsRelative` is
-    // `ts_path::is_relative`, which has the same rules.
+    // this is a Checker method without `b`.
     fn sort_by_best_name(&mut self, a: &SortedSymbolNamePair, b: &SortedSymbolNamePair) -> i32 {
         let specifier_a = &a.name;
         let specifier_b = &b.name;
         if !specifier_a.is_empty() && !specifier_b.is_empty() {
-            let is_b_relative = ts_path::is_relative(specifier_b);
-            if ts_path::is_relative(specifier_a) == is_b_relative {
+            let is_b_relative = crate::frontend::tspath::path_is_relative(specifier_b);
+            if crate::frontend::tspath::path_is_relative(specifier_a) == is_b_relative {
                 // Both relative or both non-relative, sort by number of parts
                 return count_path_components(specifier_a) - count_path_components(specifier_b);
             }

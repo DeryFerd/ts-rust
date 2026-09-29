@@ -936,37 +936,12 @@ fn is_ascii_word_character(ch: char) -> bool {
     is_ascii_letter(ch) || is_digit(ch) || ch == '_'
 }
 
-// Go: tspath/path.go:840 GetBaseFileName
-// PORT: the crate has no public port of tspath.GetBaseFileName (options.rs
-// and checker_p17.rs keep private copies), so this is another private copy.
-fn tspath_get_base_file_name(path: &str) -> String {
-    let path = ts_path::normalize_slashes(path);
-
-    // if the path provided is itself the root, then it has no file name.
-    let root_length = ts_path::root_length(&path);
-    if root_length == path.len() {
-        return String::new();
-    }
-
-    // return the trailing portion of the path starting after the last (non-terminal) directory
-    // separator but not including any trailing directory separator.
-    // Go: tspath.RemoveTrailingDirectorySeparator
-    let path: &str = if path.ends_with('/') || path.ends_with('\\') {
-        &path[..path.len() - 1]
-    } else {
-        &path
-    };
-    let after_sep = path.rfind('/').map_or(0, |i| i + 1);
-    let start = std::cmp::max(ts_path::root_length(path), after_sep);
-    path[start..].to_string()
-}
-
 // Go: printer/utilities.go:691 makeIdentifierFromModuleName
 // PORT: Go reads the bytes of the Go string. `module_name` is a port form
 // (see `scanner_util::GO_STRING_MARKER`), so this reads its Go bytes. Each
 // byte that is not ASCII becomes '_', so the kept bytes are ASCII.
 pub(crate) fn make_identifier_from_module_name(module_name: &str) -> String {
-    let module_name = tspath_get_base_file_name(module_name);
+    let module_name = crate::frontend::tspath::get_base_file_name(module_name);
     let bytes = go_string_bytes(&module_name);
     let push_ascii = |builder: &mut String, kept: &[u8]| {
         builder.extend(kept.iter().map(|&b| char::from(b)));

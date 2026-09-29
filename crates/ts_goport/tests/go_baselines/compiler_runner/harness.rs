@@ -812,16 +812,16 @@ fn get_program_like_diagnostics(
 
 // Go: diagnostics/diagnostics.go:152 NewAdHocMessage, used as
 // `ast.NewCompilerDiagnostic(diagnostics.NewAdHocMessage(message))`.
-// PORT: `ts_diagnostics::Message` has a `u32` code, so the Go code -1 is set
+// PORT: `ts_goport::diagnostics::Message` has a `u32` code, so the Go code -1 is set
 // on the diagnostic (`Diagnostic.code`, which the baselines print). A
 // diagnostic holds a `&'static Message`, so the message is leaked. Decision
 // (bump A queue #78): this test helper stays out of the shared
-// `ts_diagnostics` crate.
+// `ts_goport::diagnostics` module.
 fn new_ad_hoc_compiler_diagnostic(message: String) -> Diagnostic {
     let text: &'static str = Box::leak(message.into_boxed_str());
     let message: &'static Message = Box::leak(Box::new(Message::new(
         0,
-        ts_diagnostics::Category::Error,
+        ts_goport::diagnostics::Category::Error,
         "-1",
         text,
         false,
@@ -1191,11 +1191,11 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
     };
     // PORT: the frontend parses with no current program; the result is a
     // program version (see the module comment).
-    let np: &'static NewProgram = {
+    let np = {
         let _scope = enter_program(None);
-        Box::leak(Box::new(new_program(program_options)))
+        Rc::new(new_program(program_options))
     };
-    let program = tsprogram::new_program_version(np, None);
+    let program = tsprogram::new_program_version(&np, None);
     if config.compiler_options().incremental.is_true() {
         let _scope = enter_program(Some(program));
         let reader = TestBuildInfoReader {

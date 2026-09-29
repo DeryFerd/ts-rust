@@ -1486,7 +1486,7 @@ impl Checker {
                 && (num_type_arguments < min_type_argument_count
                     || num_type_arguments > type_parameters.len() as i32)
             {
-                let message: &'static ts_diagnostics::Message;
+                let message: &'static crate::diagnostics::Message;
 
                 let missing_augments_tag = is_js
                     && is_expression_with_type_arguments(node)

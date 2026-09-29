@@ -2,7 +2,7 @@
 //!
 //! PORT: one thread (project/dirty/interfaces.rs). Go `*Project` is
 //! `Rc<RefCell<Project>>` (the dirty maps change it through the pointer).
-//! Go `*compiler.Program` is `&'static compiler::NewProgram` (nil is
+//! Go `*compiler.Program` is `Rc<compiler::NewProgram>` (nil is
 //! `None`). Go `*tsoptions.ParsedCommandLine` is
 //! `Option<Rc<tsoptions::ParsedCommandLine>>`; Go pointer equality is
 //! `Rc::ptr_eq`.
@@ -85,7 +85,7 @@ pub struct Project {
     pub command_line: Option<Rc<tsoptions::ParsedCommandLine>>,
     pub command_line_with_typings_files: RefCell<Option<Rc<tsoptions::ParsedCommandLine>>>,
     pub command_line_with_typings_files_once: Cell<bool>,
-    pub program: Option<&'static compiler::NewProgram>,
+    pub program: Option<Rc<compiler::NewProgram>>,
     // The kind of update that was performed on the program last time it was updated.
     pub program_update_kind: ProgramUpdateKind,
     // The ID of the snapshot that created the program stored in this project.
@@ -325,8 +325,8 @@ impl Project {
     // Go: project/project.go:210 Project.GetProgram
     // PORT: Go returns a nil program as nil; the `ls::Project` impl below
     // (which returns a program handle) panics on it.
-    pub fn get_program(&self) -> Option<&'static compiler::NewProgram> {
-        self.program
+    pub fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
+        self.program.clone()
     }
 
     // Go: project/project.go:217 Project.GetProjectDiagnostics
@@ -340,6 +340,7 @@ impl Project {
         }
         let program = self
             .program
+            .as_deref()
             .expect("invalid memory address or nil pointer dereference: Project.Program");
         // Go: slices.Concat
         let mut diagnostics = program.get_config_file_parsing_diagnostics();
@@ -356,12 +357,14 @@ impl Project {
     // Go: project/project.go:232 Project.containsFile
     pub fn contains_file(&self, path: &tspath::Path) -> bool {
         self.program
+            .as_ref()
             .is_some_and(|program| program.get_source_file_by_path(path).is_some())
     }
 
     // Go: project/project.go:236 Project.IsSourceFromProjectReference
     pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
         self.program
+            .as_ref()
             .is_some_and(|program| program.is_source_from_project_reference(path))
     }
 
@@ -384,7 +387,7 @@ impl Project {
                 self.command_line_with_typings_files.borrow().clone(),
             ),
             command_line_with_typings_files_once: Cell::new(false),
-            program: self.program,
+            program: self.program.clone(),
             program_update_kind: ProgramUpdateKind::NONE,
             program_last_update: self.program_last_update,
             potential_project_references: self.potential_project_references.clone(),
@@ -494,7 +497,7 @@ impl Project {
     pub fn create_program(&self) -> CreateProgramResult {
         let mut update_kind = ProgramUpdateKind::NEW_FILES;
         let mut program_cloned = false;
-        let new_program: &'static compiler::NewProgram;
+        let new_program: Rc<compiler::NewProgram>;
 
         let host = self
             .host
@@ -520,11 +523,15 @@ impl Project {
             let checker_pool_options = host.session_options.checker_pool_options.clone();
             let created_checker_pool = created_checker_pool.clone();
             Rc::new(
-                move |program: &'static compiler::NewProgram| -> Rc<dyn ls_program::CheckerPool> {
+                move |program: &Rc<compiler::NewProgram>| -> Rc<dyn ls_program::CheckerPool> {
                     let log: Rc<dyn Fn(&str)> = Rc::new(|_msg: &str| {
                         // Go: p.log(msg) (empty body)
                     });
-                    let pool = new_checker_pool(checker_pool_options.clone(), program, Some(log));
+                    let pool = new_checker_pool(
+                        checker_pool_options.clone(),
+                        Rc::clone(program),
+                        Some(log),
+                    );
                     *created_checker_pool.borrow_mut() = Some(pool.clone());
                     pool
                 },
@@ -534,12 +541,12 @@ impl Project {
         // Create the command line, potentially augmented with typing files
         let command_line = self.get_command_line_with_typings_files();
 
-        let same_command_line = match (self.program, &command_line) {
+        let same_command_line = match (&self.program, &command_line) {
             (Some(program), Some(command_line)) => Rc::ptr_eq(program.command_line(), command_line),
             _ => false,
         };
         if !self.dirty_file_path.is_empty() && self.program.is_some() && same_command_line {
-            let program = self.program.expect("checked above");
+            let program = self.program.as_deref().expect("checked above");
             let host_rc: Rc<dyn compiler::CompilerHost> = host.clone();
             let (updated_program, dirty_file, cloned) = ls_program::update_program(
                 program,
@@ -644,12 +651,13 @@ impl Project {
         if !program_cloned
             && self
                 .program
-                .is_some_and(|program| program.has_same_file_names(new_program))
+                .as_ref()
+                .is_some_and(|program| program.has_same_file_names(&new_program))
         {
             update_kind = ProgramUpdateKind::SAME_FILE_NAMES;
         }
 
-        ls_program::bind_source_files(new_program);
+        ls_program::bind_source_files(&new_program);
 
         let checker_pool = created_checker_pool.borrow().clone();
         CreateProgramResult {
@@ -697,7 +705,7 @@ impl Project {
         builder: &mut String,
     ) -> String {
         builder.push_str(&format!("\nProject '{}'\n", self.name()));
-        match self.program {
+        match &self.program {
             None => {
                 builder.push_str("\tFiles (0) NoProgram\n");
             }
@@ -747,7 +755,7 @@ impl Project {
     // GetUnresolvedImports extracts unresolved imports from this project's program.
     // PORT: Go returns the program's cached set; the port copies it into an `Rc`.
     pub fn get_unresolved_imports(&self) -> Option<Rc<FxHashSet<String>>> {
-        let program = self.program?;
+        let program = self.program.as_ref()?;
 
         Some(Rc::new(program.get_unresolved_imports().clone()))
     }
@@ -808,8 +816,9 @@ impl ls::Project for Project {
     // Go: project/project.go:210 Project.GetProgram
     // PORT: `ls::Project` returns a program handle; Go returns nil for a
     // project without a program, which the port can not represent.
-    fn get_program(&self) -> &'static compiler::NewProgram {
+    fn get_program(&self) -> Rc<compiler::NewProgram> {
         self.program
+            .clone()
             .expect("invalid memory address or nil pointer dereference: Project.Program")
     }
 
@@ -826,7 +835,7 @@ impl ls::Project for RefCell<Project> {
         ls::Project::id(&*self.borrow())
     }
 
-    fn get_program(&self) -> &'static compiler::NewProgram {
+    fn get_program(&self) -> Rc<compiler::NewProgram> {
         ls::Project::get_program(&*self.borrow())
     }
 
@@ -840,7 +849,7 @@ impl ls::Project for RefCell<Project> {
 // for `program` (Go `result.Program.GetCheckerPool().(*checkerPool)`).
 #[derive(Clone)]
 pub struct CreateProgramResult {
-    pub program: &'static compiler::NewProgram,
+    pub program: Rc<compiler::NewProgram>,
     pub update_kind: ProgramUpdateKind,
     pub checker_pool: Option<Rc<CheckerPool>>,
 }

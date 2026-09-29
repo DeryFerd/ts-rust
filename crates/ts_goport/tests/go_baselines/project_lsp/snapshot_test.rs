@@ -393,7 +393,9 @@ child_test! {
     // it (`ls_program::release_now`). A clone shares the processed files of
     // the program it was cloned from (Go `UpdateProgram`), and their
     // resolver reads the first host's file system, so that host and the
-    // resolver's caches stay until the last clone is released.
+    // resolver's caches stay until the last clone is released. The test
+    // holds the `Rc` of the second program after its release, as a stale Go
+    // holder would; its host still drops its data.
     fn released_program_hosts_drop_their_data() {
         let session = setup(p1_files());
         open(&session, P1_INDEX_URI, P1_INDEX_TEXT);
@@ -415,9 +417,9 @@ child_test! {
         assert!(!is_released(&h3));
         // A released program still finds its files by name (Go
         // `GetSourceFile` reads the host's case sensitivity).
-        assert!(has_file(p2, "/home/projects/TS/p1/a.ts"));
+        assert!(has_file(&p2, "/home/projects/TS/p1/a.ts"));
         // The second clone still uses the first load's resolver.
-        assert!(cached_resolutions(p2) > 0);
+        assert!(cached_resolutions(&p2) > 0);
 
         // Adding an import loads the program again. The last clone is
         // released, and with it the first host and the first load's
@@ -428,8 +430,8 @@ child_test! {
         assert!(is_released(&h1));
         assert!(is_released(&h3));
         assert!(!is_released(&h4));
-        assert_eq!(cached_resolutions(p2), 0);
-        assert!(cached_resolutions(program(&session, P1_INDEX_URI)) > 0);
+        assert_eq!(cached_resolutions(&p2), 0);
+        assert!(cached_resolutions(&program(&session, P1_INDEX_URI)) > 0);
     }
 }
 
@@ -474,7 +476,7 @@ child_test! {
         ]));
         open(&session, file_uri, &text);
         // Code, start and end of the declaration diagnostics of the file.
-        let declaration_diagnostics = |p: &'static NewProgram| -> Vec<(i32, i32, i32)> {
+        let declaration_diagnostics = |p: &NewProgram| -> Vec<(i32, i32, i32)> {
             let root = p.get_source_file(file).expect("index.ts is in the program").root;
             ls_program::get_declaration_diagnostics(p, &with_request_id(&bg()), root)
                 .iter()
@@ -485,7 +487,7 @@ child_test! {
 
         let p1 = program(&session, file_uri);
         let before = live();
-        let first = declaration_diagnostics(p1);
+        let first = declaration_diagnostics(&p1);
         let made = live() - before;
         // TS4094: the private member of the exported class expression.
         assert!(first.iter().any(|&(code, _, _)| code == 4094), "{first:?}");
@@ -499,7 +501,7 @@ child_test! {
             edit(&session, file_uri, version, (end_line, 0), (end_line, 0), "\n");
             let p = program(&session, file_uri);
             live_after_release.push(live());
-            assert_eq!(declaration_diagnostics(p), first);
+            assert_eq!(declaration_diagnostics(&p), first);
         }
         let growth = live_after_release[3].saturating_sub(live_after_release[0]);
         assert!(

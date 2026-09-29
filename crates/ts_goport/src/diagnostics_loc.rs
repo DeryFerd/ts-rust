@@ -10,11 +10,11 @@
 
 use crate::prelude::*;
 
+use crate::diagnostics::Message;
 use crate::frontend::json::json_unmarshal;
 use crate::locale::{Locale, language};
 use std::io::Read;
 use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
-use ts_diagnostics::Message;
 
 // Go: diagnostics/diagnostics.go:44 Key
 // PORT: a key is a `&str` (`Message::key`); catalogs map `String` keys.

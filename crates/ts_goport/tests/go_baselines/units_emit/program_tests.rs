@@ -308,7 +308,7 @@ fn test_include_processor_diagnostics_with_missing_file_casing() {
             // file path points to the missing /src/MyFile.ts. Before the fix this
             // panicked with a nil pointer dereference.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ls_program::get_program_diagnostics(program)
+                ls_program::get_program_diagnostics(&program)
             }));
             if let Err(payload) = result {
                 panic!(
@@ -363,10 +363,10 @@ foo.bar;";
         assert_eq!(errors.len(), 0, "Expected no errors in parsed command line");
 
         let p = new_program_with_config(map_fs.fs(), cd, Rc::new(parsed.expect("parsed config")));
-        let _current = ls_program::enter(p);
-        ls_program::bind_source_files(p);
-        let (c, done) = ls_program::get_type_checker(p, &context::background());
-        let file = source_file(p, "/foo.ts").root;
+        let _current = ls_program::enter(&p);
+        ls_program::bind_source_files(&p);
+        let (c, done) = ls_program::get_type_checker(&p, &context::background());
+        let file = source_file(&p, "/foo.ts").root;
         let statements = file.statements();
         let interface_id = statements.get(0).name();
         let var_id = statements

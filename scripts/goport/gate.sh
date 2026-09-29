@@ -542,6 +542,14 @@ from pathlib import Path
 label, mode, started, commit_in, commit, bins, gate, allow = sys.argv[1:]
 R = Path('/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport')
 sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def family(root, pattern):
+    # One hash for the files under root that match pattern; 'missing' when root does not exist.
+    if not root.is_dir():
+        return 'missing'
+    h = hashlib.sha256()
+    for f in sorted(q for q in root.glob(pattern) if q.is_file()):
+        h.update(f'{f.relative_to(root)}\0{sha(f)}\n'.encode())
+    return h.hexdigest()
 scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(gate).parent / 'sweep.sh',
            Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
@@ -557,6 +565,17 @@ print(json.dumps({
     'gate': {'path': gate, 'sha256': sha(gate)},
     'allowList': {'path': allow, 'sha256': sha(allow)},
     'scripts': {str(p): sha(p) for p in scripts},
+    # The saved Go outputs the stages judge against (gate-compare.py compares them with the base run):
+    # each oracle-sweep file, and one hash per other family (sha256 of the sorted "path NUL sha256" lines).
+    'oracleCaches': {**{str(p.resolve()): sha(p) for p in sorted((R / 'oracle-sweep').glob('*.txt'))},
+                     **{f'family:{name}': family(root, pattern) for name, root, pattern in (
+                         ('errcopies-oracle', R / 'errcopies-oracle', '*.txt'),        # measure (Q-E1 to Q-E5, H-E1)
+                         ('oracle', R / 'oracle', '*.txt'),                            # measure-extra
+                         ('project-inputs-extra', R.parent / 'project-inputs-extra', '*/oracle.txt'),  # sweep-extra2
+                         ('project-inputs-wide', R.parent / 'project-inputs-wide', '*/oracle/**/*'),   # sweep-wide
+                         ('sample-f1', R.parent / 'continuation-r104-conformance-sample', 'results/*.oracle.out'),  # f1
+                         ('sample-f1-lists', R.parent / 'continuation-r104-conformance-sample', '*.json'),        # f1 cases, classes
+                         ('emit-oracle', Path('/tmp/goport-emit-oracle'), '**/*'))}},  # emit
     **({'upstreamPin': os.environ['GOPORT_PIN_ACTIVE']} if os.environ.get('GOPORT_PIN_ACTIVE') else {}),
 }))
 EOF

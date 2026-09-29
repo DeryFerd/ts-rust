@@ -186,8 +186,7 @@ pub fn combine_multi_document_highlights(
     results: Vec<lsproto::MultiDocumentHighlightsOrNull>,
 ) -> lsproto::MultiDocumentHighlightsOrNull {
     let mut by_uri: FxHashMap<lsproto::DocumentUri, usize> = FxHashMap::default();
-    let mut seen: FxHashMap<lsproto::DocumentUri, FxHashSet<lsproto::Range>> =
-        FxHashMap::default();
+    let mut seen: FxHashMap<lsproto::DocumentUri, FxHashSet<lsproto::Range>> = FxHashMap::default();
     let mut combined_documents: Vec<lsproto::MultiDocumentHighlight> = Vec::new();
     for result in results {
         let Some(documents) = result.multi_document_highlights else {
@@ -225,7 +224,7 @@ impl LanguageService {
         ctx: &Context,
         position: i32,
         node: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         source_files: &[Node],
     ) -> Vec<lsproto::MultiDocumentHighlight> {
         let options = RefOptions {

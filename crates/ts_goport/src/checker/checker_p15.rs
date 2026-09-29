@@ -1,8 +1,8 @@
 //! Port of typescript-go `internal/checker/checker.go` lines 13025-13928.
 
+use crate::diagnostics::Message;
 use crate::gostd::Context;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `checkObjectLiteral` builds its result with a closure
 // (`createObjectLiteralType`) that reads these locals by reference. The
@@ -1388,8 +1388,8 @@ impl Checker {
                                 } else {
                                     0
                                 };
-                            let index_type =
-                                self.get_number_literal_type(ts_jsnum::Number::from(index as f64));
+                            let index_type = self
+                                .get_number_literal_type(crate::jsnum::Number::from(index as f64));
                             t = self.get_indexed_access_type(narrowed_type, index_type);
                         }
                     }

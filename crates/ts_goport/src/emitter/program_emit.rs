@@ -340,7 +340,7 @@ pub fn start_emit_batch_with(
 /// - F2: no program file is inside `outDir` or `declarationDir`.
 /// - F3: neither has a `node_modules` path segment. F2 and F3 keep the
 ///   probes for module specifiers in type text (`modulespecifiers::host`
-///   `get_package_json_info_for_directory` and `resolve_package_directory`,
+///   `get_package_json_info_for_directory`,
 ///   `modulespecifiers::util::try_get_any_file_from_path`) away from the
 ///   outputs and the directories that the emit makes.
 /// - F4: `preserveSymlinks` is off, so the program file paths of F2 are the

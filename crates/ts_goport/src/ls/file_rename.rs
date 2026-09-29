@@ -1,6 +1,6 @@
 //! Port of Go `ls/file_rename.go`.
 //!
-//! PORT: Go `*compiler.Program` is `&'static compiler::NewProgram`. Go
+//! PORT: Go `*compiler.Program` is `&compiler::NewProgram`. Go
 //! `*change.Tracker` is `&mut change::Tracker`. Go passes an
 //! `*ast.SourceFile` where a program method takes an `ast.HasFileName`; here
 //! that is `autoimport::source_file_has_file_name(file)`.
@@ -162,7 +162,7 @@ impl LanguageService {
     // Go: ls/file_rename.go:94 updateTsconfigFiles
     pub fn update_tsconfig_files(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         change_tracker: &mut change::Tracker,
         old_to_new: &PathUpdater<'_>,
         old_path: &str,
@@ -381,7 +381,7 @@ impl LanguageService {
     // Go: ls/file_rename.go:199 updateImportsForFileRename
     pub fn update_imports_for_file_rename(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         change_tracker: &mut change::Tracker,
         old_to_new: &PathUpdater<'_>,
     ) {
@@ -459,7 +459,7 @@ impl LanguageService {
     // here that is `modulespecifiers::ProgramHost` (the installed program).
     pub fn get_updated_import_specifier(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         checker: &mut Checker,
         source_file: Node, // old importing source file
         import_literal: Node,
@@ -530,7 +530,7 @@ impl LanguageService {
 // Go: ls/file_rename.go:282 getSourceFileToImport
 // PORT: Go returns `*toImport`; nil is `None`.
 pub fn get_source_file_to_import(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     source_file: Node,
     import_literal: Node,
     old_to_new: &PathUpdater<'_>,
@@ -564,7 +564,7 @@ pub fn get_source_file_to_import(
 // PORT: Go passes the program as the `ModuleSpecifierGenerationHost`; here
 // that is `modulespecifiers::ProgramHost` (the installed program).
 pub fn get_updated_import_specifier_from_moved_source_files(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     source_file: Node,
     import_literal: Node,
     moved_files: &[MovedFile],

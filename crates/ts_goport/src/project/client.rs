@@ -33,8 +33,8 @@ pub trait Client {
     ) -> Result<(), GoError>;
     fn refresh_inlay_hints(&self, ctx: &Context) -> Result<(), GoError>;
     fn refresh_code_lens(&self, ctx: &Context) -> Result<(), GoError>;
-    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>);
-    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>);
+    fn progress_start(&self, message: &'static crate::diagnostics::Message, args: Vec<String>);
+    fn progress_finish(&self, message: &'static crate::diagnostics::Message, args: Vec<String>);
     fn send_telemetry(
         &self,
         ctx: &Context,

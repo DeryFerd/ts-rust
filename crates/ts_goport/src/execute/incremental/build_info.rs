@@ -294,7 +294,7 @@ fn marshal_float(enc: &mut String, v: f64) -> Result<(), JsonError> {
     if v == 0.0 && v.is_sign_negative() {
         enc.push_str("-0");
     } else {
-        enc.push_str(&ts_jsnum::Number::from(v).to_string());
+        enc.push_str(&crate::jsnum::Number::from(v).to_string());
     }
     Ok(())
 }
@@ -1530,7 +1530,9 @@ impl BuildInfo {
     // PORT: Go `slices.Equal` treats nil and empty alike, as `unwrap_or_default` does.
     #[must_use]
     pub fn content_mapper_identities_match(&self, current: Option<&[String]>) -> bool {
-        self.content_mapper_identities.as_deref().unwrap_or_default()
+        self.content_mapper_identities
+            .as_deref()
+            .unwrap_or_default()
             == current.unwrap_or_default()
     }
 

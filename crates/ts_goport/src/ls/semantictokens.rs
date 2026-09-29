@@ -196,7 +196,7 @@ impl LanguageService {
         ctx: &Context,
         c: &mut Checker,
         file: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
     ) -> Vec<SemanticToken> {
         self.collect_semantic_tokens_in_range(ctx, c, file, program, file.pos(), file.end())
     }
@@ -209,7 +209,7 @@ impl LanguageService {
         ctx: &Context,
         c: &mut Checker,
         file: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         span_start: i32,
         span_end: i32,
     ) -> Vec<SemanticToken> {
@@ -248,7 +248,7 @@ struct SemanticTokenCollector<'a> {
     ctx: &'a Context,
     c: &'a mut Checker,
     file: Node,
-    program: &'static compiler::NewProgram,
+    program: &'a compiler::NewProgram,
     span_start: i32,
     span_end: i32,
     tokens: Vec<SemanticToken>,

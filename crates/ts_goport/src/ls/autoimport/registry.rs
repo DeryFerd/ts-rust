@@ -741,7 +741,7 @@ pub fn should_stop_build(ctx: &Context) -> bool {
 // Go: ls/autoimport/registry.go:495 RegistryCloneHost
 // PORT: Go embeds `module.ResolutionHost` and repeats its `FS()`; both come
 // from the supertrait (`fs`, `get_current_directory`). Go
-// `*compiler.Program` is `&'static compiler::NewProgram` (nil is `None`), Go
+// `*compiler.Program` is `Rc<compiler::NewProgram>` (nil is `None`), Go
 // `*packagejson.InfoCacheEntry` is `Option<Rc<..>>`, and Go `*ast.SourceFile`
 // is `Node` (`Node::NIL` for nil). The project area implements it
 // (`autoImportRegistryCloneHost`).
@@ -749,11 +749,11 @@ pub trait RegistryCloneHost: module::ResolutionHost {
     fn get_default_project(
         &self,
         path: &tspath::Path,
-    ) -> (tspath::Path, Option<&'static compiler::NewProgram>);
+    ) -> (tspath::Path, Option<Rc<compiler::NewProgram>>);
     fn get_program_for_project(
         &self,
         project_path: &tspath::Path,
-    ) -> Option<&'static compiler::NewProgram>;
+    ) -> Option<Rc<compiler::NewProgram>>;
     fn get_package_json(&self, file_name: &str) -> Option<Rc<packagejson::InfoCacheEntry>>;
     fn get_source_file(&self, file_name: &str, path: &tspath::Path) -> Node;
     fn dispose(&self);
@@ -1237,7 +1237,7 @@ impl RegistryBuilder {
             dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>,
         >| {
             let program = self.host.get_program_for_project(&entry.key());
-            if let Some(program) = program {
+            if let Some(program) = program.as_deref() {
                 all_resolved_package_names.insert(
                     entry.key(),
                     Rc::new(get_resolved_package_names(ctx, program)),
@@ -1552,7 +1552,7 @@ impl RegistryBuilder {
                 if !set_equals(
                     project_value.resolved_package_names.as_deref(),
                     resolved_package_names.as_deref(),
-                ) || has_new_non_node_modules_files(program, &project_value)
+                ) || has_new_non_node_modules_files(program.as_deref(), &project_value)
                 {
                     should_rebuild = true;
                 } else {
@@ -1716,7 +1716,7 @@ impl RegistryBuilder {
 // PORT: Go `program` can be nil; it is read only for a
 // `newProgramStructureDifferentFileNames` bucket, where nil panics as in Go.
 pub fn has_new_non_node_modules_files(
-    program: Option<&'static compiler::NewProgram>,
+    program: Option<&compiler::NewProgram>,
     bucket: &RegistryBucket,
 ) -> bool {
     if bucket.state.borrow().new_program_structure != NewProgramStructure::DIFFERENT_FILE_NAMES {
@@ -1737,7 +1737,7 @@ pub fn has_new_non_node_modules_files(
 // Go: ls/autoimport/registry.go:1134 isIgnoredFile
 // PORT: only `FileName()` and `Path()` are read, so the program's
 // `ParsedSourceFile` is passed (see the file header).
-pub fn is_ignored_file(program: &'static compiler::NewProgram, file: &ParsedSourceFile) -> bool {
+pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) -> bool {
     program.is_source_file_default_library(file.path())
         || ls_program::is_global_typings_file(program, file.file_name())
 }
@@ -1878,6 +1878,7 @@ impl RegistryBuilder {
             .host
             .get_program_for_project(project_path)
             .expect(NIL_DEREF);
+        let program = &*program;
         let project_root_path = (self.base.to_path)(&program.get_current_directory());
         let symlink_cache = program.get_symlink_cache();
         let (get_checker, close_pool, checker_count) = create_checker_pool(program);

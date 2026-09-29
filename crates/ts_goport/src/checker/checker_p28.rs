@@ -2,8 +2,8 @@
 //! type constructors, literal types, widening helpers, `mapType` and union
 //! type construction and reduction.
 
+use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
-use ts_jsnum::{Number, PseudoBigInt};
 
 impl Checker {
     // Go: checker/checker.go:24957 newUniqueESSymbolType

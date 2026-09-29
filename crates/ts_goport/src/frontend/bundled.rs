@@ -310,9 +310,9 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
         .copied()
 }
 
-// PORT: one `EMBEDDED_CONTENTS` entry. `crates/ts_bundled/libs` stays at the
-// old pin because the protected `ts_compiler` crate shares it. The `goport`
-// form takes a lib that changed at the pin from `crates/ts_goport/libs`.
+// PORT: one `EMBEDDED_CONTENTS` entry. `crates/ts_bundled/libs` is still at
+// the old pin. The `goport` form takes a lib that changed at the pin from
+// `crates/ts_goport/libs`.
 // The include paths are relative to this file: this file builds in
 // `goport_util`, whose manifest dir is not `crates/ts_goport`.
 macro_rules! bundled_lib {

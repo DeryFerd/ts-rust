@@ -25,12 +25,12 @@ pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
 
 /// Go `diagnostics.Category(raw)`. The build info keeps the raw Go value.
 #[must_use]
-pub fn category_from_raw(raw: i32) -> ts_diagnostics::Category {
+pub fn category_from_raw(raw: i32) -> crate::diagnostics::Category {
     match raw {
-        0 => ts_diagnostics::Category::Warning,
-        1 => ts_diagnostics::Category::Error,
-        2 => ts_diagnostics::Category::Suggestion,
-        3 => ts_diagnostics::Category::Message,
+        0 => crate::diagnostics::Category::Warning,
+        1 => crate::diagnostics::Category::Error,
+        2 => crate::diagnostics::Category::Suggestion,
+        3 => crate::diagnostics::Category::Message,
         _ => panic!("invalid diagnostic category {raw}"),
     }
 }

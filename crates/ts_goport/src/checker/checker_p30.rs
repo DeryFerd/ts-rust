@@ -1,9 +1,9 @@
 //! Port of typescript-go `internal/checker/checker.go` lines 26861-27804.
 
+use crate::diagnostics::Message;
+use crate::jsnum::Number;
 use crate::prelude::*;
 use smallvec::SmallVec;
-use ts_diagnostics::Message;
-use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:26861 getPropertyTypeForIndexType

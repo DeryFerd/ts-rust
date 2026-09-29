@@ -1,6 +1,6 @@
 //! Port of Go `ls/definition.go`.
 //!
-//! PORT: Go `*compiler.Program` is `&'static compiler::NewProgram`. A Go
+//! PORT: Go `*compiler.Program` is `&compiler::NewProgram`. A Go
 //! checker lease `c, done := program.GetTypeCheckerForFile(ctx, file)` is
 //! `ls_program::get_type_checker_for_file`, with `done` kept alive to the end
 //! of the scope (Go `defer done()`).

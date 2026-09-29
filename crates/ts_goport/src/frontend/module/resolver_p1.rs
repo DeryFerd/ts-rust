@@ -17,6 +17,7 @@
 //!   hold them as `Rc`.
 
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 /// Go `if r.tracer != nil { r.tracer.write(diag, args...) }`.
 macro_rules! trace_write {
@@ -84,14 +85,14 @@ pub struct Tracer {
 // `ToString` when written (`args!`), like the Go `%v` formatting later.
 #[derive(Clone, Debug)]
 pub struct DiagAndArgs {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static crate::diagnostics::Message,
     pub args: Vec<String>,
 }
 
 impl Tracer {
     // Go: module/resolver.go:55 tracer.write
     // PORT: the Go nil check is on the caller side (`trace_write!`).
-    pub fn write(&mut self, diag: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn write(&mut self, diag: &'static crate::diagnostics::Message, args: Vec<String>) {
         self.traces.push(DiagAndArgs {
             message: diag,
             args,
@@ -449,7 +450,7 @@ impl Resolver {
         containing_file: &str,
         resolution_mode: ResolutionMode,
         redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
-    ) -> (Rc<ResolvedModule>, Vec<DiagAndArgs>) {
+    ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>) {
         let containing_directory = get_directory_path(containing_file);
         let trace_builder = self.new_trace_builder();
 
@@ -469,7 +470,6 @@ impl Resolver {
             if let Some(shared) = &self.caches.shared
                 && let Some(found) = shared.cache.get_module(&cache_key)
             {
-                let found = Rc::new((*found).clone());
                 self.caches
                     .module_resolution_cache
                     .set(cache_key, found.clone());
@@ -545,17 +545,16 @@ impl Resolver {
             }
         }
 
-        let final_result = Rc::new(self.try_resolve_from_typings_location(
+        let final_result = Arc::new(self.try_resolve_from_typings_location(
             module_name,
             &containing_directory,
             result,
             &trace_builder,
         ));
         if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
-            shared.cache.set_module(
-                cache_key.clone(),
-                std::sync::Arc::new((*final_result).clone()),
-            );
+            shared
+                .cache
+                .set_module(cache_key.clone(), Arc::clone(&final_result));
         }
         self.caches
             .module_resolution_cache

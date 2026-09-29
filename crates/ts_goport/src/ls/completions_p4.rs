@@ -75,7 +75,7 @@ impl LanguageService {
     pub fn get_completion_item_details(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         checker: &mut Checker,
         position: i32,
         file: Node,
@@ -1358,7 +1358,7 @@ impl LanguageService {
         file: Node,
         position: i32,
         options: &CompilerOptions,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         c: &mut Checker,
     ) -> Result<Option<lsproto::CompletionItem>, GoError> {
         let clauses = case_block.clauses().nodes().to_vec();

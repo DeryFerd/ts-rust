@@ -11,18 +11,34 @@ use crate::spanmap::{Fidelity, SpanMap};
 // (plan contract C3).
 pub fn get_all_diagnostics(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut files = vec![file];
     files.extend_from_slice(source_file_supplemental_source_files(file));
     for source_file in files {
-        diags.extend(ls_program::get_syntactic_diagnostics(program, ctx, source_file));
-        diags.extend(ls_program::get_semantic_diagnostics(program, ctx, source_file));
-        diags.extend(ls_program::get_suggestion_diagnostics(program, ctx, source_file));
+        diags.extend(ls_program::get_syntactic_diagnostics(
+            program,
+            ctx,
+            source_file,
+        ));
+        diags.extend(ls_program::get_semantic_diagnostics(
+            program,
+            ctx,
+            source_file,
+        ));
+        diags.extend(ls_program::get_suggestion_diagnostics(
+            program,
+            ctx,
+            source_file,
+        ));
         if program.options().get_emit_declarations() {
-            diags.extend(ls_program::get_declaration_diagnostics(program, ctx, source_file));
+            diags.extend(ls_program::get_declaration_diagnostics(
+                program,
+                ctx,
+                source_file,
+            ));
         }
     }
     diags
@@ -156,13 +172,13 @@ pub fn aggregate_synthesized_diagnostics(file: Node, diags: &[Diagnostic]) -> Di
 }
 
 // Go: ls/diagnostics.go:109 worstCategory
-pub fn worst_category(diags: &[Diagnostic]) -> ts_diagnostics::Category {
+pub fn worst_category(diags: &[Diagnostic]) -> crate::diagnostics::Category {
     let mut worst = diags[0].category();
     for diag in diags {
         match diag.category() {
-            ts_diagnostics::Category::Error => return ts_diagnostics::Category::Error,
-            ts_diagnostics::Category::Warning => {
-                worst = ts_diagnostics::Category::Warning;
+            crate::diagnostics::Category::Error => return crate::diagnostics::Category::Error,
+            crate::diagnostics::Category::Warning => {
+                worst = crate::diagnostics::Category::Warning;
             }
             _ => {}
         }

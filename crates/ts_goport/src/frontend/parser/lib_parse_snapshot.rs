@@ -13,7 +13,7 @@
 //! too.
 //!
 //! The key of a lib file (`ParseKey`) is a compile-time hash of the
-//! parser, scanner, factory, store and node sources, ts_ast and this file
+//! parser, scanner, factory, store and node sources, astdata and this file
 //! (`SOURCES_HASH`), a hash of the parse options that the parse reads (file
 //! name, script kind, module indicator options) and the xxh3 hash of the
 //! text. Any mismatch or load error parses the file live, so a stale blob
@@ -25,7 +25,7 @@
 //! or symbol id (a lib parse makes none either; the tests check this).
 //!
 //! After a change to the parser, the scanner, the factory, the store,
-//! ts_ast or a bundled lib, write the blob again (the integrator does this
+//! astdata or a bundled lib, write the blob again (the integrator does this
 //! after each merge round, before the lib bind generator):
 //!
 //! ```text
@@ -48,7 +48,7 @@
 //! - each slot `i`: its palette index, zz(pos - pos of slot i - 1),
 //!   zz(end - pos), zz(parent - i), the two links (`link`), the name index
 //!   for an Identifier or PrivateIdentifier, and the data: a variant tag
-//!   (`SHARED_NAME` for the shared name node) and the fields in ts_ast
+//!   (`SHARED_NAME` for the shared name node) and the fields in astdata
 //!   order (`payload_codec!`). A child id is zz(id - i); a list range is
 //!   zz(start - pos) and zz(end - start);
 //! - the `ParsedSourceFile` fields in declaration order, with node handles
@@ -57,12 +57,12 @@
 use crate::ast::store::{LibParseSlot, load_lib_parse_slots, reset_file_store};
 #[cfg(test)]
 use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
+use crate::astdata::NodeData;
 use crate::binder::lib_snapshot::{
     MIN_TEXT_LEN, Mode, SnapshotEntry, SnapshotReader, TEXT_BIT, const_hash, mix, read_entries,
 };
 use crate::frontend::prelude::*;
 use std::sync::OnceLock;
-use ts_ast::NodeData;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// The embedded snapshot, written by `generate_lib_parse_snapshot`.
@@ -82,7 +82,7 @@ const SHARED_NAME: u8 = u8::MAX;
 /// A compile-time hash of the sources whose change can change the parse
 /// output or the blob format: the parser, the scanner, the node factory,
 /// the store and node reads, `core.rs` (names), the flag values, the lib
-/// name ids, ts_ast, the blob helpers of `lib_snapshot.rs` and this file.
+/// name ids, astdata, the blob helpers of `lib_snapshot.rs` and this file.
 /// After a change there, every key misses until the blob is written again.
 // PORT: the parser also calls helpers in other files (ast utilities, for
 // example). `snapshot_matches_live_parse` finds a blob that such a change
@@ -110,8 +110,8 @@ const SOURCES_HASH: u64 = {
         SOURCE_CORE,
         SOURCE_FLAGS,
         SOURCE_LIB_NAMES,
-        SOURCE_TS_AST,
-        SOURCE_TS_AST_LIB,
+        SOURCE_ASTDATA,
+        SOURCE_ASTDATA_MOD,
         SOURCE_LIB_SNAPSHOT,
         SOURCE_SNAPSHOT,
     ];
@@ -147,8 +147,8 @@ const SOURCE_NODE: u64 = const_hash(include_bytes!("../../ast/node.rs"));
 const SOURCE_CORE: u64 = const_hash(include_bytes!("../../core.rs"));
 const SOURCE_FLAGS: u64 = const_hash(include_bytes!("../../flags.rs"));
 const SOURCE_LIB_NAMES: u64 = const_hash(include_bytes!("../../core/lib_names.rs"));
-const SOURCE_TS_AST: u64 = const_hash(include_bytes!("../../../../ts_ast/src/ast_generated.rs"));
-const SOURCE_TS_AST_LIB: u64 = const_hash(include_bytes!("../../../../ts_ast/src/lib.rs"));
+const SOURCE_ASTDATA: u64 = const_hash(include_bytes!("../../astdata/ast_generated.rs"));
+const SOURCE_ASTDATA_MOD: u64 = const_hash(include_bytes!("../../astdata/mod.rs"));
 const SOURCE_LIB_SNAPSHOT: u64 = const_hash(include_bytes!("../../binder/lib_snapshot.rs"));
 const SOURCE_SNAPSHOT: u64 = const_hash(include_bytes!("lib_parse_snapshot.rs"));
 
@@ -524,21 +524,21 @@ impl<'a> Decoder<'a> {
     // The `payload_codec!` field readers.
 
     #[inline]
-    fn id(&mut self) -> Option<ts_ast::NodeId> {
-        Some(ts_ast::NodeId::new(self.rel_slot()?))
+    fn id(&mut self) -> Option<crate::astdata::NodeId> {
+        Some(crate::astdata::NodeId::new(self.rel_slot()?))
     }
 
     #[inline]
-    fn oid(&mut self) -> Option<Option<ts_ast::NodeId>> {
+    fn oid(&mut self) -> Option<Option<crate::astdata::NodeId>> {
         match self.var()? {
             0 => Some(None),
-            value => Some(Some(ts_ast::NodeId::new(
+            value => Some(Some(crate::astdata::NodeId::new(
                 self.slot_at(unzigzag(value - 1))?,
             ))),
         }
     }
 
-    fn list(&mut self) -> Option<ts_ast::NodeList> {
+    fn list(&mut self) -> Option<crate::astdata::NodeList> {
         let start_delta = self.zz()?;
         let start = u32::try_from(self.pos + start_delta).ok()?;
         let end = u32::try_from(i64::from(start) + self.zz()?).ok()?;
@@ -551,17 +551,17 @@ impl<'a> Decoder<'a> {
         for _ in 0..len {
             nodes.push(self.id()?);
         }
-        Some(ts_ast::NodeList {
-            range: ts_core::TextRange::new(
-                ts_core::TextPos::new(start),
-                ts_core::TextPos::new(end),
+        Some(crate::astdata::NodeList {
+            range: crate::astdata::text::TextRange::new(
+                crate::astdata::text::TextPos::new(start),
+                crate::astdata::text::TextPos::new(end),
             ),
             nodes,
             has_trailing_comma: head & 1 != 0,
         })
     }
 
-    fn olist(&mut self) -> Option<Option<ts_ast::NodeList>> {
+    fn olist(&mut self) -> Option<Option<crate::astdata::NodeList>> {
         Some(if self.flag()? {
             Some(self.list()?)
         } else {
@@ -569,37 +569,41 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn mods(&mut self) -> Option<Option<ts_ast::ModifierList>> {
+    fn mods(&mut self) -> Option<Option<crate::astdata::ModifierList>> {
         if !self.flag()? {
             return Some(None);
         }
         let list = self.list()?;
-        Some(Some(ts_ast::ModifierList {
+        Some(Some(crate::astdata::ModifierList {
             list,
-            flags: ts_ast::ModifierFlags(self.num()?),
+            flags: crate::astdata::ModifierFlags(self.num()?),
         }))
     }
 
-    fn osym(&mut self) -> Option<Option<ts_ast::SymbolId>> {
+    fn osym(&mut self) -> Option<Option<crate::astdata::SymbolId>> {
         match self.var()? {
             0 => Some(None),
-            value => Some(Some(ts_ast::SymbolId(u32::try_from(value - 1).ok()?))),
+            value => Some(Some(crate::astdata::SymbolId(
+                u32::try_from(value - 1).ok()?,
+            ))),
         }
     }
 
-    fn oflow(&mut self) -> Option<Option<ts_ast::FlowNodeId>> {
+    fn oflow(&mut self) -> Option<Option<crate::astdata::FlowNodeId>> {
         match self.var()? {
             0 => Some(None),
-            value => Some(Some(ts_ast::FlowNodeId(u32::try_from(value - 1).ok()?))),
+            value => Some(Some(crate::astdata::FlowNodeId(
+                u32::try_from(value - 1).ok()?,
+            ))),
         }
     }
 
-    fn table(&mut self) -> Option<ts_ast::SymbolTable> {
-        Some(ts_ast::SymbolTable)
+    fn table(&mut self) -> Option<crate::astdata::SymbolTable> {
+        Some(crate::astdata::SymbolTable)
     }
 
-    fn opaque(&mut self) -> Option<ts_ast::OpaqueValue> {
-        Some(ts_ast::OpaqueValue)
+    fn opaque(&mut self) -> Option<crate::astdata::OpaqueValue> {
+        Some(crate::astdata::OpaqueValue)
     }
 
     fn flag(&mut self) -> Option<bool> {
@@ -623,8 +627,8 @@ impl<'a> Decoder<'a> {
         Some(self.str()?.to_owned())
     }
 
-    fn tflags(&mut self) -> Option<ts_ast::TokenFlags> {
-        Some(ts_ast::TokenFlags(self.num()?))
+    fn tflags(&mut self) -> Option<crate::astdata::TokenFlags> {
+        Some(crate::astdata::TokenFlags(self.num()?))
     }
 
     fn kind(&mut self) -> Option<SyntaxKind> {
@@ -648,7 +652,7 @@ impl<'a> Decoder<'a> {
         Some(list)
     }
 
-    fn ids(&mut self) -> Option<Vec<ts_ast::NodeId>> {
+    fn ids(&mut self) -> Option<Vec<crate::astdata::NodeId>> {
         let len = self.count()?;
         let mut list = Vec::with_capacity(len);
         for _ in 0..len {
@@ -657,7 +661,7 @@ impl<'a> Decoder<'a> {
         Some(list)
     }
 
-    fn oids(&mut self) -> Option<Option<Vec<ts_ast::NodeId>>> {
+    fn oids(&mut self) -> Option<Option<Vec<crate::astdata::NodeId>>> {
         Some(if self.flag()? {
             Some(self.ids()?)
         } else {
@@ -709,13 +713,13 @@ impl<'a> Decoder<'a> {
         let end = self.i32()?;
         let code = self.i32()?;
         let category = match self.r.u8()? {
-            0 => ts_diagnostics::Category::Warning,
-            1 => ts_diagnostics::Category::Error,
-            2 => ts_diagnostics::Category::Suggestion,
-            3 => ts_diagnostics::Category::Message,
+            0 => crate::diagnostics::Category::Warning,
+            1 => crate::diagnostics::Category::Error,
+            2 => crate::diagnostics::Category::Suggestion,
+            3 => crate::diagnostics::Category::Message,
             _ => return None,
         };
-        let message = ts_diagnostics::message_by_key(self.str()?)?;
+        let message = crate::diagnostics::message_by_key(self.str()?)?;
         let message_args = self.strings()?;
         let message_chain = self.diagnostics()?;
         let related_information = self.diagnostics()?;
@@ -875,10 +879,10 @@ impl<'a> Decoder<'a> {
 /// Makes `decode_payload` and (tests) `encode_payload`, which read and
 /// write the node data of one slot: the variant tag, then each field with
 /// the `Decoder` (`Encoder`) method named by its codec. The table lists
-/// every `NodeData` variant and every field of its ts_ast struct, in ts_ast
-/// order, so a new variant or field in ts_ast does not compile here (the
+/// every `NodeData` variant and every field of its astdata struct, in
+/// astdata order, so a new variant or field in astdata does not compile here (the
 /// match must be exhaustive, the struct pattern and literal must name every
-/// field). `crates/ts_ast/src/ast_generated.rs` is in `SOURCES_HASH`.
+/// field). `src/astdata/ast_generated.rs` is in `SOURCES_HASH`.
 macro_rules! payload_codec {
     ($($variant_tag:literal $variant:ident($data:ident) {
         $($field:ident: $codec:ident),* $(,)?
@@ -886,7 +890,7 @@ macro_rules! payload_codec {
         /// The node data with variant tag `variant_tag`, from `dec`.
         fn decode_payload(dec: &mut Decoder<'_>, variant_tag: u8) -> Option<NodeData> {
             Some(match variant_tag {
-                $($variant_tag => NodeData::$variant(Box::new(ts_ast::$data {
+                $($variant_tag => NodeData::$variant(Box::new(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
                 })),)*
                 _ => return None,
@@ -898,7 +902,7 @@ macro_rules! payload_codec {
         fn encode_payload(enc: &mut Encoder, payload: &NodeData) -> Result<(), String> {
             match payload {
                 $(NodeData::$variant(payload) => {
-                    let ts_ast::$data { $($field),* } = &**payload;
+                    let crate::astdata::$data { $($field),* } = &**payload;
                     enc.u8($variant_tag);
                     $(enc.$codec($field)?;)*
                 })*
@@ -908,7 +912,7 @@ macro_rules! payload_codec {
     };
 }
 
-// The rows come from `crates/ts_ast/src/ast_generated.rs` (one per
+// The rows come from `src/astdata/ast_generated.rs` (one per
 // `NodeData` variant, in enum order; the codec of each field follows from
 // its type). The tags stay below `SHARED_NAME`.
 payload_codec! {
@@ -1391,19 +1395,19 @@ impl Encoder {
         }
     }
 
-    fn slot_of(id: &ts_ast::NodeId) -> Result<u32, String> {
+    fn slot_of(id: &crate::astdata::NodeId) -> Result<u32, String> {
         u32::try_from(id.index()).map_err(|_| format!("node id {id:?} too large"))
     }
 
     // The `payload_codec!` field writers.
 
-    fn id(&mut self, id: &ts_ast::NodeId) -> Result<(), String> {
+    fn id(&mut self, id: &crate::astdata::NodeId) -> Result<(), String> {
         let slot = Self::slot_of(id)?;
         self.zz(self.rel(slot));
         Ok(())
     }
 
-    fn oid(&mut self, id: &Option<ts_ast::NodeId>) -> Result<(), String> {
+    fn oid(&mut self, id: &Option<crate::astdata::NodeId>) -> Result<(), String> {
         match id {
             None => self.var(0),
             Some(id) => {
@@ -1414,7 +1418,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn list(&mut self, l: &ts_ast::NodeList) -> Result<(), String> {
+    fn list(&mut self, l: &crate::astdata::NodeList) -> Result<(), String> {
         let start = i64::from(l.range.start.get());
         let end = i64::from(l.range.end.get());
         self.zz(start - self.pos);
@@ -1426,7 +1430,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn olist(&mut self, l: &Option<ts_ast::NodeList>) -> Result<(), String> {
+    fn olist(&mut self, l: &Option<crate::astdata::NodeList>) -> Result<(), String> {
         match l {
             None => self.u8(0),
             Some(l) => {
@@ -1437,7 +1441,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn mods(&mut self, m: &Option<ts_ast::ModifierList>) -> Result<(), String> {
+    fn mods(&mut self, m: &Option<crate::astdata::ModifierList>) -> Result<(), String> {
         match m {
             None => self.u8(0),
             Some(m) => {
@@ -1449,21 +1453,21 @@ impl Encoder {
         Ok(())
     }
 
-    fn osym(&mut self, symbol: &Option<ts_ast::SymbolId>) -> Result<(), String> {
+    fn osym(&mut self, symbol: &Option<crate::astdata::SymbolId>) -> Result<(), String> {
         self.var(symbol.map_or(0, |symbol| u64::from(symbol.0) + 1));
         Ok(())
     }
 
-    fn oflow(&mut self, flow: &Option<ts_ast::FlowNodeId>) -> Result<(), String> {
+    fn oflow(&mut self, flow: &Option<crate::astdata::FlowNodeId>) -> Result<(), String> {
         self.var(flow.map_or(0, |flow| u64::from(flow.0) + 1));
         Ok(())
     }
 
-    fn table(&mut self, _: &ts_ast::SymbolTable) -> Result<(), String> {
+    fn table(&mut self, _: &crate::astdata::SymbolTable) -> Result<(), String> {
         Ok(())
     }
 
-    fn opaque(&mut self, _: &ts_ast::OpaqueValue) -> Result<(), String> {
+    fn opaque(&mut self, _: &crate::astdata::OpaqueValue) -> Result<(), String> {
         Ok(())
     }
 
@@ -1487,7 +1491,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn tflags(&mut self, flags: &ts_ast::TokenFlags) -> Result<(), String> {
+    fn tflags(&mut self, flags: &crate::astdata::TokenFlags) -> Result<(), String> {
         self.var(u64::from(flags.0));
         Ok(())
     }
@@ -1516,7 +1520,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn ids(&mut self, list: &Vec<ts_ast::NodeId>) -> Result<(), String> {
+    fn ids(&mut self, list: &Vec<crate::astdata::NodeId>) -> Result<(), String> {
         self.count(list.len());
         for id in list {
             self.id(id)?;
@@ -1524,7 +1528,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn oids(&mut self, list: &Option<Vec<ts_ast::NodeId>>) -> Result<(), String> {
+    fn oids(&mut self, list: &Option<Vec<crate::astdata::NodeId>>) -> Result<(), String> {
         match list {
             None => self.u8(0),
             Some(list) => {
@@ -1574,7 +1578,7 @@ impl Encoder {
             self.zz(i64::from(diagnostic.code));
             self.u8(diagnostic.category as u8);
             let key = diagnostic.message.key();
-            if ts_diagnostics::message_by_key(key) != Some(diagnostic.message) {
+            if crate::diagnostics::message_by_key(key) != Some(diagnostic.message) {
                 return Err(format!("message key {key} does not find its message"));
             }
             self.str(key);

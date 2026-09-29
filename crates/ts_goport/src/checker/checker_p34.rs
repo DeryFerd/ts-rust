@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use ts_diagnostics::Message;
+use crate::diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:30607 instantiateInstantiableTypes

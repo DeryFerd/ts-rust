@@ -1132,11 +1132,11 @@ fn diagnostic_script_and_range<'a>(
 
 // Go: ls/lsconv/converters.go:601 diagnosticSeverity
 // diagnosticSeverity maps a diagnostic category to its LSP severity.
-fn diagnostic_severity(category: ts_diagnostics::Category) -> lsproto::DiagnosticSeverity {
+fn diagnostic_severity(category: crate::diagnostics::Category) -> lsproto::DiagnosticSeverity {
     match category {
-        ts_diagnostics::Category::Suggestion => lsproto::DiagnosticSeverity::HINT,
-        ts_diagnostics::Category::Message => lsproto::DiagnosticSeverity::INFORMATION,
-        ts_diagnostics::Category::Warning => lsproto::DiagnosticSeverity::WARNING,
+        crate::diagnostics::Category::Suggestion => lsproto::DiagnosticSeverity::HINT,
+        crate::diagnostics::Category::Message => lsproto::DiagnosticSeverity::INFORMATION,
+        crate::diagnostics::Category::Warning => lsproto::DiagnosticSeverity::WARNING,
         _ => lsproto::DiagnosticSeverity::ERROR,
     }
 }

@@ -77,8 +77,8 @@ child_test! {
 
         // Get language service to access the program
         let program = program(&session, &p1_uri("src/index.ts"));
-        assert!(has_file(program, &p1("src/x.ts")));
-        assert_eq!(text(program, &p1("src/x.ts")), "export const x = 1;");
+        assert!(has_file(&program, &p1("src/x.ts")));
+        assert_eq!(text(&program, &p1("src/x.ts")), "export const x = 1;");
     }
 }
 
@@ -133,7 +133,7 @@ child_test! {
         assert_eq!(projects_len(&session), 1);
 
         let program = program(&session, &p1_uri("index.js"));
-        assert!(has_file(program, &p1("index.js")));
+        assert!(has_file(&program, &p1("index.js")));
     }
 }
 
@@ -185,7 +185,7 @@ child_test! {
 
         // Verify a.ts is in the program with the original content.
         let p = program(&session, &p1_uri("src/b.ts"));
-        assert_eq!(text(p, &p1("src/a.ts")), old_content);
+        assert_eq!(text(&p, &p1("src/a.ts")), old_content);
 
         // Modify a.ts on disk (simulate a build tool or git checkout).
         let new_content = "export const a = 2;\nexport const extra = true;\n";
@@ -201,7 +201,7 @@ child_test! {
 
         // The program's SourceFile must reflect the overlay (new) content.
         let p = program(&session, &p1_uri("src/a.ts"));
-        assert_eq!(text(p, &p1("src/a.ts")), new_content);
+        assert_eq!(text(&p, &p1("src/a.ts")), new_content);
     }
 }
 
@@ -223,8 +223,8 @@ child_test! {
         let program_after = program(&session, &p1_uri("src/x.ts"));
 
         // Program should change due to the file content change
-        assert!(!same_program(program_after, program_before));
-        assert_eq!(text(program_after, &p1("src/x.ts")), "export const x = 2;");
+        assert!(!same_program(&program_after, &program_before));
+        assert_eq!(text(&program_after, &p1("src/x.ts")), "export const x = 2;");
     }
 }
 
@@ -237,14 +237,14 @@ child_test! {
 
         let program_before = program(&session, "untitled:Untitled-1");
         let untitled_file_name = uri("untitled:Untitled-1").file_name();
-        assert_eq!(text(program_before, &untitled_file_name), "let x = 1;");
+        assert_eq!(text(&program_before, &untitled_file_name), "let x = 1;");
 
         edit(&session, "untitled:Untitled-1", 2, (0, 8), (0, 9), "2");
 
         let program_after = program(&session, "untitled:Untitled-1");
 
-        assert!(!same_program(program_after, program_before));
-        assert_eq!(text(program_after, &untitled_file_name), "let x = 2;");
+        assert!(!same_program(&program_after, &program_before));
+        assert_eq!(text(&program_after, &untitled_file_name), "let x = 2;");
     }
 }
 
@@ -279,7 +279,7 @@ child_test! {
 
         // Verify y.ts is not initially in the program
         let program_before = program(&session, &p1_uri("src/index.ts"));
-        assert!(!has_file(program_before, &p1("y.ts")));
+        assert!(!has_file(&program_before, &p1("y.ts")));
 
         edit(
             &session,
@@ -293,7 +293,7 @@ child_test! {
         let program_after = program(&session, &p1_uri("src/index.ts"));
 
         // y.ts should now be included in the program
-        assert!(has_file(program_after, &p1("y.ts")));
+        assert!(has_file(&program_after, &p1("y.ts")));
     }
 }
 
@@ -362,15 +362,15 @@ fn delete_close_recreate(files: FileMap) {
 
     close(&session, &p1_uri("src/x.ts"));
     let p = program(&session, &p1_uri("src/index.ts"));
-    assert!(!has_file(p, &p1("src/x.ts")));
+    assert!(!has_file(&p, &p1("src/x.ts")));
 
     utils.fs().write_file(&p1("src/x.ts"), "").unwrap();
 
     open(&session, &p1_uri("src/x.ts"), "");
 
     let p = program(&session, &p1_uri("src/x.ts"));
-    assert!(has_file(p, &p1("src/x.ts")));
-    assert_eq!(text(p, &p1("src/x.ts")), "");
+    assert!(has_file(&p, &p1("src/x.ts")));
+    assert_eq!(text(&p, &p1("src/x.ts")), "");
 }
 
 child_test! {
@@ -556,7 +556,7 @@ child_test! {
 
         let program_after = program(&session, &p1_uri("src/index.ts"));
         // Program should remain the same since the file is open and changes are handled through DidChangeTextDocument
-        assert!(same_program(program_before, program_after));
+        assert!(same_program(&program_before, &program_after));
     }
 }
 
@@ -574,7 +574,7 @@ child_test! {
         watch(&session, &[(CHANGED, &p1_uri("src/x.ts"))]);
 
         let program_after = program(&session, &p1_uri("src/index.ts"));
-        assert!(!same_program(program_after, program_before));
+        assert!(!same_program(&program_after, &program_before));
     }
 }
 
@@ -619,7 +619,7 @@ fn change_program_file_not_in_tsconfig_root_files(workspace_dir: &str) {
     watch(&session, &[(CHANGED, "file:///home/projects/TS/x.ts")]);
 
     let program_after = program(&session, &p1_uri("src/index.ts"));
-    assert!(!same_program(program_after, program_before));
+    assert!(!same_program(&program_after, &program_before));
 }
 
 child_test! {
@@ -665,7 +665,7 @@ child_test! {
         open(&session, &p1_uri("src/index.ts"), index_text);
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
 
         utils
             .fs()
@@ -683,7 +683,7 @@ child_test! {
         watch(&session, &[(CHANGED, &p1_uri("tsconfig.json"))]);
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 1);
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 1);
     }
 }
 
@@ -707,8 +707,8 @@ child_test! {
         open(&session, &p1_uri("src/index.ts"), r#"import { x } from "./x";"#);
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert!(file_names(p).contains(&p1("src/x.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
+        assert!(file_names(&p).contains(&p1("src/x.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
 
         utils.fs().remove(&p1("src/x.ts")).unwrap();
 
@@ -716,9 +716,9 @@ child_test! {
 
         let p = program(&session, &p1_uri("src/index.ts"));
         // File name is still in the command line, was explicitly included
-        assert!(file_names(p).contains(&p1("src/x.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 1);
-        assert!(!has_file(p, &p1("src/x.ts")));
+        assert!(file_names(&p).contains(&p1("src/x.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 1);
+        assert!(!has_file(&p, &p1("src/x.ts")));
 
         // Open file to trigger cleanup
         open(&session, "untitled:Untitled-1", "");
@@ -746,8 +746,8 @@ child_test! {
         open(&session, &p1_uri("src/x.ts"), "let y = x;");
 
         let p = program(&session, &p1_uri("src/x.ts"));
-        assert!(file_names(p).contains(&p1("src/index.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/x.ts")), 0);
+        assert!(file_names(&p).contains(&p1("src/index.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/x.ts")), 0);
 
         utils.fs().remove(&p1("src/index.ts")).unwrap();
 
@@ -755,8 +755,8 @@ child_test! {
 
         let p = program(&session, &p1_uri("src/x.ts"));
         // File name is gone from the command line, was originally included via wildcard
-        assert!(!file_names(p).contains(&p1("src/index.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/x.ts")), 1);
+        assert!(!file_names(&p).contains(&p1("src/index.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/x.ts")), 1);
 
         // Open file to trigger cleanup
         open(&session, "untitled:Untitled-1", "");
@@ -784,8 +784,8 @@ child_test! {
         open(&session, &p1_uri("src/index.ts"), r#"import { x } from "./sub/x";"#);
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert!(file_names(p).contains(&p1("src/sub/x.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
+        assert!(file_names(&p).contains(&p1("src/sub/x.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
 
         // Delete the entire subdirectory from the file system.
         utils.fs().remove(&p1("src/sub")).unwrap();
@@ -795,9 +795,9 @@ child_test! {
 
         let p = program(&session, &p1_uri("src/index.ts"));
         // The directory was deleted, so the file should no longer be in the program.
-        assert!(!file_names(p).contains(&p1("src/sub/x.ts")));
+        assert!(!file_names(&p).contains(&p1("src/sub/x.ts")));
         // The import should now be an error since the module is missing.
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 1);
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 1);
     }
 }
 
@@ -821,10 +821,10 @@ child_test! {
         open(&session, &p1_uri("src/index.ts"), r#"import { x } from "./sub/x";"#);
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert!(file_names(p).contains(&p1("src/index.ts")));
+        assert!(file_names(&p).contains(&p1("src/index.ts")));
         // x.ts is not in "files" but is pulled in via the import.
-        assert!(has_file(p, &p1("src/sub/x.ts")));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
+        assert!(has_file(&p, &p1("src/sub/x.ts")));
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
 
         // Delete the entire subdirectory from the file system.
         utils.fs().remove(&p1("src/sub")).unwrap();
@@ -834,9 +834,9 @@ child_test! {
 
         let p = program(&session, &p1_uri("src/index.ts"));
         // The directory was deleted, so the file should no longer be resolvable.
-        assert!(!has_file(p, &p1("src/sub/x.ts")));
+        assert!(!has_file(&p, &p1("src/sub/x.ts")));
         // The import should now be an error since the module is missing.
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 1);
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 1);
     }
 }
 
@@ -937,7 +937,7 @@ fn create_file_resolves_error(tsconfig: &str, index: &str, new_file: &str, new_t
 
     let p = program(&session, &p1_uri("src/index.ts"));
     // Initially should have an error because the file is missing
-    assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 1);
+    assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 1);
 
     // Add the missing file
     utils.fs().write_file(&p1(new_file), new_text).unwrap();
@@ -946,8 +946,8 @@ fn create_file_resolves_error(tsconfig: &str, index: &str, new_file: &str, new_t
 
     // Error should be resolved
     let p = program(&session, &p1_uri("src/index.ts"));
-    assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
-    assert!(has_file(p, &p1(new_file)));
+    assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
+    assert!(has_file(&p, &p1(new_file)));
 }
 
 child_test! {
@@ -1021,7 +1021,7 @@ child_test! {
         open(&session, &p1_uri("src/index.ts"), "export const x = 1;");
 
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert_eq!(sem_diag_count(p, &p1("src/index.ts")), 0);
+        assert_eq!(sem_diag_count(&p, &p1("src/index.ts")), 0);
         let old_program = p;
 
         // Modify an irrelevant file and send change/create events for files with
@@ -1040,7 +1040,7 @@ child_test! {
         // The program should not have been rebuilt since all events had irrelevant extensions.
         let p = program(&session, &p1_uri("src/index.ts"));
         assert!(
-            same_program(p, old_program),
+            same_program(&p, &old_program),
             "program should not be rebuilt for irrelevant extension changes"
         );
     }
@@ -1080,7 +1080,7 @@ child_test! {
 
         // Before pnpm install: the import is unresolved because node_modules/@repo/alpha doesn't exist.
         let p = program(&session, beta);
-        assert_eq!(sem_diag_count(p, "/home/projects/pnpm/packages/beta/index.ts"), 1);
+        assert_eq!(sem_diag_count(&p, "/home/projects/pnpm/packages/beta/index.ts"), 1);
 
         // Simulate pnpm install: create a symlink from beta's node_modules/@repo/alpha to packages/alpha.
         let map_fs = utils.fs_from_file_map();
@@ -1107,7 +1107,7 @@ child_test! {
 
         // After pnpm install: the import should resolve.
         let p = program(&session, beta);
-        assert_eq!(sem_diag_count(p, "/home/projects/pnpm/packages/beta/index.ts"), 0);
+        assert_eq!(sem_diag_count(&p, "/home/projects/pnpm/packages/beta/index.ts"), 0);
     }
 }
 
@@ -1155,7 +1155,7 @@ child_test! {
         let p = program(&session, index);
         session.wait_for_background_tasks();
         assert_eq!(
-            sem_diag_count(p, "/home/projects/myproject/src/index.ts"),
+            sem_diag_count(&p, "/home/projects/myproject/src/index.ts"),
             0,
             "import should resolve initially"
         );
@@ -1188,7 +1188,7 @@ child_test! {
         // After removing "main" from package.json, the import should no longer resolve.
         let p = program(&session, index);
         assert!(
-            sem_diag_count(p, "/home/projects/myproject/src/index.ts") > 0,
+            sem_diag_count(&p, "/home/projects/myproject/src/index.ts") > 0,
             "import should fail after removing main from package.json"
         );
     }
@@ -1234,7 +1234,7 @@ child_test! {
         let p = program(&session, &p1_uri("src/index.ts"));
 
         // Initially, project only has the one file in src/.
-        let names = file_names(p);
+        let names = file_names(&p);
         assert!(names.contains(&p1("src/index.ts")));
         assert!(!names.contains(&p1("src/linked/utils.ts")));
         assert!(!names.contains(&p1("src/linked/helpers.ts")));
@@ -1250,7 +1250,7 @@ child_test! {
         // After the symlink directory is created, the files inside it should be
         // picked up by the wildcard include pattern.
         let p = program(&session, &p1_uri("src/index.ts"));
-        let names = file_names(p);
+        let names = file_names(&p);
         assert!(names.contains(&p1("src/index.ts")));
         assert!(names.contains(&p1("src/linked/utils.ts")));
         assert!(names.contains(&p1("src/linked/helpers.ts")));
@@ -1559,8 +1559,8 @@ child_test! {
         // Do NOT open any file. Directly request language service for a closed file
         // that belongs to the configured project.
         let p = program(&session, &p1_uri("src/index.ts"));
-        assert!(has_file(p, &p1("src/index.ts")));
-        assert_eq!(text(p, &p1("src/index.ts")), "export const x: number = 1;");
+        assert!(has_file(&p, &p1("src/index.ts")));
+        assert_eq!(text(&p, &p1("src/index.ts")), "export const x: number = 1;");
     }
 }
 
@@ -1574,9 +1574,9 @@ child_test! {
         let (session, _) = projecttestutil::setup(files);
 
         let p = program(&session, "file:///home/projects/TS/loose/index.ts");
-        assert!(has_file(p, "/home/projects/TS/loose/index.ts"));
+        assert!(has_file(&p, "/home/projects/TS/loose/index.ts"));
         assert_eq!(
-            text(p, "/home/projects/TS/loose/index.ts"),
+            text(&p, "/home/projects/TS/loose/index.ts"),
             r#"const greeting: string = "hello";"#
         );
     }

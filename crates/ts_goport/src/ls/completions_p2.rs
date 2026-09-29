@@ -187,7 +187,7 @@ impl LanguageService {
                     file,
                     position,
                     compiler_options,
-                    self.program,
+                    &self.program,
                     type_checker,
                 )?;
                 if let Some(cases_item) = cases_item {
@@ -1486,7 +1486,8 @@ impl LanguageService {
 
         let mut erase_range: Option<lsproto::Range> = None;
         if range_pos < range_end {
-            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(range_pos, range_end, file);
+            let (lsp_range, fidelity) =
+                self.create_lsp_range_from_bounds(range_pos, range_end, file);
             if fidelity.is_exact() {
                 erase_range = Some(lsp_range);
             }
@@ -3245,7 +3246,8 @@ impl LanguageService {
                 || location.kind() == SyntaxKind::PrivateIdentifier)
         {
             let start = astnav::get_start_of_node(location, file, false /*includeJSDoc*/);
-            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(start, location.end(), file);
+            let (lsp_range, fidelity) =
+                self.create_lsp_range_from_bounds(start, location.end(), file);
             if fidelity.is_exact() {
                 return Some(lsp_range);
             }

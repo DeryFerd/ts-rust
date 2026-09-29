@@ -878,7 +878,7 @@ impl Snapshot {
         for project in new_snapshot.project_collection.projects() {
             let project = project.borrow();
             // PORT: Go `project.Program` (the field).
-            if let Some(program) = project.program {
+            if let Some(program) = &project.program {
                 session.program_counter.ref_(program);
                 if project.program_last_update == new_snapshot_id {
                     // If the program was updated during this clone, the project and its host are new
@@ -980,7 +980,7 @@ impl Snapshot {
         for project in self.project_collection.projects() {
             let project = project.borrow();
             // PORT: Go `project.Program` (the field).
-            if let Some(program) = project.program {
+            if let Some(program) = &project.program {
                 if session.program_counter.deref(program) {
                     if let Some(content_mapper_project) = program.content_mapper_project() {
                         let _ = content_mapper_project.close();
@@ -1030,10 +1030,13 @@ impl Snapshot {
                     }
                     // PORT: Go frees the program when nothing references it.
                     // The port frees its checkers and its program version
-                    // now, or when the last request on it ends. Its
-                    // cross-project search thread ends after its queued jobs.
-                    crate::program::ls_program::release_program(program);
+                    // now, or when the last request on it ends; the program
+                    // goes with its last `Rc` holder. Its cross-project
+                    // search thread ends after its queued jobs. The search
+                    // thread is found by the program version, so it is
+                    // released first.
                     crate::ls::release_search_thread(program);
+                    crate::program::ls_program::release_program(program);
                 }
             }
         }

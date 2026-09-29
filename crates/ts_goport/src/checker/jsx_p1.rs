@@ -1,8 +1,8 @@
 //! Port of `checker/jsx.go` lines 1-928.
 
+use crate::diagnostics::Message;
+use crate::jsnum::Number;
 use crate::prelude::*;
-use ts_diagnostics::Message;
-use ts_jsnum::Number;
 
 // PORT: Go `JsxFlags` and `JsxReferenceKind` (jsx.go:17-32) are generated in
 // `crate::flags` (`JsxFlags::INTRINSIC_NAMED_ELEMENT`,

@@ -10,8 +10,8 @@
 //! that #4825 changed, and the helpers here whose change depends on a caller
 //! value, add first and then change the stored diagnostic that `add` returns.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:13929 errorSkippedOnNoEmit
@@ -76,7 +76,7 @@ impl Checker {
             self.add_diagnostic(diagnostic);
         } else {
             let mut suggestion = diagnostic.clone();
-            suggestion.set_category(ts_diagnostics::Category::Suggestion);
+            suggestion.set_category(crate::diagnostics::Category::Suggestion);
             self.add_suggestion_diagnostic(suggestion);
         }
     }

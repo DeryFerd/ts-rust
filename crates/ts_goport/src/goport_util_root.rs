@@ -1,5 +1,8 @@
 //! Crate root of `goport_util`: the bottom part of the goport port (Go std
-//! pieces, `tspath`, `vfs`, `json`, `fswatch`, `jsonrpc`, `diag`, `locale`).
+//! pieces, `tspath`, `vfs`, `json`, `fswatch`, `jsonrpc`, `diag`, `locale`,
+//! and the syntax model `astdata`, the message catalog `diagnostics` and
+//! `jsnum`, which were the crates `ts_ast`, `ts_core`, `ts_diagnostics` and
+//! `ts_jsnum`).
 //! Its files stay in `crates/ts_goport/src` and keep their module paths.
 //! `ts_goport` re-exports each module at its old path, so `crate::` paths in
 //! these files and `ts_goport::` paths outside do not change.
@@ -19,12 +22,15 @@
     non_snake_case
 )]
 
+pub mod astdata;
 #[path = "gopanic.rs"]
 pub mod core;
 pub mod diag;
+pub mod diagnostics;
 mod flags_macros;
 pub mod fswatch;
 pub mod gostd;
+pub mod jsnum;
 pub mod jsonrpc;
 pub mod locale;
 #[path = "util_prelude.rs"]

@@ -102,7 +102,7 @@ pub struct ModuleReference {
 // map of an earlier search with the same checker.
 pub fn create_import_tracker<'a, P: ProgramView>(
     ctx: &Context,
-    program: P,
+    program: &P,
     source_files: &'a [Node],
     source_files_set: &'a FxHashSet<String>,
     checker: &mut Checker,
@@ -141,7 +141,7 @@ pub fn create_import_tracker<'a, P: ProgramView>(
 // Returns a map from a module symbol to all import statements that directly reference the module
 pub fn get_direct_imports_map<P: ProgramView>(
     ctx: &Context,
-    program: P,
+    program: &P,
     source_files: &[Node],
     checker: &mut Checker,
 ) -> FxHashMap<SymbolId, Vec<Node>> {
@@ -203,7 +203,7 @@ thread_local! {
 // maps of dropped checkers are removed at the next call.
 fn get_direct_imports_map_cached<P: ProgramView>(
     ctx: &Context,
-    program: P,
+    program: &P,
     source_files: &[Node],
     checker: &mut Checker,
 ) -> Rc<FxHashMap<SymbolId, Vec<Node>>> {
@@ -244,7 +244,7 @@ fn get_direct_imports_map_cached<P: ProgramView>(
 // PORT: Go `sourceFile.Path()` is the installed program's path of the file
 // (`source_file_info(file).path`).
 pub fn for_each_import<P: ProgramView>(
-    program: P,
+    program: &P,
     source_file: Node,
     action: &mut dyn FnMut(Node, Node), /*importStatement, imported*/
 ) {
@@ -1198,7 +1198,7 @@ pub fn symbol_name_no_default(symbols: &SymbolArena, symbol: SymbolId) -> String
 // program's parsed file; they are `ProgramView::references_to_file`
 // (program_view.rs), in the same order.
 pub fn find_module_references<P: ProgramView>(
-    program: P,
+    program: &P,
     source_files: &[Node],
     search_module_symbol: SymbolId,
     checker: &mut Checker,

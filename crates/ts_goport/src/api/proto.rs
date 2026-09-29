@@ -3034,7 +3034,7 @@ pub struct DiagnosticResponse {
     // Code is the diagnostic error code.
     pub code: i32,
     // Category is the diagnostic category (error, warning, suggestion, message).
-    pub category: ts_diagnostics::Category,
+    pub category: crate::diagnostics::Category,
     // Text is the localized diagnostic message text.
     pub text: String,
     // ReportsUnnecessary indicates this diagnostic highlights unnecessary code.

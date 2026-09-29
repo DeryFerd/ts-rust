@@ -10,6 +10,7 @@ use super::Subtests;
 use crate::support::vfstest;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use ts_goport::frontend::module::{
     ResolutionHost, Resolver, new_resolver, parse_node_module_from_path,
 };
@@ -519,7 +520,7 @@ impl ModuleSpecifierGenerationHost for MockModuleSpecifierGenerationHost {
     fn get_project_reference_from_source(
         &self,
         _path: &Path,
-    ) -> Option<&'static SourceOutputAndProjectReference> {
+    ) -> Option<Arc<SourceOutputAndProjectReference>> {
         None
     }
     fn get_redirect_targets(&self, _path: &Path) -> Vec<String> {

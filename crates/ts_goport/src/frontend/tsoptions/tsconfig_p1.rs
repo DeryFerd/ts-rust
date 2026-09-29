@@ -1414,7 +1414,7 @@ pub fn convert_property_value_to_json(
         SyntaxKind::NumericLiteral => {
             return (
                 CompilerOptionsValue::Number(
-                    ts_jsnum::Number::from_string(value_expression.text()).0,
+                    crate::jsnum::Number::from_string(value_expression.text()).0,
                 ),
                 Vec::new(),
             );
@@ -1426,7 +1426,7 @@ pub fn convert_property_value_to_json(
             {
                 return (
                     CompilerOptionsValue::Number(
-                        -ts_jsnum::Number::from_string(value_expression.operand().text()).0,
+                        -crate::jsnum::Number::from_string(value_expression.operand().text()).0,
                     ),
                     Vec::new(),
                 );

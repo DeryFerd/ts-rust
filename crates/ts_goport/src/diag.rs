@@ -2,7 +2,7 @@
 //! Go `diagnostics.Name` messages. Use them as `diag::Name`.
 #![allow(non_upper_case_globals, clippy::unreadable_literal)]
 
-use ts_diagnostics::{CATALOG, Category, Message};
+use crate::diagnostics::{CATALOG, Category, Message};
 
 pub static Unterminated_string_literal: &Message = &CATALOG[0];
 pub static Identifier_expected: &Message = &CATALOG[1];
@@ -2653,10 +2653,9 @@ pub static Organize_Imports: &Message = &CATALOG[2150];
 pub static Remove_Unused_Imports: &Message = &CATALOG[2151];
 pub static Sort_Imports: &Message = &CATALOG[2152];
 
-// PORT: messages that Go at the pin has and `ts_diagnostics::CATALOG` (old pin) lacks.
-// `crates/ts_diagnostics` stays at the old pin because the protected `ts_compiler` crate
-// shares it (as `crates/ts_bundled/libs` does for the libs). `key_to_message` below finds
-// them by key.
+// PORT: messages that Go at the pin has and `crate::diagnostics::CATALOG` (old pin) lacks.
+// `src/diagnostics/catalog.rs` is still at the old pin (as `crates/ts_bundled/libs` is for the
+// libs). `key_to_message` below finds them by key.
 pub static Declaration_emit_elides_private_members_but_0_refers_to_a_private_member_Write_an_explicit_type_here: &Message =
     &Message::new(
         7080,
@@ -3193,7 +3192,7 @@ pub static Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations
 
 // Go: diagnostics/diagnostics_generated.go keyToMessage
 /// PORT: Go switches over every key. Here the local messages match first and
-/// `ts_diagnostics::message_by_key` finds the rest. A key that Go removed gives `None`, as
+/// `crate::diagnostics::message_by_key` finds the rest. A key that Go removed gives `None`, as
 /// in Go, also while its message is kept above.
 #[must_use]
 pub fn key_to_message(key: &str) -> Option<&'static Message> {
@@ -3253,6 +3252,6 @@ pub fn key_to_message(key: &str) -> Option<&'static Message> {
         "The_invalid_diagnostic_directive_is_in_supplemental_output_0_returned_by_the_content_mapper_100067" => Some(The_invalid_diagnostic_directive_is_in_supplemental_output_0_returned_by_the_content_mapper),
         "Diagnostic_directive_0_returned_by_the_content_mapper_has_an_invalid_unusedExpectDirectiveIndex_100068" => Some(Diagnostic_directive_0_returned_by_the_content_mapper_has_an_invalid_unusedExpectDirectiveIndex),
         "Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations_9019" => None,
-        _ => ts_diagnostics::message_by_key(key),
+        _ => crate::diagnostics::message_by_key(key),
     }
 }

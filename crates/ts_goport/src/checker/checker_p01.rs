@@ -9,11 +9,11 @@
 //! `TypeFacts`, `IterationUse`, `IterationTypeKind`) are generated in
 //! `crate::flags` and are not repeated here.
 
+use crate::diagnostics::Message;
 use crate::gostd::Context;
+use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
 use std::sync::LazyLock;
-use ts_diagnostics::Message;
-use ts_jsnum::{Number, PseudoBigInt};
 
 // Go: checker/checker.go:51 TypeSystemEntity
 // PORT: Go `TypeSystemEntity any`. The Go callers of `pushTypeResolution`
@@ -448,7 +448,7 @@ pub const MAX_SERIALIZATION_LEVEL: i32 = 2;
 // ported as types. The checker reads the installed program through
 // `prog()` and the free functions in `program.rs`.
 
-// PORT: Go `map[jsnum.Number]*Type` key. `ts_jsnum::Number` is not `Hash`.
+// PORT: Go `map[jsnum.Number]*Type` key. `crate::jsnum::Number` is not `Hash`.
 // Go compares float map keys with `==`, so -0 and +0 are one key. NaN never
 // matches in Go; `getNumberLiteralType` caches NaN separately, so NaN never
 // reaches this key.
@@ -462,7 +462,7 @@ impl From<Number> for NumberKey {
     }
 }
 
-// PORT: Go `map[jsnum.PseudoBigInt]*Type` key. `ts_jsnum::PseudoBigInt` is
+// PORT: Go `map[jsnum.PseudoBigInt]*Type` key. `crate::jsnum::PseudoBigInt` is
 // not `Hash`. Go compares the struct fields, like this key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PseudoBigIntKey {

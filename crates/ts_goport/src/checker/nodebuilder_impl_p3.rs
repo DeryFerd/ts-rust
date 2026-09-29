@@ -121,7 +121,7 @@ pub(crate) fn classify_property_name(
     }
     if !string_named
         && is_numeric_literal_name(name)
-        && ts_jsnum::Number::from_string(name) >= ts_jsnum::Number(0.0)
+        && crate::jsnum::Number::from_string(name) >= crate::jsnum::Number(0.0)
     {
         PropertyNameNodeKind::NUMERIC_LITERAL
     } else {

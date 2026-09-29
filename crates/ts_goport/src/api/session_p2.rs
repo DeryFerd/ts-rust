@@ -263,7 +263,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -325,7 +325,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
 
         let t = setup
             .checker
@@ -447,7 +447,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -477,7 +477,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
 
         let t = setup
             .checker
@@ -502,7 +502,7 @@ impl Session {
         if !params.location.0.is_empty() {
             enclosing_declaration = setup
                 .sd
-                .resolve_node_handle(setup.program, &params.location)?;
+                .resolve_node_handle(&setup.program, &params.location)?;
         }
 
         let type_node = setup.checker.borrow_mut().type_to_type_node_exported(
@@ -548,7 +548,7 @@ impl Session {
         if !params.location.0.is_empty() {
             enclosing_declaration = setup
                 .sd
-                .resolve_node_handle(setup.program, &params.location)?;
+                .resolve_node_handle(&setup.program, &params.location)?;
         }
 
         // PORT: Go converts any int32 to `ast.Kind` (int16). A value that is
@@ -603,7 +603,7 @@ impl Session {
         if !params.location.0.is_empty() {
             enclosing_declaration = setup
                 .sd
-                .resolve_node_handle(setup.program, &params.location)?;
+                .resolve_node_handle(&setup.program, &params.location)?;
         }
 
         if params.flags != 0 {
@@ -1047,7 +1047,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(false);
         }
@@ -1415,7 +1415,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -1438,7 +1438,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
 
         let sig = setup
             .checker
@@ -1458,7 +1458,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -1726,7 +1726,7 @@ impl SnapshotData {
     // Go: api/session.go:2053 resolveNodeHandle
     pub fn resolve_node_handle(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         handle: &NodeHandle,
     ) -> Result<Node, GoError> {
         let s = handle.0.as_str();
@@ -1830,8 +1830,8 @@ pub fn compute_snapshot_changes(
         |_, old_proj, new_proj| {
             let old_program = old_proj.borrow().get_program();
             let new_program = new_proj.borrow().get_program();
-            let same_program = match (old_program, new_program) {
-                (Some(a), Some(b)) => std::ptr::eq(a, b),
+            let same_program = match (&old_program, &new_program) {
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
                 (None, None) => true,
                 _ => false,
             };
@@ -1840,11 +1840,11 @@ pub fn compute_snapshot_changes(
             }
             // PORT: a nil Go map is an empty map here.
             let empty: FxHashMap<tspath::Path, Rc<ParsedSourceFile>> = FxHashMap::default();
-            let old_files = match old_program {
+            let old_files = match &old_program {
                 Some(p) => p.files_by_path(),
                 None => &empty,
             };
-            let new_files = match new_program {
+            let new_files = match &new_program {
                 Some(p) => p.files_by_path(),
                 None => &empty,
             };
@@ -1987,11 +1987,11 @@ impl Session {
         &self,
         ctx: &Context,
         params: &GetDiagnosticsParams,
-        getter: fn(&'static compiler::NewProgram, &Context, Node) -> Vec<Diagnostic>,
+        getter: fn(&compiler::NewProgram, &Context, Node) -> Vec<Diagnostic>,
     ) -> Result<Vec<DiagnosticResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
 
@@ -2066,7 +2066,7 @@ impl Session {
     ) -> Result<Vec<DiagnosticResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
 
@@ -2083,7 +2083,7 @@ impl Session {
     ) -> Result<Vec<DiagnosticResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
 
@@ -2111,14 +2111,14 @@ impl Session {
             ));
         };
         // Current for the whole handler (session_p1.rs header).
-        let _program = ls_program::enter(program);
+        let _program = ls_program::enter(&program);
 
         // Global diagnostics are accumulated lazily by the project's checker pool as
         // files are checked. Force a full semantic pass so any global (non-file-specific)
         // diagnostics are produced; otherwise this would return an empty result for
         // projects using an external checker pool (the typical API case), since
         // compiler.Program.GetGlobalDiagnostics only reports for the internal pool.
-        let _ = ls_program::get_semantic_diagnostics(program, ctx, Node::NIL);
+        let _ = ls_program::get_semantic_diagnostics(&program, ctx, Node::NIL);
 
         let diags: Vec<Diagnostic> = proj
             .borrow()
@@ -2134,7 +2134,7 @@ impl Session {
     // Returns nil if the identifier is nil (meaning all files).
     pub fn resolve_optional_source_file(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Option<&DocumentIdentifier>,
     ) -> Result<Node, GoError> {
         let Some(file) = file else {
@@ -2204,7 +2204,7 @@ impl Session {
         params: &GetSignatureUsagesParams,
     ) -> Result<Vec<SignatureUsageResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
 
@@ -2213,7 +2213,7 @@ impl Session {
             return Ok(Vec::new());
         }
 
-        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
 
         let usages = lang_svc.get_signature_usages(ctx, signature_decl);
         // PORT: Go `usages == nil`. Go returns a nil slice exactly when there
@@ -2251,7 +2251,7 @@ impl Session {
             ctx
         };
         let sd = self.get_snapshot_data(params.snapshot)?;
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
         let source_file = program
@@ -2260,7 +2260,7 @@ impl Session {
         if source_file.is_nil() {
             return Ok(None);
         }
-        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
         let position_map = source_file_get_position_map(source_file);
         let internal_pos = position_map.utf16_to_utf8(params.position as i32);
         let result = lang_svc.get_completions_at_position_exported(
@@ -2321,7 +2321,7 @@ impl Session {
         params: &GetReferencedSymbolsForNodeParams,
     ) -> Result<Vec<ReferencedSymbolEntry>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
         let _program = ls_program::enter(program);
 
@@ -2330,7 +2330,7 @@ impl Session {
             return Ok(Vec::new());
         }
 
-        let lang_svc = self.setup_language_service(&sd, program, &params.project, "")?;
+        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
 
         let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();
         let entries = lang_svc.get_referenced_symbols_for_node_exported(

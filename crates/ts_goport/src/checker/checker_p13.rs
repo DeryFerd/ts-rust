@@ -793,7 +793,7 @@ impl Checker {
                             prop_node,
                             containing_type,
                         );
-                        let message: &'static ts_diagnostics::Message = if self
+                        let message: &'static crate::diagnostics::Message = if self
                             .container_seems_to_be_empty_dom_element(containing_type)
                         {
                             diag::Property_0_does_not_exist_on_type_1_Try_changing_the_lib_compiler_option_to_include_dom

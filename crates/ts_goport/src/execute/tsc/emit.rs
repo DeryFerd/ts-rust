@@ -83,13 +83,13 @@ pub fn get_trace_with_writer_from_sys(
     w: Writer,
     locale: Locale,
     testing: Option<Rc<dyn CommandLineTesting>>,
-) -> Rc<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)> {
+) -> Rc<dyn Fn(&'static crate::diagnostics::Message, Vec<String>)> {
     // PORT: testing
     if let Some(testing) = testing {
         return testing.get_trace(w, locale);
     }
     Rc::new(
-        move |msg: &'static ts_diagnostics::Message, args: Vec<String>| {
+        move |msg: &'static crate::diagnostics::Message, args: Vec<String>| {
             write_str(&w, &format!("{}\n", message_localize(msg, &locale, &args)));
         },
     )

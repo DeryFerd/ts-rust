@@ -1031,7 +1031,7 @@ impl View {
         let import_kind = get_import_kind(
             self.importing_file,
             export,
-            self.program,
+            &self.program,
             false, /*forceImportKeyword*/
         );
         let add_as_type_only =
@@ -1110,7 +1110,7 @@ impl View {
         if get_import_kind(
             self.importing_file,
             export,
-            self.program,
+            &self.program,
             false, /*forceImportKeyword*/
         ) != lsproto::ImportKind::NAMED
         {
@@ -1203,7 +1203,7 @@ impl View {
         let import_kind = get_import_kind(
             self.importing_file,
             export,
-            self.program,
+            &self.program,
             false, /*forceImportKeyword*/
         );
         if import_kind == lsproto::ImportKind::COMMON_JS
@@ -1322,7 +1322,7 @@ impl View {
 pub fn get_import_kind_for_import_statement(
     importing_file: Node,
     export: &Export,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> lsproto::ImportKind {
     get_import_kind(
         importing_file,
@@ -1338,7 +1338,7 @@ pub fn get_import_kind_for_import_statement(
 fn get_import_kind(
     importing_file: Node,
     export: &Export,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     force_import_keyword: bool,
 ) -> lsproto::ImportKind {
     if program.options().verbatim_module_syntax.is_true()
@@ -1664,7 +1664,7 @@ impl View {
                 &a.module_specifier,
                 &b.module_specifier,
                 self.importing_file,
-                self.program,
+                &self.program,
             );
             if comparison != 0 {
                 return comparison;
@@ -1734,7 +1734,7 @@ impl View {
         a: &str,
         b: &str,
         _importing_file: Node,
-        _program: &'static compiler::NewProgram,
+        _program: &compiler::NewProgram,
     ) -> i32 {
         if a.starts_with("node:") && !b.starts_with("node:") {
             if self.should_use_uri_style_node_core_modules.is_true() {

@@ -2,8 +2,8 @@
 //! control flow binding, narrowing predicates, declaration helpers and binder
 //! diagnostics.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // PORT: Binder storage used by this file. Go stores binder output on the AST
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
@@ -1322,7 +1322,7 @@ impl Binder {
     pub fn error_on_node(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) {
         let diagnostic = self.create_diagnostic_for_node(node, message, args);
@@ -1333,7 +1333,7 @@ impl Binder {
     pub fn error_on_first_token(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) {
         let span = get_range_of_token_at_position(self.file, node.pos());
@@ -1347,7 +1347,7 @@ impl Binder {
     pub fn create_diagnostic_for_node(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Diagnostic {
         new_diagnostic(

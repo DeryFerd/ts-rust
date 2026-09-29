@@ -1,6 +1,6 @@
 //! Port of Go `ls/sourcedefinition.go`.
 //!
-//! PORT: Go `*compiler.Program` is `&'static compiler::NewProgram`.
+//! PORT: Go `*compiler.Program` is `&compiler::NewProgram`.
 //! `getOrParseSourceFile` parses and binds a file outside the program as Go
 //! does; the file is published with no program first (node reads of a file
 //! need its published Go file).
@@ -215,8 +215,8 @@ impl LanguageService {
 pub struct SourceDefResolver<'a> {
     pub ls: &'a LanguageService,
     pub fs: Rc<dyn vfs::Fs>,
-    pub options: &'static CompilerOptions,
-    pub get_source_file: Box<dyn Fn(&str) -> Node>,
+    pub options: &'a CompilerOptions,
+    pub get_source_file: Box<dyn Fn(&str) -> Node + 'a>,
     pub resolve_from: String,
     pub resolver: module::Resolver,
     pub parsed_files: Option<FxHashMap<String, Node>>,
@@ -224,11 +224,11 @@ pub struct SourceDefResolver<'a> {
 
 impl LanguageService {
     // Go: ls/sourcedefinition.go:121 newSourceDefResolver
-    pub fn new_source_def_resolver(
-        &self,
-        program: &'static compiler::NewProgram,
+    pub fn new_source_def_resolver<'a>(
+        &'a self,
+        program: &'a compiler::NewProgram,
         resolve_from: &str,
-    ) -> SourceDefResolver<'_> {
+    ) -> SourceDefResolver<'a> {
         let options = program.options();
         let mut no_dts_options = options.clone();
         no_dts_options.no_dts_resolution = Tristate::True;
@@ -317,7 +317,7 @@ impl SourceDefResolver<'_> {
 // of the import that brought the symbol into scope (empty if not applicable).
 pub fn get_source_def_checker_info(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     file: Node,
     node: Node,
 ) -> (Vec<Node>, String) {
@@ -396,7 +396,7 @@ impl SourceDefResolver<'_> {
         &mut self,
         file: Node,
         pos: i32,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
     ) -> (Vec<Node>, Option<FileReference>) {
         let Some(ref_) = get_reference_at_position(file, pos, program) else {
             return (Vec::new(), None);
@@ -619,7 +619,7 @@ impl SourceDefResolver<'_> {
 
         for mode in modes {
             // PORT: Go `resolved != nil` always holds; the resolver returns an
-            // `Rc<ResolvedModule>`.
+            // `Arc<ResolvedModule>`.
             let (resolved, _) =
                 self.resolver
                     .resolve_module_name(module_name, resolve_from_file, mode, None);

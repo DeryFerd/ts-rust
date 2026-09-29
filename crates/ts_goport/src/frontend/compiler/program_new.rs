@@ -1,7 +1,7 @@
 //! Go `internal/compiler/program.go` lines 1 to 444: program options, the
 //! `Program` struct, construction, update and the simple accessors.
 //! The `Program` type is `NewProgram` (the loader contract name), so it does
-//! not clash with the legacy program in program.rs.
+//! not clash with the program state in program.rs.
 
 use crate::contentmapper::{Mapper, Project};
 use crate::frontend::prelude::*;

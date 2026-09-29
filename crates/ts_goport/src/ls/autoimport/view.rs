@@ -37,7 +37,7 @@ pub struct View {
     pub registry: Rc<Registry>,
     pub importing_file: Node,
     pub importing_file_path: tspath::Path,
-    pub program: &'static compiler::NewProgram,
+    pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
     pub project_key: tspath::Path,
 
@@ -62,7 +62,7 @@ pub fn new_view(
     registry: Rc<Registry>,
     importing_file: Node,
     project_key: tspath::Path,
-    program: &'static compiler::NewProgram,
+    program: Rc<compiler::NewProgram>,
     preferences: modulespecifiers::UserPreferences,
 ) -> View {
     let mut importing_file_path = tspath::Path(source_file_info(importing_file).path.clone());
@@ -74,6 +74,14 @@ pub fn new_view(
     {
         importing_file_path = canonical.path().clone();
     }
+    let conditions = module::get_conditions(
+        program.options(),
+        program.get_default_resolution_mode_for_file(&source_file_has_file_name(importing_file)),
+    )
+    .into_iter()
+    .collect();
+    let should_use_uri_style_node_core_modules =
+        lsutil::should_use_uri_style_node_core_modules(importing_file, &program);
     View {
         registry,
         importing_file,
@@ -81,17 +89,8 @@ pub fn new_view(
         program,
         project_key,
         preferences,
-        conditions: module::get_conditions(
-            program.options(),
-            program
-                .get_default_resolution_mode_for_file(&source_file_has_file_name(importing_file)),
-        )
-        .into_iter()
-        .collect(),
-        should_use_uri_style_node_core_modules: lsutil::should_use_uri_style_node_core_modules(
-            importing_file,
-            program,
-        ),
+        conditions,
+        should_use_uri_style_node_core_modules,
         allowed_endings: RefCell::new(None),
         existing_imports: RefCell::new(None),
         should_use_require_for_fixes: Cell::new(None),

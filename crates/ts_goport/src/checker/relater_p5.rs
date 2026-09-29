@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use ts_diagnostics::Message;
+use crate::diagnostics::Message;
 
 // PORT: Go methods on `*Relater` are `impl Checker` methods with the Go snake
 // name that take the relater handle `r: &Rc<RefCell<Relater>>` right after

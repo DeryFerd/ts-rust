@@ -1,6 +1,6 @@
+use crate::diagnostics::Message;
 use crate::frontend::prelude::*;
 use std::sync::LazyLock;
-use ts_diagnostics::Message;
 
 // ---------------------------------------------------------------------------
 // tsoptions/errors.go

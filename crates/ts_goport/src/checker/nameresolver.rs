@@ -12,9 +12,9 @@
 //! symbols for the binder reference resolver of JS emit, which runs on
 //! threads with no checker (`transformers::reference_resolver`).
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
 use std::cell::Cell;
-use ts_diagnostics::Message;
 
 // PORT: Go `ast.InternalSymbolNameDefault` ("default"). Kept private here so
 // this file does not depend on the constant's Rust name in the ast files.

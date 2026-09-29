@@ -145,7 +145,7 @@ pub struct WatchFilesCall {
 /// Go `ClientMock.calls.ProgressStart` / `ProgressFinish` entry.
 #[derive(Clone)]
 pub struct ProgressCall {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static ts_goport::diagnostics::Message,
     pub args: Vec<String>,
 }
 
@@ -158,7 +158,8 @@ pub type SetLocaleFunc = Box<dyn Fn(&str)>;
 
 pub type RefreshCodeLensFunc = Box<dyn Fn(&Context) -> Result<(), GoError>>;
 
-pub type RegisterContentMapperExtensionsFunc = Box<dyn Fn(&Context, &[String]) -> Result<(), GoError>>;
+pub type RegisterContentMapperExtensionsFunc =
+    Box<dyn Fn(&Context, &[String]) -> Result<(), GoError>>;
 
 // Go: clientmock_generated.go:58 ClientMock
 #[derive(Default)]
@@ -171,7 +172,8 @@ pub struct ClientMock {
     // Go `RefreshCodeLensFunc`.
     pub refresh_code_lens_func: RefCell<Option<RefreshCodeLensFunc>>,
     // Go `RegisterContentMapperExtensionsFunc` (tsgo#4712).
-    pub register_content_mapper_extensions_func: RefCell<Option<RegisterContentMapperExtensionsFunc>>,
+    pub register_content_mapper_extensions_func:
+        RefCell<Option<RegisterContentMapperExtensionsFunc>>,
     watch_files: RefCell<Vec<WatchFilesCall>>,
     unwatch_files: RefCell<Vec<WatcherID>>,
     register_content_mapper_extensions: RefCell<Vec<Vec<String>>>,
@@ -285,12 +287,16 @@ impl Client for ClientMock {
             None => Ok(()),
         }
     }
-    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_start(&self, message: &'static ts_goport::diagnostics::Message, args: Vec<String>) {
         self.progress_start
             .borrow_mut()
             .push(ProgressCall { message, args });
     }
-    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_finish(
+        &self,
+        message: &'static ts_goport::diagnostics::Message,
+        args: Vec<String>,
+    ) {
         self.progress_finish
             .borrow_mut()
             .push(ProgressCall { message, args });

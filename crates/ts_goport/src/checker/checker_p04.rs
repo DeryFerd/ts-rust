@@ -2,8 +2,8 @@
 //! type node checks, function declaration checks, overload agreement checks,
 //! block and if statement checks, and known-truthy condition checks.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `core.OrElse(a, b)` for node handles.
 fn or_else_node_p04(a: Node, b: Node) -> Node {

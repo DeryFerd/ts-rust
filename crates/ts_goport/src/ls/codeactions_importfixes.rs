@@ -469,7 +469,7 @@ fn get_type_only_promotion_fix(
     source_file: Node,
     symbol_token: Node,
     symbol_name: &str,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> Option<Rc<autoimport::Fix>> {
     // Get the symbol at the token location
     let symbol = ch.resolve_name_exported(

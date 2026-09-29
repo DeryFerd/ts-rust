@@ -17,22 +17,24 @@ pub struct ModuleResolutionCacheKey {
 
 // Go: module/cache.go:20 moduleResolutionCache
 // PORT: Go `collections.SyncMap` is a plain map behind a `RefCell`, so the
-// `Resolver` methods can take `&self`. Cached Go pointers are `Rc`.
+// `Resolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
+// workers share them (`SharedResolutionCache`), and checker threads read
+// the program's resolutions with no copy (`GoSharedState`).
 #[derive(Default)]
 pub struct ModuleResolutionCache {
-    pub cache: RefCell<FxHashMap<ModuleResolutionCacheKey, Rc<ResolvedModule>>>,
+    pub cache: RefCell<FxHashMap<ModuleResolutionCacheKey, Arc<ResolvedModule>>>,
 }
 
 impl ModuleResolutionCache {
     // Go: module/cache.go:24 moduleResolutionCache.Get
     #[must_use]
-    pub fn get(&self, key: &ModuleResolutionCacheKey) -> Option<Rc<ResolvedModule>> {
+    pub fn get(&self, key: &ModuleResolutionCacheKey) -> Option<Arc<ResolvedModule>> {
         self.cache.borrow().get(key).cloned()
     }
 
     // Go: module/cache.go:28 moduleResolutionCache.Set
     // PORT: Go `LoadOrStore`: the first stored value wins.
-    pub fn set(&self, key: ModuleResolutionCacheKey, value: Rc<ResolvedModule>) {
+    pub fn set(&self, key: ModuleResolutionCacheKey, value: Arc<ResolvedModule>) {
         self.cache.borrow_mut().entry(key).or_insert(value);
     }
 }

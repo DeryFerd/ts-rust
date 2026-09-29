@@ -79,9 +79,14 @@ export function verifyAppendOnly(dir = STATE_DIR) {
   const file = paths(dir).history;
   let committed;
   try {
-    committed = execFileSync("git", ["-C", ROOT, "show", `HEAD:${relative(ROOT, file)}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  } catch {
-    return "history.jsonl is not committed yet. No append-only baseline.";
+    // The history is several MB. The default 1 MB buffer failed with ENOBUFS, which
+    // skipped this check without a word.
+    committed = execFileSync("git", ["-C", ROOT, "show", `HEAD:${relative(ROOT, file)}`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1 << 30 });
+  } catch (error) {
+    // git exits 128 when HEAD has no such file (or the path is outside the repository).
+    if (error.status === 128) return "history.jsonl is not committed yet. No append-only baseline.";
+    return fail(`Cannot read the committed history.jsonl: ${error.message}`);
   }
   if (!readFileSync(file, "utf8").startsWith(committed)) fail("history.jsonl changed committed lines. It is append-only.");
   return `history.jsonl keeps all ${committed.split("\n").filter(Boolean).length} committed lines.`;
@@ -141,6 +146,25 @@ function recordCurrent(dir, patch) {
   writeCurrent(dir, checkCurrent(dir, patch));
   append(dir, { kind: "current", value: patch });
   return `Updated current.json: ${Object.keys(patch).join(", ")}.`;
+}
+
+// Moves acceptanceRuleChanges entries of closed batches (a batch whose record is in
+// batchRecords and is not the current batch) out of current.json. Each moved entry becomes
+// one "archived-rule" history line. Standing rules (batchId "*" or "standing:...") and the
+// rules of the current batch stay. The batch check reads only those.
+function archiveRules(dir, dryRun) {
+  const current = readJson(paths(dir).current);
+  const closed = new Set((current.batchRecords ?? []).map(entry => entry?.path ?? entry));
+  const rules = current.acceptanceRuleChanges ?? [];
+  const moved = rules.filter(rule => typeof rule?.batchId === "string" && rule.batchId !== current.batch?.id
+    && closed.has(`docs/typechecker-batches/${rule.batchId}.json`));
+  if (!moved.length) return "No rules of closed batches in current.json.";
+  const names = [...new Set(moved.map(rule => rule.batchId))].join(", ");
+  if (dryRun) return `Would move ${moved.length} rules of closed batches to history: ${names}.`;
+  moved.forEach(value => append(dir, { kind: "archived-rule", value }));
+  recordCurrent(dir, { acceptanceRuleChanges: rules.filter(rule => !moved.includes(rule)) });
+  return `Moved ${moved.length} rules of closed batches to history (kind archived-rule): ${names}. `
+    + `current.json is ${readFileSync(paths(dir).current).length} bytes.`;
 }
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -230,6 +254,7 @@ function summary(dir) {
     ["revisions", `${history.length} recorded, batch says ${batch.recoveryRevision}${history.length === batch.recoveryRevision ? "" : " (MISMATCH)"}`],
     ["last revision", label(last)],
     ["last measured", measured && `${label(measured)}: ${measured.outcome}`],
+    ["protected set", batch.protectedSet ?? "legacy roster"],
     ["batch Query", JSON.stringify(batch.ordinaryQuery ?? null)],
     ["batch Hono", hono && `${hono.startedUtc ?? "?"} complete=${hono.complete} source ${hono.sourceFingerprint ?? "?"}`],
     ["auditor", verdict(batch.auditor)],
@@ -242,7 +267,7 @@ function summary(dir) {
     const largest = Object.entries(readJson(paths(dir).current))
       .map(([key, value]) => [key, JSON.stringify(value)?.length ?? 0]).sort((a, b) => b[1] - a[1]).slice(0, 3);
     rows.push(["WARNING", `current.json is ${Math.round(bytes / 1024)} KB (limit ${CURRENT_WARN_BYTES / 1024} KB). Largest: `
-      + largest.map(([key, size]) => `${key} ${Math.round(size / 1024)} KB`).join(", ") + ". Move old entries to history with record note."]);
+      + largest.map(([key, size]) => `${key} ${Math.round(size / 1024)} KB`).join(", ") + ". Move old entries to history with archive-rules or record note."]);
   }
   return rows.map(([label, value]) => `${label.padEnd(15)}${value ?? "none"}`).join("\n");
 }
@@ -264,7 +289,7 @@ const USAGE = `Usage: scripts/state <command>
                                   in the shape saved to docs/typechecker-batches/<id>.json.
   history [--last N] [--kind K] [--key NAME] [--revision N]
                                   Print history lines (default --last 5). Kinds: revision,
-                                  passing-result, note, current, migration.
+                                  passing-result, note, current, archived-rule, migration.
   record revision <file|->        Append a revision row. Only the latest or next number.
   record passing-result <file|->  Append an auditor passing-result reference.
   record note <key> <file|->      Archive a named record (diagnosis, measurement, plan).
@@ -273,6 +298,8 @@ const USAGE = `Usage: scripts/state <command>
                                   For older scripts that load, edit and save the whole state.
   export                          Full legacy-shaped state JSON (for audits).
   verify                          Rebuild the state and check history.jsonl is append-only.
+  archive-rules [--dry-run]       Move acceptanceRuleChanges entries of closed batches
+                                  (saved in batchRecords, not the current batch) to history.
   migrate <legacy.json>           One-time split of the old single-file state.
 
 Directory: ${STATE_DIR} (override with TS_STATE_DIR).`;
@@ -310,6 +337,7 @@ export function main(args, dir = process.env.TS_STATE_DIR ?? STATE_DIR) {
       const state = loadState(dir);
       return `State rebuilds with ${state.batch?.recoveryHistory?.length ?? 0} revisions. ${verifyAppendOnly(dir)}`;
     }
+    case "archive-rules": return archiveRules(dir, rest.includes("--dry-run"));
     case "migrate": return migrate(rest[0] ?? fail("Pass the legacy state file."), dir);
     case undefined: case "--help": case "-h": case "help": return USAGE;
     default: return fail(`Unknown command: ${command}.\n\n${USAGE}`);

@@ -67,6 +67,11 @@
 //! (`project::WarmAutoImportPreempt`), as Go's dispatch goroutine does when
 //! it handles them. The warm stops at its next context check.
 //!
+//! Large frees (`gostd::local::drop_later`: a released program, the parse
+//! tasks of a load) wait until the message is done, and then run only
+//! while no message waits. Go's garbage collector does them in the
+//! background.
+//!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
 //! request is dropped. The LS loops check the request context. The checker
@@ -1413,7 +1418,7 @@ impl project::Client for Server {
 
     // Go: server.go:352 ProgressStart
     // ProgressStart implements project.Client.
-    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_start(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         if let Some(project_progress) = self.shared.project_progress.get() {
             project_progress.start(message, args);
         }
@@ -1421,7 +1426,7 @@ impl project::Client for Server {
 
     // Go: server.go:359 ProgressFinish
     // ProgressFinish implements project.Client.
-    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_finish(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         if let Some(project_progress) = self.shared.project_progress.get() {
             project_progress.finish(message, args);
         }
@@ -1889,7 +1894,13 @@ impl Server {
         // PORT: when the loop last finished a message (see
         // `IDLE_QUIET_PERIOD`).
         let mut free_since = Instant::now();
+        gostd::local::keep_garbage();
+        let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
         loop {
+            // PORT: the frees that the last message or wake-up left
+            // (`gostd::local::drop_later`) run after its answer, while no
+            // message waits.
+            gostd::local::drop_garbage(busy);
             // PORT: idle work (the auto-import warm) runs only after a
             // quiet period with no message, so it does not delay a request
             // that has arrived or that comes right after an answer. Work it
@@ -1901,6 +1912,7 @@ impl Server {
                 && gostd::local::run_idle()
             {
                 gostd::local::run_pending();
+                gostd::local::drop_garbage(busy);
             }
 
             let item = self.shared.request_queue.get(&ctx)?;
@@ -4170,7 +4182,7 @@ impl Server {
         let mut resp = lsproto::WorkspaceSymbolResponse::default();
         let mut ls_err: Option<GoError> = None;
         let mut provide_symbols =
-            |snapshot: &Rc<Snapshot>, programs: Vec<&'static compiler::NewProgram>| {
+            |snapshot: &Rc<Snapshot>, programs: Vec<Rc<compiler::NewProgram>>| {
                 self.recover_guard(
                     req_msg,
                     || (),
@@ -4200,7 +4212,7 @@ impl Server {
             let uri = &text_document.uri;
             session.with_snapshot_for_document(ctx, uri, &mut |snapshot: &Rc<Snapshot>| {
                 // Go: core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
-                let programs: Vec<&'static compiler::NewProgram> = snapshot
+                let programs: Vec<Rc<compiler::NewProgram>> = snapshot
                     .get_projects_containing_file(uri)
                     .iter()
                     .map(|p| p.get_program())
@@ -4212,7 +4224,7 @@ impl Server {
                 Snapshot,
             >| {
                 // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
-                let programs: Vec<&'static compiler::NewProgram> = snapshot
+                let programs: Vec<Rc<compiler::NewProgram>> = snapshot
                     .project_collection
                     .projects()
                     .iter()

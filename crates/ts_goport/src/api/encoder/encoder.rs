@@ -454,7 +454,7 @@ fn source_file_fields(sf: Node) -> SourceFileFields {
 
 /// Go `%v` of an `ast.Kind` (the generated stringer): "KindX", or "Kind(N)"
 /// out of range.
-// PORT: `ts_ast::SyntaxKind::as_str` gives the Go names without the `Kind`
+// PORT: `crate::astdata::SyntaxKind::as_str` gives the Go names without the `Kind`
 // prefix. Go `ast.Kind` is an `int16`.
 pub fn go_kind_string(kind: i16) -> String {
     if kind >= 0

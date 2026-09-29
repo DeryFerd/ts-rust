@@ -17,9 +17,8 @@ signature is gone).
 | `lib.es2020.intl.d.ts` | `7b4f295ddb7e8c73f608bf54aa5d76b604b4fc44340a2eaa1f34040e7261afd4` |
 | `lib.es5.d.ts` | `6388847232654d7fcbed7fe89ea511a65ad1f5104b41e905c43f90910e1408b6` |
 
-`crates/ts_bundled/libs` stays at the old pin, because the protected
-`ts_compiler` crate uses it. ts_goport takes these 7 names from here and every
-other lib from `crates/ts_bundled/libs` (`src/frontend/bundled.rs`,
+`crates/ts_bundled/libs` is still at the old pin. ts_goport takes these 7 names
+from here and every other lib from `crates/ts_bundled/libs` (`src/frontend/bundled.rs`,
 `bundled_lib!(goport ...)`). With these overrides the lib set equals
 `internal/bundled/libs` at the pin byte for byte.
 

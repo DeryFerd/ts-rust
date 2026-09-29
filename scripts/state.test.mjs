@@ -3,13 +3,13 @@ import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadState, main, migrate } from "./state.mjs";
+import { loadState, main, migrate, verifyAppendOnly } from "./state.mjs";
 
 const hash = digit => digit.repeat(64);
 const row = revision => ({ revision, hypothesis: "h", sourceFingerprint: hash("a"), fullResultSha256: null });
 
-// A synthetic legacy state. Tests never touch the real state directory.
-function legacyDir() {
+// A synthetic legacy state. Tests never write the real state directory.
+function legacyDir(extra = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ts-state-"));
   const legacy = {
     schemaVersion: 1, status: "active", decision: "STOP", phase: "recovery-continuation",
@@ -17,6 +17,7 @@ function legacyDir() {
     batchRecords: [],
     additionalPassingResultsForAuditor: [{ path: "p", sha256: hash("b") }],
     oldDiagnosis: { note: "kept" },
+    ...extra,
   };
   writeFileSync(join(dir, "legacy.json"), JSON.stringify(legacy));
   migrate(join(dir, "legacy.json"), join(dir, "state"));
@@ -86,4 +87,27 @@ test("import applies an edited full state as records", () => {
   edited.batch.recoveryHistory[0] = { ...row(1), hypothesis: "rewritten" };
   writeFileSync(file, JSON.stringify(edited));
   assert.throws(() => main(["import", file], state), /rewrites an older revision/);
+});
+
+test("archive-rules moves the rules of closed batches to history and keeps the rest", () => {
+  const rule = (id, batchId) => ({ id, batchId, approvedBy: "Theo" });
+  const { state } = legacyDir({
+    batchRecords: [{ path: "docs/typechecker-batches/b0.json", sha256: hash("c") }],
+    acceptanceRuleChanges: [rule("opt-in", "b0"), rule("opt-in", "b1"), rule("carry", "*"), rule("pin-bump", "standing:pin-bump"),
+      rule("opt-in", "b9"), rule("unbound", "b0")],
+  });
+  const before = readFileSync(join(state, "current.json"), "utf8");
+  assert.match(main(["archive-rules", "--dry-run"], state), /Would move 2 rules of closed batches to history: b0\./);
+  assert.equal(readFileSync(join(state, "current.json"), "utf8"), before);
+  assert.match(main(["archive-rules"], state), /Moved 2 rules/);
+  assert.deepEqual(loadState(state).acceptanceRuleChanges.map(item => item.batchId), ["b1", "*", "standing:pin-bump", "b9"]);
+  const archived = main(["history", "--kind", "archived-rule", "--last", "9"], state).split("\n").map(line => JSON.parse(line).value);
+  assert.deepEqual(archived, [rule("opt-in", "b0"), rule("unbound", "b0")]);
+  assert.match(main(["history", "--last", "1"], state), /"kind":"current"/);
+  assert.equal(main(["archive-rules"], state), "No rules of closed batches in current.json.");
+});
+
+test("the append-only check reads the full committed history", () => {
+  // The real history is several MB. A too-small git output buffer used to skip this check.
+  assert.match(verifyAppendOnly(), /keeps all \d+ committed lines/);
 });

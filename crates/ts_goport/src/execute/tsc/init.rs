@@ -5,6 +5,7 @@ use crate::prelude::*;
 use super::compile::{System, write_str};
 use super::diagnostics::DiagnosticReporter;
 use super::help::{format_value_v, get_header};
+use crate::diagnostics::Message;
 use crate::diagnostics_loc::message_localize;
 use crate::execute::incremental::build_info::marshal_any;
 use crate::frontend::tsoptions::{
@@ -12,7 +13,6 @@ use crate::frontend::tsoptions::{
 };
 use crate::frontend::tspath::{combine_paths, normalize_path};
 use crate::locale::Locale;
-use ts_diagnostics::Message;
 
 // Go: execute/tsc/init.go:19 WriteConfigFile
 // PORT: Go `options` is the command line `Raw` map

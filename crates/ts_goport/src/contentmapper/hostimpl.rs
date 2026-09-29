@@ -2524,7 +2524,7 @@ fn decode_transform_result(
             Node::NIL,
             TextRange::new(start, end),
             diagnostic_source,
-            ts_diagnostics::Category::Error,
+            crate::diagnostics::Category::Error,
             d.code,
             &d.message_text,
         ));

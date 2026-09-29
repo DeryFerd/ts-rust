@@ -19,10 +19,10 @@ use std::time::SystemTime;
 use super::compile::{System, Writer, write_str};
 // PORT: testing (the status reporters)
 use super::compile::CommandLineTesting;
+use crate::diagnostics::Category;
 use crate::diagnostics_loc::message_localize;
 use crate::frontend::tspath::{ComparePathsOptions, convert_to_relative_path, path_is_absolute};
 use crate::locale::Locale;
-use ts_diagnostics::Category;
 
 // Go: diagnosticwriter/diagnosticwriter.go:180 FormattingOptions
 #[derive(Clone, Debug, Default)]
@@ -664,15 +664,6 @@ const RESET_ESCAPE_SEQUENCE: &str = "\u{1b}[0m";
 // Go: diagnosticwriter/diagnosticwriter.go:198 ellipsis
 const ELLIPSIS: &str = "...";
 
-/// PORT: on the legacy frontend (`GOPORT_FRONTEND=legacy`) a diagnostic in
-/// the config file has a nil file. Its location is in a program side table
-/// that only `program::format_diagnostic` reads. The pretty writers cannot
-/// tell it from a global diagnostic, so they stop at every diagnostic
-/// without a file on that path.
-fn is_legacy_diagnostic_without_file(diagnostic: &Diagnostic) -> bool {
-    diagnostic.file.is_nil() && try_prog().is_some() && go_frontend_program().is_none()
-}
-
 // Go: diagnosticwriter/diagnosticwriter.go:213 FormatDiagnosticWithColorAndContext
 pub fn format_diagnostic_with_color_and_context(
     output: &Writer,
@@ -691,8 +682,6 @@ pub fn format_diagnostic_with_color_and_context(
             write_with_style_and_reset,
         );
         write_str(output, " - ");
-    } else if is_legacy_diagnostic_without_file(diagnostic.0) {
-        unported!("FormatDiagnosticWithColorAndContext of a legacy frontend config diagnostic");
     }
 
     write_with_style_and_reset(
@@ -760,8 +749,6 @@ pub fn format_diagnostic_with_color_and_context(
                 "    ",
                 format_opts,
             );
-        } else if is_legacy_diagnostic_without_file(related_information.0) {
-            unported!("FormatDiagnosticWithColorAndContext of a legacy frontend config diagnostic");
         }
         write_str(output, &format_opts.new_line);
     }
@@ -1061,9 +1048,6 @@ fn get_error_summary(diags: &[Diagnostic]) -> ErrorSummary<'_> {
         total_error_count += 1;
         match AstDiagnostic(diagnostic).file() {
             None => {
-                if is_legacy_diagnostic_without_file(diagnostic) {
-                    unported!("WriteErrorSummaryText of a legacy frontend config diagnostic");
-                }
                 global_errors.push(diagnostic);
             }
             Some(file) => {
@@ -1166,21 +1150,11 @@ fn pretty_path_for_file_error(
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:555 WriteFormatDiagnostic
-// PORT: on the legacy frontend (`GOPORT_FRONTEND=legacy`) a diagnostic goes
-// through `program::format_diagnostic`: a config diagnostic there has a nil
-// file and its location is in the program's side table. That writer uses
-// the program's current directory, which is the system one, and writes
-// English. The execute paths install the Go frontend program, so they
-// always take the Go code below.
 pub fn write_format_diagnostic(
     output: &Writer,
     diagnostic: &Diagnostic,
     format_opts: &FormattingOptions,
 ) {
-    if try_prog().is_some() && go_frontend_program().is_none() {
-        write_str(output, &format_diagnostic(diagnostic));
-        return;
-    }
     let wrapped = AstDiagnostic(diagnostic);
     if let Some(file) = wrapped.file() {
         let (line, character) =

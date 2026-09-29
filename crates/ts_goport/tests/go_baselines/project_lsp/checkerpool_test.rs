@@ -92,10 +92,10 @@ fn setup_checker_pool_session(opts: CheckerPoolOptions) -> (Rc<Session>, Rc<Chec
 
 // Go: checkerpool_test.go:55 newTestCheckerPool
 fn new_test_checker_pool(
-    program: &'static ts_goport::frontend::compiler::NewProgram,
+    program: &Rc<ts_goport::frontend::compiler::NewProgram>,
     opts: CheckerPoolOptions,
 ) -> Rc<CheckerPool> {
-    new_checker_pool(opts, program, Some(Rc::new(|_: &str| {})))
+    new_checker_pool(opts, Rc::clone(program), Some(Rc::new(|_: &str| {})))
 }
 
 /// The session's program and a fresh test pool on it (the start of most Go tests).
@@ -105,7 +105,7 @@ fn test_pool(
 ) -> (Rc<Session>, Rc<CheckerPool>) {
     let (session, _) = setup_checker_pool_session(session_opts);
     let p = program(&session, "file:///src/index.ts");
-    let pool = new_test_checker_pool(p, pool_opts);
+    let pool = new_test_checker_pool(&p, pool_opts);
     (session, pool)
 }
 
@@ -214,7 +214,7 @@ child_test! {
     fn canceled_checker_disposal() {
         let (_session, pool) = test_pool(opts(2, 10), opts(4, 30));
         let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
-        let _guard = ts_goport::program::ls_program::enter(pool.program);
+        let _guard = ts_goport::program::ls_program::enter(&pool.program);
 
         // Acquire a query checker and cancel it.
         let ctx = req(&bg(), "cancel-test", CheckerLifetime::TEMPORARY);
@@ -240,7 +240,7 @@ child_test! {
     // Go: checkerpool_test.go:339 TestCheckerPoolRequestAssociationCleanupOnDisposal
     fn request_association_cleanup_on_disposal() {
         let (_session, pool) = test_pool(opts(2, 10), opts(4, 5));
-        let _guard = ts_goport::program::ls_program::enter(pool.program);
+        let _guard = ts_goport::program::ls_program::enter(&pool.program);
 
         // Create a query checker with a request association.
         let (req_ctx, req_cancel) = context::with_cancel(&bg());
@@ -695,7 +695,7 @@ child_test! {
         let ctx = req(&bg(), "global-diag-req", CheckerLifetime::TEMPORARY);
         let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
         {
-            let _guard = ts_goport::program::ls_program::enter(pool.program);
+            let _guard = ts_goport::program::ls_program::enter(&pool.program);
             let (c, release) = pool.get_checker(&ctx, source_file);
             c.borrow_mut().get_diagnostics_exported(&ctx, source_file);
             release.call();
@@ -711,7 +711,7 @@ child_test! {
         // Releasing the same checker again with the same state should not set the flag.
         let ctx2 = req(&bg(), "global-diag-req-2", CheckerLifetime::TEMPORARY);
         {
-            let _guard = ts_goport::program::ls_program::enter(pool.program);
+            let _guard = ts_goport::program::ls_program::enter(&pool.program);
             let (c2, release2) = pool.get_checker(&ctx2, source_file);
             c2.borrow_mut().get_diagnostics_exported(&ctx2, source_file);
             release2.call();
@@ -729,7 +729,7 @@ child_test! {
     fn api_checker_disposed_on_cancel() {
         let (_session, pool) = test_pool(opts(4, 10), opts(4, 30));
         let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
-        let _guard = ts_goport::program::ls_program::enter(pool.program);
+        let _guard = ts_goport::program::ls_program::enter(&pool.program);
 
         let ctx = core_context::with_checker_lifetime(&bg(), CheckerLifetime::API);
         let (c, release) = pool.get_checker(&ctx, NIL);

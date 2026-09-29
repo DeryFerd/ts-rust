@@ -173,7 +173,7 @@ impl Parser {
         &mut self,
         allow_reserved_words: bool,
         allow_private_name: bool,
-        diagnostic_message: Option<&'static ts_diagnostics::Message>,
+        diagnostic_message: Option<&'static crate::diagnostics::Message>,
     ) -> Node {
         let pos = self.node_pos();
         let mut entity = if allow_reserved_words {
@@ -972,7 +972,7 @@ impl Parser {
     pub fn parse_function_block_or_semicolon(
         &mut self,
         flags: ParseFlags,
-        diagnostic_message: Option<&'static ts_diagnostics::Message>,
+        diagnostic_message: Option<&'static crate::diagnostics::Message>,
     ) -> Node {
         if self.token != SyntaxKind::OpenBraceToken {
             if flags.intersects(ParseFlags::TYPE) {
@@ -992,7 +992,7 @@ impl Parser {
     pub fn parse_function_block(
         &mut self,
         flags: ParseFlags,
-        diagnostic_message: Option<&'static ts_diagnostics::Message>,
+        diagnostic_message: Option<&'static crate::diagnostics::Message>,
     ) -> Node {
         let save_context_flags = self.context_flags;
         let save_has_await_identifier = self.statement_has_await_identifier;

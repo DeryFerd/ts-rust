@@ -4,8 +4,8 @@
 use super::Subtests;
 use super::childprog::in_child;
 use super::parsetestutil::parse_type_script_published;
-use ts_diagnostics::Message;
 use ts_goport::ast::{NodeVisitor, NodeVisitorHooks, compute_position_map, new_node_visitor};
+use ts_goport::diagnostics::Message;
 use ts_goport::frontend::core_ext::get_script_kind_from_file_name;
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::tspath::Path;
@@ -692,12 +692,12 @@ fn test_diagnostics_collection_deduplicates_exact_diagnostics_on_add() {
 
 // Go `ast.NewCompilerDiagnostic(diagnostics.NewAdHocMessage(message))`.
 // PORT: as `compiler_runner::harness::new_ad_hoc_compiler_diagnostic`: a
-// `ts_diagnostics::Message` code is a `u32`, so the Go code -1 is set on the
+// `ts_goport::diagnostics::Message` code is a `u32`, so the Go code -1 is set on the
 // diagnostic, and the message is leaked.
 fn new_ad_hoc_compiler_diagnostic(text: &'static str) -> Diagnostic {
     let message: &'static Message = Box::leak(Box::new(Message::new(
         0,
-        ts_diagnostics::Category::Error,
+        ts_goport::diagnostics::Category::Error,
         "-1",
         text,
         false,
@@ -785,7 +785,7 @@ fn test_external_diagnostic_identity() {
     )
     .root;
     let loc = TextRange::new(1, 2);
-    let error = ts_diagnostics::Category::Error;
+    let error = ts_goport::diagnostics::Category::Error;
     let first = new_external_diagnostic(file, loc, "mapper-a", error, 0, "first");
     let diagnostics = [
         first.clone(),
@@ -795,7 +795,7 @@ fn test_external_diagnostic_identity() {
             file,
             loc,
             "mapper-a",
-            ts_diagnostics::Category::Warning,
+            ts_goport::diagnostics::Category::Warning,
             0,
             "first",
         ),
