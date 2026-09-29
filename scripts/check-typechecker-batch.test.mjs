@@ -489,13 +489,13 @@ function writeJson(path, value) {
 function fixtureTools(f) {
   return {
     gitInputs,
-    gateCompare: (base, now, defects) => inTemp(dir => {
+    gateCompare: (base, now, defects, toolChanges) => inTemp(dir => {
       const [from, to] = [base, now].map(path => relative(ROOT, path));
       for (const [path, file] of Object.entries(f.files)) {
         if (path.startsWith(`${dirname(from)}/runs/`)) writeJson(join(dir, "base", relative(dirname(from), path)), file.value);
       }
       return TOOLS.gateCompare(writeJson(join(dir, "base/manifest.json"), f.files[from].value),
-        writeJson(join(dir, "new/manifest.json"), f.files[to].value), defects);
+        writeJson(join(dir, "new/manifest.json"), f.files[to].value), defects, toolChanges);
     }),
     oracleCompare: (base, now) => inTemp(dir => {
       for (const [side, path] of [["base", base], ["new", now]]) {
@@ -800,6 +800,20 @@ test("gate items are judged by gate-compare.py: removed, MATCH lost, new FAIL, n
   // A flaky single-threaded-equal item: MATCH to ALLOWED by an entry of the base allow list.
   const f = goportFixture();
   Object.assign(item(f, "corpus-diag/00001"), { status: "ALLOWED", allowedBy: [{ id: "corpus-diag/00001/single", condition: "single-threaded-equal" }] });
+  assert.equal(check(f).verdict, "PASS");
+});
+
+test("a gate tool change passes only when batch.gateToolChanges lists it exactly (R133)", () => {
+  const withTool = (f, sha) => { f.files["gate/r131/manifest.json"].value.gate = { path: "scripts/goport/gate.sh", sha256: "a".repeat(64) };
+    f.gateNew.gate = { path: "scripts/goport/gate.sh", sha256: sha }; };
+  let f = goportFixture(); withTool(f, "b".repeat(64));
+  const result = stopped(f, /1 gate items regressed/);
+  assert.deepEqual(result.losses.gate.map(({ id }) => id), ["tool/gate"]);
+  f = goportFixture(); withTool(f, "b".repeat(64));
+  f.state.batch.gateToolChanges = [{ key: "gate", from: "a".repeat(64), to: "c".repeat(64), reason: "wrong to" }];
+  stopped(f, /1 gate items regressed/);
+  f = goportFixture(); withTool(f, "b".repeat(64));
+  f.state.batch.gateToolChanges = [{ key: "gate", from: "a".repeat(64), to: "b".repeat(64), reason: "the reviewed stage 1 gate.sh" }];
   assert.equal(check(f).verdict, "PASS");
 });
 
