@@ -2305,7 +2305,8 @@ impl Session {
     // PORT: Go `%v` of a `time.Duration` is `{:?}` (log only), as in the
     // other session logs. Go sorts the map keys.
     pub fn log_content_mapper_timings(&self, timings: &contentmapper::Timings) {
-        if timings.request_wait.is_zero() {
+        if timings.request_wait.is_zero() && !has_content_mapper_operation_timings(&timings.mappers)
+        {
             return;
         }
         self.logger
@@ -2318,11 +2319,7 @@ impl Session {
         identities.sort();
         for identity in identities {
             let mapper = &timings.mappers[identity];
-            if mapper.spawn.count == 0
-                && mapper.open_project.count == 0
-                && mapper.close_project.count == 0
-                && mapper.transform.count == 0
-            {
+            if !has_content_mapper_operation_timing(mapper) {
                 continue;
             }
             self.logger.logf(&format!("  {identity}:"));
@@ -2369,6 +2366,27 @@ impl Session {
             self.background_queue.wait();
         }
     }
+}
+
+// Go: project/session.go:1461 hasContentMapperOperationTimings (ts#64015)
+// PORT: Go map order is random; the result does not depend on it.
+pub fn has_content_mapper_operation_timings(
+    timings: &IndexMap<String, contentmapper::MapperTimings>,
+) -> bool {
+    for timing in timings.values() {
+        if has_content_mapper_operation_timing(timing) {
+            return true;
+        }
+    }
+    false
+}
+
+// Go: project/session.go:1470 hasContentMapperOperationTiming (ts#64015)
+pub fn has_content_mapper_operation_timing(timing: &contentmapper::MapperTimings) -> bool {
+    timing.spawn.count != 0
+        || timing.open_project.count != 0
+        || timing.close_project.count != 0
+        || timing.transform.count != 0
 }
 
 // Go: project/session.go:1254 updateWatch

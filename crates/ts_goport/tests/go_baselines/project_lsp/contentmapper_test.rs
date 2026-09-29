@@ -295,13 +295,7 @@ child_test! {
         let calls = utils.client().register_content_mapper_extensions_calls();
         assert!(!calls.is_empty(), "expected RegisterContentMapperExtensions to be called");
         assert_eq!(calls.last().cloned(), Some(vec![".box".to_string()]));
-        let logs = utils.logs();
-        assert!(
-            logs.contains("Content mapper timings since previous snapshot adoption:"),
-            "{logs}"
-        );
-        assert!(logs.contains("mapper@1.0.0:"), "{logs}");
-        assert!(logs.contains("Transforms: 1 ("), "{logs}");
+        // ts#64015 removed the log assertions here.
         session.close();
     }
 }
