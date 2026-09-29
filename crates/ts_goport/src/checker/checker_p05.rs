@@ -515,7 +515,7 @@ impl Checker {
         let mut has_duplicate_default_clause = false;
         let expression_type = self.check_expression(node.expression());
         let case_block = node.case_block();
-        for clause in case_block.clauses().nodes().to_vec() {
+        for clause in case_block.clauses().nodes() {
             // Grammar check for duplicate default clauses, skip if we already report duplicate default clause
             if is_default_clause(clause) && !has_duplicate_default_clause {
                 if first_default_clause.is_nil() {
@@ -541,7 +541,7 @@ impl Checker {
                     );
                 }
             }
-            self.check_source_elements(&clause.statements().to_vec());
+            self.check_source_elements(clause.statements());
             if self
                 .compiler_options
                 .no_fallthrough_cases_in_switch
@@ -674,13 +674,12 @@ impl Checker {
     pub fn check_class_declaration(&mut self, node: Node) {
         let first_decorator = node
             .modifier_nodes()
-            .to_vec()
-            .into_iter()
+            .iter()
             .find(|&n| is_decorator(n))
             .unwrap_or(Node::NIL);
         if self.legacy_decorators
             && first_decorator.is_some()
-            && node.members().to_vec().into_iter().any(|p| {
+            && node.members().iter().any(|p| {
                 has_static_modifier(p) && is_private_identifier_class_element_declaration(p)
             })
         {
@@ -698,7 +697,7 @@ impl Checker {
             );
         }
         self.check_class_like_declaration(node);
-        self.check_source_elements(&node.members().to_vec());
+        self.check_source_elements(node.members());
         self.register_for_unused_identifiers_check(node);
     }
 
@@ -707,7 +706,7 @@ impl Checker {
         self.check_grammar_class_like_declaration(node);
         self.check_decorators(node);
         self.check_collisions_for_declaration_name(node, node.name());
-        self.check_type_parameters(&node.type_parameters().to_vec());
+        self.check_type_parameters(node.type_parameters());
         self.check_exports_on_merged_declarations(node);
         let symbol = self.get_symbol_of_declaration(node);
         let class_type = self.get_declared_type_of_symbol(symbol);
@@ -725,7 +724,7 @@ impl Checker {
 
         let base_type_node = get_extends_heritage_clause_element(node);
         if base_type_node.is_some() {
-            self.check_source_elements(&base_type_node.type_arguments().to_vec());
+            self.check_source_elements(base_type_node.type_arguments());
             let base_types = self.get_base_types(class_type);
             if !base_types.is_empty() {
                 let base_type = base_types[0];
@@ -735,7 +734,7 @@ impl Checker {
                 self.check_source_element(base_type_node.expression());
                 let type_argument_nodes = base_type_node.type_arguments().to_vec();
                 if !type_argument_nodes.is_empty() {
-                    self.check_source_elements(&type_argument_nodes);
+                    self.check_source_elements(type_argument_nodes.iter().copied());
                     for constructor in self.get_constructors_for_type_arguments(
                         static_base_type,
                         &type_argument_nodes,
@@ -896,13 +895,13 @@ impl Checker {
         if self.compiler_options.get_use_define_for_class_fields() {
             return;
         }
-        for member in node.members().to_vec() {
+        for member in node.members() {
             let member_name_node = member.name();
             let is_static_member = is_static(member);
             if is_static_member && member_name_node.is_some() {
                 let (member_name, _) =
                     self.get_effective_property_name_for_property_name_node(member_name_node);
-                match member_name.as_str() {
+                match &*member_name {
                     "name" | "length" | "caller" | "arguments" => {
                         let class_symbol = self.get_symbol_of_declaration(node);
                         let class_name = self.symbol_to_string(class_symbol);
@@ -1050,7 +1049,7 @@ impl Checker {
     ) {
         // iterate over all implemented properties and issue errors on each one which isn't compatible, rather than the class as a whole, if possible
         let mut issued_member_error = false;
-        for member in node.members().to_vec() {
+        for member in node.members() {
             if is_static(member) {
                 continue;
             }
@@ -1449,10 +1448,10 @@ impl Checker {
             }
         }
         let base_static_type = self.get_base_constructor_type_of_class(t);
-        for member in node.members().to_vec() {
+        for member in node.members() {
             if !has_ambient_modifier(member) {
                 if is_constructor_declaration(member) {
-                    for param in member.parameters().to_vec() {
+                    for param in member.parameters() {
                         if is_parameter_property_declaration(param, member) {
                             self.check_member_for_override_modifier(
                                 node,
@@ -1638,7 +1637,7 @@ impl Checker {
         }
         let type_declaration = self.sym(symbol).value_declaration;
         if type_declaration.is_some() && is_class_like(type_declaration) {
-            for member in type_declaration.members().to_vec() {
+            for member in type_declaration.members() {
                 // Only process instance properties against instance index signatures and static properties against static index signatures
                 if is_static(member) == is_static_index && !self.has_bindable_name(member) {
                     let symbol = self.get_symbol_of_declaration(member);

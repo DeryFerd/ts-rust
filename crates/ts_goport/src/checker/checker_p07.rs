@@ -87,8 +87,7 @@ impl Checker {
                 ExternalEmitHelpers::ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES,
             );
         }
-        let declarations = node.declarations().nodes().to_vec();
-        self.check_source_elements(&declarations);
+        self.check_source_elements(node.declarations().nodes());
     }
 
     // Go: checker/checker.go:5758 checkVariableDeclaration
@@ -188,8 +187,7 @@ impl Checker {
         }
         // For a binding pattern, check contained binding elements
         if is_binding_pattern(name) {
-            let elements = name.elements().to_vec();
-            self.check_source_elements(&elements);
+            self.check_source_elements(name.elements());
         }
         // For a parameter declaration with an initializer, error and exit if the containing function doesn't have a body
         if initializer.is_some()
@@ -604,7 +602,7 @@ impl Checker {
             }
         }
         self.mark_linked_references(node, ReferenceHint::DECORATOR, SymbolId::NIL, TypeId::NIL);
-        for modifier in node.modifier_nodes().to_vec() {
+        for modifier in node.modifier_nodes() {
             if is_decorator(modifier) {
                 self.check_decorator(modifier);
             }

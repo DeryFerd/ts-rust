@@ -25,7 +25,7 @@ impl Checker {
             }
             return self.global_array_type;
         }
-        let elements = node.elements().to_vec();
+        let elements = node.elements();
         let mut element_infos: Vec<TupleElementInfo> = Vec::with_capacity(elements.len());
         for e in elements {
             element_infos.push(self.get_tuple_element_info(e));
@@ -103,7 +103,7 @@ impl Checker {
     pub fn get_type_from_union_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let alias = self.get_alias_for_type_node(node);
-            let nodes = node.types().nodes().to_vec();
+            let nodes = node.types().nodes();
             let mut types: Vec<TypeId> = Vec::with_capacity(nodes.len());
             for n in nodes {
                 types.push(self.get_type_from_type_node(n));
@@ -123,7 +123,7 @@ impl Checker {
     pub fn get_type_from_intersection_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let alias = self.get_alias_for_type_node(node);
-            let nodes = node.types().nodes().to_vec();
+            let nodes = node.types().nodes();
             let mut types: Vec<TypeId> = Vec::with_capacity(nodes.len());
             for n in nodes {
                 types.push(self.get_type_from_type_node(n));
@@ -549,7 +549,7 @@ impl Checker {
     pub fn is_simple_tuple_type(&self, node: Node) -> bool {
         is_tuple_type_node(node)
             && !node.elements().is_empty()
-            && !node.elements().to_vec().into_iter().any(|e| {
+            && !node.elements().iter().any(|e| {
                 is_optional_type_node(e)
                     || is_rest_type_node(e)
                     || is_named_tuple_member(e)
