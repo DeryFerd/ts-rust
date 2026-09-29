@@ -33,7 +33,8 @@ const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
 const SCOPE = "Original 6055 and later 6330 PASS names only. Later added passes and corpus parity need independent review.";
 const GOPORT_SCOPE = "goport protected set: every base ok test name and every base gate item, plus bound runs, LSP and API oracles "
-  + "and quality. Name maps, gate id maps, gate noise and allow-list conditions need independent review.";
+  + "and quality. Name maps, gate id maps, oracle rebase runs and known diffs, oracle answer sets, gate noise and allow-list "
+  + "conditions need independent review.";
 const TEST_STATUSES = new Set(["ok", "failed", "ignored", "unrun"]);
 
 function requireValue(condition, message) {
@@ -102,8 +103,8 @@ function matchCounts(actual, claimed, label) {
 // Reads an evidence file {path, sha256} relative to the repository root. The hash must match
 // unless the caller passes pinned false (for records the state saves without a hash, such as
 // the quality record). A path that ends in .gz is gzip: the hash is of the stored bytes. json
-// false returns the text.
-export function readEvidenceFile(reference, { pinned = true, json = true } = {}) {
+// false returns the text; gunzip false returns the stored bytes (to check only the hash of a big file).
+export function readEvidenceFile(reference, { pinned = true, json = true, gunzip = true } = {}) {
   requireValue(text(reference?.path) && (!pinned || HASH.test(reference?.sha256)), "Missing evidence path or SHA-256.");
   let bytes;
   try {
@@ -113,6 +114,7 @@ export function readEvidenceFile(reference, { pinned = true, json = true } = {})
   }
   requireValue(!pinned || createHash("sha256").update(bytes).digest("hex") === reference.sha256,
     `Evidence hash mismatch: ${reference.path}.`);
+  if (!gunzip) return bytes;
   if (reference.path.endsWith(".gz")) {
     try {
       bytes = gunzipSync(bytes);
@@ -170,10 +172,29 @@ function goportRule(state) {
   return rule;
 }
 
+// The canonical JSON text of a value: object keys sorted, no spaces (Python json.dumps(value,
+// sort_keys=True, separators=(",", ":"), ensure_ascii=False)). oracleRebaseSha256 is its sha256.
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map(name => `${JSON.stringify(name)}:${canonicalJson(value[name])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+// The evidence hashes of the batch oracles that the history row and both verdicts carry:
+// oracleRebaseSha256 (the sha256 of the canonical JSON of batch.oracleRebase, or null) and
+// oracleAnswersSha256 (the sorted sha256 values of batch.oracleAnswers).
+function oracleHashes(batch) {
+  return { oracleRebaseSha256: batch.oracleRebase == null ? null : createHash("sha256").update(canonicalJson(batch.oracleRebase)).digest("hex"),
+    oracleAnswersSha256: (Array.isArray(batch.oracleAnswers) ? batch.oracleAnswers : []).map(ref => ref?.sha256).sort() };
+}
+
 // goport is the goport-protected-set rule for a goport batch, else null. A goport batch has
 // no full result: its current history row and verdicts carry goportTestsSha256, gateSha256,
-// nameMapSha256 (the goportTests name map sha256) and gateIdMapSha256 (the batch.gateIdMap
-// sha256); a map sha256 is absent or null when the batch has no such map.
+// nameMapSha256 (the goportTests name map sha256), gateIdMapSha256 (the batch.gateIdMap
+// sha256), oracleRebaseSha256 and oracleAnswersSha256 (oracleHashes); a map or rebase sha256 is
+// absent or null when the batch has none, and the answer list absent or empty without answer sets.
 function validateBatch(state, goport = null) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
   const continuation = state.phase === "recovery-continuation";
@@ -215,13 +236,17 @@ function validateBatch(state, goport = null) {
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
-  // A goport row and verdict bind to the goport test results, the gate manifest, the name map and the
-  // gate id map instead. checkGoport checks that the gate id map file has batch.gateIdMap.sha256.
+  // A goport row and verdict bind to the goport test results, the gate manifest, the name map, the
+  // gate id map, the oracle rebase runs and the oracle answer sets instead. checkGoport checks that the
+  // gate id map and answer set files have their sha256.
+  const oracle = goport ? oracleHashes(batch) : null;
   const evidence = item => goport ? item.goportTestsSha256 === batch.goportTests?.sha256 && item.gateSha256 === batch.gate?.sha256
     && (item.nameMapSha256 ?? null) === (batch.goportTests?.nameMap?.sha256 ?? null)
     && (item.gateIdMapSha256 ?? null) === (batch.gateIdMap?.sha256 ?? null)
+    && (item.oracleRebaseSha256 ?? null) === oracle.oracleRebaseSha256
+    && JSON.stringify([...(item.oracleAnswersSha256 ?? [])].sort()) === JSON.stringify(oracle.oracleAnswersSha256)
     : item.fullResultSha256 === batch.fullResult.sha256;
-  const bound = goport ? "goport test, gate, name map and gate id map hashes" : "full result";
+  const bound = goport ? "goport test, gate, name map and gate id map hashes, and the oracle rebase and answer set hashes" : "full result";
   requireValue(last.hypothesis === batch.hypothesis && last.sourceFingerprint === batch.sourceFingerprint && evidence(last),
     `Current history row does not match the batch source, hypothesis, and ${bound}.`);
   const verdicts = [batch.auditor, batch.reviewer];
@@ -446,13 +471,21 @@ function runGateCompare(basePath, newPath, openDefects, gateToolChanges, gateIdM
   }
 }
 
-// Runs scripts/goport/oracle-compare.py on two LSP or API oracle results dirs (absolute paths):
-// every protected base request (same or oracle_error_same) must be protected again.
-function runOracleCompare(baseDir, newDir) {
-  const { exit, output } = runPython("oracle-compare.py", [baseDir, newDir]);
-  const total = output?.total;
-  requireValue(total && ["lost", "unrun", "absent"].every(field => Number.isInteger(total[field]))
-    && (exit === 1) === (total.lost + total.unrun + total.absent > 0), "oracle-compare.py output lacks its totals.");
+// Runs scripts/goport/oracle-compare.py on LSP or API oracle results dirs (absolute paths): the base
+// dirs (one, or the runs of batch.oracleRebase, where a request is protected when it is protected in
+// any run) and the new dir. Every protected base request (same or oracle_error_same) must be protected
+// again. Each answer set of answers ({path, sha256} with an absolute path, of this kind) goes as
+// --answers path@sha256: a base flaky_oracle request in a set must keep goport's answer in the set at
+// the set's pin. parity passes --parity (the new run matches Go at its pin) with --known-diff for each
+// key of knownDiffs, and identity passes --identity (resultsSha256, goportSha256 and oracleSha256 of
+// each dir). With any option it passes --kind. Exit 1 is a loss or a parity problem.
+function runOracleCompare(baseDirs, newDir, { kind = null, answers = [], parity = false, knownDiffs = [], identity = false } = {}) {
+  const args = [...answers.flatMap(ref => ["--answers", `${ref.path}@${ref.sha256}`]), ...(parity ? ["--parity"] : []),
+    ...knownDiffs.flatMap(diff => ["--known-diff", diff]), ...(identity ? ["--identity"] : [])];
+  const { exit, output } = runPython("oracle-compare.py", [...baseDirs, newDir, ...args, ...(args.length ? ["--kind", kind] : [])]);
+  const total = output?.total, bad = parity ? output?.parity?.bad : 0;
+  requireValue(total && ["lost", "unrun", "absent"].every(field => Number.isInteger(total[field])) && Number.isInteger(bad)
+    && (exit === 1) === (total.lost + total.unrun + total.absent + bad > 0), "oracle-compare.py output lacks its totals.");
   return output;
 }
 
@@ -489,6 +522,42 @@ function gateIdMapRef(ref, readEvidence) {
   return { path: resolve(ROOT, ref.path), sha256: ref.sha256 };
 }
 
+// A list of oracle answer sets [{kind, path, sha256, pin}] (goport-oracle-answers/1 files: the recorded Go
+// answers of the flake requests of a pin bump). Each file must have its sha256. Returns the list with
+// absolute paths.
+function answerSetRefs(list, label, readEvidence) {
+  if (list == null) return [];
+  requireValue(Array.isArray(list) && list.every(ref => (ref?.kind === "lsp" || ref?.kind === "api") && text(ref.path)
+    && HASH.test(ref.sha256) && typeof ref.pin === "string" && GO_PIN.test(ref.pin)),
+  `${label} must list answer sets {kind (lsp or api), path, sha256, pin}.`);
+  for (const ref of list) readEvidence(ref, { json: false, gunzip: false });
+  return list.map(ref => ({ ...ref, path: resolve(ROOT, ref.path) }));
+}
+
+// One key per answer set (kind, absolute path, sha256 and pin), sorted: two lists name the same sets when
+// their keys are equal.
+function answerKeys(list) {
+  return JSON.stringify(list.map(ref => [ref.kind, resolve(ROOT, ref.path), ref.sha256, ref.pin].join(" ")).sort());
+}
+
+// batch.oracleRebase.<kind> (reviewer ruling 10) {runs [{label, dir, resultsSha256}], binsSha256,
+// oracleSha256, knownDiffs? [{key, reason}] (API only)}: runs of the base batch's bins (binsSha256, the
+// tsgo sha256 of its gate manifest) with the oracle of the batch pin (oracleSha256,
+// upstreamPin.oracleSha256). Returns the runs, the base of the compare.
+function rebaseRuns(kind, entry, tsgo, oracle) {
+  const field = `batch.oracleRebase.${kind}`;
+  requireValue(Array.isArray(entry?.runs) && entry.runs.length > 0
+    && entry.runs.every(run => text(run?.label) && text(run.dir) && HASH.test(run.resultsSha256))
+    && new Set(entry.runs.map(run => resolve(ROOT, run.dir))).size === entry.runs.length,
+  `${field} needs runs [{label, dir, resultsSha256}], each dir once.`);
+  requireValue(entry.binsSha256 === tsgo, `${field}.binsSha256 must be the tsgo sha256 of the base batch's gate manifest (${tsgo}).`);
+  requireValue(entry.oracleSha256 === oracle, `${field}.oracleSha256 must be the oracle of the batch pin, upstreamPin.oracleSha256 (${oracle}).`);
+  const known = entry.knownDiffs ?? [];
+  requireValue(Array.isArray(known) && known.every(diff => text(diff?.key) && text(diff.reason)) && new Set(known.map(diff => diff.key)).size === known.length
+    && (kind === "api" || known.length === 0), `${field}.knownDiffs must list each {key, reason} once${kind === "lsp" ? "; the LSP has none" : ""}.`);
+  return entry.runs;
+}
+
 // The external tools of the goport check. Tests may replace them.
 export const TOOLS = { gitInputs, gateCompare: runGateCompare, oracleCompare: runOracleCompare, keptGateRuns };
 
@@ -507,27 +576,70 @@ function sameRun(a, b) {
   return (a == null && b == null) || samePath(a?.dir, b?.dir);
 }
 
-// An LSP or API oracle record of accept_revision.py ({label, dir, base {label, dir}, compare,
-// output {path, sha256}}). Its base is the base batch's run. Its pinned oracle-compare.py output
-// compares that base with its dir and shows no lost, unrun or absent request. The check also
-// runs oracle-compare.py again on both dirs. Returns the new totals.
-function checkOracle(field, record, baseRun, tools, readEvidence, reasons) {
-  requireValue(baseRun, `${field}: the base batch names no oracle run to compare with.`);
-  requireValue(text(record?.dir) && samePath(record.base?.dir, baseRun.dir), `${field} needs its results dir and the base run ${baseRun.dir}.`);
+// An LSP or API oracle record of accept_revision.py ({label, dir, base {label, dir}, bases?, compare,
+// output {path, sha256}}). Its base is the base batch's run, or the runs of batch.oracleRebase (rebase, in
+// order; bases lists them all, base is the first). Its pinned oracle-compare.py output compares those base
+// runs with its dir, names the answer sets (answers, of this kind) and shows no lost, unrun or absent
+// request. The check also runs oracle-compare.py again on the dirs with the same answer sets. With rebase
+// (reviewer ruling 10) it also passes --parity with the known diffs and --identity: each base run must
+// have its resultsSha256, the base batch's tsgo (binsSha256) and the batch pin's oracle (oracleSha256), the
+// new run that oracle, and the new run no parity problem (condition 3). Returns the new totals.
+function checkOracle(field, kind, record, baseRuns, answers, rebase, pin, tools, readEvidence, reasons) {
+  requireValue(baseRuns.length > 0 && baseRuns.every(Boolean), `${field}: the base batch names no oracle run to compare with.`);
+  const dirs = baseRuns.map(run => run.dir).join(", ");
+  const sameRuns = list => Array.isArray(list) && list.length === baseRuns.length && list.every((head, i) => samePath(head?.dir, baseRuns[i].dir));
+  requireValue(text(record?.dir) && sameRuns(record.bases ?? [record.base]),
+    `${field} needs its results dir and the base run${baseRuns.length > 1 ? "s" : ""} ${dirs}.`);
   const output = readEvidence(record.output);
-  requireValue(samePath(output?.base?.dir, baseRun.dir) && samePath(output.new?.dir, record.dir),
-    `${field}.output must be the oracle-compare.py output of ${baseRun.dir} and ${record.dir}.`);
+  requireValue(sameRuns(output?.bases ?? [output?.base]) && samePath(output.new?.dir, record.dir),
+    `${field}.output must be the oracle-compare.py output of ${dirs} and ${record.dir}.`);
+  const shas = list => JSON.stringify((list ?? []).map(ref => ref?.sha256).sort());
+  requireValue(shas(output.answers) === shas(answers),
+    `${field}.output must use the answer sets ${answers.map(ref => ref.sha256).join(", ") || "(none)"}.`);
+  const knownDiffs = (rebase?.knownDiffs ?? []).map(diff => diff.key);
+  if (rebase) {
+    requireValue(output.parity && output.parity.knownDiffs === knownDiffs.length && output.new?.oracleSha256,
+      `${field}.output must be a compare with --parity, the ${knownDiffs.length} known diffs and --identity (batch.oracleRebase).`);
+  }
   const saved = ["lost", "unrun", "absent"]
     .filter(name => size(record.compare?.[name], `${field}.compare.${name}`) > 0 || size(output.total?.[name], `${field}.output total ${name}`) > 0);
   if (saved.length) reasons.push(`${field} compare reports ${saved.join(", ")} requests.`);
-  const again = tools.oracleCompare(resolve(ROOT, baseRun.dir), resolve(ROOT, record.dir)), total = again.total;
+  const again = tools.oracleCompare(baseRuns.map(run => resolve(ROOT, run.dir)), resolve(ROOT, record.dir),
+    { kind, answers, parity: Boolean(rebase), knownDiffs, identity: Boolean(rebase) });
+  const total = again.total;
+  requireValue(shas(again.answers) === shas(answers), `${field}: oracle-compare.py did not use the answer sets.`);
   const lost = ["lost", "unrun", "absent"].filter(name => total[name] > 0);
   if (lost.length) reasons.push(`${field}: ${lost.map(name => `${total[name]} ${name}`).join(", ")} protected base requests.`);
+  if (rebase) {
+    (again.bases ?? [again.base]).forEach((head, i) => {
+      const run = baseRuns[i], one = value => JSON.stringify([value]);
+      requireValue(head?.resultsSha256 === run.resultsSha256,
+        `${field}: rebase run ${run.label} (${run.dir}) has resultsSha256 ${head?.resultsSha256}, batch.oracleRebase says ${run.resultsSha256}.`);
+      requireValue(JSON.stringify(head.goportSha256) === one(rebase.binsSha256),
+        `${field}: rebase run ${run.label} ran tsgo ${(head.goportSha256 ?? []).join(", ") || "(none)"}, not the base batch's ${rebase.binsSha256}.`);
+      requireValue(JSON.stringify(head.oracleSha256) === one(rebase.oracleSha256),
+        `${field}: rebase run ${run.label} used the oracle ${(head.oracleSha256 ?? []).join(", ") || "(none)"}, not the batch pin's ${rebase.oracleSha256}.`);
+    });
+    requireValue(JSON.stringify(again.new?.oracleSha256) === JSON.stringify([rebase.oracleSha256]),
+      `${field}: the new run ${record.dir} did not use the batch pin's oracle ${rebase.oracleSha256} only.`);
+    // The answer sets of the batch pin are at its oracle, so parity checked each of their requests.
+    const atPin = (again.answers ?? []).filter(set => sameHash(set.pin, pin));
+    requireValue(atPin.every(set => set.oracleSha256 === rebase.oracleSha256)
+      && again.parity.answerRequests + again.parity.badFirst.filter(row => row.class === "absent").length
+        >= atPin.reduce((sum, set) => sum + set.requests, 0),
+    `${field}: an answer set of the batch pin ${pin} is not at its oracle ${rebase.oracleSha256}, so parity did not check its requests.`);
+    const bad = run => run.parity.bad ? `${run.parity.bad} (first: ${run.parity.badFirst.slice(0, 5)
+      .map(row => `${row.battery}/${row.trace}#${row.event} ${row.class}: ${row.why}`).join("; ")})` : null;
+    if (bad(output) || bad(again)) {
+      reasons.push(`${field}: the new run does not match Go at the batch pin (ruling 10 condition 3): ${bad(again) ?? bad(output)} problems.`);
+    }
+  }
   // The dirs are not pinned. The same counts as the pinned output show that they did not change.
-  const counts = run => ({ ...run.total, base: [run.base?.traces, run.base?.requests], new: [run.new?.traces, run.new?.requests] });
+  const counts = run => ({ ...run.total, bases: (run.bases ?? [run.base]).map(head => [head?.traces, head?.requests]),
+    new: [run.new?.traces, run.new?.requests], parity: run.parity?.bad ?? null });
   requireValue(JSON.stringify(counts(again)) === JSON.stringify(counts(output)),
     `${field}: oracle-compare.py gives other counts now than its pinned output ${record.output.path}. A results dir changed.`);
-  return { label: record.label, base: baseRun.label, traces: again.new.traces, requests: again.new.requests, ...total };
+  return { label: record.label, base: baseRuns.map(run => run.label).join(","), traces: again.new.traces, requests: again.new.requests, ...total };
 }
 
 // The LSP run's summary.json (lsp_oracle.py, in its dir): it has the traces and requests that
@@ -555,8 +667,8 @@ function checkLspClean(record, checked, gateManifest, readEvidence, reasons) {
 
 // The API run's manifest.json (api_oracle.py check, in its dir) names the goport binary
 // (goportSha) of each battery it ran. Every battery ran the gate manifest's tsgo, and the run has
-// every battery of the base run's manifest.json.
-function checkApiRun(record, baseRun, gateManifest, readEvidence, reasons) {
+// every battery of the base runs' manifest.json.
+function checkApiRun(record, baseRuns, gateManifest, readEvidence, reasons) {
   const batteries = run => {
     const manifest = readEvidence({ path: join(run.dir, "manifest.json") }, { pinned: false });
     requireValue(manifest?.batteries && typeof manifest.batteries === "object" && !Array.isArray(manifest.batteries),
@@ -568,7 +680,7 @@ function checkApiRun(record, baseRun, gateManifest, readEvidence, reasons) {
   const other = Object.keys(now).filter(name => now[name]?.goportSha !== tsgo);
   requireValue(HASH.test(tsgo) && Object.keys(now).length > 0 && other.length === 0,
     `apiOracle ran another goport binary than the gate's tsgo${other.length ? ` (batteries ${other.join(", ")})` : ""}.`);
-  const missing = Object.keys(batteries(baseRun)).filter(name => !Object.hasOwn(now, name));
+  const missing = [...new Set(baseRuns.flatMap(run => Object.keys(batteries(run))))].filter(name => !Object.hasOwn(now, name));
   if (missing.length) reasons.push(`apiOracle did not run the base batteries ${missing.join(", ")}.`);
 }
 
@@ -668,11 +780,13 @@ function checkGoport(state, rule, readEvidence, tools) {
   // The oracle base runs. A legacy base batch had no API run: the rule's apiBaseline is its base.
   const lspBase = oracleRun(previous.languageServerOracle);
   const apiBase = oracleRun(previousGoport ? previous.apiOracle : rule.apiBaseline);
+  // The answer sets of the base batch (oracleAnswers): they keep the flake requests of a pin bump protected.
+  const baseAnswers = answerSetRefs(previous.oracleAnswers, `Accepted batch ${previous.id} oracleAnswers`, readEvidence);
   // open_revision.py saves the same base as batch.protectedBase when it opens the batch.
   const saved = batch.protectedBase;
   requireValue(saved == null || (saved.batch === previous.id && samePath(saved.tests?.path, baseRef.path) && saved.tests.sha256 === baseRef.sha256
     && samePath(saved.gate?.path, previous.gate?.manifest) && saved.gate.sha256 === previous.gate.sha256
-    && sameRun(saved.lsp, lspBase) && sameRun(saved.api, apiBase)),
+    && sameRun(saved.lsp, lspBase) && sameRun(saved.api, apiBase) && answerKeys(saved.oracleAnswers ?? []) === answerKeys(baseAnswers)),
   `batch.protectedBase differs from the base that accepted batch ${previous.id} gives.`);
   const tests = batch.goportTests;
   requireValue(samePath(tests?.base, baseRef.path) && tests.baseSha256 === baseRef.sha256,
@@ -704,7 +818,7 @@ function checkGoport(state, rule, readEvidence, tools) {
   requireValue(sameInputs(tools.gitInputs(newGate.commit), inputs),
     `Gate manifest comes from commit ${newGate.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
   requireValue(sameHash(newGate.upstreamPin, pin), `Gate manifest is not at the batch Go pin ${pin}.`);
-  readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 });
+  const baseGate = readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 });
   const idMap = gateIdMapRef(batch.gateIdMap, readEvidence);
   const gate = tools.gateCompare(resolve(ROOT, previous.gate.manifest), resolve(ROOT, gateCompare.new), batch.openDefects, batch.gateToolChanges, idMap);
   const output = readEvidence(gateCompare.output);
@@ -718,10 +832,38 @@ function checkGoport(state, rule, readEvidence, tools) {
   const gateRuns = checkGateRuns(state, batch, resolve(ROOT, previous.gate.manifest), idMap, inputs, pin, tools, readEvidence, reasons);
 
   checkRunEvidence(batch, readEvidence);
-  const lsp = checkOracle("languageServerOracle", batch.languageServerOracle, lspBase, tools, readEvidence, reasons);
+  // batch.oracleAnswers: the answer sets of the base at the batch pin (accept_revision.py keeps them), and in a
+  // pin-bump batch new answer sets at the batch pin (reviewer ruling 10 condition 5: the flake requests of the bump).
+  const pinBump = !sameHash(basePin, pin);
+  const answers = answerSetRefs(batch.oracleAnswers, "batch.oracleAnswers", readEvidence);
+  const setKey = ref => `${ref.kind} ${ref.sha256}`;
+  const inBase = new Set(baseAnswers.map(setKey)), own = new Set(answers.map(setKey));
+  requireValue(own.size === answers.length, "batch.oracleAnswers names an answer set twice.");
+  const dropped = baseAnswers.filter(ref => sameHash(ref.pin, pin) && !own.has(setKey(ref)));
+  requireValue(dropped.length === 0,
+    `batch.oracleAnswers must keep the answer sets of the base at the batch pin ${pin}: ${dropped.map(ref => ref.path).join(", ")}.`);
+  for (const ref of answers) {
+    requireValue(sameHash(ref.pin, pin), `batch.oracleAnswers ${ref.path} is at the Go pin ${ref.pin}, not the batch pin ${pin}.`);
+    requireValue(inBase.has(setKey(ref)) || pinBump, `batch.oracleAnswers ${ref.path} is not an answer set of the base: only a pin-bump batch can add one.`);
+  }
+  // Each compare uses the answer sets of the base and of the batch of its kind, each once.
+  const compareSets = [...new Map([...baseAnswers, ...answers].map(ref => [setKey(ref), ref])).values()];
+  const ofKind = kind => compareSets.filter(ref => ref.kind === kind);
+  // batch.oracleRebase (reviewer ruling 10): at a pin bump the oracle base is the base batch's bins measured
+  // again at the batch pin, instead of the base batch's own runs.
+  const rebase = batch.oracleRebase ?? null;
+  let [lspRuns, apiRuns] = [[lspBase], [apiBase]];
+  if (rebase != null) {
+    requireValue(pinBump, `batch.oracleRebase is only for a pin-bump batch; base batch ${previous.id} is at the batch pin ${pin}.`);
+    const tsgo = baseGate.binaries?.tsgo?.sha256, oracle = batch.upstreamPin?.oracleSha256;
+    requireValue(HASH.test(tsgo) && HASH.test(oracle), "batch.oracleRebase needs the tsgo sha256 of the base gate manifest and upstreamPin.oracleSha256.");
+    [lspRuns, apiRuns] = [rebaseRuns("lsp", rebase.lsp, tsgo, oracle), rebaseRuns("api", rebase.api, tsgo, oracle)];
+  }
+  const lsp = checkOracle("languageServerOracle", "lsp", batch.languageServerOracle, lspRuns, ofKind("lsp"), rebase?.lsp ?? null, pin,
+    tools, readEvidence, reasons);
   checkLspClean(batch.languageServerOracle, lsp, newGate, readEvidence, reasons);
-  const api = checkOracle("apiOracle", batch.apiOracle, apiBase, tools, readEvidence, reasons);
-  checkApiRun(batch.apiOracle, apiBase, newGate, readEvidence, reasons);
+  const api = checkOracle("apiOracle", "api", batch.apiOracle, apiRuns, ofKind("api"), rebase?.api ?? null, pin, tools, readEvidence, reasons);
+  checkApiRun(batch.apiOracle, apiRuns, newGate, readEvidence, reasons);
   const { lost, absent, unrun, removed, ...counts } = compared;
   return { verdict: reasons.length ? "STOP" : "PASS", scope: GOPORT_SCOPE, protectedSet: "goport", rule: GOPORT_RULE, reasons,
     base: { batch: previous.id, tests: baseRef.path, gate: previous.gate.manifest },
@@ -867,9 +1009,12 @@ every batch). The batch has no fullResult, corpus, roster baselines or
 rosterCarryForward. The history rules above still apply. The current history
 row and both verdicts (PASS, batchId, sourceFingerprint) carry
 goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256,
-nameMapSha256 = goportTests.nameMap.sha256 and gateIdMapSha256 =
-gateIdMap.sha256 (each map sha256 absent or null without that map) instead of
-fullResultSha256.
+nameMapSha256 = goportTests.nameMap.sha256, gateIdMapSha256 =
+gateIdMap.sha256 (each map sha256 absent or null without that map),
+oracleRebaseSha256 = the sha256 of the canonical JSON (keys sorted, no
+spaces) of oracleRebase (absent or null without it) and oracleAnswersSha256 =
+the sorted sha256 values of oracleAnswers (absent or empty without answer
+sets) instead of fullResultSha256.
 
 The base is batch.previousBatch.archive {path, sha256}, the saved record of the
 last accepted batch: it must be the last batchRecords entry (open_revision.py
@@ -932,19 +1077,50 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   in gateFlakes for the reviewer.
 - ordinaryQuery and latestHono: complete, exitCode 0, matchesOracle, the batch
   sourceFingerprint, and runs [{manifest, sha256}] whose manifests name it.
-- languageServerOracle and apiOracle {label, dir, base {label, dir}, compare,
-  output {path, sha256}} (accept_revision.py): dir is the results dir of
-  lsp_oracle.py or api_oracle.py check. The base run is the base batch's run
-  (its dir, or the dir of its summary path); after a legacy base batch the
-  API base is the rule's apiBaseline {label?, dir}. base.dir is that run,
-  output is the oracle-compare.py output of the base and new dirs, and
-  compare and output show 0 lost, unrun and absent requests. The check runs
-  oracle-compare.py again on both dirs: every base same or oracle_error_same
-  request must be so again, and the counts must equal the pinned output. The
-  LSP run's summary.json has the traces and requests of that compare, the gate
-  manifest's tsgo and 0 diff, goport_error, timeout and crash. The API run's
-  manifest.json gives the gate manifest's tsgo as the goportSha of every
-  battery, and has every battery of the base run's manifest.json.
+- languageServerOracle and apiOracle {label, dir, base {label, dir}, bases?,
+  compare, output {path, sha256}} (accept_revision.py): dir is the results
+  dir of lsp_oracle.py or api_oracle.py check. The base run is the base
+  batch's run (its dir, or the dir of its summary path); after a legacy base
+  batch the API base is the rule's apiBaseline {label?, dir}. With
+  oracleRebase the base runs are its runs of that kind, in order: bases lists
+  them and base is the first. base.dir (bases) is that run, output is the
+  oracle-compare.py output of the base and new dirs with the answer sets of
+  that kind (below), and compare and output show 0 lost, unrun and absent
+  requests. The check runs oracle-compare.py again on the dirs: every base
+  same or oracle_error_same request must be so again (in any base run), and
+  the counts must equal the pinned output. The LSP run's summary.json has the
+  traces and requests of that compare, the gate manifest's tsgo and 0 diff,
+  goport_error, timeout and crash. The API run's manifest.json gives the gate
+  manifest's tsgo as the goportSha of every battery, and has every battery of
+  the base runs' manifest.json.
+- oracleAnswers [{kind, path, sha256, pin}]: answer sets
+  (goport-oracle-answers/1: the recorded Go answers of the flake requests of a
+  pin bump). Each file must have its sha256 and each set the batch pin. It
+  holds every answer set of the base batch's oracleAnswers at the batch pin
+  (accept_revision.py adds them), and only a pin-bump batch can add others.
+  batch.protectedBase.oracleAnswers must equal the base batch's oracleAnswers.
+  The compares use the base's and the batch's answer sets of their kind (each
+  once, oracle-compare.py --answers path@sha256), and both pinned compare
+  outputs must name them. A base flaky_oracle request in a set counts as
+  retainedByAnswers when goport's new answer is in the set at the set's
+  oracle, else as lost; with a set of another oracle only it is protected like
+  a same request.
+- oracleRebase {lsp, api} (optional, reviewer ruling 10): each
+  {runs [{label, dir, resultsSha256}], binsSha256, oracleSha256, knownDiffs?
+  [{key, reason}] (API only)}, the runs of the base batch's bins at the batch
+  pin, which replace the base batch's runs as the oracle base. Only a
+  pin-bump batch (the base batch pin differs from upstreamPin.to) can have it.
+  binsSha256 must be the tsgo sha256 of the base batch's gate manifest and
+  oracleSha256 upstreamPin.oracleSha256. The check runs oracle-compare.py
+  with every run as a base (protected in any run), --identity and --parity
+  with the known diff keys: each run must have its resultsSha256, binsSha256
+  as its only tsgo and oracleSha256 as its only oracle, and the new run that
+  oracle. Parity: the new LSP run has no diff, goport_error,
+  oracle_error_diff, timeout, crash or crash exit, and the new API run no
+  goport_error, crash or timeout and no diff, id_only or oracle_error_diff
+  outside knownDiffs; a request in an answer set of its oracle must have
+  goport's answer in the set, and is then allowed. An unused known diff is a
+  problem. Both pinned compare outputs must be such compares.
 - quality {record} and qualityEvidence {sourceFingerprint}: the record names
   the batch source, rustfmtExit 0, clippyExit 0, tsGoportWarnings 0,
   keptCrateWarnings 0 or absent, fingerprintUnchanged true.

@@ -107,9 +107,24 @@ cannot remove a case. An unmapped base id of a mapped family, or a line that nam
 removed id (format and rules in the `gate-compare.py` docstring). The corpus-emit stage runs the case
 paths of `gate-emit-sample.txt`, so a pin that adds cases keeps the same sample under new ids.
 
-`oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
+`oracle-compare.py <base results dir>... <new results dir>` compares LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,
-unrun or absent request.
+unrun or absent request, and 2 on bad input. Options (formats in its docstring):
+
+- Several base dirs: every run counts. A request is protected when it is protected in any base run.
+  `batch.oracleRebase` gives these runs at a pin bump: the base batch's bins run again at the new pin.
+- `--answers FILE@SHA256` (repeatable): an answer set, the recorded Go answers of flaky requests at one
+  pin (`batch.oracleAnswers`). A base `flaky_oracle` request in a set counts as `retainedByAnswers` only
+  when goport's new answer is in the set. At another pin it is protected like a `same` request.
+- `--parity` with `--known-diff KEY` (API only): the new run must match Go at its pin. The output lists
+  each problem, and a problem gives exit 1.
+- `--identity`: each head also gets `resultsSha256` (the `sha256sum` listing of every file in the dir),
+  and the tsgo and oracle sha256 values that the run records.
+
+Without options and with one base dir, the output is byte-equal to the output before the options.
+`candidate.sh side` passes the answer sets of the base and of the batch. With `batch.oracleRebase` it
+also passes its runs, `--parity`, the API known diffs and `--identity`. It reuses a passing compare only
+when the base runs, answer sets and rebase record have not changed.
 
 `candidate.sh` runs its local helpers from its own checkout, so a worktree copy can be tried with
 `--dry-run` before its merge. The state, `target/` and the host commands (`gate.sh` and the oracles,
