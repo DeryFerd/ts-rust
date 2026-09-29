@@ -320,11 +320,19 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
 
 impl BoundFile {
     /// Stores the output in the file's `GoFile` `OnceLock`s (Go
-    /// `file.BindOnce`).
+    /// `file.BindOnce`). AST node records, step 2: first writes the symbol,
+    /// the flow node and the added flags of each node into its record
+    /// (`ast::bind_store_records`); the other fields go into the extras of
+    /// `node_bind`.
     pub fn install(self) {
-        let go_file = crate::ast::go_file(self.file.file_index());
+        let file = self.file.file_index();
+        let go_file = crate::ast::go_file(file);
+        assert!(go_file.node_bind.get().is_none(), "file already bound");
+        let mut node_bind = self.node_bind;
+        let extras = crate::ast::bind_store_records(file, node_bind.nodes());
+        node_bind.set_extras(extras);
         assert!(
-            go_file.node_bind.set(self.node_bind).is_ok(),
+            go_file.node_bind.set(node_bind).is_ok(),
             "file already bound"
         );
         assert!(

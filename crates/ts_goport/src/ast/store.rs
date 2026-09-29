@@ -141,6 +141,10 @@ struct FileStore {
     /// the slot is made and written by the parse (`get_mut`). The publish
     /// reads them in place (`Frozen::records`).
     records: Vec<NodeRecord>,
+    /// AST node records, step 2: the parents in another store of node
+    /// slots (`ParentCode`), in the order the parse wrote them. The publish
+    /// reads them in place (`FrozenStore::foreign`).
+    foreign_parents: Vec<Node>,
     /// AST node records, step 1: the `NodeKids` of every slot, pushed with
     /// its record and made again when its data is replaced
     /// (`FrozenStore::kids`). U1 (d): the only copy of the text of a node
@@ -261,8 +265,7 @@ impl StoreFacts {
             self.alias_free = false;
             return;
         }
-        let parent = record.up();
-        if parent.is_some() && parent.file_index() != LOCAL_STORE {
+        if record.has_foreign_parent() {
             self.parents_local = false;
         }
         if record
@@ -437,21 +440,31 @@ impl SlotChildren {
     }
 }
 
-/// AST node records, step 1 (`ast-design/study.md`): the Go `NodeBase`
-/// fields of one slot in 32 bytes (`FileStore::records`). `NodeHeader` is
-/// its value form. The words are atomics that the reads load with
-/// `Relaxed` (a plain load on x86-64 and aarch64), so a later step can
-/// write binder fields into a published record; the parse writes them
-/// through `get_mut`.
+/// AST node records (`ast-design/study.md`): the Go `NodeBase` fields and
+/// the hot binder fields of one slot in 32 bytes (`FileStore::records`).
+/// `NodeHeader` is the value form of its parse fields. The words are
+/// atomics that the reads load with `Relaxed` (a plain load on x86-64 and
+/// aarch64). The parse writes them through `get_mut`; the binder writes its
+/// fields into the published record (`bind_store_records`).
 ///
 /// - `kind`: Go `node.Kind`; `Unknown` for the nil slot and alias slots.
 /// - `bits`: `SOURCE_FILE_ROOT`, `TEXT_IS_KEYWORD` and `NO_NODE`.
-/// - `flags`: the parser `node.Flags`.
+/// - `flags`: Go `node.Flags`: the parser flags, and after the bind also
+///   the bits the binder added (`BINDER_ADDED_FLAGS` in node.rs).
 /// - `loc`: Go `node.Loc`, pos in the low half and end in the high half.
-/// - `up`: the stored Go `node.Parent` of a node slot (a parent in the same
-///   store is a `LOCAL_STORE` handle), or the target of the nil slot or an
-///   alias slot.
-/// - `bind`: not used yet (step 2 moves binder fields here), always 0.
+/// - `up` of a node slot: the parent code in the low half (`ParentCode`),
+///   and the Go symbol (`SymbolId`) in the high half, 0 before the bind.
+///   `up` of the nil slot or an alias slot: the whole target `Node`.
+/// - `bind`: the low half of the Go `FlowNodeData().FlowNode` (the flow
+///   node is in the same file; 0 is nil), and in the high half the index + 1
+///   of the other binder fields of the node in `FileNodeBind` (0 for none).
+///
+/// Only the parse and the bind write a record. The bind writes after the
+/// publish, and changes only `flags`, the high half of `up` and `bind`, so
+/// `header` (parse fields only) never mixes an old and a new word. The
+/// bind of a file ends before any reader of its binder fields starts: the
+/// checker threads start after the bind, or get their work through a lock
+/// or a channel, which orders the writes before their reads.
 // PORT: `kind` is a plain field. Safe Rust has no inline u16 to
 // `SyntaxKind` conversion (`SyntaxKind::try_from` is a 351-arm match in
 // goport_util, not inline), and the kind of a slot never changes after the
@@ -468,6 +481,18 @@ pub struct NodeRecord {
 }
 
 const _: () = assert!(std::mem::size_of::<NodeRecord>() == 32);
+
+/// AST node records, step 2: the low half of `NodeRecord::up` of a node
+/// slot. 0 is a nil parent. `1..FOREIGN_PARENT` is a parent in the same
+/// store: its slot index + 1, so the handle is `(file << 32) | code` and
+/// needs no rewrite when the store id changes (`adopt_detached_store`).
+/// `FOREIGN_PARENT | i` is a parent in another store (or a synthetic
+/// parent): entry `i` of the foreign parents of the store
+/// (`FileStore::foreign_parents`, `FrozenStore::foreign`).
+type ParentCode = u32;
+
+/// The `ParentCode` bit of a parent in another store.
+const FOREIGN_PARENT: ParentCode = 1 << 31;
 
 impl NodeRecord {
     /// Go `GetSourceFileOfNode(node)` is the root of the store
@@ -493,7 +518,7 @@ impl NodeRecord {
             },
             NodeFlags::NONE,
             TextRange::undefined(),
-            Node::NIL,
+            0,
         )
     }
 
@@ -505,18 +530,19 @@ impl NodeRecord {
             Self::NO_NODE,
             NodeFlags::NONE,
             TextRange::undefined(),
-            target,
+            target.0,
         )
     }
 
+    /// A slot with word `up` (see `NodeRecord`) and no binder fields.
     #[inline]
-    fn new(kind: SyntaxKind, bits: u8, flags: NodeFlags, loc: TextRange, up: Node) -> Self {
+    fn new(kind: SyntaxKind, bits: u8, flags: NodeFlags, loc: TextRange, up: u64) -> Self {
         Self {
             kind,
             bits: AtomicU8::new(bits),
             flags: AtomicU32::new(flags.0),
             loc: AtomicU64::new(Self::loc_word(loc)),
-            up: AtomicU64::new(up.0),
+            up: AtomicU64::new(up),
             bind: AtomicU64::new(0),
         }
     }
@@ -558,30 +584,51 @@ impl NodeRecord {
         TextRange::new(word as u32 as i32, (word >> 32) as u32 as i32)
     }
 
-    /// `up` as stored: the stored parent of a node slot, the target of any
-    /// other slot.
+    /// The target of the nil slot or an alias slot (`NO_NODE`).
     #[inline]
-    fn up(&self) -> Node {
+    fn target_node(&self) -> Node {
         Node(self.up.load(Ordering::Relaxed))
     }
 
-    /// Go `node.Parent` of a node slot of store `file` (see `LOCAL_STORE`).
+    /// The `ParentCode` of a node slot.
     #[inline]
-    fn parent(&self, file: usize) -> Node {
-        let parent = self.up();
-        if parent.file_index() == LOCAL_STORE {
-            handle(file, slot_index(parent) as u32)
-        } else {
-            parent
-        }
+    fn parent_code(&self) -> ParentCode {
+        self.up.load(Ordering::Relaxed) as u32
+    }
+
+    /// The slot index of the parent of a node slot when it is a node of the
+    /// same store, else `None` (nil or another store).
+    #[inline]
+    fn local_parent(&self) -> Option<usize> {
+        let code = self.parent_code();
+        (code != 0 && code & FOREIGN_PARENT == 0).then(|| code as usize - 1)
+    }
+
+    /// True when the parent of a node slot is in another store.
+    #[inline]
+    fn has_foreign_parent(&self) -> bool {
+        self.parent_code() & FOREIGN_PARENT != 0
+    }
+
+    /// Go `node.Parent` of a node slot of store `file`. `foreign(i)` gives
+    /// entry `i` of the foreign parents of the store (see `ParentCode`).
+    #[inline]
+    fn parent_with(&self, file: usize, foreign: impl FnOnce(usize) -> Node) -> Node {
+        parent_of_code(self.parent_code(), file, foreign)
     }
 
     /// The header of this slot of store `file`, as the node reads see it.
+    /// `foreign` as for `parent_with`. The parent of the nil slot or an
+    /// alias slot is its target.
     #[inline]
-    fn header(&self, file: usize) -> NodeHeader {
+    fn header(&self, file: usize, foreign: impl FnOnce(usize) -> Node) -> NodeHeader {
         let bits = self.bits();
         NodeHeader {
-            parent: self.parent(file),
+            parent: if bits & Self::NO_NODE == 0 {
+                self.parent_with(file, foreign)
+            } else {
+                self.target_node()
+            },
             loc: self.loc(),
             flags: self.flags(),
             kind: self.kind,
@@ -590,10 +637,24 @@ impl NodeRecord {
         }
     }
 
-    /// Writes the stored parent (`NodeHeader::stored_parent`).
+    /// AST node records, step 2: Go `node.Symbol()` of a node slot (nil
+    /// before the bind).
     #[inline]
-    fn set_up(&mut self, stored: Node) {
-        *self.up.get_mut() = stored.0;
+    fn symbol(&self) -> SymbolId {
+        SymbolId((self.up.load(Ordering::Relaxed) >> 32) as u32)
+    }
+
+    /// AST node records, step 2: the `bind` word (see `NodeRecord`).
+    #[inline]
+    fn bind_word(&self) -> u64 {
+        self.bind.load(Ordering::Relaxed)
+    }
+
+    /// Writes the parent code of a node slot.
+    #[inline]
+    fn set_parent_code(&mut self, code: ParentCode) {
+        let up = self.up.get_mut();
+        *up = (*up & !0xffff_ffff) | u64::from(code);
     }
 
     #[inline]
@@ -614,6 +675,51 @@ impl NodeRecord {
         } else {
             *bits &= !bit;
         }
+    }
+
+    /// AST node records, step 2: writes the binder fields of a node slot of
+    /// a published store (`bind_store_records`): the symbol into `up`, the
+    /// added flags into `flags`, and the `bind` word. The bind is the only
+    /// writer of a published record, and it writes each record once.
+    #[inline]
+    fn write_bind(&self, symbol: SymbolId, added: NodeFlags, bind: u64) {
+        if symbol.is_some() {
+            let up = self.up.load(Ordering::Relaxed);
+            self.up.store(
+                (up & 0xffff_ffff) | (u64::from(symbol.0) << 32),
+                Ordering::Relaxed,
+            );
+        }
+        if !added.is_empty() {
+            let flags = self.flags.load(Ordering::Relaxed);
+            self.flags.store(flags | added.0, Ordering::Relaxed);
+        }
+        if bind != 0 {
+            self.bind.store(bind, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The `ParentCode` of `stored`, nil or a `LOCAL_STORE` handle
+/// (`NodeHeader::stored_parent`).
+#[inline]
+fn local_parent_code(stored: Node) -> ParentCode {
+    debug_assert!(stored.is_nil() || stored.file_index() == LOCAL_STORE);
+    let code = stored.0 as u32;
+    assert!(code < FOREIGN_PARENT, "too many slots in a store");
+    code
+}
+
+/// Go `node.Parent` of a node slot of store `file` whose parent code is
+/// `code` (see `NodeRecord::parent_with`).
+#[inline]
+fn parent_of_code(code: ParentCode, file: usize, foreign: impl FnOnce(usize) -> Node) -> Node {
+    if code & FOREIGN_PARENT != 0 {
+        foreign((code & !FOREIGN_PARENT) as usize)
+    } else if code == 0 {
+        Node::NIL
+    } else {
+        Node(((file as u64) << 32) | u64::from(code))
     }
 }
 
@@ -1051,6 +1157,9 @@ struct FrozenStore<'a> {
     links: &'a [SlotLinks],
     /// `FileStore::root` (`frozen_source_file_of_node`).
     root: Node,
+    /// AST node records, step 2: `FileStore::foreign_parents`
+    /// (`frozen_foreign_parent`).
+    foreign: &'a [Node],
 }
 
 impl<'a> FrozenStore<'a> {
@@ -1062,6 +1171,7 @@ impl<'a> FrozenStore<'a> {
             kids: &s.kids,
             links: &s.links,
             root: s.root,
+            foreign: &s.foreign_parents,
         }
     }
 }
@@ -1607,7 +1717,41 @@ impl FileStore {
     /// form of the parent (`NodeHeader::stored_parent`).
     #[inline]
     fn set_slot_parent(&mut self, index: usize, stored: Node) {
-        self.records[index].set_up(stored);
+        let code = if stored.file_index() == LOCAL_STORE || stored.is_nil() {
+            local_parent_code(stored)
+        } else {
+            self.foreign_parent_code(stored)
+        };
+        self.records[index].set_parent_code(code);
+        debug_assert_eq!(
+            self.slot_stored_parent(index),
+            stored,
+            "astrec2: stored parent of slot {index}"
+        );
+    }
+
+    /// The `ParentCode` of `parent`, a parent in another store: a new entry
+    /// of `foreign_parents`.
+    #[cold]
+    #[inline(never)]
+    fn foreign_parent_code(&mut self, parent: Node) -> ParentCode {
+        let index = ParentCode::try_from(self.foreign_parents.len()).expect("foreign parents");
+        assert!(index < FOREIGN_PARENT, "too many foreign parents");
+        self.foreign_parents.push(parent);
+        FOREIGN_PARENT | index
+    }
+
+    /// The stored parent of node slot `index` (`NodeHeader::stored_parent`):
+    /// nil, a `LOCAL_STORE` handle or a node of another store.
+    fn slot_stored_parent(&self, index: usize) -> Node {
+        let code = self.records[index].parent_code();
+        if code & FOREIGN_PARENT != 0 {
+            self.foreign_parents[(code & !FOREIGN_PARENT) as usize]
+        } else if code == 0 {
+            Node::NIL
+        } else {
+            handle(LOCAL_STORE, code - 1)
+        }
     }
 
     /// Go `node.Loc = loc` on slot `index`.
@@ -1626,7 +1770,7 @@ impl FileStore {
     /// node reads see it.
     #[inline]
     fn slot_header(&self, file: usize, index: usize) -> NodeHeader {
-        self.records[index].header(file)
+        self.records[index].header(file, |i| self.foreign_parents[i])
     }
 
     /// `record_resolve` of slot `index` of this store, which has id `file`.
@@ -3384,15 +3528,13 @@ pub fn file_store_slot_count(file: usize) -> usize {
 
 /// The parser `node.Flags` of every slot, indexed by slot index. Nil and
 /// alias slots give no flags. The loader fills `GoFile::parser_flags` from
-/// this for the binder.
+/// this for the binder, before the publish.
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
-    // A freeable file version keeps its records in its node shell.
-    if let Some(flags) = frozen!(file, records, |_, _, records| records
-        .iter()
-        .map(NodeRecord::flags)
-        .collect())
-    {
+    // AST node records, step 2: the records of a published file also hold
+    // the flags that the binder added, so its parser flags are the ones
+    // that its `GoFile` took before the publish.
+    if let Some(flags) = try_with_go_file(file, |g| g.parser_flags.clone()) {
         return flags;
     }
     let computed = |s: &FileStore| s.records.iter().map(NodeRecord::flags).collect();
@@ -3593,6 +3735,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> &'static Frozen<'static> {
         };
     let records: &'static [NodeRecord] = Vec::leak(std::mem::take(&mut store.records));
     let kids: &'static [NodeKids] = Vec::leak(std::mem::take(&mut store.kids));
+    let foreign: &'static [Node] = Vec::leak(std::mem::take(&mut store.foreign_parents));
     store.links = Box::default();
     let per_store = FrozenStore {
         nil,
@@ -3600,6 +3743,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> &'static Frozen<'static> {
         kids,
         links: &[],
         root: store.root,
+        foreign,
     };
     Box::leak(Box::new(Frozen {
         base: file,
@@ -3640,12 +3784,11 @@ fn mark_source_file_roots(store: &mut FileStore) {
         if !record.is_node() {
             continue;
         }
-        let parent = record.up();
         if record.kind() != SyntaxKind::SourceFile
-            && parent.file_index() == LOCAL_STORE
-            && matches!(state[slot_index(parent)], ROOT | NOT_ROOT)
+            && let Some(parent) = record.local_parent()
+            && matches!(state[parent], ROOT | NOT_ROOT)
         {
-            let result = state[slot_index(parent)];
+            let result = state[parent];
             state[start] = result;
             store.set_source_file_root(start, result == ROOT);
             continue;
@@ -3664,11 +3807,10 @@ fn mark_source_file_roots(store: &mut FileStore) {
             if record.kind() == SyntaxKind::SourceFile {
                 break if cur == root { ROOT } else { NOT_ROOT };
             }
-            let parent = record.up();
-            if parent.file_index() != LOCAL_STORE {
+            let Some(parent) = record.local_parent() else {
                 break NOT_ROOT;
-            }
-            cur = slot_index(parent);
+            };
+            cur = parent;
         };
         for i in path.drain(..) {
             state[i] = result;
@@ -3728,7 +3870,7 @@ pub fn store_header(n: Node) -> NodeHeader {
     if let Some(header) = frozen_static!(file, records, |_, _, records| {
         let record = &records[index];
         debug_assert!(record.is_node(), "store handle does not name a node slot");
-        record.header(file)
+        record.header(file, |i| frozen_foreign_parent(file, i))
     }) {
         return header;
     }
@@ -3763,7 +3905,9 @@ pub fn try_store_header(n: Node) -> Option<NodeHeader> {
 /// `try_store_header` for a node that is not in the active store.
 #[inline(never)]
 fn try_store_header_slow(file: usize, index: usize) -> Option<NodeHeader> {
-    if let Some(header) = frozen!(file, records, |_, _, records| records[index].header(file)) {
+    if let Some(header) = frozen!(file, records, |_, _, records| records[index]
+        .header(file, |i| frozen_foreign_parent(file, i)))
+    {
         return Some(header);
     }
     unpublished_store(file).map(|store| store.borrow().slot_header(file, index))
@@ -3811,11 +3955,112 @@ fn frozen_record(n: Node) -> Option<&'static NodeRecord> {
         [slot_index(n)])
 }
 
+/// AST node records, step 2: entry `index` of the foreign parents
+/// (`ParentCode`) of published store `file` (tier 0 or tier 1, which has
+/// the node shell of a freeable file version).
+#[cold]
+#[inline(never)]
+fn frozen_foreign_parent(file: usize, index: usize) -> Node {
+    frozen_static!(file, per_store, |_, _, s| s.foreign[index])
+        .expect("the foreign parents of a published store")
+}
+
 /// Parser `node.Flags` of a published store node (see `frozen_record`).
 #[inline]
 #[must_use]
 pub fn frozen_store_flags(n: Node) -> Option<NodeFlags> {
     frozen_record(n).map(NodeRecord::flags)
+}
+
+/// AST node records, step 2: Go `node.Symbol()` of a published store node
+/// (see `frozen_record`), nil before its file is bound.
+#[inline]
+#[must_use]
+pub fn frozen_store_symbol(n: Node) -> Option<SymbolId> {
+    frozen_record(n).map(|r| {
+        debug_assert!(r.is_node(), "store handle does not name a node slot");
+        r.symbol()
+    })
+}
+
+/// AST node records, step 2: the `bind` word of a published store node
+/// (see `NodeRecord` and `frozen_record`), 0 before its file is bound.
+#[inline]
+#[must_use]
+pub fn frozen_store_bind_word(n: Node) -> Option<u64> {
+    frozen_record(n).map(|r| {
+        debug_assert!(r.is_node(), "store handle does not name a node slot");
+        r.bind_word()
+    })
+}
+
+/// AST node records, step 2: true when `test` is true for the symbol of
+/// some node slot of published store `file`. `None` when `file` is not a
+/// published store.
+#[must_use]
+pub fn frozen_store_any_symbol(
+    file: usize,
+    mut test: impl FnMut(SymbolId) -> bool,
+) -> Option<bool> {
+    frozen_static!(file, records, |_, _, records| records
+        .iter()
+        .any(|r| r.is_node() && test(r.symbol())))
+}
+
+/// AST node records, step 2 (`BoundFile::install`): writes the binder
+/// output of published store file `file` into its records (tier 0, tier 1,
+/// or the node shell of a freeable file version). `nodes` gives, in slot
+/// order, each node slot that has binder data, with the index of its data
+/// entry and the data (`FileNodeBind::nodes`). The symbol, the added flags
+/// and the flow node go into the record; the other fields go into the
+/// returned extras, and the record keeps their index + 1 (`NodeRecord`,
+/// `bind`). Slots that share a data entry share one extras entry.
+// PORT: only this writes a published record (see `NodeRecord`). The
+// writes are `Relaxed` stores; the bind of a file ends before its binder
+// fields are read on another thread.
+pub fn bind_store_records<'d>(
+    file: usize,
+    nodes: impl Iterator<Item = (usize, usize, &'d NodeBindData)>,
+) -> Vec<NodeBindExtra> {
+    let records: &'static [NodeRecord] = static_frozen_of(file, |f| f.records)
+        .unwrap_or_else(|_| panic!("file {file} has no published records"))
+        .2;
+    let flow_file = (file as u64) << 32;
+    let mut extras: Vec<NodeBindExtra> = Vec::new();
+    // The data entry of the last extras entry, and its index + 1.
+    let mut last = (usize::MAX, 0u32);
+    for (index, entry, data) in nodes {
+        let record = &records[index];
+        assert!(
+            record.is_node(),
+            "binder data on slot {index} of file {file}, not a node"
+        );
+        debug_assert!(
+            super::node::BINDER_ADDED_FLAGS.contains(data.added_flags),
+            "binder added {:#x}, outside BINDER_ADDED_FLAGS",
+            data.added_flags
+                .without(super::node::BINDER_ADDED_FLAGS)
+                .bits()
+        );
+        let flow = data.flow_node;
+        assert!(
+            flow.is_nil() || flow.0 & !0xffff_ffff == flow_file,
+            "flow node of slot {index} of file {file} is in another file"
+        );
+        let extra = NodeBindExtra::of(data);
+        let extra = if extra == NodeBindExtra::default() {
+            0
+        } else if last.0 == entry {
+            last.1
+        } else {
+            extras.push(extra);
+            last = (entry, u32::try_from(extras.len()).expect("binder extras"));
+            last.1
+        };
+        let bind = (flow.0 & 0xffff_ffff) | (u64::from(extra) << 32);
+        record.write_bind(data.symbol, data.added_flags, bind);
+    }
+    extras
 }
 
 /// Go `node.Loc` of a published store node (see `frozen_record`).
@@ -3829,7 +4074,11 @@ pub fn frozen_store_loc(n: Node) -> Option<TextRange> {
 #[inline]
 #[must_use]
 pub fn frozen_store_parent(n: Node) -> Option<Node> {
-    frozen_record(n).map(|r| r.parent(n.file_index()))
+    let file = n.file_index();
+    frozen_record(n).map(|r| {
+        debug_assert!(r.is_node(), "store handle does not name a node slot");
+        r.parent_with(file, |i| frozen_foreign_parent(file, i))
+    })
 }
 
 /// The astdata node of a published store node: the inlined fast path of
@@ -3953,7 +4202,7 @@ fn record_resolve(file: usize, index: usize, records: &[NodeRecord]) -> Node {
     if record.is_node() {
         handle(file, index as u32)
     } else {
-        record.up()
+        record.target_node()
     }
 }
 
@@ -4302,17 +4551,19 @@ fn store_find_ancestor(
         if callback(node, record.kind()) {
             return AncestorWalk::Found(node);
         }
-        // The stored parent (`NodeRecord::parent`): a `LOCAL_STORE` handle is
-        // a node of this store; anything else is nil or another store.
-        let parent = record.up();
-        if parent.file_index() != LOCAL_STORE {
-            return if parent.is_nil() {
-                AncestorWalk::Found(Node::NIL)
-            } else {
-                AncestorWalk::Next(parent)
-            };
+        // The parent code (`ParentCode`): a node of this store, nil or a
+        // node of another store.
+        let code = record.parent_code();
+        if code == 0 {
+            return AncestorWalk::Found(Node::NIL);
         }
-        index = slot_index(parent);
+        if code & FOREIGN_PARENT != 0 {
+            return AncestorWalk::Next(frozen_foreign_parent(
+                file,
+                (code & !FOREIGN_PARENT) as usize,
+            ));
+        }
+        index = code as usize - 1;
     }
 }
 
@@ -4328,11 +4579,9 @@ pub fn frozen_store_parent_kind(n: Node) -> Option<(Node, SyntaxKind)> {
     }
     let file = n.file_index();
     frozen_static!(file, records, |_, _, records| {
-        let parent = records[slot_index(n)].up();
-        (parent.file_index() == LOCAL_STORE).then(|| {
-            let index = slot_index(parent);
-            (handle(file, index as u32), records[index].kind())
-        })
+        records[slot_index(n)]
+            .local_parent()
+            .map(|index| (handle(file, index as u32), records[index].kind()))
     })
     .flatten()
 }
@@ -4379,7 +4628,7 @@ impl FrozenIds {
                 if record.is_node() {
                     Node(base | (id.index() as u64 + 1))
                 } else {
-                    record.up()
+                    record.target_node()
                 }
             }
             FrozenIds::Direct { base, nil } => {
@@ -4637,7 +4886,7 @@ fn set_parent_in_owned_store_children(s: &mut FileStore, index: usize) -> bool {
     let owned = owned.as_deref().expect("a store that owns its nodes");
     let node = owned.node(owned.cell_of[index]);
     let kind = records[index].kind();
-    let stored = handle(LOCAL_STORE, index as u32);
+    let code = local_parent_code(handle(LOCAL_STORE, index as u32));
     unlink_children(build_links, index);
     build_links[index].first_child = LINK_END;
     let mut last = LINK_END;
@@ -4647,7 +4896,7 @@ fn set_parent_in_owned_store_children(s: &mut FileStore, index: usize) -> bool {
         if nodes[child].is_none() {
             return true;
         }
-        records[child].set_up(stored);
+        records[child].set_parent_code(code);
         if linking && !link_child(build_links, index, &mut last, child) {
             linking = false;
             unlink_children(build_links, index);
@@ -4680,7 +4929,7 @@ pub fn debug_store_child_link_state(parent: Node) -> Vec<(u32, Node, u32, u32)> 
             let links = s.build_links[index];
             (
                 index as u32,
-                s.records[index].up(),
+                s.slot_stored_parent(index),
                 links.first_child,
                 links.next_sibling,
             )
@@ -4849,11 +5098,11 @@ impl FileStore {
             Some(data) => leak_ast_node(kind, data),
             None => shared_name_node(kind),
         };
-        // `NodeHeader::stored_parent` of a parent in this store.
+        // The `ParentCode` of a parent in this store (nil for `NIL_SLOT`).
         let parent = if parent == NIL_SLOT {
-            Node::NIL
+            0
         } else {
-            handle(LOCAL_STORE, parent)
+            local_parent_code(handle(LOCAL_STORE, parent))
         };
         let bits = if text_is_keyword {
             NodeRecord::TEXT_IS_KEYWORD
@@ -4861,7 +5110,7 @@ impl FileStore {
             0
         };
         self.records
-            .push(NodeRecord::new(kind, bits, flags, loc, parent));
+            .push(NodeRecord::new(kind, bits, flags, loc, u64::from(parent)));
         self.nodes.push(Some(node));
         let modifier_bits = super::node::store_node_modifier_bits(kind, node);
         let children = super::node::store_node_children(kind, node);
@@ -4938,9 +5187,9 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
                     "slot {index}: the ts_ast node has other base fields"
                 ));
             }
-            let parent = match record.up() {
-                p if p.is_nil() => NIL_SLOT,
-                p if p.file_index() == LOCAL_STORE => slot_index(p) as u32,
+            let parent = match (record.local_parent(), record.parent_code()) {
+                (_, 0) => NIL_SLOT,
+                (Some(parent), _) => parent as u32,
                 _ => return Err(format!("slot {index}: a parent in another store")),
             };
             let shared_name = is_name_kind(kind) && std::ptr::eq(node, shared_name_node(kind));
@@ -5054,7 +5303,11 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 record.bits(),
                 record.flags(),
                 record.loc(),
-                local(record.parent(file)),
+                if record.is_node() {
+                    local(record.parent_with(file, |i| s.foreign_parents[i]))
+                } else {
+                    local(record.target_node())
+                },
                 record.bind.load(Ordering::Relaxed),
                 s.nodes[index].is_some(),
                 kids.children(),

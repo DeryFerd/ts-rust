@@ -2273,13 +2273,29 @@ impl Node {
     }
 
     /// Go `node.Flags`: parser flags plus the flags the binder adds.
+    // PERF: AST node records, step 2. The bind ORs its flags into the record
+    // (`bind_store_records`), so a published store node reads one word.
     #[inline]
     #[must_use]
     pub fn flags(self) -> NodeFlags {
         // Every tier 0 store file is published.
         match frozen_store_flags(self) {
-            Some(flags) => flags | self.added_flags(),
+            Some(flags) => {
+                debug_assert_eq!(flags, self.old_flags(flags), "astrec2: flags of {self:?}");
+                flags
+            }
             None => self.flags_slow(),
+        }
+    }
+
+    /// AST node records, step 2a, debug builds: Go `node.Flags` of a
+    /// published store node from the `GoFile` (parser flags) and the old
+    /// binder data. `record` (the record flags) before the `GoFile` exists.
+    fn old_flags(self, record: NodeFlags) -> NodeFlags {
+        let index = nid(self).index();
+        match crate::ast::try_with_go_file(self.file_index(), |g| g.parser_flags[index]) {
+            Some(parser) => parser | self.added_flags(),
+            None => record,
         }
     }
 
@@ -2333,10 +2349,15 @@ impl Node {
             return synthetic_flags(self);
         }
         if let Some(h) = try_store_header(self) {
-            // The parser reads flags before the file is published. A
-            // published file has a GoFile and binder data.
+            // The parser reads flags before the file is published. The bind
+            // of a published file ORs its flags into the record.
+            #[cfg(debug_assertions)]
             if is_published(self.file_index()) {
-                return h.flags | self.added_flags();
+                debug_assert_eq!(
+                    h.flags,
+                    self.old_flags(h.flags),
+                    "astrec2: flags of {self:?}"
+                );
             }
             return h.flags;
         }
@@ -2576,15 +2597,32 @@ impl Node {
     // PORT: Go reads `DeclarationData().Symbol`. The binder only sets the
     // symbol on declaration nodes, so reading the bind data directly is the
     // same.
+    // PERF: AST node records, step 2. The symbol of a published store node
+    // is in its record (`frozen_store_symbol`).
     #[must_use]
     pub fn symbol(self) -> SymbolId {
-        self.bind_field(|b| b.symbol)
+        let symbol = match frozen_store_symbol(self) {
+            Some(symbol) => symbol,
+            None => self.bind_miss().symbol,
+        };
+        debug_assert_eq!(
+            symbol,
+            self.bind_field(|b| b.symbol),
+            "astrec2: symbol of {self:?}"
+        );
+        symbol
     }
 
     // Go: ast.go:237 LocalSymbol
     #[must_use]
     pub fn local_symbol(self) -> SymbolId {
-        self.bind_field(|b| b.local_symbol)
+        let symbol = self.bind_extra(|e| e.local_symbol);
+        debug_assert_eq!(
+            symbol,
+            self.bind_field(|b| b.local_symbol),
+            "astrec2: local symbol of {self:?}"
+        );
+        symbol
     }
 
     // Go: ast.go:245 Locals
@@ -2598,7 +2636,13 @@ impl Node {
             debug_assert!(self.bind_field(|b| b.locals.is_nil()));
             return SymbolTable::NIL;
         }
-        self.bind_field(|b| b.locals)
+        let locals = self.bind_extra(|e| e.locals);
+        debug_assert_eq!(
+            locals,
+            self.bind_field(|b| b.locals),
+            "astrec2: locals of {self:?}"
+        );
+        locals
     }
 
     /// Go `LocalsContainerData().NextContainer`.
@@ -2609,26 +2653,123 @@ impl Node {
             debug_assert!(self.bind_field(|b| b.next_container.is_nil()));
             return Node::NIL;
         }
-        self.bind_field(|b| b.next_container)
+        let next = self.bind_extra(|e| e.next_container);
+        debug_assert_eq!(
+            next,
+            self.bind_field(|b| b.next_container),
+            "astrec2: next container of {self:?}"
+        );
+        next
     }
 
     /// Go `FlowNodeData().FlowNode`.
+    // PERF: AST node records, step 2. The flow node of a published store
+    // node is in the low half of its `bind` word (the flow node is in the
+    // same file).
     #[must_use]
     pub fn flow_node(self) -> FlowNodeId {
-        self.bind_field(|b| b.flow_node)
+        let flow = match frozen_store_bind_word(self) {
+            Some(word) => {
+                let low = word & 0xffff_ffff;
+                if low == 0 {
+                    FlowNodeId::NIL
+                } else {
+                    FlowNodeId((self.0 & !0xffff_ffff) | low)
+                }
+            }
+            None => self.bind_miss().flow_node,
+        };
+        debug_assert_eq!(
+            flow,
+            self.bind_field(|b| b.flow_node),
+            "astrec2: flow of {self:?}"
+        );
+        flow
     }
 
     /// Go `EndFlowNode` of a function-like or module node.
     #[must_use]
     pub fn end_flow_node(self) -> FlowNodeId {
-        self.bind_field(|b| b.end_flow_node)
+        let flow = self.bind_extra(|e| e.end_flow_node);
+        debug_assert_eq!(
+            flow,
+            self.bind_field(|b| b.end_flow_node),
+            "astrec2: end flow of {self:?}"
+        );
+        flow
     }
 
     /// Go `ReturnFlowNode` of a function-like node or class static block.
     #[must_use]
     pub fn return_flow_node(self) -> FlowNodeId {
-        self.bind_field(|b| b.return_flow_node)
+        let flow = self.bind_extra(|e| e.return_flow_node);
+        debug_assert_eq!(
+            flow,
+            self.bind_field(|b| b.return_flow_node),
+            "astrec2: return flow of {self:?}"
+        );
+        flow
     }
+
+    /// AST node records, step 2: reads one field of the binder fields of
+    /// this node that are not in its record (`NodeBindExtra`). A published
+    /// store node reads the index in its `bind` word, and only a node that
+    /// has an entry reads its `GoFile` (`FileNodeBind::extra`).
+    #[inline]
+    fn bind_extra<T>(self, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
+        match frozen_store_bind_word(self) {
+            Some(word) => match (word >> 32) as u32 {
+                0 => field(&NodeBindExtra::NONE),
+                extra => match crate::ast::static_go_file(self.file_index()) {
+                    Some(go_file) => field(node_extra_in(go_file, extra)),
+                    None => self.bind_extra_slow(extra, field),
+                },
+            },
+            None => field(&NodeBindExtra::of(&self.bind_miss())),
+        }
+    }
+
+    /// `bind_extra` for a node of a freeable file version, which owns its
+    /// `GoFile` (the hot file version first).
+    #[cold]
+    #[inline(never)]
+    fn bind_extra_slow<T>(self, extra: u32, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
+        let file = self.file_index();
+        if crate::ast::is_hot_file(file) {
+            return crate::ast::with_hot_go_file(|go_file| field(node_extra_in(go_file, extra)));
+        }
+        crate::ast::with_go_file(file, |go_file| field(node_extra_in(go_file, extra)))
+    }
+
+    /// AST node records, step 2: the binder data of a node that has no
+    /// published record: a factory node (its thread's data), or a store node
+    /// of a file that is not bound yet (nil values). Panics as `go_file`
+    /// for a store node of a file that is not published.
+    #[cold]
+    #[inline(never)]
+    fn bind_miss(self) -> NodeBindData {
+        if is_synthetic_node(self) {
+            return synthetic_bind(self);
+        }
+        crate::ast::with_go_file(self.file_index(), |go_file| {
+            debug_assert!(
+                go_file.node_bind.get().is_none(),
+                "astrec2: a bound file with no published records"
+            );
+        });
+        NO_BIND
+    }
+}
+
+/// AST node records, step 2: extras entry `extra` (index + 1) of the bound
+/// file `go_file`.
+#[inline]
+fn node_extra_in(go_file: &GoFile, extra: u32) -> &NodeBindExtra {
+    go_file
+        .node_bind
+        .get()
+        .expect("a record with binder extras is in a bound file")
+        .extra(extra)
 }
 
 impl FlowNodeId {

@@ -2560,10 +2560,50 @@ pub struct NodeBindData {
     pub added_flags: NodeFlags,
 }
 
+/// AST node records, step 2: the binder fields of one node that are not in
+/// its `NodeRecord` (`ast/store.rs`, which holds the symbol, the flow node
+/// and the added flags). Most nodes have none of them: only locals
+/// containers, exported declarations and function-like nodes do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeBindExtra {
+    pub local_symbol: SymbolId,
+    pub locals: SymbolTable,
+    pub next_container: Node,
+    pub end_flow_node: FlowNodeId,
+    pub return_flow_node: FlowNodeId,
+}
+
+impl NodeBindExtra {
+    /// The fields of `data` that are not in the record.
+    #[inline]
+    #[must_use]
+    pub fn of(data: &NodeBindData) -> Self {
+        NodeBindExtra {
+            local_symbol: data.local_symbol,
+            locals: data.locals,
+            next_container: data.next_container,
+            end_flow_node: data.end_flow_node,
+            return_flow_node: data.return_flow_node,
+        }
+    }
+
+    /// The empty fields: a node with no extras entry.
+    pub const NONE: Self = NodeBindExtra {
+        local_symbol: SymbolId::NIL,
+        locals: SymbolTable::NIL,
+        next_container: Node::NIL,
+        end_flow_node: FlowNodeId::NIL,
+        return_flow_node: FlowNodeId::NIL,
+    };
+}
+
 /// Binder data of every node of one bound file, stored compactly. Most
 /// nodes have no data, or the same data as the node before them (a run of
 /// identifiers in one flow region), so they share one entry. Each node keeps
 /// one byte: the offset of its entry from the first entry of its block.
+/// AST node records, step 2: the install also writes the data into the
+/// node records and keeps the fields that are not in a record in `extras`
+/// (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
     /// Per node, by `NodeId::index()`: entry offset in its block, or
@@ -2572,6 +2612,9 @@ pub struct FileNodeBind {
     /// Per block of `NODE_BIND_BLOCK` nodes: the index of its first entry.
     bases: Vec<u32>,
     entries: Vec<NodeBindData>,
+    /// AST node records, step 2: the `NodeBindExtra` entries of the nodes,
+    /// by the index + 1 in the `bind` word of their records.
+    extras: Box<[NodeBindExtra]>,
 }
 
 const NODE_BIND_BLOCK_BITS: usize = 7;
@@ -2629,7 +2672,52 @@ impl FileNodeBind {
             slots,
             bases,
             entries,
+            extras: Box::default(),
         }
+    }
+
+    /// Each node that has data, in node order: its `NodeId::index()`, the
+    /// index of its entry (nodes that share an entry give the same index)
+    /// and the data.
+    pub fn nodes(&self) -> impl Iterator<Item = (usize, usize, &NodeBindData)> {
+        self.slots
+            .chunks(NODE_BIND_BLOCK)
+            .zip(&self.bases)
+            .enumerate()
+            .flat_map(move |(block, (slots, &base))| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &offset)| offset != NO_NODE_BIND)
+                    .map(move |(i, &offset)| {
+                        let entry = base as usize + offset as usize;
+                        (
+                            (block << NODE_BIND_BLOCK_BITS) + i,
+                            entry,
+                            &self.entries[entry],
+                        )
+                    })
+            })
+    }
+
+    /// AST node records, step 2: sets the extras entries that the install
+    /// made (`ast::bind_store_records`).
+    pub fn set_extras(&mut self, extras: Vec<NodeBindExtra>) {
+        self.extras = extras.into_boxed_slice();
+    }
+
+    /// AST node records, step 2: the extras entry whose index + 1 is
+    /// `extra` (the high half of the `bind` word of a record, not 0).
+    #[inline]
+    #[must_use]
+    pub fn extra(&self, extra: u32) -> &NodeBindExtra {
+        &self.extras[extra as usize - 1]
+    }
+
+    /// AST node records, step 2: the extras entries.
+    #[must_use]
+    pub fn extras(&self) -> &[NodeBindExtra] {
+        &self.extras
     }
 
     /// The distinct data entries, for remapping ids in place. Non-empty data
@@ -2672,6 +2760,7 @@ impl FileNodeBind {
             slots,
             bases,
             entries,
+            extras: Box::default(),
         })
     }
 
