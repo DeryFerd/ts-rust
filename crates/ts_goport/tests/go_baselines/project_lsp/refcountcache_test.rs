@@ -26,7 +26,10 @@ use super::projecttestutil::{FileMap, files};
 use super::util::*;
 
 // Go: refcountcache_test.go:21 TestContentMappedParseCacheBundleLifetime (tsgo#4712)
-// PORT: Go uses empty `&ast.SourceFile{}` values; here two parsed empty files.
+// PORT: Go uses empty `&ast.SourceFile{}` values and does not parse. Here two
+// parsed empty files. They need absolute, normalized names, because the parser
+// keeps the Go NewSourceFile check on the file name. The test only checks the
+// identity of the files, so the names do not change what it tests.
 #[test]
 fn test_content_mapped_parse_cache_bundle_lifetime() {
     let cache = new_content_mapped_parse_cache(RefCountCacheOptions::default());
@@ -39,12 +42,20 @@ fn test_content_mapped_parse_cache_bundle_lifetime() {
         0,
     );
     let canonical = Rc::new(parser::parse_source_file(
-        &SourceFileParseOptions::default(),
+        &SourceFileParseOptions {
+            file_name: "/canonical.ts".to_string(),
+            path: Path("/canonical.ts".to_string()),
+            ..Default::default()
+        },
         "",
         ScriptKind::TS,
     ));
     let supplemental = Rc::new(parser::parse_source_file(
-        &SourceFileParseOptions::default(),
+        &SourceFileParseOptions {
+            file_name: "/supplemental.ts".to_string(),
+            path: Path("/supplemental.ts".to_string()),
+            ..Default::default()
+        },
         "",
         ScriptKind::TS,
     ));
