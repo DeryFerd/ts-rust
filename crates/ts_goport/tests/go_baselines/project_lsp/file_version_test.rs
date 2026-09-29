@@ -192,15 +192,15 @@ child_test! {
         assert!(!static_diagnostics.is_empty(), "index.js has a parse error");
 
         edit(&session, JS_URI, 2, (1, 17), (1, 18), "2");
-        let (probe, root, statement) = {
+        let (probe, edited, statement) = {
             let p = program(&session, JS_URI);
             let root = root(&p, JS_FILE);
             let probe = file_version_probe(root).expect("the edited version is freeable");
             (probe, root, root.statements().get(0))
         };
         // The edit keeps every length, so the positions do not change.
-        assert_eq!(diagnostics(root), static_diagnostics);
-        let jsdoc = statement.js_doc(root);
+        assert_eq!(diagnostics(edited), static_diagnostics);
+        let jsdoc = statement.js_doc(edited);
         assert_eq!(jsdoc.len(), 1);
         assert_eq!(jsdoc.get(0).kind(), SyntaxKind::JsDoc);
 
@@ -210,9 +210,9 @@ child_test! {
         assert!(probe.is_freed(), "the version of the released program is not freed");
 
         let _program = ls_program::enter(&live);
-        let stale = format!("file version {} is released", root.file_index());
+        let stale = format!("file version {} is released", edited.file_index());
         let info = panic_message(|| {
-            let _ = source_file_info(root).file_name.len();
+            let _ = source_file_info(edited).file_name.len();
         });
         assert_eq!(info.as_deref(), Some(stale.as_str()), "a GoFile read of a dead version");
         let kind = panic_message(|| {

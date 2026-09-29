@@ -372,7 +372,8 @@ pub fn load(file: Node, symbols: &mut SymbolArena) -> Option<BoundFile> {
     if mode == Mode::Off || !symbols.is_new() {
         return None;
     }
-    let lib = bundled::bundled_lib_name(&source_file_info(file).file_name)?;
+    let info = source_file_info(file);
+    let lib = bundled::bundled_lib_name(&info.file_name)?;
     let entry = entries().iter().find(|entry| entry.name == lib)?;
     let start = (mode == Mode::Trace).then(std::time::Instant::now);
     let result = load_section(file, entry.section);

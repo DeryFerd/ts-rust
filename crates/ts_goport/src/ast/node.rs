@@ -5303,11 +5303,14 @@ fn diagnostic_list(info: &crate::program::SourceFileInfo, key: usize) -> &[Diagn
 }
 
 /// Diagnostic list `list` of the info of `file` (see `source_file_info`).
+// PORT: the part must stay a place expression, with no braces around it. A
+// block is a value, so `&{ .. }` would move the list into a temporary.
 fn source_file_list(file: Node, list: DiagnosticList) -> FileRef<[Diagnostic]> {
+    use crate::ast::file_version::go_file_ref;
     let file = published_source_file(file);
-    crate::ast::file_version::go_file_ref!(file.file_index(), list as usize, |g, key| {
-        *diagnostic_list(&g.info, key)
-    })
+    go_file_ref!(file.file_index(), list as usize, |g, key| *diagnostic_list(
+        &g.info, key
+    ))
 }
 
 // Go: ast.go:2582 (*SourceFile).Diagnostics
