@@ -66,7 +66,8 @@ pub struct Binder {
     pub file_index: usize,
     /// Rust-only: parser flags of `file` (`GoFile::parser_flags`), indexed
     /// by `NodeId::index()`. Cached so `node_flags` skips the program lookup.
-    pub parser_flags: &'static [NodeFlags],
+    /// The guard pins a freeable file version while the binder runs.
+    pub parser_flags: FileRef<[NodeFlags]>,
     /// Rust-only: binder data per node of `file`, indexed by `NodeId::index()`.
     pub node_bind: NodeBindBuilder,
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
@@ -269,8 +270,9 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
 /// The snapshot generator and its test use it for the live side.
 pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile {
     let file_index = file.file_index();
-    let go_file = crate::ast::go_file(file_index);
-    let node_count = go_file.parser_flags.len();
+    let parser_flags =
+        crate::ast::file_version::go_file_ref!(file_index, 0, |g, _key| g.parser_flags[..]);
+    let node_count = parser_flags.len();
     // PERF: U1 (e). A store file has counts from its slot kinds, made when
     // it was frozen, so the flow nodes grow with no copy. Its entry count
     // also counts one entry per identifier flow node, which bind C keeps in
@@ -290,7 +292,7 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
     let mut b = Binder {
         file,
         file_index,
-        parser_flags: &go_file.parser_flags,
+        parser_flags,
         symbols: std::mem::take(symbols),
         node_bind,
         flow_nodes,
@@ -513,7 +515,7 @@ impl Binder {
 
     /// Go `b.file.IsDeclarationFile`.
     pub fn file_is_declaration_file(&self) -> bool {
-        source_file_info(self.file).is_declaration_file
+        with_source_file_info(self.file, |info| info.is_declaration_file)
     }
 
     /// Go `ast.IsExternalOrCommonJSModule(b.file)` while binding. The binder
@@ -783,7 +785,7 @@ impl Binder {
 
     /// `get_declaration_name` on `d`, the data of `node` that the caller
     /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
-    pub fn get_declaration_name_in(&mut self, node: Node, d: &'static NodeData) -> Name {
+    pub fn get_declaration_name_in(&mut self, node: Node, d: LoadedData) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
                 Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
@@ -1690,7 +1692,7 @@ impl Binder {
 
     // Go: binder/binder.go:752 bindPropertyWorker
     // PERF: query Q7-3. `d` is the data of `node`, loaded once by `bind`.
-    pub fn bind_property_worker(&mut self, node: Node, d: &'static NodeData) {
+    pub fn bind_property_worker(&mut self, node: Node, d: LoadedData) {
         // Go `ast.IsAutoAccessorPropertyDeclaration(node)` on the loaded data.
         let is_auto_accessor = is_property_declaration(node)
             && has_syntactic_modifier_in(node, d, ModifierFlags::ACCESSOR);
@@ -1846,7 +1848,7 @@ impl Binder {
                 diag::Global_module_exports_may_only_appear_in_module_files,
                 vec![],
             );
-        } else if !source_file_info(parent).is_declaration_file {
+        } else if !with_source_file_info(parent, |info| info.is_declaration_file) {
             self.error_on_node(
                 node,
                 diag::Global_module_exports_may_only_appear_in_declaration_files,

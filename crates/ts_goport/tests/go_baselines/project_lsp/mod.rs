@@ -33,6 +33,19 @@ macro_rules! child_test {
             });
         }
     };
+    // The child runs with the environment variables `$env` set.
+    (env $env:expr; $(#[$meta:meta])* fn $name:ident() $body:block) => {
+        $(#[$meta])*
+        #[test]
+        fn $name() {
+            let path = concat!(module_path!(), "::", stringify!($name));
+            let test = path.split_once("::").map_or(path, |(_, rest)| rest);
+            crate::support::child::run_test_in_child_with_env(test, $env, || {
+                crate::project_lsp::projecttestutil::install_fs_override();
+                $body
+            });
+        }
+    };
 }
 
 pub(crate) mod autoimporttestutil;
@@ -59,6 +72,7 @@ mod contentmapper_test;
 mod customconfigfilename_test;
 mod dirty_syncmap_test;
 mod extendedconfigcache_test;
+mod file_version_test;
 mod logging_logtree_test;
 mod lsp_dynamic_queue_test;
 mod lsp_progress_test;

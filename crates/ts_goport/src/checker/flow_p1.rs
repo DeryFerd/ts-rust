@@ -3,6 +3,7 @@
 //! `getNarrowedTypeWorker`.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 // Go: checker/flow.go:19 FlowType
@@ -40,27 +41,29 @@ pub struct SharedFlow {
 
 /// Go `*ast.FlowReduceLabelData` on the flow state: the target label and
 /// the temporary antecedent list of a reduce label flow node.
-// PERF: both parts borrow the flow node's `antecedents`
-// (`[target, antecedents...]`, see `FlowNode::as_flow_reduce_label_data`),
-// so a push copies no list and `get_branch_label_antecedents` returns a
-// borrowed slice, not a copy.
-#[derive(Clone, Copy, Debug)]
+// PERF: the parts come from the flow node's `antecedents`
+// (`[target, antecedents...]`, see `FlowNode::as_flow_reduce_label_data`).
+// The list is a copy: a flow node of a freeable file version (lsshells M3b)
+// is not `'static`, so the flow state cannot borrow it. Reduce labels come
+// only from `finally` blocks; `get_branch_label_antecedents` still borrows
+// the list of an ordinary branch label (perf14).
+#[derive(Clone, Debug)]
 pub struct ReduceLabel {
     pub target: FlowNodeId,
-    pub antecedents: &'static [FlowNodeId],
+    pub antecedents: Box<[FlowNodeId]>,
 }
 
 impl ReduceLabel {
     /// Go `flow.Node.AsFlowReduceLabelData()` of a reduce label flow node.
     #[must_use]
-    pub fn of(flow_data: &'static FlowNode) -> Self {
+    pub fn of(flow_data: &FlowNode) -> Self {
         assert!(
             flow_data.flags.intersects(FlowFlags::REDUCE_LABEL),
             "not a reduce label flow node"
         );
         Self {
             target: flow_data.antecedents[0],
-            antecedents: &flow_data.antecedents[1..],
+            antecedents: flow_data.antecedents[1..].into(),
         }
     }
 }
@@ -221,8 +224,12 @@ impl Checker {
         }
         f.borrow_mut().depth += 1;
         let mut shared_flow = FlowNodeId::NIL;
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        // lsshells M3 repair: one guard for the whole walk, so the steps in
+        // one freeable file version share one pin (`get_flow_in`).
+        let mut flow_data_guard = None;
         loop {
-            let flow_data = flow.get_flow();
+            let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 // We cache results of flow type resolution for shared nodes that were previously visited in
@@ -262,7 +269,7 @@ impl Checker {
                     flow = antecedents[0];
                     continue;
                 }
-                t = self.get_type_at_flow_branch_label(f, antecedents);
+                t = self.get_type_at_flow_branch_label(f, &antecedents);
             } else if flags.intersects(FlowFlags::LOOP_LABEL) {
                 if flow_data.antecedents.len() <= 1 {
                     flow = flow_data.antecedents[0];
@@ -330,32 +337,36 @@ impl Checker {
 
 // Go: checker/flow.go:204 getBranchLabelAntecedents
 // PORT: Go returns the `*ast.FlowList`; here it is the antecedent slice of a
-// flow node (see `core::FlowNode::antecedents` and `ReduceLabel`), borrowed.
+// flow node (see `core::FlowNode::antecedents` and `ReduceLabel`): borrowed
+// from `flow_data`, or a copy of a reduce label's list (the caller changes
+// the flow state while it walks the list).
 // `flow_data` is `flow.get_flow()`, which the caller has read.
-pub fn get_branch_label_antecedents(
+pub fn get_branch_label_antecedents<'a>(
     flow: FlowNodeId,
-    flow_data: &'static FlowNode,
+    flow_data: &'a FlowNode,
     reduce_labels: &[ReduceLabel],
-) -> &'static [FlowNodeId] {
+) -> Cow<'a, [FlowNodeId]> {
     let mut i = reduce_labels.len();
     while i != 0 {
         i -= 1;
         let data = &reduce_labels[i];
         if data.target == flow {
-            return data.antecedents;
+            return Cow::Owned(data.antecedents.to_vec());
         }
     }
-    &flow_data.antecedents
+    Cow::Borrowed(&flow_data.antecedents)
 }
 
 impl Checker {
     // Go: checker/flow.go:216 getTypeAtFlowAssignment
-    // PERF: `flow_data` is `flow.get_flow()`, which the caller has read.
+    // PERF: `flow_data` is `flow.get_flow()`, which the caller has read
+    // (perf14), so a freeable file version is not pinned again (lsshells M3
+    // repair).
     pub fn get_type_at_flow_assignment(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
-        flow_data: &'static FlowNode,
+        flow_data: &FlowNode,
     ) -> FlowType {
         let node = flow_data.node;
         let (reference, declared_type) = {
@@ -492,7 +503,7 @@ impl Checker {
     pub fn get_type_at_flow_call(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow_data: &'static FlowNode,
+        flow_data: &FlowNode,
     ) -> FlowType {
         let signature = self.get_effects_signature(flow_data.node);
         if signature.is_some() {
@@ -626,7 +637,7 @@ impl Checker {
     pub fn get_type_at_flow_condition(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow_data: &'static FlowNode,
+        flow_data: &FlowNode,
     ) -> FlowType {
         let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
         if self.ty(flow_type.t).flags.intersects(TypeFlags::NEVER) {

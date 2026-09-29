@@ -102,7 +102,9 @@ impl Checker {
                 Rc::new(RefCell::new(Vec::new()));
             let mut reg_exp_scanner = crate::frontend::scanner::new_scanner();
             reg_exp_scanner.set_script_target(self.language_version);
-            reg_exp_scanner.set_language_variant(source_file_info(source_file).language_variant);
+            reg_exp_scanner.set_language_variant(with_source_file_info(source_file, |info| {
+                info.language_variant
+            }));
             let sink = reports.clone();
             reg_exp_scanner.set_on_error(Some(Box::new(
                 move |message: &'static Message, start: i32, length: i32, args: Vec<String>| {

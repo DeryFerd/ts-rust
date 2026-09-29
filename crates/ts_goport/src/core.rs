@@ -1026,6 +1026,12 @@ pub struct Symbol {
 /// is cloned; a clone copies owned chunks. The first write to a shared chunk
 /// takes it back (a copy only when a clone still uses it).
 /// Reads cost one extra pointer hop compared to a `Vec`.
+///
+/// Holes (lsshells M3d): `end_chunk` moves the length to the next chunk
+/// start, so the indexes left in the last chunk hold no value, and
+/// `free_chunks` makes whole chunks empty. A hole is an empty (or short)
+/// owned chunk, so reads keep their code: a read of a hole panics (index
+/// out of bounds). Indexes never move and are never used again.
 #[derive(Clone, Debug)]
 pub struct CowChunks<T> {
     chunks: Vec<Chunk<T>>,
@@ -1187,14 +1193,49 @@ impl<T: Clone> CowChunks<T> {
     }
 
     /// Makes the chunks that hold values from index `from` on shared, so
-    /// clones copy none of them. Pass 0 to share every chunk.
+    /// clones copy none of them. Pass 0 to share every chunk. A freed chunk
+    /// (`free_chunks`) stays an empty owned chunk.
     pub fn share_from(&mut self, from: usize) {
         let first = (from >> COW_CHUNK_SHIFT).min(self.chunks.len());
         for chunk in &mut self.chunks[first..] {
-            if let Chunk::Owned(values) = chunk {
+            if let Chunk::Owned(values) = chunk
+                && !values.is_empty()
+            {
                 *chunk = Chunk::Shared(Arc::new(std::mem::take(values)));
             }
         }
+    }
+
+    /// Moves the length to the start of the next chunk, so the next value
+    /// starts a new chunk. The indexes left in the last chunk hold no value.
+    /// Does nothing when the length is at a chunk start.
+    pub fn end_chunk(&mut self) {
+        self.len = self.len.next_multiple_of(COW_CHUNK_LEN);
+    }
+
+    /// Frees the chunks of the indexes from `from` to `to`, which are chunk
+    /// starts (`end_chunk`). Each becomes an empty owned chunk, so a read of
+    /// one of these indexes panics and later indexes do not move. A clone
+    /// that shares a freed chunk keeps its values until it drops.
+    pub fn free_chunks(&mut self, from: usize, to: usize) {
+        debug_assert!(
+            from & COW_CHUNK_MASK == 0 && to & COW_CHUNK_MASK == 0,
+            "freed indexes {from}..{to} are not whole chunks"
+        );
+        let end = (to >> COW_CHUNK_SHIFT).min(self.chunks.len());
+        let first = from.div_ceil(COW_CHUNK_LEN).min(end);
+        for chunk in &mut self.chunks[first..end] {
+            *chunk = Chunk::Owned(Vec::new());
+        }
+    }
+
+    /// The number of chunks that hold values (freed chunks do not count).
+    #[must_use]
+    pub fn live_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| !chunk.values().is_empty())
+            .count()
     }
 
     /// Moves the values from index `skip` on into chunks for `append_aligned`
@@ -1288,6 +1329,111 @@ pub struct AlignedChunks<T> {
 impl<T: Clone> Default for CowChunks<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// PORT: no Go counterpart. Holes of the binder lineage (lsshells M3d).
+#[cfg(test)]
+mod hole_tests {
+    use super::*;
+
+    /// Pushes each index as its value until the length is `end`.
+    fn push_to(values: &mut CowChunks<usize>, end: usize) {
+        while values.len() < end {
+            let index = values.len();
+            values.push(index);
+        }
+    }
+
+    // A range that `end_chunk` starts and ends is whole chunks. Freeing it
+    // makes its indexes (and the padding before it) holes that panic on a
+    // read, keeps every other index, and a clone keeps the freed values.
+    #[test]
+    fn freed_chunks_are_holes_and_other_indexes_stay() {
+        let mut values = CowChunks::new();
+        push_to(&mut values, 300);
+        values.end_chunk();
+        let start = values.len();
+        assert_eq!(start, 2 * COW_CHUNK_LEN);
+        push_to(&mut values, start + 600);
+        values.end_chunk();
+        let end = values.len();
+        assert_eq!(end, 5 * COW_CHUNK_LEN);
+        push_to(&mut values, end + 10);
+        values.share_from(0);
+        let clone = values.clone();
+        assert_eq!(values.live_chunks(), 6);
+
+        values.free_chunks(start, end);
+        assert_eq!(values.live_chunks(), 3);
+        assert_eq!((*values.get(299), *values.get(end + 9)), (299, end + 9));
+        let read = |index: usize| std::panic::catch_unwind(|| *values.get(index)).is_err();
+        assert!(read(start + 1), "a read of a freed index panics");
+        assert!(read(400), "a read of the padding panics");
+        assert_eq!(
+            *clone.get(start + 1),
+            start + 1,
+            "the clone keeps its chunks"
+        );
+        assert_eq!(clone.live_chunks(), 6);
+
+        values.share_from(0);
+        assert_eq!(values.live_chunks(), 3, "a freed chunk stays empty");
+        values.push(end + 10);
+        assert_eq!((values.len(), *values.get(end + 10)), (end + 11, end + 10));
+    }
+
+    // The values of a freed chunk drop with the last clone that shares it.
+    #[test]
+    fn freed_values_drop_with_the_last_clone() {
+        let token = Arc::new(());
+        let mut values = CowChunks::new();
+        for _ in 0..10 {
+            values.push(Arc::clone(&token));
+        }
+        values.end_chunk();
+        values.share_from(0);
+        let clone = values.clone();
+        values.free_chunks(0, COW_CHUNK_LEN);
+        assert_eq!(Arc::strong_count(&token), 11);
+        drop(clone);
+        assert_eq!(Arc::strong_count(&token), 1);
+    }
+
+    // A file arena joins at aligned offsets as it would bind there: the
+    // offsets are `ArenaOffsets::aligned`, its ids start at a chunk start,
+    // and its tables point to its symbols. Freeing its range keeps the
+    // symbols before it.
+    #[test]
+    fn file_arena_joins_at_a_chunk_start() {
+        let mut arena = SymbolArena::new();
+        let before = arena.new_symbol(SymbolFlags::NONE, "before");
+        for _ in 0..299 {
+            arena.new_symbol(SymbolFlags::NONE, "other");
+        }
+        let offsets = arena.next_file_offsets();
+        arena.end_chunk();
+        assert_eq!(arena.next_file_offsets(), offsets.aligned());
+        assert_eq!(offsets.aligned().aligned(), offsets.aligned());
+
+        let mut file = SymbolArena::new();
+        let symbol = file.new_symbol(SymbolFlags::NONE, "f");
+        let members = file.new_table();
+        file.set(members, "f", symbol);
+        file.sym_mut(symbol).members = members;
+        let start = arena.mark();
+        let moved = arena.append_file_arena(file, true);
+        assert_eq!(moved, offsets.aligned());
+        let id = moved.symbol(symbol);
+        assert_eq!(id.index(), 2 * COW_CHUNK_LEN);
+        assert_eq!(arena.sym(id).name.as_str(), "f");
+        assert_eq!(arena.get(arena.sym(id).members, "f"), id);
+
+        arena.end_chunk();
+        let live = arena.live_chunk_count();
+        arena.free_range(start, arena.mark());
+        assert_eq!(arena.live_chunk_count(), live - 2);
+        assert_eq!(arena.sym(before).name.as_str(), "before");
     }
 }
 
@@ -1542,6 +1688,9 @@ impl Table {
 /// the binder's symbol and table chunks; a checker copies a chunk only when
 /// it first writes to it. The binder writes without atomic operations and
 /// then shares what it wrote (`share_since`), so the copy copies nothing.
+/// The binder lineage (`program.rs`) binds a freeable file version into
+/// whole chunks of its own (`end_chunk`) and frees them when the version
+/// dies (`free_range`, lsshells M3d).
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
@@ -1839,6 +1988,32 @@ impl SymbolArena {
         self.tables.share_from(mark.tables);
     }
 
+    /// Ends the last symbol chunk and the last table chunk, so the next
+    /// symbol and table start new chunks (`CowChunks::end_chunk`). The ids
+    /// skipped here hold nothing. `next_file_offsets` is then
+    /// `ArenaOffsets::aligned`.
+    pub fn end_chunk(&mut self) {
+        self.symbols.end_chunk();
+        self.tables.end_chunk();
+    }
+
+    /// Frees the symbols and tables from `start` to `end`: the range of one
+    /// file version that `end_chunk` started and ended. Their ids become
+    /// holes, and a read of one panics. Other ids do not move. A clone that
+    /// shares the chunks (a program copy, a checker arena) keeps them until
+    /// it drops.
+    pub fn free_range(&mut self, start: ArenaMark, end: ArenaMark) {
+        self.symbols.free_chunks(start.symbols, end.symbols);
+        self.tables.free_chunks(start.tables, end.tables);
+    }
+
+    /// The symbol and table chunks that hold values. Tests use it to see
+    /// that `free_range` frees.
+    #[must_use]
+    pub fn live_chunk_count(&self) -> usize {
+        self.symbols.live_chunks() + self.tables.live_chunks()
+    }
+
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
     #[inline]
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
@@ -1953,15 +2128,19 @@ impl SymbolArena {
     /// Appends the symbols and tables of `file_arena`, an arena that one
     /// file was bound into on its own, and returns how its ids moved. The
     /// ids get the values that binding the file into this arena would give:
-    /// every id moves by the number of entries already here.
-    pub fn append_file_arena(&mut self, file_arena: SymbolArena) -> ArenaOffsets {
+    /// every id moves by the number of entries already here. `freeable` is
+    /// as in `prepare_file_arena`.
+    pub fn append_file_arena(&mut self, file_arena: SymbolArena, freeable: bool) -> ArenaOffsets {
         let offsets = self.next_file_offsets();
-        self.append_prepared_file_arena(file_arena.prepare_file_arena(offsets))
+        self.append_prepared_file_arena(file_arena.prepare_file_arena(offsets, freeable))
     }
 
     /// Moves every id in this file arena by `offsets`, in place, and puts
     /// the entries in chunks for `append_prepared_file_arena` with the same
     /// offsets. It can run on another thread once the offsets are known.
+    /// The declaration lists of a static file leak (`make_static`), because
+    /// its symbols live until exit. A freeable file version (`freeable`,
+    /// lsshells M3d) keeps them owned, so they go with its chunks.
     // PORT: the binder writes a symbol id into the names of private
     // identifier symbols (`get_symbol_name_for_private_identifier`), so those
     // names move with the ids. Source text can spell a name of the same form
@@ -1973,7 +2152,7 @@ impl SymbolArena {
     // PERF: the entries are changed in place and moved by chunk. Rebuilding
     // each symbol in an iterator chain was most of the join time.
     #[must_use]
-    pub fn prepare_file_arena(self, offsets: ArenaOffsets) -> PreparedFileArena {
+    pub fn prepare_file_arena(self, offsets: ArenaOffsets, freeable: bool) -> PreparedFileArena {
         let SymbolArena {
             symbols,
             tables,
@@ -2008,8 +2187,11 @@ impl SymbolArena {
             symbol.exports = offsets.table(symbol.exports);
             symbol.parent = offsets.symbol(symbol.parent);
             symbol.export_symbol = offsets.symbol(symbol.export_symbol);
-            // Program symbols live until exit, so their lists can leak.
-            symbol.declarations.make_static();
+            // The symbols of a static file live until exit, so their lists
+            // can leak.
+            if !freeable {
+                symbol.declarations.make_static();
+            }
         });
         let tables = tables.into_aligned(1, offsets.tables as usize + 1, |table| {
             let mut renamed = false;
@@ -2258,6 +2440,23 @@ pub struct ArenaOffsets {
 }
 
 impl ArenaOffsets {
+    /// These offsets moved to the next chunk start: the offsets that
+    /// `SymbolArena::next_file_offsets` gives after `SymbolArena::end_chunk`.
+    /// Parallel binding gives a freeable file version, and the file after
+    /// it, these offsets (lsshells M3d).
+    #[must_use]
+    pub fn aligned(self) -> ArenaOffsets {
+        // An offset is the index of the next entry minus 1 (the nil entry).
+        let align = |offset: u32| {
+            let next = (offset as usize + 1).next_multiple_of(COW_CHUNK_LEN);
+            u32::try_from(next - 1).expect("arena overflow")
+        };
+        ArenaOffsets {
+            symbols: align(self.symbols),
+            tables: align(self.tables),
+        }
+    }
+
     /// The offsets of the file after a file with these offsets, where
     /// `file_arena` is the `SymbolArena::mark` of that file's own arena.
     /// Parallel binding adds the counts of the earlier files this way.
@@ -2869,10 +3068,12 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
 pub use goport_util::core::*;
 
 /// One version of a loaded source file: one per file id. The file registry
-/// (`ast/store.rs`) owns it from `publish_file_stores` on; read it with
-/// `crate::ast::go_file`. Program versions that share a file version share
-/// this value. Parser data is ready when the file is published. The binder
-/// fills the `OnceLock` fields once per file version.
+/// (`ast/store.rs`) owns it from `publish_file_stores` on, or the
+/// `FileVersion` of a freeable file version (lsshells M3b); read it with
+/// `crate::ast::go_file` (a `FileRef` guard) or `crate::ast::with_go_file`.
+/// Program versions that share a file version share this value. Parser
+/// data is ready when the file is published. The binder fills the
+/// `OnceLock` fields once per file version.
 pub struct GoFile {
     /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,
@@ -2898,16 +3099,17 @@ pub struct GoProgram {
     /// File ids in Go `Program.SourceFiles()` order.
     pub source_file_order: Vec<usize>,
     pub options: crate::options::CompilerOptions,
-    /// Binder symbols. Each checker clones this.
-    pub bound_symbols: std::sync::OnceLock<SymbolArena>,
+    // The binder symbols of the program are in its tables
+    // (`program::bound_symbols`, lsshells M2c), so a release frees them.
     /// Program state (`program::state()`). Set once, after the files are
     /// published.
     pub(crate) state: std::sync::OnceLock<&'static crate::program::ProgramState>,
 }
 
 impl GoProgram {
-    /// Go `Program.SourceFiles()`: the program files in Go order.
-    pub fn source_files(&self) -> impl Iterator<Item = &'static GoFile> {
+    /// Go `Program.SourceFiles()`: the program files in Go order. Each guard
+    /// pins a freeable file version while it lives (see `ast::go_file`).
+    pub fn source_files(&self) -> impl Iterator<Item = crate::ast::FileRef<GoFile>> {
         self.source_file_order
             .iter()
             .map(|&index| crate::ast::go_file(index))

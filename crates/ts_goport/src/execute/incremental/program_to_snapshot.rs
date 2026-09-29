@@ -567,7 +567,8 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
     }
 
     // Handle type reference directives
-    let path = source_file_info(file).path.as_str();
+    let info = source_file_info(file);
+    let path = info.path.as_str();
     for type_ref in get_resolved_type_reference_directives_in_file(path) {
         if !type_ref.resolved_file_name.is_empty() {
             add_referenced_file_from_file_name(

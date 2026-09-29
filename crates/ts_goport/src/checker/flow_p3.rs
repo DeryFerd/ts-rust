@@ -1022,7 +1022,9 @@ impl Checker {
             if flow == self.last_flow_node {
                 return self.last_flow_node_reachable;
             }
-            let flow_data = flow.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut flow_data_guard = None;
+            let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check && f.borrow().reduce_labels.is_empty() {
@@ -1067,7 +1069,7 @@ impl Checker {
                 // A branching point is reachable if any branch is reachable.
                 let antecedents =
                     get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
-                for &antecedent in antecedents {
+                for &antecedent in antecedents.iter() {
                     if self
                         .is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
                     {
@@ -1148,7 +1150,9 @@ impl Checker {
         let mut flow = flow;
         let mut no_cache_check = no_cache_check;
         loop {
-            let flow_data = flow.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut flow_data_guard = None;
+            let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check {
@@ -1178,7 +1182,7 @@ impl Checker {
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
                 let antecedents =
                     get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
-                for &antecedent in antecedents {
+                for &antecedent in antecedents.iter() {
                     if !self
                         .is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
                     {

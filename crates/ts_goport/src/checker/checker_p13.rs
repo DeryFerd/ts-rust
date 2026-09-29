@@ -1030,7 +1030,9 @@ impl Checker {
     ) {
         let value_declaration = self.sym(prop).value_declaration;
         if value_declaration.is_nil()
-            || source_file_info(get_source_file_of_node(node)).is_declaration_file
+            || with_source_file_info(get_source_file_of_node(node), |info| {
+                info.is_declaration_file
+            })
         {
             return;
         }
@@ -1570,9 +1572,10 @@ impl Checker {
                     // Don't contextually type `this` as `exports` in `exports.Point = function(x, y) { this.x = x; this.y = y; }`
                     if in_js && is_identifier(expression) {
                         let source_file = get_source_file_of_node(parent);
-                        if source_file_info(source_file)
-                            .common_js_module_indicator
-                            .is_some()
+                        if with_source_file_info(source_file, |info| {
+                            info.common_js_module_indicator
+                        })
+                        .is_some()
                         {
                             let resolved = self.get_resolved_symbol(expression);
                             if self

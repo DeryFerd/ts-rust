@@ -161,7 +161,7 @@ pub fn has_syntactic_modifier(node: Node, flags: ModifierFlags) -> bool {
 // PERF: U4 (bind A). A tier 0 store node reads the U1 (b) modifier column
 // (`frozen_store_modifier_flags`), as `Node::modifier_flags` does, not its
 // modifier list.
-pub fn has_syntactic_modifier_in(node: Node, d: &'static NodeData, flags: ModifierFlags) -> bool {
+pub fn has_syntactic_modifier_in(node: Node, d: LoadedData, flags: ModifierFlags) -> bool {
     if let Some(modifier_flags) = frozen_store_modifier_flags(node) {
         debug_assert_eq!(modifier_flags, node.modifiers_in(d).modifier_flags());
         return modifier_flags.intersects(flags);
@@ -451,7 +451,7 @@ pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+pub fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
@@ -590,7 +590,7 @@ pub fn walk_up_binding_elements_and_patterns(binding: Node) -> Node {
 
 // Go: ast/utilities.go:1271 IsSourceFileJS
 pub fn is_source_file_js(file: Node) -> bool {
-    let script_kind = source_file_info(file).script_kind;
+    let script_kind = with_source_file_info(file, |info| info.script_kind);
     script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }
 
@@ -836,7 +836,7 @@ pub fn get_name_of_declaration(declaration: Node) -> Node {
 /// `get_name_of_declaration` on `d`, the data of the non-nil `declaration`
 /// that the caller already loaded with `parsed_node_data` (query Q7-3, see
 /// `Node::name_in`).
-pub fn get_name_of_declaration_in(declaration: Node, d: &'static NodeData) -> Node {
+pub fn get_name_of_declaration_in(declaration: Node, d: LoadedData) -> Node {
     name_of_declaration(declaration, || declaration.name_in(d))
 }
 
@@ -1021,7 +1021,7 @@ pub fn has_dynamic_name(declaration: Node) -> bool {
 
 /// `has_dynamic_name` on `d`, the data of the non-nil `declaration` that
 /// the caller already loaded with `parsed_node_data` (query Q7-3).
-pub fn has_dynamic_name_in(declaration: Node, d: &'static NodeData) -> bool {
+pub fn has_dynamic_name_in(declaration: Node, d: LoadedData) -> bool {
     let name = get_name_of_declaration_in(declaration, d);
     name.is_some() && is_dynamic_name(name)
 }
@@ -1105,13 +1105,14 @@ pub fn is_ambient_module_symbol_name(s: &str) -> bool {
 // Go: ast/utilities.go:1641 IsExternalModule
 /// PORT: Go takes `*SourceFile`; this takes the SourceFile node.
 pub fn is_external_module(file: Node) -> bool {
-    source_file_info(file).external_module_indicator.is_some()
+    with_source_file_info(file, |info| info.external_module_indicator.is_some())
 }
 
 // Go: ast/utilities.go:1645 IsExternalOrCommonJSModule
 pub fn is_external_or_common_js_module(file: Node) -> bool {
-    let info = source_file_info(file);
-    info.external_module_indicator.is_some() || info.common_js_module_indicator.is_some()
+    with_source_file_info(file, |info| {
+        info.external_module_indicator.is_some() || info.common_js_module_indicator.is_some()
+    })
 }
 
 // Go: ast/utilities.go:1650 IsEffectiveExternalModule
@@ -1119,7 +1120,7 @@ pub fn is_external_or_common_js_module(file: Node) -> bool {
 pub fn is_effective_external_module(node: Node, compiler_options: &CompilerOptions) -> bool {
     is_external_module(node)
         || (is_common_js_containing_module_kind(compiler_options.get_emit_module_kind())
-            && source_file_info(node).common_js_module_indicator.is_some())
+            && with_source_file_info(node, |info| info.common_js_module_indicator.is_some()))
 }
 
 // Go: ast/utilities.go:1654 isCommonJSContainingModuleKind

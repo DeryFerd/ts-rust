@@ -1802,7 +1802,7 @@ pub fn get_line_of_position(file: Node, pos: i32) -> i32 {
 // Go: ls/completions.go:2459 getLineEndOfPosition
 pub fn get_line_end_of_position(file: Node, pos: i32) -> i32 {
     let line = get_line_of_position(file, pos);
-    let line_starts = get_ecma_line_starts(file);
+    let line_starts = &*get_ecma_line_starts(file);
     let last_char_pos: i32 = if (line + 1) as usize >= line_starts.len() {
         file.end()
     } else {
@@ -3211,7 +3211,7 @@ impl LanguageService {
         sorted_entries: Vec<CompletionItem>,
     ) -> Vec<CompletionItem> {
         let mut sorted_entries = sorted_entries;
-        let name_table = source_file_get_name_table(file);
+        let name_table = &*source_file_get_name_table(file);
         for (name, &pos) in name_table {
             // Skip identifiers produced only from the current location
             if pos == position {

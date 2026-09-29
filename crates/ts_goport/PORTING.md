@@ -127,7 +127,8 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 
 `checker/checker_p01.rs` defines `pub struct Checker` with every Go
 `Checker` field (snake), and these arenas and accessors:
-- `symbols: SymbolArena` (starts as a clone of `prog().bound_symbols`).
+- `symbols: SymbolArena` (starts as a clone of the program's binder
+  symbols, `program::bound_symbols()`).
   Access: `self.symbols.sym(s)`, `self.symbols.sym_mut(s)`; shorthand
   methods `self.sym(s) -> &Symbol` and `self.sym_mut(s)`.
 - `types: Vec<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
@@ -159,19 +160,37 @@ methods reach the AST through it.
   `n.end() -> i32`, `n.loc() -> TextRange` (Go `core.TextRange`, defined in
   node.rs with `pos()`/`end()`/`len()`).
 - `ast.GetSourceFileOfNode(n)` -> `get_source_file_of_node(n) -> Node`.
-  File data: `n.go_file() -> &'static GoFile` (any node);
+  File data: `n.go_file() -> FileRef<GoFile>` (any node);
   `file.AsSourceFile().X` for Go SourceFile fields -> `source_file_info(file).x`
   (parser/program fields, `program::SourceFileInfo`) or
   `file_bind_data(file).x` (binder fields, `core::FileBindData`). Text:
   `file.Text()` -> `source_file_text(file) -> &'static str`,
   `file.FileName()` -> `source_file_file_name(file) -> &'static str`.
+- File data guards (lsshells M3b): a published file is static (never
+  freed) or a freeable file version (`ast/file_version.rs`), so the file
+  data accessors return a `FileRef<T>` guard, not a `&'static T`:
+  `ast::go_file`, `try_go_file`, `source_file_info`, `file_bind_data`,
+  `FlowNodeId::get_flow`, `source_file_diagnostics`,
+  `source_file_js_diagnostics`, `source_file_jsdoc_diagnostics`,
+  `source_file_bind_diagnostics`,
+  `source_file_ecma_line_map`, `get_ecma_line_starts`,
+  `source_file_get_name_table`, `source_file_get_position_map`,
+  `source_file_get_declaration_map`, `get_pragma_from_source_file`. It
+  derefs to the data; `as_static()` gives the `&'static` borrow of a static
+  file. A guard keeps its file version alive, so read the fields you need
+  and let it go; copy or clone to keep a value. Hot readers use a closure
+  (`ast::with_go_file(id, |g| ..)`, the `frozen!` reads in `ast/store.rs`),
+  which pins the version for the read only. A slice of a freeable file's
+  data is a handle that reads at each use (`NodeSlice::from_file_imports`,
+  `from_file_js_doc`). A read of a dead file version panics ("file version
+  N is released"); it never reads another file.
 - Binder data (Go fields set by the binder on nodes): `n.symbol()`,
   `n.local_symbol()`, `n.locals()`, `n.flow_node_data().flow_node`... use
-  `n.bind() -> &'static NodeBindData` and its fields; Go `node.Symbol()` ->
+  `n.bind() -> NodeBindData` (a copy) and its fields; Go `node.Symbol()` ->
   `n.symbol()`, `node.Locals()` -> `n.locals()`, `node.LocalSymbol()` ->
   `n.local_symbol()`, `node.FlowNodeData().FlowNode` -> `n.flow_node()`,
   `EndFlowNode`/`ReturnFlowNode` -> `n.end_flow_node()`/`n.return_flow_node()`.
-  Flow data: `f.get_flow() -> &'static FlowNode`.
+  Flow data: `f.get_flow() -> FileRef<FlowNode>`.
 - Go field access through `As*()`: `node.AsBinaryExpression().OperatorToken`
   -> `n.operator_token()`. One accessor per Go field name, generated in
   `ast/fields.rs`, that works for every kind that has that field (panics on
@@ -196,18 +215,30 @@ methods reach the AST through it.
   `ast/node.rs`. A list of parsed data points at its astdata list (it lives
   for the process). A list of synthetic data is an index into the thread's
   synthetic arena (`SyntheticList`), so it is valid only on the thread
-  that made it, like a synthetic `Node`. Equality is Go pointer equality.
+  that made it, like a synthetic `Node`. A list of a store that owns its
+  nodes (a freeable parse, lsshells M3c) is a `StoreList` handle (file,
+  node data cell or pending list, and the id of its selector,
+  `SelectorSite`), read at each use; it is valid on any thread while its
+  file version lives, and its `list_ptr` address can repeat after the
+  version is freed, so keep that address only for keys of one request.
+  Equality is Go pointer equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
 - Node data reads are scoped, because a thread owns its synthetic nodes
   and frees them when its program is released (`ast/synthetic.rs`). Read
   a field with `by_data!`, `with_data!` or `with_ast_data(n, |d| ...)`,
   and a list field with `list_of!` or `modifiers_of!` (`list_by_data!` in
-  `node.rs`). Nothing returns a reference into node data. Only parsed data
-  is `&'static` (`static_ast_node`): the binder, which binds parsed nodes
-  only, loads it once with `parsed_node_data` for the `_in` reads
-  (`data_accessor!`). `Node::bind()` returns the binder data by value, and
-  the text of a synthetic node is interned (`Name`).
+  `node.rs`). Nothing returns a reference into node data. Only the data of
+  a static parse is `&'static` (`static_ast_node`); a node that a freeable
+  parse owns (lsshells M3c) is read in a scope like a synthetic node
+  (`with_scoped_ast_node` holds it, `read_scoped_ast_node` reads a field;
+  the body of `with_data!` must not make or change nodes of the store of
+  the node). The binder, which binds parsed nodes only, loads the data
+  once with `parsed_node_data` for the `_in` reads (`data_accessor!`); it
+  gives `LoadedData`, `None` for an owned node, and then an `_in` read reads
+  the node again. `Node::bind()` returns the binder data by value, and the
+  text of a synthetic node or an owned node is interned (`Name`; an owned
+  node of a published file keeps it per thread in `JOINED_TEXT`).
 - Synthetic node owners (`ast/synthetic.rs`): on the language server
   dispatch thread, each program version owns the synthetic nodes, lists
   and data writes made while it is current, and its release frees them
@@ -218,14 +249,32 @@ methods reach the AST through it.
   so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
   off.
 - Store columns and the other registry tables of a published file are read
-  through one file lookup (`frozen_of` in `ast/store.rs`), not
-  `FROZEN.get()` directly. It checks tier 0 (the first publish) and then,
-  inline, tier 1 (every later publish), so the nodes of a later program
-  (`tsc -b`, an edited file) read the same columns as the nodes of the
-  first program. The tier 1 part is a cold block, so it adds no code to
-  the hot path of a one-program process; keep new tier 1 work after
-  `later_publish_path()`. A new column gets a `Frozen` table and a reader
-  that calls `frozen_of` with that table.
+  through one file lookup (the `frozen!` macro and `static_frozen_of` in
+  `ast/store.rs`), not `FROZEN.get()` directly. It checks tier 0 (the
+  first publish), then, inline, tier 1 (every later publish), then a
+  freeable file version (its store and `GoFile`; out of line, pinned while
+  the read runs), so the nodes of a later program (`tsc -b`, an edited
+  file) read the same columns as the nodes of the first program. The tier
+  1 slot of a freeable version names its node shell (its header and child
+  columns, leaked; no node column when its store owns its nodes), so its
+  header and child reads are tier 1 reads, and its node data reads miss
+  the static tiers and read the pinned version (`static_store_node`,
+  `with_scoped_store_node`). The tier 1 and freeable parts
+  are a cold block, so they add no code to the hot path of a one-program
+  process; keep new tier 1 work after `later_publish_path()`, and keep one
+  inline copy of the read (after the static tiers join). A read gets
+  a borrow for its closure only, so it copies its result out. A new column
+  gets a `Frozen` table and a reader that calls `frozen!` with that table.
+  A reader that must return a `&'static` slice of a table uses the static
+  tiers only (`static_frozen`), which have the node shell tables of a
+  freeable version but not its store or `GoFile`. The inline fast paths
+  of the node reads (`kind`, `parent`, `flags`, `loc`, children,
+  `Node::new`, `bind`) use `frozen_static!` (static tiers, no call), as a
+  one-program process needs; the binder data of a freeable version is
+  read out of line with one pinned read (`Node::bind_field`). A node
+  shell has no link column, so `frozen_store_children` gives `None` and
+  the caller reads the node data. Use `frozen_static!` only where `None`
+  sends the caller to an exact path.
 
 ## Program (owned by program.rs)
 
@@ -238,9 +287,11 @@ The batch that adds it is not accepted until Theo approves.
   (`source_file_order`), options, binder symbols and its program state. It
   has no file list.
 - `GoFile` is one file version. The file registry (`ast/store.rs`) owns it
-  from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
-  versions share the file versions they have in common, as Go shares
-  unchanged `SourceFile` objects.
+  from `publish_file_stores` on, or its `FileVersion` for a freeable file
+  version; read it with `ast::go_file(id)` (a `FileRef` guard) or
+  `ast::with_go_file(id, |g| ..)`. Program versions share the file
+  versions they have in common, as Go shares unchanged `SourceFile`
+  objects.
 - The per-version program tables (files by path, file metadata,
   diagnostics, checker file associations, the declaration diagnostic cache
   and the Go frontend copies in `GoSharedState`) are in
@@ -256,10 +307,11 @@ The batch that adds it is not accepted until Theo approves.
   frontend and the tables of a version. The frontend `NewProgram` goes
   with its last `Rc` holder. Its parses stay: the publish that gives a
   file its `GoFile` keeps that file's parse, because the `GoFile` borrows
-  it. `GoSharedState` owns its copies of the frontend data. The module
-  resolutions are not copied: the frontend keeps them in an `Arc` map of
-  `Arc<ResolvedModule>`, and `GoSharedState` shares that map (a lookup
-  borrows the name through `module::ModeAwareKey`). Each checker worker frees its
+  it (a freeable file version, below, is the exception). `GoSharedState`
+  owns its copies of the frontend data. The module resolutions are not
+  copied: the frontend keeps them in an `Arc` map of `Arc<ResolvedModule>`,
+  and `GoSharedState` shares that map (a lookup borrows the name through
+  `module::ModeAwareKey`). Each checker worker frees its
   checker and the synthetic nodes it made (`free_synthetic_nodes`), and
   each emit thread frees its synthetic nodes. A worker, bind, emit or
   search thread gets a copy of the tables `Arc` in its `WorkerSeed` and
@@ -267,8 +319,8 @@ The batch that adds it is not accepted until Theo approves.
   release, as a Go goroutine that holds the program does. A read of a
   released version's tables on a thread with no copy panics ("program
   version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
-  runs and a field fallback). The `GoProgram` shell and the file versions
-  stay leaked for now. A one-program process forgets its checkers and the
+  runs and a field fallback). The `GoProgram` shell and the static file
+  versions stay leaked for now. A one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go. Watch mode uses
   `program::release_program_in_background`: the old checker pool stops
   without a wait, and the old checkers are freed on the pool threads while
@@ -286,6 +338,56 @@ The batch that adds it is not accepted until Theo approves.
   and the parse tasks of a load. The dispatch loop drops them after each
   message, while no message waits (`drop_garbage`); more than 16 are
   dropped even when messages wait. Other threads drop them at once.
+- Freeable file versions (lsshells M3a to M3d, `ast/file_version.rs`). In
+  a language server or API process (`project::new_session`), a parse cache
+  parse of a path that a publish on this thread published before gets a
+  `FileVersion`. Its parse holds it (`ParsedSourceFile::version`), and so
+  do the `VersionTables` of each program version that has the file, so a
+  seeded thread keeps it too. A thread that reads it pins it until the
+  next program release (`release_file_version_pins`, run when a
+  `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
+  registry keeps a `Weak`. At publish the version takes its `FileStore`
+  and its `GoFile` (M3b). Its header and child columns (headers, kinds,
+  names, modifier bits, children, resolved; 44 bytes per node) are leaked
+  in its node shell, the tier 1 publish of its id, so a header or child
+  read of the edited file stays inline (a pinned read per node read made
+  edits 3 to 4 ms slower); the child link column is dropped, and the
+  binder's child walk reads the node data. With owned nodes (M3c; on by
+  default in a language server or API process since M3g,
+  `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
+  (`enter_freeable_parse`, opened by the parse cache), so its store owns
+  its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  (`OwnedAst`), and they are freed with the version; its node data reads
+  are pinned reads, and its lists are `StoreList` handles. Only with them
+  do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
+  session instructions +6.40% on effect and +4.68% on query-core (+2.2%
+  with owned nodes off); edit median +0.5 to +2.1 ms on effect and +0.8 to
+  +1.7 ms on query-core in 200-edit sessions, +0.9 ms (query-core) and
+  +1.0 to +1.2 ms (effect) in 1000-edit sessions. The CLI costs
+  (instructions: query +1.38%, hono +0.48%, zod +0.18%, effect +0.19%)
+  come from the M3 merge, not from owned nodes. The planned fix of the
+  read cost is the AST node records plan
+  (`target/continuation-r97-goport/ast-design/study.md`). A prefetched parse keeps its
+  nodes leaked (its node column is in the shell), and so does every parse
+  with owned nodes off, as before M3c. Its
+  `SourceFileInfo` owns copies of
+  the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
+  its name table, position map, declaration map and identifier set are
+  fields of the version, as in Go. When its last holder lets go, the store
+  and the `GoFile` are freed, a later read of the id panics, and each
+  per-file
+  thread-local map (`PerFileMap`: `SOURCE_FILE_DATA`, `TOKEN_CACHES`,
+  `TOKEN_FACTORIES`, `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`,
+  `DECORATORS`) forgets the entries of the file at its next write. Its
+  symbols and tables in the binder lineage are whole chunks of its own
+  (M3d); after it dies, the next bind frees them, and a read of one of its
+  symbol or table ids panics (index out of bounds). The header columns of
+  the node shell and the text stay leaked for now. Tier 0, the first
+  version of each file and every CLI publish never get one.
+  `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
+  process; there `update_program_version` (`goport_multiprog`) also gives
+  each new parse of a published path a version, so a leak record can
+  measure it.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
@@ -354,7 +456,13 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 - Files bind in parallel, each into its own arena, and join the binder
   lineage in file order (`program::bind_all`). The ids equal a serial bind.
   A file version binds once (Go `BindOnce`): a later program version binds
-  only its new file versions and adds them to the same lineage.
+  only its new file versions and adds them to the same lineage. The
+  program's binder symbols (`program::bound_symbols()`, a `BoundSymbols`
+  guard) are a copy of the lineage in its `VersionTables`, so a release
+  frees them (lsshells M2c). A freeable file version starts and ends on a
+  chunk start (`SymbolArena::end_chunk`), so its ids and the ids after it
+  skip to that start, and its chunks are freed when it dies (M3d). Ids are
+  never used again.
 - Each program has its own checker pool. Each checker is made on its own
   worker thread and stays there (Go `checkerPool`: 4 checkers, file `i`
   goes to checker `i % 4`). The loading thread sends jobs and merges the
@@ -732,7 +840,8 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   while the version was current, now or when the last guard of `p` drops.
   The version's tables go with it (see "Program"). The registry drops its
   `Rc` of `p`, so the `NewProgram` is freed with its last holder. The
-  `GoProgram` shell and the file versions stay leaked (M3). A compiler
+  `GoProgram` shell and the static file versions stay leaked; a freeable
+  file version goes with its last holder (see "Program"). A compiler
   host drops its data
   (`CompilerHost::release`, not in Go) when no live program uses it. A
   program uses its own host and the host of the load that made its files:

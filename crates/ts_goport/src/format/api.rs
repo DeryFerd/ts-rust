@@ -86,7 +86,7 @@ pub fn format_span(
             get_indentation_for_node(enclosing_node, Some(&span), file, &opts),
             get_own_or_inherited_delta(enclosing_node, &opts, file),
             kind,
-            prepare_range_contains_error_function(source_file_diagnostics(file), span),
+            prepare_range_contains_error_function(&source_file_diagnostics(file), span),
             file,
         ),
     )

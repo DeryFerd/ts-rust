@@ -459,10 +459,28 @@ impl FileLike {
 
     /// Go `FileLike.ECMALineMap`.
     #[must_use]
-    pub fn ecma_line_map(&self) -> &[i32] {
+    pub fn ecma_line_map(&self) -> LineMapRef<'_> {
         match self {
-            FileLike::Source(file) => get_ecma_line_starts(*file),
-            FileLike::Original(file) => &file.line_map,
+            FileLike::Source(file) => LineMapRef::File(get_ecma_line_starts(*file)),
+            FileLike::Original(file) => LineMapRef::Original(&file.line_map),
+        }
+    }
+}
+
+/// The line map of a `FileLike`: the guard of a source file's map (it pins a
+/// freeable file version, lsshells M3b) or the map of an original text file.
+pub enum LineMapRef<'a> {
+    File(FileRef<[i32]>),
+    Original(&'a [i32]),
+}
+
+impl std::ops::Deref for LineMapRef<'_> {
+    type Target = [i32];
+
+    fn deref(&self) -> &[i32] {
+        match self {
+            LineMapRef::File(map) => map,
+            LineMapRef::Original(map) => map,
         }
     }
 }
@@ -630,7 +648,7 @@ fn new_original_text_file(file: Node) -> Rc<OriginalTextFile> {
 // PORT: Go takes an `ast.SourceFileLike`. The Rust scanner function takes a
 // file node, so this is its code on a `FileLike`.
 fn get_ecma_line_of_file_position(file: &FileLike, pos: i32) -> i32 {
-    compute_line_of_position(file.ecma_line_map(), pos)
+    compute_line_of_position(&file.ecma_line_map(), pos)
 }
 
 // Go: scanner/scanner.go:2685 GetECMALineAndUTF16CharacterOfPosition
@@ -639,7 +657,7 @@ fn get_ecma_line_of_file_position(file: &FileLike, pos: i32) -> i32 {
 // function for a `pos` inside a char.
 fn get_ecma_line_and_utf16_character_of_file_position(file: &FileLike, pos: i32) -> (i32, i32) {
     let line_map = file.ecma_line_map();
-    let line = compute_line_of_position(line_map, pos);
+    let line = compute_line_of_position(&line_map, pos);
     let text = file.text();
     let end = pos as usize;
     let mut boundary = end;
@@ -805,7 +823,7 @@ fn write_code_snippet(
         }
 
         // Go scanner.GetECMAPositionOfLineAndByteOffset
-        let line_starts = source_file.ecma_line_map();
+        let line_starts = &*source_file.ecma_line_map();
         let line_start = compute_position_of_line_and_byte_offset(line_starts, i, 0);
         let line_end = if i < last_line_of_file {
             compute_position_of_line_and_byte_offset(line_starts, i + 1, 0)

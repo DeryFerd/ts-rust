@@ -26,8 +26,12 @@
 //! (`with_ast_node`, `with_ast_data`, or the `with_data!` macro in hot code),
 //! and a list field through a selector (`list_of!`, `modifiers_of!`). A list
 //! of synthetic data is a `SyntheticList` handle (an index), not a pointer,
-//! and a text is interned (`synthetic_text`). Only a parsed node gives
-//! `&'static` data (`static_ast_node`). A checker worker of a released
+//! and a text is interned (`synthetic_text`). Only a parsed node of a
+//! static parse gives `&'static` data (`static_ast_node`). A node that a
+//! freeable parse owns (lsshells M3c, `ast/store.rs` `OwnedAst`) is read the
+//! same way as a synthetic node: in a scope (`with_scoped_ast_node`,
+//! `read_scoped_ast_node`), with lists as handles (`ast::StoreList`, whose
+//! selector has a small id, `SelectorSite`). A checker worker of a released
 //! program frees all of it (`free_synthetic_nodes`, called by
 //! `program::release_program`). A one-program process leaks it at the end
 //! instead (`forget_synthetic_nodes`), like the checker itself.
@@ -61,6 +65,8 @@
 use crate::astdata::NodeData;
 use crate::prelude::*;
 use std::cell::{Cell, OnceCell};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
 pub const SYNTHETIC_NODE_FILE: usize = 0xffff_fffe;
@@ -722,8 +728,10 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
     })
 }
 
-/// The astdata node of a parsed (store) node, or `None` for a synthetic
-/// node. Go dereferences the pointer, so nil panics.
+/// The astdata node of a parsed (store) node with `'static` data, or
+/// `None` for a synthetic node and for a node that a freeable parse owns
+/// (lsshells M3c): read those with `with_scoped_ast_node`. Go dereferences
+/// the pointer, so nil panics.
 // In a one-program process almost every read after the publish is a tier 0
 // store node, so only that path is inlined into callers. The synthetic file
 // index is never a store id, so checking the store tables first gives the
@@ -739,47 +747,65 @@ pub fn static_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     }
 }
 
-/// `static_ast_node` for a node that is not a published store node: a
-/// synthetic node (`None`) or an unpublished (built or detached) store node.
-/// Panics for any other node.
+/// `static_ast_node` for a node that is not a published store node of a
+/// static tier: a synthetic node (`None`), a node of a freeable file
+/// version (`None`: its node shell has no node column, lsshells M3c) or an
+/// unpublished (built or detached) store node (`None` when the store owns
+/// it). Panics for any other node.
 #[cold]
 #[inline(never)]
 fn static_ast_node_slow(n: Node) -> Option<&'static crate::astdata::Node> {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return None;
     }
-    match try_store_ast_node(n) {
-        Some(node) => Some(node),
-        None => panic!("node {n:?} is not synthetic and has no store"),
+    match crate::ast::store::static_store_node(n) {
+        StaticNode::Static(node) => Some(node),
+        StaticNode::Scoped => None,
+        StaticNode::NoStore => panic!("node {n:?} is not synthetic and has no store"),
     }
 }
 
+/// The data of a parsed node that a caller loads once for several field
+/// reads (`parsed_node_data`, the `_in` accessors of `node.rs`): `Some` for
+/// a node with `'static` data, `None` for a node that a freeable parse owns
+/// (lsshells M3c). With `None` an `_in` accessor reads the node again, as
+/// its plain accessor does (most of them read a store column).
+pub type LoadedData = Option<&'static NodeData>;
+
 /// The astdata data of parsed node `n`, for code that reads parsed nodes
 /// only: the binder, which loads the data of a node once and passes it to
-/// the `_in` field reads (`data_accessor!`). Panics on a synthetic node.
+/// the `_in` field reads (`data_accessor!`). `None` for a node that a
+/// freeable parse owns (see `LoadedData`). Panics on a synthetic node.
 #[inline]
 #[must_use]
-pub fn parsed_node_data(n: Node) -> &'static NodeData {
+pub fn parsed_node_data(n: Node) -> LoadedData {
     match static_ast_node(n) {
-        Some(node) => &node.data,
-        None => panic!("synthetic node where a parsed node is read"),
+        Some(node) => Some(&node.data),
+        None => {
+            assert!(
+                n.file_index() != SYNTHETIC_NODE_FILE,
+                "synthetic node where a parsed node is read"
+            );
+            None
+        }
     }
 }
 
 /// Calls `f` with the astdata node (kind and data) of any node, parsed or
 /// synthetic. Go dereferences the pointer, so nil panics. `f` cannot keep a
 /// reference into the node. For a synthetic node the arena is not borrowed
-/// while `f` runs, so `f` can make and change synthetic nodes. Hot node
-/// reads use the `with_data!` macro instead.
+/// while `f` runs, and a node that a freeable parse owns is held apart from
+/// its store, so `f` can make and change nodes. Hot node reads use the
+/// `with_data!` macro instead.
 #[inline]
 pub fn with_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     // One call of `f`, so a small `f` is inlined (see `with_data!`).
-    let synthetic;
+    let scoped;
     let node = match static_ast_node(n) {
         Some(node) => node,
         None => {
-            synthetic = synthetic_ast_node(n);
-            &*synthetic
+            scoped = scoped_ast_node(n);
+            &*scoped
         }
     };
     f(node)
@@ -791,33 +817,138 @@ pub fn with_ast_data<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
     with_ast_node(n, |node| f(&node.data))
 }
 
-/// `with_ast_node` for a synthetic node, out of line.
+/// The astdata node of a node with no `'static` node, held for its reader:
+/// a synthetic node (its data chunk, `HeldNode`) or a node that a freeable
+/// parse owns (`ast::HeldStoreNode`: its cell chunk, or its pinned file
+/// version).
+enum ScopedNode {
+    Synthetic(HeldNode),
+    Store(crate::ast::store::HeldStoreNode),
+}
+
+impl std::ops::Deref for ScopedNode {
+    type Target = crate::astdata::Node;
+
+    #[inline]
+    fn deref(&self) -> &crate::astdata::Node {
+        match self {
+            Self::Synthetic(node) => &**node,
+            Self::Store(node) => &**node,
+        }
+    }
+}
+
+/// `ScopedNode` of non-nil node `n`, which has no `'static` node.
 #[cold]
 #[inline(never)]
-pub fn with_synthetic_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
-    f(&synthetic_ast_node(n))
+fn scoped_ast_node(n: Node) -> ScopedNode {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        ScopedNode::Synthetic(synthetic_ast_node(n))
+    } else {
+        ScopedNode::Store(crate::ast::store::held_store_node(n))
+    }
+}
+
+/// `with_ast_node` for a node with no `'static` node, out of line: a
+/// synthetic node or a node that a freeable parse owns (lsshells M3c). The
+/// node is held, so `f` can make and change nodes.
+#[cold]
+#[inline(never)]
+pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    // A synthetic id is never a hot file.
+    if crate::ast::store::is_hot_store_node(n) {
+        return crate::ast::store::with_hot_store_node(n, f);
+    }
+    with_held_ast_node(n, f)
+}
+
+/// `with_scoped_ast_node` for a node that is not of the hot file version.
+// PERF: lsshells M3f. Its own function, so the hot read above saves few
+// registers.
+#[cold]
+#[inline(never)]
+fn with_held_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    f(&scoped_ast_node(n))
+}
+
+/// `with_scoped_ast_node` for a field read (`with_data!`): `f` must not
+/// make or change nodes of the store of `n`. A node that a freeable parse
+/// owns is read in place (pinned, or with its store borrowed), with no
+/// chunk or pin clone (`ast::with_scoped_store_node`).
+#[cold]
+#[inline(never)]
+pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return f(&synthetic_ast_node(n));
+    }
+    crate::ast::store::with_scoped_store_node(n, f)
+}
+
+/// The inline part of `static_ast_node`: the astdata node of a published
+/// store node of a static tier, or `None` for any other node (`with_data!`
+/// then reads it with `read_ast_node_miss`). Go dereferences the pointer,
+/// so nil panics.
+#[inline]
+#[must_use]
+pub fn static_tier_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
+    assert!(n.is_some(), "nil node dereference");
+    frozen_store_ast_node(n)
+}
+
+/// `read` on the astdata node of node `n` when it is not a node of a static
+/// tier (`static_tier_ast_node`): a synthetic node, an unpublished store
+/// node or a node of a freeable file version (lsshells M3c). `read` must not
+/// make or change nodes of the store of `n` (a field read,
+/// `read_scoped_ast_node`).
+// PERF: lsshells M3c. One out-of-line call for the whole miss: a node data
+// read of the edited file made three (`static_ast_node_slow`,
+// `read_scoped_ast_node`, `with_scoped_store_node`) and looked the file up
+// twice.
+#[cold]
+#[inline(never)]
+pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    // lsshells M3f: a node of the hot file version (a synthetic id never
+    // is), with the other misses out of line, so this path saves few
+    // registers.
+    if crate::ast::store::is_hot_store_node(n) {
+        return crate::ast::store::with_hot_store_node(n, read);
+    }
+    read_ast_node_cold(n, read)
+}
+
+/// `read_ast_node_miss` for a node that is not of the hot file version.
+#[cold]
+#[inline(never)]
+fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return read(&synthetic_ast_node(n));
+    }
+    crate::ast::store::read_store_node_miss(n, read)
 }
 
 /// `$body` with `$d` bound to the astdata data (`&NodeData`) of node `$n`,
 /// parsed or synthetic, like `with_ast_data`. Go dereferences the pointer, so
 /// nil panics. `$body` cannot keep a reference into the data, and it cannot
-/// `return` from the caller.
-// PERF: the macro writes `$body` twice: inline for a parsed node (the
-// `&'static` read, with no closure call) and in a closure that runs out of
-// line for a synthetic node. That closure holds the node data apart from the
-// arena, so `$body` can make synthetic nodes. A closure with two call sites
-// is not inlined, which cost about 1% of instructions in multiprog. To write
-// `$body` once instead, make this `with_ast_data($n, |$d| $body)`; no call
-// site changes.
+/// `return` from the caller. It is a field read: it must not make or change
+/// nodes of the store of `$n` (`read_scoped_ast_node`).
+// PERF: the macro writes `$body` twice: inline for a node of a static tier
+// (the `&'static` read, with no closure call) and in a closure that runs
+// out of line for any other node (`read_ast_node_miss`): a synthetic node,
+// an unpublished store node, or a node that a freeable parse owns (lsshells
+// M3c). That closure holds the synthetic node data apart
+// from the arena, so `$body` can make synthetic nodes. A closure with two
+// call sites is not inlined, which cost about 1% of instructions in
+// multiprog. To write `$body` once instead, make this
+// `with_ast_data($n, |$d| $body)`; no call site changes.
 macro_rules! with_data {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_ast_node(n__) {
+        match $crate::ast::synthetic::static_tier_ast_node(n__) {
             Some(node__) => {
                 let $d: &crate::astdata::NodeData = &node__.data;
                 $body
             }
-            None => $crate::ast::synthetic::with_synthetic_ast_node(n__, |node__| {
+            None => $crate::ast::synthetic::read_ast_node_miss(n__, |node__| {
                 let $d: &crate::astdata::NodeData = &node__.data;
                 $body
             }),
@@ -829,11 +960,13 @@ pub(crate) use with_data;
 /// The `NodeList` that the selector `|$d| $body` (a `ListSel` body) finds in
 /// the data of node `$n` (nil for a Go `nil` field), or `None` when the kind
 /// of `$n` has no such field. Like `with_data!`, the selector runs inline for
-/// a parsed node; a synthetic node gets it as a `ListSel`.
+/// a node of a static tier; any other node (a synthetic node, an unpublished
+/// store node, a node that a freeable parse owns) gets it as a `ListSel`,
+/// with the id of this site (`SelectorSite`).
 macro_rules! list_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_ast_node(n__) {
+        match $crate::ast::synthetic::static_tier_ast_node(n__) {
             Some(node__) => {
                 let $d: &'static crate::astdata::NodeData = &node__.data;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
@@ -844,7 +977,11 @@ macro_rules! list_of {
                     )
                 })
             }
-            None => $crate::ast::synthetic::synthetic_node_list_of(n__, |$d| $body),
+            None => {
+                static SITE: $crate::ast::synthetic::SelectorSite =
+                    $crate::ast::synthetic::SelectorSite::new();
+                $crate::ast::synthetic::scoped_node_list_of(n__, &SITE, |$d| $body)
+            }
         }
     }};
 }
@@ -854,7 +991,7 @@ pub(crate) use list_of;
 macro_rules! modifiers_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_ast_node(n__) {
+        match $crate::ast::synthetic::static_tier_ast_node(n__) {
             Some(node__) => {
                 let $d: &'static crate::astdata::NodeData = &node__.data;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
@@ -865,7 +1002,11 @@ macro_rules! modifiers_of {
                     )
                 })
             }
-            None => $crate::ast::synthetic::synthetic_modifiers_of(n__, |$d| $body),
+            None => {
+                static SITE: $crate::ast::synthetic::SelectorSite =
+                    $crate::ast::synthetic::SelectorSite::new();
+                $crate::ast::synthetic::scoped_modifiers_of(n__, &SITE, |$d| $body)
+            }
         }
     }};
 }
@@ -907,6 +1048,117 @@ impl<'a> AnyList<'a> {
 /// kind without it). `Some(None)`: the field is Go `nil`.
 pub type ListSel = for<'a> fn(&'a NodeData) -> Option<Option<AnyList<'a>>>;
 
+/// The most list selector sites (`SelectorSite`) in the process.
+const SELECTOR_LIMIT: usize = 1024;
+
+/// The selectors that `SelectorSite::id` gave ids, by id.
+static SELECTORS: [OnceLock<ListSel>; SELECTOR_LIMIT] = [const { OnceLock::new() }; SELECTOR_LIMIT];
+
+/// The number of ids that `SelectorSite::id` gave.
+static SELECTOR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The list selector of one `list_of!` or `modifiers_of!` site, with a
+/// small process-wide id (lsshells M3c): a list handle of a store that owns
+/// its nodes (`ast::StoreList`) names its selector with 4 bytes, so
+/// `NodeList` and `ModifierList` stay 16 bytes. Each site gets its id at its
+/// first scoped read.
+// PORT: Go keeps a `*NodeList` pointer. A list of a freeable file version
+// cannot be borrowed past its read, so the handle names the node data cell
+// and the selector, and the list is found again at each use.
+pub struct SelectorSite(AtomicU32);
+
+impl SelectorSite {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+
+    /// The id of `sel`, the selector of this site (`list_selector`).
+    #[inline]
+    pub fn id(&self, sel: ListSel) -> u32 {
+        match self.0.load(Ordering::Acquire) {
+            0 => self.new_id(sel),
+            id => id - 1,
+        }
+    }
+
+    /// The first `id` of this site.
+    #[cold]
+    #[inline(never)]
+    fn new_id(&self, sel: ListSel) -> u32 {
+        let id = SELECTOR_COUNT.fetch_add(1, Ordering::Relaxed);
+        // The last id is `ast::store::PENDING_SEL`.
+        assert!(
+            id < SELECTOR_LIMIT - 1,
+            "more than {} list selector sites",
+            SELECTOR_LIMIT - 1
+        );
+        // A new id: this is its only write.
+        let _ = SELECTORS[id].set(sel);
+        let id = id as u32;
+        // Two threads can give one site an id at once. The first id stays;
+        // the other one is not used again.
+        match self
+            .0
+            .compare_exchange(0, id + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => id,
+            Err(first) => first - 1,
+        }
+    }
+}
+
+impl Default for SelectorSite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The list selector with id `id` (`SelectorSite::id`).
+#[inline]
+#[must_use]
+pub fn list_selector(id: u32) -> ListSel {
+    *SELECTORS[id as usize]
+        .get()
+        .expect("a list selector id has its selector")
+}
+
+/// `list_of!` for a node that is not a node of a static tier
+/// (`static_tier_ast_node`): a `Field` handle for a synthetic node, a
+/// `StoreList` handle for a node that a freeable parse owns (lsshells M3c),
+/// and a static handle for any other store node (an unpublished store).
+#[cold]
+#[inline(never)]
+#[must_use]
+pub fn scoped_node_list_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option<NodeList> {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return synthetic_node_list_of(n, sel);
+    }
+    let file = n.file_index();
+    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+        None => NodeList::NIL,
+        Some(ScopedList::Static(l)) => NodeList::from_ts(file, Some(l.nodes())),
+        Some(ScopedList::Store(l)) => NodeList::store(l),
+    })
+}
+
+/// `modifiers_of!` for a node that is not a node of a static tier (see
+/// `scoped_node_list_of`).
+#[cold]
+#[inline(never)]
+#[must_use]
+pub fn scoped_modifiers_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option<ModifierList> {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return synthetic_modifiers_of(n, sel);
+    }
+    let file = n.file_index();
+    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+        None => ModifierList::NIL,
+        Some(ScopedList::Static(m)) => ModifierList::from_ts(file, Some(m.modifiers())),
+        Some(ScopedList::Store(m)) => ModifierList::store(m),
+    })
+}
+
 /// `list_of!` for a synthetic node: a `Field` handle.
 #[cold]
 #[inline(never)]
@@ -930,14 +1182,16 @@ pub fn synthetic_modifiers_of(n: Node, sel: ListSel) -> Option<ModifierList> {
 }
 
 /// Go `node.Text()` (and the `RawText` of template literals) of synthetic
-/// node `n`: the text that `text` finds in its data, or "" for `None`. The
-/// text is interned (`Name`), so it lives for the process, but each
-/// distinct text is kept once.
-// PORT: the text is in the node data, which the thread frees. `Node::text`
-// returns `&'static str`, so a synthetic text is interned instead.
+/// node `n`, or of a node that a freeable parse owns (lsshells M3c): the
+/// text that `text` finds in its data, or "" for `None`. The text is
+/// interned (`Name`), so it lives for the process, but each distinct text
+/// is kept once.
+// PORT: the text is in the node data, which the thread (or the file
+// version) frees. `Node::text` returns `&'static str`, so the text is
+// interned instead.
 #[must_use]
 pub fn synthetic_text(n: Node, text: impl FnOnce(&NodeData) -> Option<&str>) -> &'static str {
-    with_synthetic_ast_node(n, |node| match text(&node.data) {
+    read_scoped_ast_node(n, |node| match text(&node.data) {
         Some(s) => Name::from(s).as_str(),
         None => "",
     })
@@ -1671,7 +1925,6 @@ mod tests {
                 id: next_program_id(),
                 source_file_order: Vec::new(),
                 options: CompilerOptions::default(),
-                bound_symbols: std::sync::OnceLock::new(),
                 state: std::sync::OnceLock::new(),
             }));
             let f = NodeFactory::new();

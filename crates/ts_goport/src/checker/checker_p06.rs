@@ -784,9 +784,10 @@ impl Checker {
                 );
             }
             if self.compiler_options.get_isolated_modules()
-                && source_file_info(get_source_file_of_node(node))
-                    .external_module_indicator
-                    .is_nil()
+                && with_source_file_info(get_source_file_of_node(node), |info| {
+                    info.external_module_indicator
+                })
+                .is_nil()
             {
                 // This could be loosened a little if needed. The only problem we are trying to avoid is unqualified
                 // references to namespace members declared in other files. But use of namespaces is discouraged anyway,
@@ -1141,7 +1142,9 @@ impl Checker {
         if !allow_string_literal {
             self.grammar_error_on_node(name, diag::Identifier_expected, args![]);
         } else if self.module_kind == ModuleKind::ES2015 || self.module_kind == ModuleKind::ES2020 {
-            if !source_file_info(get_source_file_of_node(name)).is_declaration_file {
+            if !with_source_file_info(get_source_file_of_node(name), |info| {
+                info.is_declaration_file
+            }) {
                 self.grammar_error_on_node(
                     name,
                     diag::String_literal_import_and_export_names_are_not_supported_when_the_module_flag_is_set_to_es2015_or_es2020,
