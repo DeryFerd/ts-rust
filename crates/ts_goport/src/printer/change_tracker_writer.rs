@@ -226,9 +226,12 @@ impl ChangeTrackerWriter {
             return node;
         }
         let visited = node.visit_each_child(v);
-        // create proxy node for non synthesized nodes
+        // Assigning positions must not mutate the caller's node: it may be printed again (a change in a
+        // content-mapped file is formatted once per virtual projection of its insertion point), and a node
+        // that has acquired positions is printed by reading text back out of the source file. VisitEachChild
+        // returns a fresh node only when a child changed, so clone whenever it hands back the input.
         let mut new_node = visited;
-        if !node_is_synthesized(visited) {
+        if visited == node {
             new_node = v.factory().clone_node(visited);
         }
         // Go returns true from this callback, which stops ForEachChild after
