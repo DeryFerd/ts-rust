@@ -2,7 +2,7 @@
 """Writes the old-name map from a typescript-go layout test run to a microsoft/TypeScript (tsc/) layout run.
 
 usage: layout-name-map.py <base results.json[.gz]> <new results.json[.gz]> --out MAP.tsv
-                          [--absent FILE.tsv] [--collisions FILE] [--remove-absent]
+                          [--absent FILE.tsv] [--collisions FILE]
 
 The two files are goport-tests.sh results. The base pin must have the layout "typescript-go" and the new
 pin the layout "typescript" (`pin.py show`). The map (compare-tests.py --name-map format, one explicit line
@@ -20,14 +20,25 @@ reference/<dir>, no .diff files.
 
 The collisions (--collisions, default <new pin goCheckout>/testdata/promotedTestCollisions.txt) change a name:
 an "identical" submodule case was merged into the local case of the same name, so its names are removed; a
-"renamed-promoted" case gets its new file name (a variant suffix "(opt=value)" stays). Every other name keeps its
-key. The map has a line for every base name that the rules move or remove, whatever its status, and never
-maps two base names to one new name or to another base name (exit 2 if the rules would).
+"renamed-promoted" case gets its new file name (a variant suffix "(opt=value)" stays).
+
+A case-file diff can also change a configured name. When the base case file (<base goCheckout>/_submodules/
+TypeScript/tests/cases) sets @opt to several values and the new one (<new goCheckout>/testdata/tests/cases) sets
+it to only the value in the name, the option no longer varies, so Go drops "opt=value" from the name
+(harnessutil.go getFileBasedTestConfigurationDescription). Both case files must be there under the same file
+name. This applies to subtest names and to reference files "<stem>(<variant>)<ext>".
+
+A port test that mirrors a Go test file (GO_TEST_FILES) is removed when `git ls-tree` shows that file at the
+base pin and not at the new pin.
+
+Every other name keeps its key. The map has a line for every base name that the rules move or remove, whatever
+its status, and never maps two base names to one new name or to another base name (exit 2 if the rules would).
+No rule reads the port's own results: a removal needs a Go file as evidence.
 
 A mapped name that is missing from the new results is "absent" in compare-tests.py. --absent writes each such
 base name with its status and a reason: the case file is not at the new pin, the case is there but not this
-configuration or subtest, or the reference file is not there. --remove-absent also maps them to "-" with that
-reason as the evidence (for review: the accountability rules need upstream evidence for a removed name).
+configuration or subtest, or the reference file is not there. The map keeps such a name mapped, so the compare
+reports it.
 
 Last stdout line: a summary. Exit 0, or 2 on bad input.
 """
@@ -47,6 +58,17 @@ LAYOUT = '5f647a841a layout'
 # The baseline file extensions of the compiler runner (after the configured name).
 REF_EXTS = ('.types', '.symbols', '.js', '.errors.txt', '.sourcemap.txt', '.js.map', '.trace.json', '.contentmapper')
 SUBMODULE_COPIES = ('submoduleAccepted/', 'submoduleTriaged/')
+# Go test files (relative to goCheckout) and the port tests (suite, name) that mirror them.
+GO_TEST_FILES = {
+    'internal/testutil/baseline/baseline_test.go': (
+        ('go_baselines', 'support::baseline::tests::baseline_submodule_accepted_files_exist'),
+        ('go_baselines', 'support::baseline::tests::baseline_submodule_triaged_files_exist'),
+    ),
+}
+# Go: testrunner/test_case_parser.go optionRegex.
+OPTION = re.compile(r'^//\s*@(\w+)\s*:\s*([^\r\n]*)', re.M)
+# "<stem>(<variant>)<rest>" of a configured case name or a reference file.
+VARIANT = re.compile(r'([^()]+)\(([^()]+)\)(.+)')
 
 
 def die(msg):
@@ -134,8 +156,78 @@ class Renamer:
         return file, None
 
 
-def build(base, new, renamer):
-    """[(old suite, old name, new suite or None, new name or None, evidence)] for every moved or removed name."""
+def case_files(root):
+    """{(suite, file name): path relative to root} of the case files under a cases dir (root/<suite>/**)."""
+    out = {}
+    for d, _, names in os.walk(root):  # nothing when the checkout is not there
+        for f in names:
+            rel = os.path.relpath(os.path.join(d, f), root)
+            out.setdefault((rel.split(os.sep, 1)[0], f), rel)
+    return out
+
+
+def option_values(value):
+    """The lower-case values of an option value "a, b,c" (Go: harnessutil.go splitOptionValues, without * and -)."""
+    return [v.strip().lower() for v in value.split(',') if v.strip()]
+
+
+class Variants:
+    """Drops "opt=value" from a configured name when the case-file diff stops @opt from varying."""
+
+    def __init__(self, base_root, new_root, base_pin, new_pin):
+        self.roots = (Path(base_root), Path(new_root))
+        self.cases = (case_files(base_root), case_files(new_root))
+        self.pins = (base_pin, new_pin)
+        self.stems = {}  # {(suite, stem): [new case file names]}
+        for suite, f in self.cases[1]:
+            self.stems.setdefault((suite, split_ext(f)[0]), []).append(f)
+        self.options = {}
+
+    def read(self, side, suite, file):
+        """{lower-case option: value} of a case file, as Go's extractCompilerSettings reads them (the last wins)."""
+        path = self.roots[side] / self.cases[side][(suite, file)]
+        if path not in self.options:
+            text = path.read_text(encoding='utf-8', errors='replace')
+            self.options[path] = {k.lower(): v.strip().removesuffix(';') for k, v in OPTION.findall(text)}
+        return self.options[path]
+
+    def rename(self, suite, name, reference):
+        """(new name, evidence or None) of "<stem>(<variant>)<ext>"; a reference file finds its case by stem."""
+        m = VARIANT.fullmatch(name)
+        if not m:
+            return name, None
+        stem, variant, rest = m.groups()
+        files = self.stems.get((suite, stem), []) if reference else [stem + rest]
+        if len(files) != 1 or any((suite, files[0]) not in c for c in self.cases):
+            return name, None
+        old, new = self.read(0, suite, files[0]), self.read(1, suite, files[0])
+        keep, dropped = [], []
+        for part in variant.split(','):
+            key, _, value = part.partition('=')
+            was, now = option_values(old.get(key, '')), option_values(new.get(key, ''))
+            if len(was) > 1 and value in was and now == [value]:
+                dropped.append(f'@{key}: {old[key]} at {self.pins[0]} -> {new[key]} at {self.pins[1]}')
+            else:
+                keep.append(part)
+        if not dropped:
+            return name, None
+        new_name = stem + (f'({",".join(keep)})' if keep else '') + rest
+        return new_name, f'case-file diff {self.cases[1][(suite, files[0])]}: {"; ".join(dropped)} (one value)'
+
+
+def git_blob(rec, path):
+    """The blob of <path> (relative to the pin's goCheckout) at the pin commit, or None when it is not there."""
+    run = subprocess.run(['git', '-C', rec['goCheckout'], 'ls-tree', rec['commit'], '--', path],
+                         capture_output=True, text=True)
+    if run.returncode != 0:
+        die(f'git -C {rec["goCheckout"]} ls-tree {rec["commit"]} -- {path}: {run.stderr.strip()}')
+    return run.stdout.split()[2] if run.stdout.strip() else None
+
+
+def build(base, renamer, variants, gone_tests):
+    """[(old suite, old name, new suite or None, new name or None, evidence)] for every moved or removed name.
+
+    gone_tests: {(suite, name): evidence} of the port tests whose Go test file is gone."""
     lines = []
     b = base['suites']
 
@@ -154,6 +246,9 @@ def build(base, new, renamer):
             ev = f'{LAYOUT}: submodule case in testdata/tests/cases, TestLocal runs it'
             if why:
                 ev += f'; promotedTestCollisions.txt {why}: {cname} -> {new_cname}'
+            new_cname, diff = variants.rename(case_suite, new_cname, reference=False)
+            if diff:
+                ev += f'; {diff}'
             lines.append((suite, name, new_suite, f'{kind} local/{case_suite}/{new_cname}', ev))
 
     subtests('go_baselines_submodule', 'go_baselines_local')
@@ -167,6 +262,9 @@ def build(base, new, renamer):
     if 'compiler_runner::test_local' in b.get('go_baselines', {}):
         lines.append(('go_baselines', 'compiler_runner::test_local', None, None,
                       f'{LAYOUT}: TestLocal runs every case, in the 4 shards (go_baselines_local_shards)'))
+    for (suite, name), ev in gone_tests.items():
+        if name in b.get(suite, {}):
+            lines.append((suite, name, None, None, ev))
     for path in sorted(b.get('go_baselines_reference', {})):
         if path.endswith('.diff') or path.startswith(SUBMODULE_COPIES):
             lines.append(('go_baselines_reference', path, None, None,
@@ -184,6 +282,10 @@ def build(base, new, renamer):
         ev = f'{LAYOUT}: reference/submodule merged into reference'
         if why:
             ev += f'; promotedTestCollisions.txt {why}: {file} -> {new_file}'
+        if d:
+            new_file, diff = variants.rename(d.split('/', 1)[0], new_file, reference=True)
+            if diff:
+                ev += f'; {diff}'
         lines.append(('go_baselines_reference', path, 'go_baselines_reference', f'{d}/{new_file}' if d else new_file,
                       ev))
     # The rules must give an explicit one-to-one map (compare-tests.py rejects anything else).
@@ -197,17 +299,6 @@ def build(base, new, renamer):
         if name in b.get(suite, {}):
             die(f'{old_suite} {old} maps to {suite} {name}, which is a base name')
     return lines
-
-
-def case_files(go_checkout):
-    """{(suite, file name): relative path} of the case files at a typescript-layout pin."""
-    out = {}
-    root = Path(go_checkout) / 'testdata' / 'tests' / 'cases'
-    for d, _, names in os.walk(root):  # nothing when the checkout is not there
-        for f in names:
-            rel = os.path.relpath(os.path.join(d, f), root)
-            out.setdefault((rel.split(os.sep, 1)[0], f), rel)
-    return out
 
 
 def absent_reason(suite, name, new, cases, pin):
@@ -235,7 +326,6 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--absent')
     ap.add_argument('--collisions')
-    ap.add_argument('--remove-absent', action='store_true')
     a = ap.parse_args()
     base, base_sha = load(a.base)
     new, new_sha = load(a.new)
@@ -245,25 +335,34 @@ def main():
             f'{new_rec.get("layout")!r}; want typescript-go and typescript')
     collisions = a.collisions or os.path.join(new_rec['goCheckout'], 'testdata', 'promotedTestCollisions.txt')
     col_sha = hashlib.sha256(open(collisions, 'rb').read()).hexdigest()
-    lines = build(base, new, Renamer(load_collisions(collisions)))
+    variants = Variants(os.path.join(base_rec['goCheckout'], '_submodules', 'TypeScript', 'tests', 'cases'),
+                        os.path.join(new_rec['goCheckout'], 'testdata', 'tests', 'cases'), base['pin'], new['pin'])
+    gone_tests = {}
+    for path, tests in GO_TEST_FILES.items():
+        if not any(name in base['suites'].get(suite, {}) for suite, name in tests):
+            continue
+        blob = git_blob(base_rec, path)
+        if blob and git_blob(new_rec, path) is None:
+            ls_tree = f'git -C {new_rec["goCheckout"]} ls-tree {new_rec["commit"][:12]} -- {path}'
+            for test in tests:
+                gone_tests[test] = (f'Go test file {path} is at {base["pin"]} (blob {blob[:12]}), '
+                                    f'not at {new["pin"]} ({ls_tree}: empty)')
+    lines = build(base, Renamer(load_collisions(collisions)), variants, gone_tests)
 
-    cases = case_files(new_rec['goCheckout'])
+    cases = variants.cases[1]
     incomplete = set(new.get('incomplete', []))
     absent = []
-    for i, (old_suite, old, suite, name, ev) in enumerate(lines):
+    for old_suite, old, suite, name, _ in lines:
         if suite is None or suite in incomplete or name in new['suites'].get(suite, {}):
             continue
         reason = absent_reason(suite, name, new, cases, new['pin'])
         absent.append((old_suite, old, base['suites'][old_suite][old], suite, name, reason))
-        if a.remove_absent:
-            lines[i] = (old_suite, old, None, None, f'{ev}; removed upstream: {reason}')
 
     with open(a.out, 'w', encoding='utf-8') as f:
         # compare-tests.py skips the header only as the first line.
         f.write('oldSuite\toldName\tnewSuite\tnewName\tevidence\n')
         f.write(f'# layout-name-map.py: base {a.base} (sha256 {base_sha}, pin {base["pin"]}), new {a.new} '
-                f'(sha256 {new_sha}, pin {new["pin"]}), collisions {collisions} (sha256 {col_sha})'
-                f'{", absent names removed" if a.remove_absent else ""}\n')
+                f'(sha256 {new_sha}, pin {new["pin"]}), collisions {collisions} (sha256 {col_sha})\n')
         for old_suite, old, suite, name, ev in lines:
             f.write(f'{old_suite}\t{old}\t{suite or "-"}\t{name or "-"}\t{ev}\n')
     if a.absent:

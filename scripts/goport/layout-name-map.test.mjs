@@ -3,7 +3,7 @@
 // Run: node --test scripts/goport/layout-name-map.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -12,9 +12,16 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TOOL = join(HERE, "layout-name-map.py");
 const COMPARE = join(HERE, "compare-tests.py");
+const PIN_PY = join(HERE, "..", "upstream", "pin.py");
 // Pins of UPSTREAM.json: layout typescript-go and layout typescript.
 const OLD_PIN = "16c25522e123";
 const NEW_PIN = "673a5f17d713";
+// The case-file and Go test file rules read the Go checkouts of both pins.
+const goCheckout = (pin) =>
+  JSON.parse(spawnSync("python3", [PIN_PY, "show", pin], { encoding: "utf8" }).stdout).goCheckout;
+const NO_GO = [OLD_PIN, NEW_PIN].every((pin) => existsSync(goCheckout(pin)))
+  ? false
+  : "needs the Go checkouts of both pins";
 const COLLISIONS = [
   "# test",
   "identical compiler/dup.ts",
@@ -81,17 +88,19 @@ const next = () => ({
 });
 
 // Writes the two results, runs the map tool, then compare-tests.py with its map.
-function run({ edit, flags = [] } = {}) {
+function run({ edit, editNew } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "layout-name-map-"));
   try {
     const b = base();
     edit?.(b);
+    const n = next();
+    editNew?.(n);
     writeFileSync(join(dir, "base.json"), JSON.stringify(b));
-    writeFileSync(join(dir, "new.json"), JSON.stringify(next()));
+    writeFileSync(join(dir, "new.json"), JSON.stringify(n));
     writeFileSync(join(dir, "collisions.txt"), COLLISIONS);
     const map = spawnSync("python3", [TOOL, join(dir, "base.json"), join(dir, "new.json"),
       "--out", join(dir, "map.tsv"), "--absent", join(dir, "absent.tsv"),
-      "--collisions", join(dir, "collisions.txt"), ...flags], { encoding: "utf8" });
+      "--collisions", join(dir, "collisions.txt")], { encoding: "utf8" });
     if (map.status !== 0) return { rc: map.status, stderr: map.stderr };
     const lines = readFileSync(join(dir, "map.tsv"), "utf8").split("\n").filter((l) => l && !l.startsWith("#"))
       .slice(1).map((l) => l.split("\t"));
@@ -152,15 +161,48 @@ test("a mapped name missing from the new run is absent, with a reason", () => {
     ["go_baselines_local", "error local/compiler/gone.ts"]);
 });
 
-test("--remove-absent removes them with the reason as evidence, and the compare passes", () => {
-  const { lines, compare } = run({ flags: ["--remove-absent"] });
-  const line = lines.find((l) => l[1] === "error submodule/compiler/gone.ts");
-  assert.deepEqual(line.slice(2, 4), ["-", "-"]);
-  assert.match(line[4], /removed upstream: no case file/);
-  assert.equal(compare.rc, 0);
-  assert.equal(compare.out.verdict, "PASS");
-  // dup (subtest and reference), test_local, the two .diff files and gone.
-  assert.equal(compare.out.total.removedByMap, 6);
+test("a case-file diff that stops an option from varying drops it from the name", { skip: NO_GO }, () => {
+  // Upstream changed "@module: commonjs,amd" to "@module: commonjs" in this case.
+  const using = "conformance/usingDeclarationsTopLevelOfModule.2";
+  const { lines, compare } = run({
+    edit: (b) => {
+      b.suites.go_baselines_submodule[`types submodule/${using}(module=commonjs).ts`] = "ok";
+      b.suites.go_baselines_submodule[`config submodule/${using}(module=amd).ts`] = "ignored";
+      b.suites.go_baselines_reference[`submodule/${using}(module=commonjs).js`] = "ok";
+    },
+    editNew: (n) => {
+      n.suites.go_baselines_local[`types local/${using}.ts`] = "ok";
+      n.suites.go_baselines_reference[`${using}.js`] = "ok";
+    },
+  });
+  assert.deepEqual(target(lines, "go_baselines_submodule", `types submodule/${using}(module=commonjs).ts`),
+    ["go_baselines_local", `types local/${using}.ts`]);
+  assert.deepEqual(target(lines, "go_baselines_reference", `submodule/${using}(module=commonjs).js`),
+    ["go_baselines_reference", `${using}.js`]);
+  // amd is not the one value at the new pin, so that name keeps its variant (and is absent).
+  assert.deepEqual(target(lines, "go_baselines_submodule", `config submodule/${using}(module=amd).ts`),
+    ["go_baselines_local", `config local/${using}(module=amd).ts`]);
+  const line = lines.find((l) => l[1] === `types submodule/${using}(module=commonjs).ts`);
+  assert.match(line[4], /case-file diff conformance\/.*\/usingDeclarationsTopLevelOfModule\.2\.ts: /);
+  assert.ok(line[4].includes("@module: commonjs,amd at 16c25522e123 -> commonjs at 673a5f17d713 (one value)"));
+  assert.deepEqual(compare.out.mapRejected, []);
+  assert.ok(!compare.out.total.absent.some((a) => a.includes("module=commonjs")));
+});
+
+test("a port test whose Go test file is gone at the new pin is removed", { skip: NO_GO }, () => {
+  const names = ["baseline_submodule_accepted_files_exist", "baseline_submodule_triaged_files_exist"]
+    .map((n) => `support::baseline::tests::${n}`);
+  const { lines, compare } = run({
+    edit: (b) => { for (const n of names) b.suites.go_baselines[n] = "ok"; },
+  });
+  for (const n of names) {
+    const line = lines.find((l) => l[0] === "go_baselines" && l[1] === n);
+    assert.deepEqual(line.slice(2, 4), ["-", "-"]);
+    assert.match(line[4], /baseline_test\.go is at 16c25522e123 \(blob [0-9a-f]{12}\), not at 673a5f17d713/);
+  }
+  assert.deepEqual(compare.out.mapRejected, []);
+  // dup (subtest and reference), test_local, the two .diff files and the two port tests.
+  assert.equal(compare.out.total.removedByMap, 7);
 });
 
 test("a submodule reference that would land on a base name stops the tool", () => {
