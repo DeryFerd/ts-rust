@@ -869,46 +869,6 @@
       "reason": "typescript-go is archived and TypeScript 7 ships from microsoft/TypeScript tsc/. A drop-in replacement must follow upstream; the pin bump changes what pinned Go evidence means, so it is an acceptance-rule change."
     },
     {
-      "id": "opt-in-crate-no-new-loss",
-      "batchId": "recovery-continuation-go-checker-port-13",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
-      "inheritedResult": {
-        "path": "target/continuation-r96-full-result.json",
-        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
-      },
-      "inheritedLosses": {
-        "originalAccepted": 290,
-        "laterPasses": 15
-      },
-      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T05:51:29.413541+00:00"
-    },
-    {
-      "id": "unbound-history-rows",
-      "batchId": "recovery-continuation-go-checker-port-13",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "revisions": [
-        97,
-        98,
-        99
-      ],
-      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T05:51:29.413541+00:00"
-    },
-    {
       "id": "goport-only-roster-carry-forward",
       "approvedBy": "Theo",
       "date": "2026-09-28T08:08:08Z",
@@ -919,166 +879,6 @@
     },
     {
       "id": "opt-in-crate-no-new-loss",
-      "batchId": "recovery-continuation-go-checker-port-14",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
-      "inheritedResult": {
-        "path": "target/continuation-r96-full-result.json",
-        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
-      },
-      "inheritedLosses": {
-        "originalAccepted": 290,
-        "laterPasses": 15
-      },
-      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T11:51:22.621646+00:00"
-    },
-    {
-      "id": "unbound-history-rows",
-      "batchId": "recovery-continuation-go-checker-port-14",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "revisions": [
-        97,
-        98,
-        99
-      ],
-      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T11:51:22.621646+00:00"
-    },
-    {
-      "id": "opt-in-crate-no-new-loss",
-      "batchId": "recovery-continuation-go-checker-port-15",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
-      "inheritedResult": {
-        "path": "target/continuation-r96-full-result.json",
-        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
-      },
-      "inheritedLosses": {
-        "originalAccepted": 290,
-        "laterPasses": 15
-      },
-      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T15:07:50.145883+00:00"
-    },
-    {
-      "id": "unbound-history-rows",
-      "batchId": "recovery-continuation-go-checker-port-15",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "revisions": [
-        97,
-        98,
-        99
-      ],
-      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T15:07:50.145883+00:00"
-    },
-    {
-      "id": "opt-in-crate-no-new-loss",
-      "batchId": "recovery-continuation-go-checker-port-16",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
-      "inheritedResult": {
-        "path": "target/continuation-r96-full-result.json",
-        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
-      },
-      "inheritedLosses": {
-        "originalAccepted": 290,
-        "laterPasses": 15
-      },
-      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T19:12:30.523437+00:00"
-    },
-    {
-      "id": "unbound-history-rows",
-      "batchId": "recovery-continuation-go-checker-port-16",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "revisions": [
-        97,
-        98,
-        99
-      ],
-      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T19:12:30.523437+00:00"
-    },
-    {
-      "id": "opt-in-crate-no-new-loss",
-      "batchId": "recovery-continuation-go-checker-port-17",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
-      "inheritedResult": {
-        "path": "target/continuation-r96-full-result.json",
-        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
-      },
-      "inheritedLosses": {
-        "originalAccepted": 290,
-        "laterPasses": 15
-      },
-      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T20:27:36.173613+00:00"
-    },
-    {
-      "id": "unbound-history-rows",
-      "batchId": "recovery-continuation-go-checker-port-17",
-      "approvedBy": "Theo",
-      "date": "2026-09-26T00:42:45.334459+00:00",
-      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
-      "revisions": [
-        97,
-        98,
-        99
-      ],
-      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
-      "extendedFrom": "recovery-continuation-go-checker-port-3",
-      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
-      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
-      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
-      "extendedUtc": "2026-09-28T20:27:36.173613+00:00"
-    },
-    {
-      "id": "opt-in-crate-no-new-loss",
       "batchId": "recovery-continuation-go-checker-port-18",
       "approvedBy": "Theo",
       "date": "2026-09-26T00:42:45.334459+00:00",
@@ -1116,6 +916,48 @@
       "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
       "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
       "extendedUtc": "2026-09-29T00:41:21.361068+00:00"
+    },
+    {
+      "id": "goport-protected-set",
+      "batchId": "*",
+      "standing": true,
+      "approvedBy": "Theo",
+      "date": "2026-09-28T20:57:30Z",
+      "approvalNote": "legacy-removal-rule-approval-2026-09-28",
+      "directionNote": "legacy-removal-direction-2026-09-28",
+      "instruction": "Theo 2026-09-28: 'should we be deprecating the old stuff and removing it? this project is greenfield, we can delete whatever' (note legacy-removal-direction-2026-09-28) and 'i approve any rule changes that allow removing the legacy code' (note legacy-removal-rule-approval-2026-09-28).",
+      "scope": "Every batch opened after R132 (open_revision.py --new-batch sets protectedSet goport). The protected set is goport's own evidence: every goport test name (docs/goport-protected/tests-r131.json.gz, then the results of the last accepted goport revision), every gate item against the last accepted gate manifest, every gate run of the source (gateRuns; a failed run needs a flake note for each regression), the bound Query and Hono runs, the LSP oracle (6 batteries) and API oracle (10 batteries) per request, np-suite, quality and both verdicts. After a legacy batch the test, API and np-suite bases are the R131 runs (tests-r131.json.gz, api-r131, np-r131). While the defect editor-long-growth is open, editor/query-core/long and editor/hono/long can FAIL only on growth, at most the fixed caps in gate-compare.py LONG_CAP (query-core 1.58, hono 1.28 MiB/edit). A cap only goes down; only Theo can raise one. A lost, absent or unrun base pass is STOP; new passes do not compensate. Name maps only for pin bumps and moved or replaced tests, with Go evidence at the new pin, checked by the reviewer. The legacy cargo roster (6,055 and 6,330 names), the roster drive, the current-source corpus and the roster carry-forward are retired for new batches; R132 (batch port-18, opened under them before this rule) is the last revision under them. For goport batches this replaces the 'Protected cargo roster' clause of pin-bump-batch. Old batches keep their rules. Root must not widen it. Gate tools: every tool hash in the gate manifest (oracle, Go dumper, gate.sh, allow list, stage scripts, saved Go output families in oracleCaches) must equal the base run's, unless batch.gateToolChanges lists the exact change for the reviewer. Evidence builds: only the candidate checkout builds in the shared candidate target.",
+      "protectedSet": "goport",
+      "baseline": {
+        "path": "docs/goport-protected/tests-r131.json.gz",
+        "sha256": "d1b90114690033ea0d3450182b7340c7f87df27d7e3c45af07192506a2476b7a"
+      },
+      "apiBaseline": {
+        "label": "api-r131",
+        "dir": "target/continuation-r97-goport/tests2/api/results/api-r131",
+        "summarySha256": "efbbd4505f952ca8e3ae3e5789c3045276ca2c5664318a8a9cbcb82555b7dfbd",
+        "manifestSha256": "d842cd94ea3bb4ec9f2e262f32496dd9b22b23fc64e7de57bb6b97265fc30182"
+      },
+      "npBaseline": {
+        "label": "np-r131",
+        "dir": "target/continuation-r97-goport/compat-backlog/np-suite/np-r131",
+        "tests": 459,
+        "resultsSha256": "c7a3204a69aa3935191c123c8f40d34e976f5b599c86d80de36533d8156fa92e"
+      },
+      "editorLongCaps": {
+        "query-core": 1.58,
+        "hono": 1.28
+      },
+      "unboundRevisions": [
+        97,
+        98,
+        99
+      ],
+      "reviewedAt": {
+        "commit": "a6bf5137f",
+        "reviewer": "a0bc38f3370585da3 PASS",
+        "auditor": "aae6dbb734c07335a PASS"
+      }
     }
   ]
 }
