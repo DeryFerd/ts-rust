@@ -292,7 +292,7 @@ fn marshal_float(enc: &mut String, v: f64) -> Result<(), JsonError> {
     if v == 0.0 && v.is_sign_negative() {
         enc.push_str("-0");
     } else {
-        enc.push_str(&ts_jsnum::Number::from(v).to_string());
+        enc.push_str(&crate::jsnum::Number::from(v).to_string());
     }
     Ok(())
 }

@@ -17,6 +17,7 @@
 )]
 
 pub mod ast;
+pub use goport_util::astdata;
 pub mod baseline;
 pub mod binder;
 pub mod checker;
@@ -24,6 +25,7 @@ pub mod cmd;
 pub mod core;
 pub mod declarations;
 pub use goport_util::diag;
+pub use goport_util::diagnostics;
 pub mod diagnostics_loc;
 pub mod emitter;
 pub mod evaluator;
@@ -34,6 +36,7 @@ mod flags_macros {
     pub(crate) use goport_util::{go_enum, go_flags};
 }
 pub mod frontend;
+pub use goport_util::jsnum;
 pub use goport_util::locale;
 pub mod modulespecifiers;
 pub mod options;

@@ -119,7 +119,7 @@ impl ParseDiagnostics {
     pub fn parse_error_at_range(
         &mut self,
         loc: TextRange,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Option<usize> {
         // Don't report another error if it would just be at the same location as the last error
@@ -241,7 +241,7 @@ pub fn viable_keyword_suggestions() -> &'static [String] {
 // Go: parser.go:118 isMissingNodeList
 // PORT: Go marks a missing list by its shared `missingListNodes` backing
 // array. Rust lists do not share backing arrays, so `create_missing_list`
-// marks the list with the ts_ast `has_trailing_comma` bit on an empty list.
+// marks the list with the astdata `has_trailing_comma` bit on an empty list.
 // The store never sets that bit (Go computes the trailing comma from the
 // list ends) and an empty list cannot have a trailing comma.
 #[must_use]
@@ -577,7 +577,7 @@ impl Parser {
         &mut self,
         pos: i32,
         end: i32,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Option<usize> {
         self.parse_error_at_range(TextRange::new(pos, end), message, args)
@@ -586,7 +586,7 @@ impl Parser {
     // Go: parser.go:325 parseErrorAtCurrentToken
     pub fn parse_error_at_current_token(
         &mut self,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Option<usize> {
         let range = self.scanner.token_range();
@@ -598,7 +598,7 @@ impl Parser {
     pub fn parse_error_at_range(
         &mut self,
         loc: TextRange,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Option<usize> {
         self.diagnostics
@@ -1529,7 +1529,7 @@ impl Parser {
     pub fn parse_expected_with_diagnostic(
         &mut self,
         kind: SyntaxKind,
-        message: Option<&'static ts_diagnostics::Message>,
+        message: Option<&'static crate::diagnostics::Message>,
         should_advance: bool,
     ) -> bool {
         if self.token == kind {
@@ -1820,7 +1820,7 @@ impl Parser {
     pub fn parse_block(
         &mut self,
         ignore_missing_open_brace: bool,
-        diagnostic_message: Option<&'static ts_diagnostics::Message>,
+        diagnostic_message: Option<&'static crate::diagnostics::Message>,
     ) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2120,7 +2120,7 @@ impl Parser {
 // parser, so it writes the shared `ParseDiagnostics` (see there).
 fn scan_error(
     diagnostics: &Rc<RefCell<ParseDiagnostics>>,
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     pos: i32,
     length: i32,
     args: Vec<String>,

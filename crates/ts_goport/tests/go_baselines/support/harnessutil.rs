@@ -2,8 +2,8 @@
 //! runner uses: `FakeTSVersion` and `TracerForBaselining`.
 
 use rustc_hash::FxHashMap;
-use ts_diagnostics::Message;
 use ts_goport::core::version;
+use ts_goport::diagnostics::Message;
 use ts_goport::diagnostics_loc::message_localize;
 use ts_goport::execute::tsc::compile::{Writer, write_str};
 use ts_goport::frontend::tspath::{ComparePathsOptions, Path, to_path};

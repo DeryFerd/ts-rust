@@ -24,8 +24,8 @@ pub fn get_type_checker_for_file_exclusive<R: Send + 'static>(
     with_type_checker_for_file(file, f)
 }
 
-/// The Go frontend program (Go `*compiler.Program`). Panics on the legacy
-/// path, which has no Go frontend program, and off the loading thread.
+/// The Go frontend program (Go `*compiler.Program`). Panics off the loading
+/// thread.
 fn frontend_program() -> Rc<NewProgram> {
     go_frontend_program().expect("the incremental program needs the Go frontend program")
 }

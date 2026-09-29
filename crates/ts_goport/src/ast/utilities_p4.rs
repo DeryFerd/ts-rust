@@ -319,7 +319,7 @@ pub fn node_has_kind(node: Node, kind: SyntaxKind) -> bool {
 
 // Go: ast/utilities.go:2960 IsContextualKeyword
 pub fn is_contextual_keyword(token: SyntaxKind) -> bool {
-    // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
+    // PORT: compare discriminants; crate::astdata::SyntaxKind does not derive Ord.
     SyntaxKind::FIRST_CONTEXTUAL_KEYWORD as u16 <= token as u16
         && token as u16 <= SyntaxKind::LAST_CONTEXTUAL_KEYWORD as u16
 }
@@ -740,7 +740,7 @@ pub fn is_string_text_containing_node(node: Node) -> bool {
 
 // Go: ast/utilities.go:3218 IsTemplateLiteralKind
 pub fn is_template_literal_kind(kind: SyntaxKind) -> bool {
-    // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
+    // PORT: compare discriminants; crate::astdata::SyntaxKind does not derive Ord.
     SyntaxKind::FIRST_TEMPLATE_TOKEN as u16 <= kind as u16
         && kind as u16 <= SyntaxKind::LAST_TEMPLATE_TOKEN as u16
 }

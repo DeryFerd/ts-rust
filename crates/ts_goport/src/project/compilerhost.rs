@@ -169,7 +169,7 @@ impl compiler::CompilerHost for CompilerHost {
 
     // Go: project/compilerhost.go:106 compilerHost.Trace
     // Trace implements compiler.CompilerHost.
-    fn trace(&self, msg: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn trace(&self, msg: &'static crate::diagnostics::Message, args: Vec<String>) {
         let logger = self.logger.borrow().clone();
         logger.log(&crate::diagnostics_loc::message_localize(
             msg,

@@ -10,12 +10,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::mpsc;
 
-use ts_ast::SyntaxKind;
 use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
     source_file_ecma_line_map, source_file_get_declaration_map, source_file_get_name_table,
     source_file_imports, source_file_info,
 };
+use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::lsp::lsproto;

@@ -8,7 +8,7 @@
 use crate::frontend::prelude::*;
 
 /// The Go `ast.SourceFile` fields that the parser sets.
-// PORT: Go keeps these fields on the `SourceFile` node data. ts_ast cannot
+// PORT: Go keeps these fields on the `SourceFile` node data. astdata cannot
 // hold them, so the parser returns them next to the root node. The binder,
 // ECMA line map and language service fields of Go `SourceFile` are not here:
 // the parser does not set them. The Go mutexes are not needed (one thread).

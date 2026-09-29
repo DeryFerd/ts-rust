@@ -11,7 +11,7 @@
 
 use crate::ls::prelude::*;
 
-use ts_diagnostics::Message;
+use crate::diagnostics::Message;
 
 // Go: ls/rename.go:24 RenameInfo
 // RenameInfo represents the result of a rename validation check.

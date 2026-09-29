@@ -1,6 +1,6 @@
+use crate::diagnostics::Message;
 use crate::frontend::prelude::*;
 use std::sync::LazyLock;
-use ts_diagnostics::Message;
 
 // Go: tsoptions/commandlineoption.go:9 CommandLineOptionKind
 // PORT: Go `CommandLineOptionKind` is a string type. It stays a string

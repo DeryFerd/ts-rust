@@ -47,7 +47,7 @@ the most literal port and add a `// PORT:` comment that explains the choice.
   numeric values). Operators: `a|b` works, `a&b != 0` -> `a.intersects(b)`,
   `a&b == b` -> `a.contains(b)`, `a&^b` -> `a.without(b)`, `a&b` -> `a & b`.
   Raw bits: `.0`.
-- `ast.KindFoo` -> `SyntaxKind::Foo` (`ts_ast::SyntaxKind`). Only difference:
+- `ast.KindFoo` -> `SyntaxKind::Foo` (`astdata::SyntaxKind`). Only difference:
   Go `JSDoc...`/`JS...` kinds are spelled `JsDoc...`/`Js...`
   (`ast.KindJSDocTypeTag` -> `SyntaxKind::JsDocTypeTag`,
   `ast.KindJSImportDeclaration` -> `SyntaxKind::JsImportDeclaration`).
@@ -55,7 +55,7 @@ the most literal port and add a `// PORT:` comment that explains the choice.
   (compare with `>=`/`<=`; SyntaxKind is `Ord`).
 - Diagnostics: `diagnostics.Type_0_is_not_assignable_to_type_1` ->
   `diag::Type_0_is_not_assignable_to_type_1` (exact Go name,
-  `&'static ts_diagnostics::Message`).
+  `&'static diagnostics::Message`).
 - Go package-level functions in `checker` -> `impl Checker` methods when they
   touch type, symbol, signature, mapper or checker data, else free `pub fn`.
   Package-level functions in `ast`, `scanner`, `binder` that take a symbol
@@ -82,11 +82,11 @@ the most literal port and add a `// PORT:` comment that explains the choice.
 | `*TypeMapper` | `MapperId` |
 | `*InferenceContext` | `InferenceContextId` |
 | `*InferenceInfo` | `usize` index into `inference_contexts[ctx].inferences` (pass the context id too) |
-| `*diagnostics.Message` | `&'static Message` (`ts_diagnostics::Message`) |
+| `*diagnostics.Message` | `&'static Message` (`diagnostics::Message`) |
 | `*ast.Diagnostic` | `Diagnostic` (owned, `core::Diagnostic`) |
 | `[]*T` param | `&[T]` ; `[]*T` field or return | `Vec<T>` |
 | `string` param | `&str` ; field or return | `String` |
-| `int` | `i32` ; `int64` | `i64` ; `uint32` | `u32` ; `jsnum.Number` | `ts_jsnum::Number` |
+| `int` | `i32` ; `int64` | `i64` ; `uint32` | `u32` ; `jsnum.Number` | `jsnum::Number` |
 | `bool` | `bool` |
 | `any` literal value (LiteralType.value) | `LiteralValue` enum defined in `checker/types.rs` |
 | `core.Tristate` | `Tristate` (in `options.rs`) |
@@ -209,7 +209,7 @@ methods reach the AST through it.
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
 - `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
-  `ast/node.rs`. A list of parsed data points at its ts_ast list (it lives
+  `ast/node.rs`. A list of parsed data points at its astdata list (it lives
   for the process). A list of synthetic data is an index into the thread's
   synthetic arena (`SyntheticList`), so it is valid only on the thread
   that made it, like a synthetic `Node`. Equality is Go pointer equality.
@@ -809,8 +809,7 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Scanning
 
-- ls, astnav and format code scan with the literal Go scanner
-  `frontend::scanner::Scanner`, not `RsScanner`.
+- All code scans with the Go scanner `frontend::scanner::Scanner`.
 - Go `scanner.GetScannerForSourceFile(f, pos)` is
   `scanner_ls::get_scanner_for_source_file(f, pos)` and
   `scanner.GetECMAPositionOfLineAndByteOffset` is

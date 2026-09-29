@@ -19,8 +19,8 @@
 //!   `visit_embedded_statement`), as the printer plan's contract gives them.
 //!   The unexported hook-aware ones get a `_hooked` suffix.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 /// Go `NodeVisitor.Visit`.
 pub type VisitFn<'a, C> = Rc<dyn Fn(Node, &mut NodeVisitor<'a, C>) -> Node + 'a>;

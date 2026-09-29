@@ -768,21 +768,6 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
     (port + (go_pos - go)) as i32
 }
 
-// PORT: converts a legacy `ts_scanner` UTF-16 token value to the Go string
-// form. A valid pair becomes one code point and a lone surrogate becomes the
-// `encode_js_string_rune` unit, as the Go scanner writes it.
-// `JsString::to_string_lossy` would turn a lone surrogate into U+FFFD instead.
-pub fn js_string_to_token_value(value: &ts_core::JsString) -> String {
-    let mut out = String::new();
-    for result in char::decode_utf16(value.as_units().iter().copied()) {
-        match result {
-            Ok(ch) => push_js_string_rune(&mut out, ch as u32),
-            Err(err) => push_js_string_rune(&mut out, u32::from(err.unpaired_surrogate())),
-        }
-    }
-    out
-}
-
 // Go: stringutil/util.go:352 CombineSurrogatePairs
 // CombineSurrogatePairs canonicalizes a JS-string value produced by
 // concatenation, merging any adjacent high+low surrogate sentinel pair (as

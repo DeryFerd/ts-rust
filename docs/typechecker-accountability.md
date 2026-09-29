@@ -20,7 +20,7 @@ Use as many independent analysis agents as the work needs, up to the available 4
 
 Read-only research helpers are always allowed and need no build or demo gate. A goal that asks for parallel work starts a workflow within 30 minutes. For a build that fails in many files, root builds once and gives each fix agent one file and its error list. Fix agents do not run Cargo. A later wave waits until the earlier wave it depends on is integrated and builds. [AGENTS.md](../AGENTS.md) has the details.
 
-This authorization does not waive protected tests, corpus preservation, pinned Go evidence, exact source identity, independent verdicts or complete Query/Hono diagnostics, types, symbols and replay. STOP still blocks acceptance and unrelated feature work. It permits continued diagnosis and regression repair under this authorization.
+This authorization does not waive the [protected set](#protected-set), pinned Go evidence, exact source identity, independent verdicts or complete Query/Hono diagnostics, types and symbols against pinned Go. STOP still blocks acceptance and unrelated feature work. It permits continued diagnosis and regression repair under this authorization.
 
 ## Start or resume
 
@@ -33,29 +33,96 @@ This authorization does not waive protected tests, corpus preservation, pinned G
 
 The paused state can be activated only by Theo's next instruction to start the work. Record that instruction in the state. Do not claim that the goal has started merely because the accountability files exist.
 
-## Regression auditor role
+## Protected set
 
-Use this assignment when creating or resuming the agent:
+On 2026-09-28 Theo approved the retirement of the legacy cargo roster. The saved state holds his words in two notes:
 
-> You are the independent regression auditor. You do not edit compiler code, test expectations, baseline records or the primary implementer's patch. Read the accountability rules and state. Compare exact names and outcomes against the original 6,055 accepted tests, all 6,330 passes in the earlier full run and later measured passes. Verify that required runs closed normally and match the exact candidate source. Keep historical, partial and current results separate. Identify every lost pass, missing name and unrun requirement. Check any expectation change against its concrete pinned Go evidence and old-name mapping. Return one source-bound PASS or STOP verdict with the blocking facts. New passes cannot compensate for lost ones. Do not approve a focused run as full acceptance.
+- `legacy-removal-direction-2026-09-28`: "should we be deprecating the old stuff and removing it? this project is greenfield, we can delete whatever"
+- `legacy-removal-rule-approval-2026-09-28`: "i approve any rule changes that allow removing the legacy code"
 
-The auditor uses existing result parsers and logs. It does not inspect private test bodies or raw failure payloads to infer a cause. Cause investigation is a separate assigned task with its own access limits.
+The legacy roster (the 6,055 and 6,330 names, the `ts_checker`, `ts_compiler`, `ts_parser`, `ts_binder` and `ts_fixture` stages and the current-source corpus) tests only the old stack. No roster test runs goport code. Thus goport's own evidence is now the protected set, and "never lose a pass" applies to it. A batch uses this set when its rules say `protectedSet: "goport"`. Root records the change in `acceptanceRuleChanges` (id `goport-protected-set`) and cites the approval note.
 
-The historical source references are fixed:
+### What the set holds
+
+- **goport tests, per name.** The 7 test binaries: the `ts_goport`, `goport_util` and `goport_lsproto` libs, and `go_baselines` (default), `multi_program`, `emit_pool` and `early_emit`. Also the ignored-by-default goport suites that the project runs by name (the `TestSubmodule` shards, `test_local`, the reference files, the transpile runner, the lib snapshot tests and `fswatch_linux`), and the unit tests of the kept crates `ts_scanner`, `ts_ast`, `ts_diagnostics`, `ts_path`, `ts_core` and `ts_jsnum`.
+- **Gate items.** Every item in the gate `manifest.json`, one by one.
+- **Bound runs.** The bound Query core and Hono runs.
+- **LSP oracle.** `lsp_oracle.py check` on the batteries in `LSP_BATTERIES` of `candidate.sh`: `b1-inline`, `b1-query-core`, `b2-query-core`, `b1-hono`, `b2-hono` and `fourslash` (240,911 `same` requests at R131), against the pinned Go goldens. `candidate.sh side` runs it with the gate's `tsgo`. The run must have 0 diff, 0 goport_error, 0 timeout and 0 crash, and `oracle-compare.py` against the base run must show 0 lost, unrun and absent requests.
+- **API oracle.** `scripts/goport/api_oracle.py check`, with `GOPORT_PIN` set to the batch pin, on the batteries in `API_BATTERIES` of `candidate.sh`: `qc`, `qc-proto`, `qc-callbacks`, `qc-lsp`, `tsp-lsp`, `qc-xchecker`, `hono`, `hono-xchecker`, `zod` and `effect` (108,203 `same` requests at R129). `candidate.sh side` runs it. Pinned Go has known diffs here (4 at R129), so the test is per request: `oracle-compare.py` against the base run must show 0 lost, unrun and absent requests. The run must cover every battery of the base run, and the `goportSha` of each battery in `<dir>/manifest.json` must be the sha of the gate's `tsgo`.
+- **np-suite.** `scripts/goport/np-suite.sh run <label> <bins>/tsgo` runs the typescript-go native-preview API client tests (459 tests at R129, all pass) against goport's `tsgo`, with `NP_GO_DIR` at the Go checkout of the batch pin. `np-suite.sh diff <base label> <new label>` must show no `pass ->` change. Use a new label for each run, because `run` deletes the dir of its label. No tool runs it for a candidate (see "np-suite is outside `candidate.sh`" below).
+- **Quality.** rustfmt, clippy, and 0 warnings in `ts_goport` and in the kept crates.
+- **Verdicts.** Both independent verdicts on the exact source.
+
+Not in the set: the other LSP batteries (`complete-u1`, `b4`, `b3-zod`, `b3z-effect` and `fourslash-nonfatal`). Integration merges and pin bumps run them as extra checks and report the results with the batch. They are outside the set because `candidate.sh` runs one battery set and these need other golden roots or `--traces-dir`, and because `b4` has a Go-unstable auto-import request with no flaky mark (int13: the other answer appears in 13 of 25 saved full `b4` runs, and live Go at the pin also misses the golden), so a strict per-request rule fails it in about half of all runs. A new diff class or a crash in them is a finding for the reviewer.
+
+### Baseline and base
+
+- The first baseline is `docs/goport-protected/tests-r131.json.gz`: the `results.json` of the R131 test binaries, as compact JSON with sorted keys, compressed with `gzip -n -9` so that the bytes are the same each time. Every reader of a results file accepts `.json` and `.json.gz`. `docs/goport-protected/README.md` tells what it is, how to make it again and its sha256.
+- Each accepted revision writes its `results.json` to its evidence cache. The test base for a candidate is the result of the last accepted revision. The gate base is the gate manifest of the last accepted revision.
+- The LSP oracle, API oracle and np-suite base is the run of the last accepted revision. When that revision has no such run, run it once on that revision's saved release bins and use that run as the base. A legacy revision (R131 or R132) has no API or np-suite run. After a legacy batch, the API and np-suite bases are `api-r131` and `np-r131`, run on the R131 release bins (`target/continuation-r97-goport/evidence-cache/725433165cab344d/bins`), and the test base is the first baseline, also from R131. The `goport-protected-set` rule names `api-r131` in `apiBaseline`. So a loss in R132 still shows in the first goport batch.
+- Do not make a base from a candidate that is not accepted. Do not rebuild a missing base from the current source.
+
+### Tools
+
+- `scripts/goport/build-goport-tests.sh <checkout> <testbin-dir>` builds all the test binaries at a checkout. It reads `cargo metadata`, so a new crate or `tests/*.rs` target joins the set with no edit (except the crates in its `NOT_PROTECTED` list). It writes the binaries, `SUITES`, `relbin/`, `COMMIT`, `TREE` and `bins.sha256`.
+- `scripts/goport/goport-tests.sh <testbin-dir> <out-dir> [--pin PIN]` runs every protected suite from those binaries in a clean environment (`env -i`, and a bwrap over a git archive of the crates of `COMMIT`). It writes `<out-dir>/results.json`: one status for each name (`ok`, `failed`, `ignored` or `unrun`) and the list of `incomplete` suites. It refuses an out-dir that has results. A test failure still ends the log with `DONE`: the compare decides.
+- `scripts/goport/compare-tests.py <base> <new> [--name-map TSV] [--out FILE]` gives the retained, recovered, lost, absent, unrun, new and removed names for each suite. It exits 1 when a base `ok` name is lost, absent or unrun, or when a name map line is rejected. It exits 2 on bad input, also on a results pin that is not 7 to 64 hex characters.
+- **Name map.** A TSV with one line per moved, renamed or removed test and 5 columns: old suite, old name, new suite, new name and evidence. The evidence cell must not be empty. `-` as the new suite and new name removes a test. A line is rejected when its old name is still in the new results, when its new name is a base name, or when it removes a name while the Go pin did not change and the suite is not a kept-crate suite. The check script applies the same rules. It takes the pin change from `upstreamPin.to` of the base batch and of the batch, not from the results files.
+- `scripts/goport/gate-compare.py <base manifest> <new manifest> [--state FILE] [--out FILE]` compares the gate item by item with the gate rules below. It exits 1 on a regression.
+- `scripts/goport/oracle-compare.py <base dir> <new dir> [--out FILE]` compares two LSP or API oracle results dirs per request. Each base `same` or `oracle_error_same` request must be so again. It exits 1 when one is lost, unrun or absent.
+
+### Rules
+
+- **No lost pass.** Each name that is `ok` in the base must be `ok` in the candidate. A lost, absent or unrun name is STOP. New passes do not compensate for a lost pass.
+- **Gate items.** A MATCH item in the base must stay MATCH, or become ALLOWED by an allow entry (same id and condition) that the base manifest's allow list also has ("reallowed"). The oracle's trace order changes with threads, so some single-threaded-equal items move between MATCH and ALLOWED on the same bins. MATCH to ALLOWED by an entry that the base did not have is a regression. `gate-allow.txt` is a protected path, so a candidate cannot add an entry. An ALLOWED item must carry `allowedBy`: the gate checked its `gate-allow.txt` condition again in the new run. A new FAIL, a new item that is FAIL and a removed item id are regressions. The gate verdict alone is not the test, because the R131 verdict is FAIL (editor long growth).
+- **Gate tools.** The gate manifest records the sha256 of every tool that judges its items: the oracle, the Go dumper, `gate.sh`, the allow list, each stage script (most live under `target/`, which no protected path covers) and the saved Go outputs the stages judge against (`oracleCaches`: each `oracle-sweep` file, and one hash per family for `errcopies-oracle`, `oracle`, `project-inputs-extra/*/oracle.txt`, the `project-inputs-wide` oracle files, the f1 sample's `results/*.oracle.out` and lists, and `/tmp/goport-emit-oracle`). `gate-compare.py` compares each hash with the base run. A changed or removed tool is a regression unless the batch lists that exact change (key, base sha256, new sha256, reason) in `batch.gateToolChanges`, and the reviewer judges each listed change. A pin bump lists its new oracle and cached Go outputs there.
+- **Evidence builds.** Only the candidate checkout builds in the shared candidate target (`runtime/cargo-target`). Any other checkout builds in its own target. Before each build, `purge-foreign-fingerprints.py` removes the build records that name another checkout's files, so a stale crate cannot be linked (R132 side try 1).
+- **Repeat runs.** Keep every run of a protected check on one source. To run a check again, move the old run aside (for example `tests-run` to `tests-run.1` in the evidence cache) or use a new label. Do not delete a run. This includes the gate: `candidate.sh side` keeps the record of every gate run on the source (a failed run as `gate-fail-<label>.json` in the evidence cache), `verdict-request` lists every gate run, and `accept_revision.py` refuses a failed gate run that has no flake note. A base `ok` name, MATCH gate item, `same` oracle request or passing np-suite test that fails in any run of the source is lost, even when another run passes.
+- **Flakes.** The only exception is a flake that the independent reviewer accepts. Before the verdicts, root records it with `scripts/state record note flake-r<N>-<short name>`: the name, the source, the path and result of every run, the base result, and the evidence that the change did not cause the failure (for example the same failure on the base source or on pinned Go, or a timeout in the log at high load and a pass on a quiet host). A flake record covers one name on one source. It does not change a baseline, expectation, golden or flaky mark. For the tests and the oracles, the batch still uses a run with no loss, because the check script reads one run of each. For the gate, the check script reads every gate run of the source in `gateRuns`, runs `gate-compare.py` on each again, and needs a flake note for each regression of a failed run.
+- **Open defect.** The editor long-growth items `editor/query-core/long` and `editor/hono/long` can FAIL only while the batch has the open defect record `editor-long-growth` in `openDefects`, only when the failure is growth alone (no rss or answer failure), and only when the Rust growth is at most the fixed cap of the project: query-core 1.58 and hono 1.28 MiB/edit. Each cap is the highest growth of a good build in the R126 to R131 and bump B gates (query-core 1.43, hono 1.13) plus 0.15 MiB/edit of noise. The cap does not follow the base, so small growth cannot add up over revisions. `gate-compare.py` applies the caps.
+  - The caps only go down. A batch that lowers the growth (for example a fix) can lower the cap of that project to its growth + 0.15 MiB/edit, and the reviewer checks the value against the gate runs. A cap also goes down by itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the base Rust growth of that project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins can then FAIL (hono at 1.13 MiB/edit on the R131 bins: MATCH in `r131-full` at limit 1.88, FAIL in `r131-full-2` at limit 1.00). No batch can raise a cap. Only Theo can.
+  - When the defect is closed, both items must be MATCH like every other item.
+- **Pin bumps.** When a pin bump renames or removes Go tests, give a name map (format under "Tools") from each old name to its new name, with Go evidence at the new pin. The reviewer checks the map. A lost name without a map is STOP.
+- **Moved tests.** When tests move to a different binary or crate, or a kept crate's tests are deleted because goport's Go port replaces them, give a name map in the same way. R131 did this for the crate split (`target/continuation-r97-goport/buildspeed/split1/r131/lib-name-map.tsv`). The reviewer checks that each new name tests the same behavior.
+- **Expectation changes.** An expectation change needs concrete pinned Go evidence, an explicit old-name map and independent review.
+- **Batch fields.** `open_revision.py` writes `protectedSet: "goport"` and `protectedBase` (the base test results, gate manifest, and LSP and API runs). The batch needs a hex Go pin in `upstreamPin.to`. `accept_revision.py` writes these fields and the check script reads them:
+  - `goportTests`: `results`, `sha256`, `base`, `baseSha256`, `compare` (with `lost`, `absent`, `unrun`, `retained` and `recovered`), `nameMap` (`path` and `sha256`, or null), `testbin`, `commit` and `compareOutput`.
+  - `gate` and `gateCompare`: `base`, `baseSha256`, `new`, `sha256`, `regressions`, `knownOpen` and `output`. Also `gateVerdict`.
+  - `gateRuns`: every gate run of the source, oldest first, with the batch gate last. Each entry has `label`, `manifest`, `sha256`, `compare` (`path` and `sha256`) and `regressions` with their flake notes. Each kept `gate-compare-fail-<label>.json` must have an entry.
+  - `languageServerOracle` and `apiOracle`: `label`, `summary`, `dir`, `host`, `result`, `base` (`label` and `dir`), `compare` and `output`.
+  - `quality` and `qualityEvidence`, and the bound runs `ordinaryQuery` and `latestHono`.
+  - Both verdicts. The history row and both verdicts carry `goportTestsSha256`, `gateSha256` and `nameMapSha256`.
+
+  These batches have no `fullResult`, `corpus` or `rosterCarryForward`.
+- **np-suite is outside `candidate.sh`.** `candidate.sh side` runs every other part of the set, and `accept_revision.py` records it. No tool runs np-suite for a candidate, and the check script does not read it. Root runs `np-suite.sh run <new label> <bins>/tsgo` on the candidate's release bins and `np-suite.sh diff <base label> <new label>`, and records the run with `accept_revision.py --extra` as `npSuite` (label, dir, base label, and the diff output path and sha256). Both verdicts check it by hand.
+- **Protected paths.** The files that judge the protected set are protected paths: this file, `AGENTS.md`, `docs/goport-protected/`, the check and state tools, `scripts/upstream/pin.py`, `UPSTREAM.json` (the oracle and Go checkout of each pin), `scripts/run-cargo-capped.sh` (it builds the test and release bins and runs clippy), and the goport pipeline, test runners, compares, oracles and gate scripts. `scripts/goport/open_revision.py --protected` prints the list. A candidate must not change a protected path: `candidate.sh check` and `open` refuse the change, unless the batch's `allowedChangedFiles` lists that exact path.
+  - A pin-bump batch that must change a tool lists each exact path in its batch. For example, bump B lists `UPSTREAM.json`, `scripts/goport/gate.sh` and `scripts/goport/bound2.sh`, and `scripts/goport/candidate.sh` for its new API batteries. The independent reviewer judges each tool change: the pin must need it, and it must not drop or weaken a check, suite, gate item, battery or name of the base. A change that the reviewer does not accept is STOP.
+  - Any other batch needs Theo's approval to change a protected path. Root records it in the state.
+- Only Theo can change these rules. Root must not widen them by delegation.
+
+### Retired legacy roster
+
+New batches do not use the legacy roster, the roster drive, the current-source corpus or the roster carry-forward. R132 is the last revision under them: it was opened in batch port-18 under the legacy rules before this rule was recorded. Historical records and evidence stay unchanged. The check script still checks old batches in `history.jsonl` under the rules that applied to them. It uses this legacy mode (a batch with no `protectedSet`) only for revisions up to 132 (`recoveryRevision` 132 or lower). A later revision without `protectedSet: "goport"` is STOP, also with a roster carry-forward. The historical source references are:
 
 - Accepted commit: `5c7c7bd20cb45ebc8f2171eed8478fa2797e8343`, 6,055 accepted passes.
 - Code-equivalent checkpoint: `8f4943ac6dffa6785165e18a07a5b369a6811da7`. The measured run belongs to the first commit.
 - Later passing-name reference: fingerprint `162fccf9061a30bac011c98f3086538a7ba64b5ca87e99ca6c78b69990b175be`, 6,330 passes. It also had 446 failures and is not an accepted compiler.
 
-Every later passing name stays in the preservation ledger. Restarting from the accepted commit does not erase later measured behavior.
+## Regression auditor role
+
+Use this assignment when creating or resuming the agent:
+
+> You are the independent regression auditor. You do not edit compiler code, test expectations, baseline records or the primary implementer's patch. Read the accountability rules and state. Compare the candidate with the base (the last accepted revision) for each goport test name with `compare-tests.py`, for each gate item with `gate-compare.py`, for each LSP and API oracle request with `oracle-compare.py` and for each np-suite test with `np-suite.sh diff`. Verify that the results name the exact candidate source (commit, tree and test binary hashes), that the base hashes match the saved base, and that each required run closed normally. Check every run of the source in its evidence cache, not only the run that the batch names, and every gate run that the verdict request lists: a loss in any run is lost unless the reviewer accepted its flake record. Keep base, candidate and later results separate. Identify every lost, absent and unrun name, every gate regression and every lost oracle request or np-suite test. Check the open-defect condition for the editor long-growth items. Check each name map and each expectation change against its concrete pinned Go evidence. Return one source-bound PASS or STOP verdict with the blocking facts. New passes cannot compensate for lost ones. Do not approve a focused run as full acceptance.
+
+The auditor uses existing result parsers and logs. It does not inspect private test bodies or raw failure payloads to infer a cause. Cause investigation is a separate assigned task with its own access limits.
 
 ## Independent reviewer role
 
 Use this assignment when creating or resuming the agent:
 
-> You are the independent reviewer and progress reviewer. You do not edit the compiler patch or its expectations. Read the accountability rules, reset plan and state. Review the complete operation against pinned Go, including its real callers, context, cache publication, recursion, diagnostics, negative cases and repeat behavior. Check the actual ordinary Query result, Hono freshness, scope and cumulative revision count. A narrow static review or a later stopping point is not a completed feature. Return one source-bound PASS or STOP verdict. Stop new feature work when the operation remains incomplete, new regressions appear, the revision limit is reached, or the work changes targets without a decision. Do not reset the counter for new tests, traces, branches or agent replacements.
+> You are the independent reviewer and progress reviewer. You do not edit the compiler patch or its expectations. Read the accountability rules, reset plan and state. Review the change against pinned Go, including its real callers, context, cache publication, recursion, diagnostics, negative cases and repeat behavior. Check that the protected set is complete: every test binary and suite of the base still runs, every base name and gate item is in the new results or in a checked name map, every named LSP and API battery and np-suite ran, and the baseline files match their recorded sha256. Accept a flake only with the evidence that the flake rule asks for. Check each name map against its Go evidence. Judge each change to a protected path that the batch lists. Check the actual ordinary Query result, Hono freshness, scope and cumulative revision count. A narrow static review or a later stopping point is not a completed feature. Return one source-bound PASS or STOP verdict. Stop new feature work when the operation remains incomplete, the protected set is incomplete, new regressions appear, the revision limit is reached, or the work changes targets without a decision. Do not reset the counter for new tests, traces, branches or agent replacements.
 
-This is the existing independent code-review role with explicit authority to stop the work. It is not an additional approval committee. The reviewer checks the complete operation and the measured outcome, not each preparation step.
+This is the existing independent code-review role with explicit authority to stop the work. It is not an additional approval committee. The reviewer checks the change, the completeness of the protected set and the measured outcome, not each preparation step.
 
 ## What STOP means
 
@@ -88,7 +155,7 @@ Before replacing `state.batch`, save its record at `docs/typechecker-batches/<ba
 
 The record must identify the source, hypothesis, changed scope, exact expected recoveries, commands, completed runs, result paths and hashes, ordinary Query outcome, latest Hono result, both independent verdicts and the next permitted action. Each verdict names its agent, batch and exact source. A verdict from another source is stale.
 
-Keep test comparisons separate for the original accepted roster, later measured passes and new coverage. Keep corpus diagnostics, types, symbols and replay evidence separate from unit-test totals. Full acceptance needs the required corpus checks as well as regression checks. Missing evidence is STOP.
+Keep the goport test comparison, the gate item comparison and new coverage separate. Keep the bound Query and Hono runs, the LSP and API oracles, np-suite and the gate's diagnostic, emit and typesyms results separate from test totals. Full acceptance needs every part of the [protected set](#protected-set). Missing evidence is STOP.
 
 Do not store raw type graphs, private test bodies or large failure payloads in this file. Link the existing evidence. If an ignored evidence file is missing in a future checkout, stop and recover it from preserved records. Do not invent its contents.
 
@@ -105,10 +172,21 @@ node scripts/check-typechecker-batch.mjs docs/typechecker-state
 Run the tooling tests with all named results visible:
 
 ```sh
-node --test --test-isolation=none --test-reporter=spec scripts/check-typechecker-batch.test.mjs scripts/state.test.mjs
+node --test --test-isolation=none --test-reporter=spec scripts/check-typechecker-batch.test.mjs scripts/state.test.mjs scripts/goport/compare-tests.test.mjs
 ```
 
-The first version automatically compares the fixed 6,055 accepted names and the later 6,330 passing names. The regression auditor must also compare passing names added after that reference. Their starting evidence is in `additionalPassingResultsForAuditor`. Append later measured results there. The script does not itself prove this extra comparison, corpus parity, Go equivalence or Query completion. The independent verdicts must address those requirements. A script PASS alone is not compiler acceptance.
+The check and its tests need `python3`, because the check runs `gate-compare.py` and `oracle-compare.py`.
+
+For a batch with `protectedSet: "goport"`, the script compares the goport test result files again with the name map rules, runs `gate-compare.py` on the pinned gate manifests and `batch.openDefects`, and runs `oracle-compare.py` again on the LSP and API results dirs. It must reject:
+
+- a lost, absent or unrun goport test name, or a rejected name map line
+- a gate regression, also an editor long-growth item over its cap
+- a failed gate run of the source that `gateRuns` does not list, or a regression of a failed run with no flake note
+- a lost, unrun or absent LSP or API request, an LSP run with a diff, goport_error, timeout or crash, and an API run that misses a base battery or ran another goport binary than the gate's `tsgo`
+- a missing or non-hex `upstreamPin.to`
+- a results, base, gate or name map hash that does not match the saved files, the history row or a verdict
+
+For old batches (legacy mode, revisions up to 132) it keeps the old check: the fixed 6,055 accepted names, the later 6,330 passing names and `additionalPassingResultsForAuditor`. The script does not read np-suite or the repeat runs of the tests and oracles. It reads every gate run in `gateRuns`. It does not itself prove that the protected set is complete, Go equivalence or Query completion. The independent verdicts must address those requirements. A script PASS alone is not compiler acceptance.
 
 This is a required pre-acceptance check, not a replacement Cargo runner. It does not prevent someone from calling Cargo or Git directly, and it cannot prove that a human-authored review is true. Root must honor the rules for actions outside the check. Keep existing resource limits and actual tool permissions.
 
@@ -116,9 +194,11 @@ The current invocation must return STOP because no recovery batch is authorized 
 
 The original check supports `phase: "initial-recovery"`. The authorized continuation requires an explicit reviewed extension for `phase: "recovery-continuation"`. Keep the complete history and require the saved continuation authorization. Do not add an ignore-regressions path or use an unrecorded phase change to bypass the initial limit.
 
-The script checks limits in the supplied history. For a state directory it also stops when `history.jsonl` no longer starts with its committed copy. It cannot detect a rewrite that was committed. The auditor must verify carry-forward against `batchRecords`. This limitation is not permission to reset a counter.
+The script checks limits in the supplied history. For a state directory it also stops when `history.jsonl` no longer starts with its committed copy. It cannot detect a rewrite that was committed. The auditor must verify the history that each batch carries forward against `batchRecords`. This limitation is not permission to reset a counter.
 
 ## Approved rule changes
+
+The 2026-09-28 [protected set](#protected-set) change is the newest rule change. The opt-in crate rule, its extensions and the roster carry-forward below apply only to batches that use the legacy roster. They stay so that old records still pass the check. The pin-bump rule applies to all batches.
 
 Theo approved two scoped rule changes on 2026-09-25 for batch
 `recovery-continuation-go-checker-port-1`. They are saved in
@@ -154,7 +234,8 @@ the pin-bump rule below), and then to batch
 `recovery-continuation-go-checker-port-14` (same Go pin as batch 13), and then to batch
 `recovery-continuation-go-checker-port-15` (same Go pin), and then to batch
 `recovery-continuation-go-checker-port-16` (same Go pin), and then to batch
-`recovery-continuation-go-checker-port-17` (same Go pin), each time with the same pins and
+`recovery-continuation-go-checker-port-17` (same Go pin), and then to batch
+`recovery-continuation-go-checker-port-18` (same Go pin), each time with the same pins and
 scope. Each extension is a separate entry in `acceptanceRuleChanges`. The
 records name root as the extender. This is not a new direct approval by Theo,
 and it does not widen the rules.
@@ -168,54 +249,41 @@ pin from O to N (first N: the v7.0.2 content). At N, "pinned Go" means Go at N:
 - Go-side evidence (gate caches, corpora, typesyms dumps, LS and API goldens, Query and
   Hono oracle outputs, Go reference baselines) is re-recorded against N into new
   pin-keyed directories; nothing old is overwritten.
-- Acceptance happens only at N, with both independent verdicts. The protected cargo
-  roster (the 6,055 names and later passes) must not lose a name. A Rust expectation
+- Acceptance happens only at N, with both independent verdicts. The protected set must
+  not lose a pass. When the bump renames or removes Go tests, give the old-name map
+  with Go evidence at N (see "Pin bumps" in the protected set rules). A Rust expectation
   that pins old Go behavior changes only with evidence from Go at N and an old-to-new
-  name mapping, reviewed independently.
+  name mapping, reviewed independently. (Before 2026-09-28 this bullet protected the
+  legacy cargo roster.)
+- A tool change that the bump needs in a protected path (for example `gate.sh`,
+  `bound2.sh` or the API batteries in `candidate.sh`) is listed path by path in the
+  batch, and the reviewer judges each change (see "Protected paths" in the protected
+  set rules).
 - The plan and tooling are in `target/continuation-r97-goport/upstream/drift.md`. Root
   must not widen this rule by delegation.
 
-### Goport-only roster carry-forward
+### Goport-only roster carry-forward (retired)
 
-On 2026-09-28 Theo approved a standing rule for all batches. It is saved in
-`acceptanceRuleChanges` with id `goport-only-roster-carry-forward`, `batchId: "*"` and
-`standing: true`. No other rule can use `batchId: "*"`.
+On 2026-09-28 Theo approved a standing rule, saved in `acceptanceRuleChanges` with id
+`goport-only-roster-carry-forward`, `batchId: "*"` and `standing: true`. When no file
+outside `crates/ts_goport` changed since an earlier measured revision, a batch reused
+that revision's legacy roster result instead of the 45-minute roster drive. The proof
+was an equal `roster_fp.py` fingerprint, recorded in `batch.rosterFingerprint` and
+`batch.rosterCarryForward`.
 
-- **Rule.** When no file outside `crates/ts_goport` changed since an earlier measured
-  revision, do not run the protected cargo roster again (the `ts_checker`,
-  `ts_compiler` and `ts_fixture` stages and the current-source corpus). Use the saved
-  roster result of that revision. No roster crate depends on `ts_goport`.
-- **Proof.** `scripts/goport/roster_fp.py <checkout>` gives the roster fingerprint. It
-  uses the `fp.py` method on all files except `crates/ts_goport/**`. The fingerprint of
-  the current source must equal the fingerprint of the earlier source. Equal
-  fingerprints mean byte-identical roster inputs.
-- **Record.** `batch.rosterFingerprint` is the roster fingerprint of the current source.
-  `batch.rosterCarryForward` has `fromRevision`, `fromSourceFingerprint` and
-  `rosterFingerprint`. `fullResult`, `fullResultRaw` and `corpus` point at the saved
-  files of the earlier revision. Use `scripts/goport/accept_revision.py --carry-from <rev>`.
-- **Check.** The local check requires the standing rule and equal roster fingerprints.
-  The earlier history row must be `full_measured`, must not be a carried row, and must
-  have the same source, roster fingerprint and full result hash. The full result must
-  name the earlier source.
-- **What still runs.** Each revision still gets the gate, the bound Query and Hono runs,
-  the quality checks and both independent verdicts. The verdicts are bound to the
-  current source and the carried full result hash. The protected names and the
-  inherited-loss rule do not change.
-- **Auditor.** The regression auditor runs `roster_fp.py` again on the earlier source and
-  on the current source. Both values must be equal and must agree with the state. If
-  not, the verdict is STOP.
-- Root must not widen this rule by delegation. For example, root must not exclude more
-  paths or carry a partial or carried result.
+The [protected set](#protected-set) retired this rule on the same day, with the roster.
+Batches that use the goport protected set have no roster to carry. The check script
+keeps the rule only to check old records. No new batch can use it.
 
 Any other rule change still needs Theo's approval.
 
 ## Project target and reporting
 
-Query core remains first. The milestone is complete ordinary diagnostics matching pinned Go, plus a deliberate type error reported correctly in a separate copy. Full type, symbol and replay parity remain requirements.
+Query core remains first. The milestone is complete ordinary diagnostics matching pinned Go, plus a deliberate type error reported correctly in a separate copy. Full type and symbol parity with pinned Go (the gate's typesyms dumps) remains a requirement.
 
 Hono remains the cross-project check. Run it after a recovered shared operation, at the Query milestone and once per full work day on the latest accepted compiler during continued work. Do not claim the current compiler passes Hono from an older run.
 
-Every progress report states accepted passes retained or lost, exact diagnostic changes, whether ordinary Query completes and the source/date of the latest Hono check. New test coverage is separate. Unavailable diagnostics are not zero diagnostics.
+Every progress report states the goport test passes and gate items retained or lost, exact diagnostic changes, whether ordinary Query completes and the source/date of the latest Hono check. New test coverage is separate. Unavailable diagnostics are not zero diagnostics.
 
 ## Setup ownership
 

@@ -13,8 +13,8 @@
 //! The source file's `EndFlowNode` is stored in the root node's `NodeBindData.end_flow_node`.
 //! The small module-private helpers below read and write that state.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // ---------------------------------------------------------------------------
 // Module-private access helpers (not Go functions).
@@ -906,7 +906,7 @@ impl Binder {
     pub fn get_strict_mode_identifier_message(
         &self,
         node: Node,
-    ) -> &'static ts_diagnostics::Message {
+    ) -> &'static crate::diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in
         // strict mode.
         if get_containing_class(node).is_some() {
@@ -962,7 +962,7 @@ impl Binder {
     pub fn get_strict_mode_block_scope_function_declaration_message(
         &self,
         node: Node,
-    ) -> &'static ts_diagnostics::Message {
+    ) -> &'static crate::diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in strict mode.
         if get_containing_class(node).is_some() {
             return diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Class_definitions_are_automatically_in_strict_mode;
@@ -1080,7 +1080,7 @@ impl Binder {
     pub fn get_strict_mode_eval_or_arguments_message(
         &self,
         node: Node,
-    ) -> &'static ts_diagnostics::Message {
+    ) -> &'static crate::diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in strict mode
         if get_containing_class(node).is_some() {
             return diag::Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of_0_For_more_information_see_https_Colon_Slash_Slashdeveloper_mozilla_org_Slashen_US_Slashdocs_SlashWeb_SlashJavaScript_SlashReference_SlashStrict_mode;

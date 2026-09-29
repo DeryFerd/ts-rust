@@ -83,14 +83,14 @@ pub struct Tracer {
 // `ToString` when written (`args!`), like the Go `%v` formatting later.
 #[derive(Clone, Debug)]
 pub struct DiagAndArgs {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static crate::diagnostics::Message,
     pub args: Vec<String>,
 }
 
 impl Tracer {
     // Go: module/resolver.go:55 tracer.write
     // PORT: the Go nil check is on the caller side (`trace_write!`).
-    pub fn write(&mut self, diag: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn write(&mut self, diag: &'static crate::diagnostics::Message, args: Vec<String>) {
         self.traces.push(DiagAndArgs {
             message: diag,
             args,

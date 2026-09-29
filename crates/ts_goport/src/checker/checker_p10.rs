@@ -9,7 +9,7 @@ use crate::prelude::*;
 // `Rc<RefCell<Relation>>`; a `*Relation` param is `&Rc<RefCell<Relation>>`.
 // PORT: Go `candidatesOutArray *[]*Signature` is `Option<&mut Vec<SignatureId>>`.
 // PORT: Go `diagnosticOutput *[]*ast.Diagnostic` is `Option<&mut Vec<Diagnostic>>`.
-// PORT: a nullable Go `*diagnostics.Message` is `Option<&'static ts_diagnostics::Message>`.
+// PORT: a nullable Go `*diagnostics.Message` is `Option<&'static crate::diagnostics::Message>`.
 
 // Go: checker/checker.go:8804 CallState
 #[derive(Clone, Debug, Default)]
@@ -598,7 +598,7 @@ impl Checker {
     pub fn get_diagnostic_head_message_for_decorator_resolution(
         &mut self,
         node: Node,
-    ) -> &'static ts_diagnostics::Message {
+    ) -> &'static crate::diagnostics::Message {
         match node.parent().kind() {
             SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression => {
                 diag::Unable_to_resolve_signature_of_class_decorator_when_called_as_an_expression
@@ -682,7 +682,7 @@ impl Checker {
         mut candidates_out_array: Option<&mut Vec<SignatureId>>,
         check_mode: CheckMode,
         call_chain_flags: SignatureFlags,
-        mut head_message: Option<&'static ts_diagnostics::Message>,
+        mut head_message: Option<&'static crate::diagnostics::Message>,
     ) -> SignatureId {
         let is_tagged_template = node.kind() == SyntaxKind::TaggedTemplateExpression;
         let is_decorator = node.kind() == SyntaxKind::Decorator;
@@ -1293,7 +1293,7 @@ impl Checker {
         signature: SignatureId,
         type_argument_nodes: &[Node],
         report_errors: bool,
-        head_message: Option<&'static ts_diagnostics::Message>,
+        head_message: Option<&'static crate::diagnostics::Message>,
     ) -> Option<Vec<TypeId>> {
         let is_java_script = is_in_js_file(self.sig(signature).declaration);
         let type_parameters = self.sig(signature).type_parameters.clone();

@@ -1,5 +1,5 @@
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // Port of checker/exports.go (all): the exported Checker API that the
 // language service calls.

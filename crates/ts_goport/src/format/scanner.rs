@@ -11,7 +11,7 @@ pub struct TextRangeWithKind {
     pub kind: SyntaxKind,
 }
 
-// PORT: the Go zero value (Loc 0..0, KindUnknown). ts_ast::SyntaxKind has no
+// PORT: the Go zero value (Loc 0..0, KindUnknown). crate::astdata::SyntaxKind has no
 // Default.
 impl Default for TextRangeWithKind {
     fn default() -> Self {

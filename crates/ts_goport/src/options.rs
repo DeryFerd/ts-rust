@@ -1,12 +1,12 @@
 //! Port of Go `core/compileroptions.go`, `core/tristate.go`,
-//! `core/languagevariant.go`, `core/scriptkind.go` (plus their stringers),
-//! and the conversion from `ts_options::CompilerOptions`.
+//! `core/languagevariant.go` and `core/scriptkind.go` (plus their stringers).
 //!
 //! The Go enum types (`ScriptTarget`, `ModuleKind`, `ModuleResolutionKind`,
 //! `ModuleDetectionKind`, `NewLineKind`, `JsxEmit`, `LanguageVariant`,
 //! `ScriptKind`) are defined in `crate::flags` with the Go values. Their Go
 //! methods are added here as inherent impls.
 
+use crate::frontend::tspath;
 use crate::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -424,7 +424,7 @@ impl CompilerOptions {
         }
         let base_dir: String;
         if !self.config_file_path.is_empty() {
-            base_dir = tspath_get_directory_path(&self.config_file_path);
+            base_dir = tspath::get_directory_path(&self.config_file_path);
         } else {
             base_dir = current_directory.to_string();
             if base_dir.is_empty() {
@@ -438,7 +438,7 @@ impl CompilerOptions {
 
         let mut type_roots: Vec<String> = Vec::with_capacity(base_dir.matches('/').count());
         tspath_for_each_ancestor_directory(&base_dir, &mut |dir: &str| {
-            type_roots.push(ts_path::combine_paths(dir, &["node_modules", "@types"]));
+            type_roots.push(tspath::combine_paths(dir, &["node_modules", "@types"]));
             false
         });
         (type_roots, false)
@@ -748,56 +748,13 @@ impl std::fmt::Display for ScriptKind {
 
 // ---------------------------------------------------------------------------
 // tspath helpers used above. Private so they do not clash with a tspath port
-// elsewhere in the crate.
+// elsewhere in the crate. `GetDirectoryPath` and `GetBaseFileName` are the
+// `frontend::tspath` ports.
 // ---------------------------------------------------------------------------
-
-// Go: tspath/path.go:697 RemoveTrailingDirectorySeparator
-fn tspath_remove_trailing_directory_separator(path: &str) -> &str {
-    if path.ends_with('/') || path.ends_with('\\') {
-        return &path[..path.len() - 1];
-    }
-    path
-}
-
-// Go: tspath/path.go:250 GetDirectoryPath
-fn tspath_get_directory_path(path: &str) -> String {
-    let path = ts_path::normalize_slashes(path);
-
-    // If the path provided is itself a root, then return it.
-    let root_length = ts_path::root_length(&path);
-    if root_length == path.len() {
-        return path;
-    }
-
-    // return the leading portion of the path up to the last (non-terminal) directory separator
-    // but not including any trailing directory separator.
-    let path = tspath_remove_trailing_directory_separator(&path);
-    let last = path.rfind('/').map_or(-1, |i| i as i64);
-    let end = std::cmp::max(root_length as i64, last) as usize;
-    path[..end].to_string()
-}
-
-// Go: tspath/path.go:840 GetBaseFileName
-fn tspath_get_base_file_name(path: &str) -> String {
-    let path = ts_path::normalize_slashes(path);
-
-    // if the path provided is itself the root, then it has no file name.
-    let root_length = ts_path::root_length(&path);
-    if root_length == path.len() {
-        return String::new();
-    }
-
-    // return the trailing portion of the path starting after the last (non-terminal) directory
-    // separator but not including any trailing directory separator.
-    let path = tspath_remove_trailing_directory_separator(&path);
-    let after_sep = path.rfind('/').map_or(0, |i| i + 1);
-    let start = std::cmp::max(ts_path::root_length(path), after_sep);
-    path[start..].to_string()
-}
 
 // Go: tspath/extension.go:111 GetDeclarationFileExtension
 fn tspath_get_declaration_file_extension(file_name: &str) -> String {
-    let base = tspath_get_base_file_name(file_name);
+    let base = tspath::get_base_file_name(file_name);
     // Go: tspath.SupportedDeclarationExtensions
     for ext in [".d.ts", ".d.cts", ".d.mts"] {
         if base.ends_with(ext) {
@@ -829,401 +786,11 @@ fn tspath_for_each_ancestor_directory(
             return true;
         }
 
-        let parent_path = tspath_get_directory_path(&directory);
+        let parent_path = tspath::get_directory_path(&directory);
         if parent_path == directory {
             return false;
         }
 
         directory = parent_path;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// tsoptions/enummaps.go (lib names), used by `from_ts_options`.
-// ---------------------------------------------------------------------------
-
-// PORT: Go `LibMap` and `GetLibFileName` live in `ts_compiler`
-// (`ts_compiler::tsoptions_lib_map` and `ts_compiler::tsoptions_get_lib_file_name`), because
-// the `ts_compiler` program loader also resolves `/// <reference lib>` names
-// through them and cannot depend on this crate.
-
-// ---------------------------------------------------------------------------
-// Conversion from `ts_options::CompilerOptions`.
-// ---------------------------------------------------------------------------
-
-/// Maps a `ts_options` bool that has no "specified" flag. `ts_options`
-/// applies defaults, so a value equal to its default is taken as unset
-/// (Go `TSUnknown`), and any other value as explicit.
-fn ts_default_tristate(value: bool, ts_default: bool) -> Tristate {
-    if value == ts_default {
-        return Tristate::Unknown;
-    }
-    bool_to_tristate(value)
-}
-
-/// Maps a `ts_options` bool that has a matching `*_specified` flag.
-fn ts_specified_tristate(value: bool, specified: bool) -> Tristate {
-    if specified {
-        return bool_to_tristate(value);
-    }
-    Tristate::Unknown
-}
-
-fn ts_option_tristate(value: Option<bool>) -> Tristate {
-    match value {
-        Some(b) => bool_to_tristate(b),
-        None => Tristate::Unknown,
-    }
-}
-
-fn ts_module_kind(kind: ts_options::ModuleKind) -> ModuleKind {
-    use ts_options::ModuleKind as K;
-    match kind {
-        K::None => ModuleKind::NONE,
-        K::CommonJs => ModuleKind::COMMON_JS,
-        K::Amd => ModuleKind::AMD,
-        K::Umd => ModuleKind::UMD,
-        K::System => ModuleKind::SYSTEM,
-        K::Es2015 => ModuleKind::ES2015,
-        K::Es2020 => ModuleKind::ES2020,
-        K::Es2022 => ModuleKind::ES2022,
-        K::EsNext => ModuleKind::ES_NEXT,
-        K::Node16 => ModuleKind::NODE16,
-        K::Node18 => ModuleKind::NODE18,
-        K::Node20 => ModuleKind::NODE20,
-        K::NodeNext => ModuleKind::NODE_NEXT,
-        K::Preserve => ModuleKind::PRESERVE,
-    }
-}
-
-fn ts_module_resolution_kind(kind: ts_options::ModuleResolutionKind) -> ModuleResolutionKind {
-    use ts_options::ModuleResolutionKind as K;
-    match kind {
-        K::Classic => ModuleResolutionKind::CLASSIC,
-        K::Node10 => ModuleResolutionKind::NODE10,
-        K::Node16 => ModuleResolutionKind::NODE16,
-        K::NodeNext => ModuleResolutionKind::NODE_NEXT,
-        K::Bundler => ModuleResolutionKind::BUNDLER,
-    }
-}
-
-fn ts_script_target(target: ts_options::ScriptTarget) -> ScriptTarget {
-    use ts_options::ScriptTarget as K;
-    match target {
-        // PORT: Go has no ES3 target (tsoptions rejects it). Map to the
-        // lowest Go target.
-        K::Es3 | K::Es5 => ScriptTarget::ES5,
-        K::Es2015 => ScriptTarget::ES2015,
-        K::Es2016 => ScriptTarget::ES2016,
-        K::Es2017 => ScriptTarget::ES2017,
-        K::Es2018 => ScriptTarget::ES2018,
-        K::Es2019 => ScriptTarget::ES2019,
-        K::Es2020 => ScriptTarget::ES2020,
-        K::Es2021 => ScriptTarget::ES2021,
-        K::Es2022 => ScriptTarget::ES2022,
-        K::Es2023 => ScriptTarget::ES2023,
-        K::Es2024 => ScriptTarget::ES2024,
-        K::Es2025 => ScriptTarget::ES2025,
-        K::EsNext => ScriptTarget::ES_NEXT,
-    }
-}
-
-fn ts_jsx_emit(jsx: ts_options::JsxEmit) -> JsxEmit {
-    use ts_options::JsxEmit as K;
-    match jsx {
-        K::None => JsxEmit::NONE,
-        K::Preserve => JsxEmit::PRESERVE,
-        K::React => JsxEmit::REACT,
-        K::ReactNative => JsxEmit::REACT_NATIVE,
-        K::ReactJsx => JsxEmit::REACT_JSX,
-        K::ReactJsxDev => JsxEmit::REACT_JSX_DEV,
-    }
-}
-
-fn ts_module_detection_kind(kind: ts_options::ModuleDetectionKind) -> ModuleDetectionKind {
-    use ts_options::ModuleDetectionKind as K;
-    match kind {
-        K::Legacy => ModuleDetectionKind::LEGACY,
-        K::Auto => ModuleDetectionKind::AUTO,
-        K::Force => ModuleDetectionKind::FORCE,
-    }
-}
-
-fn ts_new_line_kind(kind: ts_options::NewLineKind) -> NewLineKind {
-    use ts_options::NewLineKind as K;
-    match kind {
-        K::Lf => NewLineKind::LF,
-        K::Crlf => NewLineKind::CRLF,
-    }
-}
-
-/// Builds the Go-shaped options from the normalized `ts_options` options.
-///
-/// `ts_options` stores values after defaults. Go stores only what the user
-/// wrote, and its getters apply the defaults. Rules used here:
-/// - a field with a `*_specified` flag is `Unknown` unless specified;
-/// - an `Option<bool>` field is `Unknown` when `None`;
-/// - any other bool is `Unknown` when it equals the `ts_options` default;
-/// - `module` and `moduleDetection` are `NONE` unless specified, and
-///   `moduleResolution` is the configured value (`UNKNOWN` when not set);
-/// - `target` keeps its value (the `ts_options` default is ES2025, which is
-///   Go `ScriptTargetLatestStandard`, so `GetEmitScriptTarget` agrees);
-/// - `lib` holds Go lib file names (`lib.dom.d.ts`), as Go tsoptions stores;
-/// - fields that `ts_options` does not model keep the Go zero value.
-#[must_use]
-pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
-    let d = ts_options::CompilerOptions::default();
-
-    let lib: Option<Vec<String>> = opts.lib.as_ref().map(|libs| {
-        libs.iter()
-            .filter_map(|name| ts_compiler::tsoptions_get_lib_file_name(name))
-            .collect()
-    });
-
-    // PORT: `ts_options` keeps `paths` in a BTreeMap, so Go's source order
-    // is lost; keys come out sorted. An empty map is treated as nil.
-    let paths = if opts.paths.is_empty() {
-        None
-    } else {
-        Some(
-            opts.paths
-                .iter()
-                .map(|(k, v)| (k.clone(), Some(v.clone())))
-                .collect::<IndexMap<_, _>>(),
-        )
-    };
-
-    CompilerOptions {
-        allow_js: ts_specified_tristate(opts.allow_js, opts.allow_js_specified),
-        allow_arbitrary_extensions: ts_default_tristate(
-            opts.allow_arbitrary_extensions,
-            d.allow_arbitrary_extensions,
-        ),
-        allow_importing_ts_extensions: ts_default_tristate(
-            opts.allow_importing_ts_extensions,
-            d.allow_importing_ts_extensions,
-        ),
-        allow_non_ts_extensions: Tristate::Unknown,
-        allow_umd_global_access: ts_default_tristate(
-            opts.allow_umd_global_access,
-            d.allow_umd_global_access,
-        ),
-        allow_unreachable_code: ts_option_tristate(opts.allow_unreachable_code),
-        allow_unused_labels: ts_option_tristate(opts.allow_unused_labels),
-        assume_changes_only_affect_direct_dependencies: ts_default_tristate(
-            opts.assume_changes_only_affect_direct_dependencies,
-            d.assume_changes_only_affect_direct_dependencies,
-        ),
-        // PORT: `ts_options` has no "specified" flag for checkJs, so an
-        // explicit `checkJs: false` reads as Go `TSUnknown` here.
-        check_js: ts_default_tristate(opts.check_js, d.check_js),
-        custom_conditions: opts.custom_conditions.clone(),
-        composite: ts_default_tristate(opts.composite, d.composite),
-        emit_declaration_only: ts_default_tristate(
-            opts.emit_declaration_only,
-            d.emit_declaration_only,
-        ),
-        emit_bom: ts_default_tristate(opts.emit_bom, d.emit_bom),
-        emit_decorator_metadata: ts_default_tristate(
-            opts.emit_decorator_metadata,
-            d.emit_decorator_metadata,
-        ),
-        declaration: ts_specified_tristate(opts.declaration, opts.declaration_specified),
-        declaration_dir: opts.declaration_dir.clone().unwrap_or_default(),
-        declaration_map: ts_default_tristate(opts.declaration_map, d.declaration_map),
-        deduplicate_packages: ts_default_tristate(
-            opts.deduplicate_packages,
-            d.deduplicate_packages,
-        ),
-        disable_size_limit: ts_default_tristate(opts.disable_size_limit, d.disable_size_limit),
-        disable_source_of_project_reference_redirect: Tristate::Unknown,
-        disable_solution_searching: Tristate::Unknown,
-        disable_referenced_project_load: Tristate::Unknown,
-        erasable_syntax_only: ts_default_tristate(
-            opts.erasable_syntax_only,
-            d.erasable_syntax_only,
-        ),
-        exact_optional_property_types: ts_default_tristate(
-            opts.exact_optional_property_types,
-            d.exact_optional_property_types,
-        ),
-        experimental_decorators: ts_default_tristate(
-            opts.experimental_decorators,
-            d.experimental_decorators,
-        ),
-        force_consistent_casing_in_file_names: ts_default_tristate(
-            opts.force_consistent_casing_in_file_names,
-            d.force_consistent_casing_in_file_names,
-        ),
-        isolated_modules: ts_default_tristate(opts.isolated_modules, d.isolated_modules),
-        isolated_declarations: ts_default_tristate(
-            opts.isolated_declarations,
-            d.isolated_declarations,
-        ),
-        ignore_config: Tristate::Unknown,
-        ignore_deprecations: opts.ignore_deprecations.clone().unwrap_or_default(),
-        import_helpers: ts_default_tristate(opts.import_helpers, d.import_helpers),
-        inline_source_map: ts_default_tristate(opts.inline_source_map, d.inline_source_map),
-        inline_sources: ts_default_tristate(opts.inline_sources, d.inline_sources),
-        init: Tristate::Unknown,
-        incremental: ts_specified_tristate(opts.incremental, opts.incremental_specified),
-        jsx: ts_jsx_emit(opts.jsx),
-        jsx_factory: opts.jsx_factory.clone().unwrap_or_default(),
-        jsx_fragment_factory: opts.jsx_fragment_factory.clone().unwrap_or_default(),
-        jsx_import_source: opts.jsx_import_source.clone().unwrap_or_default(),
-        lib,
-        lib_replacement: ts_default_tristate(opts.lib_replacement, d.lib_replacement),
-        locale: String::new(),
-        map_root: opts.map_root.clone().unwrap_or_default(),
-        module: if opts.module_specified {
-            ts_module_kind(opts.module)
-        } else {
-            ModuleKind::NONE
-        },
-        module_resolution: opts
-            .module_resolution_configured
-            .map_or(ModuleResolutionKind::UNKNOWN, ts_module_resolution_kind),
-        module_suffixes: opts.module_suffixes.clone(),
-        module_detection: if opts.module_detection_specified {
-            ts_module_detection_kind(opts.module_detection)
-        } else {
-            ModuleDetectionKind::NONE
-        },
-        new_line: ts_new_line_kind(opts.new_line),
-        no_emit: ts_default_tristate(opts.no_emit, d.no_emit),
-        no_check: ts_default_tristate(opts.no_check, d.no_check),
-        no_error_truncation: ts_default_tristate(opts.no_error_truncation, d.no_error_truncation),
-        no_fallthrough_cases_in_switch: ts_default_tristate(
-            opts.no_fallthrough_cases_in_switch,
-            d.no_fallthrough_cases_in_switch,
-        ),
-        no_implicit_any: ts_specified_tristate(
-            opts.no_implicit_any,
-            opts.no_implicit_any_specified,
-        ),
-        no_implicit_this: ts_specified_tristate(
-            opts.no_implicit_this,
-            opts.no_implicit_this_specified,
-        ),
-        no_implicit_returns: ts_default_tristate(opts.no_implicit_returns, d.no_implicit_returns),
-        no_emit_helpers: ts_default_tristate(opts.no_emit_helpers, d.no_emit_helpers),
-        no_lib: ts_default_tristate(opts.no_lib, d.no_lib),
-        no_property_access_from_index_signature: ts_default_tristate(
-            opts.no_property_access_from_index_signature,
-            d.no_property_access_from_index_signature,
-        ),
-        no_unchecked_indexed_access: ts_default_tristate(
-            opts.no_unchecked_indexed_access,
-            d.no_unchecked_indexed_access,
-        ),
-        no_emit_on_error: ts_default_tristate(opts.no_emit_on_error, d.no_emit_on_error),
-        no_unused_locals: ts_default_tristate(opts.no_unused_locals, d.no_unused_locals),
-        no_unused_parameters: ts_default_tristate(
-            opts.no_unused_parameters,
-            d.no_unused_parameters,
-        ),
-        no_resolve: ts_default_tristate(opts.no_resolve, d.no_resolve),
-        no_implicit_override: ts_default_tristate(
-            opts.no_implicit_override,
-            d.no_implicit_override,
-        ),
-        no_unchecked_side_effect_imports: ts_specified_tristate(
-            opts.no_unchecked_side_effect_imports,
-            opts.no_unchecked_side_effect_imports_specified,
-        ),
-        out_dir: opts.out_dir.clone().unwrap_or_default(),
-        paths,
-        preserve_const_enums: ts_default_tristate(
-            opts.preserve_const_enums,
-            d.preserve_const_enums,
-        ),
-        preserve_symlinks: ts_default_tristate(opts.preserve_symlinks, d.preserve_symlinks),
-        project: String::new(),
-        resolve_json_module: ts_specified_tristate(
-            opts.resolve_json_module,
-            opts.resolve_json_module_specified,
-        ),
-        resolve_package_json_exports: ts_default_tristate(
-            opts.resolve_package_json_exports,
-            d.resolve_package_json_exports,
-        ),
-        resolve_package_json_imports: ts_default_tristate(
-            opts.resolve_package_json_imports,
-            d.resolve_package_json_imports,
-        ),
-        remove_comments: ts_default_tristate(opts.remove_comments, d.remove_comments),
-        rewrite_relative_import_extensions: ts_default_tristate(
-            opts.rewrite_relative_import_extensions,
-            d.rewrite_relative_import_extensions,
-        ),
-        react_namespace: opts.react_namespace.clone().unwrap_or_default(),
-        root_dir: opts.root_dir.clone().unwrap_or_default(),
-        // PORT: `ts_options` keeps `rootDirs` as a `Vec`, so nil and empty are
-        // lost there; an empty list is treated as nil.
-        root_dirs: (!opts.root_dirs.is_empty()).then(|| opts.root_dirs.clone()),
-        skip_lib_check: ts_default_tristate(opts.skip_lib_check, d.skip_lib_check),
-        stable_type_ordering: ts_default_tristate(
-            opts.stable_type_ordering,
-            d.stable_type_ordering,
-        ),
-        strict: ts_specified_tristate(opts.strict, opts.strict_specified),
-        strict_bind_call_apply: ts_specified_tristate(
-            opts.strict_bind_call_apply,
-            opts.strict_bind_call_apply_specified,
-        ),
-        strict_builtin_iterator_return: ts_specified_tristate(
-            opts.strict_builtin_iterator_return,
-            opts.strict_builtin_iterator_return_specified,
-        ),
-        strict_function_types: ts_specified_tristate(
-            opts.strict_function_types,
-            opts.strict_function_types_specified,
-        ),
-        strict_null_checks: ts_specified_tristate(
-            opts.strict_null_checks,
-            opts.strict_null_checks_specified,
-        ),
-        strict_property_initialization: ts_specified_tristate(
-            opts.strict_property_initialization,
-            opts.strict_property_initialization_specified,
-        ),
-        strip_internal: ts_default_tristate(opts.strip_internal, d.strip_internal),
-        skip_default_lib_check: ts_default_tristate(
-            opts.skip_default_lib_check,
-            d.skip_default_lib_check,
-        ),
-        source_map: ts_default_tristate(opts.source_map, d.source_map),
-        source_root: opts.source_root.clone().unwrap_or_default(),
-        suppress_output_path_check: Tristate::Unknown,
-        target: ts_script_target(opts.target),
-        trace_resolution: ts_default_tristate(opts.trace_resolution, d.trace_resolution),
-        ts_build_info_file: opts.ts_build_info_file.clone().unwrap_or_default(),
-        type_roots: opts.type_roots.clone(),
-        types: opts.types.clone(),
-        use_define_for_class_fields: ts_option_tristate(opts.use_define_for_class_fields),
-        use_unknown_in_catch_variables: ts_specified_tristate(
-            opts.use_unknown_in_catch_variables,
-            opts.use_unknown_in_catch_variables_specified,
-        ),
-        verbatim_module_syntax: ts_default_tristate(
-            opts.verbatim_module_syntax,
-            d.verbatim_module_syntax,
-        ),
-        max_node_module_js_depth: opts
-            .max_node_module_js_depth
-            .map(|depth| i32::try_from(depth).unwrap_or(i32::MAX)),
-
-        allow_synthetic_default_imports: ts_default_tristate(
-            opts.allow_synthetic_default_imports,
-            d.allow_synthetic_default_imports,
-        ),
-        always_strict: ts_default_tristate(opts.always_strict, d.always_strict),
-        base_url: opts.base_url.clone().unwrap_or_default(),
-        downlevel_iteration: ts_default_tristate(opts.downlevel_iteration, d.downlevel_iteration),
-        es_module_interop: ts_default_tristate(opts.es_module_interop, d.es_module_interop),
-        out_file: opts.out_file.clone().unwrap_or_default(),
-
-        // Internal fields are not modeled by `ts_options`.
-        ..CompilerOptions::default()
     }
 }

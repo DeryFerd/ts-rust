@@ -7,9 +7,9 @@ cd /home/theo/Code/sandbox/ts-rust
 R=$1; O=target/continuation-r97-goport/measure/$R; mkdir -p $O
 WT=target/worktrees/checker-port
 REL=${GOPORT_REL:-target/continuation-r97-goport/runtime/cargo-target/release}
-# crates/ts_goport/CANDIDATE.md is the untracked marker that keeps the candidate dirty for the pinned
-# R96 corpus comparator (see decisions20260926 in the saved state). Anything else dirty stops the run.
-test -z "$(git -C $WT status --porcelain crates/ts_goport Cargo.toml Cargo.lock crates/ts_compiler/src/lib.rs | grep -v '^?? crates/ts_goport/CANDIDATE.md$')" || { echo "dirty allowed files"; exit 1; }
+# The run measures the committed source: any dirty or untracked file in the checkout stops it, except
+# crates/ts_goport/CANDIDATE.md (an untracked marker from the retired R96 corpus comparator).
+test -z "$(git -C $WT status --porcelain | grep -v '^?? crates/ts_goport/CANDIDATE.md$')" || { echo "dirty checkout"; exit 1; }
 for b in goport goport_emit goport_typesyms; do cp $REL/$b $O/$b.bin; done
 export GOPORT_BIN=$PWD/$O/goport.bin
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/measure.sh $R > $O/summary-main.txt 2>&1

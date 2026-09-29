@@ -646,13 +646,13 @@ impl Decoder<'_> {
         let end = self.r.u32()? as i32;
         let code = self.r.u32()? as i32;
         let category = match self.r.u8()? {
-            0 => ts_diagnostics::Category::Warning,
-            1 => ts_diagnostics::Category::Error,
-            2 => ts_diagnostics::Category::Suggestion,
-            3 => ts_diagnostics::Category::Message,
+            0 => crate::diagnostics::Category::Warning,
+            1 => crate::diagnostics::Category::Error,
+            2 => crate::diagnostics::Category::Suggestion,
+            3 => crate::diagnostics::Category::Message,
             _ => return None,
         };
-        let message = ts_diagnostics::message_by_key(self.r.str()?)?;
+        let message = crate::diagnostics::message_by_key(self.r.str()?)?;
         let arg_count = self.r.count()?;
         let mut message_args = Vec::with_capacity(arg_count);
         for _ in 0..arg_count {
@@ -1003,7 +1003,7 @@ impl Encoder {
             self.u32(diagnostic.code as u32);
             self.u8(diagnostic.category as u8);
             let key = diagnostic.message.key();
-            if ts_diagnostics::message_by_key(key) != Some(diagnostic.message) {
+            if crate::diagnostics::message_by_key(key) != Some(diagnostic.message) {
                 return Err(format!("message key {key} does not find its message"));
             }
             self.str(key)?;

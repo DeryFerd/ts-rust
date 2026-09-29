@@ -1478,11 +1478,13 @@ pub fn new_case_clause_tracker(
                     }
                     SyntaxKind::NumericLiteral => {
                         c.existing_numbers
-                            .insert(NumberKey::from(ts_jsnum::from_string(expression.text())));
+                            .insert(NumberKey::from(crate::jsnum::from_string(
+                                expression.text(),
+                            )));
                     }
                     SyntaxKind::BigIntLiteral => {
                         c.existing_big_ints.insert(PseudoBigIntKey::from(
-                            &ts_jsnum::PseudoBigInt::parse_valid(expression.text()),
+                            &crate::jsnum::PseudoBigInt::parse_valid(expression.text()),
                         ));
                     }
                     _ => {}

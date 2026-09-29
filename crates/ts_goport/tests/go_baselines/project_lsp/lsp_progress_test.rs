@@ -51,7 +51,7 @@ impl ProgressReporter for FakeProgressReporter {
     }
 
     // Go: progress_test.go:32 localize
-    fn localize(&self, msg: &'static ts_diagnostics::Message, args: Vec<String>) -> String {
+    fn localize(&self, msg: &'static ts_goport::diagnostics::Message, args: Vec<String>) -> String {
         ts_goport::diagnostics_loc::message_localize(msg, &Default::default(), &args)
     }
 
