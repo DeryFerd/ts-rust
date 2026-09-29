@@ -777,7 +777,7 @@ fn decode(file: Node, nodes: u32, r: SnapshotReader<'_>) -> Option<(BoundFile, S
     for _ in 0..entry_count {
         node_entries.push(d.node_bind_data()?);
     }
-    let node_bind = FileNodeBind::from_parts(slots, bases, node_entries)?;
+    let node_bind = NodeBindParts::from_parts(slots, bases, node_entries)?;
 
     let file_bind = d.file_bind()?;
     if d.r.remaining() != 0 {

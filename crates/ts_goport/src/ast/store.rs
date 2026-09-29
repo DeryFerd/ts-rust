@@ -77,8 +77,10 @@
 //!   call). Any other id takes one cold call: the detached store, then the
 //!   build stores of this thread.
 //!
-//! Binder data is not stored here: it stays in `GoFile::node_bind`, indexed
-//! by slot index.
+//! AST node records, step 2: the install of the binder output writes the
+//! symbol, the flow node and the added flags of each node into its record
+//! (`bind_store_records`). The other binder fields stay in
+//! `GoFile::node_bind`, by the index in the record.
 
 use crate::astdata::NodeData;
 use crate::frontend::parser::SourceFileParseOptions;
@@ -1726,7 +1728,7 @@ impl FileStore {
         debug_assert_eq!(
             self.slot_stored_parent(index),
             stored,
-            "astrec2: stored parent of slot {index}"
+            "stored parent of slot {index}"
         );
     }
 
@@ -3518,7 +3520,7 @@ pub fn is_file_store_frozen(file: usize) -> bool {
 }
 
 /// Number of slots (nil, alias and node slots). Per-node vectors that are
-/// indexed by `NodeId::index()` (`GoFile::node_bind`) need this length.
+/// indexed by `NodeId::index()` (`GoFile::parser_flags`) need this length.
 #[must_use]
 pub fn file_store_slot_count(file: usize) -> usize {
     // A freeable file version keeps its records in its node shell.

@@ -2597,24 +2597,54 @@ impl NodeBindExtra {
     };
 }
 
-/// Binder data of every node of one bound file, stored compactly. Most
-/// nodes have no data, or the same data as the node before them (a run of
-/// identifiers in one flow region), so they share one entry. Each node keeps
-/// one byte: the offset of its entry from the first entry of its block.
-/// AST node records, step 2: the install also writes the data into the
-/// node records and keeps the fields that are not in a record in `extras`
-/// (`ast::bind_store_records`).
+/// AST node records, step 2: the binder fields of the nodes of one bound
+/// file that are not in their records (`NodeBindExtra`). The `bind` word of
+/// a record holds the index + 1 of its entry, or 0 (`FileNodeBind::extra`).
+/// `BoundFile::install` makes it (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
+    extras: Box<[NodeBindExtra]>,
+}
+
+impl FileNodeBind {
+    /// The extras entries that the install made.
+    #[must_use]
+    pub fn new(extras: Vec<NodeBindExtra>) -> Self {
+        FileNodeBind {
+            extras: extras.into_boxed_slice(),
+        }
+    }
+
+    /// The extras entry whose index + 1 is `extra` (the high half of the
+    /// `bind` word of a record, not 0).
+    #[inline]
+    #[must_use]
+    pub fn extra(&self, extra: u32) -> &NodeBindExtra {
+        &self.extras[extra as usize - 1]
+    }
+
+    /// The extras entries.
+    #[must_use]
+    pub fn extras(&self) -> &[NodeBindExtra] {
+        &self.extras
+    }
+}
+
+/// The binder data of every node of one file, stored compactly, as the
+/// binder hands it over (`BoundFile`) and the lib bind snapshot keeps it
+/// (`parts`). Most nodes have no data, or the same data as the node before
+/// them (a run of identifiers in one flow region), so they share one entry.
+/// Each node keeps one byte: the offset of its entry from the first entry
+/// of its block. The install writes it into the node records and a
+/// `FileNodeBind` (`ast::bind_store_records`).
+#[derive(Debug, Default)]
+pub struct NodeBindParts {
     /// Per node, by `NodeId::index()`: entry offset in its block, or
     /// `NO_NODE_BIND` for the empty data.
     slots: Vec<u8>,
     /// Per block of `NODE_BIND_BLOCK` nodes: the index of its first entry.
     bases: Vec<u32>,
     entries: Vec<NodeBindData>,
-    /// AST node records, step 2: the `NodeBindExtra` entries of the nodes,
-    /// by the index + 1 in the `bind` word of their records.
-    extras: Box<[NodeBindExtra]>,
 }
 
 const NODE_BIND_BLOCK_BITS: usize = 7;
@@ -2633,7 +2663,7 @@ static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
     added_flags: NodeFlags::NONE,
 };
 
-impl FileNodeBind {
+impl NodeBindParts {
     /// Compacts the per-node data of a bound file, given in node order.
     /// `None` is a node with no data. At most `max_entries` items are
     /// `Some`.
@@ -2668,11 +2698,10 @@ impl FileNodeBind {
             slots[index] = u8::try_from(entries.len() - 1 - block_start).expect("block offset");
         }
         entries.shrink_to_fit();
-        FileNodeBind {
+        NodeBindParts {
             slots,
             bases,
             entries,
-            extras: Box::default(),
         }
     }
 
@@ -2698,26 +2727,6 @@ impl FileNodeBind {
                         )
                     })
             })
-    }
-
-    /// AST node records, step 2: sets the extras entries that the install
-    /// made (`ast::bind_store_records`).
-    pub fn set_extras(&mut self, extras: Vec<NodeBindExtra>) {
-        self.extras = extras.into_boxed_slice();
-    }
-
-    /// AST node records, step 2: the extras entry whose index + 1 is
-    /// `extra` (the high half of the `bind` word of a record, not 0).
-    #[inline]
-    #[must_use]
-    pub fn extra(&self, extra: u32) -> &NodeBindExtra {
-        &self.extras[extra as usize - 1]
-    }
-
-    /// AST node records, step 2: the extras entries.
-    #[must_use]
-    pub fn extras(&self) -> &[NodeBindExtra] {
-        &self.extras
     }
 
     /// The distinct data entries, for remapping ids in place. Non-empty data
@@ -2756,23 +2765,11 @@ impl FileNodeBind {
                 return None;
             }
         }
-        Some(FileNodeBind {
+        Some(NodeBindParts {
             slots,
             bases,
             entries,
-            extras: Box::default(),
         })
-    }
-
-    /// The data of node `index` (`NodeId::index()`).
-    #[inline]
-    #[must_use]
-    pub fn get(&self, index: usize) -> &NodeBindData {
-        let offset = self.slots[index];
-        if offset == NO_NODE_BIND {
-            return &EMPTY_NODE_BIND;
-        }
-        &self.entries[self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize]
     }
 }
 
@@ -3186,7 +3183,8 @@ pub struct GoFile {
     pub parser_flags: Vec<NodeFlags>,
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
-    /// Binder data per node, indexed by `NodeId::index()`.
+    /// The binder fields of the nodes that are not in their node records
+    /// (`ast/store.rs`, `NodeRecord`): set by the install with the records.
     pub node_bind: std::sync::OnceLock<FileNodeBind>,
     pub file_bind: std::sync::OnceLock<FileBindData>,
     pub flow_nodes: std::sync::OnceLock<Vec<FlowNode>>,

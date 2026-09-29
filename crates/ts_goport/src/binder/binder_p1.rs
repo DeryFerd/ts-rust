@@ -3,7 +3,8 @@
 //! PORT: Go stores binder output on AST nodes and on `ast.SourceFile`. Here
 //! the AST is immutable, so the binder keeps that output in `Binder`
 //! (`node_bind`, `file_bind`, `flow_nodes`) while it runs, and
-//! `bind_source_file` moves it into the `GoFile` `OnceCell`s at the end.
+//! `bind_source_file` moves it into the node records (`ast/store.rs`) and
+//! the `GoFile` `OnceCell`s at the end (`BoundFile::install`).
 //! Binder code must read and write node binder data through the `Binder`
 //! helpers below (`node_symbol`, `set_node_symbol`, `node_flags`,
 //! `get_locals`, `flow`, `flow_mut`, ...), not through `Node::symbol()` and
@@ -221,7 +222,7 @@ impl NodeBindBuilder {
     }
 
     /// The compact form of the data, in node order.
-    fn finish(&self) -> FileNodeBind {
+    fn finish(&self) -> NodeBindParts {
         debug_assert!(
             self.entries.iter().all(|data| data.flow_node.is_nil()),
             "flow node written outside set_flow_node"
@@ -238,7 +239,7 @@ impl NodeBindBuilder {
             }
             Some(data)
         });
-        FileNodeBind::new(nodes, entries.len() - 1 + self.flow_count)
+        NodeBindParts::new(nodes, entries.len() - 1 + self.flow_count)
     }
 }
 
@@ -247,7 +248,7 @@ pub struct BoundFile {
     pub file: Node,
     /// Compacted on the bind thread, so the dense per-node arrays are freed
     /// (and reused) there.
-    pub node_bind: FileNodeBind,
+    pub node_bind: NodeBindParts,
     pub flow_nodes: Vec<FlowNode>,
     pub file_bind: FileBindData,
 }
@@ -322,17 +323,15 @@ impl BoundFile {
     /// Stores the output in the file's `GoFile` `OnceLock`s (Go
     /// `file.BindOnce`). AST node records, step 2: first writes the symbol,
     /// the flow node and the added flags of each node into its record
-    /// (`ast::bind_store_records`); the other fields go into the extras of
-    /// `node_bind`.
+    /// (`ast::bind_store_records`); the other fields go into the
+    /// `FileNodeBind` of the file.
     pub fn install(self) {
         let file = self.file.file_index();
         let go_file = crate::ast::go_file(file);
         assert!(go_file.node_bind.get().is_none(), "file already bound");
-        let mut node_bind = self.node_bind;
-        let extras = crate::ast::bind_store_records(file, node_bind.nodes());
-        node_bind.set_extras(extras);
+        let extras = crate::ast::bind_store_records(file, self.node_bind.nodes());
         assert!(
-            go_file.node_bind.set(node_bind).is_ok(),
+            go_file.node_bind.set(FileNodeBind::new(extras)).is_ok(),
             "file already bound"
         );
         assert!(

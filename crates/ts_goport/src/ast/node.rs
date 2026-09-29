@@ -1013,8 +1013,9 @@ macro_rules! data_is_variant {
 /// = `HasImplicitReturn | HasExplicitReturn | HasAsyncFunctions`,
 /// `Unreachable`, `ThisNodeOrAnySubNodesHasError`). `NodeBindData::
 /// added_flags` holds only these (checked in debug builds by
-/// `Node::added_flags`), so for a mask without them Go `node.Flags & mask`
-/// is the parser flags `& mask` (`Node::parser_flags`).
+/// `ast::bind_store_records`, which ORs them into the node record), so for
+/// a mask without them Go `node.Flags & mask` is the parser flags `& mask`
+/// (`Node::parser_flags`).
 pub const BINDER_ADDED_FLAGS: NodeFlags = NodeFlags::EXPORT_CONTEXT
     .union(NodeFlags::CONTAINS_THIS)
     .union(NodeFlags::REACHABILITY_AND_EMIT_FLAGS)
@@ -1037,13 +1038,6 @@ static NO_BIND: NodeBindData = NodeBindData {
     added_flags: NodeFlags::NONE,
 };
 
-/// `Node::bind_field` for a factory node.
-#[cold]
-#[inline(never)]
-fn synthetic_bind_field<T>(n: Node, field: impl FnOnce(&NodeBindData) -> T) -> T {
-    field(&synthetic_bind(n))
-}
-
 /// The flow nodes of `go_file`. Panics before its binder built them.
 #[inline]
 fn flow_nodes_of(go_file: &GoFile) -> &[FlowNode] {
@@ -1051,16 +1045,6 @@ fn flow_nodes_of(go_file: &GoFile) -> &[FlowNode] {
         .flow_nodes
         .get()
         .expect("flow nodes are not built for this file")
-}
-
-/// The binder data of node slot `index` of `go_file`: nil values before the
-/// file is bound.
-#[inline]
-fn node_bind_in(go_file: &GoFile, index: usize) -> &NodeBindData {
-    match go_file.node_bind.get() {
-        Some(v) => v.get(index),
-        None => &NO_BIND,
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2280,37 +2264,9 @@ impl Node {
     pub fn flags(self) -> NodeFlags {
         // Every tier 0 store file is published.
         match frozen_store_flags(self) {
-            Some(flags) => {
-                debug_assert_eq!(flags, self.old_flags(flags), "astrec2: flags of {self:?}");
-                flags
-            }
+            Some(flags) => flags,
             None => self.flags_slow(),
         }
-    }
-
-    /// AST node records, step 2a, debug builds: Go `node.Flags` of a
-    /// published store node from the `GoFile` (parser flags) and the old
-    /// binder data. `record` (the record flags) before the `GoFile` exists.
-    fn old_flags(self, record: NodeFlags) -> NodeFlags {
-        let index = nid(self).index();
-        match crate::ast::try_with_go_file(self.file_index(), |g| g.parser_flags[index]) {
-            Some(parser) => parser | self.added_flags(),
-            None => record,
-        }
-    }
-
-    /// The flags the binder added to Go `node.Flags` (`NodeBindData`).
-    // U4 (CH7): debug builds check that they are binder bits
-    // (`BINDER_ADDED_FLAGS`), the rule that `Node::parser_flags` needs.
-    #[inline]
-    fn added_flags(self) -> NodeFlags {
-        let added = self.bind_field(|b| b.added_flags);
-        debug_assert!(
-            BINDER_ADDED_FLAGS.contains(added),
-            "binder added {:#x}, outside BINDER_ADDED_FLAGS",
-            added.without(BINDER_ADDED_FLAGS).bits()
-        );
-        added
     }
 
     /// Go `node.Flags & mask` for a `mask` without a binder-added bit
@@ -2351,14 +2307,6 @@ impl Node {
         if let Some(h) = try_store_header(self) {
             // The parser reads flags before the file is published. The bind
             // of a published file ORs its flags into the record.
-            #[cfg(debug_assertions)]
-            if is_published(self.file_index()) {
-                debug_assert_eq!(
-                    h.flags,
-                    self.old_flags(h.flags),
-                    "astrec2: flags of {self:?}"
-                );
-            }
             return h.flags;
         }
         unreachable!("node {self:?} is not synthetic and has no store")
@@ -2426,63 +2374,6 @@ impl Node {
     #[must_use]
     pub fn go_file(self) -> FileRef<GoFile> {
         crate::ast::go_file(self.file_index())
-    }
-
-    /// Binder data for this node. Nil values before the file is bound.
-    #[inline]
-    #[must_use]
-    pub fn bind(self) -> NodeBindData {
-        self.bind_field(|b| *b)
-    }
-
-    /// Reads one field of the binder data of this node. The data of a
-    /// factory node belongs to its thread, so the field is read, not
-    /// borrowed.
-    // PERF: the program file path stays small enough to inline, and it loads
-    // only the field. The synthetic path (thread-local arena and `RefCell`
-    // borrow) is cold.
-    // PERF: lsshells M3b. A static file (tier 0, tier 1) is read inline with
-    // no call, as in R134. A freeable file version is read out of line
-    // (`bind_field_slow`), so it makes no `FileRef` guard.
-    // PERF: lsshells M3 repair. `field` runs in the out-of-line read too, so
-    // the inline part keeps no stack copy of the data: a copy made
-    // `bind_field` too big to inline in 9 places, and `goport -p` ran more
-    // instructions.
-    #[inline]
-    fn bind_field<T>(self, field: impl FnOnce(&NodeBindData) -> T) -> T {
-        if is_synthetic_node(self) {
-            return synthetic_bind_field(self, field);
-        }
-        let index = nid(self).index();
-        match crate::ast::static_go_file(self.file_index()) {
-            Some(go_file) => field(node_bind_in(go_file, index)),
-            None => self.bind_field_slow(index, field),
-        }
-    }
-
-    /// `bind_field` of node slot `index` of a freeable file version
-    /// (lsshells M3b). Panics when the file is not published.
-    #[cold]
-    #[inline(never)]
-    fn bind_field_slow<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
-        let file = self.file_index();
-        // lsshells M3f: the hot file version first, with the rest out of
-        // line, so this path saves few registers.
-        if crate::ast::is_hot_file(file) {
-            return crate::ast::with_hot_go_file(|go_file| field(node_bind_in(go_file, index)));
-        }
-        self.bind_field_cold(index, field)
-    }
-
-    /// `bind_field_slow` for a file that is not the hot file version.
-    #[cold]
-    #[inline(never)]
-    fn bind_field_cold<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
-        let file = self.file_index();
-        match crate::ast::freeable_go_file_read(file, |go_file| *node_bind_in(go_file, index)) {
-            Some(bind) => field(&bind),
-            None => crate::ast::with_go_file(file, |go_file| field(node_bind_in(go_file, index))),
-        }
     }
 
     // Go: ast.go:198 Name
@@ -2601,28 +2492,16 @@ impl Node {
     // is in its record (`frozen_store_symbol`).
     #[must_use]
     pub fn symbol(self) -> SymbolId {
-        let symbol = match frozen_store_symbol(self) {
+        match frozen_store_symbol(self) {
             Some(symbol) => symbol,
             None => self.bind_miss().symbol,
-        };
-        debug_assert_eq!(
-            symbol,
-            self.bind_field(|b| b.symbol),
-            "astrec2: symbol of {self:?}"
-        );
-        symbol
+        }
     }
 
     // Go: ast.go:237 LocalSymbol
     #[must_use]
     pub fn local_symbol(self) -> SymbolId {
-        let symbol = self.bind_extra(|e| e.local_symbol);
-        debug_assert_eq!(
-            symbol,
-            self.bind_field(|b| b.local_symbol),
-            "astrec2: local symbol of {self:?}"
-        );
-        symbol
+        self.bind_extra(|e| e.local_symbol)
     }
 
     // Go: ast.go:245 Locals
@@ -2633,16 +2512,10 @@ impl Node {
     #[must_use]
     pub fn locals(self) -> SymbolTable {
         if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind_field(|b| b.locals.is_nil()));
+            debug_assert!(self.bind_extra(|e| e.locals.is_nil()));
             return SymbolTable::NIL;
         }
-        let locals = self.bind_extra(|e| e.locals);
-        debug_assert_eq!(
-            locals,
-            self.bind_field(|b| b.locals),
-            "astrec2: locals of {self:?}"
-        );
-        locals
+        self.bind_extra(|e| e.locals)
     }
 
     /// Go `LocalsContainerData().NextContainer`.
@@ -2650,16 +2523,10 @@ impl Node {
     #[must_use]
     pub fn next_container(self) -> Node {
         if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind_field(|b| b.next_container.is_nil()));
+            debug_assert!(self.bind_extra(|e| e.next_container.is_nil()));
             return Node::NIL;
         }
-        let next = self.bind_extra(|e| e.next_container);
-        debug_assert_eq!(
-            next,
-            self.bind_field(|b| b.next_container),
-            "astrec2: next container of {self:?}"
-        );
-        next
+        self.bind_extra(|e| e.next_container)
     }
 
     /// Go `FlowNodeData().FlowNode`.
@@ -2668,7 +2535,7 @@ impl Node {
     // same file).
     #[must_use]
     pub fn flow_node(self) -> FlowNodeId {
-        let flow = match frozen_store_bind_word(self) {
+        match frozen_store_bind_word(self) {
             Some(word) => {
                 let low = word & 0xffff_ffff;
                 if low == 0 {
@@ -2678,37 +2545,19 @@ impl Node {
                 }
             }
             None => self.bind_miss().flow_node,
-        };
-        debug_assert_eq!(
-            flow,
-            self.bind_field(|b| b.flow_node),
-            "astrec2: flow of {self:?}"
-        );
-        flow
+        }
     }
 
     /// Go `EndFlowNode` of a function-like or module node.
     #[must_use]
     pub fn end_flow_node(self) -> FlowNodeId {
-        let flow = self.bind_extra(|e| e.end_flow_node);
-        debug_assert_eq!(
-            flow,
-            self.bind_field(|b| b.end_flow_node),
-            "astrec2: end flow of {self:?}"
-        );
-        flow
+        self.bind_extra(|e| e.end_flow_node)
     }
 
     /// Go `ReturnFlowNode` of a function-like node or class static block.
     #[must_use]
     pub fn return_flow_node(self) -> FlowNodeId {
-        let flow = self.bind_extra(|e| e.return_flow_node);
-        debug_assert_eq!(
-            flow,
-            self.bind_field(|b| b.return_flow_node),
-            "astrec2: return flow of {self:?}"
-        );
-        flow
+        self.bind_extra(|e| e.return_flow_node)
     }
 
     /// AST node records, step 2: reads one field of the binder fields of
@@ -2754,7 +2603,7 @@ impl Node {
         crate::ast::with_go_file(self.file_index(), |go_file| {
             debug_assert!(
                 go_file.node_bind.get().is_none(),
-                "astrec2: a bound file with no published records"
+                "a bound file with no published records"
             );
         });
         NO_BIND
