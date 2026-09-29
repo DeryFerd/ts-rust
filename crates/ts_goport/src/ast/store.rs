@@ -1451,8 +1451,14 @@ pub fn enter_freeable_parse() -> FreeableParseScope {
 // memory (M3f, mini-abf9: effect 0.46 MiB/edit and +480 MiB, off 1.23 and
 // +1216, limits 1.02 and 686). It costs edit time: every node data and list
 // read of the edited file is a pinned read (about 150,000 per edit on
-// effect), +0.6 to +1.3 ms edit median on query-core and effect against
-// off (M3f), +4.65% session instructions on effect.
+// effect). M3g against R139 (pin B): session instructions +6.40% on effect
+// and +4.68% on query-core with it on, +2.2% with it off; edit median +0.5
+// to +2.1 ms on effect and +0.8 to +1.7 ms on query-core in 200-edit
+// sessions, +0.9 ms (query-core) and +1.0 to +1.2 ms (effect) in 1000-edit
+// sessions. The CLI costs (instructions: query +1.38%, hono +0.48%, zod
+// +0.18%, effect +0.19%) come from the M3 merge, not from this switch. The
+// planned fix of the read cost is the AST node records plan
+// (`target/continuation-r97-goport/ast-design/study.md`).
 fn owned_nodes_enabled() -> bool {
     static FLAG: OnceLock<Option<bool>> = OnceLock::new();
     let flag = *FLAG.get_or_init(|| match std::env::var("GOPORT_OWNED_NODES").as_deref() {

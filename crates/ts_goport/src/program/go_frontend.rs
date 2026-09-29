@@ -318,7 +318,8 @@ pub(super) fn unpublished_parsed_source_file(store: usize) -> Option<Rc<ParsedSo
 
 /// The parse of store `store` that a publish kept for good: a file parsed
 /// on this thread outside a program load (`note_parsed_source_file`) that
-/// a publish gave no program. None for any other store.
+/// a publish gave no program. None for any other store, and for a freeable
+/// file version (`go_files_of_unpublished_stores` keeps no parse of it).
 pub(super) fn published_outside_parsed_source_file(store: usize) -> Option<Rc<ParsedSourceFile>> {
     PUBLISHED_OUTSIDE.with(|kept| kept.borrow().get(&store).map(|&file| Rc::clone(file)))
 }
@@ -423,9 +424,13 @@ fn go_files_of_unpublished_stores(
         // the parse of that publish. A freeable file version (lsshells M3a)
         // keeps no parse: the parse holds the version, so a kept parse would
         // keep it alive. Its `SourceFileInfo` owns copies of the lists
-        // instead, which are freed with the version (M3b). Only the parse
-        // cache makes freeable versions, so a parse from outside a program
-        // load is always kept.
+        // instead, which are freed with the version (M3b). A freeable parse
+        // can also be outside a program load (`is_outside`): the parse
+        // cache notes its parses in `PARSED_UNPUBLISHED`. It also gets
+        // `KeptLists::copied` and no `PUBLISHED_OUTSIDE` entry, so after
+        // its publish `parsed_source_file` returns None for it (bump B kept
+        // every outside parse). That is correct: keeping it would leak the
+        // version. Only a static outside parse goes to `PUBLISHED_OUTSIDE`.
         let is_outside = !parsed.contains_key(&store);
         let file = parsed.get(&store).copied().or_else(|| outside.get(&store));
         let info = match file {

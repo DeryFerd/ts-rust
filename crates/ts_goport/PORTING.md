@@ -358,8 +358,15 @@ The batch that adds it is not accepted until Theo approves.
   its astdata nodes, pending lists, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with the version; its node data reads
   are pinned reads, and its lists are `StoreList` handles. Only with them
-  do 1000-edit sessions pass memory; they cost about +0.6 to +1.3 ms edit
-  median on query-core and effect (M3f). A prefetched parse keeps its
+  do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
+  session instructions +6.40% on effect and +4.68% on query-core (+2.2%
+  with owned nodes off); edit median +0.5 to +2.1 ms on effect and +0.8 to
+  +1.7 ms on query-core in 200-edit sessions, +0.9 ms (query-core) and
+  +1.0 to +1.2 ms (effect) in 1000-edit sessions. The CLI costs
+  (instructions: query +1.38%, hono +0.48%, zod +0.18%, effect +0.19%)
+  come from the M3 merge, not from owned nodes. The planned fix of the
+  read cost is the AST node records plan
+  (`target/continuation-r97-goport/ast-design/study.md`). A prefetched parse keeps its
   nodes leaked (its node column is in the shell), and so does every parse
   with owned nodes off, as before M3c. Its
   `SourceFileInfo` owns copies of
