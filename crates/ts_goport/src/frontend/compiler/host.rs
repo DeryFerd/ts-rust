@@ -48,6 +48,15 @@ pub trait CompilerHost {
         false
     }
 
+    /// The cache where `fs()` keeps its `FileExists`, `DirectoryExists`,
+    /// `Realpath` and `GetAccessibleEntries` lookups, when it keeps them
+    /// where the parse workers can use them too (`SharedStatCache`). Only
+    /// the `tsc -b` host does: its cache lasts for all programs of a build.
+    // PORT: not in Go. Go parse tasks share the host's cachedvfs.
+    fn stat_cache(&self) -> Option<std::sync::Arc<StatCache>> {
+        None
+    }
+
     /// True when a program load with this host starts parse workers that
     /// parse the queued files ahead of the loader (`FilesParser::parse`).
     /// A host that gives most files from its own cache returns false: the
@@ -59,17 +68,18 @@ pub trait CompilerHost {
         true
     }
 
-    /// The names of the files that `get_source_file` gives now from the
-    /// host's own cache, with no read and no parse. The parse workers of
-    /// a program load do not parse these files (`FilesParser::parse`).
-    /// Only the `tsc -b` host has such a cache: it shares the parsed
-    /// `.d.ts` and `.json` files between the programs of a build.
+    /// The files that `get_source_file` gives now from the host's own
+    /// cache, with no read and no parse, by name, with their references.
+    /// The parse workers of a program load do not parse these files; they
+    /// resolve and queue their references (`FilesParser::parse`). Only the
+    /// `tsc -b` host has such a cache: it shares the parsed `.d.ts` and
+    /// `.json` files between the programs of a build.
     // PORT: not in Go (see `prefetch_parses`). A name, not the full parse
     // options: the workers only guess the options. A cached parse with
     // other options is a cache miss, and the loader then parses the file
     // itself, with the same result.
-    fn cached_source_file_names(&self) -> FxHashSet<String> {
-        FxHashSet::default()
+    fn cached_source_file_refs(&self) -> FxHashMap<String, std::sync::Arc<FileRefs>> {
+        FxHashMap::default()
     }
 
     /// Drops the data that the host keeps for its programs (for example a
@@ -119,6 +129,28 @@ pub fn new_cached_fs_compiler_host(
         trace,
         content_mapper_project,
         plain_os_fs,
+    )
+}
+
+/// Go `NewCompilerHost` on `fs`, a file system that caches the lookups of
+/// `base` (Go `cachedvfs.From(base)`, as the `tsc -b` host makes it). The
+/// host shows the plain OS file system (`CompilerHost::is_plain_os_fs`)
+/// when `base` is the wrapped OS file system.
+// PORT: not in Go. `new_compiler_host` cannot see through the cache.
+pub fn new_compiler_host_over(
+    current_directory: &str,
+    fs: Rc<dyn Fs>,
+    base: &Rc<dyn Fs>,
+    default_library_path: &str,
+) -> Rc<dyn CompilerHost> {
+    new_compiler_host_with(
+        current_directory,
+        fs,
+        default_library_path,
+        None,
+        None,
+        None,
+        is_wrapped_os_fs(base),
     )
 }
 

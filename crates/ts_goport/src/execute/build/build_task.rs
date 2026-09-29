@@ -605,7 +605,7 @@ impl BuildTask {
         // from that cache, and the workers would parse them for nothing.
         let mut host_has_parses = false;
         host.source_files
-            .for_each_stored(|_| host_has_parses = true);
+            .for_each_stored(|_, _| host_has_parses = true);
         if !host_has_parses {
             crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
         }

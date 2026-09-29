@@ -408,11 +408,41 @@ impl FilesParser {
             .shared
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
+        // The workers use the cache of the loader's file system
+        // (`SharedStatCache`). Only on the plain OS file system: another
+        // file system caches other files than the workers read.
+        let build_host_cache = loader
+            .opts
+            .host
+            .stat_cache()
+            .filter(|_| loader.opts.host.is_plain_os_fs());
+        let build_host = build_host_cache.is_some();
+        if let Some(cache) = build_host_cache {
+            let _ = pool.shared.stats.host.set(cache);
+        }
         // PERF: a later `tsc -b` program gets its shared `.d.ts` and `.json`
         // files from the build host's cache. A worker parse of such a file
         // is not used: it takes CPU from the checks of the earlier
-        // projects, and the loader waits for running parses at the end.
-        lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_names();
+        // projects, and the loader waits for running parses at the end. The
+        // workers still resolve their references, as Go parse tasks do for
+        // a file that the host gives from its cache.
+        lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_refs();
+        // A `tsc -b` program loads the output `.d.ts` files of its
+        // references in place of their sources, so the workers parse those.
+        if build_host && !loader.opts.can_use_project_reference_source() {
+            lock(&pool.shared.queue).redirects = loader
+                .project_reference_file_mapper
+                .borrow()
+                .source_to_project_reference
+                .values()
+                .filter(|reference| !reference.output_dts.is_empty())
+                .map(|reference| {
+                    let output = reference.output_dts.clone();
+                    let path = loader.to_path(&output);
+                    (reference.source.clone(), (output, path))
+                })
+                .collect();
+        }
         let prefetch = PrefetchGuard::install(pool.shared.clone());
         self.start(loader, tasks, 0);
         pool.shared
@@ -1277,6 +1307,10 @@ struct PrefetchJob {
     job: usize,
     opts: SourceFileParseOptions,
     script_kind: ScriptKind,
+    /// The references of a file that the loader's host gives from its
+    /// cache (`CompilerHost::cached_source_file_refs`). The worker does not
+    /// parse such a file: it only resolves and queues its references.
+    cached: Option<Arc<FileRefs>>,
     state: Mutex<PrefetchState>,
     done: Condvar,
 }
@@ -1338,38 +1372,48 @@ struct PrefetchQueue {
     rank: Option<(Vec<Arc<PrefetchJob>>, usize)>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
-    /// The files that the loader's host gives from its cache
-    /// (`CompilerHost::cached_source_file_names`). They get no job.
-    cached: FxHashSet<String>,
+    /// The files that the loader's host gives from its cache, with their
+    /// references (`CompilerHost::cached_source_file_refs`). Their jobs
+    /// parse nothing (`PrefetchJob::cached`).
+    cached: FxHashMap<String, Arc<FileRefs>>,
+    /// The source files of the project references whose output `.d.ts`
+    /// file the loader loads in their place, by source file name, and the
+    /// output file name and path (`get_parse_file_redirect`, a program
+    /// that does not use the sources of its references). A request for
+    /// such a source queues its output.
+    redirects: FxHashMap<String, (String, Path)>,
     next_job: usize,
     closed: bool,
 }
 
 impl PrefetchQueue {
     /// Makes the job of a file that has none and records it by name. A
-    /// `lib.dom.d.ts` job goes to `first`; the caller pushes other jobs.
-    /// `None` when the queue is closed or full, or the file is `cached`.
+    /// `lib.dom.d.ts` job that parses goes to `first`; the caller pushes
+    /// other jobs. `None` when the queue is closed or full.
     fn add(
         &mut self,
         opts: SourceFileParseOptions,
         script_kind: ScriptKind,
     ) -> Option<Arc<PrefetchJob>> {
-        if self.closed
-            || self.next_job >= DETACHED_STORE_LIMIT
-            || self.cached.contains(&opts.file_name)
-        {
+        if self.closed || self.next_job >= DETACHED_STORE_LIMIT {
             return None;
         }
+        let (opts, script_kind) = self.redirected(opts, script_kind);
+        if let Some(job) = self.by_name.get(&opts.file_name) {
+            return Some(job.clone());
+        }
+        let cached = self.cached.get(&opts.file_name).cloned();
         let job = Arc::new(PrefetchJob {
             job: self.next_job,
             opts,
             script_kind,
+            cached,
             state: Mutex::new(PrefetchState::Queued),
             done: Condvar::new(),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
-        if job.opts.file_name.ends_with("/lib.dom.d.ts") {
+        if job.cached.is_none() && job.opts.file_name.ends_with("/lib.dom.d.ts") {
             self.first = Some(job.clone());
         }
         Some(job)
@@ -1380,11 +1424,38 @@ impl PrefetchQueue {
     fn job_of(&mut self, request: PrefetchRequest) -> Option<Arc<PrefetchJob>> {
         let (opts, script_kind) = match request {
             PrefetchRequest::New(opts, script_kind) => (opts, script_kind),
-            PrefetchRequest::Known(file_name) => return self.by_name.get(&file_name).cloned(),
+            PrefetchRequest::Known(file_name) => {
+                let file_name = match self.redirects.get(&file_name) {
+                    Some((output, _)) => output,
+                    None => &file_name,
+                };
+                return self.by_name.get(file_name).cloned();
+            }
         };
         match self.by_name.get(&opts.file_name) {
             Some(job) => Some(job.clone()),
             None => self.add(opts, script_kind),
+        }
+    }
+
+    /// The parse that the loader makes for a request of `opts`: of the
+    /// output `.d.ts` file of a redirected source (`redirects`), with the
+    /// guessed options of `queue_names`, else of `opts`.
+    fn redirected(
+        &self,
+        opts: SourceFileParseOptions,
+        script_kind: ScriptKind,
+    ) -> (SourceFileParseOptions, ScriptKind) {
+        match self.redirects.get(&opts.file_name) {
+            Some((file_name, path)) => (
+                SourceFileParseOptions {
+                    file_name: file_name.clone(),
+                    path: path.clone(),
+                    external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+                },
+                get_script_kind_from_file_name(file_name),
+            ),
+            None => (opts, script_kind),
         }
     }
 
@@ -1953,8 +2024,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// What `queue_references` reads from a parse. It is taken before the
 /// parse goes to the loader, so the loader does not wait for the
-/// resolution.
-struct FileRefs {
+/// resolution. The workers only guess with it: the loader checks every
+/// file and resolution it takes from them.
+pub struct FileRefs {
     file_name: String,
     referenced_files: Vec<FileReference>,
     lib_reference_directives: Vec<FileReference>,
@@ -1963,6 +2035,18 @@ struct FileRefs {
 }
 
 impl FileRefs {
+    /// The references of a parsed file of this thread (the `tsc -b` host's
+    /// cache, `CompilerHost::cached_source_file_refs`).
+    pub fn of_file(file: &ParsedSourceFile) -> Self {
+        FileRefs {
+            file_name: file.file_name().to_string(),
+            referenced_files: file.referenced_files.clone(),
+            lib_reference_directives: file.lib_reference_directives.clone(),
+            type_reference_directives: file.type_reference_directives.clone(),
+            import_specifiers: file.imports.iter().map(|n| n.text().to_string()).collect(),
+        }
+    }
+
     fn take_from(parse: &mut DetachedParse) -> Self {
         // The loader does not read `import_specifiers`.
         let import_specifiers = std::mem::take(&mut parse.import_specifiers);
@@ -2022,11 +2106,19 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
             }
             *state = PrefetchState::Running;
         }
-        let mut result = prefetch_parse(&*fs, &job);
-        let refs = result
-            .as_mut()
-            .and_then(|result| result.parse.as_mut())
-            .map(FileRefs::take_from);
+        // A cached file's job reads nothing: `Done(None)` makes the loader
+        // parse the file itself if it asks for it (a cache miss).
+        let (result, refs) = match &job.cached {
+            Some(refs) => (None, Some(refs.clone())),
+            None => {
+                let mut result = prefetch_parse(&*fs, &job);
+                let refs = result
+                    .as_mut()
+                    .and_then(|result| result.parse.as_mut())
+                    .map(|parse| Arc::new(FileRefs::take_from(parse)));
+                (result, refs)
+            }
+        };
         *lock(&job.state) = PrefetchState::Done(result);
         job.done.notify_all();
         let Some(refs) = refs else {
@@ -2160,11 +2252,13 @@ impl WorkerResolver {
     }
 }
 
-/// Go `cachedvfs` for the parse workers: the lookups that `CachedFs`
-/// caches, shared by the workers of one load. Module resolution and import
-/// guesses ask for the same paths many times.
+/// The lookups that Go `cachedvfs` caches (all but `Stat`), in maps that
+/// other threads can read. The parse workers of one load share one
+/// (`SharedStatCache`). The `tsc -b` host's cached file system keeps its
+/// cache in one too (`CompilerHost::stat_cache`), so the workers can read
+/// what the loader's file system has cached.
 #[derive(Default)]
-struct SharedStatCache {
+pub struct StatCache {
     file_exists: Mutex<FxHashMap<String, bool>>,
     directory_exists: Mutex<FxHashMap<String, bool>>,
     realpath: Mutex<FxHashMap<String, String>>,
@@ -2185,6 +2279,69 @@ fn cached_stat<V: Clone>(
     lock(cache).entry(path.to_string()).or_insert(value).clone()
 }
 
+impl StatCache {
+    /// The cached `FileExists(path)`, or `load()` stored as it.
+    pub fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
+        cached_stat(&self.file_exists, path, load)
+    }
+
+    /// The cached `DirectoryExists(path)`, or `load()` stored as it.
+    pub fn directory_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
+        cached_stat(&self.directory_exists, path, load)
+    }
+
+    /// The cached `Realpath(path)`, or `load()` stored as it.
+    pub fn realpath(&self, path: &str, load: impl FnOnce() -> String) -> String {
+        cached_stat(&self.realpath, path, load)
+    }
+
+    /// The cached `GetAccessibleEntries(path)`, or `load()` stored as it.
+    pub fn entries(&self, path: &str, load: impl FnOnce() -> Entries) -> Entries {
+        cached_stat(&self.entries, path, load)
+    }
+
+    /// Go `cachedvfs.FS.ClearCache` for these lookups.
+    pub fn clear(&self) {
+        lock(&self.file_exists).clear();
+        lock(&self.directory_exists).clear();
+        lock(&self.realpath).clear();
+        lock(&self.entries).clear();
+    }
+}
+
+/// Go `cachedvfs` for the parse workers: the lookups that `CachedFs`
+/// caches, shared by the workers of one load. Module resolution and import
+/// guesses ask for the same paths many times.
+///
+/// PORT: Go parse tasks share the host's cachedvfs. When the loader's host
+/// keeps its cache in a `StatCache` (`CompilerHost::stat_cache`, the
+/// `tsc -b` host), the workers use that cache (`host`), as Go parse tasks
+/// do: a later program of a build can find a lookup there that an earlier
+/// program cached before the build wrote that path, and the worker then
+/// sees what the loader sees; and a lookup of a resolution that the loader
+/// takes from a worker is in the cache for the later programs, as in Go.
+#[derive(Default)]
+struct SharedStatCache {
+    own: StatCache,
+    host: OnceLock<Arc<StatCache>>,
+}
+
+impl SharedStatCache {
+    /// The cached value of `path` in the host's cache (when there is one)
+    /// or else in the workers' own cache, or `load()` stored there.
+    fn lookup<V: Clone>(
+        &self,
+        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        path: &str,
+        load: impl FnOnce() -> V,
+    ) -> V {
+        match self.host.get() {
+            Some(host) => cached_stat(map(host), path, load),
+            None => cached_stat(map(&self.own), path, load),
+        }
+    }
+}
+
 /// A parse worker's file system: the OS file system of its thread with the
 /// shared stat cache.
 struct WorkerFs {
@@ -2198,7 +2355,8 @@ impl Fs for WorkerFs {
     }
 
     fn file_exists(&self, path: &str) -> bool {
-        cached_stat(&self.stats.file_exists, path, || self.fs.file_exists(path))
+        self.stats
+            .lookup(|c| &c.file_exists, path, || self.fs.file_exists(path))
     }
 
     fn read_file(&self, path: &str) -> (String, bool) {
@@ -2227,15 +2385,19 @@ impl Fs for WorkerFs {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
-        cached_stat(&self.stats.directory_exists, path, || {
-            self.fs.directory_exists(path)
-        })
+        self.stats.lookup(
+            |c| &c.directory_exists,
+            path,
+            || self.fs.directory_exists(path),
+        )
     }
 
     fn get_accessible_entries(&self, path: &str) -> Entries {
-        cached_stat(&self.stats.entries, path, || {
-            self.fs.get_accessible_entries(path)
-        })
+        self.stats.lookup(
+            |c| &c.entries,
+            path,
+            || self.fs.get_accessible_entries(path),
+        )
     }
 
     fn stat(&self, path: &str) -> Option<FileInfo> {
@@ -2247,7 +2409,8 @@ impl Fs for WorkerFs {
     }
 
     fn realpath(&self, path: &str) -> String {
-        cached_stat(&self.stats.realpath, path, || self.fs.realpath(path))
+        self.stats
+            .lookup(|c| &c.realpath, path, || self.fs.realpath(path))
     }
 }
 

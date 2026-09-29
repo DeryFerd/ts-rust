@@ -252,18 +252,26 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     // PERF: Go resolves in all parse tasks with one shared cache. Here the
     // parse workers resolve ahead of the loader, and the loader reads their
     // answers. Only when every resolver sees the same files: the plain OS
-    // file system (no project reference faking host) and no traced
-    // resolution (Go then skips the cache too).
+    // file system (for `tsc -b`, the workers use the host's stat cache,
+    // `CompilerHost::stat_cache`), no project reference faking host (only a
+    // program that uses the sources of its references has one) and no
+    // traced resolution (Go then skips the cache too). A worker resolves
+    // with no project reference redirect; the loader resolves the imports
+    // of a redirected file with its redirect, which is part of the cache
+    // key, so it does not take a worker answer for them. A program with
+    // project references shares answers only in `tsc -b`.
     if !single_threaded
         && super::files_parser::parse_workers_enabled()
         && workers_resolve_imports(&compiler_options)
         && loader.opts.host.is_plain_os_fs()
         && compiler_options.trace_resolution != Tristate::True
-        && loader
+        && (loader
             .opts
             .config
             .resolved_project_reference_paths()
             .is_empty()
+            || loader.opts.host.stat_cache().is_some())
+        && !loader.opts.can_use_project_reference_source()
     {
         let shared = Arc::new(SharedResolutionCache::default());
         resolver.caches.shared = Some(SharedResolutionLink {
