@@ -433,15 +433,16 @@ fn read_file(name: &[u8]) -> Option<Vec<u8>> {
 // Go: diagnosticwriter/diagnosticwriter.go:21 FileLike
 /// Go `diagnosticwriter.FileLike`: the file whose text a diagnostic is shown
 /// against.
-// PORT: the Go interface has two implementations here: the
-// `*ast.SourceFile` (a source file node) and the `originalTextFile` of a
-// content-mapped file (tsgo#4712). Go compares the interface values as
-// pointers, so two values are equal when they are the same node or the same
-// `Rc`.
+// PORT: the Go interface has three implementations here: the
+// `*ast.SourceFile` (a source file node), the `originalTextFile` of a
+// content-mapped file (tsgo#4712) and the `renamedFile` of a supplemental
+// file (ts#63936). Go compares the interface values as pointers, so two
+// values are equal when they are the same node or the same `Rc`.
 #[derive(Clone)]
 pub enum FileLike {
     Source(Node),
     Original(Rc<OriginalTextFile>),
+    Renamed(Rc<RenamedFile>),
 }
 
 impl FileLike {
@@ -451,6 +452,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => source_file_file_name(*file),
             FileLike::Original(file) => file.file_name,
+            FileLike::Renamed(file) => file.file_name,
         }
     }
 
@@ -460,6 +462,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => source_file_text(*file),
             FileLike::Original(file) => file.text,
+            FileLike::Renamed(file) => source_file_text(file.file),
         }
     }
 
@@ -469,6 +472,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => LineMapRef::File(get_ecma_line_starts(*file)),
             FileLike::Original(file) => LineMapRef::Original(&file.line_map),
+            FileLike::Renamed(file) => LineMapRef::File(get_ecma_line_starts(file.file)),
         }
     }
 }
@@ -502,6 +506,7 @@ impl PartialEq for FileLike {
         match (self, other) {
             (FileLike::Source(a), FileLike::Source(b)) => a == b,
             (FileLike::Original(a), FileLike::Original(b)) => Rc::ptr_eq(a, b),
+            (FileLike::Renamed(a), FileLike::Renamed(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -514,6 +519,7 @@ impl Hash for FileLike {
         match self {
             FileLike::Source(file) => file.hash(state),
             FileLike::Original(file) => Rc::as_ptr(file).hash(state),
+            FileLike::Renamed(file) => Rc::as_ptr(file).hash(state),
         }
     }
 }
@@ -531,17 +537,25 @@ impl<'a> AstDiagnostic<'a> {
         self.0.related_information.iter().map(AstDiagnostic)
     }
 
-    // Go: diagnosticwriter/diagnosticwriter.go:57 (*ASTDiagnostic).File (tsgo#4712)
+    // Go: diagnosticwriter/diagnosticwriter.go:57 (*ASTDiagnostic).File (tsgo#4712, ts#63936)
     fn file(self) -> Option<FileLike> {
         let file = self.0.file;
         if file.is_nil() {
             return None;
         }
+        let mut file_name = source_file_file_name(file);
+        let canonical = source_file_canonical_source_file(file);
+        if canonical.is_some() {
+            file_name = source_file_file_name(canonical);
+        }
         if self.resolve().use_original {
             // The mapper's own diagnostics (Source != "") already carry original ranges; compiler
             // diagnostics have their transformed ranges mapped back. Both render against the original,
             // untransformed text. Diagnostics in synthesized code (see resolve) keep the virtual text.
-            return Some(FileLike::Original(new_original_text_file(file)));
+            return Some(FileLike::Original(new_original_text_file(file, file_name)));
+        }
+        if file_name != source_file_file_name(file) {
+            return Some(FileLike::Renamed(Rc::new(RenamedFile { file, file_name })));
         }
         Some(FileLike::Source(file))
     }
@@ -640,14 +654,22 @@ pub struct OriginalTextFile {
     line_map: Vec<i32>,
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:117 newOriginalTextFile (tsgo#4712)
-fn new_original_text_file(file: Node) -> Rc<OriginalTextFile> {
+// Go: diagnosticwriter/diagnosticwriter.go:124 newOriginalTextFile (tsgo#4712, ts#63936)
+fn new_original_text_file(file: Node, file_name: &'static str) -> Rc<OriginalTextFile> {
     let text = source_file_original_text(file);
     Rc::new(OriginalTextFile {
-        file_name: source_file_file_name(file),
+        file_name,
         text,
         line_map: compute_ecma_line_starts(text),
     })
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:137 renamedFile (ts#63936)
+/// Go `renamedFile`: a source file shown under another name (the name of
+/// its canonical source file); its text and line map are the file's own.
+pub struct RenamedFile {
+    file: Node,
+    file_name: &'static str,
 }
 
 // Go: scanner/scanner.go:2677 GetECMALineOfPosition

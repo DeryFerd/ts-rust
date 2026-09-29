@@ -344,8 +344,8 @@ impl Orchestrator {
                     if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
                         continue;
                     }
-                    let manifest_path =
-                        fs.realpath(&combine_paths(&mapper.package_directory, &["package.json"]));
+                    // ts#63936: `package_directory` is already a real path.
+                    let manifest_path = combine_paths(&mapper.package_directory, &["package.json"]);
                     let dir = get_directory_path(&manifest_path);
                     if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
                         desired_dirs.set(&dir, false);

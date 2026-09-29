@@ -1012,12 +1012,10 @@ impl Watcher {
             if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
                 continue;
             }
-            if changed_paths.contains_key(
-                &self
-                    .sys
-                    .fs()
-                    .realpath(&combine_paths(&mapper.package_directory, &["package.json"])),
-            ) {
+            // ts#63936: `package_directory` is already a real path.
+            if changed_paths
+                .contains_key(&combine_paths(&mapper.package_directory, &["package.json"]))
+            {
                 return true;
             }
         }

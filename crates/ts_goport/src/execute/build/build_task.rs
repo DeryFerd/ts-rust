@@ -1103,7 +1103,10 @@ impl BuildTask {
                 if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
                     continue;
                 }
-                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots()) {
+                // ts#63936: a supplemental file that exists is an input like any other.
+                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots())
+                    && !orchestrator.fs().file_exists(&input_file)
+                {
                     continue;
                 }
                 let input_time = orchestrator.get_m_time(&input_file);
