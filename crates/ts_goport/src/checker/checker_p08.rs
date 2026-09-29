@@ -437,6 +437,7 @@ impl Checker {
             } else if self.module_kind == ModuleKind::PRESERVE
                 && !is_import_equals_declaration(node)
                 && !is_variable_declaration(node)
+                && !is_binding_element(node)
                 && get_emit_module_format_of_file(get_source_file_of_node(node))
                     == ModuleKind::COMMON_JS
             {
@@ -549,6 +550,8 @@ impl Checker {
                     args![],
                 );
             }
+            // The `intrinsic` keyword is a leaf type node with no child nodes to check,
+            // so skipping the checkSourceElement below visits nothing.
             return;
         }
         self.check_source_element(type_node);

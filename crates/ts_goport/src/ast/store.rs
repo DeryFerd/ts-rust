@@ -198,15 +198,13 @@ struct FileStore {
     // `adopt_detached_store` (another thread) and `publish_file_stores`
     // drop them.
     lazy_jsdoc_cache: FxHashMap<Node, &'static [Node]>,
-    /// Go `file.LanguageVariant`, the parse `file.Diagnostics()` and
-    /// `file.ContainsNonASCII` (Go `NewSourceFile` sets it from the text),
+    /// Go `file.LanguageVariant` and the parse `file.Diagnostics()`,
     /// written by `finishSourceFile`. Reads of a file that is not published
     /// use them (`ast::source_file_language_variant`,
-    /// `ast::source_file_diagnostics`, `ast::source_file_get_position_map`),
-    /// for example the format tests, which parse a file with no program.
+    /// `ast::source_file_diagnostics`), for example the format tests, which
+    /// parse a file with no program.
     language_variant: LanguageVariant,
     diagnostics: &'static [Diagnostic],
-    contains_non_ascii: bool,
     /// The SourceFile node of this store, set by `publish_file_stores`.
     root: Node,
     /// Go `SourceFile.ECMALineMap()`, computed on first use after publish
@@ -258,9 +256,9 @@ struct FileStore {
     /// (`SlotLinks::NONE`) when the slot is made and written by
     /// `StoreChildLinks` and `replace_store_node_data`.
     build_links: Vec<SlotLinks>,
-    /// Go parser `identifiers` (`internIdentifier`): the name and keyword
-    /// bit of each identifier text of this file, keyed by the interned text.
-    /// Dropped by the freeze.
+    /// The name and keyword bit of each identifier text of this file, keyed
+    /// by the interned text. Port only: Go stopped interning parser texts
+    /// (`internIdentifier`) in tsgo#4731. Dropped by the freeze.
     // PERF: one text hash per identifier node; the process-wide intern (a
     // shard `Mutex`) runs once per distinct text of the file.
     identifier_names: FxHashMap<&'static str, (Name, bool)>,
@@ -2732,8 +2730,7 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
 }
 
 /// Go `result.LanguageVariant` and `result.diagnostics` in
-/// `finishSourceFile`, and `ContainsNonASCII`, which Go `NewSourceFile` sets
-/// from the text (`ParsedSourceFile::new`).
+/// `finishSourceFile`.
 // PORT: the diagnostics are leaked so reads can return a `&'static` slice,
 // like `GoFile::info.diagnostics` after the publish. A parse without errors
 // leaks nothing. A store that owns its nodes (a freeable parse, lsshells
@@ -2742,7 +2739,6 @@ pub fn set_file_store_parse_fields(
     file: usize,
     language_variant: LanguageVariant,
     diagnostics: &[Diagnostic],
-    contains_non_ascii: bool,
 ) {
     with_store_mut(file, |s| {
         s.language_variant = language_variant;
@@ -2750,7 +2746,6 @@ pub fn set_file_store_parse_fields(
             Some(owned) => owned.diagnostics = diagnostics.into(),
             None => s.diagnostics = Box::leak(diagnostics.to_vec().into_boxed_slice()),
         }
-        s.contains_non_ascii = contains_non_ascii;
     });
 }
 
@@ -2770,13 +2765,6 @@ pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
         Some(owned) if !owned.diagnostics.is_empty() => &*Box::leak(owned.diagnostics.clone()),
         _ => s.diagnostics,
     })
-}
-
-/// Go `file.ContainsNonASCII` of a store file: true when the text has a
-/// byte >= 0x80. False for a store that `finishSourceFile` did not finish.
-#[must_use]
-pub fn file_store_contains_non_ascii(file: usize) -> bool {
-    with_store(file, |s| s.contains_non_ascii)
 }
 
 /// Go `file.jsdocCache[node]` of a store file whose program is not
@@ -4565,12 +4553,12 @@ pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
     with_slot_mut(n, |h| h.flags = flags);
 }
 
-/// Go write to a data field of a node of an unfrozen file (reparser.go,
-/// `internIdentifier`). The new data replaces the old; the old node leaks
-/// (a freeable parse keeps it in its store until the store is freed, so a
-/// list handle taken before the write still reads the old list). The U1 and
-/// U4 build entries and the keyword bit of the slot follow the new data,
-/// and its R2-5 chain becomes unknown.
+/// Go write to a data field of a node of an unfrozen file (reparser.go).
+/// The new data replaces the old; the old node leaks (a freeable parse
+/// keeps it in its store until the store is freed, so a list handle taken
+/// before the write still reads the old list). The U1 and U4 build entries
+/// and the keyword bit of the slot follow the new data, and its R2-5 chain
+/// becomes unknown.
 pub fn replace_store_node_data(n: Node, data: NodeData) {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
@@ -4890,8 +4878,8 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 s.lazy_jsdoc_cache.len()
             ),
             format!(
-                "variant {:?} diagnostics {diagnostics:?} non_ascii {}",
-                s.language_variant, s.contains_non_ascii
+                "variant {:?} diagnostics {diagnostics:?}",
+                s.language_variant
             ),
             format!(
                 "facts {:?} bind {:?} overflow {}",

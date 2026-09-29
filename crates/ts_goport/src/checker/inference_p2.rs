@@ -1262,7 +1262,6 @@ pub fn clone_inference_info(info: &InferenceInfo) -> InferenceInfo {
     InferenceInfo {
         type_parameter: info.type_parameter,
         candidates: info.candidates.clone(),
-        candidate_depths: info.candidate_depths.clone(),
         contra_candidates: info.contra_candidates.clone(),
         inferred_type: info.inferred_type,
         priority: info.priority,

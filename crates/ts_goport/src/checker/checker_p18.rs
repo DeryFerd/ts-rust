@@ -1283,10 +1283,11 @@ impl Checker {
             | SyntaxKind::PropertyDeclaration
             | SyntaxKind::PropertySignature
             | SyntaxKind::VariableDeclaration
-            | SyntaxKind::BindingElement => self.get_widened_type_for_variable_like_declaration(
-                declaration,
-                true, /*reportErrors*/
-            ),
+            | SyntaxKind::BindingElement => {
+                // only report diagnostics for context-insensitive parameters - context-sensitive ones may have their type fixed to something else
+                let report_errors = !self.is_parameter_of_context_sensitive_signature(symbol);
+                self.get_widened_type_for_variable_like_declaration(declaration, report_errors)
+            }
             SyntaxKind::PropertyAssignment => {
                 self.check_property_assignment(declaration, CheckMode::NORMAL)
             }

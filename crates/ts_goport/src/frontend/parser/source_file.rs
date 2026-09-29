@@ -32,7 +32,6 @@ pub struct ParsedSourceFile {
     pub language_variant: LanguageVariant,
     pub script_kind: ScriptKind,
     pub is_declaration_file: bool,
-    pub contains_non_ascii: bool,
     pub uses_uri_style_node_core_modules: Tristate,
     pub identifier_count: i32,
     pub imports: Vec<Node>,
@@ -86,10 +85,6 @@ impl ParsedSourceFile {
             language_variant: LanguageVariant::default(),
             script_kind: ScriptKind::default(),
             is_declaration_file: false,
-            // Go: NewSourceFile sets `ContainsNonASCII` from the text
-            // (`stringutil.ContainsNonASCII`: a byte >= 0x80). A Go byte
-            // >= 0x80 is not ASCII in the port form either.
-            contains_non_ascii: !text.is_ascii(),
             uses_uri_style_node_core_modules: Tristate::Unknown,
             identifier_count: 0,
             imports: Vec::new(),
@@ -178,6 +173,187 @@ impl ParsedSourceFile {
         // Go: IsSourceFileJS
         self.root.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
     }
+
+    // ── Content mapper info (tsgo#4712) ────────────────────────────────
+    // PORT: Go keeps `contentMapperInfo` on the SourceFile. Here the node
+    // side (`ContentMapperFileInfo`) is in the process table of `crate::ast`,
+    // keyed by the file id and the file name address of its store (see
+    // `content_mapper_key` there), and the `Rc` links are in
+    // `CONTENT_MAPPER_LINKS` of this thread (an `Rc<ParsedSourceFile>` stays
+    // on its thread). A clone of a `ParsedSourceFile` has the same store, so
+    // it has the same info, as a Go copy of the pointer does.
+
+    // Go: ast/ast.go:2561 OriginalText
+    // OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
+    #[must_use]
+    pub fn original_text(&self) -> &str {
+        match source_file_content_mapper_info(self.root) {
+            Some(info) if !info.content_mapper.is_empty() => &info.original_text,
+            _ => self.text,
+        }
+    }
+
+    // Go: ast/ast.go:2569 OriginalFileName
+    // OriginalFileName returns the canonical filename associated with a supplemental source file, or FileName() otherwise.
+    // PORT: reads the canonical SourceFile node, so it does not depend on
+    // the canonical `ParsedSourceFile` being alive (see
+    // `canonical_source_file`).
+    #[must_use]
+    pub fn original_file_name(&self) -> &str {
+        let canonical = source_file_canonical_source_file(self.root);
+        if canonical.is_some() {
+            return source_file_file_name(canonical);
+        }
+        self.file_name()
+    }
+
+    // Go: ast/ast.go:2579 SpanMap
+    // SpanMap returns the span map that maps positions in this file's transformed Text() back to its
+    // original, untransformed content, or nil if the file is not content-mapped (or is a failure stub).
+    // The returned map is nil-safe: a nil map maps positions identically.
+    #[must_use]
+    pub fn span_map(&self) -> Option<&'static crate::spanmap::SpanMap> {
+        source_file_span_map(self.root)
+    }
+
+    // Go: ast/ast.go:2588 ContentMapper
+    // ContentMapper returns the identity of the content mapper that produced this file, or "" if the file
+    // was not produced by a content mapper (or the mapper did not identify itself).
+    #[must_use]
+    pub fn content_mapper(&self) -> &'static str {
+        source_file_content_mapper(self.root)
+    }
+
+    // Go: ast/ast.go:2597 IsContentMapperFailureStub
+    // IsContentMapperFailureStub reports whether this file is the empty placeholder produced when a content
+    // mapper's transform failed.
+    #[must_use]
+    pub fn is_content_mapper_failure_stub(&self) -> bool {
+        source_file_is_content_mapper_failure_stub(self.root)
+    }
+
+    // Go: ast/ast.go:2601 ContentMapperTransformIdentity
+    #[must_use]
+    pub fn content_mapper_transform_identity(&self) -> &'static str {
+        source_file_content_mapper_transform_identity(self.root)
+    }
+
+    // Go: ast/ast.go:2608 VirtualFileName
+    #[must_use]
+    pub fn virtual_file_name(&self) -> &'static str {
+        source_file_virtual_file_name(self.root)
+    }
+
+    // Go: ast/ast.go:2644 ContentMapperParseOptions
+    // ContentMapperParseOptions returns the parse options used to acquire this file from the mapped parse cache.
+    #[must_use]
+    pub fn content_mapper_parse_options(&self) -> &'static SourceFileParseOptions {
+        source_file_content_mapper_parse_options(self.root)
+    }
+
+    // Go: ast/ast.go:2652 SetContentMapperInfo
+    // SetContentMapperInfo initializes all content-mapper metadata before the source file is published.
+    // PORT: takes `&self`, because callers hold the file in an `Rc`. Panics
+    // when the info is already set, as Go does.
+    // PORT: the canonical and supplemental files point at each other. The
+    // canonical file owns its supplemental files (`Rc`), and a supplemental
+    // file points back with a `Weak`, so the links make no `Rc` cycle.
+    pub fn set_content_mapper_info(&self, info: ContentMapperSourceFileInfo) {
+        let ContentMapperSourceFileInfo {
+            content_mapper,
+            transform_identity,
+            parse_options,
+            virtual_file_name,
+            original_text,
+            span_map,
+            diagnostic_directives,
+            supplemental_source_files,
+            canonical_source_file,
+        } = info;
+        set_source_file_content_mapper_info(
+            self.root,
+            ContentMapperFileInfo {
+                content_mapper,
+                transform_identity,
+                parse_options,
+                virtual_file_name,
+                original_text,
+                span_map,
+                diagnostic_directives,
+                supplemental_source_files: supplemental_source_files
+                    .iter()
+                    .map(|file| file.root)
+                    .collect(),
+                canonical_source_file: canonical_source_file
+                    .as_ref()
+                    .map_or(Node::NIL, |file| file.root),
+            },
+        );
+        let links = ContentMapperLinks {
+            supplemental_source_files,
+            canonical_source_file: canonical_source_file
+                .as_ref()
+                .map_or_else(std::rc::Weak::new, Rc::downgrade),
+        };
+        CONTENT_MAPPER_LINKS.with(|m| m.borrow_mut().insert(self.root.file_index(), links));
+    }
+
+    // Go: ast/ast.go:2659 DiagnosticDirectives
+    #[must_use]
+    pub fn diagnostic_directives(&self) -> &'static [MappedDiagnosticDirective] {
+        source_file_diagnostic_directives(self.root)
+    }
+
+    // Go: ast/ast.go:2667 SupplementalSourceFiles
+    // SupplementalSourceFiles returns the additional outputs produced from this canonical source file.
+    // PORT: returns a copy of the `Rc` list (the list is in a thread table).
+    #[must_use]
+    pub fn supplemental_source_files(&self) -> Vec<Rc<ParsedSourceFile>> {
+        CONTENT_MAPPER_LINKS.with(|m| {
+            m.borrow()
+                .get(&self.root.file_index())
+                .map(|links| links.supplemental_source_files.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    // Go: ast/ast.go:2675 CanonicalSourceFile
+    // CanonicalSourceFile returns the canonical output associated with this supplemental source file.
+    // PORT: the link is a `Weak` (see `set_content_mapper_info`), so this is
+    // `None` after the canonical file is dropped. A supplemental file is
+    // reached through its canonical file or a program that holds both, so a
+    // reader does not see that case.
+    #[must_use]
+    pub fn canonical_source_file(&self) -> Option<Rc<ParsedSourceFile>> {
+        CONTENT_MAPPER_LINKS.with(|m| {
+            m.borrow()
+                .get(&self.root.file_index())
+                .and_then(|links| links.canonical_source_file.upgrade())
+        })
+    }
+
+    // Go: ast/ast.go:2683 IsContentMapperSupplemental
+    // IsContentMapperSupplemental reports whether this is an unnamed supplemental mapper output.
+    // PORT: reads the canonical SourceFile node (see `original_file_name`).
+    #[must_use]
+    pub fn is_content_mapper_supplemental(&self) -> bool {
+        source_file_is_content_mapper_supplemental(self.root)
+    }
+}
+
+/// The links of a content-mapped file (Go
+/// `ContentMapperSourceFileInfo.SupplementalSourceFiles` and
+/// `CanonicalSourceFile`).
+struct ContentMapperLinks {
+    supplemental_source_files: Vec<Rc<ParsedSourceFile>>,
+    canonical_source_file: std::rc::Weak<ParsedSourceFile>,
+}
+
+thread_local! {
+    /// The content mapper links of the parsed files of this thread, by file
+    /// id. Like the node-side table, it is never cleared.
+    static CONTENT_MAPPER_LINKS: RefCell<FxHashMap<usize, ContentMapperLinks>> =
+        RefCell::new(FxHashMap::default());
 }
 
 fn remap_diagnostic(d: &mut Diagnostic, remap: StoreRemap) {

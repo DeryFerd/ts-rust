@@ -1,3 +1,5 @@
+use crate::contentmapper::Mapper;
+use crate::frontend::json_ext::JsonValue;
 use crate::frontend::prelude::*;
 
 // Port of tsoptions/parsinghelpers.go.
@@ -73,32 +75,118 @@ pub fn parse_number(value: &CompilerOptionsValue) -> Option<i32> {
     None
 }
 
-// Go: tsoptions/parsinghelpers.go:73 parseProjectReference
-// PORT: Go `[]*core.ProjectReference` is `Vec<ProjectReference>`. Go
-// `v.(string)` and `v.(bool)` panic on a wrong type; the Rust port panics
-// with the same meaning. Option validation makes both unreachable.
-pub fn parse_project_reference(json: &CompilerOptionsValue) -> Vec<ProjectReference> {
-    let mut result = Vec::new();
-    if let CompilerOptionsValue::Map(v) = json {
-        let mut reference = ProjectReference::default();
-        if let Some(v) = v.get("path") {
-            reference.path = match v {
-                CompilerOptionsValue::String(s) => s.clone(),
-                _ => panic!("interface conversion: reference path is not string"),
-            };
-        }
-        if let Some(v) = v.get("circular") {
-            reference.circular = match v {
-                CompilerOptionsValue::Bool(b) => *b,
-                _ => panic!("interface conversion: reference circular is not bool"),
-            };
-        }
-        result.push(reference);
-    }
-    result
+// Go: tsoptions/parsinghelpers.go:75 projectReferenceParseResult
+#[derive(Clone, Debug, Default)]
+pub struct ProjectReferenceParseResult {
+    pub reference: ProjectReference,
+    pub has_path: bool,
+    pub path_valid: bool,
+    pub has_circular: bool,
+    pub circular_valid: bool,
 }
 
-// Go: tsoptions/parsinghelpers.go:88 parseJsonToStringKey
+// Go: tsoptions/parsinghelpers.go:83 parseProjectReference
+// PORT: Go returns a nilable pointer; that is `Option`.
+pub fn parse_project_reference(json: &CompilerOptionsValue) -> Option<ProjectReferenceParseResult> {
+    if let CompilerOptionsValue::Map(v) = json {
+        let mut result = ProjectReferenceParseResult::default();
+        if let Some(value) = v.get("path") {
+            result.has_path = true;
+            if let CompilerOptionsValue::String(path) = value {
+                result.reference.path = path.clone();
+                result.path_valid = true;
+            }
+        }
+        if let Some(value) = v.get("circular") {
+            result.has_circular = true;
+            if let CompilerOptionsValue::Bool(circular) = value {
+                result.reference.circular = *circular;
+                result.circular_valid = true;
+            }
+        }
+        return Some(result);
+    }
+    None
+}
+
+// Go: tsoptions/parsinghelpers.go:105 parseContentMapper (tsgo#4712)
+// PORT: Go returns a nilable `*contentmapper.Mapper`; that is an owned
+// `Option<Mapper>`, which the caller changes and then puts in an `Rc`.
+pub fn parse_content_mapper(value: &CompilerOptionsValue) -> (Option<Mapper>, Vec<Diagnostic>) {
+    let CompilerOptionsValue::Map(v) = value else {
+        return (None, Vec::new());
+    };
+    let mut errors: Vec<Diagnostic> = Vec::new();
+    let mut mapper = Mapper::default();
+    if let Some(pkg) = v.get("package") {
+        match pkg {
+            CompilerOptionsValue::String(str) if !str.is_empty() => {
+                mapper.definition.package = str.clone();
+            }
+            _ => errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.package", "string"],
+            )),
+        }
+    } else {
+        errors.push(new_compiler_diagnostic(
+            diag::Compiler_option_0_requires_a_value_of_type_1,
+            args!["contentMapper.package", "string"],
+        ));
+    }
+    if let Some(extensions) = v.get("extensions") {
+        if let Some(strs) = parse_string_array_strict(extensions) {
+            mapper.definition.extensions = strs;
+        } else {
+            errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.extensions", "string[]"],
+            ));
+        }
+    } else {
+        errors.push(new_compiler_diagnostic(
+            diag::Compiler_option_0_requires_a_value_of_type_1,
+            args!["contentMapper.extensions", "string[]"],
+        ));
+    }
+    if let Some(options) = v.get("options") {
+        if !matches!(options, CompilerOptionsValue::Map(_)) {
+            errors.push(new_compiler_diagnostic(
+                diag::Compiler_option_0_requires_a_value_of_type_1,
+                args!["contentMapper.options", "object"],
+            ));
+        } else {
+            // Go: `mapper.Options, _ = json.Marshal(options)` (compact JSON v2).
+            let mut json = String::new();
+            super::tsconfig_p2::stringify_json(options, &mut json);
+            mapper.definition.options = JsonValue(json.into_bytes());
+        }
+    }
+    if !errors.is_empty() {
+        return (None, errors);
+    }
+    (Some(mapper), errors)
+}
+
+// Go: tsoptions/parsinghelpers.go:145 parseStringArrayStrict (tsgo#4712)
+// parseStringArrayStrict returns the string slice and true only if value is an array whose
+// elements are all strings. A missing element or wrong element type yields false.
+// PORT: Go `([]string, bool)` is `Option<Vec<String>>`.
+pub fn parse_string_array_strict(value: &CompilerOptionsValue) -> Option<Vec<String>> {
+    let CompilerOptionsValue::List(arr) = value else {
+        return None;
+    };
+    let mut result = Vec::with_capacity(arr.len());
+    for v in arr {
+        let CompilerOptionsValue::String(str) = v else {
+            return None;
+        };
+        result.push(str.clone());
+    }
+    Some(result)
+}
+
+// Go: tsoptions/parsinghelpers.go:161 parseJsonToStringKey
 // PORT: Go returns a map pointer that is never nil. It is `Option` so it
 // can go straight to the nilable `json` argument of
 // `parseJsonConfigFileContentWorker`; it is always `Some`.
@@ -118,6 +206,10 @@ pub fn parse_json_to_string_key(
         }
         if let Some(v) = m.get("references") {
             result.insert("references".to_string(), v.clone());
+        }
+        // tsgo#4712
+        if let Some(v) = m.get("contentMappers") {
+            result.insert("contentMappers".to_string(), v.clone());
         }
         if let Some(v) = m.get("extends") {
             if let CompilerOptionsValue::String(str) = v {
@@ -424,6 +516,7 @@ fn parse_compiler_options_worker(
         "singleThreaded" => all_options.single_threaded = parse_tristate(value),
         "quiet" => all_options.quiet = parse_tristate(value),
         "checkers" => all_options.checkers = parse_number(value),
+        "runExternalCode" => all_options.run_external_code = parse_tristate(value),
         _ => {
             // different than any key above
             return false;
@@ -709,6 +802,7 @@ pub fn merge_compiler_options<'a>(
         build => "build",
         help => "help",
         all => "all",
+        run_external_code => "runExternalCode",
         pprof_dir => "pprofDir",
         single_threaded => "singleThreaded",
         quiet => "quiet",

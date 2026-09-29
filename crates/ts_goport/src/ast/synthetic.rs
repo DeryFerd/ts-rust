@@ -113,9 +113,7 @@ struct SyntheticNode {
 // PORT: a parsed SourceFile keeps these fields in `SourceFileInfo`. astdata
 // node data cannot hold them, so a factory SourceFile keeps them in its slot.
 // Go `parseOptions` is kept as its file name and path; the external module
-// indicator options are only read by the parser. `ContainsNonASCII` and
-// `Identifiers` are not in `SourceFileInfo`, so `copyFrom` cannot copy them
-// from a parsed file and they are not kept.
+// indicator options are only read by the parser.
 #[derive(Clone, Debug, Default)]
 pub struct SyntheticSourceFileData {
     // Fields set by NewSourceFile
@@ -138,6 +136,8 @@ pub struct SyntheticSourceFileData {
     pub lib_reference_directives: Vec<FileReference>,
     pub common_js_module_indicator: Node,
     pub external_module_indicator: Node,
+    /// Go `contentMapperInfo` (tsgo#4712), set by `copyFrom`.
+    pub content_mapper_info: Option<&'static ContentMapperFileInfo>,
 }
 
 /// A list that the factory made (`new_synthetic_node_list`,
@@ -1673,16 +1673,25 @@ pub fn source_file_parser_fields(file: Node) -> SyntheticSourceFileData {
         lib_reference_directives: info.lib_reference_directives.clone(),
         common_js_module_indicator: info.common_js_module_indicator,
         external_module_indicator: info.external_module_indicator,
+        content_mapper_info: source_file_content_mapper_info(file),
     }
 }
 
-// Go: ast/ast.go:2663 (node *SourceFile) copyFrom
+// Go: ast/ast.go:2805 (node *SourceFile) copyFrom
 /// Copies the parser fields of `other` (parsed or factory-made) to the
 /// factory SourceFile `node`.
 pub fn source_file_copy_from(node: Node, other: Node) {
     // Do not copy fields set by NewSourceFile (Text, FileName, Path, or Statements)
     let o = source_file_parser_fields(other);
     update_synthetic_source_file(node, |d| {
+        // tsgo#4712
+        if let Some(info) = o.content_mapper_info {
+            // Go: node.SetContentMapperInfo(*other.contentMapperInfo)
+            if d.content_mapper_info.is_some() {
+                panic!("content mapper source file info already set");
+            }
+            d.content_mapper_info = Some(info);
+        }
         d.language_variant = o.language_variant;
         d.script_kind = o.script_kind;
         d.is_declaration_file = o.is_declaration_file;

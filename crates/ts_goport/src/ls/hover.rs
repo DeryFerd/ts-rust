@@ -1,5 +1,7 @@
 use crate::ls::prelude::*;
 
+use crate::spanmap::{Feature, Fidelity};
+
 // Go: ls/hover.go:20 symbolFormatFlags
 pub const SYMBOL_FORMAT_FLAGS: SymbolFormatFlags =
     SymbolFormatFlags::WRITE_TYPE_PARAMETERS_OR_ARGUMENTS
@@ -13,7 +15,7 @@ pub const TYPE_FORMAT_FLAGS: TypeFormatFlags =
         .union(TypeFormatFlags::USE_INSTANTIATION_EXPRESSIONS);
 
 impl LanguageService {
-    // Go: ls/hover.go:25 ProvideHover
+    // Go: ls/hover.go:28 ProvideHover
     pub fn provide_hover(
         &self,
         ctx: &Context,
@@ -29,9 +31,17 @@ impl LanguageService {
         }
 
         let (program, file) = self.get_program_and_file(&params.text_document.uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&file, &params.position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            params.position,
+            Feature::HOVER,
+        );
+        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
+            return Ok(lsproto::HoverOrNull::default());
+        }
+        let file = positions[0].script;
+        let position = positions[0].position;
         let node = astnav::get_touching_property_name(file, position);
         if is_source_file(node)
             || is_property_access_or_qualified_name(node)
@@ -59,17 +69,24 @@ impl LanguageService {
             ..Default::default()
         };
 
-        let (quick_info, documentation) = self.get_quick_info_and_documentation_for_symbol(
-            c,
-            symbol,
-            range_node,
-            content_format.clone(),
-            Some(&vc),
-        );
+        let vs_capability = caps.vs_supports_visual_studio_extensions;
+        let (quick_info, documentation, vs_documentation, quick_info_runs) = self
+            .get_quick_info_and_documentation_for_symbol(
+                c,
+                symbol,
+                range_node,
+                content_format.clone(),
+                Some(&vc),
+                vs_capability,
+            );
         if quick_info.is_empty() {
             return Ok(lsproto::HoverOrNull::default());
         }
-        let hover_range = self.get_lsp_range_of_node(range_node, Node::NIL, Node::NIL);
+        let range_file = get_source_file_of_node(range_node);
+        let text_range = get_range_of_node(range_node, range_file, Node::NIL /*endNode*/);
+        let (hover_range, hover_fidelity) =
+            self.converters
+                .to_lsp_range_for_feature(&range_file, text_range, Feature::HOVER);
 
         let content = if content_format == lsproto::MarkupKind::MARKDOWN {
             format_quick_info(&quick_info) + &documentation
@@ -85,18 +102,54 @@ impl LanguageService {
                 }),
                 ..Default::default()
             },
-            range: Some(hover_range),
             ..Default::default()
         };
+        if hover_fidelity.is_single_segment() {
+            hover.range = Some(hover_range);
+        }
 
         if caps.experimental.hover_verbosity_level {
             hover.can_increase_verbosity = vc.can_increase_verbosity.get() && !vc.truncated.get();
         }
 
+        // Clients that support Visual Studio extensions (e.g. VS itself, when Corsa/Native TS Preview is
+        // enabled) render `_vs_rawContent` in place of `contents`. Without it, VS shows plain markdown
+        // with no symbol icon and no syntax coloring, unlike the legacy TSServer-backed hover path.
+        if vs_capability && !quick_info_runs.is_empty() {
+            let mut kind = lsutil::ScriptElementKind::KEYWORD;
+            let mut modifiers = lsutil::ScriptElementKindModifier::NONE;
+            if symbol.is_some() {
+                // Resolve aliases to their target before computing the icon kind, so e.g. `import { x }`
+                // shows the icon for whatever `x` actually is (const, function, ...) rather than a
+                // generic alias icon. GetSymbolModifiers already accounts for the alias target itself.
+                let mut icon_symbol = symbol;
+                if c.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
+                    let resolved = c.get_aliased_symbol(symbol);
+                    if resolved.is_some() && resolved != symbol {
+                        icon_symbol = resolved;
+                    }
+                }
+                kind = lsutil::get_symbol_kind(Some(&mut *c), icon_symbol, range_node);
+                modifiers = lsutil::get_symbol_modifiers(Some(&mut *c), symbol);
+            }
+            let image_id = get_vs_hover_image_id(kind, modifiers);
+            let mut documentation_runs: Vec<lsproto::VSClassifiedTextRun> = Vec::new();
+            let doc_text = vs_documentation.trim_start_matches('\n');
+            if !doc_text.is_empty() {
+                documentation_runs = vec![lsproto::VSClassifiedTextRun {
+                    classification_type_name: lsproto::ClassificationTypeName::TEXT.0.to_string(),
+                    text: doc_text.to_string(),
+                    ..Default::default()
+                }];
+            }
+            hover.vs_raw_content =
+                build_vs_hover_raw_content(image_id, quick_info_runs, documentation_runs);
+        }
+
         Ok(lsproto::HoverOrNull { hover: Some(hover) })
     }
 
-    // Go: ls/hover.go:88 getQuickInfoAndDocumentationForSymbol
+    // Go: ls/hover.go:128 getQuickInfoAndDocumentationForSymbol
     pub fn get_quick_info_and_documentation_for_symbol(
         &self,
         c: &mut Checker,
@@ -104,274 +157,412 @@ impl LanguageService {
         node: Node,
         content_format: lsproto::MarkupKind,
         vc: Option<&VerbosityContext>,
-    ) -> (String, String) {
+        vs_capability: bool,
+    ) -> (String, String, String, Vec<lsproto::VSClassifiedTextRun>) {
         let content_format = &content_format;
         let meaning = get_meaning_from_location(node);
-        let info = get_quick_info_and_declaration_at_location(
-            c, symbol, node, vc, false, /*vsCapability*/
-            meaning,
-        );
+        let info =
+            get_quick_info_and_declaration_at_location(c, symbol, node, vc, vs_capability, meaning);
         let quick_info = info.display_parts.borrow().string();
         if quick_info.is_empty() {
-            return (String::new(), String::new());
+            return (String::new(), String::new(), String::new(), Vec::new());
         }
+        let quick_info_runs = info.display_parts.borrow().get_runs(c);
 
-        let call_node = get_call_or_new_expression(node);
-        let mut documentation = self.documentation_from_signature(
+        let documentation = get_documentation_for_symbol(
+            &self.documentation_location_mapper(Feature::HOVER),
             c,
             symbol,
-            call_node,
             node,
-            content_format,
-            false, /*commentOnly*/
-        );
-        if !documentation.is_empty() {
-            return (quick_info, documentation);
-        }
-
-        documentation = self.get_documentation_from_declaration(
-            c,
-            symbol,
             info.declaration,
-            node,
             content_format,
             false, /*commentOnly*/
         );
-        if !documentation.is_empty() {
-            return (quick_info, documentation);
-        }
 
-        let documentation = self.documentation_from_alias(c, symbol, node, content_format);
-        (quick_info, documentation)
-    }
-
-    // Go: ls/hover.go:108 documentationFromSignature
-    pub fn documentation_from_signature(
-        &self,
-        c: &mut Checker,
-        symbol: SymbolId,
-        node: Node,
-        location: Node,
-        content_format: &lsproto::MarkupKind,
-        comment_only: bool,
-    ) -> String {
-        if node.is_nil() {
-            return String::new();
-        }
-        let signature = c.get_resolved_signature_exported(node);
-        if signature.is_nil() {
-            return String::new();
-        }
-        let declaration = c.sig(signature).declaration;
-        if declaration.is_nil() {
-            return String::new();
-        }
-        if is_call_signature_declaration(declaration)
-            || is_construct_signature_declaration(declaration)
-        {
-            return self.get_documentation_from_declaration(
+        // VS's rich hover (_vs_rawContent) renders documentation as plain colorized text with no Markdown
+        // parser, so it can't use the tag section (@param/@returns/@example/@see, etc.) that
+        // getDocumentationFromDeclaration renders with '*@tag*' bolding and ```-fenced @example blocks --
+        // those would show up as literal asterisks/backticks. This also matches the legacy TSServer-backed
+        // VS hover (TypeScript-VS's HoverService.cs), which only ever surfaced the JSDoc summary
+        // (TSServer's quickinfo `documentation`) and never included the tag section at all (TSServer
+        // exposes tags via a separate `tags` field that legacy VS hover never read). So request
+        // comment-only, plain-text documentation for the VS path instead of reusing `documentation`.
+        let mut vs_documentation = String::new();
+        if vs_capability {
+            vs_documentation = get_documentation_for_symbol(
+                &self.documentation_location_mapper(Feature::HOVER),
                 c,
                 symbol,
+                node,
+                info.declaration,
+                &lsproto::MarkupKind::PLAIN_TEXT,
+                true, /*commentOnly*/
+            );
+        }
+
+        (quick_info, documentation, vs_documentation, quick_info_runs)
+    }
+}
+
+// Go: ls/hover.go:158 documentationLocationMapper
+/// `l.documentationLocationMapper(feature)` or `noMappedLocation`.
+// PORT: Go passes the func value; here a reference to the closure.
+pub type DocumentationLocationMapper<'a> =
+    &'a dyn Fn(Node, TextRange) -> (lsproto::Location, Fidelity);
+
+impl<P: ProgramView> LanguageService<P> {
+    // Go: ls/hover.go:160 documentationLocationMapper
+    pub fn documentation_location_mapper(
+        &self,
+        feature: Feature,
+    ) -> impl Fn(Node, TextRange) -> (lsproto::Location, Fidelity) + '_ {
+        move |file: Node, file_range: TextRange| {
+            self.source_file_range_to_lsp_location_for_feature(file, file_range, feature)
+        }
+    }
+}
+
+// Go: ls/hover.go:166 getDocumentationForSymbol
+// getDocumentationForSymbol tries each documentation source in turn (call-signature documentation,
+// declaration JSDoc, root-symbol JSDoc, alias target JSDoc) and returns the first non-empty result,
+// formatted for contentFormat. commentOnly restricts the result to the JSDoc summary, excluding the
+// @tag section.
+pub fn get_documentation_for_symbol(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    c: &mut Checker,
+    symbol: SymbolId,
+    node: Node,
+    declaration: Node,
+    content_format: &lsproto::MarkupKind,
+    comment_only: bool,
+) -> String {
+    let call_node = get_call_or_new_expression(node);
+    let mut documentation = documentation_from_signature(
+        get_mapped_location,
+        c,
+        symbol,
+        call_node,
+        node,
+        content_format,
+        comment_only,
+    );
+    if !documentation.is_empty() {
+        return documentation;
+    }
+
+    documentation = documentation_from_root_symbols(
+        get_mapped_location,
+        c,
+        symbol,
+        node,
+        content_format,
+        comment_only,
+    );
+    if !documentation.is_empty() {
+        return documentation;
+    }
+
+    documentation = get_documentation_from_declaration(
+        get_mapped_location,
+        c,
+        symbol,
+        declaration,
+        node,
+        content_format,
+        comment_only,
+    );
+    if !documentation.is_empty() {
+        return documentation;
+    }
+
+    documentation_from_alias(
+        get_mapped_location,
+        c,
+        symbol,
+        node,
+        content_format,
+        comment_only,
+    )
+}
+
+// Go: ls/hover.go:185 documentationFromSignature
+pub fn documentation_from_signature(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    c: &mut Checker,
+    symbol: SymbolId,
+    node: Node,
+    location: Node,
+    content_format: &lsproto::MarkupKind,
+    comment_only: bool,
+) -> String {
+    if node.is_nil() {
+        return String::new();
+    }
+    let signature = c.get_resolved_signature_exported(node);
+    if signature.is_nil() {
+        return String::new();
+    }
+    let declaration = c.sig(signature).declaration;
+    if declaration.is_nil() {
+        return String::new();
+    }
+    if is_call_signature_declaration(declaration) || is_construct_signature_declaration(declaration)
+    {
+        return get_documentation_from_declaration(
+            get_mapped_location,
+            c,
+            symbol,
+            declaration,
+            location,
+            content_format,
+            comment_only,
+        );
+    }
+    String::new()
+}
+
+// Go: ls/hover.go:203 documentationFromAlias
+pub fn documentation_from_alias(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    c: &mut Checker,
+    symbol: SymbolId,
+    node: Node,
+    content_format: &lsproto::MarkupKind,
+    comment_only: bool,
+) -> String {
+    if symbol.is_nil() || !c.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
+        return String::new();
+    }
+
+    let aliased_symbol = c.get_aliased_symbol(symbol);
+    if aliased_symbol.is_nil() || aliased_symbol == c.get_unknown_symbol() {
+        return String::new();
+    }
+
+    let mut candidates = vec![aliased_symbol];
+    let export_symbol = c.sym(aliased_symbol).export_symbol;
+    if export_symbol.is_some() {
+        candidates.push(export_symbol);
+    }
+
+    for candidate in candidates {
+        let value_declaration = c.sym(candidate).value_declaration;
+        let aliased_declaration = if value_declaration.is_some() {
+            value_declaration
+        } else {
+            c.sym(candidate)
+                .declarations
+                .first()
+                .copied()
+                .unwrap_or(Node::NIL)
+        };
+        if aliased_declaration.is_nil() {
+            continue;
+        }
+
+        let documentation = get_documentation_from_declaration(
+            get_mapped_location,
+            c,
+            candidate,
+            aliased_declaration,
+            node,
+            content_format,
+            comment_only,
+        );
+        if !documentation.is_empty() {
+            return documentation;
+        }
+    }
+
+    String::new()
+}
+
+// Go: ls/hover.go:232 documentationFromRootSymbols
+pub fn documentation_from_root_symbols(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    c: &mut Checker,
+    symbol: SymbolId,
+    node: Node,
+    content_format: &lsproto::MarkupKind,
+    comment_only: bool,
+) -> String {
+    if symbol.is_nil() {
+        return String::new();
+    }
+
+    let root_symbols = c.get_root_symbols(symbol);
+    if root_symbols.len() <= 1 {
+        return String::new();
+    }
+
+    let mut docs: Vec<String> = Vec::new();
+    for root_symbol in root_symbols {
+        if root_symbol.is_nil() {
+            continue;
+        }
+        let mut declarations = c.sym(root_symbol).declarations.clone();
+        let value_declaration = c.sym(root_symbol).value_declaration;
+        if declarations.is_empty() && value_declaration.is_some() {
+            declarations = vec![value_declaration].into();
+        }
+        for declaration in declarations {
+            let documentation = get_documentation_from_declaration(
+                get_mapped_location,
+                c,
+                root_symbol,
                 declaration,
-                location,
+                node,
                 content_format,
                 comment_only,
             );
-        }
-        String::new()
-    }
-
-    // Go: ls/hover.go:126 documentationFromAlias
-    pub fn documentation_from_alias(
-        &self,
-        c: &mut Checker,
-        symbol: SymbolId,
-        node: Node,
-        content_format: &lsproto::MarkupKind,
-    ) -> String {
-        if symbol.is_nil() || !c.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
-            return String::new();
-        }
-
-        let aliased_symbol = c.get_aliased_symbol(symbol);
-        if aliased_symbol.is_nil() || aliased_symbol == c.get_unknown_symbol() {
-            return String::new();
-        }
-
-        let mut candidates = vec![aliased_symbol];
-        let export_symbol = c.sym(aliased_symbol).export_symbol;
-        if export_symbol.is_some() {
-            candidates.push(export_symbol);
-        }
-
-        for candidate in candidates {
-            let value_declaration = c.sym(candidate).value_declaration;
-            let aliased_declaration = if value_declaration.is_some() {
-                value_declaration
-            } else {
-                c.sym(candidate)
-                    .declarations
-                    .first()
-                    .copied()
-                    .unwrap_or(Node::NIL)
-            };
-            if aliased_declaration.is_nil() {
-                continue;
-            }
-
-            let documentation = self.get_documentation_from_declaration(
-                c,
-                candidate,
-                aliased_declaration,
-                node,
-                content_format,
-                false, /*commentOnly*/
-            );
-            if !documentation.is_empty() {
-                return documentation;
+            if !documentation.is_empty() && !docs.contains(&documentation) {
+                docs.push(documentation);
             }
         }
-
-        String::new()
     }
+    docs.join("\n")
+}
 
-    // Go: ls/hover.go:155 getDocumentationFromDeclaration
-    pub fn get_documentation_from_declaration(
-        &self,
-        c: &mut Checker,
-        symbol: SymbolId,
-        declaration: Node,
-        location: Node,
-        content_format: &lsproto::MarkupKind,
-        comment_only: bool,
-    ) -> String {
-        if declaration.is_nil() {
-            return String::new();
-        }
-        let is_markdown = *content_format == lsproto::MarkupKind::MARKDOWN;
-        let mut b = String::new();
-        let jsdoc = get_js_doc_or_tag(c, declaration);
-        if jsdoc.is_some()
-            && !(!declaration.flags().intersects(NodeFlags::REPARSED)
-                && contains_typedef_tag(jsdoc))
-        {
-            self.write_comments(&mut b, c, &jsdoc.comments().to_vec(), is_markdown);
-            if jsdoc.kind() == SyntaxKind::JsDoc && !comment_only {
-                let tags = jsdoc.tags();
-                if tags.is_some() {
-                    for tag in tags.nodes() {
-                        if tag.kind() == SyntaxKind::JsDocTypeTag
-                            || tag.kind() == SyntaxKind::JsDocTypedefTag
-                            || tag.kind() == SyntaxKind::JsDocCallbackTag
-                        {
-                            continue;
+// Go: ls/hover.go:260 getDocumentationFromDeclaration
+pub fn get_documentation_from_declaration(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    c: &mut Checker,
+    symbol: SymbolId,
+    declaration: Node,
+    location: Node,
+    content_format: &lsproto::MarkupKind,
+    comment_only: bool,
+) -> String {
+    if declaration.is_nil() {
+        return String::new();
+    }
+    let is_markdown = *content_format == lsproto::MarkupKind::MARKDOWN;
+    let mut b = String::new();
+    let jsdoc = get_js_doc_or_tag(c, declaration, &mut FxHashSet::default());
+    if jsdoc.is_some()
+        && !(!declaration.flags().intersects(NodeFlags::REPARSED) && contains_typedef_tag(jsdoc))
+    {
+        write_comments(
+            get_mapped_location,
+            &mut b,
+            c,
+            &jsdoc.comments().to_vec(),
+            is_markdown,
+        );
+        if jsdoc.kind() == SyntaxKind::JsDoc && !comment_only {
+            let tags = jsdoc.tags();
+            if tags.is_some() {
+                for tag in tags.nodes() {
+                    if tag.kind() == SyntaxKind::JsDocTypeTag
+                        || tag.kind() == SyntaxKind::JsDocTypedefTag
+                        || tag.kind() == SyntaxKind::JsDocCallbackTag
+                    {
+                        continue;
+                    }
+                    b.push_str("\n\n");
+                    if is_markdown {
+                        b.push_str("*@");
+                        b.push_str(tag.tag_name().text());
+                        b.push('*');
+                    } else {
+                        b.push('@');
+                        b.push_str(tag.tag_name().text());
+                    }
+                    match tag.kind() {
+                        SyntaxKind::JsDocParameterTag | SyntaxKind::JsDocPropertyTag => {
+                            write_optional_entity_name(&mut b, tag.name());
                         }
-                        b.push_str("\n\n");
-                        if is_markdown {
-                            b.push_str("*@");
-                            b.push_str(tag.tag_name().text());
-                            b.push('*');
-                        } else {
-                            b.push('@');
-                            b.push_str(tag.tag_name().text());
+                        SyntaxKind::JsDocAugmentsTag => {
+                            write_optional_entity_name(&mut b, tag.class_name());
                         }
-                        match tag.kind() {
-                            SyntaxKind::JsDocParameterTag | SyntaxKind::JsDocPropertyTag => {
-                                write_optional_entity_name(&mut b, tag.name());
-                            }
-                            SyntaxKind::JsDocAugmentsTag => {
-                                write_optional_entity_name(&mut b, tag.class_name());
-                            }
-                            SyntaxKind::JsDocTemplateTag => {
-                                for (i, tp) in tag.type_parameters().iter().enumerate() {
-                                    if i != 0 {
-                                        b.push(',');
-                                    }
-                                    write_optional_entity_name(&mut b, tp.name());
+                        SyntaxKind::JsDocTemplateTag => {
+                            for (i, tp) in tag.type_parameters().iter().enumerate() {
+                                if i != 0 {
+                                    b.push(',');
                                 }
+                                write_optional_entity_name(&mut b, tp.name());
                             }
-                            _ => {}
                         }
-                        let comments = tag.comments().to_vec();
-                        if tag.kind() == SyntaxKind::JsDocUnknownTag
-                            && tag.tag_name().text() == "example"
-                        {
-                            let mut comment_text = get_text_of_js_doc_comment(tag.comment_list());
-                            if comment_text.starts_with("<caption>") {
-                                if let Some(caption_end) = comment_text.find("</caption>") {
-                                    if caption_end > 0 {
-                                        b.push_str(" — ");
-                                        b.push_str(&comment_text["<caption>".len()..caption_end]);
-                                        comment_text = comment_text
-                                            [caption_end + "</caption>".len()..]
-                                            .to_string();
-                                        // Trim leading blank lines from commentText
-                                        loop {
-                                            let s1 = comment_text.trim_start_matches(|ch: char| {
-                                                ch == ' ' || ch == '\t'
-                                            });
-                                            let s2 = s1.trim_start_matches(|ch: char| {
-                                                ch == '\r' || ch == '\n'
-                                            });
-                                            if s1.len() == s2.len() {
-                                                break;
-                                            }
-                                            comment_text = s2.to_string();
+                        _ => {}
+                    }
+                    let comments = tag.comments().to_vec();
+                    if tag.kind() == SyntaxKind::JsDocUnknownTag
+                        && tag.tag_name().text() == "example"
+                    {
+                        let mut comment_text = get_text_of_js_doc_comment(tag.comment_list());
+                        if comment_text.starts_with("<caption>") {
+                            if let Some(caption_end) = comment_text.find("</caption>") {
+                                if caption_end > 0 {
+                                    b.push_str(" — ");
+                                    b.push_str(&comment_text["<caption>".len()..caption_end]);
+                                    comment_text = comment_text[caption_end + "</caption>".len()..]
+                                        .to_string();
+                                    // Trim leading blank lines from commentText
+                                    loop {
+                                        let s1 = comment_text
+                                            .trim_start_matches(|ch: char| ch == ' ' || ch == '\t');
+                                        let s2 = s1.trim_start_matches(|ch: char| {
+                                            ch == '\r' || ch == '\n'
+                                        });
+                                        if s1.len() == s2.len() {
+                                            break;
                                         }
+                                        comment_text = s2.to_string();
                                     }
                                 }
                             }
-                            b.push('\n');
-                            if comment_text.len() > 6
-                                && comment_text.starts_with("```")
-                                && comment_text.ends_with("```")
-                                && comment_text.contains('\n')
-                            {
-                                b.push_str(&comment_text);
-                                b.push('\n');
-                            } else {
-                                write_code(&mut b, "tsx", &comment_text);
-                            }
-                        } else if tag.kind() == SyntaxKind::JsDocSeeTag
-                            && tag.name_expression().is_some()
-                        {
-                            b.push_str(" — ");
-                            self.write_name_link(
-                                &mut b,
-                                c,
-                                tag.name_expression().name(),
-                                "",
-                                false, /*quote*/
-                                is_markdown,
-                            );
-                            if !comments.is_empty() {
-                                b.push(' ');
-                                self.write_comments(&mut b, c, &comments, is_markdown);
-                            }
-                        } else if tag.kind() == SyntaxKind::JsDocThrowsTag
-                            && tag.type_expression().is_some()
-                        {
-                            b.push_str(" — ");
-                            b.push_str(&get_text_of_node(tag.type_expression()));
-                            if !comments.is_empty() {
-                                b.push(' ');
-                                self.write_comments(&mut b, c, &comments, is_markdown);
-                            }
-                        } else if !comments.is_empty() {
-                            b.push(' ');
-                            if comments[0].kind() != SyntaxKind::JsDocText
-                                || !comments[0].text().starts_with('-')
-                            {
-                                b.push_str("— ");
-                            }
-                            self.write_comments(&mut b, c, &comments, is_markdown);
                         }
+                        b.push('\n');
+                        if comment_text.len() > 6
+                            && comment_text.starts_with("```")
+                            && comment_text.ends_with("```")
+                            && comment_text.contains('\n')
+                        {
+                            b.push_str(&comment_text);
+                            b.push('\n');
+                        } else {
+                            write_code(&mut b, "tsx", &comment_text);
+                        }
+                    } else if tag.kind() == SyntaxKind::JsDocSeeTag
+                        && tag.name_expression().is_some()
+                    {
+                        b.push_str(" — ");
+                        write_name_link(
+                            get_mapped_location,
+                            &mut b,
+                            c,
+                            tag.name_expression().name(),
+                            "",
+                            false, /*quote*/
+                            is_markdown,
+                        );
+                        if !comments.is_empty() {
+                            b.push(' ');
+                            write_comments(get_mapped_location, &mut b, c, &comments, is_markdown);
+                        }
+                    } else if tag.kind() == SyntaxKind::JsDocThrowsTag
+                        && tag.type_expression().is_some()
+                    {
+                        b.push_str(" — ");
+                        b.push_str(&get_text_of_node(tag.type_expression()));
+                        if !comments.is_empty() {
+                            b.push(' ');
+                            write_comments(get_mapped_location, &mut b, c, &comments, is_markdown);
+                        }
+                    } else if !comments.is_empty() {
+                        b.push(' ');
+                        if comments[0].kind() != SyntaxKind::JsDocText
+                            || !comments[0].text().starts_with('-')
+                        {
+                            b.push_str("— ");
+                        }
+                        write_comments(get_mapped_location, &mut b, c, &comments, is_markdown);
                     }
                 }
             }
         }
-        b
     }
+    b
 }
 
 // Go: ls/hover.go:245 formatQuickInfo
@@ -896,7 +1087,17 @@ impl QuickInfoWriter<'_> {
                     self.write_type_classified(t, container, TYPE_FORMAT_FLAGS);
                 }
             }
-            self.set_declaration(value_declaration);
+            let declaration = if value_declaration.is_some() {
+                value_declaration
+            } else {
+                self.c
+                    .sym(symbol)
+                    .declarations
+                    .first()
+                    .copied()
+                    .unwrap_or(Node::NIL)
+            };
+            self.set_declaration(declaration);
         }
         if flags.intersects(SymbolFlags::ENUM_MEMBER) {
             self.write_new_line();
@@ -1405,216 +1606,6 @@ pub fn contains_typedef_tag(jsdoc: Node) -> bool {
     false
 }
 
-// Go: ls/hover.go:849 getJSDoc
-pub fn get_js_doc(node: Node) -> Node {
-    node.js_doc(Node::NIL).last().unwrap_or(Node::NIL)
-}
-
-// Go: ls/hover.go:853 getJSDocOrTag
-pub fn get_js_doc_or_tag(c: &mut Checker, node: Node) -> Node {
-    let jsdoc = get_js_doc(node);
-    if jsdoc.is_some() {
-        return jsdoc;
-    }
-    if is_parameter_declaration(node) {
-        let name = node.name();
-        if is_binding_pattern(name) {
-            // For binding patterns, match JSDoc @param tags by position rather than by name
-            return get_js_doc_parameter_tag_by_position(c, node);
-        }
-        return get_matching_js_doc_tag(c, node.parent(), name.text(), is_matching_parameter_tag);
-    } else if is_type_parameter_declaration(node) {
-        return get_matching_js_doc_tag(
-            c,
-            node.parent(),
-            node.name().text(),
-            is_matching_template_tag,
-        );
-    } else if is_variable_declaration(node)
-        && is_variable_declaration_list(node.parent())
-        && node
-            .parent()
-            .declarations()
-            .nodes()
-            .first()
-            .unwrap_or(Node::NIL)
-            == node
-    {
-        return get_js_doc_or_tag(c, node.parent().parent());
-    } else if (is_function_expression_or_arrow_function(node) || is_class_expression(node))
-        && (is_variable_declaration(node.parent())
-            || is_property_declaration(node.parent())
-            || is_property_assignment(node.parent()))
-        && node.parent().initializer() == node
-    {
-        return get_js_doc_or_tag(c, node.parent());
-    } else if is_binding_element(node) && is_object_binding_pattern(node.parent()) {
-        let name = node.property_name_or_name();
-        if is_identifier(name) {
-            let object_type = c.get_type_at_location(node.parent());
-            if object_type.is_some() {
-                let prop = c.get_property_of_type_exported(object_type, name.text());
-                if prop.is_some() {
-                    let declarations = c.sym(prop).declarations.clone();
-                    for d in declarations {
-                        let jsdoc = get_js_doc(d);
-                        if jsdoc.is_some() {
-                            return jsdoc;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let symbol = node.symbol();
-    if symbol.is_some() && node.parent().is_some() {
-        if is_function_declaration(node)
-            || is_method_declaration(node)
-            || is_method_signature_declaration(node)
-            || is_constructor_declaration(node)
-            || is_construct_signature_declaration(node)
-        {
-            let first_signature = c
-                .sym(symbol)
-                .declarations
-                .iter()
-                .copied()
-                .find(|&d| is_function_like(d))
-                .unwrap_or(Node::NIL);
-            if first_signature.is_some() && node != first_signature {
-                let js_doc = get_js_doc_or_tag(c, first_signature);
-                if js_doc.is_some() {
-                    return js_doc;
-                }
-            }
-        }
-        if is_class_or_interface_like(node.parent()) {
-            let is_static = has_static_modifier(node);
-            let class_type = c.get_declared_type_of_symbol_exported(node.parent().symbol());
-            let symbol_name = c.sym(symbol).name.as_str();
-            if is_static {
-                // For static members, use the checker's base constructor type resolution.
-                // This correctly handles intersection constructor types from mixins
-                // (e.g., typeof MixinClass & T) by preserving the full intersection.
-                let base_constructor_type =
-                    c.get_base_constructor_type_of_class_exported(class_type);
-                let static_base_type = c.get_apparent_type_exported(base_constructor_type);
-                let prop = c.get_property_of_type_exported(static_base_type, symbol_name);
-                if prop.is_some() {
-                    let prop_value_declaration = c.sym(prop).value_declaration;
-                    if prop_value_declaration.is_some() {
-                        let js_doc = get_js_doc_or_tag(c, prop_value_declaration);
-                        if js_doc.is_some() {
-                            return js_doc;
-                        }
-                    }
-                }
-            } else {
-                for base_type in c.get_base_types_exported(class_type) {
-                    let prop = c.get_property_of_type_exported(base_type, symbol_name);
-                    if prop.is_some() {
-                        let prop_value_declaration = c.sym(prop).value_declaration;
-                        if prop_value_declaration.is_some() {
-                            let js_doc = get_js_doc_or_tag(c, prop_value_declaration);
-                            if js_doc.is_some() {
-                                return js_doc;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Node::NIL
-}
-
-// Go: ls/hover.go:921 getMatchingJSDocTag
-pub fn get_matching_js_doc_tag(
-    c: &mut Checker,
-    node: Node,
-    name: &str,
-    match_: fn(Node, &str) -> bool,
-) -> Node {
-    let jsdoc = get_js_doc_or_tag(c, node);
-    if jsdoc.is_some() && jsdoc.kind() == SyntaxKind::JsDoc {
-        let tags = jsdoc.tags();
-        if tags.is_some() {
-            for tag in tags.nodes() {
-                if match_(tag, name) {
-                    return tag;
-                }
-            }
-        }
-    }
-    Node::NIL
-}
-
-// Go: ls/hover.go:936 getJSDocParameterTagByPosition
-// getJSDocParameterTagByPosition finds a JSDoc @param tag for a binding pattern parameter by position.
-// Since binding patterns don't have a simple name, we match the @param tag at the same index as the parameter.
-pub fn get_js_doc_parameter_tag_by_position(c: &mut Checker, param: Node) -> Node {
-    let parent = param.parent();
-    if parent.is_nil() {
-        return Node::NIL;
-    }
-
-    // Find the parameter's index in the parent's parameters list
-    let params = parent.parameters();
-    let mut param_index: i32 = -1;
-    for (i, p) in params.iter().enumerate() {
-        if p == param {
-            param_index = i as i32;
-            break;
-        }
-    }
-    if param_index < 0 {
-        return Node::NIL;
-    }
-
-    // Get the JSDoc for the parent function/method
-    let jsdoc = get_js_doc_or_tag(c, parent);
-    if jsdoc.is_nil() || jsdoc.kind() != SyntaxKind::JsDoc {
-        return Node::NIL;
-    }
-
-    // Collect all @param tags in order
-    let tags = jsdoc.tags();
-    if tags.is_nil() {
-        return Node::NIL;
-    }
-
-    let mut param_tag_index: i32 = 0;
-    for tag in tags.nodes() {
-        if tag.kind() == SyntaxKind::JsDocParameterTag {
-            if param_tag_index == param_index {
-                return tag;
-            }
-            param_tag_index += 1;
-        }
-    }
-    Node::NIL
-}
-
-// Go: ls/hover.go:979 isMatchingParameterTag
-pub fn is_matching_parameter_tag(tag: Node, name: &str) -> bool {
-    tag.kind() == SyntaxKind::JsDocParameterTag && is_node_with_name(tag, name)
-}
-
-// Go: ls/hover.go:983 isMatchingTemplateTag
-pub fn is_matching_template_tag(tag: Node, name: &str) -> bool {
-    tag.kind() == SyntaxKind::JsDocTemplateTag
-        && tag
-            .type_parameters()
-            .iter()
-            .any(|tp| is_node_with_name(tp, name))
-}
-
-// Go: ls/hover.go:987 isNodeWithName
-pub fn is_node_with_name(node: Node, name: &str) -> bool {
-    let node_name = node.name();
-    is_identifier(node_name) && node_name.text() == name
-}
-
 // Go: ls/hover.go:992 writeCode
 pub fn write_code(b: &mut String, lang: &str, code: &str) {
     if code.is_empty() {
@@ -1637,125 +1628,134 @@ pub fn write_code(b: &mut String, lang: &str, code: &str) {
     b.push('\n');
 }
 
-impl LanguageService {
-    // Go: ls/hover.go:1013 writeComments
-    pub fn write_comments(
-        &self,
-        b: &mut String,
-        c: &mut Checker,
-        comments: &[Node],
-        is_markdown: bool,
-    ) {
-        for &comment in comments {
-            match comment.kind() {
-                SyntaxKind::JsDocText => {
-                    b.push_str(comment.text());
-                }
-                SyntaxKind::JsDocLink | SyntaxKind::JsDocLinkPlain => {
-                    self.write_js_doc_link(b, c, comment, false /*quote*/, is_markdown);
-                }
-                SyntaxKind::JsDocLinkCode => {
-                    self.write_js_doc_link(b, c, comment, true /*quote*/, is_markdown);
-                }
-                _ => {}
+// Go: ls/hover.go:975 writeComments
+pub fn write_comments(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    b: &mut String,
+    c: &mut Checker,
+    comments: &[Node],
+    is_markdown: bool,
+) {
+    for &comment in comments {
+        match comment.kind() {
+            SyntaxKind::JsDocText => {
+                b.push_str(comment.text());
             }
-        }
-    }
-
-    // Go: ls/hover.go:1026 writeJSDocLink
-    pub fn write_js_doc_link(
-        &self,
-        b: &mut String,
-        c: &mut Checker,
-        link: Node,
-        quote: bool,
-        is_markdown: bool,
-    ) {
-        let name = link.name();
-        let text = link.text().trim_matches(' ');
-        if name.is_nil() {
-            write_quoted_string(b, text, quote && is_markdown);
-            return;
-        }
-        if is_identifier(name)
-            && (name.text() == "http" || name.text() == "https")
-            && text.starts_with("://")
-        {
-            let mut link_text = name.text().to_string() + text;
-            let mut link_uri = link_text.clone();
-            if let Some(comment_pos) = link_text.find(|ch: char| ch == ' ' || ch == '|') {
-                link_uri = link_text[..comment_pos].to_string();
-                link_text = trim_comment_prefix(&link_text[comment_pos..]).to_string();
-                if link_text.is_empty() {
-                    link_text = link_uri.clone();
-                }
-            }
-            if is_markdown {
-                write_markdown_link(b, &link_text, &link_uri, quote);
-            } else {
-                write_quoted_string(b, &link_text, false);
-                if link_text != link_uri {
-                    b.push_str(" (");
-                    b.push_str(&link_uri);
-                    b.push(')');
-                }
-            }
-            return;
-        }
-        self.write_name_link(b, c, name, text, quote, is_markdown);
-    }
-
-    // Go: ls/hover.go:1058 writeNameLink
-    pub fn write_name_link(
-        &self,
-        b: &mut String,
-        c: &mut Checker,
-        name: Node,
-        text: &str,
-        quote: bool,
-        is_markdown: bool,
-    ) {
-        let declarations = get_declarations_from_location(c, name);
-        if !declarations.is_empty() {
-            let declaration = declarations[0];
-            let file = get_source_file_of_node(declaration);
-            let name_of_declaration = get_name_of_declaration(declaration);
-            let node = if name_of_declaration.is_some() {
-                name_of_declaration
-            } else {
-                declaration
-            };
-            let loc = self.get_mapped_location(
-                source_file_file_name(file),
-                create_range_from_node(node, file),
-            );
-            let prefix_len = if text.starts_with("()") { 2 } else { 0 };
-            let mut link_text = trim_comment_prefix(&text[prefix_len..]).to_string();
-            if link_text.is_empty() {
-                link_text = get_entity_name_string(name) + &text[..prefix_len];
-            }
-            if is_markdown {
-                let link_uri = format!(
-                    "{}#{},{}-{},{}",
-                    loc.uri,
-                    loc.range.start.line + 1,
-                    loc.range.start.character + 1,
-                    loc.range.end.line + 1,
-                    loc.range.end.character + 1
+            SyntaxKind::JsDocLink | SyntaxKind::JsDocLinkPlain => {
+                write_js_doc_link(
+                    get_mapped_location,
+                    b,
+                    c,
+                    comment,
+                    false, /*quote*/
+                    is_markdown,
                 );
-                write_markdown_link(b, &link_text, &link_uri, quote);
-            } else {
-                write_quoted_string(b, &link_text, false);
             }
-            return;
+            SyntaxKind::JsDocLinkCode => {
+                write_js_doc_link(
+                    get_mapped_location,
+                    b,
+                    c,
+                    comment,
+                    true, /*quote*/
+                    is_markdown,
+                );
+            }
+            _ => {}
         }
-        let separator = if !text.is_empty() { " " } else { "" };
-        write_quoted_string(
-            b,
-            &(get_entity_name_string(name) + separator + text),
-            quote && is_markdown,
-        );
     }
+}
+
+// Go: ls/hover.go:988 writeJSDocLink
+pub fn write_js_doc_link(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    b: &mut String,
+    c: &mut Checker,
+    link: Node,
+    quote: bool,
+    is_markdown: bool,
+) {
+    let name = link.name();
+    let text = link.text().trim_matches(' ');
+    if name.is_nil() {
+        write_quoted_string(b, text, quote && is_markdown);
+        return;
+    }
+    if is_identifier(name)
+        && (name.text() == "http" || name.text() == "https")
+        && text.starts_with("://")
+    {
+        let mut link_text = name.text().to_string() + text;
+        let mut link_uri = link_text.clone();
+        if let Some(comment_pos) = link_text.find(|ch: char| ch == ' ' || ch == '|') {
+            link_uri = link_text[..comment_pos].to_string();
+            link_text = trim_comment_prefix(&link_text[comment_pos..]).to_string();
+            if link_text.is_empty() {
+                link_text = link_uri.clone();
+            }
+        }
+        if is_markdown {
+            write_markdown_link(b, &link_text, &link_uri, quote);
+        } else {
+            write_quoted_string(b, &link_text, false);
+            if link_text != link_uri {
+                b.push_str(" (");
+                b.push_str(&link_uri);
+                b.push(')');
+            }
+        }
+        return;
+    }
+    write_name_link(get_mapped_location, b, c, name, text, quote, is_markdown);
+}
+
+// Go: ls/hover.go:1020 writeNameLink
+pub fn write_name_link(
+    get_mapped_location: DocumentationLocationMapper<'_>,
+    b: &mut String,
+    c: &mut Checker,
+    name: Node,
+    text: &str,
+    quote: bool,
+    is_markdown: bool,
+) {
+    let declarations = get_declarations_from_location(c, name);
+    if !declarations.is_empty() {
+        let declaration = declarations[0];
+        let file = get_source_file_of_node(declaration);
+        let name_of_declaration = get_name_of_declaration(declaration);
+        let node = if name_of_declaration.is_some() {
+            name_of_declaration
+        } else {
+            declaration
+        };
+        let (loc, fidelity) = get_mapped_location(file, create_range_from_node(node, file));
+        let prefix_len = if text.starts_with("()") { 2 } else { 0 };
+        let mut link_text = trim_comment_prefix(&text[prefix_len..]).to_string();
+        if link_text.is_empty() {
+            link_text = get_entity_name_string(name) + &text[..prefix_len];
+        }
+        if is_markdown && fidelity.is_single_segment() {
+            let link_uri = format!(
+                "{}#{},{}-{},{}",
+                loc.uri,
+                loc.range.start.line + 1,
+                loc.range.start.character + 1,
+                loc.range.end.line + 1,
+                loc.range.end.character + 1
+            );
+            write_markdown_link(b, &link_text, &link_uri, quote);
+        } else {
+            write_quoted_string(b, &link_text, false);
+        }
+        return;
+    }
+    let separator = if !text.is_empty() { " " } else { "" };
+    write_quoted_string(
+        b,
+        &(get_entity_name_string(name) + separator + text),
+        quote && is_markdown,
+    );
 }
 
 // Go: ls/hover.go:1081 trimCommentPrefix

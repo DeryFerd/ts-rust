@@ -63,7 +63,14 @@ pub(crate) fn new_program_with_config(
     cwd: &str,
     config: Rc<ParsedCommandLine>,
 ) -> Rc<NewProgram> {
-    let host = new_compiler_host(cwd, bundled::wrap_fs(fs), &bundled::lib_path(), None, None);
+    let host = new_compiler_host(
+        cwd,
+        bundled::wrap_fs(fs),
+        &bundled::lib_path(),
+        None,
+        None,
+        None,
+    );
     ls_program::new_program(
         ProgramOptions {
             host,

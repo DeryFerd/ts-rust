@@ -374,15 +374,15 @@ impl Checker {
     // parameter symbols with declarations that have explicit type annotations. Such references are
     // resolvable with no possibility of triggering circularities in control flow analysis.
     // Go: checker/flow.go:2101 getTypeOfDottedName
-    // PORT: Go passes the `*ast.Diagnostic` already added to the collection so
-    // related information can be appended to it. The caller passes the owned
-    // copy returned by `error`; `get_explicit_type_of_symbol` appends the
-    // related information to the stored copy (see
-    // `add_related_info_to_stored_diagnostic`).
+    // PORT: Go passes the `*ast.Diagnostic` that `c.error` returned, so
+    // `getExplicitTypeOfSymbol` can add related info to the stored diagnostic.
+    // The stored `&mut Diagnostic` cannot be kept across the checker calls here,
+    // so `diagnostic` collects that related info (`None` is Go nil), and the
+    // caller adds it to the stored diagnostic (see `check_call_expression`).
     pub fn get_type_of_dotted_name(
         &mut self,
         node: Node,
-        diagnostic: Option<Diagnostic>,
+        mut diagnostic: Option<&mut Vec<Diagnostic>>,
     ) -> TypeId {
         if !node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             match node.kind() {
@@ -398,7 +398,8 @@ impl Checker {
                     return self.check_super_expression(node);
                 }
                 SyntaxKind::PropertyAccessExpression => {
-                    let t = self.get_type_of_dotted_name(node.expression(), diagnostic.clone());
+                    let t =
+                        self.get_type_of_dotted_name(node.expression(), diagnostic.as_deref_mut());
                     if t.is_some() {
                         let name = node.name();
                         let mut prop = SymbolId::NIL;
@@ -430,12 +431,32 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2134 getExplicitTypeOfSymbol
+    // PORT: `diagnostic` collects the related info (see `get_type_of_dotted_name`).
     pub fn get_explicit_type_of_symbol(
         &mut self,
         symbol: SymbolId,
-        diagnostic: Option<Diagnostic>,
+        diagnostic: Option<&mut Vec<Diagnostic>>,
     ) -> TypeId {
         let symbol = self.resolve_symbol(symbol);
+        if !self.resolving_explicit_type_of_symbol.insert(symbol) {
+            return TypeId::NIL;
+        }
+        // PORT: Go `defer c.resolvingExplicitTypeOfSymbol.Delete(symbol)`. The
+        // body is in `get_explicit_type_of_symbol_worker`, so every return path
+        // deletes the symbol here. A panic skips the delete, as it skips the
+        // pops of the other checker stacks (`type_resolutions`).
+        let result = self.get_explicit_type_of_symbol_worker(symbol, diagnostic);
+        self.resolving_explicit_type_of_symbol.remove(&symbol);
+        result
+    }
+
+    // PORT: Rust-only: the part of Go `getExplicitTypeOfSymbol` after the
+    // `resolvingExplicitTypeOfSymbol` guard. `symbol` is already resolved.
+    fn get_explicit_type_of_symbol_worker(
+        &mut self,
+        symbol: SymbolId,
+        mut diagnostic: Option<&mut Vec<Diagnostic>>,
+    ) -> TypeId {
         let flags = self.sym(symbol).flags;
         if flags.intersects(
             SymbolFlags::FUNCTION
@@ -450,7 +471,7 @@ impl Checker {
                 let origin = self.mapped_symbol_links.get(symbol).synthetic_origin;
                 if origin.is_some()
                     && self
-                        .get_explicit_type_of_symbol(origin, diagnostic.clone())
+                        .get_explicit_type_of_symbol(origin, diagnostic.as_deref_mut())
                         .is_some()
                 {
                     return self.get_type_of_symbol(symbol);
@@ -482,50 +503,18 @@ impl Checker {
                         );
                     }
                 }
-                if let Some(diagnostic) = &diagnostic {
+                if let Some(diagnostic) = diagnostic {
                     let symbol_name = self.symbol_to_string(symbol);
                     let related = create_diagnostic_for_node(
                         declaration,
                         diag::X_0_needs_an_explicit_type_annotation,
                         args![symbol_name],
                     );
-                    self.add_related_info_to_stored_diagnostic(diagnostic, related);
+                    diagnostic.push(related);
                 }
             }
         }
         TypeId::NIL
-    }
-
-    // PORT: Rust-only helper for Go `diagnostic.AddRelatedInfo(...)` on a
-    // diagnostic that is already in `c.diagnostics`. Diagnostics are owned
-    // values, so this finds the stored copy (the latest one with the same file,
-    // span, code, message and arguments) and appends to it. If the diagnostic
-    // was never stored (`addDiagnostic` can drop it), the Go mutation is not
-    // observable either, so nothing happens.
-    fn add_related_info_to_stored_diagnostic(
-        &mut self,
-        diagnostic: &Diagnostic,
-        related: Diagnostic,
-    ) {
-        let same = |d: &Diagnostic| {
-            d.file == diagnostic.file
-                && d.pos == diagnostic.pos
-                && d.end == diagnostic.end
-                && d.code == diagnostic.code
-                && std::ptr::eq(d.message, diagnostic.message)
-                && d.message_args == diagnostic.message_args
-        };
-        let list = if diagnostic.file.is_some() {
-            let file_name = source_file_file_name(diagnostic.file).to_string();
-            self.diagnostics.file_diagnostics.get_mut(&file_name)
-        } else {
-            Some(&mut self.diagnostics.non_file_diagnostics)
-        };
-        if let Some(list) = list {
-            if let Some(stored) = list.iter_mut().rev().find(|d| same(d)) {
-                stored.add_related_info(Some(related));
-            }
-        }
     }
 
     // Go: checker/flow.go:2172 isDeclarationWithExplicitTypeAnnotation
@@ -884,6 +873,11 @@ impl Checker {
         if !self.ty(source).flags.intersects(TypeFlags::UNION) {
             return self.is_type_assignable_to(source, target);
         }
+        // Quick exit when source union contains the target type
+        if self.contains_type(self.ty(source).types(), target) {
+            return true;
+        }
+        // Otherwise, check if any constituent type of the source union is assignable to the target type
         for t in self.ty(source).types_list() {
             if self.is_type_assignable_to(t, target) {
                 return true;
@@ -1033,7 +1027,7 @@ impl Checker {
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
-                if !no_cache_check {
+                if !no_cache_check && f.borrow().reduce_labels.is_empty() {
                     if let Some(&reachable) = self.flow_node_reachable.get(&flow) {
                         return reachable;
                     }

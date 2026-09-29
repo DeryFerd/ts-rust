@@ -30,6 +30,7 @@ use crate::ls::lsconv;
 use crate::lsp::lsproto;
 use crate::lsp::lsproto::{HasTextDocumentPosition, HasTextDocumentURI};
 use crate::program::ls_program;
+use crate::spanmap::Feature;
 use std::cell::OnceCell;
 use std::collections::VecDeque;
 
@@ -134,16 +135,18 @@ go_enum!(EntryKind, i32 {
     SEARCHED_PROPERTY_FOUND_LOCAL = 5;
 });
 
-// Go: ls/findallreferences.go:104 ReferenceEntry
-// PORT: Go `*core.TextRange` and `*lsproto.Location` are `Option`s.
+// Go: ls/findallreferences.go:105 ReferenceEntry
+// PORT: Go `*core.TextRange` and `*lsproto.Location` are `Option`s. Go
+// `*ast.SourceFile` is the file root `Node` (nil is `Node::NIL`).
 #[derive(Clone, Debug, Default)]
 pub struct ReferenceEntry {
     pub kind: EntryKind,
     pub node: Node,
     pub context: Node, // !!! ContextWithStartAndEndNode, optional
-    pub file_name: String,
+    pub source_file: Node,
     pub text_range: Option<TextRange>,
     pub lsp_range: Option<lsproto::Location>,
+    pub unmappable: bool,
 }
 
 impl ReferenceEntry {
@@ -211,7 +214,7 @@ impl SymbolAndEntries {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:167 getRangeOfEntry
+    // Go: ls/findallreferences.go:169 getRangeOfEntry
     pub fn get_range_of_entry(&self, entry: &Rc<RefCell<ReferenceEntry>>) -> lsproto::Range {
         self.resolve_entry(entry)
             .borrow()
@@ -221,7 +224,17 @@ impl<P: ProgramView> LanguageService<P> {
             .range
     }
 
-    // Go: ls/findallreferences.go:171 getFileNameOfEntry
+    // Go: ls/findallreferences.go:173 getRangeOfEntryForFeature
+    pub fn get_range_of_entry_for_feature(
+        &self,
+        entry: &Rc<RefCell<ReferenceEntry>>,
+        feature: Feature,
+    ) -> (lsproto::Range, bool) {
+        let (location, ok) = self.get_location_of_entry_for_feature(entry, feature);
+        (location.range, ok)
+    }
+
+    // Go: ls/findallreferences.go:178 getFileNameOfEntry
     pub fn get_file_name_of_entry(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
@@ -235,47 +248,80 @@ impl<P: ProgramView> LanguageService<P> {
             .clone()
     }
 
-    // Go: ls/findallreferences.go:175 getLocationOfEntry
-    pub fn get_location_of_entry(&self, entry: &Rc<RefCell<ReferenceEntry>>) -> lsproto::Location {
-        self.resolve_entry(entry)
-            .borrow()
-            .lsp_range
-            .clone()
-            .expect(NIL_DEREF)
+    // Go: ls/findallreferences.go:182 getLocationOfEntry
+    pub fn get_location_of_entry(
+        &self,
+        entry: &Rc<RefCell<ReferenceEntry>>,
+    ) -> (lsproto::Location, bool) {
+        let resolved = self.resolve_entry(entry);
+        let resolved = resolved.borrow();
+        (
+            resolved.lsp_range.clone().expect(NIL_DEREF),
+            !resolved.unmappable,
+        )
     }
 
-    // Go: ls/findallreferences.go:179 resolveEntry
+    // Go: ls/findallreferences.go:187 getLocationOfEntryForFeature
+    pub fn get_location_of_entry_for_feature(
+        &self,
+        entry: &Rc<RefCell<ReferenceEntry>>,
+        feature: Feature,
+    ) -> (lsproto::Location, bool) {
+        self.resolve_entry_source(entry);
+        let (source_file, text_range) = {
+            let e = entry.borrow();
+            (e.source_file, e.text_range.expect(NIL_DEREF))
+        };
+        let (location, fidelity) =
+            self.source_file_range_to_lsp_location_for_feature(source_file, text_range, feature);
+        (location, fidelity.is_single_segment())
+    }
+
+    // Go: ls/findallreferences.go:193 resolveEntrySource
+    pub fn resolve_entry_source(&self, entry: &Rc<RefCell<ReferenceEntry>>) {
+        let mut e = entry.borrow_mut();
+        if e.source_file.is_nil() {
+            crate::go_assert!(
+                e.node.is_some(),
+                "reference entry must have a node or source file"
+            );
+            e.source_file = get_source_file_of_node(e.node);
+        }
+        if e.text_range.is_none() {
+            let text_range = get_range_of_node(e.node, e.source_file, Node::NIL /*endNode*/);
+            e.text_range = Some(text_range);
+        }
+    }
+
+    // Go: ls/findallreferences.go:204 resolveEntry
     // PORT: Go returns the same pointer; here a clone of the same handle.
     pub fn resolve_entry(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
     ) -> Rc<RefCell<ReferenceEntry>> {
+        self.resolve_entry_source(entry);
         {
             let mut e = entry.borrow_mut();
-            if e.text_range.is_none() {
-                let source_file = get_source_file_of_node(e.node);
-                let text_range = get_range_of_node(e.node, source_file, Node::NIL /*endNode*/);
-                e.text_range = Some(text_range);
-                e.file_name = source_file_file_name(source_file).to_string();
-            }
             if e.lsp_range.is_none() {
                 let text_range = e.text_range.expect(NIL_DEREF);
-                let location = self.get_mapped_location(&e.file_name, text_range);
+                let (location, fidelity) =
+                    self.source_file_range_to_lsp_location(e.source_file, text_range);
                 e.lsp_range = Some(location);
+                e.unmappable = !fidelity.is_single_segment();
             }
         }
         Rc::clone(entry)
     }
 }
 
-// Go: ls/findallreferences.go:193 newNodeEntryWithKind
+// Go: ls/findallreferences.go:214 newNodeEntryWithKind
 pub fn new_node_entry_with_kind(node: Node, kind: EntryKind) -> Rc<RefCell<ReferenceEntry>> {
     let e = new_node_entry(node);
     e.borrow_mut().kind = kind;
     e
 }
 
-// Go: ls/findallreferences.go:199 newNodeEntry
+// Go: ls/findallreferences.go:220 newNodeEntry
 pub fn new_node_entry(node: Node) -> Rc<RefCell<ReferenceEntry>> {
     // creates nodeEntry with `kind == entryKindNode`
     let name = node.name();
@@ -287,7 +333,7 @@ pub fn new_node_entry(node: Node) -> Rc<RefCell<ReferenceEntry>> {
     }))
 }
 
-// Go: ls/findallreferences.go:208 getContextNodeForNodeEntry
+// Go: ls/findallreferences.go:229 getContextNodeForNodeEntry
 pub fn get_context_node_for_node_entry(node: Node) -> Node {
     if is_declaration(node) {
         return get_context_node(node);
@@ -370,7 +416,7 @@ pub fn get_context_node_for_node_entry(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/findallreferences.go:271 getContextNode
+// Go: ls/findallreferences.go:292 getContextNode
 pub fn get_context_node(node: Node) -> Node {
     if node.is_nil() {
         return Node::NIL;
@@ -427,25 +473,7 @@ pub fn get_context_node(node: Node) -> Node {
     }
 }
 
-// utils
-impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:321 getLspRangeOfNode
-    // PORT: Go nil `sourceFile` and `endNode` are `Node::NIL`.
-    pub fn get_lsp_range_of_node(
-        &self,
-        node: Node,
-        mut source_file: Node,
-        end_node: Node,
-    ) -> lsproto::Range {
-        if source_file.is_nil() {
-            source_file = get_source_file_of_node(node);
-        }
-        let text_range = get_range_of_node(node, source_file, end_node);
-        self.create_lsp_range_from_bounds(text_range.pos(), text_range.end(), source_file)
-    }
-}
-
-// Go: ls/findallreferences.go:329 getRangeOfNode
+// Go: ls/findallreferences.go:341 getRangeOfNode
 pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> TextRange {
     if source_file.is_nil() {
         source_file = get_source_file_of_node(node);
@@ -730,6 +758,10 @@ impl LanguageService {
             if is_definition_visible(&emit_resolver, checker, d) {
                 let (file, start_pos) = get_file_and_start_pos_from_declaration(d);
                 let file_name = source_file_file_name(file).to_string();
+                let (lsp_position, fidelity) = self.converters.to_lsp_position(&file, start_pos);
+                if fidelity.is_none() {
+                    continue;
+                }
                 let source_file_name = file_name.clone();
                 let generated_file_name = file_name.clone();
                 let source_position: OnceCell<Option<Position>> = OnceCell::new();
@@ -737,9 +769,7 @@ impl LanguageService {
                 return Some(NonLocalDefinition {
                     position: Position {
                         uri: lsconv::file_name_to_document_uri(&file_name),
-                        pos: self
-                            .converters
-                            .position_to_line_and_character(&file, start_pos),
+                        pos: lsp_position,
                     },
                     get_source_position: Box::new(move || {
                         source_position
@@ -747,13 +777,15 @@ impl LanguageService {
                                 let mapped =
                                     self.try_get_source_position(&source_file_name, start_pos);
                                 if let Some(mapped) = mapped {
-                                    let uri = lsconv::file_name_to_document_uri(&mapped.file_name);
                                     let script = self.get_script(&mapped.file_name);
+                                    let (mapped_position, mapped_fidelity) =
+                                        self.converters.to_lsp_position(&script, mapped.pos);
+                                    if mapped_fidelity.is_none() {
+                                        return None;
+                                    }
                                     return Some(Position {
-                                        uri,
-                                        pos: self
-                                            .converters
-                                            .position_to_line_and_character(&script, mapped.pos),
+                                        uri: lsconv::file_name_to_document_uri(&mapped.file_name),
+                                        pos: mapped_position,
                                     });
                                 }
                                 None
@@ -766,13 +798,15 @@ impl LanguageService {
                                 let mapped = self
                                     .try_get_generated_position(&generated_file_name, start_pos);
                                 if let Some(mapped) = mapped {
-                                    let uri = lsconv::file_name_to_document_uri(&mapped.file_name);
                                     let script = self.get_script(&mapped.file_name);
+                                    let (mapped_position, mapped_fidelity) =
+                                        self.converters.to_lsp_position(&script, mapped.pos);
+                                    if mapped_fidelity.is_none() {
+                                        return None;
+                                    }
                                     return Some(Position {
-                                        uri,
-                                        pos: self
-                                            .converters
-                                            .position_to_line_and_character(&script, mapped.pos),
+                                        uri: lsconv::file_name_to_document_uri(&mapped.file_name),
+                                        pos: mapped_position,
                                     });
                                 }
                                 None
@@ -867,20 +901,21 @@ impl<P: ProgramView> LanguageService<P> {
                 // Map to ts position
                 let mapped = self.try_get_source_position(source_file_file_name(file), start_pos);
                 if let Some(mapped) = mapped {
-                    let uri = lsconv::file_name_to_document_uri(&mapped.file_name);
                     let script = self.get_script(&mapped.file_name);
-                    cb(
-                        uri,
-                        self.converters
-                            .position_to_line_and_character(&script, mapped.pos),
-                    );
+                    let (lsp_position, fidelity) =
+                        self.converters.to_lsp_position(&script, mapped.pos);
+                    if !fidelity.is_none() {
+                        cb(
+                            lsconv::file_name_to_document_uri(&mapped.file_name),
+                            lsp_position,
+                        );
+                    }
                 }
             } else if program.is_source_from_project_reference(&self.to_path(file_name)) {
-                cb(
-                    lsconv::file_name_to_document_uri(file_name),
-                    self.converters
-                        .position_to_line_and_character(&file, start_pos),
-                );
+                let (lsp_position, fidelity) = self.converters.to_lsp_position(&file, start_pos);
+                if !fidelity.is_none() {
+                    cb(lsconv::file_name_to_document_uri(file_name), lsp_position);
+                }
             }
         }
     }
@@ -904,7 +939,7 @@ pub struct SymbolAndEntriesData {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:628 provideSymbolsAndEntries
+    // Go: ls/findallreferences.go:652 provideSymbolsAndEntries
     // PORT: Go passes the URI by value; here by reference.
     pub fn provide_symbols_and_entries(
         &self,
@@ -916,10 +951,60 @@ impl<P: ProgramView> LanguageService<P> {
     ) -> (SymbolAndEntriesData, bool) {
         // `findReferencedSymbols` except only computes the information needed to return reference locations
         let (program, source_file) = self.get_program_and_file(uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&source_file, &document_position);
+        let mut feature = Feature::REFERENCES;
+        if implementations {
+            feature = Feature::IMPLEMENTATION;
+        } else if is_rename {
+            feature = Feature::RENAME;
+        }
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            document_position,
+            feature,
+        );
+        if positions.is_empty() {
+            return (SymbolAndEntriesData::default(), false);
+        }
+        let mut combined = SymbolAndEntriesData::default();
+        let mut ok = false;
+        for mapped in positions {
+            if !mapped.fidelity.is_single_segment() {
+                continue;
+            }
+            let (data, found) = self.provide_symbols_and_entries_at_position(
+                ctx,
+                program,
+                mapped.script,
+                mapped.position,
+                is_rename,
+                implementations,
+            );
+            if !found {
+                continue;
+            }
+            if !ok {
+                combined.original_node = data.original_node;
+                combined.position = data.position;
+                ok = true;
+            }
+            combined
+                .symbols_and_entries
+                .extend(data.symbols_and_entries);
+        }
+        (combined, ok)
+    }
 
+    // Go: ls/findallreferences.go:685 provideSymbolsAndEntriesAtPosition
+    pub fn provide_symbols_and_entries_at_position(
+        &self,
+        ctx: &Context,
+        program: &P,
+        source_file: Node,
+        position: i32,
+        is_rename: bool,
+        implementations: bool,
+    ) -> (SymbolAndEntriesData, bool) {
         let mut node = astnav::get_touching_property_name(source_file, position);
         if is_rename {
             // Adjust modifier/keyword nodes to the declaration name, matching Strada's findRenameLocations.
@@ -954,18 +1039,43 @@ impl<P: ProgramView> LanguageService<P> {
         let mut implementation_entries: Vec<Rc<RefCell<SymbolAndEntries>>> = Vec::new();
         let mut queue: VecDeque<Rc<RefCell<ReferenceEntry>>> = VecDeque::new();
         let mut seen_nodes: FxHashSet<Node> = FxHashSet::default();
+        let mut seen_definitions: FxHashSet<SymbolId> = FxHashSet::default();
         // Go: addToQueue
+        // PORT: the Go closure captures the locals; here they are parameters.
         let add_to_queue =
             |implementation_entries: &mut Vec<Rc<RefCell<SymbolAndEntries>>>,
              queue: &mut VecDeque<Rc<RefCell<ReferenceEntry>>>,
+             seen_nodes: &mut FxHashSet<Node>,
+             seen_definitions: &mut FxHashSet<SymbolId>,
              symbol_and_entries: Vec<Rc<RefCell<SymbolAndEntries>>>| {
-                implementation_entries.extend(symbol_and_entries.iter().cloned());
                 for s in &symbol_and_entries {
-                    queue.extend(s.borrow().references.iter().cloned());
+                    let s = s.borrow();
+                    let mut new_references: Vec<Rc<RefCell<ReferenceEntry>>> = Vec::new();
+                    for ref_ in &s.references {
+                        if seen_nodes.insert(ref_.borrow().node) {
+                            queue.push_back(ref_.clone());
+                            new_references.push(ref_.clone());
+                        }
+                    }
+                    if !new_references.is_empty()
+                        || s.definition.is_none()
+                        || seen_definitions.insert(s.definition.as_ref().unwrap().symbol)
+                    {
+                        implementation_entries.push(Rc::new(RefCell::new(SymbolAndEntries {
+                            definition: s.definition.clone(),
+                            references: new_references,
+                        })));
+                    }
                 }
             };
 
-        add_to_queue(&mut implementation_entries, &mut queue, entries);
+        add_to_queue(
+            &mut implementation_entries,
+            &mut queue,
+            &mut seen_nodes,
+            &mut seen_definitions,
+            entries,
+        );
         while let Some(entry) = queue.front().cloned() {
             if ctx.err().is_some() {
                 return (SymbolAndEntriesData::default(), false);
@@ -973,8 +1083,7 @@ impl<P: ProgramView> LanguageService<P> {
 
             queue.pop_front();
             let entry_node = entry.borrow().node;
-            if entry_node.is_some() && !seen_nodes.contains(&entry_node) {
-                seen_nodes.insert(entry_node);
+            if entry_node.is_some() {
                 let found = self.get_symbol_and_entries(
                     ctx,
                     entry_node.pos(),
@@ -983,7 +1092,13 @@ impl<P: ProgramView> LanguageService<P> {
                     is_rename,
                     implementations,
                 );
-                add_to_queue(&mut implementation_entries, &mut queue, found);
+                add_to_queue(
+                    &mut implementation_entries,
+                    &mut queue,
+                    &mut seen_nodes,
+                    &mut seen_definitions,
+                    found,
+                );
             }
         }
         (
@@ -1107,7 +1222,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:722 symbolAndEntriesToReferences
+    // Go: ls/findallreferences.go:783 symbolAndEntriesToReferences
     pub fn symbol_and_entries_to_references(
         &self,
         ctx: &Context,
@@ -1117,18 +1232,19 @@ impl<P: ProgramView> LanguageService<P> {
     ) -> Result<lsproto::ReferencesResponse, GoError> {
         // `findReferencedSymbols` except only computes the information needed to return reference locations
         let mut locations: Vec<lsproto::Location> = Vec::new();
-        for s in &data.symbols_and_entries {
-            locations.extend(
-                self.convert_symbol_and_entries_to_locations(
-                    ctx,
-                    s,
-                    params
-                        .context
-                        .as_ref()
-                        .expect(NIL_DEREF)
-                        .include_declaration,
-                ),
+        let mut seen_locations: FxHashSet<lsproto::Location> = FxHashSet::default();
+        for symbol in &data.symbols_and_entries {
+            let symbol_locations = self.convert_symbol_and_entries_to_locations(
+                ctx,
+                symbol,
+                params
+                    .context
+                    .as_ref()
+                    .expect(NIL_DEREF)
+                    .include_declaration,
+                Feature::REFERENCES,
             );
+            locations = combine_location_array(locations, &symbol_locations, &mut seen_locations);
         }
         Ok(lsproto::LocationsOrNull {
             locations: Some(locations),
@@ -1137,7 +1253,7 @@ impl<P: ProgramView> LanguageService<P> {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:730 symbolAndEntriesToVSReferences
+    // Go: ls/findallreferences.go:794 symbolAndEntriesToVSReferences
     pub fn symbol_and_entries_to_vs_references(
         &self,
         ctx: &Context,
@@ -1206,7 +1322,10 @@ impl LanguageService {
                     continue;
                 }
 
-                let ref_location = self.get_location_of_entry(ref_);
+                let (ref_location, ok) = self.get_location_of_entry(ref_);
+                if !ok {
+                    continue;
+                }
 
                 // Determine read/write kind
                 let mut kind = lsproto::VSReferenceKind::READ;
@@ -1246,7 +1365,7 @@ pub struct ReferencedSymbolDefinitionInfo {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:800 definitionToReferencedSymbolDefinitionInfo
+    // Go: ls/findallreferences.go:867 definitionToReferencedSymbolDefinitionInfo
     // definitionToReferencedSymbolDefinitionInfo converts a Definition to display info
     pub fn definition_to_referenced_symbol_definition_info(
         &self,
@@ -1284,11 +1403,15 @@ impl LanguageService {
                     original_node
                 };
 
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 Some(ReferencedSymbolDefinitionInfo {
                     node,
                     location: loc,
@@ -1301,11 +1424,15 @@ impl LanguageService {
                 if node.is_nil() {
                     return None;
                 }
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 Some(ReferencedSymbolDefinitionInfo {
                     node,
                     location: loc,
@@ -1328,11 +1455,15 @@ impl LanguageService {
                     return None;
                 }
                 let name = token_to_string(node.kind());
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 Some(ReferencedSymbolDefinitionInfo {
                     node,
                     location: loc,
@@ -1360,11 +1491,15 @@ impl LanguageService {
                 }
                 let element =
                     self.get_definition_kind_and_display_parts(ctx, symbol, node, vs_capability);
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 Some(ReferencedSymbolDefinitionInfo {
                     node,
                     location: loc,
@@ -1377,11 +1512,15 @@ impl LanguageService {
                 if node.is_nil() {
                     return None;
                 }
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 Some(ReferencedSymbolDefinitionInfo {
                     node,
                     location: loc,
@@ -1406,11 +1545,15 @@ impl LanguageService {
                     return None;
                 }
                 let node = triple_slash_file_ref.file;
-                let loc = self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
-                    kind: EntryKind::NODE,
-                    node,
-                    ..Default::default()
-                })));
+                let (loc, ok) =
+                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                        kind: EntryKind::NODE,
+                        node,
+                        ..Default::default()
+                    })));
+                if !ok {
+                    return None;
+                }
                 let reference_file_name = &triple_slash_file_ref
                     .reference
                     .as_ref()
@@ -1524,7 +1667,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:943 symbolAndEntriesToImplementations
+    // Go: ls/findallreferences.go:1028 symbolAndEntriesToImplementations
     pub fn symbol_and_entries_to_implementations(
         &self,
         ctx: &Context,
@@ -1553,13 +1696,18 @@ impl<P: ProgramView> LanguageService<P> {
                 .implementation
                 .link_support
         {
-            let links = self.convert_entries_to_location_links(&entries);
+            let links = self.convert_entries_to_location_links(&entries, Feature::IMPLEMENTATION);
             return Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
                 definition_links: Some(links),
                 ..Default::default()
             });
         }
-        let locations = self.convert_entries_to_locations(&entries);
+        let locations = self.convert_entries_to_locations(
+            ctx,
+            &entries,
+            SymbolId::NIL, /*definitionSymbol*/
+            Feature::IMPLEMENTATION,
+        );
         Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
             locations: Some(locations),
             ..Default::default()
@@ -1567,7 +1715,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 
     // == functions for conversions ==
-    // Go: ls/findallreferences.go:963 convertSymbolAndEntriesToLocations
+    // Go: ls/findallreferences.go:1048 convertSymbolAndEntriesToLocations
     // PORT: takes `ctx` to read the definition symbol through the request
     // checker (see the file header).
     pub fn convert_symbol_and_entries_to_locations(
@@ -1575,6 +1723,7 @@ impl<P: ProgramView> LanguageService<P> {
         ctx: &Context,
         s: &Rc<RefCell<SymbolAndEntries>>,
         include_declarations: bool,
+        feature: Feature,
     ) -> Vec<lsproto::Location> {
         let (definition, mut references) = {
             let s = s.borrow();
@@ -1590,11 +1739,15 @@ impl<P: ProgramView> LanguageService<P> {
             });
         }
 
-        self.convert_entries_to_locations(&references)
+        let mut definition_symbol = SymbolId::NIL;
+        if include_declarations && let Some(definition) = &definition {
+            definition_symbol = definition.symbol;
+        }
+        self.convert_entries_to_locations(ctx, &references, definition_symbol, feature)
     }
 }
 
-// Go: ls/findallreferences.go:976 isDeclarationOfSymbol
+// Go: ls/findallreferences.go:1065 isDeclarationOfSymbol
 // PORT: reading `target.Declarations` takes the symbol arena.
 pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: SymbolId) -> bool {
     if node.is_nil() || target.is_nil() {
@@ -1629,51 +1782,97 @@ pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: Symbo
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:1000 convertEntriesToLocations
+    // Go: ls/findallreferences.go:1089 convertEntriesToLocations
+    // PORT: Go `definitionSymbol *ast.Symbol`; nil is `SymbolId::NIL`.
+    // `isDeclarationOfSymbol` reads the symbol through the request checker
+    // (see the file header), so this takes `ctx`. Go's check returns false
+    // for a nil symbol, so the checker is taken only for a set symbol.
     pub fn convert_entries_to_locations(
         &self,
+        ctx: &Context,
         entries: &[Rc<RefCell<ReferenceEntry>>],
+        definition_symbol: SymbolId,
+        feature: Feature,
     ) -> Vec<lsproto::Location> {
+        // A synthesized declaration has no source span, but it still represents the symbol's definition in
+        // that file. Mirror go-to-definition's file-level fallback while continuing to omit synthesized uses.
+        let mut concrete_files: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
+        for entry in entries {
+            let (location, ok) = self.get_location_of_entry_for_feature(entry, feature);
+            if ok {
+                concrete_files.insert(location.uri);
+            }
+        }
+
         let mut locations = Vec::with_capacity(entries.len());
         for entry in entries {
-            locations.push(self.get_location_of_entry(entry));
+            let (mut location, ok) = self.get_location_of_entry_for_feature(entry, feature);
+            if ok {
+                locations.push(location);
+            } else if definition_symbol.is_some()
+                && {
+                    let entry_node = entry.borrow().node;
+                    let (checker, _done) = self.get_program().get_type_checker(ctx);
+                    let is_declaration = is_declaration_of_symbol(
+                        &checker.borrow().symbols,
+                        entry_node,
+                        definition_symbol,
+                    );
+                    is_declaration
+                }
+                && !concrete_files.contains(&location.uri)
+            {
+                location.range = lsproto::Range::default();
+                concrete_files.insert(location.uri.clone());
+                locations.push(location);
+            }
         }
         locations
     }
 
-    // Go: ls/findallreferences.go:1008 convertEntriesToLocationLinks
+    // Go: ls/findallreferences.go:1113 convertEntriesToLocationLinks
     pub fn convert_entries_to_location_links(
         &self,
         entries: &[Rc<RefCell<ReferenceEntry>>],
+        feature: Feature,
     ) -> Vec<lsproto::LocationLink> {
         let mut links = Vec::with_capacity(entries.len());
         for entry in entries {
             // Get the selection range (the actual reference)
-            let loc = self.get_location_of_entry(entry);
+            let (loc, ok) = self.get_location_of_entry_for_feature(entry, feature);
+            if !ok {
+                continue;
+            }
             let target_selection_range = loc.range;
             let mut target_range = target_selection_range;
 
-            let (entry_node, entry_text_range, entry_file_name, entry_context) = {
+            let (entry_node, entry_text_range, entry_source_file, entry_context) = {
                 let e = entry.borrow();
-                (e.node, e.text_range, e.file_name.clone(), e.context)
+                (e.node, e.text_range, e.source_file, e.context)
             };
 
             // For entries with nodes, compute ranges directly from the node
             if entry_node.is_some() {
                 // Get the context range (broader scope including declaration context)
-                // PORT: Go `*ast.SourceFile` is the file root `Node`.
-                let context_file = self.program.source_file_root(&entry_file_name);
                 let context_text_range =
-                    to_context_range(entry_text_range, context_file, entry_context);
+                    to_context_range(entry_text_range, entry_source_file, entry_context);
                 if let Some(context_text_range) = context_text_range {
-                    let context_location =
-                        self.get_mapped_location(&entry_file_name, context_text_range);
-                    target_range = context_location.range;
+                    let (context_location, fidelity) = self
+                        .source_file_range_to_lsp_location_for_feature(
+                            entry_source_file,
+                            context_text_range,
+                            feature,
+                        );
+                    if !fidelity.is_none() && context_location.uri == loc.uri {
+                        target_range = context_location.range;
+                    }
                 }
             }
 
             links.push(lsproto::LocationLink {
-                target_uri: lsconv::file_name_to_document_uri(&entry_file_name),
+                target_uri: lsconv::file_name_to_document_uri(source_file_original_file_name(
+                    entry_source_file,
+                )),
                 target_range,
                 target_selection_range,
                 ..Default::default()
@@ -1682,7 +1881,7 @@ impl<P: ProgramView> LanguageService<P> {
         links
     }
 
-    // Go: ls/findallreferences.go:1036 mergeReferences
+    // Go: ls/findallreferences.go:1146 mergeReferences
     // PORT: Go variadic `referencesToMerge ...[]*SymbolAndEntries` is a
     // `Vec` of lists (a nil list is empty). Go returns a non-nil slice.
     pub fn merge_references(
@@ -1693,15 +1892,8 @@ impl<P: ProgramView> LanguageService<P> {
         let mut result: Vec<Rc<RefCell<SymbolAndEntries>>> = Vec::new();
         let get_source_file_index_of_entry =
             |program: &P, entry: &Rc<RefCell<ReferenceEntry>>| -> i32 {
-                let source_file = {
-                    let entry = entry.borrow();
-                    if entry.kind == EntryKind::RANGE {
-                        // PORT: Go `*ast.SourceFile` is the file root `Node`.
-                        program.source_file_root(&entry.file_name)
-                    } else {
-                        get_source_file_of_node(entry.node)
-                    }
-                };
+                self.resolve_entry_source(entry);
+                let source_file = entry.borrow().source_file;
                 program.source_file_index(source_file)
             };
 
@@ -1740,7 +1932,7 @@ impl<P: ProgramView> LanguageService<P> {
                 let reference = Rc::clone(&result[ref_index]);
                 let mut sorted_refs = reference.borrow().references.clone();
                 sorted_refs.extend(entry.borrow().references.iter().cloned());
-                // Go: ls/findallreferences.go:1074 slices.SortStableFunc(sortedRefs, ...)
+                // Go: ls/findallreferences.go:1179 slices.SortStableFunc(sortedRefs, ...)
                 crate::gostd::slices::sort_stable_func(&mut sorted_refs, |entry1, entry2| {
                     let entry1_file = get_source_file_index_of_entry(program, entry1);
                     let entry2_file = get_source_file_index_of_entry(program, entry2);

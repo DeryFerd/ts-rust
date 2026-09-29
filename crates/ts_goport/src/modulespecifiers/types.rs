@@ -94,6 +94,8 @@ pub trait ModuleSpecifierGenerationHost {
     fn get_symlink_cache(&self) -> Option<Rc<KnownSymlinks>>;
     // GetFileIncludeReasons() any // !!! TODO: adapt new resolution cache model
     fn common_source_directory(&self) -> String;
+    // tsgo#4712
+    fn content_mapper_extensions(&self) -> Vec<String>;
     fn get_global_typings_cache_location(&self) -> String;
     fn use_case_sensitive_file_names(&self) -> bool;
     fn get_current_directory(&self) -> String;

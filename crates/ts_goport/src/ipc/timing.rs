@@ -1,4 +1,4 @@
-//! Port of internal/api/timing.go.
+//! Port of internal/ipc/timing.go (internal/api/timing.go before tsgo#4712).
 //!
 //! PORT: Go guards `timingCollector` with a mutex so the async connection
 //! can record from several request goroutines. The connections here run on
@@ -8,12 +8,18 @@ use crate::frontend::json::{JsonError, MarshalerTo};
 use crate::frontend::json_ext::{marshal_field, write_object_end, write_object_start};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// Go: api/timing.go:10 serverRecentRequestCapacity
+// Go: ipc/timing.go:10
+// Method names for the generic connection-level timing feature, handled by the connection itself rather
+// than the handler when timing collection is enabled.
+pub const METHOD_GET_SERVER_TIMING: &str = "getServerTiming";
+pub const METHOD_RESET_SERVER_TIMING: &str = "resetServerTiming";
+
+// Go: ipc/timing.go:17 serverRecentRequestCapacity
 // serverRecentRequestCapacity is the number of most-recent requests retained in
 // the server-side timing ring buffer.
 pub const SERVER_RECENT_REQUEST_CAPACITY: usize = 5;
 
-// Go: api/timing.go:13 serverRequestTiming
+// Go: ipc/timing.go:20 serverRequestTiming
 // serverRequestTiming is a single server-side request's processing-time sample.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServerRequestTiming {
@@ -53,7 +59,7 @@ impl MarshalerTo for ServerRequestTiming {
     }
 }
 
-// Go: api/timing.go:24 serverTimingTotals
+// Go: ipc/timing.go:31 serverTimingTotals
 // serverTimingTotals holds running totals accumulated across every handled request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServerTimingTotals {
@@ -79,7 +85,7 @@ impl MarshalerTo for ServerTimingTotals {
     }
 }
 
-// Go: api/timing.go:33 serverTimingInfo
+// Go: ipc/timing.go:40 serverTimingInfo
 // serverTimingInfo is a point-in-time snapshot of collected server timing,
 // returned to clients in response to a getServerTiming request.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -105,7 +111,7 @@ impl MarshalerTo for ServerTimingInfo {
     }
 }
 
-// Go: api/timing.go:47 timingCollector
+// Go: ipc/timing.go:54 timingCollector
 // timingCollector accumulates per-request server processing times into running
 // totals and a fixed-size ring buffer of the most recent requests.
 #[derive(Clone, Debug, Default)]
@@ -117,13 +123,13 @@ pub struct TimingCollector {
     head: usize,
 }
 
-// Go: api/timing.go:56 newTimingCollector
+// Go: ipc/timing.go:63 newTimingCollector
 pub fn new_timing_collector() -> TimingCollector {
     TimingCollector::default()
 }
 
 impl TimingCollector {
-    // Go: api/timing.go:61 record
+    // Go: ipc/timing.go:68 record
     // record adds a single request's processing time to the totals and ring buffer.
     pub fn record(&mut self, method: &str, d: Duration) {
         let processing_ms = duration_to_millis(d);
@@ -144,7 +150,7 @@ impl TimingCollector {
         }
     }
 
-    // Go: api/timing.go:85 snapshot
+    // Go: ipc/timing.go:92 snapshot
     // snapshot returns a copy of the currently collected timing information, with
     // recent requests ordered from oldest to newest.
     pub fn snapshot(&self) -> ServerTimingInfo {
@@ -159,7 +165,7 @@ impl TimingCollector {
         }
     }
 
-    // Go: api/timing.go:101 reset
+    // Go: ipc/timing.go:108 reset
     // reset clears all accumulated totals and recent-request history.
     pub fn reset(&mut self) {
         self.totals = ServerTimingTotals::default();
@@ -168,7 +174,7 @@ impl TimingCollector {
     }
 }
 
-// Go: api/timing.go:112 serverTimingSnapshot
+// Go: ipc/timing.go:119 serverTimingSnapshot
 // serverTimingSnapshot returns the collector's snapshot, or a disabled snapshot
 // when timing collection is not enabled (collector is nil).
 pub fn server_timing_snapshot(c: Option<&TimingCollector>) -> ServerTimingInfo {
@@ -178,7 +184,7 @@ pub fn server_timing_snapshot(c: Option<&TimingCollector>) -> ServerTimingInfo {
     c.snapshot()
 }
 
-// Go: api/timing.go:121 disabledServerTimingInfo
+// Go: ipc/timing.go:128 disabledServerTimingInfo
 // disabledServerTimingInfo is the snapshot returned when timing collection is
 // not enabled.
 pub fn disabled_server_timing_info() -> ServerTimingInfo {
@@ -189,7 +195,7 @@ pub fn disabled_server_timing_info() -> ServerTimingInfo {
     }
 }
 
-// Go: api/timing.go:131 durationToMillis
+// Go: ipc/timing.go:138 durationToMillis
 // durationToMillis converts a duration to fractional milliseconds, clamped to be
 // non-negative. It preserves sub-microsecond precision by converting from the
 // full nanosecond duration.

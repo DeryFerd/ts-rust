@@ -5,9 +5,10 @@ use crate::ls::prelude::*;
 use crate::astnav;
 use crate::gostd::{Context, GoError};
 use crate::lsp::lsproto;
+use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/autoinsert.go:12 ProvideOnAutoInsert
+    // Go: ls/autoinsert.go:14 ProvideOnAutoInsert
     pub fn provide_on_auto_insert(
         &self,
         _ctx: &Context,
@@ -21,9 +22,17 @@ impl LanguageService {
         }
 
         let (_, source_file) = self.get_program_and_file(&params.vs_text_document.uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&source_file, &params.vs_position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            params.vs_position,
+            Feature::AUTO_INSERT,
+        );
+        if positions.len() != 1 || !positions[0].fidelity.is_exact() {
+            return Ok(lsproto::VSOnAutoInsertResponse::default());
+        }
+        let source_file = positions[0].script;
+        let position = positions[0].position;
 
         let token = astnav::find_preceding_token(source_file, position);
         if token.is_nil() {

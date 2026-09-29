@@ -2,13 +2,15 @@
 
 use crate::api::prelude::*;
 
-use crate::api::conn::Conn;
 use crate::frontend::json::{
-    JsonDecoder, JsonError, UnmarshalerFrom, json_unmarshal, json_unmarshal_decode,
+    JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, json_unmarshal, json_unmarshal_decode,
 };
-use crate::frontend::json_ext::unmarshal_struct_fields;
+use crate::frontend::json_ext::{
+    AnyValue, marshal_field, unmarshal_struct_fields, write_object_end, write_object_start,
+};
 use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
 use crate::gostd::{Context, GoError, errors};
+use crate::ipc::Conn;
 use std::time::SystemTime;
 
 // Go: callbackfs.go:19 callbackFS
@@ -37,6 +39,8 @@ const CALLBACK_FILE_EXISTS: &str = "fileExists";
 const CALLBACK_DIRECTORY_EXISTS: &str = "directoryExists";
 const CALLBACK_GET_ACCESSIBLE_ENTRIES: &str = "getAccessibleEntries";
 const CALLBACK_REALPATH: &str = "realpath";
+// tsgo#4699
+const CALLBACK_WRITE_FILE: &str = "writeFile";
 
 // Go: callbackfs.go:37 isCallbackName
 fn is_callback_name(name: &str) -> bool {
@@ -47,6 +51,7 @@ fn is_callback_name(name: &str) -> bool {
             | CALLBACK_DIRECTORY_EXISTS
             | CALLBACK_GET_ACCESSIBLE_ENTRIES
             | CALLBACK_REALPATH
+            | CALLBACK_WRITE_FILE
     )
 }
 
@@ -122,6 +127,25 @@ impl UnmarshalerFrom for RawEntries {
     }
 }
 
+// Go: the anonymous `struct { Path string; Data string }` in WriteFile
+// (tsgo#4699).
+#[derive(Debug)]
+struct WriteFilePayload {
+    path: String,
+    data: String,
+}
+
+impl MarshalerTo for WriteFilePayload {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "path", &self.path)?;
+        marshal_field(enc, &mut first, "data", &self.data)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
 impl CallbackFS {
     // Go: callbackfs.go:70 SetConnection
     // SetConnection sets the RPC connection for callbacks.
@@ -140,7 +164,8 @@ impl CallbackFS {
 
     // Go: callbackfs.go:81 call
     // call invokes a callback on the client and returns the result.
-    fn call(&self, name: &str, arg: &str) -> Result<Vec<u8>, GoError> {
+    // PORT: Go `arg any` is any value that marshals (`AnyValue`).
+    fn call(&self, name: &str, arg: impl AnyValue) -> Result<Vec<u8>, GoError> {
         let conn = self.conn.borrow().clone();
         let Some(conn) = conn else {
             return Err(errors::new(format!(
@@ -155,7 +180,7 @@ impl CallbackFS {
             .borrow()
             .clone()
             .expect("CallbackFS: ctx is set with conn");
-        let result = conn.call(&ctx, name, Some(Box::new(arg.to_string())))?;
+        let result = conn.call(&ctx, name, Some(Box::new(arg)))?;
         Ok(result.0)
     }
 }
@@ -181,7 +206,7 @@ impl Fs for CallbackFS {
     //   - string content: {"content": "..."}
     fn read_file(&self, path: &str) -> (String, bool) {
         if self.is_enabled(CALLBACK_READ_FILE) {
-            let result = match self.call(CALLBACK_READ_FILE, path) {
+            let result = match self.call(CALLBACK_READ_FILE, path.to_string()) {
                 Ok(result) => result,
                 Err(err) => panic_error(&err),
             };
@@ -203,7 +228,7 @@ impl Fs for CallbackFS {
     // FileExists implements vfs.FS.
     fn file_exists(&self, path: &str) -> bool {
         if self.is_enabled(CALLBACK_FILE_EXISTS) {
-            let result = match self.call(CALLBACK_FILE_EXISTS, path) {
+            let result = match self.call(CALLBACK_FILE_EXISTS, path.to_string()) {
                 Ok(result) => result,
                 Err(err) => panic_error(&err),
             };
@@ -218,7 +243,7 @@ impl Fs for CallbackFS {
     // DirectoryExists implements vfs.FS.
     fn directory_exists(&self, path: &str) -> bool {
         if self.is_enabled(CALLBACK_DIRECTORY_EXISTS) {
-            let result = match self.call(CALLBACK_DIRECTORY_EXISTS, path) {
+            let result = match self.call(CALLBACK_DIRECTORY_EXISTS, path.to_string()) {
                 Ok(result) => result,
                 Err(err) => panic_error(&err),
             };
@@ -233,7 +258,7 @@ impl Fs for CallbackFS {
     // GetAccessibleEntries implements vfs.FS.
     fn get_accessible_entries(&self, path: &str) -> Entries {
         if self.is_enabled(CALLBACK_GET_ACCESSIBLE_ENTRIES) {
-            let result = match self.call(CALLBACK_GET_ACCESSIBLE_ENTRIES, path) {
+            let result = match self.call(CALLBACK_GET_ACCESSIBLE_ENTRIES, path.to_string()) {
                 Ok(result) => result,
                 Err(err) => panic_error(&err),
             };
@@ -258,7 +283,7 @@ impl Fs for CallbackFS {
     // Realpath implements vfs.FS.
     fn realpath(&self, path: &str) -> String {
         if self.is_enabled(CALLBACK_REALPATH) {
-            let result = match self.call(CALLBACK_REALPATH, path) {
+            let result = match self.call(CALLBACK_REALPATH, path.to_string()) {
                 Ok(result) => result,
                 Err(err) => panic_error(&err),
             };
@@ -273,9 +298,24 @@ impl Fs for CallbackFS {
         self.base.realpath(path)
     }
 
-    // Go: callbackfs.go:199 WriteFile
-    // WriteFile implements vfs.FS - always delegates to base (no callback support).
+    // Go: callbackfs.go:202 WriteFile
+    // WriteFile implements vfs.FS.
+    // PORT: Go returns the callback error; it is `FsError::Other` with its
+    // text.
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        // tsgo#4699
+        if self.is_enabled(CALLBACK_WRITE_FILE) {
+            let payload = WriteFilePayload {
+                path: path.to_string(),
+                data: data.to_string(),
+            };
+
+            if let Err(err) = self.call(CALLBACK_WRITE_FILE, payload) {
+                return Err(FsError::Other(err.error()));
+            }
+            return Ok(());
+        }
+
         self.base.write_file(path, data)
     }
 

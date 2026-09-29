@@ -36,6 +36,7 @@ const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer de
 pub struct View {
     pub registry: Rc<Registry>,
     pub importing_file: Node,
+    pub importing_file_path: tspath::Path,
     pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
     pub project_key: tspath::Path,
@@ -64,6 +65,15 @@ pub fn new_view(
     program: Rc<compiler::NewProgram>,
     preferences: modulespecifiers::UserPreferences,
 ) -> View {
+    let mut importing_file_path = tspath::Path(source_file_info(importing_file).path.clone());
+    // PORT: Go `importingFile.CanonicalSourceFile()` is read from the program's
+    // `ParsedSourceFile` for the file root `Node` (see `ls/utilities.rs`).
+    if let Some(canonical) = program
+        .get_source_file_by_path(&importing_file_path)
+        .and_then(|file| file.canonical_source_file())
+    {
+        importing_file_path = canonical.path().clone();
+    }
     let conditions = module::get_conditions(
         program.options(),
         program.get_default_resolution_mode_for_file(&source_file_has_file_name(importing_file)),
@@ -75,6 +85,7 @@ pub fn new_view(
     View {
         registry,
         importing_file,
+        importing_file_path,
         program,
         project_key,
         preferences,

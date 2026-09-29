@@ -615,7 +615,7 @@ impl Checker {
         }
         // at this point the only legal case for parent is ClassLikeDeclaration
         let class_like_declaration = container.parent();
-        if get_extends_heritage_clause_element(class_like_declaration).is_nil() {
+        if get_class_extends_heritage_element(class_like_declaration).is_nil() {
             self.error(
                 node,
                 diag::X_super_can_only_be_referenced_in_a_derived_class,
@@ -1218,6 +1218,7 @@ impl Checker {
         self.check_grammar_import_call_expression(node);
         let args = node.arguments().to_vec();
         if args.is_empty() {
+            // No call arguments exist, so there are no child expressions to check.
             return self.create_promise_return_type(node, self.any_type);
         }
         let specifier = args[0];
@@ -1361,15 +1362,24 @@ impl Checker {
                     args![],
                 );
             } else if self.get_effects_signature(node).is_nil() {
-                let diagnostic = self.error(
+                // PORT: Go adds the diagnostic (`c.error`), then `getTypeOfDottedName`
+                // adds related info to the stored one (#4825: it can be an equal one
+                // added before). The stored `&mut Diagnostic` cannot be kept across
+                // that walk, so the walk runs first and collects the related info,
+                // and it goes on the stored diagnostic after the add. The add still
+                // compares the diagnostic without this info, as in Go.
+                let mut related_info = Vec::new();
+                self.get_type_of_dotted_name(node.expression(), Some(&mut related_info));
+                let diagnostic = new_diagnostic_for_node(
                     node.expression(),
                     diag::Assertions_require_every_name_in_the_call_target_to_be_declared_with_an_explicit_type_annotation,
                     args![],
                 );
-                // PORT: Go passes the `*ast.Diagnostic` pointer so the callee can attach
-                // related information to the diagnostic already added. The Rust
-                // `error` returns an owned `Diagnostic`; the callee receives it by value.
-                self.get_type_of_dotted_name(node.expression(), Some(diagnostic));
+                if let Some(diagnostic) = self.add_diagnostic(diagnostic) {
+                    for related in related_info {
+                        diagnostic.add_related_info(Some(related));
+                    }
+                }
             }
         }
         return_type

@@ -87,7 +87,7 @@ fn get_import_code_actions(
 
     let mut actions: Vec<CodeAction> = Vec::new();
     for fix_info in &info {
-        let (edits, description) = fix_info.fix.edits(
+        let (edits, description, ok) = fix_info.fix.edits(
             ctx,
             fix_context.source_file,
             fix_context.program.options(),
@@ -96,16 +96,18 @@ fn get_import_code_actions(
             &fix_context.ls.user_preferences(),
         );
 
-        actions.push(CodeAction {
-            description,
-            changes: edits,
-            fix_id: IMPORT_FIX_ID.to_string(),
-            fix_all_description: crate::diagnostics_loc::message_localize(
-                diag::Add_all_missing_imports,
-                &locale::from_context(ctx),
-                &args![],
-            ),
-        });
+        if ok {
+            actions.push(CodeAction {
+                description,
+                changes: edits,
+                fix_id: IMPORT_FIX_ID.to_string(),
+                fix_all_description: crate::diagnostics_loc::message_localize(
+                    diag::Add_all_missing_imports,
+                    &locale::from_context(ctx),
+                    &args![],
+                ),
+            });
+        }
     }
     Ok(actions)
 }
@@ -124,7 +126,7 @@ fn get_all_import_code_actions(
 
     let mut import_diags: Vec<Diagnostic> = Vec::new();
     for diag in all_diagnostics {
-        if contains_error_code(&IMPORT_FIX_ERROR_CODES, diag.code()) {
+        if is_fixable_diagnostic(&diag, &IMPORT_FIX_ERROR_CODES) {
             import_diags.push(diag);
         }
     }
@@ -403,10 +405,13 @@ fn get_fixes_info_for_non_umd_import(
     let mut all_info: Vec<FixInfo> = Vec::new();
 
     // Compute usage position for JSDoc import type fixes
-    let usage_position = fix_context.ls.converters.position_to_line_and_character(
+    let (usage_position, fidelity) = fix_context.ls.converters.to_lsp_position(
         &fix_context.source_file,
         get_token_pos_of_node(symbol_token, fix_context.source_file, false),
     );
+    if !fidelity.is_exact() {
+        return Vec::new();
+    }
 
     for sn in &symbol_names {
         // Type-only imports are handled by the promotion code path, not the auto-import path.

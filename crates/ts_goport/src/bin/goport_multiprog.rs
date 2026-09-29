@@ -32,9 +32,8 @@
 use std::panic::catch_unwind;
 use std::path::Path;
 
-use ts_goport::emitter::program_emit::{EmitOptions, EmitResult};
 use ts_goport::execute::tsc::{
-    CompileTimes, CompilerProgram, EmitInput, ProgramLike, Writer, create_diagnostic_reporter,
+    CompileTimes, CompilerProgram, EmitInput, Writer, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, new_os_system,
 };
 use ts_goport::frontend::tspath::{normalize_path, resolve_path};
@@ -266,7 +265,10 @@ fn report(p: &'static GoProgram) -> (Vec<u8>, i32) {
     let options = options();
     let (result, _statistics) = emit_and_report_statistics(&EmitInput {
         sys: &sys,
-        program_like: &GoportProgram,
+        // #4407: under `noEmit`, Go's incremental `Program.Emit` gives the
+        // result of the plain one (goport writes no build info), so the
+        // report equals a fresh `goport` run.
+        program_like: &CompilerProgram,
         config: None,
         report_diagnostic: create_diagnostic_reporter(
             &sys,
@@ -292,38 +294,6 @@ fn report(p: &'static GoProgram) -> (Vec<u8>, i32) {
         p.id
     );
     (buffer.take(), result.status.code())
-}
-
-/// `CompilerProgram` with the `goport` emit rule: under `noEmit` an
-/// incremental program skips the emit (Go `incremental.Program.Emit`), so
-/// a report equals a fresh `goport` run.
-struct GoportProgram;
-
-impl ProgramLike for GoportProgram {
-    fn options(&self) -> &'static CompilerOptions {
-        CompilerProgram.options()
-    }
-    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_bind_diagnostics(file)
-    }
-    fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
-        CompilerProgram.get_global_diagnostics()
-    }
-    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_semantic_diagnostics(file)
-    }
-    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_declaration_diagnostics(file)
-    }
-    fn emit(&self, emit_options: EmitOptions) -> EmitResult {
-        if options().is_incremental() {
-            return EmitResult {
-                emit_skipped: true,
-                ..EmitResult::default()
-            };
-        }
-        CompilerProgram.emit(emit_options)
-    }
 }
 
 /// The id of the file of `p` named `file_name`.

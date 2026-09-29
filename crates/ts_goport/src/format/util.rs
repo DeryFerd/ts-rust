@@ -81,91 +81,6 @@ pub fn get_line_start_position_for_position(position: i32, source_file: Node) ->
 }
 
 /**
- * Tests whether `child` is a grammar error on `parent`.
- * In strada, this also checked node arrays, but it is never actually called with one in practice.
- */
-// Go: format/util.go:88 isGrammarError
-pub fn is_grammar_error(parent: Node, child: Node) -> bool {
-    if is_type_parameter_declaration(parent) {
-        // PORT: Go `parent.AsTypeParameterDeclaration().Expression`; the
-        // `Node::expression` accessor reads that field for this kind.
-        return child == parent.expression();
-    }
-    if is_property_signature_declaration(parent) {
-        return child == parent.initializer();
-    }
-    if is_property_declaration(parent) {
-        return is_auto_accessor_property_declaration(parent)
-            && child == parent.postfix_token()
-            && child.kind() == SyntaxKind::QuestionToken;
-    }
-    if is_property_assignment(parent) {
-        let mods = parent.modifiers();
-        return child == parent.postfix_token()
-            || (mods.is_some()
-                && is_grammar_error_element(mods.node_list(), child, is_modifier_like));
-    }
-    if is_shorthand_property_assignment(parent) {
-        let mods = parent.modifiers();
-        return child == parent.equals_token()
-            || child == parent.postfix_token()
-            || (mods.is_some()
-                && is_grammar_error_element(mods.node_list(), child, is_modifier_like));
-    }
-    if is_method_declaration(parent) {
-        return child == parent.postfix_token() && child.kind() == SyntaxKind::ExclamationToken;
-    }
-    if is_constructor_declaration(parent) {
-        // PORT: Go `parent.AsConstructorDeclaration().Type`; `Node::type_`
-        // reads that field for this kind.
-        return child == parent.type_()
-            || is_grammar_error_element(
-                parent.type_parameter_list(),
-                child,
-                is_type_parameter_declaration,
-            );
-    }
-    if is_get_accessor_declaration(parent) {
-        return is_grammar_error_element(
-            parent.type_parameter_list(),
-            child,
-            is_type_parameter_declaration,
-        );
-    }
-    if is_set_accessor_declaration(parent) {
-        // PORT: Go `parent.AsSetAccessorDeclaration().Type`; `Node::type_`
-        // reads that field for this kind.
-        return child == parent.type_()
-            || is_grammar_error_element(
-                parent.type_parameter_list(),
-                child,
-                is_type_parameter_declaration,
-            );
-    }
-    if is_namespace_export_declaration(parent) {
-        let mods = parent.modifiers();
-        return mods.is_some()
-            && is_grammar_error_element(mods.node_list(), child, is_modifier_like);
-    }
-    false
-}
-
-// Go: format/util.go:127 isGrammarErrorElement
-pub fn is_grammar_error_element(
-    list: NodeList,
-    child: Node,
-    is_possible_element: fn(Node) -> bool,
-) -> bool {
-    if list.is_nil() || list.nodes().is_empty() {
-        return false;
-    }
-    if !is_possible_element(child) {
-        return false;
-    }
-    list.nodes().iter().any(|n| n == child)
-}
-
-/**
  * Validating `expectedTokenKind` ensures the token was typed in the context we expect (eg: not a comment).
  * @param expectedTokenKind The kind of the last token constituting the desired parent node.
  */
@@ -237,5 +152,21 @@ pub fn is_list_element(parent: Node, node: Node) -> bool {
         _ => {}
     }
 
+    false
+}
+
+// Go: format/util.go:137 isMemberListElement
+pub fn is_member_list_element(parent: Node, node: Node) -> bool {
+    match parent.kind() {
+        SyntaxKind::ClassDeclaration
+        | SyntaxKind::ClassExpression
+        | SyntaxKind::InterfaceDeclaration
+        | SyntaxKind::EnumDeclaration
+        | SyntaxKind::TypeLiteral
+        | SyntaxKind::MappedType => {
+            return node.loc().contained_by(parent.member_list().loc());
+        }
+        _ => {}
+    }
     false
 }

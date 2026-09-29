@@ -84,12 +84,14 @@ impl<'a> MissingMemberFixer<'a> {
         source_file: Node,
         body: Node,
         preserve_optional: PreserveOptionalFlags,
+        abstract_: bool,
     ) -> Vec<Node> {
         let declarations: Vec<Node> = self.type_checker.sym(symbol).declarations.to_vec();
         let declaration = declarations.first().copied().unwrap_or(Node::NIL);
 
         let quote_preference = lsutil::get_quote_preference(source_file, &self.preferences);
         let ambient = enclosing_declaration.flags().intersects(NodeFlags::AMBIENT);
+        let signature_only = ambient || abstract_;
         let optional = self
             .type_checker
             .sym(symbol)
@@ -163,7 +165,8 @@ impl<'a> MissingMemberFixer<'a> {
                         );
                         let type_node =
                             self.create_type_node(t, enclosing_declaration, flags, &node_builder);
-                        let accessor_body = self.create_body(body, ambient, quote_preference);
+                        let accessor_body =
+                            self.create_body(body, quote_preference, signature_only);
                         nodes.push(
                             self.change_tracker
                                 .node_factory()
@@ -205,7 +208,8 @@ impl<'a> MissingMemberFixer<'a> {
                             1,
                             is_in_js_file(enclosing_declaration),
                         );
-                        let accessor_body = self.create_body(body, ambient, quote_preference);
+                        let accessor_body =
+                            self.create_body(body, quote_preference, signature_only);
                         nodes.push(
                             self.change_tracker
                                 .node_factory()
@@ -233,7 +237,7 @@ impl<'a> MissingMemberFixer<'a> {
                 }
 
                 if declarations.len() == 1 {
-                    let method_body = self.create_body(body, ambient, quote_preference);
+                    let method_body = self.create_body(body, quote_preference, signature_only);
                     let method = self.create_signature_declaration_from_signature(
                         signatures.first().copied().unwrap_or(SignatureId::NIL),
                         SyntaxKind::MethodDeclaration,
@@ -263,7 +267,7 @@ impl<'a> MissingMemberFixer<'a> {
                         SyntaxKind::MethodDeclaration,
                         source_file,
                         enclosing_declaration,
-                        Node::NIL,
+                        Node::NIL, /*body*/
                         modifiers,
                         declaration_name,
                         preserve_optional,
@@ -273,7 +277,7 @@ impl<'a> MissingMemberFixer<'a> {
                     }
                 }
 
-                if ambient {
+                if signature_only {
                     return nodes;
                 }
 
@@ -281,7 +285,8 @@ impl<'a> MissingMemberFixer<'a> {
                     let signature = self.type_checker.get_signature_from_declaration_exported(
                         declarations.last().copied().unwrap_or(Node::NIL),
                     );
-                    let method_body = self.create_body(body, ambient, quote_preference);
+                    let method_body =
+                        self.create_body(body, quote_preference, false /*signatureOnly*/);
                     let method = self.create_signature_declaration_from_signature(
                         signature,
                         SyntaxKind::MethodDeclaration,
@@ -715,7 +720,7 @@ impl<'a> MissingMemberFixer<'a> {
         let question_token = if optional { optional_token } else { Node::NIL };
         let return_type =
             self.get_return_type_from_signatures(signatures, enclosing_declaration, &node_builder);
-        let method_body = self.create_body(body, false /*ambient*/, quote_preference);
+        let method_body = self.create_body(body, quote_preference, false /*signatureOnly*/);
 
         self.change_tracker.node_factory().new_method_declaration(
             modifiers,
@@ -785,9 +790,13 @@ impl<'a> MissingMemberFixer<'a> {
             );
         if imported_type_node.is_some() {
             for symbol in symbols {
+                let export_symbol = Self::get_exported_symbol(self.type_checker, symbol);
+                if export_symbol.is_nil() {
+                    continue;
+                }
                 import_adder.add_import_from_exported_symbol(
                     self.type_checker,
-                    symbol,
+                    export_symbol,
                     true, /*isValidTypeOnlyUseSite*/
                 );
             }
@@ -802,16 +811,32 @@ impl<'a> MissingMemberFixer<'a> {
                 continue;
             }
             seen.insert(symbol);
+            let export_symbol = Self::get_exported_symbol(self.type_checker, symbol);
+            if export_symbol.is_nil() {
+                continue;
+            }
             import_adder.add_import_from_exported_symbol(
                 self.type_checker,
-                symbol,
+                export_symbol,
                 true, /*isValidTypeOnlyUseSite*/
             );
         }
         type_node
     }
 
-    // Go: ls/codeactions_missingmemberfixer.go:397 createIndexSignatureDeclarationFromType
+    // Go: ls/codeactions_missingmemberfixer.go:405 getExportedSymbol
+    // PORT: a Go method on the fixer that reads only `f.typeChecker`. It
+    // takes the checker, so `importTypeNode` can call it while it holds the
+    // import adder.
+    fn get_exported_symbol(type_checker: &Checker, symbol: SymbolId) -> SymbolId {
+        let symbol = type_checker.get_export_symbol_of_symbol(symbol);
+        if symbol.is_nil() || type_checker.sym(symbol).parent.is_nil() {
+            return SymbolId::NIL;
+        }
+        symbol
+    }
+
+    // Go: ls/codeactions_missingmemberfixer.go:413 createIndexSignatureDeclarationFromType
     pub fn create_index_signature_declaration_from_type(
         &mut self,
         class_declaration: Node,
@@ -840,14 +865,14 @@ impl<'a> MissingMemberFixer<'a> {
             )
     }
 
-    // Go: ls/codeactions_missingmemberfixer.go:407 createBody
+    // Go: ls/codeactions_missingmemberfixer.go:423 createBody
     fn create_body(
         &self,
         body: Node,
-        ambient: bool,
         quote_preference: lsutil::QuotePreference,
+        signature_only: bool,
     ) -> Node {
-        if ambient {
+        if signature_only {
             return Node::NIL;
         }
         let body = self.change_tracker.node_factory().deep_clone_node(body);

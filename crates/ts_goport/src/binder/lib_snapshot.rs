@@ -668,7 +668,10 @@ impl Decoder<'_> {
             end,
             code,
             category,
+            // tsgo#4712: a lib file has no external diagnostic.
+            source: String::new(),
             message,
+            message_text: String::new(),
             message_args,
             message_chain,
             related_information,
@@ -681,8 +684,6 @@ impl Decoder<'_> {
 
     fn file_bind(&mut self) -> Option<FileBindData> {
         let bind_diagnostics = self.diagnostics()?;
-        let bind_suggestion_diagnostics = self.diagnostics()?;
-        let end_flow_node = self.flow()?;
         let symbol_count = self.r.u32()? as i32;
         let pattern_count = self.r.count()?;
         let mut pattern_ambient_modules = Vec::with_capacity(pattern_count);
@@ -695,8 +696,6 @@ impl Decoder<'_> {
         }
         Some(FileBindData {
             bind_diagnostics,
-            bind_suggestion_diagnostics,
-            end_flow_node,
             symbol_count,
             pattern_ambient_modules,
             global_exports: self.table()?,
@@ -1031,8 +1030,6 @@ impl Encoder {
 
     fn file_bind(&mut self, data: &FileBindData) -> Result<(), String> {
         self.diagnostics(&data.bind_diagnostics)?;
-        self.diagnostics(&data.bind_suggestion_diagnostics)?;
-        self.flow(data.end_flow_node)?;
         self.u32(data.symbol_count as u32);
         self.count(data.pattern_ambient_modules.len())?;
         for module in &data.pattern_ambient_modules {

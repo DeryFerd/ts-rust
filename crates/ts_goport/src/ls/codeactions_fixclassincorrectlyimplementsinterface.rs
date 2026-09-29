@@ -49,7 +49,7 @@ fn get_code_actions_to_fix_class_incorrectly_implements_interface(
         return Ok(Vec::new());
     }
 
-    let implements_types = get_implements_type_nodes(class_declaration);
+    let implements_types = get_implements_heritage_clause_elements(class_declaration);
     let locale = locale::from_context(context);
 
     let (type_checker, _done) = ls_program::get_type_checker_for_file(
@@ -131,9 +131,9 @@ fn get_all_code_actions_to_fix_class_incorrectly_implements_interface(
     let mut seen_class_declarations: FxHashSet<Node> = FxHashSet::default();
 
     for diag in get_all_diagnostics(context, fix_context.program, fix_context.source_file) {
-        if contains_error_code(
+        if is_fixable_diagnostic(
+            &diag,
             &FIX_CLASS_INCORRECTLY_IMPLEMENTS_INTERFACE_ERROR_CODES,
-            diag.code,
         ) {
             let class_declaration =
                 get_class(fix_context.source_file, TextRange::new(diag.pos, diag.end));
@@ -142,7 +142,7 @@ fn get_all_code_actions_to_fix_class_incorrectly_implements_interface(
             }
             // Go: seenClassDeclarations.AddIfAbsent(classDeclaration)
             if seen_class_declarations.insert(class_declaration) {
-                let implements_types = get_implements_type_nodes(class_declaration);
+                let implements_types = get_implements_heritage_clause_elements(class_declaration);
                 for implemented_type_node in implements_types {
                     let mut checker_ref = type_checker.borrow_mut();
                     add_changes(
@@ -263,6 +263,7 @@ fn add_changes(
             fix_context.source_file,
             Node::NIL, /*body*/
             PreserveOptionalFlags::ALL,
+            false, /*abstract*/
         );
         for member_node in member_nodes {
             insert_interface_member_node(
@@ -282,10 +283,13 @@ fn get_changes(
     import_adder: Option<&mut (dyn autoimport::ImportAdder + 'static)>,
     source_file: Node,
 ) -> Vec<lsproto::TextEdit> {
+    let (mut changes, unmappable) = change_tracker.get_changes();
+    if !unmappable.is_empty() {
+        return Vec::new();
+    }
     // PORT: Go indexes the map; a missing file gives a nil slice.
-    let mut file_changes = change_tracker
-        .get_changes()
-        .shift_remove(source_file_file_name(source_file))
+    let mut file_changes = changes
+        .shift_remove(source_file_original_file_name(source_file))
         .unwrap_or_default();
     if let Some(import_adder) = import_adder
         && import_adder.has_fixes()

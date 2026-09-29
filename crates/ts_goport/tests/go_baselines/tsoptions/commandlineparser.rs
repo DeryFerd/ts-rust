@@ -219,7 +219,42 @@ fn response_file_does_not_panic() {
     t.finish();
 }
 
-// Go: commandlineparser_test.go:109 TestParseCommandLineTypeRootsRelativePath
+// Go: commandlineparser_test.go:109 TestResponseFileParsing
+#[test]
+fn response_file_parsing() {
+    let mut t = Subtests::new("TestResponseFileParsing");
+    t.run("final token without trailing whitespace", || {
+        let host = new_vfs_parse_config_host(
+            &file_map(&[("/project/args.txt", "--strict --outDir dist")]),
+            "/project",
+            true,
+        );
+        let parsed = parse_command_line(&strs(&["@args.txt"]), &host);
+        assert_eq!(parsed.errors.len(), 0);
+        assert!(parsed.compiler_options().strict.is_true());
+        assert_eq!(parsed.compiler_options().out_dir, "/project/dist");
+        Ok(())
+    });
+
+    t.run("cyclic response files", || {
+        let host = new_vfs_parse_config_host(
+            &file_map(&[
+                ("/project/a.txt", "@/project/b.txt --strict"),
+                ("/project/b.txt", "@/project/a.txt --outDir dist"),
+            ]),
+            "/project",
+            true,
+        );
+        let parsed = parse_command_line(&strs(&["@a.txt"]), &host);
+        assert_eq!(parsed.errors.len(), 0);
+        assert!(parsed.compiler_options().strict.is_true());
+        assert_eq!(parsed.compiler_options().out_dir, "/project/dist");
+        Ok(())
+    });
+    t.finish();
+}
+
+// Go: commandlineparser_test.go:136 TestParseCommandLineTypeRootsRelativePath
 #[test]
 fn parse_command_line_type_roots_relative_path() {
     let host = new_vfs_parse_config_host(

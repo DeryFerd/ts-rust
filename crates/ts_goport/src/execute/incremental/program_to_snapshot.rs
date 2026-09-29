@@ -42,6 +42,7 @@ pub fn program_to_snapshot(
         to.reuse_from_old_program();
         to.compute_program_file_changes();
         to.handle_file_delete();
+        to.handle_global_scope_change();
         to.handle_pending_emit();
         to.handle_pending_check();
     }
@@ -259,7 +260,41 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:172 handlePendingEmit
+    // Go: incremental/programtosnapshot.go:182 handleGlobalScopeChange
+    // PORT: Go ranges over a `SyncMap` (random order) and stops at the first
+    // file that lost global scope; the result does not depend on the order.
+    fn handle_global_scope_change(&mut self) {
+        let Some(old_program) = self.old_program else {
+            return;
+        };
+        if self.global_file_removed {
+            return;
+        }
+        let mut global_scope_lost = false;
+        for (file_path, old_info) in &old_program.snapshot.borrow().file_infos {
+            if !old_info.affects_global_scope {
+                continue;
+            }
+            if let Some(new_info) = self.snapshot.file_infos.get(file_path) {
+                if !new_info.affects_global_scope {
+                    global_scope_lost = true;
+                    break;
+                }
+            }
+        }
+        if global_scope_lost {
+            let files = self
+                .snapshot
+                .get_all_files_excluding_default_library_file(Node::NIL)
+                .to_vec();
+            for file in files {
+                self.snapshot
+                    .add_file_to_change_set(Path(source_file_info(file).path.clone()));
+            }
+        }
+    }
+
+    // Go: incremental/programtosnapshot.go:204 handlePendingEmit
     fn handle_pending_emit(&mut self) {
         if let Some(old_program) = self.old_program {
             if self.global_file_removed {
@@ -301,20 +336,36 @@ impl ToProgramSnapshot<'_> {
     }
 }
 
-/// Starts the Go `t.snapshot.computeHash(file.Text())` of each file in
+/// Starts the Go `t.snapshot.computeHash(versionText)` of each file in
 /// `files`. The receiver gives the hashes in file order as they are ready.
 // PORT: perf. The hashes run on one new thread, so that they overlap the
 // bind and the checker start in `compute_program_file_changes` (the texts
-// are `'static`). With `--singleThreaded` they run here, before the bind.
+// are `'static`, or owned for a content-mapped file). With `--singleThreaded` they run here, before the bind.
 // One thread is enough: it reads each text once (about 16 MB for Effect),
 // which takes much less time than the bind.
 fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::Receiver<String> {
-    let texts: Vec<&'static str> = files.iter().map(|&file| source_file_text(file)).collect();
+    let texts: Vec<std::borrow::Cow<'static, str>> = files
+        .iter()
+        .map(|&file| {
+            // Go: incremental/programtosnapshot.go:94 (tsgo#4712): a
+            // content-mapped file's version text is its original text and
+            // its transform identity.
+            if source_file_content_mapper(file).is_empty() {
+                std::borrow::Cow::Borrowed(source_file_text(file))
+            } else {
+                std::borrow::Cow::Owned(format!(
+                    "{}\x00{}",
+                    source_file_original_text(file),
+                    source_file_content_mapper_transform_identity(file)
+                ))
+            }
+        })
+        .collect();
     let (sender, receiver) = std::sync::mpsc::channel();
     let hash_texts = move || {
         for text in texts {
             // A send fails only when the loop stopped (it panicked).
-            if sender.send(compute_hash(text, hash_with_text)).is_err() {
+            if sender.send(compute_hash(&text, hash_with_text)).is_err() {
                 return;
             }
         }
@@ -602,6 +653,8 @@ pub fn repopulate_diagnostic_message_chain(
                 end,
                 code: c.code(),
                 category: c.category() as i32,
+                source: c.source().to_string(),
+                message_text: c.message_text().to_string(),
                 message_key: c.message_key().to_string(),
                 message_args: c.message_args().to_vec(),
                 repopulate_info: Some(repopulate_info),
@@ -641,6 +694,8 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         end,
         code: d.code(),
         category: d.category() as i32,
+        source: d.source().to_string(),
+        message_text: d.message_text().to_string(),
         message_key: d.message_key().to_string(),
         message_args: d.message_args().to_vec(),
         repopulate_info: d.repopulate_info(),
@@ -650,4 +705,41 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         b.message_chain.push(ast_diag_to_build_info_diag(nested));
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: incremental/external_diagnostic_test.go:14 TestExternalDiagnosticBuildInfoRoundTrip (tsgo#4712)
+    // PORT: Go `toDiagnostic(nil, file)` has no program argument here.
+    #[test]
+    fn test_external_diagnostic_build_info_round_trip() {
+        let file = parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/app.vue".to_string(),
+                path: Path("/app.vue".to_string()),
+                ..Default::default()
+            },
+            "",
+            ScriptKind::TS,
+        )
+        .root;
+        let diagnostic = crate::ast::new_external_diagnostic(
+            file,
+            TextRange::new(1, 2),
+            "vue",
+            crate::diagnostics::Category::Warning,
+            1001,
+            "mapper warning",
+        );
+
+        let serialized = ast_diag_to_build_info_diag(&diagnostic);
+        assert_eq!(serialized.source, "vue");
+        assert_eq!(serialized.message_text, "mapper warning");
+
+        let restored = serialized.to_diagnostic(file);
+        assert_eq!(restored.source(), "vue");
+        assert_eq!(restored.localize(&crate::locale::DEFAULT), "mapper warning");
+    }
 }

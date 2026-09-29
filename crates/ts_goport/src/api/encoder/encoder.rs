@@ -70,8 +70,8 @@ pub const HEADER_OFFSET_STRUCTURED_DATA: usize = 36;
 pub const HEADER_OFFSET_NODES: usize = 40;
 pub const HEADER_SIZE: usize = 44;
 
-// Go: api/encoder/encoder.go:64 ProtocolVersion
-pub const PROTOCOL_VERSION: u8 = 5;
+// Go: api/encoder/encoder.go:66 ProtocolVersion
+pub const PROTOCOL_VERSION: u8 = 7;
 
 // Source File Binary Format
 // =========================
@@ -156,6 +156,13 @@ pub const PROTOCOL_VERSION: u8 = 5;
 // | 36-40       | uint32 | Byte offset of `moduleAugmentations` node index array         |
 // | 40-44       | uint32 | Byte offset of `ambientModuleNames` string array              |
 // | 44-48       | uint32 | Node index of `externalModuleIndicator` (0 = nil)             |
+// | 48-52       | uint32 | Index of `originalText` in the string offsets section         |
+// | 52-56       | uint32 | Byte offset of `spanMap` in structured data                    |
+// | 56-60       | uint32 | Byte offset of `supplementalSourceFileNames` in structured data |
+// | 60-64       | uint32 | Index of `canonicalSourceFileName`, or noStructuredData         |
+// | 64-68       | uint32 | Index of `contentMapper`, or noStructuredData                   |
+// | 68-72       | uint32 | Index of `virtualFileName`, or noStructuredData                 |
+// | 72-76       | uint32 | Byte offset of `diagnosticDirectives` in structured data       |
 //
 // Structured data (variable)
 // --------------------------
@@ -168,6 +175,14 @@ pub const PROTOCOL_VERSION: u8 = 5;
 // Node index arrays (imports, moduleAugmentations) are msgpack arrays of uint values, where each
 // value is a node index into the nodes section. String arrays (ambientModuleNames) are msgpack
 // arrays of string values.
+//
+// Span maps are msgpack arrays of tuples in UTF-16 coordinates:
+//
+//   [virtualStart: uint, virtualLength: uint, originalStart: uint, originalLength: uint, kind: uint, features?: uint]
+//
+// Diagnostic directives are msgpack arrays of normalized tuples in UTF-16 coordinates:
+//
+//   [originalStart: uint, originalLength: uint, virtualStart: uint, virtualLength: uint, policy: uint, unusedCode: uint]
 //
 // An offset of 0xFFFFFFFF indicates no data (empty array).
 //
@@ -299,11 +314,32 @@ struct Uint128 {
 }
 
 /// Go `sourceFile.Hash`.
-// PORT: ts_goport keeps no `SourceFile.Hash` field. The project parse cache
-// sets Go `file.Hash` to `xxh3.HashString128` of the file content, which is
-// the parsed text, so the hash is computed here on demand (the same value).
+// PORT: ts_goport keeps no `SourceFile.Hash` field. At pin B only the two
+// project parse caches set Go `file.Hash`:
+// - project/parsecache.go NewParseCache sets `fh.Hash()`, the xxh3-128 of
+//   the file content, which is the parsed text.
+// - project/compilerhost.go GetContentMappedSourceFiles (tsgo#4712) sets
+//   the hash of the cache key on the canonical file and on each
+//   supplemental file of a content-mapped file.
+// The project parse cache keeps each value by file text
+// (`project::parsecache::source_file_hash`, which gives the xxh3-128 of the
+// text for a text it did not record). This reads it for a file of a
+// language server program, which the parse caches made. Any other parse
+// (Go `parser.ParseSourceFile`, for example a tsconfig from
+// `tsoptions.NewTsconfigSourceFileFromFilePath`) keeps Go Hash 0. Such a
+// file is in no program, also when a publish kept its parse (the root
+// config of a project, api/session.go handleGetConfigSourceFile at pin B).
+// So the test is "a program made here has this file"
+// (`program_parsed_source_file`), not "some parse of this file exists"
+// (`parsed_source_file_of`, which also finds that root config).
 fn source_file_content_hash(source_file: Node) -> Uint128 {
-    let h = xxhash_rust::xxh3::xxh3_128(source_file_text(source_file).as_bytes());
+    if source_file.is_nil() || is_synthetic_node(source_file) {
+        return Uint128::default();
+    }
+    let Some(parsed) = crate::program::ls_program::program_parsed_source_file(source_file) else {
+        return Uint128::default();
+    };
+    let h = crate::project::parsecache::source_file_hash(parsed.text);
     Uint128 {
         hi: (h >> 64) as u64,
         lo: h as u64,
@@ -1028,10 +1064,10 @@ pub fn get_node_data(
     }
 }
 
-// Go: api/encoder/encoder.go:642 noStructuredData
+// Go: api/encoder/encoder.go:659 noStructuredData
 const NO_STRUCTURED_DATA: u32 = 0xFFFFFFFF;
 
-// Go: api/encoder/encoder.go:644 recordExtendedData_SourceFile
+// Go: api/encoder/encoder.go:661 recordExtendedData_SourceFile
 pub fn record_extended_data_source_file(
     node: Node,
     strs: &mut StringTable,
@@ -1042,6 +1078,11 @@ pub fn record_extended_data_source_file(
     let sf = node;
     let fields = source_file_fields(sf);
     let text_index = strs.add(source_file_text(sf), sf.kind(), sf.pos(), sf.end());
+    let original_text = source_file_original_text(sf);
+    let mut original_text_index = text_index;
+    if original_text != source_file_text(sf) {
+        original_text_index = strs.add(original_text, SyntaxKind::Unknown, 0, 0);
+    }
     let file_name_index = strs.add(source_file_file_name(sf), SyntaxKind::Unknown, 0, 0);
     let path_index = strs.add(fields.path(), SyntaxKind::Unknown, 0, 0);
     let referenced_files_offset =
@@ -1056,6 +1097,54 @@ pub fn record_extended_data_source_file(
         position_map,
         structured_data,
     );
+    // PORT: Go computes the position map of the original text for each of
+    // `encodeSpanMap` and `encodeDiagnosticDirectives`. The port computes it
+    // once, and only when a span map or a directive is encoded. The output
+    // is the same.
+    let original_positions_cell: OnceCell<PositionMap> = OnceCell::new();
+    let original_positions =
+        || original_positions_cell.get_or_init(|| compute_position_map(original_text));
+    let mut span_map_offset = NO_STRUCTURED_DATA;
+    if let Some(span_map) = source_file_span_map(sf) {
+        span_map_offset = encode_span_map(
+            Some(span_map),
+            position_map,
+            original_positions(),
+            structured_data,
+        );
+    }
+    let supplemental_file_names: Vec<String> = source_file_supplemental_source_files(sf)
+        .iter()
+        .map(|file| source_file_file_name(*file).to_string())
+        .collect();
+    let supplemental_file_names_offset =
+        encode_string_array(&supplemental_file_names, structured_data);
+    let mut canonical_file_name_index = NO_STRUCTURED_DATA;
+    let canonical = source_file_canonical_source_file(sf);
+    if canonical.is_some() {
+        canonical_file_name_index =
+            strs.add(source_file_file_name(canonical), SyntaxKind::Unknown, 0, 0);
+    }
+    let mut content_mapper_index = NO_STRUCTURED_DATA;
+    let content_mapper = source_file_content_mapper(sf);
+    if !content_mapper.is_empty() {
+        content_mapper_index = strs.add(content_mapper, SyntaxKind::Unknown, 0, 0);
+    }
+    let mut virtual_file_name_index = NO_STRUCTURED_DATA;
+    let virtual_file_name = source_file_virtual_file_name(sf);
+    if !virtual_file_name.is_empty() {
+        virtual_file_name_index = strs.add(virtual_file_name, SyntaxKind::Unknown, 0, 0);
+    }
+    let diagnostic_directives = source_file_diagnostic_directives(sf);
+    let mut diagnostic_directives_offset = NO_STRUCTURED_DATA;
+    if !diagnostic_directives.is_empty() {
+        diagnostic_directives_offset = encode_diagnostic_directives(
+            diagnostic_directives,
+            position_map,
+            original_positions(),
+            structured_data,
+        );
+    }
     // imports, moduleAugmentations, ambientModuleNames offsets are placeholders;
     // they will be patched after the tree walk when node indices are known.
     append_uint32s(
@@ -1073,6 +1162,13 @@ pub fn record_extended_data_source_file(
             NO_STRUCTURED_DATA,
             NO_STRUCTURED_DATA,
             0,
+            original_text_index,
+            span_map_offset,
+            supplemental_file_names_offset,
+            canonical_file_name_index,
+            content_mapper_index,
+            virtual_file_name_index,
+            diagnostic_directives_offset,
         ],
     );
 }
@@ -1231,6 +1327,69 @@ fn encode_string_array(strs: &[String], buf: &mut Vec<u8>) -> u32 {
     msgpack_write_array_header(buf, strs.len());
     for s in strs {
         msgpack_write_string(buf, s);
+    }
+    offset
+}
+
+// Go: api/encoder/encoder.go:795 encodeSpanMap
+fn encode_span_map(
+    m: Option<&spanmap::SpanMap>,
+    virtual_positions: &PositionMap,
+    original_positions: &PositionMap,
+    buf: &mut Vec<u8>,
+) -> u32 {
+    if m.is_none() {
+        return NO_STRUCTURED_DATA;
+    }
+    let segments = spanmap::SpanMap::segments(m);
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, segments.len());
+    for segment in &segments {
+        let mut tuple_length = 5;
+        if segment.features != spanmap::Feature::ALL {
+            tuple_length = 6;
+        }
+        msgpack_write_array_header(buf, tuple_length);
+        let virtual_start = virtual_positions.utf8_to_utf16(segment.virtual_start);
+        let virtual_end = virtual_positions.utf8_to_utf16(segment.virtual_end);
+        let original_start = original_positions.utf8_to_utf16(segment.original_start);
+        let original_end = original_positions.utf8_to_utf16(segment.original_end);
+        msgpack_write_uint(buf, virtual_start as u32);
+        msgpack_write_uint(buf, (virtual_end - virtual_start) as u32);
+        msgpack_write_uint(buf, original_start as u32);
+        msgpack_write_uint(buf, (original_end - original_start) as u32);
+        msgpack_write_uint(buf, segment.kind.0 as u32);
+        if tuple_length == 6 {
+            msgpack_write_uint(buf, segment.features.0 as u32);
+        }
+    }
+    offset
+}
+
+// Go: api/encoder/encoder.go:824 encodeDiagnosticDirectives
+fn encode_diagnostic_directives(
+    directives: &[MappedDiagnosticDirective],
+    virtual_positions: &PositionMap,
+    original_positions: &PositionMap,
+    buf: &mut Vec<u8>,
+) -> u32 {
+    if directives.is_empty() {
+        return NO_STRUCTURED_DATA;
+    }
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, directives.len());
+    for directive in directives {
+        msgpack_write_array_header(buf, 6);
+        let original_start = original_positions.utf8_to_utf16(directive.original_range.pos());
+        let original_end = original_positions.utf8_to_utf16(directive.original_range.end());
+        let virtual_start = virtual_positions.utf8_to_utf16(directive.virtual_range.pos());
+        let virtual_end = virtual_positions.utf8_to_utf16(directive.virtual_range.end());
+        msgpack_write_uint(buf, original_start as u32);
+        msgpack_write_uint(buf, (original_end - original_start) as u32);
+        msgpack_write_uint(buf, virtual_start as u32);
+        msgpack_write_uint(buf, (virtual_end - virtual_start) as u32);
+        msgpack_write_uint(buf, u32::from(directive.policy.0));
+        msgpack_write_uint(buf, directive.unused_code as u32);
     }
     offset
 }

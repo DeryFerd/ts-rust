@@ -260,18 +260,32 @@ impl Checker {
             };
         }
         let discriminant_type = self.get_union_type(&clause_types);
-        let case_type = if self
+        let mut case_type = TypeId::NIL;
+        if self
             .ty(discriminant_type)
             .flags
             .intersects(TypeFlags::NEVER)
         {
-            self.never_type
+            case_type = self.never_type;
         } else {
-            let filtered = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
-                c.are_types_comparable(discriminant_type, t)
-            });
-            self.replace_primitives_with_literals(filtered, discriminant_type)
-        };
+            if self
+                .ty(discriminant_type)
+                .flags
+                .intersects(TypeFlags::PRIMITIVE)
+                && self.is_uniform_union_type(t)
+            {
+                let regular_type = self.get_regular_type_of_literal_type(discriminant_type);
+                if self.union_contains_type(t, regular_type, false /*matchSymbol*/) {
+                    case_type = regular_type;
+                }
+            }
+            if case_type.is_nil() {
+                let filtered = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+                    c.are_types_comparable(discriminant_type, t)
+                });
+                case_type = self.replace_primitives_with_literals(filtered, discriminant_type);
+            }
+        }
         if !has_default_clause {
             return case_type;
         }

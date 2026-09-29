@@ -4,6 +4,7 @@
 //! reads: emit flags, comment and source map ranges, original node links,
 //! auto-generated name info and emit helpers.
 
+use crate::flags_macros::go_enum;
 use crate::prelude::*;
 
 use super::factory::NodeFactory;
@@ -710,6 +711,24 @@ impl EmitContext {
         }
         Node::NIL
     }
+
+    // Go: printer/emitcontext.go:509 IsFileLevelUniqueName
+    // PORT: `source_file_has_identifier` is Go `(*SourceFile).HasIdentifier`
+    // (tsgo#4731, the syntax lane's part).
+    pub fn is_file_level_unique_name(
+        &self,
+        source_file: Node,
+        name: &str,
+        has_global_name: Option<&dyn Fn(&str) -> bool>,
+    ) -> bool {
+        if let Some(has_global_name) = has_global_name
+            && has_global_name(name)
+        {
+            return false;
+        }
+        let source_file = self.most_original(source_file);
+        !source_file_has_identifier(source_file, name)
+    }
 }
 
 // Go: printer/emitcontext.go:362 isHoistedVariable
@@ -759,6 +778,18 @@ pub(crate) type EmitNodeFlags = u32;
 pub(crate) const HAS_COMMENT_RANGE: EmitNodeFlags = 1 << 0;
 pub(crate) const HAS_SOURCE_MAP_RANGE: EmitNodeFlags = 1 << 1;
 
+// Go: printer/emitcontext.go:528 SnippetKind
+go_enum!(SnippetKind, i32 {
+    TAB_STOP = 0; // SnippetKindTabStop
+});
+
+// Go: printer/emitcontext.go:534 SnippetElement
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnippetElement {
+    pub kind: SnippetKind,
+    pub order: i32,
+}
+
 /// Go `SynthesizedComment`.
 #[derive(Clone, Debug)]
 pub struct SynthesizedComment {
@@ -783,6 +814,8 @@ pub(crate) struct EmitNode {
     pub(crate) leading_comments: Vec<SynthesizedComment>,
     pub(crate) trailing_comments: Vec<SynthesizedComment>,
     pub(crate) type_node: Node,
+    /// Go nil `*SnippetElement` is `None`.
+    pub(crate) snippet_element: Option<SnippetElement>,
 }
 
 impl EmitNode {
@@ -796,6 +829,9 @@ impl EmitNode {
         self.token_source_map_ranges = source.token_source_map_ranges.clone();
         self.helpers = source.helpers.clone();
         self.external_helpers_module_name = source.external_helpers_module_name;
+        if let Some(snippet_element) = source.snippet_element {
+            self.snippet_element = Some(snippet_element);
+        }
     }
 }
 
@@ -826,6 +862,20 @@ impl EmitContext {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
         let emit_node = emit_nodes.get(node);
         emit_node.emit_flags = emit_node.emit_flags | flags;
+    }
+
+    // Go: printer/emitcontext.go:591 SnippetElement
+    #[must_use]
+    pub fn snippet_element(&self, node: Node) -> Option<SnippetElement> {
+        if let Some(emit_node) = self.emit_nodes.borrow().try_get(node) {
+            return emit_node.snippet_element;
+        }
+        None
+    }
+
+    // Go: printer/emitcontext.go:598 SetSnippetElement
+    pub fn set_snippet_element(&self, node: Node, snippet_element: SnippetElement) {
+        self.emit_nodes.borrow_mut().get(node).snippet_element = Some(snippet_element);
     }
 
     // Go: printer/emitcontext.go:568 CommentRange
@@ -1268,6 +1318,22 @@ impl EmitContext {
         scope.borrow_mut().initialization_statements.push(node);
     }
 
+    // Go: printer/emitcontext.go:930 ConvertToFunctionBlock
+    pub fn convert_to_function_block(&self, node: Node, multi_line: bool) -> Node {
+        if is_block(node) {
+            return node;
+        }
+        let f = self.factory();
+        let return_statement = f.new_return_statement(node);
+        set_node_loc(return_statement, node.loc());
+        // PORT: Go sets `statements.Loc` after `NewNodeList`. A list `Loc` is
+        // fixed when the list is made, so it is made with the loc.
+        let statements = f.new_node_list_with_loc(&[return_statement], node.loc());
+        let block = f.new_block(statements, multi_line);
+        set_node_loc(block, node.loc());
+        block
+    }
+
     // Go: printer/emitcontext.go:895 VisitFunctionBody
     pub fn visit_function_body<C>(&self, node: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         // !!! c.resumeVariableEnvironment()
@@ -1283,9 +1349,13 @@ impl EmitContext {
         }
 
         if !is_block(updated) {
-            let statements =
-                self.merge_environment(&[f.new_return_statement(updated)], &declarations);
-            return f.new_block(f.new_node_list(&statements), false /*multiLine*/);
+            self.add_emit_flags(updated, EmitFlags::NO_COMMENTS);
+            let block = self.convert_to_function_block(updated, false /*multiLine*/);
+            return f.update_block(
+                block,
+                self.merge_environment_list(block.statement_list(), &declarations),
+                block.multi_line(),
+            );
         }
 
         f.update_block(

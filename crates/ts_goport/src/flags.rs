@@ -243,7 +243,6 @@ go_flags!(SymbolFlags, u32 {
     CLASS_MEMBER = 0x1a004; // SymbolFlagsClassMember
     EXPORT_SUPPORTS_DEFAULT_MODIFIER = 0x70; // SymbolFlagsExportSupportsDefaultModifier
     EXPORT_DOES_NOT_SUPPORT_DEFAULT_MODIFIER = 0xffffff8f; // SymbolFlagsExportDoesNotSupportDefaultModifier
-    CLASSIFIABLE = 0x2c07e0; // SymbolFlagsClassifiable
     LATE_BINDING_CONTAINER = 0x1870; // SymbolFlagsLateBindingContainer
 });
 
@@ -679,6 +678,12 @@ go_enum!(SignatureKind, i32 {
     CONSTRUCT = 1; // SignatureKindConstruct
 });
 
+go_enum!(MemberOverrideStatus, i32 {
+    NONE = 0; // MemberOverrideStatusNone
+    NEEDS_OVERRIDE = 1; // MemberOverrideStatusNeedsOverride
+    HAS_INVALID_OVERRIDE = 2; // MemberOverrideStatusHasInvalidOverride
+});
+
 go_flags!(ContextFlags, u32 {
     NONE = 0; // ContextFlagsNone
     SIGNATURE = 1; // ContextFlagsSignature
@@ -919,6 +924,8 @@ go_flags!(ObjectFlags, u32 {
     CONTAINS_INTERSECTIONS = 0x2000000; // ObjectFlagsContainsIntersections
     IS_UNKNOWN_LIKE_UNION_COMPUTED = 0x4000000; // ObjectFlagsIsUnknownLikeUnionComputed
     IS_UNKNOWN_LIKE_UNION = 0x8000000; // ObjectFlagsIsUnknownLikeUnion
+    IS_UNIFORM_ENUM_COMPUTED = 0x10000000; // ObjectFlagsIsUniformEnumComputed
+    IS_UNIFORM_ENUM = 0x20000000; // ObjectFlagsIsUniformEnum
     IS_NEVER_INTERSECTION_COMPUTED = 0x2000000; // ObjectFlagsIsNeverIntersectionComputed
     IS_NEVER_INTERSECTION = 0x4000000; // ObjectFlagsIsNeverIntersection
     IS_CONSTRAINED_TYPE_VARIABLE = 0x8000000; // ObjectFlagsIsConstrainedTypeVariable
@@ -1015,9 +1022,8 @@ go_flags!(RelationComparisonResult, u32 {
     REPORTS_UNMEASURABLE = 8; // RelationComparisonResultReportsUnmeasurable
     REPORTS_UNRELIABLE = 0x10; // RelationComparisonResultReportsUnreliable
     COMPLEXITY_OVERFLOW = 0x20; // RelationComparisonResultComplexityOverflow
-    STACK_DEPTH_OVERFLOW = 0x40; // RelationComparisonResultStackDepthOverflow
     REPORTS_MASK = 0x18; // RelationComparisonResultReportsMask
-    OVERFLOW = 0x60; // RelationComparisonResultOverflow
+    OVERFLOW = 0x20; // RelationComparisonResultOverflow
 });
 
 go_flags!(JsxFlags, u32 {

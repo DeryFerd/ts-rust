@@ -28,6 +28,7 @@ pub mod folding;
 pub mod format;
 pub mod host;
 pub mod hover;
+pub mod hovericon;
 pub mod import_tracker;
 pub mod inlay_hints;
 pub mod jsdoc;
@@ -75,6 +76,7 @@ pub use folding::*;
 pub use format::*;
 pub use host::*;
 pub use hover::*;
+pub use hovericon::*;
 pub use import_tracker::*;
 pub use inlay_hints::*;
 pub use jsdoc::*;
@@ -104,9 +106,9 @@ pub mod prelude {
         completions_p3::*, completions_p4::*, constants::*, crossproject::*, definition::*,
         diagnostics::*, displaypartswriter::*, documenthighlights::*, file_rename::*,
         findallreferences_p1::*, findallreferences_p2::*, folding::*, format::*, host::*, hover::*,
-        import_tracker::*, inlay_hints::*, jsdoc::*, jsdoc_snippet::*, languageservice::*,
-        linkedediting::*, organizeimports::*, program_view::*, rename::*, search_thread::*,
-        selectionranges::*, semantictokens::*, signaturehelp::*, source_map::*,
+        hovericon::*, import_tracker::*, inlay_hints::*, jsdoc::*, jsdoc_snippet::*,
+        languageservice::*, linkedediting::*, organizeimports::*, program_view::*, rename::*,
+        search_thread::*, selectionranges::*, semantictokens::*, signaturehelp::*, source_map::*,
         sourcedefinition::*, string_completions::*, symbols::*, utilities::*,
     };
     pub use crate::astnav;

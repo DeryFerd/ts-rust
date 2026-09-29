@@ -2676,8 +2676,6 @@ impl FileNodeBind {
 #[derive(Clone, Debug, Default)]
 pub struct FileBindData {
     pub bind_diagnostics: Vec<Diagnostic>,
-    pub bind_suggestion_diagnostics: Vec<Diagnostic>,
-    pub end_flow_node: FlowNodeId,
     pub symbol_count: i32,
     // PORT: Go also keeps `ClassifiableNames` here. Nothing reads it, so the
     // binder does not collect it.
@@ -2703,7 +2701,17 @@ pub struct Diagnostic {
     pub end: i32,
     pub code: i32,
     pub category: crate::diagnostics::Category,
+    /// Go `source` (tsgo#4712). When non-empty, a custom prefix (e.g. a
+    /// content mapper's name) shown instead of "TS" before the code. It
+    /// marks the diagnostic as coming from an external source whose ranges
+    /// point into the file's original, untransformed text.
+    pub source: String,
+    /// Go `message`. The Go nil message is `crate::ast::NIL_MESSAGE`.
     pub message: &'static crate::diagnostics::Message,
+    /// Go `messageText` (tsgo#4712): an already-localized message used when
+    /// the message is nil, e.g. a diagnostic deserialized from an external
+    /// process that owns its own localization.
+    pub message_text: String,
     pub message_args: Vec<String>,
     pub message_chain: Vec<Diagnostic>,
     pub related_information: Vec<Diagnostic>,

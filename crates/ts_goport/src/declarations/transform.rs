@@ -104,6 +104,8 @@ pub struct DeclarationTransformer {
     pub(crate) expando_hosts: FxHashMap<Node, Node>,
     // store any found expando _members_ after transforming them so *if* the host is referenced, they can be emitted alongside it
     pub(crate) expando_members: FxHashMap<Node, Vec<Node>>,
+    // expando assignments whose host wasn't visible when collected, processed if the host is late-marked visible
+    pub(crate) deferred_expando_assignments: FxHashMap<Node, Vec<Node>>,
     pub(crate) seen_properties: FxHashSet<ThisPropertyAssignmentKey>,
     pub(crate) this_property_assignments_collected: Vec<Node>,
     pub(crate) raw_referenced_files: Vec<ReferencedFilePair>,
@@ -169,6 +171,7 @@ pub fn new_declaration_transformer(
         late_statement_replacement_map: FxHashMap::default(),
         expando_hosts: FxHashMap::default(),
         expando_members: FxHashMap::default(),
+        deferred_expando_assignments: FxHashMap::default(),
         seen_properties: FxHashSet::default(),
         this_property_assignments_collected: Vec::new(),
         raw_referenced_files: Vec::new(),
@@ -381,6 +384,7 @@ impl DeclarationTransformer {
         self.late_statement_replacement_map = FxHashMap::default();
         self.expando_hosts = FxHashMap::default();
         self.expando_members = FxHashMap::default();
+        self.deferred_expando_assignments = FxHashMap::default();
         self.raw_referenced_files = Vec::new();
         self.raw_type_reference_directives = Vec::new();
         self.raw_lib_reference_directives = Vec::new();
@@ -688,7 +692,7 @@ impl DeclarationTransformer {
         &mut self,
         input: Node,
     ) -> (bool, CleanupDiagnosticContext) {
-        let can_prodice_diagnostic = can_produce_diagnostics(input);
+        let can_produce_diagnostic = can_produce_diagnostics(input);
         let old_within_object_literal_type = self.suppress_new_diagnostic_contexts;
         // PERF: pure kind tests; read each kind once. The parent kind is still
         // read only for a type literal or mapped type, as in Go.
@@ -705,7 +709,7 @@ impl DeclarationTransformer {
             .borrow()
             .get_symbol_accessibility_diagnostic
             .clone();
-        if can_prodice_diagnostic && !self.suppress_new_diagnostic_contexts {
+        if can_produce_diagnostic && !self.suppress_new_diagnostic_contexts {
             self.state.borrow_mut().get_symbol_accessibility_diagnostic =
                 Some(create_get_symbol_accessibility_diagnostic_for_node(input));
         }
@@ -716,7 +720,7 @@ impl DeclarationTransformer {
         }
 
         (
-            can_prodice_diagnostic,
+            can_produce_diagnostic,
             CleanupDiagnosticContext {
                 old_diag,
                 old_name,
@@ -796,7 +800,7 @@ impl DeclarationTransformer {
             self.enclosing_declaration = input;
         }
 
-        let (can_prodice_diagnostic, cleanup_diagnostic_context) =
+        let (can_produce_diagnostic, cleanup_diagnostic_context) =
             self.setup_diagnostic_context(input);
 
         let result = match input.kind() {
@@ -827,6 +831,16 @@ impl DeclarationTransformer {
                 self.check_entity_name_visibility(input.expr_name(), enclosing_declaration);
                 self.with_visitor(|v| v.visit_each_child(input))
             }
+            SyntaxKind::QualifiedName => {
+                if input.right().kind() == SyntaxKind::PrivateIdentifier {
+                    self.state.borrow_mut().add_diagnostic(create_diagnostic_for_node(
+                        input,
+                        diag::Declaration_emit_elides_private_members_but_0_refers_to_a_private_member_Write_an_explicit_type_here,
+                        args![input.right().text()],
+                    ));
+                }
+                self.with_visitor(|v| v.visit_each_child(input))
+            }
             SyntaxKind::TupleType => {
                 let result = self.with_visitor(|v| v.visit_each_child(input));
                 if result.is_some() && is_original_node_single_line(&self.emit_context, input) {
@@ -846,7 +860,7 @@ impl DeclarationTransformer {
             _ => self.with_visitor(|v| v.visit_each_child(input)),
         };
 
-        if result.is_some() && can_prodice_diagnostic && has_dynamic_name(input) {
+        if result.is_some() && can_produce_diagnostic && has_dynamic_name(input) {
             self.check_name(input);
         }
 
@@ -908,8 +922,12 @@ impl DeclarationTransformer {
         let retained_clauses: Vec<Node> = types
             .iter()
             .filter(|&t| {
-                is_entity_name_expression(t.expression())
+                // Go: the element is an ExpressionWithTypeArguments or a TypeReference (tsgo#4797).
+                let name = get_heritage_clause_element_name(t);
+                is_entity_name(name)
+                    || is_entity_name_expression(name)
                     || (clause.token() == SyntaxKind::ExtendsKeyword
+                        && is_expression_with_type_arguments(t)
                         && t.expression().kind() == SyntaxKind::NullKeyword)
             })
             .collect();

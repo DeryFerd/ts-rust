@@ -16,35 +16,54 @@ use crate::ls::prelude::*;
 use crate::frontend::parser::ParsedSourceFile;
 use crate::frontend::stringutil_ls;
 use crate::gostd::unicode;
+use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/symbols.go:24 ProvideDocumentSymbols
+    // Go: ls/symbols.go:25 ProvideDocumentSymbols
     pub fn provide_document_symbols(
         &self,
         ctx: &Context,
         document_uri: &lsproto::DocumentUri,
     ) -> Result<lsproto::DocumentSymbolResponse, GoError> {
         let (_, file) = self.get_program_and_file(document_uri);
+        let projections = std::iter::once(file)
+            .chain(source_file_supplemental_source_files(file).iter().copied());
+        let mut symbols: Vec<DocSymbol> = Vec::new();
+        // PORT: Go keys `seen` by an anonymous struct {name, kind, rng}; a tuple
+        // here.
+        let mut seen: FxHashSet<(String, lsproto::SymbolKind, lsproto::Range)> =
+            FxHashSet::default();
+        for projection in projections {
+            for symbol in self.get_document_symbols_for_children(ctx, projection, projection) {
+                let key = {
+                    let s = symbol.borrow();
+                    (s.name.clone(), s.kind, s.range)
+                };
+                if seen.insert(key) {
+                    symbols.push(symbol);
+                }
+            }
+        }
+        let symbols = doc_symbols_to_lsp(&symbols);
         if lsproto::get_client_capabilities(ctx)
             .text_document
             .document_symbol
             .hierarchical_document_symbol_support
         {
-            let symbols = self.get_document_symbols_for_children(ctx, file, file);
             return Ok(lsproto::SymbolInformationsOrDocumentSymbolsOrNull {
-                document_symbols: Some(doc_symbols_to_lsp(&symbols)),
+                document_symbols: Some(symbols),
                 ..Default::default()
             });
         }
         // Client doesn't support hierarchical document symbols, return flat SymbolInformation array
-        let symbol_infos = self.get_document_symbol_informations(ctx, file, document_uri);
+        let symbol_infos = flatten_document_symbols(&symbols, document_uri);
         Ok(lsproto::SymbolInformationsOrDocumentSymbolsOrNull {
             symbol_informations: Some(symbol_infos),
             ..Default::default()
         })
     }
 
-    // Go: ls/symbols.go:40 getDocumentSymbolInformations
+    // Go: ls/symbols.go:59 getDocumentSymbolInformations
     // getDocumentSymbolInformations converts hierarchical DocumentSymbols to a flat SymbolInformation array
     pub fn get_document_symbol_informations(
         &self,
@@ -55,44 +74,10 @@ impl LanguageService {
         // First get hierarchical symbols
         let doc_symbols =
             doc_symbols_to_lsp(&self.get_document_symbols_for_children(ctx, file, file));
-
-        // Flatten the hierarchy
-        // PORT: the recursive Go closure `flatten` is a nested fn that takes
-        // the captured `result` and `documentURI`.
-        fn flatten(
-            result: &mut Vec<lsproto::SymbolInformation>,
-            document_uri: &lsproto::DocumentUri,
-            symbols: &[lsproto::DocumentSymbol],
-            container_name: Option<&String>,
-        ) {
-            for symbol in symbols {
-                let info = lsproto::SymbolInformation {
-                    name: symbol.name.clone(),
-                    kind: symbol.kind,
-                    location: lsproto::Location {
-                        uri: document_uri.clone(),
-                        range: symbol.range,
-                    },
-                    container_name: container_name.cloned(),
-                    tags: symbol.tags.clone(),
-                    deprecated: symbol.deprecated,
-                };
-                result.push(info);
-
-                // Recursively flatten children with this symbol as container
-                if let Some(children) = &symbol.children {
-                    if !children.is_empty() {
-                        flatten(result, document_uri, children, Some(&symbol.name));
-                    }
-                }
-            }
-        }
-        let mut result: Vec<lsproto::SymbolInformation> = Vec::new();
-        flatten(&mut result, document_uri, &doc_symbols, None);
-        result
+        flatten_document_symbols(&doc_symbols, document_uri)
     }
 
-    // Go: ls/symbols.go:72 getDocumentSymbolsForChildren
+    // Go: ls/symbols.go:94 getDocumentSymbolsForChildren
     fn get_document_symbols_for_children(
         &self,
         ctx: &Context,
@@ -112,6 +97,47 @@ impl LanguageService {
         node.for_each_child(|child| visitor.visit(child));
         merge_expandos(visitor.symbols)
     }
+}
+
+// Go: ls/symbols.go:65 flattenDocumentSymbols
+pub fn flatten_document_symbols(
+    doc_symbols: &[lsproto::DocumentSymbol],
+    document_uri: &lsproto::DocumentUri,
+) -> Vec<lsproto::SymbolInformation> {
+    // Flatten the hierarchy
+    // PORT: the recursive Go closure `flatten` is a nested fn that takes
+    // the captured `result` and `documentURI`.
+    fn flatten(
+        result: &mut Vec<lsproto::SymbolInformation>,
+        document_uri: &lsproto::DocumentUri,
+        symbols: &[lsproto::DocumentSymbol],
+        container_name: Option<&String>,
+    ) {
+        for symbol in symbols {
+            let info = lsproto::SymbolInformation {
+                name: symbol.name.clone(),
+                kind: symbol.kind,
+                location: lsproto::Location {
+                    uri: document_uri.clone(),
+                    range: symbol.range,
+                },
+                container_name: container_name.cloned(),
+                tags: symbol.tags.clone(),
+                deprecated: symbol.deprecated,
+            };
+            result.push(info);
+
+            // Recursively flatten children with this symbol as container
+            if let Some(children) = &symbol.children {
+                if !children.is_empty() {
+                    flatten(result, document_uri, children, Some(&symbol.name));
+                }
+            }
+        }
+    }
+    let mut result: Vec<lsproto::SymbolInformation> = Vec::new();
+    flatten(&mut result, document_uri, doc_symbols, None);
+    result
 }
 
 // PORT: Go `*lsproto.DocumentSymbol` while the tree is built and merged (see
@@ -151,7 +177,7 @@ fn doc_symbols_to_lsp(symbols: &[DocSymbol]) -> Vec<lsproto::DocumentSymbol> {
         .collect()
 }
 
-// Go: ls/symbols.go:72 (the state of the closures in getDocumentSymbolsForChildren)
+// Go: ls/symbols.go:94 (the state of the closures in getDocumentSymbolsForChildren)
 struct DocumentSymbolsVisitor<'a> {
     ls: &'a LanguageService,
     ctx: &'a Context,
@@ -170,7 +196,7 @@ struct EndNode {
 }
 
 impl DocumentSymbolsVisitor<'_> {
-    // Go: ls/symbols.go:75 addSymbolForNode
+    // Go: ls/symbols.go:97 addSymbolForNode
     fn add_symbol_for_node(&mut self, node: Node, name: Node, children: Vec<DocSymbol>) {
         if !node.flags().intersects(NodeFlags::REPARSED) {
             let symbol = self.ls.new_document_symbol(node, name, children);
@@ -180,7 +206,7 @@ impl DocumentSymbolsVisitor<'_> {
         }
     }
 
-    // Go: ls/symbols.go:84 getSymbolsForChildren
+    // Go: ls/symbols.go:106 getSymbolsForChildren
     fn get_symbols_for_children(&mut self, node: Node) -> Vec<DocSymbol> {
         let mut result: Vec<DocSymbol> = Vec::new();
         if node.is_some() {
@@ -193,7 +219,7 @@ impl DocumentSymbolsVisitor<'_> {
         result
     }
 
-    // Go: ls/symbols.go:98 startNode
+    // Go: ls/symbols.go:120 startNode
     fn start_node(&mut self, node: Node, name: Node) -> Option<EndNode> {
         if node.is_nil() {
             return None;
@@ -208,7 +234,7 @@ impl DocumentSymbolsVisitor<'_> {
         })
     }
 
-    // Go: ls/symbols.go:106 (the func returned by startNode)
+    // Go: ls/symbols.go:128 (the func returned by startNode)
     fn end_node(&mut self, end: Option<EndNode>) {
         let Some(end) = end else {
             return;
@@ -218,7 +244,7 @@ impl DocumentSymbolsVisitor<'_> {
         self.add_symbol_for_node(end.node, end.name, result);
     }
 
-    // Go: ls/symbols.go:113 getSymbolsForNode
+    // Go: ls/symbols.go:135 getSymbolsForNode
     fn get_symbols_for_node(&mut self, node: Node) -> Vec<DocSymbol> {
         let mut result: Vec<DocSymbol> = Vec::new();
         if node.is_some() {
@@ -229,7 +255,7 @@ impl DocumentSymbolsVisitor<'_> {
         result
     }
 
-    // Go: ls/symbols.go:124 visit
+    // Go: ls/symbols.go:146 visit
     fn visit(&mut self, node: Node) -> bool {
         if self.ctx.err().is_some() {
             return true;
@@ -436,7 +462,7 @@ impl DocumentSymbolsVisitor<'_> {
     }
 }
 
-// Go: ls/symbols.go:260 isPrototypeExpando
+// Go: ls/symbols.go:282 isPrototypeExpando
 // Target is `f.prototype`.
 pub fn is_prototype_expando(target: Node) -> bool {
     if is_access_expression(target) {
@@ -446,11 +472,11 @@ pub fn is_prototype_expando(target: Node) -> bool {
     false
 }
 
-// Go: ls/symbols.go:268 maxLength
+// Go: ls/symbols.go:290 maxLength
 const MAX_LENGTH: i32 = 150;
 
 impl LanguageService {
-    // Go: ls/symbols.go:270 newDocumentSymbol
+    // Go: ls/symbols.go:292 newDocumentSymbol
     // PORT: Go returns a nil `*lsproto.DocumentSymbol` as `None`.
     fn new_document_symbol(
         &self,
@@ -499,22 +525,22 @@ impl LanguageService {
         if truncated_text.len() < text.len() {
             text = truncated_text + "...";
         }
-        let range = lsproto::Range {
-            start: self
-                .converters
-                .position_to_line_and_character(&file, node_start_pos),
-            end: self
-                .converters
-                .position_to_line_and_character(&file, node.end()),
-        };
-        let selection_range = lsproto::Range {
-            start: self
-                .converters
-                .position_to_line_and_character(&file, name_start_pos),
-            end: self
-                .converters
-                .position_to_line_and_character(&file, name_end_pos),
-        };
+        let (selection_range, selection_fidelity) = self.converters.to_lsp_range_for_feature(
+            &file,
+            TextRange::new(name_start_pos, name_end_pos),
+            Feature::DOCUMENT_SYMBOLS,
+        );
+        if !selection_fidelity.is_single_segment() {
+            return None;
+        }
+        let (mut range, range_fidelity) = self.converters.to_lsp_range_for_feature(
+            &file,
+            TextRange::new(node_start_pos, node.end()),
+            Feature::DOCUMENT_SYMBOLS,
+        );
+        if range_fidelity.is_none() {
+            range = selection_range;
+        }
         // PORT: Go turns a nil `children` into an empty slice; an empty `Vec`
         // is both here.
         Some(Rc::new(RefCell::new(DocumentSymbolNode {
@@ -530,7 +556,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/symbols.go:327 mergeExpandos
+// Go: ls/symbols.go:351 mergeExpandos
 // Merges expando symbols into their target symbols, and namespaces of same name.
 // Modifies the input slice.
 // PORT: Go sets merged entries of the input slice to nil; here the input is
@@ -624,7 +650,7 @@ fn merge_expandos(symbols: Vec<DocSymbol>) -> Vec<DocSymbol> {
     merged_symbols
 }
 
-// Go: ls/symbols.go:386 mergeChildren
+// Go: ls/symbols.go:410 mergeChildren
 fn merge_children(target: &DocSymbol, source: &DocSymbol) {
     // PORT: copy the child lists out so no `RefCell` borrow is held while
     // `merge_expandos` borrows the children.
@@ -647,7 +673,7 @@ fn merge_children(target: &DocSymbol, source: &DocSymbol) {
     }
 }
 
-// Go: ls/symbols.go:400 isAnonymousName
+// Go: ls/symbols.go:424 isAnonymousName
 // See `getUnnamedNodeLabel`.
 pub fn is_anonymous_name(name: &str) -> bool {
     name == "<function>"
@@ -661,7 +687,7 @@ pub fn is_anonymous_name(name: &str) -> bool {
         || name.ends_with(") callback")
 }
 
-// Go: ls/symbols.go:405 getTextOfName
+// Go: ls/symbols.go:429 getTextOfName
 pub fn get_text_of_name(node: Node) -> String {
     match node.kind() {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::NumericLiteral => {
@@ -683,7 +709,7 @@ pub fn get_text_of_name(node: Node) -> String {
     get_text_of_node(node)
 }
 
-// Go: ls/symbols.go:421 getUnnamedNodeLabel
+// Go: ls/symbols.go:445 getUnnamedNodeLabel
 pub fn get_unnamed_node_label(node: Node) -> String {
     let parent = walk_up_parenthesized_expressions(node.parent());
     if parent.is_some() && is_export_assignment(parent) {
@@ -727,7 +753,7 @@ pub fn get_unnamed_node_label(node: Node) -> String {
     }
 }
 
-// Go: ls/symbols.go:462 getCallExpressionName
+// Go: ls/symbols.go:486 getCallExpressionName
 pub fn get_call_expression_name(node: Node) -> String {
     match node.kind() {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
@@ -746,7 +772,7 @@ pub fn get_call_expression_name(node: Node) -> String {
     String::new()
 }
 
-// Go: ls/symbols.go:477 getCallExpressionLiteralArgs
+// Go: ls/symbols.go:501 getCallExpressionLiteralArgs
 pub fn get_call_expression_literal_args(call_expr: Node) -> String {
     let mut parts: Vec<String> = Vec::new();
     for arg in call_expr.arguments() {
@@ -757,7 +783,7 @@ pub fn get_call_expression_literal_args(call_expr: Node) -> String {
     parts.join(", ")
 }
 
-// Go: ls/symbols.go:487 cleanCallbackText
+// Go: ls/symbols.go:511 cleanCallbackText
 pub fn clean_callback_text(text: &str) -> String {
     let mut text = text.to_string();
     let truncated = stringutil_ls::truncate_by_runes(&text, MAX_LENGTH);
@@ -768,7 +794,7 @@ pub fn clean_callback_text(text: &str) -> String {
     text.chars().filter(|&r| !is_line_break(r)).collect()
 }
 
-// Go: ls/symbols.go:500 getInteriorModule
+// Go: ls/symbols.go:524 getInteriorModule
 pub fn get_interior_module(node: Node) -> Node {
     let mut node = node;
     while node.body().is_some() && is_module_declaration(node.body()) {
@@ -777,7 +803,7 @@ pub fn get_interior_module(node: Node) -> Node {
     node
 }
 
-// Go: ls/symbols.go:507 getModuleName
+// Go: ls/symbols.go:531 getModuleName
 pub fn get_module_name(node: Node) -> String {
     let mut node = node;
     let mut result = node.name().text().to_string();
@@ -788,7 +814,7 @@ pub fn get_module_name(node: Node) -> String {
     result
 }
 
-// Go: ls/symbols.go:516 DeclarationInfo
+// Go: ls/symbols.go:540 DeclarationInfo
 #[derive(Clone, Debug)]
 pub struct DeclarationInfo {
     pub name: String,
@@ -796,7 +822,7 @@ pub struct DeclarationInfo {
     pub match_score: i32,
 }
 
-// Go: ls/symbols.go:522 ProvideWorkspaceSymbols
+// Go: ls/symbols.go:546 ProvideWorkspaceSymbols
 // PORT: Go `[]*compiler.Program` is `&[Rc<compiler::NewProgram>]`, Go
 // `*lsconv.Converters` is `&lsconv::Converters`, and the preferences are
 // passed by reference.
@@ -864,10 +890,19 @@ pub fn provide_workspace_symbols(
         let name_start =
             astnav::get_start_of_node(name_node, source_file, false /*includeJsDoc*/);
         let name_range = TextRange::new(name_start, name_node.end());
+        let (location, fidelity) = converters.to_lsp_location_for_feature(
+            &source_file,
+            name_range,
+            Feature::DOCUMENT_SYMBOLS,
+        );
+        if !fidelity.is_single_segment() {
+            // The name has no counterpart in the original text, so there is nothing to navigate to.
+            continue;
+        }
         let mut symbol = lsproto::SymbolInformation::default();
         symbol.name = info.name.clone();
         symbol.kind = get_symbol_kind_from_node(info.declaration);
-        symbol.location = converters.to_lsp_location(&source_file, name_range);
+        symbol.location = location;
         symbol.container_name = container_name;
         symbols.push(symbol);
     }
@@ -878,7 +913,7 @@ pub fn provide_workspace_symbols(
     })
 }
 
-// Go: ls/symbols.go:586 shouldExcludeFile
+// Go: ls/symbols.go:615 shouldExcludeFile
 // PORT: Go takes the `*ast.SourceFile`; `NewProgram::is_lib_file` takes the
 // parsed file, so this does too.
 pub fn should_exclude_file(
@@ -890,12 +925,12 @@ pub fn should_exclude_file(
         && (is_inside_node_modules(file.file_name()) || program.is_lib_file(file))
 }
 
-// Go: ls/symbols.go:590 isInsideNodeModules
+// Go: ls/symbols.go:619 isInsideNodeModules
 pub fn is_inside_node_modules(file_name: &str) -> bool {
     file_name.contains("/node_modules/")
 }
 
-// Go: ls/symbols.go:599 getMatchScore
+// Go: ls/symbols.go:628 getMatchScore
 // Return a score for matching `s` against `pattern`. In order to match, `s` must contain each of the characters in
 // `pattern` in the same order. Upper case characters in `pattern` must match exactly, whereas lower case characters
 // in `pattern` match either case in `s`. If `s` doesn't match, -1 is returned. Otherwise, the returned score is the
@@ -936,7 +971,7 @@ fn unicode_is_upper(c: char) -> bool {
     )
 }
 
-// Go: ls/symbols.go:620 compareDeclarationInfos
+// Go: ls/symbols.go:649 compareDeclarationInfos
 // Sort DeclarationInfos by ascending match score, then ascending case insensitive name, then
 // ascending case sensitive name, and finally by source file name and position.
 pub fn compare_declaration_infos(d1: &DeclarationInfo, d2: &DeclarationInfo) -> i32 {
@@ -962,7 +997,7 @@ pub fn compare_declaration_infos(d1: &DeclarationInfo, d2: &DeclarationInfo) -> 
     d1.declaration.pos() - d2.declaration.pos()
 }
 
-// Go: ls/symbols.go:640 getSymbolKindFromNode
+// Go: ls/symbols.go:669 getSymbolKindFromNode
 // getSymbolKindFromNode converts an AST node to an LSP SymbolKind.
 // Combines getNodeKind with VS Code's fromProtocolScriptElementKind.
 pub fn get_symbol_kind_from_node(node: Node) -> lsproto::SymbolKind {

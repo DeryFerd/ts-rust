@@ -1,5 +1,6 @@
 //! Port of Go `internal/ls/autoimport/registry_test.go` (`TestRegistryLifecycle`,
-//! `TestHiddenDirectoriesInNodeModules`, `TestAutoImportEntrypointDirectorySearch`).
+//! `TestContentMappedNodeModulesFileUsesProjectBucket`, `TestHiddenDirectoriesInNodeModules`,
+//! `TestAutoImportEntrypointDirectorySearch`, `TestUpdateIndexesConcurrentMapSafety`).
 
 use std::rc::Rc;
 
@@ -9,20 +10,20 @@ use ts_goport::ls::lsconv;
 use ts_goport::ls::lsutil;
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
-use ts_goport::project::Session;
+use ts_goport::project::{self, Session, SessionOptions};
 
 use super::autoimporttestutil::{
     self, MonorepoPackageConfig, MonorepoPackageTemplate, MonorepoSetupConfig, TextFileSpec,
 };
-use super::projecttestutil::{self, FileMap, files};
+use super::projecttestutil::{self, FileMap, TypingsInstallerOptions, files};
 use super::util::*;
-use crate::support::vfstest;
+use crate::support::{contentmappertest, vfstest};
 
-// Go: registry_test.go:1127 lifecycleProjectRoot, monorepoProjectRoot
+// Go: registry_test.go:1234 lifecycleProjectRoot, monorepoProjectRoot
 const LIFECYCLE_PROJECT_ROOT: &str = "/home/src/autoimport-lifecycle";
 const MONOREPO_PROJECT_ROOT: &str = "/home/src/autoimport-monorepo";
 
-// Go: registry_test.go:1132 autoImportStats
+// Go: registry_test.go:1274 autoImportStats
 fn auto_import_stats(session: &Rc<Session>) -> CacheStats {
     let snapshot = session.snapshot();
     let registry = snapshot
@@ -31,7 +32,7 @@ fn auto_import_stats(session: &Rc<Session>) -> CacheStats {
     registry.get_cache_stats()
 }
 
-// Go: registry_test.go:1142 singleBucket
+// Go: registry_test.go:1284 singleBucket
 fn single_bucket(buckets: &[BucketStats]) -> BucketStats {
     assert_eq!(buckets.len(), 1, "expected 1 bucket, got {}", buckets.len());
     buckets[0].clone()
@@ -140,7 +141,7 @@ fn template(
 }
 
 child_test! {
-    // Go: registry_test.go:26 TestRegistryLifecycle/builds project and node_modules buckets
+    // Go: registry_test.go:27 TestRegistryLifecycle/builds project and node_modules buckets
     fn builds_project_and_node_modules_buckets() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -168,7 +169,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:54 TestRegistryLifecycle/bucket does not rebuild on same-file change
+    // Go: registry_test.go:55 TestRegistryLifecycle/bucket does not rebuild on same-file change
     fn bucket_does_not_rebuild_on_same_file_change() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 2);
         let session = fixture.session();
@@ -210,7 +211,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:102 TestRegistryLifecycle/bucket updates on same-file change when new files added to the program
+    // Go: registry_test.go:103 TestRegistryLifecycle/bucket updates on same-file change when new files added to the program
     fn bucket_updates_on_same_file_change_when_new_files_added_to_the_program() {
         let project_root = "/home/src/explicit-files-project";
         let tsconfig = format!("{project_root}/tsconfig.json");
@@ -254,7 +255,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:146 TestRegistryLifecycle/package.json dependency changes invalidate node_modules buckets
+    // Go: registry_test.go:147 TestRegistryLifecycle/package.json dependency changes invalidate node_modules buckets
     fn package_json_dependency_changes_invalidate_node_modules_buckets() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -301,7 +302,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:188 TestRegistryLifecycle/node_modules buckets get deleted when no open files can reference them
+    // Go: registry_test.go:189 TestRegistryLifecycle/node_modules buckets get deleted when no open files can reference them
     fn node_modules_buckets_get_deleted_when_no_open_files_can_reference_them() {
         let fixture = autoimporttestutil::setup_monorepo_lifecycle_session(MonorepoSetupConfig {
             root: MONOREPO_PROJECT_ROOT.to_string(),
@@ -344,7 +345,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:231 TestRegistryLifecycle/deleting node_modules leaves the registry prepared for importing
+    // Go: registry_test.go:232 TestRegistryLifecycle/deleting node_modules leaves the registry prepared for importing
     fn deleting_node_modules_leaves_the_registry_prepared_for_importing() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -387,7 +388,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:280 TestRegistryLifecycle/deleting node_modules alongside a package.json change removes the bucket
+    // Go: registry_test.go:281 TestRegistryLifecycle/deleting node_modules alongside a package.json change removes the bucket
     fn deleting_node_modules_alongside_a_package_json_change_removes_the_bucket() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -433,7 +434,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:323 TestRegistryLifecycle/deleting a package directory inside node_modules invalidates the bucket
+    // Go: registry_test.go:324 TestRegistryLifecycle/deleting a package directory inside node_modules invalidates the bucket
     fn deleting_a_package_directory_inside_node_modules_invalidates_the_bucket() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -462,7 +463,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:352 TestRegistryLifecycle/node_modules bucket dependency selection changes with open files
+    // Go: registry_test.go:353 TestRegistryLifecycle/node_modules bucket dependency selection changes with open files
     fn node_modules_bucket_dependency_selection_changes_with_open_files() {
         let monorepo_root = "/home/src/monorepo";
         let package_a_dir = tspath::combine_paths(monorepo_root, &["packages", "a"]);
@@ -523,7 +524,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:416 TestRegistryLifecycle/node_modules bucket includes resolved packages from all projects
+    // Go: registry_test.go:417 TestRegistryLifecycle/node_modules bucket includes resolved packages from all projects
     fn node_modules_bucket_includes_resolved_packages_from_all_projects() {
         let monorepo_root = "/home/src/cross-project-deps";
         let package_a_dir = tspath::combine_paths(monorepo_root, &["packages", "a"]);
@@ -678,7 +679,7 @@ fn file_text(files: &FileMap, name: &str) -> String {
 }
 
 child_test! {
-    // Go: registry_test.go:495 TestRegistryLifecycle/symlinked monorepo invalidates on source file change
+    // Go: registry_test.go:496 TestRegistryLifecycle/symlinked monorepo invalidates on source file change
     fn symlinked_monorepo_invalidates_on_source_file_change() {
         let monorepo_root = "/home/src/symlinked-monorepo-invalidation";
         let project_a_dir = tspath::combine_paths(monorepo_root, &["packages", "project-a"]);
@@ -746,7 +747,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:626 TestRegistryLifecycle/pnpm-style symlinks only grant granular updates to workspace packages
+    // Go: registry_test.go:627 TestRegistryLifecycle/pnpm-style symlinks only grant granular updates to workspace packages
     fn pnpm_style_symlinks_only_grant_granular_updates_to_workspace_packages() {
         let monorepo_root = "/home/src/pnpm-monorepo";
         let project_a_dir = tspath::combine_paths(monorepo_root, &["packages", "project-a"]);
@@ -860,7 +861,90 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:783 TestRegistryLifecycle/changed fileExcludePatterns triggers bucket rebuild
+    // Go: registry_test.go:784 TestRegistryLifecycle/circular workspace symlinks do not exclude local project files
+    fn circular_workspace_symlinks_do_not_exclude_local_project_files() {
+        let monorepo_root = "/home/src/circular-workspaces";
+        let package_a_dir = tspath::combine_paths(monorepo_root, &["packages", "pkg-a"]);
+        let package_b_dir = tspath::combine_paths(monorepo_root, &["packages", "pkg-b"]);
+        let consumer_a = tspath::combine_paths(&package_a_dir, &["consumer.ts"]);
+        let helper_a = tspath::combine_paths(&package_a_dir, &["helper.ts"]);
+
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            tspath::combine_paths(&package_a_dir, &["tsconfig.json"]),
+            r#"{
+				"compilerOptions": {
+					"module": "esnext",
+					"strict": true
+				}
+			}"#,
+        );
+        add(
+            tspath::combine_paths(&package_a_dir, &["package.json"]),
+            r#"{
+				"name": "pkg-a",
+				"dependencies": { "pkg-b": "*" }
+			}"#,
+        );
+        add(
+            tspath::combine_paths(&package_a_dir, &["index.ts"]),
+            "import { b } from \"pkg-b\";\nexport const a = b;\n",
+        );
+        add(
+            consumer_a.clone(),
+            "export const usesHelper = uniqueHelperValueFromHelperA;\n",
+        );
+        add(helper_a, "export const uniqueHelperValueFromHelperA = 1;\n");
+        add(
+            tspath::combine_paths(&package_b_dir, &["tsconfig.json"]),
+            r#"{
+				"compilerOptions": {
+					"module": "esnext",
+					"strict": true
+				}
+			}"#,
+        );
+        add(
+            tspath::combine_paths(&package_b_dir, &["package.json"]),
+            r#"{
+				"name": "pkg-b",
+				"dependencies": { "pkg-a": "*" }
+			}"#,
+        );
+        add(
+            tspath::combine_paths(&package_b_dir, &["index.ts"]),
+            "import { a } from \"pkg-a\";\nexport const b = a;\n",
+        );
+        // Circular workspace links
+        files.insert(
+            tspath::combine_paths(&package_a_dir, &["node_modules", "pkg-b"]),
+            vfstest::symlink(&package_b_dir),
+        );
+        files.insert(
+            tspath::combine_paths(&package_b_dir, &["node_modules", "pkg-a"]),
+            vfstest::symlink(&package_a_dir),
+        );
+
+        let (session, _) = projecttestutil::setup(files.clone());
+        let consumer_a_uri = lsconv::file_name_to_document_uri(&consumer_a);
+        open_uri(&session, &consumer_a_uri, &file_text(&files, &consumer_a), lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &consumer_a_uri);
+
+        let stats = auto_import_stats(&session);
+        let project_bucket = single_bucket(&stats.project_buckets);
+        assert_eq!(
+            3, project_bucket.file_count,
+            "expected all pkg-a project files despite circular workspace symlinks"
+        );
+    }
+}
+
+child_test! {
+    // Go: registry_test.go:843 TestRegistryLifecycle/changed fileExcludePatterns triggers bucket rebuild
     fn changed_file_exclude_patterns_triggers_bucket_rebuild() {
         let fixture = autoimporttestutil::setup_lifecycle_session(LIFECYCLE_PROJECT_ROOT, 1);
         let session = fixture.session();
@@ -900,7 +984,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:837 TestRegistryLifecycle/dedupes packages that resolve to same realpath across ancestor node_modules buckets
+    // Go: registry_test.go:897 TestRegistryLifecycle/dedupes packages that resolve to same realpath across ancestor node_modules buckets
     fn dedupes_packages_that_resolve_to_same_realpath_across_ancestor_node_modules_buckets() {
         let repo_root = "/home/src/autoimport-realpath-dedupe";
         let app_dir = tspath::combine_paths(repo_root, &["apps", "web"]);
@@ -985,7 +1069,75 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:900 TestHiddenDirectoriesInNodeModules/deep import through subdirectory package.json in hidden store
+    // Go: registry_test.go:958 TestContentMappedNodeModulesFileUsesProjectBucket
+    // PORT: Go `bundled.Embedded` is always true in the port, so the skip is dropped.
+    fn content_mapped_node_modules_file_uses_project_bucket() {
+        const MAIN_TEXT: &str = "profileTitle;";
+        let mapper_package_json = contentmappertest::package_json(contentmappertest::COMPONENT_MAPPER);
+        let files = files(&[
+            (
+                "/home/project/tsconfig.json",
+                r#"{
+			"compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "strict": true, "skipLibCheck": true },
+			"contentMappers": [ { "package": "mapper", "extensions": [".vue"] } ]
+		}"#,
+            ),
+            ("/home/project/node_modules/mapper/package.json", mapper_package_json.as_str()),
+            (
+                "/home/project/node_modules/profile-package/ProfileCard.vue",
+                r#"<component name="ProfileCard">
+<script lang="ts">
+export const profileTitle = "Profile";
+</script>"#,
+            ),
+            (
+                "/home/project/node_modules/profile-package/HiddenCard.vue",
+                r#"<component name="HiddenCard">
+<script lang="ts">
+export const hiddenTitle = "Hidden";
+</script>"#,
+            ),
+            ("/home/project/node_modules/profile-package/ordinary.ts", "export const ordinary = true;"),
+            (
+                "/home/project/load.ts",
+                r#"import "profile-package/ProfileCard.vue";
+import "profile-package/ordinary";"#,
+            ),
+            ("/home/project/main.ts", MAIN_TEXT),
+        ]);
+        // PORT: the Go literal names 5 fields; the others are Go zero values
+        // (`watch_enabled` and `logging_enabled` false). Go nil `tiOptions`
+        // is the default `TypingsInstallerOptions`.
+        let (mut init, _) = projecttestutil::get_session_init_options(
+            files,
+            Some(SessionOptions {
+                run_external_code: true,
+                watch_enabled: false,
+                logging_enabled: false,
+                ..projecttestutil::session_options("/home/project")
+            }),
+            TypingsInstallerOptions::default(),
+        );
+        init.spawner = Some(contentmappertest::new_spawner());
+        let session = project::new_session(&init);
+
+        let main_uri = uri("file:///home/project/main.ts");
+        open_uri(&session, &main_uri, MAIN_TEXT, lsproto::LanguageKind::TYPE_SCRIPT);
+        with_auto_imports(&session, &main_uri);
+        session.wait_for_background_tasks();
+
+        let project_bucket = single_bucket(&auto_import_stats(&session).project_buckets);
+        assert_eq!(
+            project_bucket.file_count, 3,
+            "expected the two project roots and referenced mapped package file"
+        );
+        // Go: defer session.Close()
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: registry_test.go:1007 TestHiddenDirectoriesInNodeModules/deep import through subdirectory package.json in hidden store
     fn deep_import_through_subdirectory_package_json_in_hidden_store() {
         let project_root = "/home/src/fuse-project";
         let store_dir = format!("{project_root}/node_modules/.yarn-store");
@@ -1087,7 +1239,7 @@ child_test! {
     }
 }
 
-// Go: registry_test.go:983 TestAutoImportEntrypointDirectorySearch (files)
+// Go: registry_test.go:1090 TestAutoImportEntrypointDirectorySearch (files)
 const ENTRYPOINT_ROOT: &str = "/home/src/entrypoint-search";
 
 fn entrypoint_files() -> FileMap {
@@ -1149,7 +1301,7 @@ fn directory_search_prefs() -> lsutil::UserPreferences {
 }
 
 child_test! {
-    // Go: registry_test.go:1012 TestAutoImportEntrypointDirectorySearch/default limits to main entrypoint
+    // Go: registry_test.go:1119 TestAutoImportEntrypointDirectorySearch/default limits to main entrypoint
     fn entrypoint_default_limits_to_main_entrypoint() {
         let (session, _) = projecttestutil::setup(entrypoint_files());
         let index_uri = entrypoint_index_uri();
@@ -1168,7 +1320,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:1030 TestAutoImportEntrypointDirectorySearch/autoImportEntrypointDirectorySearch enables all files
+    // Go: registry_test.go:1137 TestAutoImportEntrypointDirectorySearch/autoImportEntrypointDirectorySearch enables all files
     fn entrypoint_auto_import_entrypoint_directory_search_enables_all_files() {
         let (session, _) = projecttestutil::setup(entrypoint_files());
         session.configure(directory_search_prefs());
@@ -1186,7 +1338,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:1052 TestAutoImportEntrypointDirectorySearch/changing preference triggers rebuild
+    // Go: registry_test.go:1159 TestAutoImportEntrypointDirectorySearch/changing preference triggers rebuild
     fn entrypoint_changing_preference_triggers_rebuild() {
         let (session, _) = projecttestutil::setup(entrypoint_files());
         let index_uri = entrypoint_index_uri();
@@ -1226,7 +1378,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: registry_test.go:1093 TestAutoImportEntrypointDirectorySearch/deep import from program update enables recursive search for that package
+    // Go: registry_test.go:1200 TestAutoImportEntrypointDirectorySearch/deep import from program update enables recursive search for that package
     fn entrypoint_deep_import_from_program_update_enables_recursive_search_for_that_package() {
         let (session, _) = projecttestutil::setup(entrypoint_files());
         let index_uri = entrypoint_index_uri();
@@ -1260,5 +1412,50 @@ child_test! {
             file_count >= 4,
             "expected at least 4 files after deep import triggers recursive search, got {file_count}"
         );
+    }
+}
+
+child_test! {
+    // Go: registry_test.go:1239 TestUpdateIndexesConcurrentMapSafety
+    fn update_indexes_concurrent_map_safety() {
+        const PROJECT_ROOT: &str = "/home/src/autoimport-fallback-race";
+        const PACKAGE_COUNT: i32 = 40;
+
+        let mut files = FileMap::new();
+        files.insert(
+            format!("{PROJECT_ROOT}/tsconfig.json"),
+            r#"{
+			"compilerOptions": { "module": "esnext", "target": "esnext", "strict": true }
+		}"#.into(),
+        );
+        files.insert(format!("{PROJECT_ROOT}/index.ts"), "export {};\n".into());
+        for i in 0..PACKAGE_COUNT {
+            let pkg_dir = format!("{PROJECT_ROOT}/node_modules/pkg{i}");
+            files.insert(
+                format!("{pkg_dir}/package.json"),
+                format!(r#"{{"name":"pkg{i}","version":"1.0.0","main":"index.js"}}"#).into(),
+            );
+            files.insert(format!("{pkg_dir}/index.js"), "module.exports = {};\n".into());
+            let types_dir = format!("{PROJECT_ROOT}/node_modules/@types/pkg{i}");
+            files.insert(
+                format!("{types_dir}/package.json"),
+                format!(r#"{{"name":"@types/pkg{i}","version":"1.0.0","types":"index.d.ts"}}"#).into(),
+            );
+            files.insert(
+                format!("{types_dir}/index.d.ts"),
+                format!("export declare const foo{i}: number;\n").into(),
+            );
+        }
+
+        let (session, _) = projecttestutil::setup(files);
+
+        let index_uri = uri(&format!("file://{PROJECT_ROOT}/index.ts"));
+        open_uri(&session, &index_uri, "export {};\n", lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &index_uri);
+
+        let stats = auto_import_stats(&session);
+        let node_modules_bucket = single_bucket(&stats.node_modules_buckets);
+        assert_eq!(node_modules_bucket.export_count, PACKAGE_COUNT);
     }
 }

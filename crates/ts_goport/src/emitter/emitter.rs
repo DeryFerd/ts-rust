@@ -7,7 +7,10 @@
 use crate::prelude::*;
 
 use super::program_emit::{EmitResult, PoolJsPart, SourceMapEmitResult, WriteFile, WriteFileData};
-use crate::declarations::DeclarationTransformer;
+use crate::declarations::{
+    DeclarationTransformer, SupplementalReferencesTransformer,
+    new_supplemental_references_transformer,
+};
 use crate::frontend::outputpaths::OutputPaths;
 use crate::frontend::outputpaths::get_source_file_path_in_new_dir;
 use crate::frontend::tspath::{
@@ -29,7 +32,8 @@ pub enum EmitOnly {
     All,
     Js,
     Dts,
-    ForcedDts,
+    // #4849: renamed from Go `EmitOnlyForcedDts`.
+    BuilderSignature,
 }
 
 // Go: compiler/emitter.go:33 emitter
@@ -43,6 +47,8 @@ pub struct Emitter {
     pub paths: OutputPaths,
     pub source_file: Node,
     pub emit_result: EmitResult,
+    // #4699
+    pub force_emit: bool,
     pub write_file: Option<WriteFile>,
     /// PORT: not in Go. Set when this emitter runs only the d.ts part of the
     /// file, on its checker thread, and the JS part runs on the emit pool
@@ -50,6 +56,34 @@ pub struct Emitter {
     /// writes, so a file's outputs are written in Go's order (JS, then
     /// d.ts), and its `WriteFileData` holds the JS diagnostics too.
     pub js_part: Option<Rc<RefCell<PoolJsPart>>>,
+}
+
+// Go: compiler/emitter.go:55 declarationTransformer (#4712)
+// PORT: renamed, because `DeclarationTransformer` is the declarations
+// transformer struct.
+trait DeclarationTransformerLike {
+    fn transform_source_file(&mut self, source_file: Node) -> Node;
+    fn get_diagnostics(&self) -> Vec<Diagnostic>;
+}
+
+impl DeclarationTransformerLike for DeclarationTransformer {
+    fn transform_source_file(&mut self, source_file: Node) -> Node {
+        self.transform_source_file_root(source_file)
+    }
+
+    fn get_diagnostics(&self) -> Vec<Diagnostic> {
+        DeclarationTransformer::get_diagnostics(self)
+    }
+}
+
+impl DeclarationTransformerLike for SupplementalReferencesTransformer {
+    fn transform_source_file(&mut self, source_file: Node) -> Node {
+        SupplementalReferencesTransformer::transform_source_file(self, source_file)
+    }
+
+    fn get_diagnostics(&self) -> Vec<Diagnostic> {
+        SupplementalReferencesTransformer::get_diagnostics(self)
+    }
 }
 
 impl Emitter {
@@ -83,21 +117,35 @@ impl Emitter {
         self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
     }
 
-    // Go: compiler/emitter.go:54 emitter.getDeclarationTransformers
+    // Go: compiler/emitter.go:60 emitter.getDeclarationTransformers
+    // #4712: takes the source file, and adds the supplemental references
+    // transformer.
     fn get_declaration_transformers(
         &self,
         emit_context: &Rc<EmitContext>,
+        source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
-    ) -> Vec<DeclarationTransformer> {
-        let transform = crate::declarations::new_declaration_transformer(
+    ) -> Vec<Box<dyn DeclarationTransformerLike>> {
+        let force_dts_emit = self.emit_only == EmitOnly::BuilderSignature
+            || self.force_emit && self.emit_only == EmitOnly::Dts;
+        let mut transformers: Vec<Box<dyn DeclarationTransformerLike>> = Vec::with_capacity(2);
+        transformers.push(Box::new(crate::declarations::new_declaration_transformer(
             self.host.clone(),
             Some(emit_context.clone()),
             options(),
             declaration_file_path,
             declaration_map_path,
-        );
-        vec![transform]
+        )));
+        // PORT: Go passes the source file, and the transformer reads its
+        // `SupplementalSourceFiles()`. The Rust transformer takes that list.
+        transformers.push(Box::new(new_supplemental_references_transformer(
+            self.host.clone(),
+            source_file_supplemental_source_files(source_file).to_vec(),
+            declaration_file_path,
+            force_dts_emit,
+        )));
+        transformers
     }
 
     // Go: compiler/emitter.go:59 emitter.runScriptTransformers
@@ -139,10 +187,11 @@ impl Emitter {
         let mut diags = Vec::new();
         for mut transformer in self.get_declaration_transformers(
             emit_context,
+            source_file,
             declaration_file_path,
             declaration_map_path,
         ) {
-            source_file = transformer.transform_source_file_root(source_file);
+            source_file = transformer.transform_source_file(source_file);
             diags.extend(transformer.get_diagnostics());
         }
         (source_file, diags)
@@ -159,8 +208,9 @@ impl Emitter {
             return;
         }
 
-        if options.no_emit == Tristate::True
-            || crate::printer::EmitHost::is_emit_blocked(self.host.as_ref(), js_file_path)
+        if !self.force_emit
+            && (options.no_emit == Tristate::True
+                || crate::printer::EmitHost::is_emit_blocked(self.host.as_ref(), js_file_path))
         {
             self.emit_result.emit_skipped = true;
             return;
@@ -235,6 +285,13 @@ impl Emitter {
         {
             return;
         }
+        // #4712
+        // Declaration files for content-mapped files don't get source maps because the mapped positions would point into
+        // transformed TS content that exists only in-memory during the build. As a future improvement, it may be possible
+        // to double-map the positions using the content-mapped file's spanmap.
+        let emit_declaration_map = self.emit_only != EmitOnly::BuilderSignature
+            && options.declaration_map.is_true()
+            && source_file_content_mapper(source_file).is_empty();
 
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -261,7 +318,8 @@ impl Emitter {
             self.emitter_diagnostics.add(elem.clone());
         }
 
-        if self.emit_only != EmitOnly::ForcedDts
+        if !self.force_emit
+            && self.emit_only != EmitOnly::BuilderSignature
             && (options.no_emit == Tristate::True
                 || crate::printer::EmitHost::is_emit_blocked(
                     self.host.as_ref(),
@@ -273,7 +331,8 @@ impl Emitter {
             return;
         }
 
-        let decl_blocked = !diags.is_empty() && self.emit_only != EmitOnly::ForcedDts;
+        let decl_blocked =
+            !diags.is_empty() && !self.force_emit && self.emit_only != EmitOnly::BuilderSignature;
         if decl_blocked {
             self.emit_result.emit_skipped = true;
             put_emit_context();
@@ -287,7 +346,7 @@ impl Emitter {
             // Module: 			   options.Module, // NYI
             // ModuleResolution:   options.ModuleResolution, // NYI
             target: options.get_emit_script_target(),
-            source_map: self.emit_only != EmitOnly::ForcedDts && options.declaration_map.is_true(),
+            source_map: emit_declaration_map,
             inline_source_map: options.inline_source_map.is_true(),
             // InlineSources:       options.InlineSources.IsTrue(), // ignored, per strada
             // ExtendedDiagnostics: options.ExtendedDiagnostics.IsTrue(), // NYI
@@ -307,9 +366,7 @@ impl Emitter {
         );
 
         let declaration_map_options = CompilerOptions {
-            source_map: if self.emit_only != EmitOnly::ForcedDts
-                && options.declaration_map.is_true()
-            {
+            source_map: if emit_declaration_map {
                 Tristate::True
             } else {
                 Tristate::False
@@ -411,12 +468,22 @@ impl Emitter {
             // Write the source map
             if !source_map_file_path.is_empty() {
                 let source_map = generator.borrow_mut().string();
-                let result = self.write_text(source_map_file_path, &source_map, None);
+                // #4699: the source map write gets the source file too.
+                let result = self.write_text(
+                    source_map_file_path,
+                    &source_map,
+                    &mut WriteFileData {
+                        source_file: self.source_file,
+                        ..WriteFileData::default()
+                    },
+                );
                 match result {
-                    Err(err) => self.emitter_diagnostics.add(new_compiler_diagnostic(
-                        diag::Could_not_write_file_0_Colon_1,
-                        args![js_file_path, err],
-                    )),
+                    Err(err) => {
+                        self.emitter_diagnostics.add(new_compiler_diagnostic(
+                            diag::Could_not_write_file_0_Colon_1,
+                            args![js_file_path, err],
+                        ));
+                    }
                     Ok(()) => self
                         .emit_result
                         .emitted_files
@@ -439,14 +506,17 @@ impl Emitter {
             build_info: None,
             diagnostics: self.write_data_diagnostics(),
             skipped_dts_write: false,
+            source_file: self.source_file,
         };
-        let result = self.write_text(js_file_path, &text, Some(&mut data));
+        let result = self.write_text(js_file_path, &text, &mut data);
         let skipped_dts_write = data.skipped_dts_write;
         match result {
-            Err(err) => self.emitter_diagnostics.add(new_compiler_diagnostic(
-                diag::Could_not_write_file_0_Colon_1,
-                args![js_file_path, err],
-            )),
+            Err(err) => {
+                self.emitter_diagnostics.add(new_compiler_diagnostic(
+                    diag::Could_not_write_file_0_Colon_1,
+                    args![js_file_path, err],
+                ));
+            }
             Ok(()) => {
                 if !skipped_dts_write {
                     self.emit_result
@@ -489,17 +559,13 @@ impl Emitter {
     }
 
     // Go: compiler/emitter.go:374 emitter.writeText
-    // PORT: Go passes a nil `*WriteFileData` for source maps; the callback
-    // gets a default one then.
     fn write_text(
         &self,
         file_name: &str,
         text: &str,
-        data: Option<&mut WriteFileData>,
+        data: &mut WriteFileData,
     ) -> Result<(), String> {
         if let Some(write_file) = &self.write_file {
-            let mut default_data = WriteFileData::default();
-            let data = data.unwrap_or(&mut default_data);
             return write_file(file_name, text, data);
         }
         crate::printer::EmitHost::write_file(self.host.as_ref(), file_name, text)

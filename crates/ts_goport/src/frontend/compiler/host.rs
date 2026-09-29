@@ -1,7 +1,9 @@
 //! Go `internal/compiler/host.go`: the compiler host that reads and parses
 //! source files and resolves project references.
 
+use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::frontend::prelude::*;
+use crate::gostd::GoError;
 
 /// Go `compiler.CompilerHost`.
 // PORT: Go `FS()` returns the `vfs.FS` interface. This returns a shared
@@ -13,6 +15,23 @@ pub trait CompilerHost {
     fn get_current_directory(&self) -> String;
     fn trace(&self, msg: &'static Message, args: Vec<String>);
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>>;
+    // GetContentMappedSourceFile produces the source file for a content-mapped (foreign) file by running
+    // the given mapper's transform on the file's content. The caller resolves the mapper (and owns the
+    // failure accounting), so implementations must use it as-is. It returns nil if the file cannot be read,
+    // or an error if the transform fails or the mapper produces invalid position mappings. Implementations
+    // may cache successful results.
+    // Go: host.go:26 CompilerHost.GetContentMappedSourceFiles (tsgo#4712)
+    // PORT: Go returns `(contentmapper.SourceFiles, error)`; a file that
+    // cannot be read is `Ok` with no canonical file.
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &SourceFileParseOptions,
+        mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError>;
+    // ContentMapperProject returns the project-scoped content mapper used by this host, or nil when the
+    // command line has no content mappers. The project owns transform identity and lifecycle state.
+    // Go: host.go:29 CompilerHost.ContentMapperProject (tsgo#4712)
+    fn content_mapper_project(&self) -> Option<Rc<dyn Project>>;
     fn get_resolved_project_reference(
         &self,
         file_name: &str,
@@ -76,17 +95,20 @@ pub struct CompilerHostImpl {
     // PORT: Go nil interface is `None`.
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: TraceFn,
+    // tsgo#4712. PORT: Go nil interface is `None`.
+    content_mapper_project: Option<Rc<dyn Project>>,
     /// `fs` is `bundled::is_wrapped_os_fs` (maybe behind the cache).
     plain_os_fs: bool,
 }
 
-// Go: host.go:34 NewCachedFSCompilerHost
+// Go: host.go:44 NewCachedFSCompilerHost
 pub fn new_cached_fs_compiler_host(
     current_directory: &str,
     fs: Rc<dyn Fs>,
     default_library_path: &str,
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
+    content_mapper_project: Option<Rc<dyn Project>>,
 ) -> Rc<dyn CompilerHost> {
     let plain_os_fs = is_wrapped_os_fs(&fs);
     new_compiler_host_with(
@@ -95,17 +117,19 @@ pub fn new_cached_fs_compiler_host(
         default_library_path,
         extended_config_cache,
         trace,
+        content_mapper_project,
         plain_os_fs,
     )
 }
 
-// Go: host.go:44 NewCompilerHost
+// Go: host.go:55 NewCompilerHost
 pub fn new_compiler_host(
     current_directory: &str,
     fs: Rc<dyn Fs>,
     default_library_path: &str,
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
+    content_mapper_project: Option<Rc<dyn Project>>,
 ) -> Rc<dyn CompilerHost> {
     let plain_os_fs = is_wrapped_os_fs(&fs);
     new_compiler_host_with(
@@ -114,6 +138,7 @@ pub fn new_compiler_host(
         default_library_path,
         extended_config_cache,
         trace,
+        content_mapper_project,
         plain_os_fs,
     )
 }
@@ -126,6 +151,7 @@ fn new_compiler_host_with(
     default_library_path: &str,
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
+    content_mapper_project: Option<Rc<dyn Project>>,
     plain_os_fs: bool,
 ) -> Rc<dyn CompilerHost> {
     // PORT: Go nil func is `None`.
@@ -136,6 +162,7 @@ fn new_compiler_host_with(
         default_library_path: default_library_path.to_string(),
         extended_config_cache,
         trace,
+        content_mapper_project,
         plain_os_fs,
     })
 }
@@ -167,7 +194,7 @@ impl CompilerHost for CompilerHostImpl {
     // data points into the text), so a file text is leaked for the program
     // lifetime.
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let script_kind = get_script_kind_from_file_name(&opts.file_name);
+        let script_kind = ensure_script_kind_from_file_name(&opts.file_name);
         let text: &'static str = if self.plain_os_fs {
             // PERF: on the plain OS file system a worker read the same
             // bytes, so the file is read once, as in Go. A bundled lib is
@@ -209,6 +236,33 @@ impl CompilerHost for CompilerHostImpl {
         let _owned_nodes =
             crate::ast::freeable_path(&opts.path.0).then(crate::ast::enter_freeable_parse);
         Some(Rc::new(parse_source_file(opts, text, script_kind)))
+    }
+
+    // Go: host.go:100 (*compilerHost).GetContentMappedSourceFiles (tsgo#4712)
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &SourceFileParseOptions,
+        mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError> {
+        let Some(project) = &self.content_mapper_project else {
+            return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
+        };
+        let (content, ok) = CompilerHost::fs(self).read_file(&parse_options.file_name);
+        if !ok {
+            return Ok(SourceFiles::default());
+        }
+        let files =
+            contentmapper::transform_and_parse(parse_options, &content, mapper, &**project)?;
+        let fs = CompilerHost::fs(self);
+        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
+            fs.file_exists(name)
+        })?;
+        Ok(files)
+    }
+
+    // Go: host.go:115 (*compilerHost).ContentMapperProject (tsgo#4712)
+    fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
+        self.content_mapper_project.clone()
     }
 
     // Go: host.go:86 (*compilerHost).GetResolvedProjectReference

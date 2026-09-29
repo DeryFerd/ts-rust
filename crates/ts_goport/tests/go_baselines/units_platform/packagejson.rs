@@ -9,7 +9,7 @@ use ts_goport::frontend::json::{
     JsonDecoder, JsonError, JsonToken, UnmarshalerFrom, json_unmarshal, json_unmarshal_decode,
 };
 use ts_goport::frontend::packagejson::{
-    self, Expected, ExportsOrImports, JSONValue, JSONValueType, JsonAny,
+    self, ContentMapperFields, Expected, ExportsOrImports, JSONValue, JSONValueType, JsonAny,
 };
 
 /// Decodes one JSON object; `field` decodes the member `name` and returns
@@ -258,23 +258,36 @@ fn exported<T: Clone>(e: &Expected<T>) -> (bool, bool, T) {
     (e.null, e.valid, e.value.clone())
 }
 
-// Go: packagejson_test.go:63 TestParse
-#[test]
-fn test_parse() {
-    // duplicate names
-    let content = r#"{
-				"name": "test-package",
-				"name": "test-package",
-				"version": "1.0.0"
-			}"#;
-    let got = packagejson::parse(content.as_bytes()).expect("Parse");
-    let want_name = packagejson::expected_of("test-package".to_string());
-    let want_version = packagejson::expected_of("1.0.0".to_string());
-    assert_eq!(exported(&got.header_fields.name), exported(&want_name));
-    assert_eq!(
-        exported(&got.header_fields.version),
-        exported(&want_version)
-    );
+/// The exported fields of a Go `Expected[ContentMapperFields]`, with the
+/// exported fields of each nested `Expected` (Go `cmpopts.IgnoreUnexported`).
+type ContentMapperExported = (
+    bool,
+    bool,
+    (bool, bool, Vec<String>),
+    (bool, bool, Vec<String>),
+    (bool, bool, bool),
+);
+
+fn exported_content_mapper(e: &Expected<ContentMapperFields>) -> ContentMapperExported {
+    (
+        e.null,
+        e.valid,
+        exported(&e.value.exec),
+        exported(&e.value.compiler_options),
+        exported(&e.value.dynamic_config),
+    )
+}
+
+/// Go `assert.DeepEqual(got, want, cmpopts.IgnoreUnexported(...))` for a
+/// want value that sets only the name, the version and the content mapper.
+fn assert_parse_result(
+    got: &packagejson::Fields,
+    name: &Expected<String>,
+    version: &Expected<String>,
+    content_mapper: &Expected<ContentMapperFields>,
+) {
+    assert_eq!(exported(&got.header_fields.name), exported(name));
+    assert_eq!(exported(&got.header_fields.version), exported(version));
     // Every other exported field is the zero value.
     let zero: Expected<String> = Expected::default();
     assert_eq!(exported(&got.header_fields.type_), exported(&zero));
@@ -294,4 +307,58 @@ fn test_parse() {
     ] {
         assert!(!e.null && !e.valid && e.value.is_empty());
     }
+    assert_eq!(
+        exported_content_mapper(&got.content_mapper),
+        exported_content_mapper(content_mapper)
+    );
+}
+
+// Go: packagejson_test.go:63 TestParse
+#[test]
+fn test_parse() {
+    let zero: Expected<String> = Expected::default();
+    let no_content_mapper: Expected<ContentMapperFields> = Expected::default();
+
+    // duplicate names
+    let content = r#"{
+				"name": "test-package",
+				"name": "test-package",
+				"version": "1.0.0"
+			}"#;
+    let got = packagejson::parse(content.as_bytes()).expect("Parse");
+    assert_parse_result(
+        &got,
+        &packagejson::expected_of("test-package".to_string()),
+        &packagejson::expected_of("1.0.0".to_string()),
+        &no_content_mapper,
+    );
+
+    // content mapper (tsgo#4712)
+    let content = r#"{
+				"name": "test-package",
+				"typescript": {
+					"contentMapper": { "exec": ["mapper"], "dynamicConfig": true }
+				}
+			}"#;
+    let got = packagejson::parse(content.as_bytes()).expect("Parse");
+    assert_parse_result(
+        &got,
+        &packagejson::expected_of("test-package".to_string()),
+        &zero,
+        &packagejson::expected_of(ContentMapperFields {
+            exec: packagejson::expected_of(vec!["mapper".to_string()]),
+            dynamic_config: packagejson::expected_of(true),
+            ..Default::default()
+        }),
+    );
+
+    // invalid typescript field is ignored (tsgo#4712)
+    let content = r#"{ "name": "test-package", "typescript": "invalid" }"#;
+    let got = packagejson::parse(content.as_bytes()).expect("Parse");
+    assert_parse_result(
+        &got,
+        &packagejson::expected_of("test-package".to_string()),
+        &zero,
+        &no_content_mapper,
+    );
 }

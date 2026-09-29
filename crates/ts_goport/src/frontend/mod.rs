@@ -10,7 +10,7 @@ pub mod compiler;
 pub mod core_ext;
 pub use goport_util::frontend::json;
 pub mod module;
-pub use goport_util::frontend::nativepath;
+pub use goport_util::frontend::{nativepath, osutil};
 pub mod outputpaths;
 pub mod packagejson;
 pub mod parser;

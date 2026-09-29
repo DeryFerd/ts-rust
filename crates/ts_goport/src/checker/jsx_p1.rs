@@ -15,6 +15,7 @@ pub struct JsxElementLinks {
     pub resolved_jsx_element_attributes_type: TypeId, // Resolved element attributes type of a JSX opening-like element
     pub jsx_namespace: SymbolId,                      // Resolved JSX namespace symbol for this node
     pub jsx_implicit_import_container: SymbolId, // Resolved module symbol the implicit JSX import of this file should refer to
+    pub first_jsx_tag_in_file: Node,             // The first JSX tag in the file
 }
 
 // Go: checker/jsx.go:41 JsxNames
@@ -160,6 +161,7 @@ impl Checker {
 
     // Go: checker/jsx.go:128 checkJsxAttributes
     pub fn check_jsx_attributes(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
+        self.check_node_deferred(node);
         self.create_jsx_attributes_type_from_attributes_property(node.parent(), check_mode)
     }
 
@@ -1411,21 +1413,6 @@ impl Checker {
                     }
                     if attribute_decl.name().text() == jsx_children_property_name {
                         explicitly_specify_children_attribute = true;
-                    }
-                    if contextual_type.is_some() {
-                        let prop = self.get_property_of_type(contextual_type, &member_name);
-                        if prop.is_some()
-                            && !self.sym(prop).declarations.is_empty()
-                            && self.is_deprecated_symbol(prop)
-                            && is_identifier(attribute_decl.name())
-                        {
-                            let prop_declarations = self.sym(prop).declarations.clone();
-                            self.add_deprecated_suggestion(
-                                attribute_decl.name(),
-                                &prop_declarations,
-                                attribute_decl.name().text(),
-                            );
-                        }
                     }
                     if contextual_type.is_some()
                         && check_mode.intersects(CheckMode::INFERENTIAL)

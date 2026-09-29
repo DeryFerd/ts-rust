@@ -303,6 +303,7 @@ impl TypingsInstaller {
                 }),
                 "",
                 "",
+                Vec::new(),
             );
             for package_name in filtered_typings {
                 let typing_file = self.typing_to_file_name(&resolver, package_name);
@@ -727,6 +728,7 @@ impl TypingsInstaller {
                 }),
                 "",
                 "",
+                Vec::new(),
             );
             if let Some(dev_dependencies) = &npm_config.dev_dependencies
                 && (npm_lock.packages.is_some() || npm_lock.dependencies.is_some())

@@ -473,7 +473,9 @@ impl NewProgram {
             // loop over `self.files` does not overlap the mutable borrow.
             let mut not_listed: Vec<Rc<ProcessingDiagnostic>> = Vec::new();
             for file in &self.files {
-                if self.source_file_may_be_emitted(file, false) && !root_paths.contains(file.path())
+                // #4699: Go `sourceFileMayBeEmitted(file, p, false, false)`.
+                if source_file_may_be_emitted(file, self, false, false)
+                    && !root_paths.contains(file.path())
                 {
                     not_listed.push(Rc::new(ProcessingDiagnostic {
                         kind: ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE,
@@ -670,7 +672,9 @@ impl NewProgram {
             let dir = self.common_source_directory();
             let mut emitted_files: Vec<String> = Vec::new();
             for file in &self.files {
-                if !file.is_declaration_file && self.source_file_may_be_emitted(file, false) {
+                // #4699: Go `sourceFileMayBeEmitted(file, p, false, false)`.
+                if !file.is_declaration_file && source_file_may_be_emitted(file, self, false, false)
+                {
                     emitted_files.push(file.file_name().to_string());
                 }
             }
@@ -937,7 +941,8 @@ impl NewProgram {
             // `ForEachEmittedFile` callback. The callback only reads, so the
             // names are collected first and then checked in the same order.
             let mut emit_file_names: Vec<String> = Vec::new();
-            let source_files_to_emit = self.get_source_files_to_emit(None, false);
+            // #4699: Go `p.getSourceFilesToEmit(nil, false, false)`.
+            let source_files_to_emit = self.get_source_files_to_emit(None, false, false);
             for_each_emitted_file(
                 self,
                 &options,

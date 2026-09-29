@@ -752,11 +752,6 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2975 emitExpressionWithTypeArgumentsNode
-    pub(crate) fn emit_expression_with_type_arguments_node(&mut self, node: Node) {
-        self.emit_expression_with_type_arguments(node);
-    }
-
     // Go: printer/printer.go:2979 emitAsExpression
     pub(crate) fn emit_as_expression(&mut self, node: Node) {
         let state = self.enter_node(node);

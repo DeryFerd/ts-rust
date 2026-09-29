@@ -16,7 +16,9 @@
 //!   arshaler: digits only, no fraction or exponent.
 
 use super::hash::*;
+use crate::contentmapper;
 use crate::frontend::prelude::*;
+use crate::gostd::GoError;
 // `vfs::FileInfo` is also in the frontend prelude.
 use super::hash::FileInfo;
 
@@ -816,6 +818,8 @@ pub struct BuildInfoDiagnostic {
     pub end: i32,
     pub code: i32,
     pub category: i32,
+    pub source: String,
+    pub message_text: String,
     pub message_key: String,
     pub message_args: Option<Vec<String>>,
     pub message_chain: Option<Vec<BuildInfoDiagnostic>>,
@@ -835,6 +839,8 @@ impl MarshalerTo for BuildInfoDiagnostic {
         w.int_omitzero("end", i64::from(self.end));
         w.int_omitzero("code", i64::from(self.code));
         w.int_omitzero("category", i64::from(self.category));
+        w.string_omitzero("source", &self.source)?;
+        w.string_omitzero("messageText", &self.message_text)?;
         w.string_omitzero("messageKey", &self.message_key)?;
         w.slice_omitzero("messageArgs", self.message_args.as_ref())?;
         w.slice_omitzero("messageChain", self.message_chain.as_ref())?;
@@ -860,6 +866,8 @@ impl UnmarshalerFrom for BuildInfoDiagnostic {
                 "end" => self.end = unmarshal_i32(dec)?,
                 "code" => self.code = unmarshal_i32(dec)?,
                 "category" => self.category = unmarshal_i32(dec)?,
+                "source" => self.source = unmarshal_string(dec)?,
+                "messageText" => self.message_text = unmarshal_string(dec)?,
                 "messageKey" => self.message_key = unmarshal_string(dec)?,
                 "messageArgs" => self.message_args = unmarshal_slice(dec, unmarshal_string)?,
                 "messageChain" => self.message_chain = unmarshal_slice(dec, unmarshal_elem)?,
@@ -1372,6 +1380,7 @@ pub struct BuildInfo {
     pub root: Option<Vec<BuildInfoRoot>>,
     pub package_jsons: Option<Vec<String>>,
     pub missing_package_jsons: Option<Vec<String>>,
+    pub content_mapper_identities: Option<Vec<String>>,
 
     // IncrementalProgram info
     pub file_names: Option<Vec<String>>,
@@ -1400,6 +1409,10 @@ impl MarshalerTo for BuildInfo {
         w.slice_omitzero("root", self.root.as_ref())?;
         w.slice_omitzero("packageJsons", self.package_jsons.as_ref())?;
         w.slice_omitzero("missingPackageJsons", self.missing_package_jsons.as_ref())?;
+        w.slice_omitzero(
+            "contentMapperIdentities",
+            self.content_mapper_identities.as_ref(),
+        )?;
         w.slice_omitzero("fileNames", self.file_names.as_ref())?;
         w.slice_omitzero("fileInfos", self.file_infos.as_ref())?;
         w.slice_omitzero("fileIdsList", self.file_ids_list.as_ref())?;
@@ -1452,6 +1465,9 @@ impl UnmarshalerFrom for BuildInfo {
                 "missingPackageJsons" => {
                     self.missing_package_jsons = unmarshal_slice(dec, unmarshal_string)?;
                 }
+                "contentMapperIdentities" => {
+                    self.content_mapper_identities = unmarshal_slice(dec, unmarshal_string)?;
+                }
                 "fileNames" => self.file_names = unmarshal_slice(dec, unmarshal_string)?,
                 "fileInfos" => self.file_infos = unmarshal_slice(dec, unmarshal_elem)?,
                 "fileIdsList" => {
@@ -1488,11 +1504,36 @@ impl UnmarshalerFrom for BuildInfo {
     }
 }
 
+// Go: incremental/buildInfo.go:501 ContentMapperIdentities (tsgo#4712)
+// ContentMapperIdentities returns the project's sorted mapper transform identities. A nil project means
+// the compiler host has no configured content mappers.
+// PORT: Go nil (the slice and the project) is `None`.
+pub fn content_mapper_identities(
+    project: Option<&dyn contentmapper::Project>,
+) -> Result<Option<Vec<String>>, GoError> {
+    match project {
+        None => Ok(None),
+        Some(project) => project.identities().map(Some),
+    }
+}
+
 impl BuildInfo {
-    // Go: incremental/buildInfo.go:492 IsValidVersion
+    // Go: incremental/buildInfo.go:495 IsValidVersion
     #[must_use]
     pub fn is_valid_version(&self) -> bool {
         self.version == version()
+    }
+
+    // Go: incremental/buildInfo.go:510 ContentMapperIdentitiesMatch (tsgo#4712)
+    // ContentMapperIdentitiesMatch reports whether the content mapper identities recorded in this build info
+    // match the given current identities (as produced by ContentMapperIdentities).
+    // PORT: Go `slices.Equal` treats nil and empty alike, as `unwrap_or_default` does.
+    #[must_use]
+    pub fn content_mapper_identities_match(&self, current: Option<&[String]>) -> bool {
+        self.content_mapper_identities
+            .as_deref()
+            .unwrap_or_default()
+            == current.unwrap_or_default()
     }
 
     // Go: incremental/buildInfo.go:496 IsIncremental

@@ -171,7 +171,10 @@ impl LanguageService {
             }
         }
 
-        change_tracker.get_changes()
+        // Unmappable files are dropped by GetChanges, so a content-mapped file whose imports cannot be
+        // faithfully rewritten yields no edits rather than a corrupting one.
+        let (changes, _) = change_tracker.get_changes();
+        changes
     }
 }
 

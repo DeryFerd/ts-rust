@@ -10,6 +10,7 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
+use crate::spanmap::{Feature, Fidelity};
 use std::cell::Cell;
 
 // Go: ls/utilities.go:25 quoteReplacer
@@ -398,17 +399,28 @@ pub fn is_in_right_side_of_internal_import_equals_declaration(node: Node) -> boo
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/utilities.go:287 createLspRangeFromNode
-    pub fn create_lsp_range_from_node(&self, node: Node, file: Node) -> lsproto::Range {
+    // Go: ls/utilities.go:288 createLspRangeFromNode
+    pub fn create_lsp_range_from_node(&self, node: Node, file: Node) -> (lsproto::Range, Fidelity) {
         self.create_lsp_range_from_bounds(
             get_token_pos_of_node(node, file, false /*includeJSDoc*/),
             node.end(),
             file,
         )
     }
+
+    // Go: ls/utilities.go:292 createLspRangeFromNodeForFeature
+    pub fn create_lsp_range_from_node_for_feature(
+        &self,
+        node: Node,
+        file: Node,
+        feature: Feature,
+    ) -> (lsproto::Range, Fidelity) {
+        self.converters
+            .to_lsp_range_for_feature(&file, create_range_from_node(node, file), feature)
+    }
 }
 
-// Go: ls/utilities.go:291 createRangeFromNode
+// Go: ls/utilities.go:296 createRangeFromNode
 pub fn create_range_from_node(node: Node, file: Node) -> TextRange {
     TextRange::new(
         get_token_pos_of_node(node, file, false /*includeJSDoc*/),
@@ -417,26 +429,30 @@ pub fn create_range_from_node(node: Node, file: Node) -> TextRange {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/utilities.go:295 createLspRangeFromBounds
+    // Go: ls/utilities.go:300 createLspRangeFromBounds
     // PORT: Go passes the `*ast.SourceFile` as an `lsconv.Script`.
-    pub fn create_lsp_range_from_bounds(&self, start: i32, end: i32, file: Node) -> lsproto::Range {
+    pub fn create_lsp_range_from_bounds(
+        &self,
+        start: i32,
+        end: i32,
+        file: Node,
+    ) -> (lsproto::Range, Fidelity) {
         self.converters
             .to_lsp_range(&file, TextRange::new(start, end))
     }
 
-    // Go: ls/utilities.go:299 createLspRangeFromRange
+    // Go: ls/utilities.go:304 createLspRangeFromRange
     pub fn create_lsp_range_from_range(
         &self,
         text_range: TextRange,
         script: &dyn lsconv::Script,
-    ) -> lsproto::Range {
+    ) -> (lsproto::Range, Fidelity) {
         self.converters.to_lsp_range(script, text_range)
     }
 
-    // Go: ls/utilities.go:303 createLspPosition
-    pub fn create_lsp_position(&self, position: i32, file: Node) -> lsproto::Position {
-        self.converters
-            .position_to_line_and_character(&file, position)
+    // Go: ls/utilities.go:308 createLspPosition
+    pub fn create_lsp_position(&self, position: i32, file: Node) -> (lsproto::Position, Fidelity) {
+        self.converters.to_lsp_position(&file, position)
     }
 }
 
@@ -451,7 +467,7 @@ pub fn quote(file: Node, preferences: &lsutil::UserPreferences, text: &str) -> S
         crate::frontend::json::json_marshal_indent(text, "" /*prefix*/, "" /*indent*/)
             .unwrap_or_default();
     if quote_preference == lsutil::QuotePreference::SINGLE {
-        quoted = quote_replacer_replace(&strip_quotes(&quoted));
+        quoted = "'".to_string() + &quote_replacer_replace(&strip_quotes(&quoted)) + "'";
     }
     quoted
 }
@@ -599,11 +615,15 @@ pub fn find_reference_in_position(refs: &[FileReference], pos: i32) -> Option<&F
 
 // Go: ls/utilities.go:431 getContainingNodeIfInHeritageClause
 pub fn get_containing_node_if_in_heritage_clause(node: Node) -> Node {
-    if node.kind() == SyntaxKind::Identifier || node.kind() == SyntaxKind::PropertyAccessExpression
+    if node.kind() == SyntaxKind::Identifier
+        || node.kind() == SyntaxKind::QualifiedName
+        || node.kind() == SyntaxKind::PropertyAccessExpression
     {
         return get_containing_node_if_in_heritage_clause(node.parent());
     }
-    if node.kind() == SyntaxKind::ExpressionWithTypeArguments
+    if (node.kind() == SyntaxKind::ExpressionWithTypeArguments
+        || node.kind() == SyntaxKind::TypeReference)
+        && is_heritage_clause(node.parent())
         && (is_class_like(node.parent().parent())
             || node.parent().parent().kind() == SyntaxKind::InterfaceDeclaration)
     {
@@ -798,7 +818,7 @@ pub fn get_adjusted_location(node: Node, for_rename: bool, source_file: Node) ->
             // /**/extends [|name|]
             // /**/implements [|name|]
             if node.types().nodes().len() == 1 {
-                return node.types().nodes().get(0).expression();
+                return get_heritage_clause_element_name(node.types().nodes().get(0));
             }
 
             // fall through `getAdjustedLocation`
@@ -1220,6 +1240,8 @@ pub fn get_intersecting_meaning_from_declarations(
 
 // Go: ls/utilities.go:915 getAllSuperTypeNodes
 // Returns the node in an `extends` or `implements` clause of a class or interface.
+// PORT: Go returns `[]*ast.HeritageClauseElement` (ExpressionWithTypeArguments
+// or TypeReference nodes, tsgo#4797).
 pub fn get_all_super_type_nodes(node: Node) -> Vec<Node> {
     if is_interface_declaration(node) {
         return get_heritage_elements(node, SyntaxKind::ExtendsKeyword);
@@ -1231,7 +1253,7 @@ pub fn get_all_super_type_nodes(node: Node) -> Vec<Node> {
         if extends.is_some() {
             result.push(extends);
         }
-        result.extend(get_implements_type_nodes(node));
+        result.extend(get_implements_heritage_clause_elements(node));
         return result;
     }
     Vec::new()

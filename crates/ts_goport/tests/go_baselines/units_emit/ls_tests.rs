@@ -20,7 +20,8 @@ use ts_goport::frontend::tspath::Path;
 use ts_goport::gostd::context;
 use ts_goport::ls::is_in_comment;
 use ts_goport::ls::lsconv::{
-    Converters, Script, compute_lsp_line_starts, file_name_to_document_uri, new_converters,
+    Converters, Script, compute_lsp_line_starts, file_name_to_document_uri, from_lsp_position,
+    new_converters,
 };
 use ts_goport::ls::lsutil::{
     self, EditorSettings, FormatCodeSettings, IncludeInlayParameterNameHints, IndentStyle,
@@ -301,7 +302,24 @@ fn position(line: u32, character: u32) -> lsproto::Position {
     lsproto::Position { line, character }
 }
 
-// Go: ls/lsconv/converters_test.go:113 TestConvertersInvalidUTF8
+/// Go `lsconv.FromLSPPosition(conv, script, lc, spanmap.FeatureAll)` with the
+/// test's `assert.Equal(t, len(positions), 1)`: the one position, or an error.
+fn from_lsp_position_all(
+    conv: &Converters,
+    script: &TestScript,
+    lc: lsproto::Position,
+) -> Result<i32, String> {
+    let positions = from_lsp_position(conv, script, lc, ts_goport::spanmap::Feature::ALL);
+    match positions.as_slice() {
+        [mapped] => Ok(mapped.position),
+        _ => Err(format!(
+            "FromLSPPosition({lc:?}) gave {} positions, want 1",
+            positions.len()
+        )),
+    }
+}
+
+// Go: ls/lsconv/converters_test.go:159 TestConvertersInvalidUTF8
 /// TestConvertersInvalidUTF8 verifies behavior on text containing invalid UTF-8
 /// sequences (e.g. lone continuation bytes). Node's TextDecoder substitutes such
 /// bytes with U+FFFD, so the JS-reference test cannot cover this; we assert the
@@ -335,14 +353,15 @@ fn test_converters_invalid_utf8() {
     let mut errors = Vec::new();
     for &(line, char, byte_pos) in mappings {
         let lc = position(line, char);
-        let got = conv.line_and_character_to_position(&script, &lc);
-        if got != port(byte_pos) {
-            errors.push(format!(
+        match from_lsp_position_all(&conv, &script, lc) {
+            Ok(got) if got != port(byte_pos) => errors.push(format!(
                 "LineAndCharacterToPosition({line},{char}) = {got} (port offset), want Go {byte_pos} (port {})",
                 port(byte_pos)
-            ));
+            )),
+            Ok(_) => {}
+            Err(err) => errors.push(err),
         }
-        let got = conv.position_to_line_and_character(&script, port(byte_pos));
+        let (got, _) = conv.to_lsp_position(&script, port(byte_pos));
         if got != lc {
             errors.push(format!(
                 "PositionToLineAndCharacter({byte_pos}) = {got:?}, want {lc:?}"
@@ -352,13 +371,14 @@ fn test_converters_invalid_utf8() {
 
     // Byte-by-byte round-trip across the entire text.
     for byte_pos in 0..=go_bytes.len() as i32 {
-        let lc = conv.position_to_line_and_character(&script, port(byte_pos));
-        let rt = conv.line_and_character_to_position(&script, &lc);
-        if rt != port(byte_pos) {
-            errors.push(format!(
+        let (lc, _) = conv.to_lsp_position(&script, port(byte_pos));
+        match from_lsp_position_all(&conv, &script, lc) {
+            Ok(rt) if rt != port(byte_pos) => errors.push(format!(
                 "round-trip byte {byte_pos}: got port offset {rt}, want {}",
                 port(byte_pos)
-            ));
+            )),
+            Ok(_) => {}
+            Err(err) => errors.push(err),
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
@@ -520,7 +540,7 @@ fn run_js_reference(texts: &[&str]) -> Option<Vec<Vec<JsTuple>>> {
     Some(out)
 }
 
-// Go: ls/lsconv/converters_test.go:279 TestConvertersAgainstJSReference
+// Go: ls/lsconv/converters_test.go:329 TestConvertersAgainstJSReference
 /// TestConvertersAgainstJSReference cross-checks the Go UTF-16 conversions against
 /// authoritative results computed by Node.js using real UTF-16 string semantics.
 #[test]
@@ -557,14 +577,14 @@ fn test_converters_against_js_reference() {
             for &(byte_pos, line, char) in reference {
                 let expected_lc = position(line, char);
 
-                let got_lc = conv.position_to_line_and_character(&script, byte_pos);
+                let (got_lc, _) = conv.to_lsp_position(&script, byte_pos);
                 if got_lc != expected_lc {
                     return Err(format!(
                         "PositionToLineAndCharacter({byte_pos}) mismatch in {text:?}: got {got_lc:?}, want {expected_lc:?}"
                     ));
                 }
 
-                let got_pos = conv.line_and_character_to_position(&script, &expected_lc);
+                let got_pos = from_lsp_position_all(&conv, &script, expected_lc)?;
                 if got_pos != byte_pos {
                     return Err(format!(
                         "LineAndCharacterToPosition({line},{char}) mismatch in {text:?}: got {got_pos}, want {byte_pos}"
@@ -808,12 +828,14 @@ fn fill_non_zero_values() -> UserPreferences {
         },
         prefer_go_to_source_definition: true,
         exclude_library_symbols_in_nav_to: f,
+        workspace_symbols_scope: lsutil::WorkspaceSymbolsScope("test".into()),
         enable_formatting: f,
         enable_validation: f,
         disable_suggestions: f,
         disable_line_text_in_references: f,
         display_parts_for_js_doc: f,
         report_style_checks_as_warnings: f,
+        locale: "test".to_string(),
         disable_automatic_type_acquisition: f,
         automatic_type_acquisition_enabled: f,
         custom_config_file_name: "test".to_string(),
@@ -973,6 +995,20 @@ fn items(entries: &[(&str, LspAny)]) -> IndexMap<String, LspAny> {
     }
 }
 
+// Go: ls/lsutil/userpreferences_test.go:429 TestUserPreferencesLocale
+#[test]
+fn test_user_preferences_locale() {
+    let prefs = parse_user_preferences(&items(&[
+        (
+            "typescript",
+            obj(&[("locale", LspAny::String("de".into()))]),
+        ),
+        ("js/ts", obj(&[("locale", LspAny::String("fr".into()))])),
+    ]));
+
+    assert_eq!(prefs.locale, "fr");
+}
+
 // Go: ls/lsutil/userpreferences_test.go:427 TestUserPreferencesReportStyleChecksAsWarnings
 #[test]
 fn test_user_preferences_report_style_checks_as_warnings() {
@@ -1100,4 +1136,27 @@ fn test_user_preferences_parse_ata() {
     );
 
     t.finish();
+}
+
+// Go: ls/lsutil/userpreferences_test.go:531 TestParseUserPreferencesEditorFormatting
+// PORT: Go writes the numbers as Go `int`; a JSON number is `LspAny::Number`.
+#[test]
+fn test_parse_user_preferences_editor_formatting() {
+    let prefs = parse_user_preferences(&items(&[(
+        "editor",
+        obj(&[
+            ("tabSize", LspAny::Number(2.0)),
+            ("insertSpaces", LspAny::Bool(false)),
+        ]),
+    )]));
+
+    let settings = &prefs.format_code_settings.editor_settings;
+    assert_equal(settings.tab_size, 2, "FormatCodeSettings.TabSize").unwrap();
+    assert_equal(settings.indent_size, 2, "FormatCodeSettings.IndentSize").unwrap();
+    assert_equal(
+        settings.convert_tabs_to_spaces,
+        Tristate::False,
+        "FormatCodeSettings.ConvertTabsToSpaces",
+    )
+    .unwrap();
 }

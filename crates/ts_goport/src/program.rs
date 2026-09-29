@@ -20,6 +20,7 @@ use crate::execute::tsc::compile::CompileTimes;
 use crate::frontend::tspath;
 use crate::gostd::{Context, context};
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -94,6 +95,9 @@ pub struct ResolvedModule {
     pub original_path: String,
     pub extension: String,
     pub resolved_using_ts_extension: bool,
+    /// #4712: the resolution used a content mapper extension (Go
+    /// `ResolvedUsingExtraExtensions`).
+    pub resolved_using_extra_extensions: bool,
     pub package_id: PackageId,
     pub is_external_library_import: bool,
     pub alternate_result: String,
@@ -178,9 +182,6 @@ pub struct SourceFileInfo {
     pub jsdoc_diagnostics: KeptData<[Diagnostic]>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
-    /// Go `SourceFile.ContainsNonASCII`: the scanner decoded a non-ASCII
-    /// rune. `ast::source_file_get_position_map` reads it.
-    pub contains_non_ascii: bool,
     late: OnceLock<LateSourceFileInfo>,
 }
 
@@ -2167,6 +2168,43 @@ pub fn options() -> &'static CompilerOptions {
     &prog().options
 }
 
+// Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+// PORT: the Go frontend program copies the extensions of its command line
+// (`GoSharedState`), so checker threads can read them. An alias resolver
+// program has none.
+pub fn content_mapper_extensions() -> Vec<String> {
+    with_tables(|tables| {
+        tables
+            .go
+            .as_ref()
+            .map(|go| go.content_mapper_extensions().to_vec())
+            .unwrap_or_default()
+    })
+}
+
+/// Go `Program.contentMapperDiagnostics` (#4712): the program diagnostics
+/// that the loader reports when a content mapper fails for good (Go
+/// `processedFiles.contentMapperDiagnostics`). An alias resolver program
+/// has none. Loading thread only.
+fn content_mapper_diagnostics() -> Vec<Diagnostic> {
+    go_frontend()
+        .map(|go| go.content_mapper_diagnostics.clone())
+        .unwrap_or_default()
+}
+
+/// Go `Program.contentMapperOptionDiagnostics` (#4712), made by
+/// `collectContentMapperOptionDiagnostics` (see `go_frontend`). An alias
+/// resolver program has none.
+fn content_mapper_option_diagnostics() -> Vec<Diagnostic> {
+    with_tables(|tables| {
+        tables
+            .go
+            .as_ref()
+            .map(|go| go.content_mapper_option_diagnostics().to_vec())
+            .unwrap_or_default()
+    })
+}
+
 // Go: compiler/program.go:403 GetConfigFileParsingDiagnostics
 // PORT: an alias resolver program has no config, so its list is empty. Go
 // has no such method on the alias resolver.
@@ -2333,23 +2371,36 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
     with_go(|go| go.is_emit_blocked(emit_file_name))
 }
 
-// Go: compiler/program.go:1927 SourceFileMayBeEmitted
+// Go: compiler/program.go:2132 SourceFileMayBeEmitted
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
     // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
     alias_resolver_unimplemented();
-    source_file_may_be_emitted_worker(source_file, force_dts_emit)
+    source_file_may_be_emitted_worker(source_file, force_dts_emit, false)
 }
 
-// Go: compiler/emitter.go:451 sourceFileMayBeEmitted
-fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) -> bool {
+// Go: compiler/emitter.go:464 sourceFileMayBeEmitted
+fn source_file_may_be_emitted_worker(
+    source_file: Node,
+    force_dts_emit: bool,
+    force_js_emit: bool,
+) -> bool {
     let options = &prog().options;
     let info = source_file_info(source_file);
     // Js files are emitted only if option is enabled
-    if options.no_emit_for_js_files.is_true() && is_source_file_js(source_file) {
+    if !force_js_emit && options.no_emit_for_js_files.is_true() && is_source_file_js(source_file) {
         return false;
     }
     // Declaration files are not emitted
     if info.is_declaration_file {
+        return false;
+    }
+    // #4712
+    // Runtime output for content-mapped files is owned by the external content mapper or build tool. Only
+    // include them in the emit set when their transformed TypeScript can produce declarations.
+    if !source_file_content_mapper(source_file).is_empty()
+        && !force_dts_emit
+        && !options.get_emit_declarations()
+    {
         return false;
     }
     // Source file from node_modules are not emitted
@@ -2357,7 +2408,7 @@ fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) ->
         return false;
     }
     // forcing dts emit => file needs to be emitted
-    if force_dts_emit {
+    if force_dts_emit || force_js_emit {
         return true;
     }
     // Source files from referenced projects are not emitted
@@ -2368,43 +2419,70 @@ fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) ->
     if !is_json_source_file(source_file) {
         return true;
     }
+    json_file_may_be_emitted(
+        &info.file_name,
+        options,
+        get_current_directory(),
+        use_case_sensitive_file_names(),
+    )
+}
+
+// Go: compiler/emitter.go:504-521 (the JSON file part of sourceFileMayBeEmitted)
+// PORT: its own function, so the tests below can run it without a loaded
+// program. Like `frontend::compiler::source_file_may_be_emitted`, it uses the
+// Go ports in `frontend::outputpaths` and `frontend::tspath`. Go result to
+// keep: `GetNormalizedAbsolutePath` removes the trailing separator of the
+// common directory (except for a root), so a file under it gets a rooted
+// output path that is never its own path, even when outDir is the common
+// directory.
+fn json_file_may_be_emitted(
+    file_name: &str,
+    options: &CompilerOptions,
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+) -> bool {
+    use crate::frontend::outputpaths;
+    use crate::frontend::tspath::{
+        ComparePathsOptions, compare_paths, get_normalized_absolute_path,
+    };
+
     // Json file is not emitted if outDir is not specified
     if options.out_dir.is_empty() {
         return false;
     }
+
     // Otherwise, if rootDir is specified or a config file exists, we know the common source directory and can check if the file would be emitted in the same location
     if !options.root_dir.is_empty() || !options.config_file_path.is_empty() {
-        let cwd = get_current_directory();
-        let case_sensitive = use_case_sensitive_file_names();
-        let common_dir = tspath::get_normalized_absolute_path(
-            &crate::frontend::outputpaths::get_common_source_directory(
+        let common_dir = get_normalized_absolute_path(
+            &outputpaths::get_common_source_directory(
                 options,
                 Vec::new,
-                cwd,
-                case_sensitive,
+                current_directory,
+                use_case_sensitive_file_names,
                 None,
             ),
-            cwd,
+            current_directory,
         );
-        let output_path = crate::frontend::outputpaths::get_source_file_path_in_new_dir_worker(
-            &info.file_name,
+        let output_path = outputpaths::get_source_file_path_in_new_dir_worker(
+            file_name,
             &options.out_dir,
-            cwd,
+            current_directory,
             &common_dir,
-            case_sensitive,
+            use_case_sensitive_file_names,
         );
-        if tspath::compare_paths(
-            &info.file_name,
+        if compare_paths(
+            file_name,
             &output_path,
-            &tspath::ComparePathsOptions {
-                use_case_sensitive_file_names: case_sensitive,
-                current_directory: cwd.to_string(),
+            &ComparePathsOptions {
+                use_case_sensitive_file_names,
+                current_directory: current_directory.to_string(),
             },
         ) == 0
         {
             return false;
         }
     }
+
     true
 }
 
@@ -2498,22 +2576,24 @@ pub fn get_source_file_from_reference(origin: Node, r: &FileReference) -> Node {
 }
 
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
-// compiler/emitHost.go:94 emitHost.GetOutputPathsFor with the program options.
-// PORT: Go reads two fields of the source file. It is named for the emit
-// host method so it does not clash with the frontend `get_output_paths_for`
-// in the frontend prelude.
+// compiler/emitHost.go:94 emitHost.GetOutputPathsFor and Program.Emit with
+// the program options.
+// PORT: Go reads three fields of the source file (#4712: the content
+// mapper). It is named for the emit host method so it does not clash with
+// the frontend `get_output_paths_for` in the frontend prelude.
 pub fn get_output_paths_for_source_file(
     file: Node,
     host: &dyn crate::frontend::outputpaths::OutputPathsHost,
-    force_dts_paths: bool,
+    force: crate::frontend::outputpaths::ForceEmitPaths,
 ) -> crate::frontend::outputpaths::OutputPaths {
     let info = source_file_info(file);
     crate::frontend::outputpaths::get_output_paths_for_file(
         &info.file_name,
         info.script_kind,
+        source_file_content_mapper(file),
         options(),
         host,
-        force_dts_paths,
+        force,
     )
 }
 
@@ -2661,10 +2741,20 @@ fn checker_count() -> usize {
 // Go: compiler/checkerpool.go:98 createCheckers
 // PORT: binding runs first on this thread, so no worker binds and every
 // worker starts from the same bound program and thread-local state.
+// The file associations (#4313) come from the Go frontend program
+// (`ls_program::get_checker_associations`), whose files are in
+// `source_file_order` order. An alias resolver program has no frontend, so
+// it keeps the round-robin order; Go gives it no checker pool.
 fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
     let program = prog();
+    let associations = match go_frontend_program() {
+        Some(np) => ls_program::get_checker_associations(&np, count),
+        None => (0..program.source_file_order.len())
+            .map(|i| i % count)
+            .collect(),
+    };
     // One entry per file id up to the last program file.
     let len = program
         .source_file_order
@@ -2673,7 +2763,7 @@ fn create_checkers() -> CheckerPool {
         .map_or(0, |&last| last + 1);
     let mut file_associations = vec![0; len];
     for (i, &file_index) in program.source_file_order.iter().enumerate() {
-        file_associations[file_index] = i % count;
+        file_associations[file_index] = associations[i];
     }
     assert!(
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
@@ -2985,7 +3075,8 @@ fn collect_diagnostics(
             .flat_map(|f| collect(f.root))
             .collect()
     };
-    sort_and_deduplicate_diagnostics(result)
+    // #4712
+    filter_and_sort_diagnostics(result)
 }
 
 // Go: compiler/program.go:562 collectCheckerDiagnostics
@@ -3000,11 +3091,31 @@ pub fn collect_checker_diagnostics_with(
             return Vec::new();
         }
         let result = with_type_checker_for_file(file, move |c| collect(c, file));
-        return sort_and_deduplicate_diagnostics(result);
+        // #4712
+        return filter_and_sort_diagnostics(result);
     }
     let files = source_files();
     let diagnostics = collect_checker_diagnostics_from_files(&files, collect);
-    sort_and_deduplicate_diagnostics(diagnostics.into_iter().flatten().collect())
+    filter_and_sort_diagnostics(diagnostics.into_iter().flatten().collect())
+}
+
+// Go: compiler/program.go:684 filterAndSortDiagnostics (#4712)
+fn filter_and_sort_diagnostics(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    diags.retain(|diag| {
+        let file = diag.file;
+        if !diag.reports_unnecessary || file.is_nil() || !diag.source().is_empty() {
+            return true;
+        }
+        let Some(span_map) = source_file_span_map(file) else {
+            return true;
+        };
+        let (_, fidelity) = crate::spanmap::SpanMap::virtual_to_original_span(
+            Some(span_map),
+            TextRange::new(diag.pos, diag.end),
+        );
+        fidelity != crate::spanmap::Fidelity::NONE
+    });
+    sort_and_deduplicate_diagnostics(diags)
 }
 
 // Go: compiler/program.go:576 collectCheckerDiagnosticsFromFiles
@@ -3116,7 +3227,8 @@ impl PendingSemanticDiagnostics {
         files
             .iter()
             .zip(self.0.wait())
-            .map(|(&file, diags)| (file, sort_and_deduplicate_diagnostics(diags)))
+            // #4712
+            .map(|(&file, diags)| (file, filter_and_sort_diagnostics(diags)))
             .collect()
     }
 }
@@ -3148,6 +3260,9 @@ pub fn get_program_diagnostics() -> Vec<Diagnostic> {
         return Vec::new();
     };
     let mut diagnostics = go.program_diagnostics.clone();
+    // #4712
+    diagnostics.extend(content_mapper_diagnostics());
+    diagnostics.extend(content_mapper_option_diagnostics());
     diagnostics.extend(
         go.include_processor
             .get_diagnostics(&go)
@@ -3189,20 +3304,18 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     if info.check_js_directive.is_some_and(|d| !d.enabled) {
         return false;
     }
-    if info.script_kind == ScriptKind::TS
-        || info.script_kind == ScriptKind::TSX
-        || info.script_kind == ScriptKind::EXTERNAL
-    {
+    // #4712: no ScriptKindExternal.
+    if info.script_kind == ScriptKind::TS || info.script_kind == ScriptKind::TSX {
         return true;
     }
     let is_js = info.script_kind == ScriptKind::JS || info.script_kind == ScriptKind::JSX;
     let is_check_js = is_js && is_check_js_enabled_for_file(source_file, options);
     let is_plain_js = is_plain_js_file(source_file, options.check_js);
-    // By default, only type-check .ts, .tsx, Deferred, plain JS, checked JS and External
+    // By default, only type-check .ts, .tsx, plain JS, and checked JS
     // - plain JS: .js files with no // ts-check and checkJs: undefined
     // - check JS: .js files with either // ts-check or checkJs: true
-    // - external: files that are added by plugins
-    is_plain_js || is_check_js || info.script_kind == ScriptKind::DEFERRED
+    // #4712: no ScriptKindDeferred.
+    is_plain_js || is_check_js
 }
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics
@@ -3297,18 +3410,22 @@ fn with_declaration_diagnostic_cache<R>(
 
 // Go: compiler/emitter.go:506 getSourceFilesToEmit
 // PORT: Go takes a `SourceFileMayBeEmittedHost`; the program functions are that host.
+// Go `Program.getSourceFilesToEmit` caches the result for nil targets and no
+// force; this computes it each time. Go nil `targetSourceFiles` is `None`.
 pub(crate) fn get_source_files_to_emit(
-    target_source_file: Node,
+    target_source_files: Option<&[Node]>,
     force_dts_emit: bool,
+    force_js_emit: bool,
 ) -> Vec<Node> {
-    let source_files = if target_source_file.is_some() {
-        vec![target_source_file]
-    } else {
-        source_files()
+    let target_source_files = match target_source_files {
+        Some(files) => files.to_vec(),
+        None => source_files(),
     };
-    source_files
+    target_source_files
         .into_iter()
-        .filter(|&source_file| source_file_may_be_emitted(source_file, force_dts_emit))
+        .filter(|&source_file| {
+            source_file_may_be_emitted_worker(source_file, force_dts_emit, force_js_emit)
+        })
         .collect()
 }
 
@@ -3322,7 +3439,10 @@ fn is_source_file_not_json(file: Node) -> bool {
 // `GetDeclarationDiagnostics` above already has the snake name.
 fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Diagnostic> {
     // TODO: use p.getSourceFilesToEmit cache
-    let full_files: Vec<Node> = get_source_files_to_emit(file, false)
+    // Go `core.SingleElementSlice(file)`: nil for a nil file.
+    let target = [file];
+    let target_source_files = file.is_some().then_some(&target[..]);
+    let full_files: Vec<Node> = get_source_files_to_emit(target_source_files, false, false)
         .into_iter()
         .filter(|&f| is_source_file_not_json(f))
         .collect();
@@ -3379,6 +3499,11 @@ impl crate::frontend::outputpaths::OutputPathsHost for EmitHost {
         common_source_directory().to_string()
     }
 
+    // Go: compiler/emitHost.go:116 emitHost.ContentMapperExtensions (#4712)
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        content_mapper_extensions()
+    }
+
     // Go: compiler/emitHost.go:109 emitHost.GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         get_current_directory().to_string()
@@ -3423,11 +3548,21 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
         Box::new(get_output_paths_for_source_file(
             file,
             self,
-            force_dts_paths,
+            // #4699: Go `outputpaths.ForceEmitPaths{Dts: forceDtsPaths}`.
+            crate::frontend::outputpaths::ForceEmitPaths {
+                dts: force_dts_paths,
+                js: false,
+                declaration_map: false,
+            },
         ))
     }
 
-    // Go: compiler/emitHost.go:99 emitHost.GetResolutionModeOverride
+    // Go: compiler/emitHost.go:99 emitHost.SourceFileMayBeEmitted (#4712)
+    fn source_file_may_be_emitted(&self, file: Node, force_dts_emit: bool) -> bool {
+        source_file_may_be_emitted_worker(file, force_dts_emit, false)
+    }
+
+    // Go: compiler/emitHost.go:103 emitHost.GetResolutionModeOverride
     fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
         self.emit_resolver.get_resolution_mode_override(node)
     }
@@ -3567,6 +3702,46 @@ pub fn get_bind_and_check_diagnostics_with_checker(
             ));
         }
     }
+    // #4712
+    apply_content_mapper_diagnostic_directives(source_file, filtered)
+}
+
+// Go: compiler/program.go:1493 applyContentMapperDiagnosticDirectives (#4712)
+fn apply_content_mapper_diagnostic_directives(
+    source_file: Node,
+    diags: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    let directives = source_file_diagnostic_directives(source_file);
+    if directives.is_empty() {
+        return diags;
+    }
+    let mut used = vec![false; directives.len()];
+    let mut mark_used = |diag: &Diagnostic| -> bool {
+        if !diag.source().is_empty() {
+            return false;
+        }
+        for (i, directive) in directives.iter().enumerate() {
+            if diag.pos >= directive.virtual_range.pos() && diag.pos < directive.virtual_range.end()
+            {
+                used[i] = true;
+                return true;
+            }
+        }
+        false
+    };
+    let mut filtered: Vec<Diagnostic> = diags.into_iter().filter(|diag| !mark_used(diag)).collect();
+    for (i, directive) in directives.iter().enumerate() {
+        if directive.policy == crate::ast::MappedDiagnosticDirectivePolicy::EXPECT && !used[i] {
+            filtered.push(crate::ast::new_external_diagnostic(
+                source_file,
+                directive.original_range,
+                &directive.source,
+                crate::diagnostics::Category::Error,
+                directive.unused_code,
+                &directive.unused_message_text,
+            ));
+        }
+    }
     filtered
 }
 
@@ -3626,13 +3801,9 @@ fn get_suggestion_diagnostics_with_checker(
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
-    // Checker creation forces binding, so bind suggestion diagnostics will be populated.
-    bind_all();
-    let mut diags = file_bind_data(source_file)
-        .bind_suggestion_diagnostics
-        .clone();
-    diags.extend(file_checker.get_suggestion_diagnostics(ctx, source_file));
-    diags
+
+    // #4776: no bind suggestion diagnostics.
+    file_checker.get_suggestion_diagnostics(ctx, source_file)
 }
 
 // Go: compiler/program.go:1422 isCommentOrBlankLine
@@ -3648,7 +3819,7 @@ fn is_comment_or_blank_line(text: &str, mut pos: usize) -> bool {
 
 // Go: compiler/program.go:1431 SortAndDeduplicateDiagnostics
 pub fn sort_and_deduplicate_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    // Go: compiler/program.go:1438 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
+    // Go: compiler/program.go:1599 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
     crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
     compact_and_merge_related_infos(diagnostics)
 }
@@ -3678,7 +3849,7 @@ fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnost
             // PORT: Go tests `relatedInfos != nil`; appending empty slices
             // keeps it nil, so an empty list means "leave d alone".
             if !related_infos.is_empty() {
-                // Go: compiler/program.go:1462 slices.SortFunc(relatedInfos, ast.CompareDiagnostics)
+                // Go: compiler/program.go:1623 slices.SortFunc(relatedInfos, ast.CompareDiagnostics)
                 crate::gostd::slices::sort_func(&mut related_infos, compare_diagnostics);
                 related_infos.dedup_by(|b, a| equal_diagnostics(a, b));
                 merged.set_related_info(related_infos);
@@ -3748,19 +3919,48 @@ pub fn instantiation_count() -> i32 {
 // PORT: Go calls `program.GetGlobalDiagnostics` and
 // `program.GetDeclarationDiagnostics` directly. They are callbacks here so a
 // caller can guard them the same way as the bind and semantic callbacks.
+// Go nil `files` is `None` (#4699).
 pub fn get_diagnostics_of_any_program(
-    file: Node,
+    files: Option<&[Node]>,
     skip_no_emit_check_for_dts_diagnostics: bool,
     get_bind_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_semantic_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_global_diagnostics: &mut dyn FnMut() -> Vec<Diagnostic>,
     get_declaration_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
 ) -> Vec<Diagnostic> {
+    // Go `appendDiagnosticsForAllFiles` (a closure over `files`).
+    fn append_diagnostics_for_all_files(
+        files: Option<&[Node]>,
+        diagnostics: &mut Vec<Diagnostic>,
+        get_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
+    ) {
+        match files {
+            None => diagnostics.extend(get_diagnostics(Node::NIL)),
+            Some(files) => {
+                for &file in files {
+                    diagnostics.extend(get_diagnostics(file));
+                }
+            }
+        }
+    }
+
     let options = &prog().options;
     let mut all_diagnostics = get_config_file_parsing_diagnostics();
     let config_file_parsing_diagnostics_length = all_diagnostics.len();
 
-    all_diagnostics.extend(get_syntactic_diagnostics(file));
+    // #4712
+    let mut syntactic_diagnostics = Vec::new();
+    append_diagnostics_for_all_files(
+        files,
+        &mut syntactic_diagnostics,
+        &mut get_syntactic_diagnostics,
+    );
+    if !syntactic_diagnostics.is_empty() {
+        // Per-file content mapper failures are syntactic diagnostics, but the locationless diagnostic
+        // that disables a repeatedly failing mapper must still be reported.
+        all_diagnostics.extend(content_mapper_diagnostics());
+    }
+    all_diagnostics.extend(syntactic_diagnostics);
 
     // If we didn't have any syntactic errors, then also try getting the program (options),
     // global and semantic errors.
@@ -3768,13 +3968,17 @@ pub fn get_diagnostics_of_any_program(
         all_diagnostics.extend(get_program_diagnostics());
 
         // Do binding early so we can track the time.
-        get_bind_diagnostics(file);
+        append_diagnostics_for_all_files(files, &mut Vec::new(), get_bind_diagnostics);
 
         if options.list_files_only.is_false_or_unknown() {
             all_diagnostics.extend(get_global_diagnostics());
 
             if all_diagnostics.len() == config_file_parsing_diagnostics_length {
-                all_diagnostics.extend(get_semantic_diagnostics(file));
+                append_diagnostics_for_all_files(
+                    files,
+                    &mut all_diagnostics,
+                    get_semantic_diagnostics,
+                );
                 // Ask for the global diagnostics again (they were empty above); we may have found new during checking, e.g. missing globals.
                 all_diagnostics.extend(get_global_diagnostics());
             }
@@ -3783,7 +3987,11 @@ pub fn get_diagnostics_of_any_program(
                 && options.get_emit_declarations()
                 && all_diagnostics.len() == config_file_parsing_diagnostics_length
             {
-                all_diagnostics.extend(get_declaration_diagnostics(file));
+                append_diagnostics_for_all_files(
+                    files,
+                    &mut all_diagnostics,
+                    get_declaration_diagnostics,
+                );
             }
         }
     }
@@ -3897,13 +4105,23 @@ fn is_plain_js_error(code: i32) -> bool {
 // Output (Go diagnosticwriter/diagnosticwriter.go, non-pretty)
 // ---------------------------------------------------------------------------
 
-// Go: diagnosticwriter/diagnosticwriter.go:467 WriteFormatDiagnostic
+// Go: diagnosticwriter/diagnosticwriter.go:555 WriteFormatDiagnostic
 // PORT: Go writes to an io.Writer; this returns the text.
+// PORT: Go wraps the diagnostic in `ASTDiagnostic`, whose `File` and `Pos`
+// go through `resolve` (#4712): see `resolve_diagnostic_location`.
 pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     let mut output = String::new();
     if diagnostic.file.is_some() {
-        let (line, character) =
-            get_ecma_line_and_utf16_character_of_position(diagnostic.file, diagnostic.pos);
+        let resolved = resolve_diagnostic_location(diagnostic);
+        let (line, character) = if resolved.use_original {
+            // Go `newOriginalTextFile`: the position is in the original text.
+            ecma_line_and_utf16_character_of_text_position(
+                source_file_original_text(diagnostic.file),
+                resolved.loc.pos(),
+            )
+        } else {
+            get_ecma_line_and_utf16_character_of_position(diagnostic.file, resolved.loc.pos())
+        };
         let file_name = &source_file_info(diagnostic.file).file_name;
         let compare_options = tspath::ComparePathsOptions {
             use_case_sensitive_file_names: use_case_sensitive_file_names(),
@@ -3917,8 +4135,9 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
         ));
     }
     output.push_str(&format!(
-        "{} TS{}: ",
+        "{} {}{}: ",
         diagnostic.category.name(),
+        diagnostic_prefix(diagnostic),
         diagnostic.code
     ));
     write_flattened_diagnostic_message(&mut output, diagnostic, "\n");
@@ -3926,25 +4145,112 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     output
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:461 WriteFormatDiagnostics
+// Go: diagnosticwriter/diagnosticwriter.go:83 resolvedLocation (#4712)
+// resolvedLocation describes how a diagnostic on a content-mapped file should be reported.
+struct ResolvedLocation {
+    loc: TextRange,
+    use_original: bool, // render against the file's original, untransformed text
+    synthesized: bool,  // the range is in virtual code with no corresponding original location
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:90 (*ASTDiagnostic).resolve (#4712)
+// resolve determines where and against which text a diagnostic should be reported. A content mapper's
+// own diagnostics already carry original ranges. A compiler diagnostic on a content-mapped file has its
+// virtual range mapped back to the original; if it falls entirely within synthesized code, there is no
+// original location, so it is shown against the virtual text and flagged as synthesized.
+fn resolve_diagnostic_location(d: &Diagnostic) -> ResolvedLocation {
+    let loc = TextRange::new(d.pos, d.end);
+    let mut resolved = ResolvedLocation {
+        loc,
+        use_original: false,
+        synthesized: false,
+    };
+    if d.file.is_nil() {
+        return resolved;
+    }
+    if !d.source().is_empty() {
+        resolved.use_original = true;
+    } else if let Some(span_map) = source_file_span_map(d.file) {
+        let (mapped, fidelity) =
+            crate::spanmap::SpanMap::virtual_to_original_span(Some(span_map), loc);
+        if fidelity == crate::spanmap::Fidelity::NONE {
+            resolved.synthesized = true;
+        } else {
+            resolved.loc = mapped;
+            resolved.use_original = true;
+        }
+    }
+    resolved
+}
+
+/// Go `scanner.GetECMALineAndUTF16CharacterOfPosition` on the Go
+/// `originalTextFile` of a content-mapped file (#4712), whose line map is
+/// `core.ComputeECMALineStarts` of its original text.
+// PORT: `get_ecma_line_and_utf16_character_of_position` reads the text of a
+// file node; the original text has no node, so this is the same code on
+// the text.
+fn ecma_line_and_utf16_character_of_text_position(text: &str, pos: i32) -> (i32, i32) {
+    let line_map = compute_ecma_line_starts(text);
+    let line = compute_line_of_position(&line_map, pos);
+    let end = pos as usize;
+    let mut boundary = end;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let character =
+        utf16_len(&text[line_map[line as usize] as usize..boundary]) + (end - boundary) as i32;
+    (line, character)
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:364 diagnosticPrefix (#4712)
+// diagnosticPrefix returns the prefix shown before a diagnostic's code, e.g. "TS" for compiler
+// diagnostics or a content mapper's custom source for its diagnostics.
+fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
+    let source = diagnostic.source();
+    if !source.is_empty() {
+        return source;
+    }
+    "TS"
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:549 WriteFormatDiagnostics
 pub fn write_format_diagnostics(output: &mut String, diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         output.push_str(&format_diagnostic(diagnostic));
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:263 WriteFlattenedDiagnosticMessage
-// PORT: this writer has no Go `FormattingOptions`, so the locale is Go
-// `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
+// Go: diagnosticwriter/diagnosticwriter.go:342 WriteFlattenedDiagnosticMessage
+// PORT: this writer has no Go `FormattingOptions`, so the locale is
+// Go `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
 // `write_format_diagnostic`).
 fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnostic, newline: &str) {
     writer.push_str(&diagnostic.localize(&crate::locale::DEFAULT));
-    for chain in &diagnostic.message_chain {
+    for chain in ast_diagnostic_message_chain(diagnostic).iter() {
         flatten_diagnostic_message_chain(writer, chain, newline, 1);
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:271 flattenDiagnosticMessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:130 (*ASTDiagnostic).MessageChain
+// PORT: Go wraps each chain entry in `ASTDiagnostic`; the entries are the
+// diagnostics themselves here.
+fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
+    // #4712
+    if !resolve_diagnostic_location(d).synthesized {
+        return Cow::Borrowed(&d.message_chain);
+    }
+    let mut result = Vec::with_capacity(d.message_chain.len() + 1);
+    result.extend(d.message_chain.iter().cloned());
+    // The diagnostic points into synthesized virtual code; make clear the shown location is not in the
+    // original file, and which content mapper produced it.
+    result.push(new_compiler_diagnostic(
+        diag::This_location_is_in_virtual_code_produced_by_the_content_mapper_0_and_has_no_corresponding_location_in_the_original_file,
+        args![source_file_content_mapper(d.file)],
+    ));
+    Cow::Owned(result)
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:350 flattenDiagnosticMessageChain
 fn flatten_diagnostic_message_chain(
     writer: &mut String,
     chain: &Diagnostic,
@@ -3956,7 +4262,7 @@ fn flatten_diagnostic_message_chain(
         writer.push_str("  ");
     }
     writer.push_str(&chain.localize(&crate::locale::DEFAULT));
-    for child in &chain.message_chain {
+    for child in ast_diagnostic_message_chain(chain).iter() {
         flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
     }
 }
@@ -4030,4 +4336,83 @@ impl<R> PendingCheckerJobs<R> {
 /// The pool index of the checker for `file` (Go `fileAssociations[file]`).
 pub fn checker_index_of_file(file: Node) -> usize {
     checker_index_for_file(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: compiler/emitter.go:504-521. No Go test covers this part. The
+    // expected values come from Go at pin B (16c25522e123): the same calls in
+    // a Go test, and for the cases marked "oracle" also a `noEmit`
+    // incremental tsgo run, where a JSON file that Go may emit is in
+    // `affectedFilesPendingEmit`.
+    #[test]
+    fn json_file_may_be_emitted_matches_go() {
+        // (file, outDir, rootDir, config file path, may be emitted)
+        let cases = [
+            // No outDir.
+            ("/proj/src/data.json", "", "/proj/src", "", false),
+            // No rootDir and no config file: the common directory is unknown.
+            ("/proj/src/data.json", "/proj/dist", "", "", true),
+            // oracle: under rootDir.
+            ("/proj/src/data.json", "/proj/dist", "/proj/src", "", true),
+            // oracle: outside rootDir, the output path is the file itself.
+            ("/proj/data.json", "/proj/dist", "/proj/src", "", false),
+            // oracle: outDir is rootDir.
+            ("/proj/src/data.json", "/proj/src", "/proj/src", "", true),
+            // oracle: outDir is the config file directory.
+            (
+                "/proj/src/data.json",
+                "/proj",
+                "",
+                "/proj/tsconfig.json",
+                true,
+            ),
+            // oracle: the path starts with rootDir, but not at a separator.
+            (
+                "/proj/src-data/data.json",
+                "/proj/dist",
+                "/proj/src",
+                "",
+                true,
+            ),
+            // A root keeps its separator.
+            ("/data.json", "/", "/", "", false),
+        ];
+        for (file, out_dir, root_dir, config_file_path, expected) in cases {
+            let options = CompilerOptions {
+                out_dir: out_dir.to_string(),
+                root_dir: root_dir.to_string(),
+                config_file_path: config_file_path.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                json_file_may_be_emitted(file, &options, "/proj", true),
+                expected,
+                "{file} outDir {out_dir:?} rootDir {root_dir:?} config {config_file_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_file_may_be_emitted_case_insensitive() {
+        let options = CompilerOptions {
+            out_dir: "/proj/dist".to_string(),
+            root_dir: "/proj/SRC".to_string(),
+            ..Default::default()
+        };
+        assert!(json_file_may_be_emitted(
+            "/proj/src/data.json",
+            &options,
+            "/proj",
+            false
+        ));
+        assert!(!json_file_may_be_emitted(
+            "/proj/src/data.json",
+            &options,
+            "/proj",
+            true
+        ));
+    }
 }

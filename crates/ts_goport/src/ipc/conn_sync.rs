@@ -1,18 +1,18 @@
-//! Port of internal/api/conn_sync.go.
+//! Port of internal/ipc/conn_sync.go (internal/api/conn_sync.go before tsgo#4712).
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
-use crate::api::conn::{Conn, Handler, recovered_value};
-use crate::api::protocol::{Message, Protocol};
-use crate::api::transport::ReadWriteCloser;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{Context, GoError, errors, strconv};
+use crate::ipc::conn::{Conn, Handler, recovered_value};
+use crate::ipc::protocol::{Message, Protocol};
+use crate::ipc::transport::ReadWriteCloser;
 use crate::jsonrpc;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Instant;
 
-// Go: conn_sync.go:17 SyncConn
+// Go: ipc/conn_sync.go:18 SyncConn
 // SyncConn manages bidirectional communication with synchronous request handling.
 // Requests are handled one at a time inline, and outgoing calls are serialized.
 pub struct SyncConn {
@@ -28,7 +28,7 @@ pub struct SyncConn {
     timing: RefCell<Option<TimingCollector>>,
 }
 
-// Go: conn_sync.go:29 NewSyncConn
+// Go: ipc/conn_sync.go:34 NewSyncConn
 // NewSyncConn creates a new sync connection with the given transport and handler.
 pub fn new_sync_conn(
     rwc: Arc<dyn ReadWriteCloser>,
@@ -46,7 +46,7 @@ pub fn new_sync_conn(
 // PORT: the Go methods are inherent methods; `impl Conn` below forwards to
 // them, so callers need not import `Conn`.
 impl SyncConn {
-    // Go: conn_sync.go:45 SetCollectTiming
+    // Go: ipc/conn_sync.go:45 SetCollectTiming
     // SetCollectTiming enables or disables per-request server processing-time
     // measurement. When enabled, the connection accumulates timing that clients can
     // retrieve via a getServerTiming request.
@@ -58,7 +58,7 @@ impl SyncConn {
         }
     }
 
-    // Go: conn_sync.go:39 Run
+    // Go: ipc/conn_sync.go:55 Run
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
     pub fn run(&self, ctx: &Context) -> Result<(), GoError> {
@@ -86,13 +86,13 @@ impl SyncConn {
             } else {
                 // Responses are not expected in the main loop - they are read inline by Call().
                 return Err(errors::new(
-                    "api: unexpected response message in sync connection",
+                    "ipc: unexpected response message in sync connection",
                 ));
             }
         }
     }
 
-    // Go: conn_sync.go:68 handleRequest
+    // Go: ipc/conn_sync.go:84 handleRequest
     // handleRequest processes an incoming request.
     // PORT: Go recovers panics in a deferred function; `catch_unwind` covers
     // the same body (the handler call and the response write). Go
@@ -100,7 +100,7 @@ impl SyncConn {
     fn handle_request(&self, ctx: &Context, msg: Message) {
         // Intercept the meta-requests for collected server timing before dispatching
         // to the handler, so they are answered directly and not themselves recorded.
-        if msg.method == Method::GET_SERVER_TIMING.0 {
+        if msg.method == METHOD_GET_SERVER_TIMING {
             let snapshot = server_timing_snapshot(self.timing.borrow().as_ref());
             let write_err = self
                 .protocol
@@ -108,13 +108,13 @@ impl SyncConn {
                 .write_response(msg.id.as_ref(), Some(Box::new(snapshot)));
             if let Err(write_err) = write_err {
                 panic!(
-                    "api: failed to write server timing response: {}",
+                    "ipc: failed to write server timing response: {}",
                     write_err.error()
                 );
             }
             return;
         }
-        if msg.method == Method::RESET_SERVER_TIMING.0 {
+        if msg.method == METHOD_RESET_SERVER_TIMING {
             if let Some(timing) = self.timing.borrow_mut().as_mut() {
                 timing.reset();
             }
@@ -124,7 +124,7 @@ impl SyncConn {
                 .write_response(msg.id.as_ref(), None);
             if let Err(write_err) = write_err {
                 panic!(
-                    "api: failed to write reset server timing response: {}",
+                    "ipc: failed to write reset server timing response: {}",
                     write_err.error()
                 );
             }
@@ -162,7 +162,7 @@ impl SyncConn {
             };
 
             if let Err(write_err) = write_err {
-                panic!("api: failed to write response: {}", write_err.error());
+                panic!("ipc: failed to write response: {}", write_err.error());
             }
         }));
 
@@ -182,14 +182,14 @@ impl SyncConn {
 
             if let Err(write_err) = write_err {
                 panic!(
-                    "api: failed to write panic error response: {} (original panic: {r})",
+                    "ipc: failed to write panic error response: {} (original panic: {r})",
                     write_err.error()
                 );
             }
         }
     }
 
-    // Go: conn_sync.go:112 handleNotification
+    // Go: ipc/conn_sync.go:161 handleNotification
     // handleNotification processes an incoming notification.
     fn handle_notification(&self, ctx: &Context, msg: Message) {
         let _ = self
@@ -197,7 +197,7 @@ impl SyncConn {
             .handle_notification(ctx, &msg.method, msg.params);
     }
 
-    // Go: conn_sync.go:118 Call
+    // Go: ipc/conn_sync.go:167 Call
     // Call sends a request to the client and waits for a response.
     // This method is safe to call from multiple goroutines - calls are serialized.
     pub fn call(
@@ -227,7 +227,7 @@ impl SyncConn {
         if msg.is_response() && msg.id.as_ref().is_some_and(|id| id.string() == method) {
             if let Some(error) = &msg.error {
                 return Err(errors::new(format!(
-                    "api: remote error [{}]: {}",
+                    "ipc: remote error [{}]: {}",
                     error.code, error.message
                 )));
             }
@@ -236,12 +236,12 @@ impl SyncConn {
 
         // Unexpected message while waiting for response
         Err(errors::new(format!(
-            "api: unexpected message while waiting for {} response",
+            "ipc: unexpected message while waiting for {} response",
             strconv::quote(method)
         )))
     }
 
-    // Go: conn_sync.go:155 Notify
+    // Go: ipc/conn_sync.go:204 Notify
     // Notify sends a notification to the client (no response expected).
     pub fn notify(
         &self,

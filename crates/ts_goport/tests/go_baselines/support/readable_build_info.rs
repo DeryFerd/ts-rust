@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use ts_goport::execute::incremental::build_info::{
     BuildInfo, BuildInfoDiagnostic, BuildInfoDiagnosticsOfFile, BuildInfoEmitSignature,
     BuildInfoFileId, BuildInfoFileIdListId, BuildInfoFileInfo, BuildInfoFilePendingEmit,
-    BuildInfoRoot, marshal_any,
+    BuildInfoRepopulateInfo, BuildInfoRoot, marshal_any,
 };
 use ts_goport::execute::incremental::hash::{FileEmitKind, get_file_emit_kind};
 use ts_goport::frontend::json::{JsonError, MarshalerTo, json_marshal_indent};
@@ -219,7 +219,7 @@ impl MarshalerTo for ReadableBuildInfoFileInfo<'_> {
     }
 }
 
-// Go: tsctests/readablebuildinfo.go:56 readableBuildInfoDiagnostic
+// Go: tsctests/readablebuildinfo.go:59 readableBuildInfoDiagnostic
 struct ReadableBuildInfoDiagnostic {
     // incrementalBuildInfoFileId if it is for a File thats other than its stored for
     file: String,
@@ -235,6 +235,7 @@ struct ReadableBuildInfoDiagnostic {
     reports_unnecessary: bool,
     reports_deprecated: bool,
     skipped_on_no_emit: bool,
+    repopulate_info: Option<ReadableBuildInfoRepopulateInfo>,
 }
 
 impl MarshalerTo for ReadableBuildInfoDiagnostic {
@@ -253,6 +254,29 @@ impl MarshalerTo for ReadableBuildInfoDiagnostic {
         w.bool_omitzero("reportsUnnecessary", self.reports_unnecessary);
         w.bool_omitzero("reportsDeprecated", self.reports_deprecated);
         w.bool_omitzero("skippedOnNoEmit", self.skipped_on_no_emit);
+        if let Some(repopulate_info) = &self.repopulate_info {
+            w.value("repopulateInfo", repopulate_info)?;
+        }
+        w.end();
+        Ok(())
+    }
+}
+
+// Go: tsctests/readablebuildinfo.go:77 readableBuildInfoRepopulateInfo
+struct ReadableBuildInfoRepopulateInfo {
+    kind: i32,
+    module_reference: String,
+    mode: i32,
+    package_name: String,
+}
+
+impl MarshalerTo for ReadableBuildInfoRepopulateInfo {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        let mut w = ObjectWriter::new(enc);
+        w.name("kind").push_str(&self.kind.to_string());
+        w.string_omitzero("moduleReference", &self.module_reference)?;
+        w.int_omitzero("mode", i64::from(self.mode));
+        w.string_omitzero("packageName", &self.package_name)?;
         w.end();
         Ok(())
     }
@@ -419,7 +443,7 @@ impl ReadableBuildInfo<'_> {
         self.file_ids_list.as_ref().expect("fileIdsList")[(file_id_list_id.0 - 1) as usize].clone()
     }
 
-    // Go: tsctests/readablebuildinfo.go:244 toReadableBuildInfoDiagnostic
+    // Go: tsctests/readablebuildinfo.go:257 toReadableBuildInfoDiagnostic
     // PORT: Go `core.Map` returns nil for a nil slice; the caller passes the
     // `Option`.
     fn to_readable_build_info_diagnostic(
@@ -454,6 +478,9 @@ impl ReadableBuildInfo<'_> {
                     reports_unnecessary: d.reports_unnecessary,
                     reports_deprecated: d.reports_deprecated,
                     skipped_on_no_emit: d.skipped_on_no_emit,
+                    repopulate_info: to_readable_build_info_repopulate_info(
+                        d.repopulate_info.as_ref(),
+                    ),
                 }
             })
             .collect()
@@ -656,6 +683,21 @@ impl ReadableBuildInfo<'_> {
                 .collect()
         });
     }
+}
+
+// Go: tsctests/readablebuildinfo.go:282 toReadableBuildInfoRepopulateInfo
+// PORT: a free function after the `readableBuildInfo` methods (Go puts it
+// between them).
+fn to_readable_build_info_repopulate_info(
+    info: Option<&BuildInfoRepopulateInfo>,
+) -> Option<ReadableBuildInfoRepopulateInfo> {
+    let info = info?;
+    Some(ReadableBuildInfoRepopulateInfo {
+        kind: info.kind.0,
+        module_reference: info.module_reference.clone(),
+        mode: info.mode.0,
+        package_name: info.package_name.clone(),
+    })
 }
 
 // Go: tsctests/readablebuildinfo.go:364 toReadableFileEmitKind

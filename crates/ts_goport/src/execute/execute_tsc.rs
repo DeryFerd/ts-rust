@@ -24,6 +24,10 @@ use crate::frontend::prelude::*;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::contentmapper::{
+    Host as ContentMapperHost, Project as ContentMapperProject,
+    ProjectSpec as ContentMapperProjectSpec,
+};
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::parse_build_command_line;
 use crate::execute::build::host::TscExtendedConfigCache;
@@ -31,13 +35,15 @@ use crate::execute::build::orchestrator::{Options as OrchestratorOptions, new_or
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::incremental::incremental::{create_host, new_build_info_reader};
 use crate::execute::incremental::program::{
-    Program as IncrementalProgram, new_program as new_incremental_program, read_build_info_program,
+    NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
+    read_build_info_program,
 };
 use crate::execute::tsc::{
     CommandLineResult, CompileTimes, CompilerProgram, DiagnosticReporter, DiagnosticsReporter,
     EmitInput, ExitStatus, ProgramLike, System, SystemParseConfigHost, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, get_trace_with_writer_from_sys,
-    print_build_help, print_help, print_version, write_config_file, write_str,
+    new_content_mapper_host, print_build_help, print_help, print_version, write_config_file,
+    write_str,
 };
 use crate::execute::watcher::create_watcher;
 use crate::frontend::json::json_marshal_indent_write;
@@ -450,7 +456,8 @@ pub fn tsc_compilation(
         };
     } else if config_for_compilation.compiler_options().is_incremental() {
         return perform_incremental_compilation(
-            &*sys,
+            ctx,
+            &sys,
             config_for_compilation,
             report_diagnostic,
             report_error_summary,
@@ -461,7 +468,8 @@ pub fn tsc_compilation(
         );
     }
     perform_compilation(
-        &*sys,
+        ctx,
+        &sys,
         config_for_compilation,
         report_diagnostic,
         report_error_summary,
@@ -540,7 +548,7 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
     }
 }
 
-// Go: execute/tsc.go:284 performIncrementalCompilation
+// Go: execute/tsc.go:287 performIncrementalCompilation
 // PORT: the incremental program reads back the installed program. A bin
 // that replaces the program (`TscCompilationHooks::program_like`) skips
 // `incremental.ReadBuildInfoProgram` and `incremental.NewProgram`: `goport`
@@ -553,10 +561,16 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // the second global diagnostics read and the emit, before
 // `EmitAndReportStatistics` (`Program::start_check_and_emit`). Each checker
 // then emits when its own check ends. `EmitAndReportStatistics` makes the
-// same calls as in Go and waits for that work. Its check time is the wait
-// for the check, and its emit time the wait for the rest of the emit.
+// same calls as in Go and waits for that work. Its check time is the time
+// that `start_check` spent on the affected files plus the wait for the
+// check (`Program::take_started_check_time`), and its emit time the wait
+// for the rest of the emit.
+// PORT: `sys_rc` is the `Rc` so that the incremental program can keep
+// `sys.Now` (Go passes the method value) and the content mapper host can
+// keep `sys` as its spawner. The body uses `sys: &dyn System`.
 fn perform_incremental_compilation(
-    sys: &dyn System,
+    ctx: &Context,
+    sys_rc: &Rc<dyn System>,
     config: ParsedCommandLine,
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
@@ -565,13 +579,18 @@ fn perform_incremental_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
+    let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
+    let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
+    let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
         Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
+        content_mapper_project,
     );
     let config = Rc::new(config);
     let replacement = hooks.program_like();
@@ -588,15 +607,24 @@ fn perform_incremental_compilation(
     install_program(host.clone(), config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
     let changes_compute_start = sys.now();
+    // Go: sys.Now
+    let nested_emit_now: NestedEmitNow = {
+        let sys = sys_rc.clone();
+        Rc::new(move || sys.now())
+    };
     let incremental_program = match replacement {
         Some(_) => None,
         None => Some(new_incremental_program(
             old_program.as_ref(),
             create_host(host),
+            Some(nested_emit_now),
             testing.is_some(),
         )),
     };
     compile_times.borrow_mut().changes_compute_time = since(sys, changes_compute_start);
+    if let Some(content_mapper_host) = &content_mapper_host {
+        compile_times.borrow_mut().content_mapper_times = content_mapper_host.timings();
+    }
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -642,9 +670,12 @@ fn perform_incremental_compilation(
     result(emit_result.status)
 }
 
-// Go: execute/tsc.go:333 performCompilation
+// Go: execute/tsc.go:345 performCompilation
+// PORT: `sys_rc` is the `Rc` so that the content mapper host can keep
+// `sys` as its spawner. The body uses `sys: &dyn System`.
 fn perform_compilation(
-    sys: &dyn System,
+    ctx: &Context,
+    sys_rc: &Rc<dyn System>,
     config: ParsedCommandLine,
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
@@ -653,13 +684,18 @@ fn perform_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
+    let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
+    let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
+    let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
         &sys.get_current_directory(),
         sys.fs(),
         &sys.default_library_path(),
         Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
         Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
+        content_mapper_project,
     );
     let config = Rc::new(config);
 
@@ -668,6 +704,9 @@ fn perform_compilation(
     let parse_start = sys.now();
     install_program(host, config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
+    if let Some(content_mapper_host) = &content_mapper_host {
+        compile_times.borrow_mut().content_mapper_times = content_mapper_host.timings();
+    }
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -708,6 +747,34 @@ pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, t
         sys.fs().use_case_sensitive_file_names(),
         &sys.default_library_path(),
     );
+}
+
+/// Go `defer contentMapperProject.Close()`: closes the project when the
+/// compile function returns.
+struct CloseContentMapperProject(Option<Rc<dyn ContentMapperProject>>);
+
+impl Drop for CloseContentMapperProject {
+    fn drop(&mut self) {
+        if let Some(project) = &self.0 {
+            let _ = project.close();
+        }
+    }
+}
+
+// Go: execute/tsc.go:394 getContentMapperProject (tsgo#4712)
+fn get_content_mapper_project(
+    host: Option<&Rc<dyn ContentMapperHost>>,
+    config: &ParsedCommandLine,
+) -> Option<Rc<dyn ContentMapperProject>> {
+    let host = host?;
+    if config.content_mappers().is_empty() {
+        return None;
+    }
+    host.project(ContentMapperProjectSpec {
+        config_file_name: config.config_name().to_string(),
+        mappers: config.content_mappers().to_vec(),
+        compiler_options: Some(config.compiler_options().clone()),
+    })
 }
 
 // Go: execute/tsc.go:373 showConfig

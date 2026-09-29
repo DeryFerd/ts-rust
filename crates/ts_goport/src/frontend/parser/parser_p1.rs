@@ -173,7 +173,6 @@ pub struct Parser {
     pub jsdoc_tag_comments_space: Vec<String>,
     pub jsdoc_tag_comments_parts_space: Vec<Node>,
     pub reparse_list: Vec<Node>,
-    pub common_js_module_indicator: Node,
 
     pub current_parent: Node,
     pub reparsed_clones: Vec<Node>,
@@ -211,7 +210,6 @@ pub fn new_parser() -> Parser {
         jsdoc_tag_comments_space: Vec::new(),
         jsdoc_tag_comments_parts_space: Vec::new(),
         reparse_list: Vec::new(),
-        common_js_module_indicator: Node::NIL,
         current_parent: Node::NIL,
         reparsed_clones: Vec::new(),
         store: 0,
@@ -427,7 +425,7 @@ impl Parser {
                             p.next_token() != SyntaxKind::ColonToken
                         }) =>
                     {
-                        self.parse_literal_expression(false /*intern*/)
+                        self.parse_literal_expression()
                     }
                     _ => self.parse_object_literal_expression(),
                 };
@@ -800,7 +798,6 @@ impl Parser {
         result.diagnostics = attach_file_to_diagnostics(diagnostics, result.root);
         result.jsdoc_diagnostics =
             attach_file_to_diagnostics(self.jsdoc_diagnostics.clone(), result.root);
-        result.common_js_module_indicator = self.common_js_module_indicator;
         result.is_declaration_file = is_declaration_file;
         result.language_variant = self.language_variant;
         result.script_kind = self.script_kind;
@@ -810,14 +807,7 @@ impl Parser {
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
         set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
-        // PORT: the store copy of `ContainsNonASCII`, which Go NewSourceFile
-        // sets (`ParsedSourceFile::new`).
-        set_file_store_parse_fields(
-            result.store,
-            result.language_variant,
-            &result.diagnostics,
-            result.contains_non_ascii,
-        );
+        set_file_store_parse_fields(result.store, result.language_variant, &result.diagnostics);
         // For non-JS files, enable lazy JSDoc parsing on demand
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;
@@ -825,7 +815,7 @@ impl Parser {
             // `resolve_file_store_js_doc`).
             set_file_store_lazy_js_doc(result.store, &result.parse_options, result.script_kind);
         }
-        // Go: parser/parser.go:485 slices.SortFunc(p.reparsedClones, ast.CompareNodePositions)
+        // Go: parser/parser.go:484 slices.SortFunc(p.reparsedClones, ast.CompareNodePositions)
         crate::gostd::slices::sort_func(&mut self.reparsed_clones, |a, b| {
             compare_node_positions(*a, *b)
         });
@@ -2148,7 +2138,10 @@ fn scan_error(
 // Go: parser.go:229 getErrorSpanForNode
 #[must_use]
 pub fn get_error_span_for_node(source_text: &str, node: Node) -> TextRange {
-    let pos = skip_trivia(source_text, node.pos());
+    let mut pos = node.pos();
+    if !node_is_missing(node) {
+        pos = skip_trivia(source_text, pos);
+    }
     TextRange::new(pos, node.end())
 }
 
@@ -2168,7 +2161,7 @@ pub fn parse_isolated_entity_name(text: &str) -> Node {
     let mut p = new_parser();
     p.initialize_state(&SourceFileParseOptions::default(), text, ScriptKind::JS);
     p.next_token();
-    let entity_name = p.parse_entity_name(true, None);
+    let entity_name = p.parse_entity_name(true, false, None);
     if p.token == SyntaxKind::EndOfFile && p.diagnostics.borrow().diagnostics.is_empty() {
         entity_name
     } else {

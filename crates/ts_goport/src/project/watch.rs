@@ -224,6 +224,42 @@ pub fn new_watched_files<T: Default>(
     })
 }
 
+// Go: project/watch.go:184 NewWatchedFilesForPaths (tsgo#4712)
+// NewWatchedFilesForPaths creates a watcher for exact file paths, routing files outside the workspace
+// through directory-based external watchers so clients can use URI-based RelativePatterns when supported.
+pub fn new_watched_files_for_paths(
+    name: &str,
+    watch_kind: lsproto::WatchKind,
+    has_relative_pattern_capability: bool,
+    workspace_directory: &str,
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+) -> Rc<WatchedFiles<Vec<String>>> {
+    let compare_paths_options = tspath::ComparePathsOptions {
+        current_directory: current_directory.to_string(),
+        use_case_sensitive_file_names,
+    };
+    let workspace_directory = workspace_directory.to_string();
+    new_watched_files(
+        name,
+        watch_kind,
+        has_relative_pattern_capability,
+        Rc::new(move |files: &Vec<String>| {
+            let mut result = PatternsAndIgnored::default();
+            for file in files {
+                if tspath::contains_path(&workspace_directory, file, &compare_paths_options) {
+                    result.patterns_inside_workspace.push(file.clone());
+                } else {
+                    result
+                        .directories_outside_workspace
+                        .push(tspath::get_directory_path(file));
+                }
+            }
+            result
+        }),
+    )
+}
+
 // Go: project/watch.go:184 Watchers
 #[derive(Clone, Debug, Default)]
 pub struct Watchers {

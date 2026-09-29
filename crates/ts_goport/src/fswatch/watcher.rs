@@ -22,7 +22,7 @@ use std::time::Duration;
 use crate::frontend::vfs::osvfs::{filepath_clean, go_string_from_os, os_path};
 use crate::fswatch::syscall;
 use crate::fswatch::walkdir::path_error;
-use crate::gostd::errors;
+use crate::gostd::{errors, strconv};
 
 // Go: watcher.go:13 errNilCallback
 pub static ERR_NIL_CALLBACK: LazyLock<GoError> =
@@ -61,6 +61,17 @@ pub static ERR_WATCH_TERMINATED: LazyLock<GoError> =
 /// available on the current platform.
 pub static ERR_UNAVAILABLE: LazyLock<GoError> =
     LazyLock::new(|| errors::new("fswatch: watcher not available on this platform"));
+
+// Go: watcher.go:50 ErrFilesystemUnsupported
+/// ErrFilesystemUnsupported indicates that the active watcher backend cannot
+/// operate on the target filesystem, even though the backend is available on
+/// the current platform. This happens, for example, with the fanotify backend
+/// on filesystems that do not support FID-based watching: name_to_handle_at
+/// returning EOPNOTSUPP (some Docker bind mounts backed by virtiofs, gRPC FUSE,
+/// or overlayfs) or fanotify_mark returning ENODEV (e.g. NTFS mounted via
+/// fuseblk).
+pub static ERR_FILESYSTEM_UNSUPPORTED: LazyLock<GoError> =
+    LazyLock::new(|| errors::new("fswatch: watcher backend unsupported on this filesystem"));
 
 // Go: watcher.go:45 Watcher
 /// Watcher represents a filesystem watching implementation.
@@ -254,6 +265,12 @@ pub static FANOTIFY_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
         crate::fswatch::fanotify_linux::init(w);
     })
 });
+pub static FANOTIFY_FALLBACK_WATCHER: LazyLock<Arc<FallbackWatcher>> = LazyLock::new(|| {
+    Arc::new(FallbackWatcher {
+        primary: FANOTIFY_WATCHER.clone(),
+        secondary: INOTIFY_WATCHER.clone(),
+    })
+});
 
 // PORT: Go `&watcher{name: name}` composite literal, followed by the
 // platform `init()` that sets the factory. The watcher also keeps a weak
@@ -271,7 +288,7 @@ pub fn new_watcher(name: &str, init: impl FnOnce(&mut WatcherStruct)) -> Arc<Wat
     })
 }
 
-// Go: watcher.go:158 AllWatchers
+// Go: watcher.go:192 AllWatchers
 /// AllWatchers returns a fresh slice listing every watcher backend the package
 /// knows about. Use [Watcher.Available] to check which ones work on the current
 /// OS.
@@ -280,18 +297,18 @@ pub fn all_watchers() -> Vec<Arc<dyn Watcher>> {
     let fsevents_watcher: Arc<dyn Watcher> = FSEVENTS_WATCHER.clone();
     let kqueue_watcher: Arc<dyn Watcher> = KQUEUE_WATCHER.clone();
     let windows_watcher: Arc<dyn Watcher> = WINDOWS_WATCHER.clone();
-    let fanotify_watcher: Arc<dyn Watcher> = FANOTIFY_WATCHER.clone();
+    let fanotify_fallback_watcher: Arc<dyn Watcher> = FANOTIFY_FALLBACK_WATCHER.clone();
     vec![
         inotify_watcher,
         fsevents_watcher,
         kqueue_watcher,
         windows_watcher,
-        fanotify_watcher,
+        fanotify_fallback_watcher,
     ]
 }
 
-// Go: watcher.go:169 Inotify
-/// Inotify returns the inotify watcher (Linux).
+// Go: watcher.go:203 Inotify
+/// Inotify returns the inotify watcher (Linux and Android).
 pub fn inotify() -> Arc<dyn Watcher> {
     INOTIFY_WATCHER.clone()
 }
@@ -314,13 +331,14 @@ pub fn windows() -> Arc<dyn Watcher> {
     WINDOWS_WATCHER.clone()
 }
 
-// Go: watcher.go:181 Fanotify
-/// Fanotify returns the fanotify watcher (Linux, kernel ≥ 5.13).
+// Go: watcher.go:216 Fanotify
+/// Fanotify returns the fanotify watcher (Linux, kernel ≥ 5.13). Directories on
+/// filesystems that don't support fanotify watches automatically use inotify instead.
 pub fn fanotify() -> Arc<dyn Watcher> {
-    FANOTIFY_WATCHER.clone()
+    FANOTIFY_FALLBACK_WATCHER.clone()
 }
 
-// Go: watcher.go:184 Default
+// Go: watcher.go:219 Default
 /// Default returns the recommended watcher for the current OS.
 ///
 /// PORT: Go `runtime.GOOS` is `std::env::consts::OS` ("macos" for Go
@@ -336,6 +354,7 @@ pub fn default() -> Arc<dyn Watcher> {
             }
             inotify()
         }
+        "android" => inotify(),
         "macos" => {
             if fs_events().available() {
                 return fs_events();
@@ -346,6 +365,115 @@ pub fn default() -> Arc<dyn Watcher> {
         "freebsd" | "openbsd" | "netbsd" | "dragonfly" => kqueue(),
         _ => new_watcher("unsupported", |_| {}),
     }
+}
+
+// Go: watcher.go:244 fallbackWatcher
+/// fallbackWatcher keeps the primary backend for supported filesystems while
+/// routing individual unsupported watches to the secondary backend.
+pub struct FallbackWatcher {
+    pub primary: Arc<dyn Watcher>,
+    pub secondary: Arc<dyn Watcher>,
+}
+
+impl Watcher for FallbackWatcher {
+    // Go: watcher.go:249 fallbackWatcher.Name
+    fn name(&self) -> String {
+        self.primary.name()
+    }
+
+    // Go: watcher.go:250 fallbackWatcher.Available
+    fn available(&self) -> bool {
+        self.primary.available()
+    }
+
+    // Go: watcher.go:251 fallbackWatcher.HasFastRecursiveBackend
+    fn has_fast_recursive_backend(&self) -> bool {
+        self.primary.has_fast_recursive_backend()
+    }
+
+    // Go: watcher.go:253 fallbackWatcher.WatchDirectory
+    fn watch_directory(
+        &self,
+        dir: &str,
+        fn_: WatchCallback,
+        opts: &[Box<dyn WatchOption>],
+    ) -> Result<Box<dyn Watch>, GoError> {
+        let watches = self.watch_directories(&[WatchDirectoryRequest {
+            dir: dir.to_string(),
+            callback: fn_,
+            options: opts,
+        }])?;
+        Ok(watches
+            .into_iter()
+            .next()
+            .expect("WatchDirectories returns one watch per request"))
+    }
+
+    // Go: watcher.go:265 fallbackWatcher.WatchDirectories
+    fn watch_directories(
+        &self,
+        requests: &[WatchDirectoryRequest<'_>],
+    ) -> Result<Vec<Box<dyn Watch>>, GoError> {
+        let err = match self.primary.watch_directories(requests) {
+            Ok(watches) => return Ok(watches),
+            Err(err) => err,
+        };
+        if !errors::is(&err, &ERR_FILESYSTEM_UNSUPPORTED) {
+            return Err(err);
+        }
+
+        let mut watches: Vec<Box<dyn Watch>> = Vec::with_capacity(requests.len());
+        let rollback = |watches: &[Box<dyn Watch>]| {
+            for watch in watches.iter().rev() {
+                let _ = watch.close();
+            }
+        };
+        for request in requests {
+            let mut result = self.primary.watch_directory(
+                &request.dir,
+                request.callback.clone(),
+                request.options,
+            );
+            if let Err(err) = &result {
+                if errors::is(err, &ERR_FILESYSTEM_UNSUPPORTED) {
+                    result = self.secondary.watch_directory(
+                        &request.dir,
+                        request.callback.clone(),
+                        request.options,
+                    );
+                }
+            }
+            match result {
+                Ok(watch) => watches.push(watch),
+                Err(err) => {
+                    rollback(&watches);
+                    return Err(errors::errorf(
+                        format!(
+                            "fswatch: failed to watch directory {}: {}",
+                            strconv::quote(&request.dir),
+                            err.error()
+                        ),
+                        vec![err],
+                    ));
+                }
+            }
+        }
+        Ok(watches)
+    }
+
+    // Go: watcher.go:291 fallbackWatcher.WatchFile
+    fn watch_file(&self, path: &str, fn_: WatchCallback) -> Result<Box<dyn Watch>, GoError> {
+        let result = self.primary.watch_file(path, fn_.clone());
+        if let Err(err) = &result {
+            if errors::is(err, &ERR_FILESYSTEM_UNSUPPORTED) {
+                return self.secondary.watch_file(path, fn_);
+            }
+        }
+        result
+    }
+
+    // Go: watcher.go:299 fallbackWatcher.unexported
+    fn unexported(&self) {}
 }
 
 // Go: watcher.go:208 watcher

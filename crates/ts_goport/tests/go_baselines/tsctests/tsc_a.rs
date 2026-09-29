@@ -173,6 +173,15 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
             command_line_args: args!["--lib", "es6 ", "first.ts"],
             ..Default::default()
         },
+        // #4407
+        TscInput {
+            sub_scenario: "noEmit with type error".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/index.ts" => "x = 5;",
+            },
+            command_line_args: args!["--noEmit", "index.ts"],
+            ..Default::default()
+        },
         TscInput {
             sub_scenario: "option diagnostics are suppressed when there are syntactic errors".into(),
             files: file_map! {

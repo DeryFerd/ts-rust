@@ -1,7 +1,7 @@
 //! Ports of internal/printer/utilities_test.go and of the printer_test.go
 //! tests that are not TestEmit or TestParenthesize*: TestNameGeneration,
-//! TestNoTrailingCommaAfterTransform, TestTrailingCommaAfterTransform and
-//! TestPartiallyEmittedExpression.
+//! TestNoTrailingCommaAfterTransform, TestTrailingCommaAfterTransform,
+//! TestPartiallyEmittedExpression and TestOmitTrailingSemicolon.
 //!
 //! Not ported (blocked, see bugs/S3.md): TestEscapeNonAsciiString and
 //! TestEscapeJsxAttributeString (`escape_non_ascii_string` and
@@ -258,4 +258,57 @@ fn partially_emitted_expression() {
     .expression
     .expression;",
     ));
+}
+
+// Go: printer/printer_test.go:2595 TestOmitTrailingSemicolon
+// PORT: runs in a child process, because the printer needs the parsed
+// files published (see `parse_type_script_published`).
+#[test]
+fn test_omit_trailing_semicolon() {
+    in_child(
+        module_path!(),
+        "test_omit_trailing_semicolon",
+        omit_trailing_semicolon,
+    );
+}
+
+fn omit_trailing_semicolon() {
+    let factory = NodeFactory::new_with_hooks(NodeFactoryHooks::default());
+    let method_signature = factory.new_method_signature_declaration(
+        nil(), /*modifiers*/
+        factory.new_identifier("m"),
+        nil(), /*postfixToken*/
+        nil(), /*typeParameters*/
+        factory.new_node_list(&[]),
+        factory.new_keyword_type_node(SyntaxKind::VoidKeyword),
+    );
+    let file = parse_type_script_published("interface I {}", false /*jsx*/);
+
+    let mut default_printer = new_printer(
+        PrinterOptions {
+            new_line: NewLineKind::LF,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        None,
+    );
+    let got = default_printer.emit(method_signature, file);
+    assert_eq!(got, "m(): void;", "default Emit()");
+
+    let mut omit_printer = new_printer(
+        PrinterOptions {
+            new_line: NewLineKind::LF,
+            omit_trailing_semicolon: true,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        None,
+    );
+    let got = omit_printer.emit(method_signature, file);
+    assert_eq!(got, "m(): void", "omit Emit()");
+
+    let for_file = parse_type_script_published("for (;;) {}", false /*jsx*/);
+    let text = omit_printer.emit_source_file_exported(for_file);
+    let got = text.strip_suffix('\n').unwrap_or(&text);
+    assert_eq!(got, "for (;;) { }", "omit EmitSourceFile(for)");
 }

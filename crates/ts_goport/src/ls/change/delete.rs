@@ -209,20 +209,8 @@ fn delete_default_import(t: &mut Tracker, source_file: Node, import_clause: Node
                     ..SkipTriviaOptions::default()
                 }),
             );
-            let start_pos = t
-                .converters
-                .position_to_line_and_character(&source_file, start);
-            let end_pos = t
-                .converters
-                .position_to_line_and_character(&source_file, end);
-            t.replace_range_with_text(
-                source_file,
-                lsproto::Range {
-                    start: start_pos,
-                    end: end_pos,
-                },
-                "",
-            );
+            let range = t.to_lsp_edit_range(source_file, TextRange::new(start, end));
+            t.replace_range_with_text(source_file, range, "");
         } else {
             delete_node(
                 t,
@@ -244,21 +232,9 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
         // import d|, { a }| from './file'
         let previous_token = astnav::get_token_at_position(source_file, node.pos() - 1);
         crate::go_assert!(previous_token.is_some(), "previousToken should not be nil");
-        let start_pos = t.converters.position_to_line_and_character(
-            &source_file,
-            astnav::get_start_of_node(previous_token, source_file, false),
-        );
-        let end_pos = t
-            .converters
-            .position_to_line_and_character(&source_file, node.end());
-        t.replace_range_with_text(
-            source_file,
-            lsproto::Range {
-                start: start_pos,
-                end: end_pos,
-            },
-            "",
-        );
+        let start = astnav::get_start_of_node(previous_token, source_file, false);
+        let range = t.to_lsp_edit_range(source_file, TextRange::new(start, node.end()));
+        t.replace_range_with_text(source_file, range, "");
     } else {
         // Delete the entire import declaration
         // |import * as ns from './file'|
@@ -362,20 +338,8 @@ fn delete_node(
 ) {
     let start_position = t.get_adjusted_start_position(source_file, node, leading_trivia, false);
     let end_position = t.get_adjusted_end_position(source_file, node, trailing_trivia);
-    let start_pos = t
-        .converters
-        .position_to_line_and_character(&source_file, start_position);
-    let end_pos = t
-        .converters
-        .position_to_line_and_character(&source_file, end_position);
-    t.replace_range_with_text(
-        source_file,
-        lsproto::Range {
-            start: start_pos,
-            end: end_pos,
-        },
-        "",
-    );
+    let range = t.to_lsp_edit_range(source_file, TextRange::new(start_position, end_position));
+    t.replace_range_with_text(source_file, range, "");
 }
 
 // Go: ls/change/delete.go:195 deleteNodeInList
@@ -433,20 +397,8 @@ fn delete_node_in_list(
         );
     }
 
-    let start_ls_pos = t
-        .converters
-        .position_to_line_and_character(&source_file, start_pos);
-    let end_ls_pos = t
-        .converters
-        .position_to_line_and_character(&source_file, end_pos);
-    t.replace_range_with_text(
-        source_file,
-        lsproto::Range {
-            start: start_ls_pos,
-            end: end_ls_pos,
-        },
-        "",
-    );
+    let range = t.to_lsp_edit_range(source_file, TextRange::new(start_pos, end_pos));
+    t.replace_range_with_text(source_file, range, "");
 }
 
 impl Tracker {

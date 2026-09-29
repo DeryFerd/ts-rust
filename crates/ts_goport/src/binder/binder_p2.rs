@@ -10,7 +10,6 @@
 //! - `flow_node_arena: Vec<FlowNode>` indexed by `FlowNodeId::local_index()`.
 //! - `symbol_arena` (Go `symbolArena`): the `SymbolArena` (owned or `&mut`).
 //! - `common_js_module_indicator: Node` (Go `file.CommonJSModuleIndicator`, set by the binder).
-//! The source file's `EndFlowNode` is stored in the root node's `NodeBindData.end_flow_node`.
 //! The small module-private helpers below read and write that state.
 
 use crate::astdata::NodeData;
@@ -182,8 +181,6 @@ impl Binder {
             SyntaxKind::ClassExpression => {
                 let mut name_text: String = INTERNAL_SYMBOL_NAME_CLASS.to_string();
                 if name.is_some() {
-                    // PORT: Go also adds the name to `classifiableNames`,
-                    // which nothing reads (see `Binder`).
                     name_text = name.text().to_string();
                 }
                 self.bind_anonymous_declaration(node, SymbolFlags::CLASS, &name_text);
@@ -1205,11 +1202,7 @@ impl Binder {
             }
             if kind == SyntaxKind::SourceFile {
                 let emit_flags = self.emit_flags;
-                let current_flow = self.current_flow;
-                let data = bound_mut(self, node);
-                data.added_flags |= emit_flags;
-                // PORT: Go `node.AsSourceFile().EndFlowNode`; stored on the root node's bind data.
-                data.end_flow_node = current_flow;
+                bound_mut(self, node).added_flags |= emit_flags;
             }
             if self.current_return_target.is_some() {
                 let current_return_target = self.current_return_target;

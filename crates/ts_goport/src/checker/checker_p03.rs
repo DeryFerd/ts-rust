@@ -230,7 +230,6 @@ impl Checker {
         // function returns.
         let mut _trace: Option<crate::tracing::Pop> = None;
         if !self.source_file_links.get(source_file).type_checked {
-            self.save_deferred_diagnostics = true;
             _trace = self.tracer.map(|tr| {
                 tr.push(
                     crate::tracing::Phase::Check,
@@ -253,7 +252,6 @@ impl Checker {
             {
                 self.check_unused_renamed_binding_elements();
             }
-            self.save_deferred_diagnostics = false;
             self.produce_deferred_diagnostics();
             self.reported_unreachable_nodes.clear();
             self.source_file_links.get(source_file).type_checked = true;
@@ -630,7 +628,8 @@ impl Checker {
             self.check_deferred_node(node);
             i += 1;
         }
-        self.source_file_links.get(context).deferred_nodes.clear();
+        // Go (#4825) replaces the set so its storage is freed.
+        self.source_file_links.get(context).deferred_nodes = IndexSet::default();
     }
 
     // Go: checker/checker.go:2489 checkDeferredNode
@@ -687,6 +686,9 @@ impl Checker {
                 if is_instance_of_expression(node) {
                     self.resolve_untyped_call(node);
                 }
+            }
+            SyntaxKind::ObjectLiteralExpression | SyntaxKind::JsxAttributes => {
+                self.check_contextual_deprecations(node);
             }
             _ => {}
         }
@@ -1230,7 +1232,7 @@ impl Checker {
         // Constructors of classes with no extends clause may not contain super calls, whereas
         // constructors of derived classes must contain at least one super call somewhere in their function body.
         let containing_class_decl = node.parent();
-        if get_extends_heritage_clause_element(containing_class_decl).is_nil() {
+        if get_class_extends_heritage_element(containing_class_decl).is_nil() {
             return;
         }
         let class_extends_null = self.class_declaration_extends_null(containing_class_decl);

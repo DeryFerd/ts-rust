@@ -38,6 +38,9 @@ pub struct ConfigFileRegistryBuilder {
     pub configs: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<ConfigFileEntry>>>>,
     pub config_file_names: Rc<dirty::Map<tspath::Path, Rc<RefCell<ConfigFileNames>>>>,
     pub custom_config_file_name_changed: bool,
+    // tsgo#4712. PORT: `contentMappersMu` is dropped (one thread); a Go nil
+    // pointer is `None`.
+    pub all_configured_content_mappers: RefCell<Option<Rc<ConfiguredContentMappers>>>,
 
     /// The Go pointer `c` (see the file comment).
     this: Weak<ConfigFileRegistryBuilder>,
@@ -65,6 +68,7 @@ pub fn new_config_file_registry_builder(
     };
     let custom_config_file_name_changed =
         custom_config_file_name != old_config_file_registry.custom_config_file_name;
+    let all_configured_content_mappers = old_config_file_registry.content_mappers();
     let configs = dirty::new_sync_map(old_config_file_registry.configs.clone());
     let config_file_names = dirty::new_map(old_config_file_registry.config_file_names.clone());
     Rc::new_cyclic(|this| ConfigFileRegistryBuilder {
@@ -77,6 +81,7 @@ pub fn new_config_file_registry_builder(
         snapshot_id,
         custom_config_file_name: custom_config_file_name.to_string(),
         custom_config_file_name_changed,
+        all_configured_content_mappers: RefCell::new(Some(all_configured_content_mappers)),
 
         configs,
         config_file_names,
@@ -108,9 +113,10 @@ impl ConfigFileRegistryBuilder {
         let (configs, changed_configs) = self.configs.finalize_exported();
         if changed_configs {
             ensure_cloned(&mut new_registry);
-            Rc::get_mut(&mut new_registry)
-                .expect("a fresh clone has one owner")
-                .configs = configs;
+            let all_configured_content_mappers = self.content_mappers();
+            let registry = Rc::get_mut(&mut new_registry).expect("a fresh clone has one owner");
+            registry.configs = configs;
+            registry.all_configured_content_mappers = Some(all_configured_content_mappers);
         }
 
         let (config_file_names, changed_names) = self.config_file_names.finalize();
@@ -129,6 +135,39 @@ impl ConfigFileRegistryBuilder {
         }
 
         new_registry
+    }
+
+    // Go: project/configfileregistrybuilder.go:102 configFileRegistryBuilder.contentMappers (tsgo#4712)
+    pub fn content_mappers(&self) -> Rc<ConfiguredContentMappers> {
+        if self.all_configured_content_mappers.borrow().is_none() {
+            let mut command_lines: Vec<Rc<tsoptions::ParsedCommandLine>> = Vec::new();
+            self.configs.range(&mut |entry: &Rc<
+                dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>,
+            >| {
+                let command_line = entry
+                    .value()
+                    .expect("invalid memory address or nil pointer dereference")
+                    .borrow()
+                    .command_line
+                    .clone();
+                if let Some(command_line) = command_line {
+                    command_lines.push(command_line);
+                }
+                true
+            });
+            *self.all_configured_content_mappers.borrow_mut() = Some(
+                collect_configured_content_mappers(command_lines.iter().map(|c| &**c)),
+            );
+        }
+        self.all_configured_content_mappers
+            .borrow()
+            .clone()
+            .expect("set above")
+    }
+
+    // Go: project/configfileregistrybuilder.go:118 configFileRegistryBuilder.invalidateContentMappers (tsgo#4712)
+    pub fn invalidate_content_mappers(&self) {
+        *self.all_configured_content_mappers.borrow_mut() = None;
     }
 
     // Go: project/configfileregistrybuilder.go:97 configFileRegistryBuilder.findOrAcquireConfigForFile
@@ -165,14 +204,16 @@ impl ConfigFileRegistryBuilder {
     // pending reload state. This function should only be called from within the
     // Change() method of a dirty map entry.
     // PORT: `entry` is the handle; each field access is a short borrow, so
-    // the calls below can reach other entries.
+    // the calls below can reach other entries. tsgo#4712 returns whether
+    // the command line changed (Go compares the pointers).
     pub fn reload_if_needed(
         &self,
         entry: &Rc<RefCell<ConfigFileEntry>>,
         file_name: &str,
         path: &tspath::Path,
         logger: Option<Rc<logging::LogTree>>,
-    ) {
+    ) -> bool {
+        let old_command_line = entry.borrow().command_line.clone();
         let pending_reload = entry.borrow().pending_reload;
         if pending_reload == PendingReload::FILE_NAMES {
             logger.log(&format!("Reloading file names for config: {file_name}"));
@@ -183,11 +224,19 @@ impl ConfigFileRegistryBuilder {
             entry.borrow_mut().command_line = Some(Rc::new(reloaded));
         } else if pending_reload == PendingReload::FULL {
             logger.log(&format!("Loading config file: {file_name}"));
-            let old_command_line = entry.borrow().command_line.clone();
+            // When the workspace is trusted, enable external content mappers so a config's contentMappers pass
+            // the runExternalCode gate and register, as they would with the CLI flag.
+            let existing_options =
+                self.session_options
+                    .run_external_code
+                    .then(|| CompilerOptions {
+                        run_external_code: Tristate::True,
+                        ..Default::default()
+                    });
             let (command_line, _) = tsoptions::get_parsed_command_line_of_config_file_path(
                 file_name,
                 path.clone(),
-                None,
+                existing_options.as_ref(),
                 None, /*optionsRaw*/
                 self,
                 Some(self as &dyn tsoptions::ExtendedConfigCache),
@@ -202,9 +251,15 @@ impl ConfigFileRegistryBuilder {
             self.update_root_files_watch(file_name, entry);
             logger.log("Finished loading config file");
         } else {
-            return;
+            return false;
         }
         entry.borrow_mut().pending_reload = PendingReload::NONE;
+        let new_command_line = entry.borrow().command_line.clone();
+        match (&old_command_line, &new_command_line) {
+            (Some(old), Some(new)) => !Rc::ptr_eq(old, new),
+            (None, None) => false,
+            _ => true,
+        }
     }
 
     // Go: project/configfileregistrybuilder.go:138 configFileRegistryBuilder.updateExtendingConfigs
@@ -402,6 +457,7 @@ impl ConfigFileRegistryBuilder {
         );
         let entry = entry.expect("dirty.SyncMap.LoadOrStore returns an entry");
         let needs_retain_project = Cell::new(false);
+        let content_mappers_changed = Cell::new(false);
         entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                 let config = config.expect("invalid memory address or nil pointer dereference");
@@ -421,9 +477,17 @@ impl ConfigFileRegistryBuilder {
                         .retaining_projects
                         .insert(project_config_file_path);
                 }
-                self.reload_if_needed(config, file_name, path, logger.clone());
+                content_mappers_changed.set(self.reload_if_needed(
+                    config,
+                    file_name,
+                    path,
+                    logger.clone(),
+                ));
             },
         );
+        if content_mappers_changed.get() {
+            self.invalidate_content_mappers();
+        }
         entry
             .value()
             .expect("invalid memory address or nil pointer dereference")
@@ -450,6 +514,7 @@ impl ConfigFileRegistryBuilder {
         );
         let entry = entry.expect("dirty.SyncMap.LoadOrStore returns an entry");
         let needs_retain_open_file = Cell::new(false);
+        let content_mappers_changed = Cell::new(false);
         entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                 let config = config.expect("invalid memory address or nil pointer dereference");
@@ -468,9 +533,17 @@ impl ConfigFileRegistryBuilder {
                         .retaining_open_files
                         .insert(file_path.clone());
                 }
-                self.reload_if_needed(config, config_file_name, config_file_path, logger.clone());
+                content_mappers_changed.set(self.reload_if_needed(
+                    config,
+                    config_file_name,
+                    config_file_path,
+                    logger.clone(),
+                ));
             },
         );
+        if content_mappers_changed.get() {
+            self.invalidate_content_mappers();
+        }
         entry
             .value()
             .expect("invalid memory address or nil pointer dereference")
@@ -625,7 +698,9 @@ impl ConfigFileRegistryBuilder {
             IndexMap::with_capacity(summary.deleted.len());
         let mut created_or_deleted_config_files: IndexSet<tspath::Path> = IndexSet::new();
         let mut created_or_changed_or_deleted_files: IndexSet<tspath::Path> =
-            IndexSet::with_capacity(summary.changed.len() + summary.deleted.len());
+            IndexSet::with_capacity(
+                summary.changed.len() + summary.created.len() + summary.deleted.len(),
+            );
         for uri in summary.changed.iter() {
             if tspath::contains_ignored_path(&uri.0) {
                 continue;
@@ -674,8 +749,8 @@ impl ConfigFileRegistryBuilder {
             self.did_close_file(&path);
         }
 
-        // Handle changes to stored config files
-        logger.log("Checking if any changed files are config files");
+        // Handle changes to stored config files and their content mapper package manifests.
+        logger.log("Checking if any changed files are configuration files");
         for path in &created_or_changed_or_deleted_files {
             if let (Some(entry), true) = self.configs.load(path) {
                 if has_excessive_changes {
@@ -707,6 +782,33 @@ impl ConfigFileRegistryBuilder {
                 }
                 // This was a config file, so assume it's not also a root file
                 created_files.shift_remove(path);
+            } else if tspath::get_base_file_name(path) == "package.json" {
+                let mut manifest_changed = false;
+                self.configs.range(&mut |entry: &Rc<
+                    dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>,
+                >| {
+                    let command_line = entry
+                        .value()
+                        .expect("invalid memory address or nil pointer dereference")
+                        .borrow()
+                        .command_line
+                        .clone();
+                    if content_mapper_manifest_path(
+                        command_line.as_deref(),
+                        &*self.fs.to_path,
+                        path,
+                    ) {
+                        affected_projects = Some(copy_map_into(
+                            affected_projects.take(),
+                            &self.handle_config_change(entry, logger.clone()),
+                        ));
+                        manifest_changed = true;
+                    }
+                    true
+                });
+                if manifest_changed {
+                    self.invalidate_content_mappers();
+                }
             }
         }
 
@@ -1097,6 +1199,7 @@ impl ConfigFileRegistryBuilder {
 
     // Go: project/configfileregistrybuilder.go:726 configFileRegistryBuilder.Cleanup
     pub fn cleanup(&self) {
+        let mut changed = false;
         self.configs.range(&mut |entry: &Rc<
             dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>,
         >| {
@@ -1104,13 +1207,42 @@ impl ConfigFileRegistryBuilder {
                 let value = value
                     .expect("invalid memory address or nil pointer dereference")
                     .borrow();
-                value.retaining_projects.is_empty()
+                let should_delete = value.retaining_projects.is_empty()
                     && value.retaining_open_files.is_empty()
-                    && value.retaining_configs.is_empty()
+                    && value.retaining_configs.is_empty();
+                changed = changed || should_delete;
+                should_delete
             });
             true
         });
+        if changed {
+            self.invalidate_content_mappers();
+        }
     }
+}
+
+// Go: project/configfileregistrybuilder.go:635 contentMapperManifestPath (tsgo#4712)
+pub fn content_mapper_manifest_path(
+    command_line: Option<&tsoptions::ParsedCommandLine>,
+    to_path: &dyn Fn(&str) -> tspath::Path,
+    path: &tspath::Path,
+) -> bool {
+    let Some(command_line) = command_line else {
+        return false;
+    };
+    for mapper in command_line.content_mappers() {
+        if !mapper.definition.package.is_empty()
+            && mapper.contribution_id.is_empty()
+            && !mapper.package_directory.is_empty()
+            && to_path(&tspath::combine_paths(
+                &mapper.package_directory,
+                &["package.json"],
+            )) == *path
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // Go: project/configfileregistrybuilder.go:335 changeFileResult

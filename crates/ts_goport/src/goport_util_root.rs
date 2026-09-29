@@ -51,6 +51,7 @@ pub mod frontend {
     pub mod json_ext;
     pub mod json_indexmap;
     pub mod nativepath;
+    pub mod osutil;
     #[path = "util_prelude.rs"]
     pub mod prelude;
     pub mod semver;
