@@ -155,6 +155,11 @@ impl Checker {
         self.get_immediate_aliased_symbol(symbol)
     }
 
+    // Go: checker/exports.go:116 GetTargetSymbol
+    pub fn get_target_symbol_exported(&mut self, symbol: SymbolId) -> SymbolId {
+        self.get_target_symbol(symbol)
+    }
+
     // Go: checker/exports.go:100 GetTypeOnlyAliasDeclaration
     pub fn get_type_only_alias_declaration_exported(&mut self, symbol: SymbolId) -> Node {
         self.get_type_only_alias_declaration(symbol)

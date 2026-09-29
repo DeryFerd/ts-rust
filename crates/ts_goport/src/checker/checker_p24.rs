@@ -589,7 +589,6 @@ impl Checker {
     pub fn get_target_symbol(&mut self, s: SymbolId) -> SymbolId {
         // if symbol is instantiated its flags are not copied from the 'target'
         // so we'll need to get back original 'target' symbol to work with correct set of flags
-        // NOTE: cast to TransientSymbol should be safe because only TransientSymbols have CheckFlags.Instantiated
         if s.is_some() && self.sym(s).check_flags.intersects(CheckFlags::INSTANTIATED) {
             return self.value_symbol_links.get(s).target;
         }
