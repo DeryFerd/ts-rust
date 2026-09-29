@@ -15,7 +15,7 @@ export GOPORT_BIN=$PWD/$O/goport.bin
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/measure.sh $R > $O/summary-main.txt 2>&1
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/measure-extra.sh $R > $O/summary-extra.txt 2>&1
 bash /home/theo/Code/sandbox/ts-rust/scripts/goport/sweep.sh $R > $O/summary-sweep.txt 2>&1
-bash /home/theo/Code/sandbox/ts-rust/scripts/goport/sweep-extra2.sh $R > $O/summary-sweep-extra2.txt 2>&1
+bash target/project-inputs-extra/sweep-extra2.sh $R > $O/summary-sweep-extra2.txt 2>&1
 bash target/continuation-r97-goport/emit/compare-emit.sh $PWD/$O/goport_emit.bin $R > $O/summary-emit.txt 2>&1
 python3 - "$O" "$WT" <<'PY'
 import sys,json,hashlib,subprocess,datetime,os

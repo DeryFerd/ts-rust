@@ -10,8 +10,7 @@
 #   --commit SHA  commit the binaries were built from (else read DIR/COMMIT, else "unknown")
 #
 # Stages (serial, one gate run at a time through /tmp/goport-gate.lock):
-#   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts; sweep, sweep-extra2
-#                 and sweep-hono-runtime run the tracked copies next to this script)
+#   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts)
 #   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
 #   emit          emit/compare-emit.sh
@@ -116,18 +115,12 @@ def item(stage, name, ok, detail='', **ctx):
     return row
 
 
-# A goport run is complete with exit 0, 1 or 2 and a clean stderr. tsgo exits 2 for diagnostics under
-# --noEmit since tsgo #4407 (Go pin 16c25522e123), and goport follows the pin. goport also exits 2 for
-# a kept Go panic, so err_clean looks for its "panic: " line. Exits over 2 are a crash.
-COMPLETE_EXITS = (0, 1, 2)
-
-
 def err_clean(path):
-    """True when a goport stderr file has no panic (Rust or kept Go) and no unported line."""
+    """True when a goport stderr file has no panic and no unported line."""
     if not Path(path).exists():
         return True
     text = Path(path).read_text(errors='replace')
-    return 'panicked at' not in text and not any(l.startswith(('unported', 'panic: ')) for l in text.splitlines())
+    return 'panicked at' not in text and not any(l.startswith('unported') for l in text.splitlines())
 
 
 # ---- log parsers for the existing bash scripts ----
@@ -156,7 +149,7 @@ def parse_measure(stage, log, runs):
         if m:
             out = Path(runs) / f'{m[1]}.out'
             ok = (out.exists() and out.read_bytes() == (R / 'oracle' / f'{m[1]}.txt').read_bytes()
-                  and m[2] in map(str, COMPLETE_EXITS) and err_clean(Path(runs) / f'{m[1]}.err'))
+                  and m[2] in ('0', '1') and err_clean(Path(runs) / f'{m[1]}.err'))
             items.append(item(stage, m[1], ok, line.strip() + ('' if ok else ' (vs oracle/%s.txt)' % m[1])))
         m = re.match(r'^([QH]-E\d+) (MATCH|DIFF)', line)
         if m:
@@ -315,7 +308,7 @@ def cmd_determinism(goport, out_dir, items_file):
         detail = (f"runs-identical={same} equal-oracle={equal_oracle} exits={exits} "
                   f"md5={hashlib.md5(outs[0]).hexdigest()[:8]} diags={outs[0].count(b'error TS')}")
         print(name, detail, flush=True)
-        items.append(item('determinism', name, same and equal_oracle and clean and exits[0] in COMPLETE_EXITS, detail))
+        items.append(item('determinism', name, same and equal_oracle and clean and exits[0] in (0, 1), detail))
     write_items(items_file, items, len(DETERMINISM))
 
 
@@ -503,15 +496,15 @@ RUNS_REL=../compat/gate/$LABEL/runs
 cd "$REPO" || exit 2
 stage measure bash "$TP/measure.sh" "$RUNS_REL/measure"; parse measure "$OUT/runs/measure" 8
 stage measure-extra bash "$TP/measure-extra.sh" "$RUNS_REL/measure-extra"; parse measure-extra "$OUT/runs/measure-extra" 3
-stage sweep bash "$HERE/sweep.sh" "$RUNS_REL/sweep"; parse sweep "$OUT/runs/sweep" 12
-stage sweep-extra2 bash "$HERE/sweep-extra2.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/extra2"
+stage sweep bash "$TP/sweep.sh" "$RUNS_REL/sweep"; parse sweep "$OUT/runs/sweep" 12
+stage sweep-extra2 bash "$X/sweep-extra2.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/extra2"
 parse sweep-extra2 "$OUT/runs/extra2" 31
 # Wide real-world sweep (51 projects, 292 configs; target/project-inputs-wide), full mode only.
 if [[ $MODE == full ]]; then
   stage sweep-wide bash "$HERE/sweep-wide.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/wide"
   parse sweep-wide "$OUT/runs/wide" 292
 fi
-stage sweep-hono-runtime bash "$HERE/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
+stage sweep-hono-runtime bash "$TP/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
 stage f1 python3 "$R/sample-f1/run-f1.py" "$BINS/goport" "$OUT/runs/f1"
 py f1 "$OUT/runs/f1/summary.json" "$OUT/items/f1.jsonl" >> "$OUT/logs/f1.log" 2>&1
 stage emit env JOBS=4 bash "$R/emit/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
@@ -550,8 +543,8 @@ def family(root, pattern):
     for f in sorted(q for q in root.glob(pattern) if q.is_file()):
         h.update(f'{f.relative_to(root)}\0{sha(f)}\n'.encode())
     return h.hexdigest()
-scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(gate).parent / 'sweep.sh',
-           Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
+scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', R / 'tools-port/sweep.sh',
+           R.parent / 'project-inputs-extra/sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', R / 'tools-port/sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
            R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py']

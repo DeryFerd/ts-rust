@@ -4,10 +4,6 @@ cd /home/theo/Code/sandbox/ts-rust
 B=${GOPORT_BIN:-target/continuation-r97-goport/runtime/cargo-target/release/goport}
 P=target/project-inputs
 O=target/continuation-r97-goport/measure/$1; OR=target/continuation-r97-goport/oracle-sweep; mkdir -p $O $OR
-# A run is complete with exit 0, 1 or 2 and no "unported" or Go "panic: " line on stderr. tsgo exits 2
-# for diagnostics under --noEmit since tsgo #4407 (Go pin 16c25522e123), and goport follows the pin.
-# goport also exits 2 for a kept Go panic, so that is judged by its stderr line. Exits over 2 are a crash
-# (70: unported code or a Rust panic; 124: timeout; 128+N: a signal).
 for pair in \
  "query-core-tests:$P/query/source/packages/query-core/tsconfig.json" \
  "query-core-legacy:$P/query/source/packages/query-core/tsconfig.legacy.json" \
@@ -25,6 +21,6 @@ for pair in \
   if [ ! -f $OR/$n.txt ]; then timeout 900 ~/.local/bin/tsgo-oracle -p $c --noEmit --pretty false --tsBuildInfoFile /tmp/goport-tsbi-$n > $OR/$n.txt 2>&1; fi
   s=$(date +%s.%N); timeout 900 $B -p $c > $O/$n.out 2> $O/$n.err; e=$?
   t=$(python3 -c "import sys;print(round(float(sys.argv[2])-float(sys.argv[1]),1))" $s $(date +%s.%N))
-  if [ $e -gt 2 ] || grep -q "^unported\|^panic: " $O/$n.err; then m=INCOMPLETE; elif diff -q $OR/$n.txt $O/$n.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR/$n.txt $O/$n.out | grep -c '^>') -$(diff $OR/$n.txt $O/$n.out | grep -c '^<'))"; fi
+  if [ $e -gt 1 ] || grep -q "^unported" $O/$n.err; then m=INCOMPLETE; elif diff -q $OR/$n.txt $O/$n.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR/$n.txt $O/$n.out | grep -c '^>') -$(diff $OR/$n.txt $O/$n.out | grep -c '^<'))"; fi
   echo "$n exit=$e diags=$(grep -c 'error TS' $O/$n.out) oracle=$(grep -c 'error TS' $OR/$n.txt) $m ${t}s panics=$(grep -c 'panic' $O/$n.err) unported=$(grep -c '^unported' $O/$n.err)"
 done
