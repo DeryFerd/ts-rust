@@ -365,13 +365,8 @@ impl OsFs {
     }
 
     // Go: os.go:189 ensureDirectoryExists
-    // PORT: Go `os.MkdirAll(directoryPath, 0o777)`. 0o777 is the std
-    // default mode on unix.
     fn ensure_directory_exists(&self, directory_path: &str) -> Result<(), FsError> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .create(os_path(directory_path))
-            .map_err(|err| FsError::path("mkdir", directory_path, err))
+        os_mkdir_all(directory_path, 0o777)
     }
 
     // Go: os.go:194 writeFileEnsuringDir
@@ -547,6 +542,88 @@ fn os_remove_all(path: &str) -> Result<(), FsError> {
         Err(err) => Err(FsError::path("unlinkat", path, err)),
         Ok(()) => Ok(()),
     }
+}
+
+// Go: os/path.go:19 MkdirAll (go1.26.4)
+// MkdirAll creates a directory named path,
+// along with any necessary parents, and returns nil,
+// or else returns an error.
+// PORT: Go standard library. Go `Stat`, `Mkdir` and `Lstat` are
+// `std::fs::metadata`, `DirBuilder::create` and `std::fs::symlink_metadata`.
+// Off unix `perm` does not apply, as in Go. pprof.rs uses it too.
+pub fn os_mkdir_all(path: &str, perm: u32) -> Result<(), FsError> {
+    // Fast path: if we can tell whether path is a directory or file, stop with success or error.
+    if let Ok(dir) = std::fs::metadata(os_path(path)) {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        return Err(FsError::path(
+            "mkdir",
+            path,
+            io::Error::from_raw_os_error(ENOTDIR),
+        ));
+    }
+
+    // Slow path: make sure parent exists and then call Mkdir for path.
+
+    // Extract the parent folder from path by first removing any trailing
+    // path separator and then scanning backward until finding a path
+    // separator or reaching the beginning of the string.
+    let p = path.as_bytes();
+    let mut i = p.len() as isize - 1;
+    while i >= 0 && is_path_separator(p[i as usize]) {
+        i -= 1;
+    }
+    while i >= 0 && !is_path_separator(p[i as usize]) {
+        i -= 1;
+    }
+    if i < 0 {
+        i = 0;
+    }
+
+    // If there is a parent directory, and it is not the volume name,
+    // recurse to ensure parent directory exists.
+    let parent = &path[..i as usize];
+    if parent.len() > volume_name_len(path) {
+        os_mkdir_all(parent, perm)?;
+    }
+
+    // Parent now exists; invoke Mkdir and use its result.
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, perm);
+    if let Err(err) = builder.create(os_path(path)) {
+        // Handle arguments like "foo/." by
+        // double-checking that directory doesn't exist.
+        if std::fs::symlink_metadata(os_path(path)).is_ok_and(|dir| dir.is_dir()) {
+            return Ok(());
+        }
+        return Err(FsError::path("mkdir", path, err));
+    }
+    Ok(())
+}
+
+// Go: syscall.ENOTDIR (go1.26.4 syscall/zerrors_linux_amd64.go; darwin and
+// the BSDs have the same value). On Windows it is ERROR_PATH_NOT_FOUND
+// (syscall/zerrors_windows.go).
+#[cfg(not(windows))]
+const ENOTDIR: i32 = 0x14;
+#[cfg(windows)]
+const ENOTDIR: i32 = 3;
+
+// Go: os.IsPathSeparator ('/' and, on Windows, '\\')
+fn is_path_separator(c: u8) -> bool {
+    c == b'/' || (cfg!(windows) && c == b'\\')
+}
+
+// Go: len(filepathlite.VolumeName(path)). There is no volume name on unix.
+#[cfg(not(windows))]
+fn volume_name_len(_: &str) -> usize {
+    0
+}
+#[cfg(windows)]
+fn volume_name_len(path: &str) -> usize {
+    filepath_volume_name_len(path.as_bytes())
 }
 
 // Go: os/path.go endsWithDot

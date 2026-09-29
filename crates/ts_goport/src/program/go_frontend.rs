@@ -465,9 +465,11 @@ fn go_files_of_unpublished_stores(
     files
 }
 
-/// The process current directory, normalized.
+/// The process current directory, normalized. The error is Go's
+/// `os.Getwd` text (`*os.SyscallError` "getwd: <errno text>").
 fn current_directory() -> Result<String, String> {
-    let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
+    let cwd = crate::frontend::vfs::os_current_dir()
+        .map_err(|e| format!("getwd: {}", crate::fswatch::syscall::io_error_text(&e)))?;
     Ok(tspath::normalize_path(&cwd))
 }
 
