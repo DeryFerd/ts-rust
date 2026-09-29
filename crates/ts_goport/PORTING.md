@@ -362,9 +362,11 @@ The batch that adds it is not accepted until Theo approves.
   made edits 0.9 to 1.6 ms slower), as before M3c. Its
   `SourceFileInfo` owns copies of
   the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
-  its name table, position map and declaration map are fields of the
-  version, as in Go. When its last holder lets go, the store and the
-  `GoFile` are freed, a later read of the id panics, and each per-file
+  its name table, position map, declaration map and identifier set are
+  fields of the version, as in Go. When its last holder lets go, the store
+  and the `GoFile` are freed (in a language server, in the idle time of
+  the dispatch loop, a step at a time: `free_dead_file_versions`, M3g), a
+  later read of the id panics, and each per-file
   thread-local map (`PerFileMap`: `SOURCE_FILE_DATA`, `TOKEN_CACHES`,
   `TOKEN_FACTORIES`, `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`,
   `DECORATORS`) forgets the entries of the file at its next write. Its
