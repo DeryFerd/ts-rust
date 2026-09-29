@@ -10,6 +10,7 @@ use crate::cmd::tsgo::lsp::run_lsp;
 use crate::gostd::context::{self, CancelFunc};
 use crate::gostd::errors;
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock};
@@ -66,6 +67,7 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
 // PORT: after Go `Stop(c.ch)`, a later SIGINT or SIGTERM kills the process
 // (the Go runtime default). The signal-hook handler stays installed, so
 // the port ignores such a signal. Every caller returns right after `stop`.
+#[cfg(unix)]
 pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
     let (ctx, cancel) = context::with_cancel_cause(parent);
     // Go: c.ch = make(chan os.Signal, 1); Notify(c.ch, c.signals...)
@@ -96,6 +98,16 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
         // Go: Stop(c.ch)
         handle.close();
     });
+    (ctx, stop)
+}
+
+// PORT: off unix, signal-hook has no `Signals` iterator, so no signal
+// cancels the context: Ctrl+C ends the process (the OS default) where Go
+// cancels it. `stop` cancels it, as in Go. Not run on such a target.
+#[cfg(not(unix))]
+pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
+    let (ctx, cancel) = context::with_cancel_cause(parent);
+    let stop: CancelFunc = Arc::new(move || cancel(None));
     (ctx, stop)
 }
 

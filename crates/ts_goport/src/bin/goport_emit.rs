@@ -78,7 +78,7 @@ const STACK_SIZE: usize = 1 << 30;
 
 /// The opt-in `jemalloc` feature makes jemalloc the global allocator
 /// (see `goport.rs` `set_malloc_tunables`).
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

@@ -9,8 +9,10 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path as OsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
@@ -23,6 +25,7 @@ use std::time::SystemTime;
 // call in the port goes through them.
 
 /// The OS path of the port form path `path`: its Go bytes.
+#[cfg(unix)]
 pub fn os_path(path: &str) -> Cow<'_, OsPath> {
     match crate::scanner_util::go_string_bytes(path) {
         Cow::Borrowed(bytes) => Cow::Borrowed(OsPath::new(OsStr::from_bytes(bytes))),
@@ -32,11 +35,30 @@ pub fn os_path(path: &str) -> Cow<'_, OsPath> {
 
 /// The value form of the OS string `s` (see `os_path` and
 /// `scanner_util::go_value_from_bytes`).
+#[cfg(unix)]
 pub fn go_string_from_os(s: impl Into<OsString>) -> String {
     match String::from_utf8(s.into().into_vec()) {
         Ok(text) => crate::scanner_util::go_string_from_utf8(text),
         Err(err) => crate::scanner_util::go_value_from_bytes(err.as_bytes()).into_owned(),
     }
+}
+
+// PORT: off unix an OS path is text (UTF-16 on Windows). As Go's
+// `syscall.UTF16FromString` and `UTF16ToString`, bytes that are not UTF-8
+// and unpaired surrogates become U+FFFD. Not run on such a target.
+#[cfg(not(unix))]
+pub fn os_path(path: &str) -> Cow<'_, OsPath> {
+    match crate::scanner_util::go_string_bytes(path) {
+        Cow::Borrowed(_) => Cow::Borrowed(OsPath::new(path)),
+        Cow::Owned(bytes) => {
+            Cow::Owned(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn go_string_from_os(s: impl Into<OsString>) -> String {
+    crate::scanner_util::go_string_from_utf8(s.into().to_string_lossy().into_owned())
 }
 
 /// The process arguments after the program name, in the port form (Go
@@ -310,8 +332,9 @@ impl OsFs {
         content: &str,
         flag: WriteFlag,
     ) -> Result<(), FsError> {
+        // PORT: Go's perm 0o666 is the std default create mode on unix.
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).mode(0o666);
+        options.write(true).create(true);
         match flag {
             WriteFlag::Truncate => options.truncate(true),
             WriteFlag::Append => options.append(true),
@@ -330,11 +353,11 @@ impl OsFs {
     }
 
     // Go: os.go:189 ensureDirectoryExists
-    // PORT: Go `os.MkdirAll(directoryPath, 0o777)`.
+    // PORT: Go `os.MkdirAll(directoryPath, 0o777)`. 0o777 is the std
+    // default mode on unix.
     fn ensure_directory_exists(&self, directory_path: &str) -> Result<(), FsError> {
         std::fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o777)
             .create(os_path(directory_path))
             .map_err(|err| FsError::path("mkdir", directory_path, err))
     }
@@ -437,16 +460,8 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
             FileMode::SYMLINK
         } else if file_type.is_file() {
             FileMode(0)
-        } else if file_type.is_block_device() {
-            FileMode::DEVICE
-        } else if file_type.is_char_device() {
-            FileMode::DEVICE | FileMode::CHAR_DEVICE
-        } else if file_type.is_fifo() {
-            FileMode::NAMED_PIPE
-        } else if file_type.is_socket() {
-            FileMode::SOCKET
         } else {
-            FileMode::IRREGULAR
+            special_file_mode(file_type)
         };
         let name = go_string_from_os(entry.file_name());
         let full_path = format!("{}/{}", dirname, name);
@@ -462,6 +477,29 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
             .cmp(&crate::scanner_util::go_string_bytes(&b.name))
     });
     Ok(entries)
+}
+
+// PORT: the `os_read_dir` mode of an entry that is not a directory, a link
+// or a regular file.
+#[cfg(unix)]
+fn special_file_mode(file_type: std::fs::FileType) -> FileMode {
+    if file_type.is_block_device() {
+        FileMode::DEVICE
+    } else if file_type.is_char_device() {
+        FileMode::DEVICE | FileMode::CHAR_DEVICE
+    } else if file_type.is_fifo() {
+        FileMode::NAMED_PIPE
+    } else if file_type.is_socket() {
+        FileMode::SOCKET
+    } else {
+        FileMode::IRREGULAR
+    }
+}
+
+// PORT: off unix, std names no other file type. Not run on such a target.
+#[cfg(not(unix))]
+fn special_file_mode(_: std::fs::FileType) -> FileMode {
+    FileMode::IRREGULAR
 }
 
 // Go: os/removeall_at.go RemoveAll

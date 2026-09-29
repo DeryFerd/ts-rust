@@ -399,9 +399,16 @@ const MAX_FILE_SIZE: usize = 10 << 20;
 // Go: time/zoneinfo_read.go:575 readFile
 // PORT: the path is raw bytes, as in Go. Go stops reading past
 // `maxFileSize` and fails; this reads the file and then checks the size.
+// Off unix a path must be UTF-8; another path fails, as a missing file.
 fn read_file(name: &[u8]) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    let data = std::fs::read(std::ffi::OsStr::from_bytes(name)).ok()?;
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(name)
+    };
+    #[cfg(not(unix))]
+    let path = std::str::from_utf8(name).ok()?;
+    let data = std::fs::read(path).ok()?;
     if data.len() > MAX_FILE_SIZE {
         return None;
     }
