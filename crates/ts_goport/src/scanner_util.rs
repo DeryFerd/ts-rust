@@ -1509,18 +1509,18 @@ pub fn compute_position_of_line_and_byte_offset(
 // scanner/utilities.go
 // ---------------------------------------------------------------------------
 
-// Go: scanner/utilities.go:13 tokenIsIdentifierOrKeyword
+// Go: scanner/utilities.go:14 tokenIsIdentifierOrKeyword
 #[allow(dead_code)]
 fn token_is_identifier_or_keyword(token: SyntaxKind) -> bool {
     token as u16 >= SyntaxKind::Identifier as u16
 }
 
-// Go: scanner/utilities.go:17 IdentifierToKeywordKind
+// Go: scanner/utilities.go:18 IdentifierToKeywordKind
 pub fn identifier_to_keyword_kind(node: Node) -> SyntaxKind {
     text_to_keyword(node.text())
 }
 
-// Go: scanner/utilities.go:21 GetSourceTextOfNodeFromSourceFile
+// Go: scanner/utilities.go:22 GetSourceTextOfNodeFromSourceFile
 pub fn get_source_text_of_node_from_source_file(
     source_file: Node,
     node: Node,
@@ -1582,7 +1582,7 @@ fn strip_leading_js_doc_comment(line: &str) -> &str {
     line.trim_start_matches(is_white_space_like)
 }
 
-// Go: scanner/utilities.go:25 GetTextOfNodeFromSourceText
+// Go: scanner/utilities.go:72 GetTextOfNodeFromSourceText
 pub fn get_text_of_node_from_source_text(
     source_text: &str,
     node: Node,
@@ -1624,7 +1624,7 @@ pub fn get_text_of_node_from_source_text(
     text.into_owned()
 }
 
-// Go: scanner/utilities.go:56 GetTextOfNode
+// Go: scanner/utilities.go:102 GetTextOfNode
 pub fn get_text_of_node(node: Node) -> String {
     get_source_text_of_node_from_source_file(
         get_source_file_of_node(node),
@@ -1633,7 +1633,7 @@ pub fn get_text_of_node(node: Node) -> String {
     )
 }
 
-// Go: scanner/utilities.go:60 GetTextOfJSDocComment
+// Go: scanner/utilities.go:106 GetTextOfJSDocComment
 pub fn get_text_of_js_doc_comment(comment: NodeList) -> String {
     if comment.is_nil() {
         return String::new();
@@ -1652,7 +1652,7 @@ pub fn get_text_of_js_doc_comment(comment: NodeList) -> String {
     b.trim_end_matches(char::is_whitespace).to_string()
 }
 
-// Go: scanner/utilities.go:76 DeclarationNameToString
+// Go: scanner/utilities.go:122 DeclarationNameToString
 pub fn declaration_name_to_string(name: Node) -> String {
     if name.is_nil() || name.pos() == name.end() {
         return "(Missing)".to_string();
@@ -1660,7 +1660,7 @@ pub fn declaration_name_to_string(name: Node) -> String {
     get_text_of_node(name)
 }
 
-// Go: scanner/utilities.go:83 IsIdentifierText
+// Go: scanner/utilities.go:129 IsIdentifierText
 pub fn is_identifier_text(name: &str, language_variant: LanguageVariant) -> bool {
     let (mut ch, mut size) = decode_rune_at(name, 0);
     if !is_identifier_start(ch) {
@@ -1677,7 +1677,7 @@ pub fn is_identifier_text(name: &str, language_variant: LanguageVariant) -> bool
     true
 }
 
-// Go: scanner/utilities.go:98 IsIntrinsicJsxName
+// Go: scanner/utilities.go:144 IsIntrinsicJsxName
 pub fn is_intrinsic_jsx_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     !name.is_empty() && (bytes[0] >= b'a' && bytes[0] <= b'z' || name.contains('-'))
@@ -23383,6 +23383,10 @@ static UNICODE_CASE_IGNORABLE_RANGES: &[(u32, u32, u32)] = &[
     (0xE0021, 0xE007F, 1),
     (0xE0100, 0xE01EF, 1),
 ];
+
+// Go: scanner/scanner_test.go tests of the private JSDoc type text helpers (tsgo#4839).
+#[cfg(test)]
+mod scanner_test;
 
 #[cfg(test)]
 mod tests {

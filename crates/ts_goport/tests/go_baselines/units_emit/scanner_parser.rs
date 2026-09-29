@@ -6,8 +6,8 @@
 //! TestSourceFilePositionMapWithNonASCIIStringLiteral; the Go benchmark and
 //! fuzz target are not ported). TestNormalizeJSDocTypeSourceText,
 //! TestIsJSDocTypeExpressionOrChild and
-//! TestGetTextOfNodeFromJSDocTypePreservesAsteriskType are blocked: they
-//! call private scanner functions or build bare Go nodes.
+//! TestGetTextOfNodeFromJSDocTypePreservesAsteriskType call private scanner
+//! functions, so they are in `src/scanner_util/scanner_test.rs`.
 
 use super::Subtests;
 use super::childprog::in_child;
