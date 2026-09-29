@@ -16,10 +16,12 @@
 //! upstream tasks are done, and a task that compiles makes its program at
 //! once (`build_project_start`) and starts its check on the program's
 //! checker threads, so the checkers of the started tasks work at the same
-//! time, as the Go goroutines do. The started tasks emit one at a time, the
-//! first in `order` first (`build_project_finish`). So a task that runs
-//! beside others in Go reads the file system before they write their
-//! outputs. Every task uses `o.host` and its caches (parsed `.d.ts` and
+//! time, as the Go goroutines do. Each checker emits when its check ends,
+//! and the emit keeps its writes in memory. The started tasks write their
+//! outputs one at a time, the first in `order` first
+//! (`build_project_finish`). So a task that runs beside others in Go reads
+//! the file system before they write their outputs. Every task uses
+//! `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Each program is released when its task reports; its checker threads
 //! free it in the background.
@@ -37,7 +39,7 @@ use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::BuildHost;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
-use crate::execute::incremental::incremental::new_build_info_reader;
+use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
     CommandLineResult, ExitStatus, System, Watcher, Writer, new_content_mapper_host, write_str,
 };
@@ -51,6 +53,7 @@ use crate::frontend::prelude::*;
 use crate::gostd::Context;
 // PORT: testing
 use crate::execute::tsc::compile::CommandLineTesting;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::SystemTime;
 
 // Go: build/orchestrator.go:27 Options
@@ -145,6 +148,10 @@ pub struct Orchestrator {
 
     // fswatch event-based watching
     pub(crate) wm: Rc<RefCell<WatchManager>>,
+
+    // PORT: not in Go (perf). The build info files that threads read ahead
+    // of the up-to-date checks of this build cycle (`BuildInfoPrefetch`).
+    build_info_prefetch: RefCell<Option<BuildInfoPrefetch>>,
 }
 
 impl Orchestrator {
@@ -457,6 +464,9 @@ impl Orchestrator {
         // PORT: testing (see the top comment)
         let testing = self.opts.testing.is_some();
         let paths: Vec<Path> = self.order.iter().map(|c| self.to_path(c)).collect();
+        if !clean {
+            *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths);
+        }
         let index_of: FxHashMap<Path, usize> = paths
             .iter()
             .enumerate()
@@ -530,6 +540,60 @@ impl Orchestrator {
                 .build_project_finish(self, &paths[next_report]);
             states[next_report] = State::Done;
         }
+        // A task that did not read its build info leaves its read unused.
+        self.build_info_prefetch.borrow_mut().take();
+    }
+
+    /// PORT: not in Go (perf). Starts reading the build info files that the
+    /// up-to-date checks of the tasks at `paths` will read (see
+    /// `BuildInfoPrefetch`), on up to `num_routines` threads. None when
+    /// there is nothing to gain or the read could differ from the task's
+    /// own read: one routine (`--singleThreaded` or `--builders 1`: Go
+    /// checks one task at a time), `--force` (no check reads the build
+    /// info), a file system other than the OS one (tests), or fewer than
+    /// two files. A solution (Go `upToDateStatusTypeSolution`) and a task
+    /// that keeps the build info of an earlier cycle (watch) read nothing.
+    /// A build info file that two tasks name (by path) is left out, so no
+    /// task of the build writes a prefetched file before its task reads it.
+    fn start_build_info_prefetch(&self, paths: &[Path]) -> Option<BuildInfoPrefetch> {
+        let num_routines = usize::try_from(self.num_routines()).unwrap_or(0);
+        if num_routines < 2
+            || self.opts.command.build_options.force.is_true()
+            || !is_wrapped_os_fs(&self.opts.sys.fs())
+        {
+            return None;
+        }
+        let mut named: FxHashMap<Path, usize> = FxHashMap::default();
+        let mut reads: Vec<(Path, String)> = Vec::new();
+        for path in paths {
+            let task = self.get_task(path);
+            let task = task.borrow();
+            let Some(resolved) = &task.resolved else {
+                continue;
+            };
+            let name = resolved.get_build_info_file_name();
+            if name.is_empty() {
+                continue;
+            }
+            let build_info_path = self.to_path(&name);
+            *named.entry(build_info_path.clone()).or_default() += 1;
+            let solution = resolved.file_names().is_empty() && resolved.has_project_references();
+            let keeps = task
+                .build_info_entry
+                .as_ref()
+                .is_some_and(|entry| entry.path == build_info_path);
+            if !solution && !keeps {
+                reads.push((build_info_path, name));
+            }
+        }
+        let names: Vec<String> = reads
+            .into_iter()
+            .filter_map(|(path, name)| (named[&path] == 1).then_some(name))
+            .collect();
+        if names.len() < 2 {
+            return None;
+        }
+        BuildInfoPrefetch::start(names, num_routines)
     }
 
     // Go: build/buildtask.go:120 (*BuildTask).report, the orchestrator part
@@ -672,6 +736,14 @@ impl BuildTaskOrchestrator for Orchestrator {
     }
 
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
+        let prefetched = self
+            .build_info_prefetch
+            .borrow_mut()
+            .as_mut()
+            .and_then(|prefetch| prefetch.take(&config.get_build_info_file_name()));
+        if let Some(build_info) = prefetched {
+            return build_info.map(Rc::new);
+        }
         new_build_info_reader(self.host.clone() as Rc<dyn CompilerHost>)
             .read_build_info(config)
             .map(Rc::new)
@@ -692,6 +764,93 @@ impl BuildTaskOrchestrator for Orchestrator {
 
     fn content_mapper_host(&self) -> Option<Rc<dyn contentmapper::Host>> {
         self.content_mapper_host.clone()
+    }
+}
+
+/// PORT: not in Go (perf). Go checks whether up to `numRoutines` projects
+/// are up to date at the same time, each on its goroutine, and each reads
+/// and unmarshals its build info file there (`loadOrStoreBuildInfo`). The
+/// orchestrator here checks one task at a time, so threads read and parse
+/// the build info files first, in build order, and a task takes the parse
+/// of its file (`take`), waiting for it when a thread has not finished
+/// it. A thread reads with the OS file system of its thread, as the host
+/// does (`ReadBuildInfo`: read the file, then `parse_build_info`).
+struct BuildInfoPrefetch {
+    slots: FxHashMap<String, Arc<BuildInfoSlot>>,
+}
+
+/// The build info of one file: `None` until a thread has read it, then
+/// `Some(None)` when the read panicked, else `Some(Some(result))` with Go
+/// `ReadBuildInfo`'s result (`None` when the file cannot be read or
+/// parsed).
+#[derive(Default)]
+struct BuildInfoSlot {
+    result: Mutex<Option<Option<Option<BuildInfo>>>>,
+    done: Condvar,
+}
+
+/// The most threads that read build info files.
+const MAX_BUILD_INFO_THREADS: usize = 8;
+
+impl BuildInfoPrefetch {
+    /// Starts the threads that read and parse `names`, in order, at most
+    /// `num_routines` (Go `numRoutines`). None when no thread starts.
+    fn start(names: Vec<String>, num_routines: usize) -> Option<Self> {
+        let slots: Vec<(String, Arc<BuildInfoSlot>)> = names
+            .into_iter()
+            .map(|name| (name, Arc::default()))
+            .collect();
+        let queue = Arc::new(Mutex::new(slots.clone().into_iter()));
+        let threads = MAX_BUILD_INFO_THREADS
+            .min(num_routines)
+            .min(crate::program::available_cores())
+            .min(slots.len());
+        let mut started = 0;
+        for _ in 0..threads {
+            let queue = queue.clone();
+            // A thread that cannot start leaves its files to the others.
+            let spawned = std::thread::Builder::new()
+                .name("goport-buildinfo".to_string())
+                .spawn(move || {
+                    let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+                    loop {
+                        let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+                        let Some((name, slot)) = next else {
+                            break;
+                        };
+                        // A read that panics is left to the task, which
+                        // panics on it too.
+                        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let (data, ok) = fs.read_file(&name);
+                            if ok { parse_build_info(&data) } else { None }
+                        }));
+                        *slot.result.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(read.ok());
+                        slot.done.notify_all();
+                    }
+                });
+            started += usize::from(spawned.is_ok());
+        }
+        (started > 0).then(|| BuildInfoPrefetch {
+            slots: slots.into_iter().collect(),
+        })
+    }
+
+    /// The build info of `name` that a thread read, once: `None` when it is
+    /// not prefetched, was taken, or its read panicked; then the caller
+    /// reads it. Waits for the thread that reads it.
+    fn take(&mut self, name: &str) -> Option<Option<BuildInfo>> {
+        let slot = self.slots.remove(name)?;
+        let mut result = slot.result.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(read) = result.take() {
+                return read;
+            }
+            result = slot
+                .done
+                .wait(result)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -724,6 +883,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         error_summary_reporter: None,
         watch_status_reporter: None,
         wm: Rc::new(RefCell::new(wm)),
+        build_info_prefetch: RefCell::new(None),
     };
     if orchestrator.opts.command.compiler_options.watch.is_true() {
         orchestrator.watch_status_reporter = Some(create_watch_status_reporter(
