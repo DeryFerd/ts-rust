@@ -18,12 +18,15 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
     if s.is_empty() {
         return false;
     }
-    let mut scanner = rs_new_scanner();
+    let mut scanner = crate::frontend::scanner::new_scanner();
     scanner.set_skip_trivia(false);
     let success = Rc::new(Cell::new(true));
     let success_in_callback = success.clone();
     scanner.set_on_error(Some(Box::new(
-        move |_diagnostic: &'static ts_diagnostics::Message, _start: i32, _length: i32| {
+        move |_diagnostic: &'static ts_diagnostics::Message,
+              _start: i32,
+              _length: i32,
+              _args: Vec<String>| {
             success_in_callback.set(false);
         },
     )));
@@ -1496,12 +1499,12 @@ pub fn create_mode_mismatch_details(_program: &GoProgram, file: Node) -> Diagnos
         if !target_ext.is_empty() {
             return DiagnosticDetails {
                 message: diag::To_convert_this_file_to_an_ECMAScript_module_change_its_file_extension_to_0_or_add_the_field_type_Colon_module_to_1,
-                args: vec![target_ext.to_string(), ts_path::combine_paths(package_json_directory, &["package.json"])],
+                args: vec![target_ext.to_string(), crate::frontend::tspath::combine_paths(package_json_directory, &["package.json"])],
             };
         }
         return DiagnosticDetails {
             message: diag::To_convert_this_file_to_an_ECMAScript_module_add_the_field_type_Colon_module_to_0,
-            args: vec![ts_path::combine_paths(package_json_directory, &["package.json"])],
+            args: vec![crate::frontend::tspath::combine_paths(package_json_directory, &["package.json"])],
         };
     }
     if !target_ext.is_empty() {

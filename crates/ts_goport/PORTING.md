@@ -761,8 +761,7 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Scanning
 
-- ls, astnav and format code scan with the literal Go scanner
-  `frontend::scanner::Scanner`, not `RsScanner`.
+- All code scans with the Go scanner `frontend::scanner::Scanner`.
 - Go `scanner.GetScannerForSourceFile(f, pos)` is
   `scanner_ls::get_scanner_for_source_file(f, pos)` and
   `scanner.GetECMAPositionOfLineAndByteOffset` is

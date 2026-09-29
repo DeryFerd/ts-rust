@@ -2,11 +2,9 @@
 //! (`scanner/scanner.go:2519-2527` `GetScannerForSourceFile`,
 //! `scanner/scanner.go:2738-2740` `GetECMAPositionOfLineAndByteOffset`).
 //!
-//! PORT: ls, astnav and format scan with the literal Go scanner
-//! (`frontend::scanner::Scanner`), not `RsScanner`, because they need Go
-//! token boundaries and `ReScanJsxToken`. The crate-level
-//! `scanner_util::get_scanner_for_source_file` (which returns `RsScanner`)
-//! stays as it is for the compiler.
+//! The compiler's `scanner_util` wrappers (`ScanTokenAtPosition`,
+//! `GetRangeOfTokenAtPosition`, `GetErrorRangeForNode`) also use this
+//! function.
 
 use crate::frontend::prelude::*;
 use crate::frontend::scanner::{Scanner, new_scanner};

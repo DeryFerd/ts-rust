@@ -214,10 +214,9 @@ impl NodeFactory {
         statements: NodeList,
         end_of_file_token: Node,
     ) -> Node {
-        // PORT: Go `tspath.GetEncodedRootLength` and `tspath.NormalizePath`
-        // are `ts_path::root_length` and `ts_path::normalize_path` here. They
-        // agree on normalized absolute file names.
-        if ts_path::root_length(file_name) == 0 || file_name != ts_path::normalize_path(file_name) {
+        if crate::frontend::tspath::get_encoded_root_length(file_name) == 0
+            || file_name != crate::frontend::tspath::normalize_path(file_name)
+        {
             panic!("fileName should be normalized and absolute: {file_name:?}");
         }
         let node = self.new_node(
