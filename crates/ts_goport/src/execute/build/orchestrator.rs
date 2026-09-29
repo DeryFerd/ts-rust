@@ -24,7 +24,11 @@
 //! `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Each program is released when its task reports; its checker threads
-//! free it in the background.
+//! free it in the background. Where Go does task work on its goroutines
+//! that needs no task state, threads do it ahead of this thread: the file
+//! name match of each config (config_prefetch.rs), and the build info
+//! read, its check parts and the source mtimes of each task
+//! (`BuildInfoPrefetch`).
 //!
 //! PORT: the task keeps its project statistics (see build_task.rs), and
 //! `report_task` adds them to the aggregate `--diagnostics` and
