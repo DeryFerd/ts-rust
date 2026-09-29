@@ -257,23 +257,31 @@ impl UnmarshalerFrom for TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
+        let state = scan_discriminated_struct(
+            dec,
+            "TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile",
+            "kind",
+        )?;
+        match state.discriminator_value.as_slice() {
             b"\"rename\"" => {
-                let v = self.rename_file.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.rename_file = Some(v);
+                return Ok(());
             }
             b"\"create\"" => {
-                let v = self.create_file.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.create_file = Some(v);
+                return Ok(());
             }
             b"\"delete\"" => {
-                let v = self.delete_file.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.delete_file = Some(v);
+                return Ok(());
             }
             _ => {
-                let v = self.text_document_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.text_document_edit = Some(v);
+                return Ok(());
             }
         }
     }
@@ -426,26 +434,26 @@ impl UnmarshalerFrom for WorkspaceFullDocumentDiagnosticReportOrUnchangedDocumen
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = WorkspaceFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
+        let state = scan_discriminated_struct(
+            dec,
+            "WorkspaceFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
+            "kind",
+        )?;
+        match state.discriminator_value.as_slice() {
             b"\"full\"" => {
-                let v = self
-                    .full_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.full_document_diagnostic_report = Some(v);
+                return Ok(());
             }
             b"\"unchanged\"" => {
-                let v = self
-                    .unchanged_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.unchanged_document_diagnostic_report = Some(v);
+                return Ok(());
             }
-            _ => {}
+            _ => {
+                return Err(state.invalid_discriminator());
+            }
         }
-        Err(err_invalid_value(
-            "WorkspaceFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
-            data,
-        ))
     }
 }
 
@@ -1114,26 +1122,27 @@ impl UnmarshalerFrom for WorkDoneProgressBeginOrReportOrEnd {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = WorkDoneProgressBeginOrReportOrEnd::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
+        let state = scan_discriminated_struct(dec, "WorkDoneProgressBeginOrReportOrEnd", "kind")?;
+        match state.discriminator_value.as_slice() {
             b"\"begin\"" => {
-                let v = self.begin.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.begin = Some(v);
+                return Ok(());
             }
             b"\"report\"" => {
-                let v = self.report.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.report = Some(v);
+                return Ok(());
             }
             b"\"end\"" => {
-                let v = self.end.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.end = Some(v);
+                return Ok(());
             }
-            _ => {}
+            _ => {
+                return Err(state.invalid_discriminator());
+            }
         }
-        Err(err_invalid_value(
-            "WorkDoneProgressBeginOrReportOrEnd",
-            data,
-        ))
     }
 }
 
@@ -1238,26 +1247,26 @@ impl UnmarshalerFrom for FullDocumentDiagnosticReportOrUnchangedDocumentDiagnost
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
+        let state = scan_discriminated_struct(
+            dec,
+            "FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
+            "kind",
+        )?;
+        match state.discriminator_value.as_slice() {
             b"\"full\"" => {
-                let v = self
-                    .full_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.full_document_diagnostic_report = Some(v);
+                return Ok(());
             }
             b"\"unchanged\"" => {
-                let v = self
-                    .unchanged_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.unchanged_document_diagnostic_report = Some(v);
+                return Ok(());
             }
-            _ => {}
+            _ => {
+                return Err(state.invalid_discriminator());
+            }
         }
-        Err(err_invalid_value(
-            "FullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
-            data,
-        ))
     }
 }
 
@@ -3451,26 +3460,31 @@ impl UnmarshalerFrom for VSImageElementOrClassifiedTextElementOrContainerElement
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = VSImageElementOrClassifiedTextElementOrContainerElement::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "_vs_type").0.as_slice() {
+        let state = scan_discriminated_struct(
+            dec,
+            "VSImageElementOrClassifiedTextElementOrContainerElement",
+            "_vs_type",
+        )?;
+        match state.discriminator_value.as_slice() {
             b"\"ContainerElement\"" => {
-                let v = self.container_element.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.container_element = Some(v);
+                return Ok(());
             }
             b"\"ImageElement\"" => {
-                let v = self.image_element.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.image_element = Some(v);
+                return Ok(());
             }
             b"\"ClassifiedTextElement\"" => {
-                let v = self.classified_text_element.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.classified_text_element = Some(v);
+                return Ok(());
             }
-            _ => {}
+            _ => {
+                return Err(state.invalid_discriminator());
+            }
         }
-        Err(err_invalid_value(
-            "VSImageElementOrClassifiedTextElementOrContainerElement",
-            data,
-        ))
     }
 }
 
@@ -4320,26 +4334,26 @@ impl UnmarshalerFrom for RelatedFullDocumentDiagnosticReportOrUnchangedDocumentD
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         *self = RelatedFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport::default();
 
-        let data = dec.read_value()?;
-        match json_object_raw_field(data, "kind").0.as_slice() {
+        let state = scan_discriminated_struct(
+            dec,
+            "RelatedFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
+            "kind",
+        )?;
+        match state.discriminator_value.as_slice() {
             b"\"full\"" => {
-                let v = self
-                    .full_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.full_document_diagnostic_report = Some(v);
+                return Ok(());
             }
             b"\"unchanged\"" => {
-                let v = self
-                    .unchanged_document_diagnostic_report
-                    .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                let v = unmarshal_discriminated_arm(&state, dec)?;
+                self.unchanged_document_diagnostic_report = Some(v);
+                return Ok(());
             }
-            _ => {}
+            _ => {
+                return Err(state.invalid_discriminator());
+            }
         }
-        Err(err_invalid_value(
-            "RelatedFullDocumentDiagnosticReportOrUnchangedDocumentDiagnosticReport",
-            data,
-        ))
     }
 }
 
@@ -5402,23 +5416,27 @@ impl UnmarshalerFrom for RequestFailureTelemetryEventOrPerformanceStatsTelemetry
                 return Ok(());
             }
             b'{' => {
-                let data = dec.read_value()?;
-                match json_object_raw_field(data, "eventName").0.as_slice() {
+                let state = scan_discriminated_struct(dec, "RequestFailureTelemetryEventOrPerformanceStatsTelemetryEventOrProjectInfoTelemetryEventOrNull", "eventName")?;
+                match state.discriminator_value.as_slice() {
                     b"\"languageServer.projectInfo\"" => {
-                        let v = self.project_info_telemetry_event.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        let v = unmarshal_discriminated_arm(&state, dec)?;
+                        self.project_info_telemetry_event = Some(v);
+                        return Ok(());
                     }
                     b"\"languageServer.errorResponse\"" => {
-                        let v = self.request_failure_telemetry_event.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        let v = unmarshal_discriminated_arm(&state, dec)?;
+                        self.request_failure_telemetry_event = Some(v);
+                        return Ok(());
                     }
                     b"\"languageServer.performanceStats\"" => {
-                        let v = self.performance_stats_telemetry_event.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        let v = unmarshal_discriminated_arm(&state, dec)?;
+                        self.performance_stats_telemetry_event = Some(v);
+                        return Ok(());
                     }
-                    _ => {}
+                    _ => {
+                        return Err(state.invalid_discriminator());
+                    }
                 }
-                return Err(err_invalid_value("RequestFailureTelemetryEventOrPerformanceStatsTelemetryEventOrProjectInfoTelemetryEventOrNull", data));
             }
             _ => {
                 return Err(err_invalid_kind("RequestFailureTelemetryEventOrPerformanceStatsTelemetryEventOrProjectInfoTelemetryEventOrNull", dec.peek_kind()));

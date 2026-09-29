@@ -2855,6 +2855,60 @@ function generateCode(): Map<string, string> {
     }
 
     /**
+     * Generate streaming discriminator dispatch for unions with at most one
+     * unmapped fallback arm. Fields after the discriminator decode directly
+     * from the active decoder; fields before it are replayed by the helper.
+     *
+     * PORT: Go (#63934) emits `scanDiscriminatedStruct` and
+     * `unmarshalDiscriminatedArm`; the Rust helpers are in lsp.rs.
+     */
+    function generateStreamingDiscriminatorDispatch(
+        name: string,
+        disc: NonNullable<ReturnType<typeof findDiscriminatorField>>,
+        indent: string,
+    ) {
+        writeLine(`${indent}let state = scan_discriminated_struct(dec, ${rustStr(name)}, ${rustStr(disc.fieldName)})?;`);
+        writeLine(`${indent}match state.discriminator_value.as_slice() {`);
+        for (const [value, entry] of disc.mapping) {
+            writeLine(`${indent}    ${rustByteStr(`"${value}"`)} => {`);
+            writeStreamingArm(entry, indent + "        ");
+            writeLine(`${indent}    }`);
+        }
+        writeLine(`${indent}    _ => {`);
+        if (disc.unmapped.length === 1) {
+            writeStreamingArm(disc.unmapped[0], indent + "        ");
+        }
+        else {
+            writeLine(`${indent}        return Err(state.invalid_discriminator());`);
+        }
+        writeLine(`${indent}    }`);
+        writeLine(`${indent}}`);
+    }
+
+    // Go: return unmarshalDiscriminatedArm(state, &o.X)
+    function writeStreamingArm(entry: UnionEntry, indent: string) {
+        writeLine(`${indent}let v = unmarshal_discriminated_arm(&state, dec)?;`);
+        writeLine(`${indent}self.${rustFieldName(entry.fieldName)} = Some(${entryIsBoxed(entry) ? "Box::new(v)" : "v"});`);
+        writeLine(`${indent}return Ok(());`);
+    }
+
+    function canStreamDiscriminator(
+        disc: NonNullable<ReturnType<typeof findDiscriminatorField>>,
+    ): boolean {
+        if (disc.unmapped.length > 1) {
+            return false;
+        }
+        const entries = [...disc.mapping.values(), ...disc.unmapped];
+        return entries.every(entry => {
+            if (entry.originalType.kind !== "reference") {
+                return false;
+            }
+            const name = entry.originalType.name;
+            return !hasCustomStructureCodec(name) && model.structures.some(structure => structure.name === name);
+        });
+    }
+
+    /**
      * Generate try-each fallback code for unmapped entries, chaining into
      * presence dispatch if possible before falling back to raw try-each.
      * Assumes a variable named `data` is in scope.
@@ -4045,14 +4099,21 @@ function generateCode(): Map<string, string> {
                     writeDirectDecode(kind, entries[0]);
                 }
                 else {
-                    // Ambiguous: buffer and dispatch
-                    writeLine(`                let data = dec.read_value()?;`);
                     let exhaustive = false;
                     const disc = findDiscriminatorField(entries);
-                    if (disc) {
-                        exhaustive = generateDiscriminatorDispatch(disc, "                ");
+                    if (disc && canStreamDiscriminator(disc)) {
+                        generateStreamingDiscriminatorDispatch(name, disc, "                ");
+                        exhaustive = true;
                     }
                     else {
+                        // Ambiguous non-discriminated objects need the complete
+                        // value for presence checks or speculative decoding.
+                        writeLine(`                let data = dec.read_value()?;`);
+                    }
+                    if (disc && !canStreamDiscriminator(disc)) {
+                        exhaustive = generateDiscriminatorDispatch(disc, "                ");
+                    }
+                    else if (!disc) {
                         const pres = findPresenceDiscriminator(entries);
                         if (pres) {
                             exhaustive = generatePresenceDispatch(pres, "                ");
@@ -4076,22 +4137,27 @@ function generateCode(): Map<string, string> {
             writeLine(`        }`);
         }
         else {
-            // Fallback: unknown kinds present (e.g. `any`), use ReadValue + try-each.
-            writeLine(`        let data = dec.read_value()?;`);
-
-            if (unionContainedNull) {
-                writeLine(`        if data == b"null" {`);
-                writeLine(`            return Ok(());`);
-                writeLine(`        }`);
-                writeLine("");
-            }
-
+            // Fallback for unknown kinds (e.g. `any`). Discriminated object
+            // unions can still stream; other unions use ReadValue + try-each.
             let exhaustive = false;
             const disc = findDiscriminatorField(fieldEntries);
-            if (disc) {
-                exhaustive = generateDiscriminatorDispatch(disc, "        ");
+            if (disc && canStreamDiscriminator(disc)) {
+                generateStreamingDiscriminatorDispatch(name, disc, "        ");
+                exhaustive = true;
             }
             else {
+                writeLine(`        let data = dec.read_value()?;`);
+                if (unionContainedNull) {
+                    writeLine(`        if data == b"null" {`);
+                    writeLine(`            return Ok(());`);
+                    writeLine(`        }`);
+                    writeLine("");
+                }
+            }
+            if (disc && !canStreamDiscriminator(disc)) {
+                exhaustive = generateDiscriminatorDispatch(disc, "        ");
+            }
+            else if (!disc) {
                 const pres = findPresenceDiscriminator(fieldEntries);
                 if (pres) {
                     exhaustive = generatePresenceDispatch(pres, "        ");
