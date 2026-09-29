@@ -7,7 +7,12 @@
 # It copies the package, and the repo files that the tests read, into a new tree where
 # built/local/tsgo is a symlink to the binary. The package then spawns that binary
 # (lib/getExePath.js). Copies use reflink on btrfs, so they are cheap.
-# The Go checkout is NP_GO_DIR (default: the pin 52168999f3dc checkout). Node >= 22.
+# The Go checkout is NP_GO_DIR, else the goCheckout of GOPORT_PIN (`pin.py path`), else the
+# pin 52168999f3dc checkout. Node >= 22.
+# At a microsoft/TypeScript pin (go.mod module github.com/microsoft/TypeScript/tsc; the Go
+# checkout is the repo's tsc/ dir) the client is packages/typescript of the repo root, it reads
+# tsc/testdata (fixtures and the astnav baselines), it runs built/local/tsc, and the repo root
+# must have node_modules (npm ci --ignore-scripts).
 # NP_KEEP=1 keeps the tree. NP_TEST_TIMEOUT (ms, default 300000) limits each test.
 # Output: target/continuation-r97-goport/compat-backlog/np-suite/<label>/
 #   results.jsonl  one line per test and suite: file, name ("a > b"), kind, status, msg
@@ -17,8 +22,10 @@
 set -uo pipefail
 cd /home/theo/Code/sandbox/ts-rust
 OUT=target/continuation-r97-goport/compat-backlog/np-suite
-GO=${NP_GO_DIR:-$HOME/.explore/repos/microsoft__typescript-go@52168999f}
-usage() { sed -n '2,16p' "$0"; exit 2; }
+if [[ -n ${NP_GO_DIR:-} ]]; then GO=$NP_GO_DIR
+elif [[ -n ${GOPORT_PIN:-} ]]; then GO=$(python3 scripts/upstream/pin.py path goCheckout "$GOPORT_PIN") || exit 2
+else GO=$HOME/.explore/repos/microsoft__typescript-go@52168999f; fi
+usage() { sed -n '2,21p' "$0"; exit 2; }
 
 run() {
   local label=$1 bin
@@ -28,17 +35,34 @@ run() {
   rm -rf "$o"; mkdir -p "$o"; o=$(realpath "$o")
   t=$(mktemp -d "${TMPDIR:-/tmp}/np-suite.XXXXXX")
   [[ ${NP_KEEP:-0} == 1 ]] && echo "tree $t (kept)" || trap 'rm -rf "$t"' EXIT
-  mkdir -p "$t/_packages" "$t/built/local" "$t/internal/core" "$t/_submodules/TypeScript" "$t/testdata/baselines/reference"
-  cp -a --reflink=auto "$GO/_packages/native-preview" "$t/_packages/"
-  cp -a --reflink=auto "$GO/internal/core/compileroptions.go" "$t/internal/core/"
-  cp -a --reflink=auto "$GO/testdata/baselines/reference/astnav" "$t/testdata/baselines/reference/"
-  # The TypeScript submodule without its 570 MB tests dir. The tests read only src.
-  for f in "$GO"/_submodules/TypeScript/*; do
-    [[ $(basename "$f") == tests ]] || cp -a --reflink=auto "$f" "$t/_submodules/TypeScript/"
-  done
-  # api.test.ts imports api.bench.ts, which needs tinybench and typescript. Read only.
-  ln -s "$GO/node_modules" "$t/node_modules"
-  ln -s "$bin" "$t/built/local/tsgo"
+  local pkg
+  if grep -qx 'module github.com/microsoft/TypeScript/tsc' "$GO/go.mod" 2>/dev/null; then
+    # microsoft/TypeScript layout (see the header).
+    local repo
+    repo=$(realpath "$GO/..")
+    [[ -d $repo/node_modules ]] || { echo "no $repo/node_modules: run npm ci --ignore-scripts in $repo" >&2; exit 2; }
+    mkdir -p "$t/packages" "$t/built/local" "$t/tsc/testdata/baselines/reference"
+    cp -a --reflink=auto "$repo/packages/typescript" "$t/packages/"
+    cp -a --reflink=auto "$GO/testdata/fixtures" "$t/tsc/testdata/"
+    cp -a --reflink=auto "$GO/testdata/baselines/reference/astnav" "$t/tsc/testdata/baselines/reference/"
+    # ast.test.ts imports ast.bench.ts, which needs tinybench. Read only.
+    ln -s "$repo/node_modules" "$t/node_modules"
+    ln -s "$bin" "$t/built/local/tsc"
+    pkg=$t/packages/typescript
+  else
+    mkdir -p "$t/_packages" "$t/built/local" "$t/internal/core" "$t/_submodules/TypeScript" "$t/testdata/baselines/reference"
+    cp -a --reflink=auto "$GO/_packages/native-preview" "$t/_packages/"
+    cp -a --reflink=auto "$GO/internal/core/compileroptions.go" "$t/internal/core/"
+    cp -a --reflink=auto "$GO/testdata/baselines/reference/astnav" "$t/testdata/baselines/reference/"
+    # The TypeScript submodule without its 570 MB tests dir. The tests read only src.
+    for f in "$GO"/_submodules/TypeScript/*; do
+      [[ $(basename "$f") == tests ]] || cp -a --reflink=auto "$f" "$t/_submodules/TypeScript/"
+    done
+    # api.test.ts imports api.bench.ts, which needs tinybench and typescript. Read only.
+    ln -s "$GO/node_modules" "$t/node_modules"
+    ln -s "$bin" "$t/built/local/tsgo"
+    pkg=$t/_packages/native-preview
+  fi
   { echo "bin $bin"; echo "sha256 $(sha256sum "$bin" | cut -d' ' -f1)"; echo "go $GO $(git -C "$GO" rev-parse HEAD)"; echo "node $(node --version)"; echo "host $(hostname)"; date -Is; } > "$o/meta.txt"
 
   # Reporter: one JSON line per finished test or suite, with its full name path.
@@ -76,7 +100,7 @@ export default async function* (source) {
 }
 EOF
   echo "np-suite $label: running with $bin"
-  ( cd "$t/_packages/native-preview" && timeout "${NP_TIMEOUT:-1800}" node --experimental-strip-types --no-warnings \
+  ( cd "$pkg" && timeout "${NP_TIMEOUT:-1800}" node --experimental-strip-types --no-warnings \
       --conditions @typescript/source --test --test-timeout="${NP_TEST_TIMEOUT:-300000}" \
       --test-reporter=spec --test-reporter-destination="$o/spec.log" \
       --test-reporter="$t/reporter.mjs" --test-reporter-destination="$o/results.jsonl" \
