@@ -68,14 +68,16 @@ listed=$("$bin/tsc" --listFilesOnly --lib es5 "$build/a.ts")
 grep -q "^$bin/lib.es5.d.ts$" <<< "$listed" ||
   { echo "$exe is not a noembed build: it lists $(head -1 <<< "$listed")" >&2; exit 1; }
 
-# The JS API (dist), as Go's `npm run build` of _packages/native-preview makes it (tsc -b).
+# The JS API (dist), as Go's `npm run -w @typescript/native-preview build` makes it (tsc -b). npm
+# finds `tsc` in the root node_modules/.bin: @typescript/bundled-typescript, not the typescript
+# package (another version, whose source maps differ).
 src="$build/dist-src"
 mkdir -p "$src"
 for f in "$go_dir"/_packages/native-preview/*; do
   [[ $f == */node_modules || $f == */dist ]] || cp -r "$f" "$src/"
 done
 ln -s "$go_dir/_packages/native-preview/node_modules" "$src/node_modules"
-node "$go_dir/node_modules/typescript/bin/tsc" -b "$src"
+"$go_dir/node_modules/.bin/tsc" -b "$src"
 
 native_bin=()
 [[ -n $go_version ]] || native_bin=(--native-bin)
