@@ -11,6 +11,11 @@
 # Ubuntu 20.04 and later).
 # RELEASE_STATIC=1: static glibc with glibc malloc, for comparison.
 #
+# Lib files: a shipped release (RELEASE_VERSION set) is Go's noembed build, as
+# Go's release builds and npm packages are. The lib files are not in the bins;
+# they are next to them. A dev build (no RELEASE_VERSION) embeds them, as the
+# pinned oracle does.
+#
 # Usage: build-release.sh [out-dir]
 #   out-dir  default: <data-root>/target/goport-release
 #
@@ -30,7 +35,7 @@
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
 #   The binaries land in <out-dir>/bin, with BUILD.txt (and the lib files
-#   with RELEASE_FEATURES=noembed).
+#   in a noembed build).
 #
 # Measured on R121 source, against the plain goport profile and build-pgo.sh:
 #   - zbook (glibc 2.44), paired perf stat: 14 to 15% fewer cycles than plain
@@ -71,6 +76,7 @@
 #                     read them from their own dir and print their real paths.
 #                     The script copies them (scripts/copy-libs.sh) next to the
 #                     bins in each dir that runs them and in <out-dir>/bin.
+#                     RELEASE_VERSION adds "noembed".
 #   RELEASE_VERSION   the version the bins report (tsc -v, .tsbuildinfo,
 #                     typesVersions matching, ATA), for example 7.0.2. It is
 #                     passed to the build as the build-time env var
@@ -78,6 +84,9 @@
 #                     build sets core.version with -ldflags -X. Default:
 #                     $GOPORT_BUILD_VERSION, else none, and then the bins report
 #                     the source default 7.1.0-dev, as a Go build without -X.
+#                     RELEASE_VERSION also adds the feature "noembed" (a
+#                     shipped release). For a version with embedded libs, set
+#                     GOPORT_BUILD_VERSION and not RELEASE_VERSION.
 #   RELEASE_GLIBC_FLOOR  dynamic build: the newest GLIBC_ symbol version a
 #                     bin may need (default 2.28). Change it together with
 #                     RELEASE_SYSROOT.
@@ -140,6 +149,10 @@ out="${1:-$data_root/target/goport-release}"
 static="${RELEASE_STATIC:-0}"
 jemalloc="${RELEASE_JEMALLOC:-$((static == 1 ? 0 : 1))}"
 features="${RELEASE_FEATURES:-}"
+# A shipped release is the noembed build (see the header).
+if [[ -n ${RELEASE_VERSION:-} && ",${features// /,}," != *,noembed,* ]]; then
+  features="${features:+$features,}noembed"
+fi
 [[ ",${features// /,}," == *,jemalloc,* ]] && jemalloc=1
 noembed=0
 [[ ",${features// /,}," == *,noembed,* ]] && noembed=1

@@ -31,8 +31,9 @@ fn executable_dir() -> String {
 /// Go `libPath()`: the directory of the executable, once. Panics when it
 /// has no lib.d.ts.
 // Go: noembed.go:32 libPath
-// PORT: Go returns TestingLibPath() in a test binary. Tests run on the
-// default (embed) build, so that branch is not ported.
+// PORT: Go returns TestingLibPath() in a test binary. That branch is not
+// ported: the protected tests run on the default (embed) build, and a
+// noembed test binary needs the lib files next to it (scripts/copy-libs.sh).
 fn lib_dir() -> &'static str {
     static LIB_DIR: OnceLock<String> = OnceLock::new();
     LIB_DIR.get_or_init(|| {

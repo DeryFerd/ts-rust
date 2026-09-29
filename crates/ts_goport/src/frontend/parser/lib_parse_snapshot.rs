@@ -1815,7 +1815,7 @@ fn encode_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binder::lib_snapshot::{snapshot_libs, write_blob};
+    use crate::binder::lib_snapshot::{lib_text, snapshot_libs, write_blob};
     use crate::frontend::parser::utilities::{
         module_indicator_options_read, reset_module_indicator_options_read,
     };
@@ -1842,7 +1842,7 @@ mod tests {
     /// loader gives them (the path is not read by the parse).
     fn lib_input(lib: &str) -> (SourceFileParseOptions, &'static str) {
         let file_name = format!("{}/{lib}", crate::frontend::bundled::lib_path());
-        let text = bundled_text(&file_name).unwrap_or_else(|| panic!("no bundled {lib}"));
+        let text = lib_text(lib).unwrap_or_else(|| panic!("no bundled {lib}"));
         let opts = SourceFileParseOptions {
             file_name,
             ..Default::default()
