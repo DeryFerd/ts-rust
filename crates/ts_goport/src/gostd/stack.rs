@@ -25,9 +25,8 @@ const MIN_STACK_SIZE: usize = 8 << 20;
 /// threads: 32 stacks take half of the limit and 64 take all of it. Query
 /// core, where Go exits 0 in each case: `--checkers 16` and `--checkers 32`
 /// give Go's output at `ulimit -v 1G` and `2G`. `--checkers 48` does at 2G,
-/// but at 1G a checker thread cannot start and the run then ends out of
-/// memory (exit 134). `--checkers 64` exits 70 ("cannot start a checker
-/// thread") at both.
+/// but exits 70 ("cannot start a checker thread") at 1G. `--checkers 64`
+/// exits 70 at both.
 const LIMIT_SHARE: u64 = 64;
 
 /// The stack size of a thread that runs Go code: 1 GiB, or 1/64 of the
