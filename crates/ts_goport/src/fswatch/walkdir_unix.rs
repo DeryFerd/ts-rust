@@ -1,10 +1,13 @@
 //! Go: internal/fswatch/walkdir_unix.go and walkdir_dirent_linux.go (the
-//! getdents directory walk used by the Linux backends).
+//! getdents directory walk used by the Linux backends and, on darwin and the
+//! BSDs, by the kqueue backend).
 //!
 //! PORT: the syscalls go through the `unix` shim (rustix, D-W1). Dirent
 //! records are read with `unix::Dirent::from_ne_bytes`
-//! instead of Go's `unsafe.Pointer` cast. The darwin and BSD dirent
-//! helpers (walkdir_dirent_{darwin,fileno,noreclen}.go) are not ported.
+//! instead of Go's `unsafe.Pointer` cast. On darwin and the BSDs the shim
+//! (unix_bsd.rs) writes the entries in the Linux record layout, so the
+//! Linux helpers below serve there too; the darwin and BSD dirent helpers
+//! (walkdir_dirent_{darwin,fileno,noreclen}.go) are not needed.
 
 use crate::fswatch::prelude::*;
 

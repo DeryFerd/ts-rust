@@ -1,8 +1,10 @@
 //! Go: internal/fswatch/walkdir.go (the portable directory walk).
 //!
 //! PORT: Go uses it on platforms without a native walk (walkdir_other.go)
-//! and in tests. On Linux the backends use `walkdir_unix::walk_dir`; the
-//! other targets have no ported backend that walks.
+//! and in tests. The backends that walk use `walkdir_unix::walk_dir`: inotify
+//! and fanotify on Linux, kqueue on darwin and the BSDs. Go's Windows walk
+//! (walkdir_windows.go, FindFirstFile) is not ported: the Windows backend
+//! does not walk, and only walkdir_test.go calls it there.
 //! `os.Lstat` and `os.ReadDir` are `std::fs`; their error text is the Rust
 //! text (Go prints `lstat <path>: <errno text>`).
 
