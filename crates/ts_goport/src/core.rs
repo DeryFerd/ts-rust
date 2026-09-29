@@ -239,6 +239,21 @@ impl Name {
     pub fn from_stable_id(id: u32) -> Option<Name> {
         intern::stable(id)
     }
+
+    /// The 4-byte id, for a packed node column (`ast::store::NodeKids`).
+    /// It is valid only in this process.
+    #[inline]
+    #[must_use]
+    pub(crate) fn id(&self) -> u32 {
+        self.0
+    }
+
+    /// The name whose `Name::id` in this process is `id`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_id(id: u32) -> Name {
+        Name(id)
+    }
 }
 
 // PORT: not `Copy`, so existing `.clone()` calls stay clean for clippy.
