@@ -25,5 +25,10 @@ rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "te
 nix = { version = "=0.31.3", default-features = false, features = ["fanotify"] }
 name-to-handle-at = "=0.1.0"
 
+[features]
+# Go build tag `noembed`: the lib files are read from next to the binary, not
+# embedded (src/frontend/bundled.rs). Build it through ts_goport's feature.
+noembed = []
+
 [lints]
 workspace = true
