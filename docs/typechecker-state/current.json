@@ -679,7 +679,15 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R133 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Run the R133 pipeline (candidate.sh side).",
+    "gateToolChanges": [
+      {
+        "key": "gate",
+        "from": "df23951335cb153bd13d2af381a935916e88051a7bdcbc73e38a9d834db3be79",
+        "to": "a65cf4763545de859eefa22f96f3785c232c0a19183ddc03f90f1eba80516b43",
+        "reason": "scripts/goport/gate.sh of legacy removal stage 1 (goport-legacy1 a4dba5f2b and a6bf5137f, merged into main b59ad9de0 with reviewer and auditor PASS): the manifest now also records oracleCaches (saved Go output hashes). No stage or item logic changed. The base r132-full ran the pre-stage-1 gate.sh."
+      }
+    ]
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
