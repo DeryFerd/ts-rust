@@ -612,24 +612,25 @@ impl NodeRecord {
         self.parent_code() & FOREIGN_PARENT != 0
     }
 
-    /// Go `node.Parent` of a node slot of store `file`. `foreign(i)` gives
-    /// entry `i` of the foreign parents of the store (see `ParentCode`).
-    #[inline]
-    fn parent_with(&self, file: usize, foreign: impl FnOnce(usize) -> Node) -> Node {
-        parent_of_code(self.parent_code(), file, foreign)
-    }
-
-    /// The header of this slot of store `file`, as the node reads see it.
-    /// `foreign` as for `parent_with`. The parent of the nil slot or an
+    /// The header of this slot of store `file`, whose foreign parents are
+    /// `foreign`, as the node reads see it. The parent of the nil slot or an
     /// alias slot is its target.
     #[inline]
-    fn header(&self, file: usize, foreign: impl FnOnce(usize) -> Node) -> NodeHeader {
+    fn header(&self, file: usize, foreign: &[Node]) -> NodeHeader {
         let bits = self.bits();
+        let up = self.up.load(Ordering::Relaxed);
+        let code = up as ParentCode;
         NodeHeader {
-            parent: if bits & Self::NO_NODE == 0 {
-                self.parent_with(file, foreign)
+            parent: if bits & Self::NO_NODE != 0 {
+                Node(up)
+            } else if code & FOREIGN_PARENT != 0 {
+                // No call and no panic, so a reader that does not use the
+                // parent loses this code after inlining.
+                let parent = foreign.get((code & !FOREIGN_PARENT) as usize).copied();
+                debug_assert!(parent.is_some(), "foreign parent {code:#x}");
+                parent.unwrap_or_default()
             } else {
-                self.target_node()
+                local_parent_of_code(code, file)
             },
             loc: self.loc(),
             flags: self.flags(),
@@ -712,13 +713,12 @@ fn local_parent_code(stored: Node) -> ParentCode {
     code
 }
 
-/// Go `node.Parent` of a node slot of store `file` whose parent code is
-/// `code` (see `NodeRecord::parent_with`).
+/// Go `node.Parent` of a node slot of store `file` whose parent code
+/// `code` is nil or a slot of the store (not `FOREIGN_PARENT`).
 #[inline]
-fn parent_of_code(code: ParentCode, file: usize, foreign: impl FnOnce(usize) -> Node) -> Node {
-    if code & FOREIGN_PARENT != 0 {
-        foreign((code & !FOREIGN_PARENT) as usize)
-    } else if code == 0 {
+fn local_parent_of_code(code: ParentCode, file: usize) -> Node {
+    debug_assert_eq!(code & FOREIGN_PARENT, 0);
+    if code == 0 {
         Node::NIL
     } else {
         Node(((file as u64) << 32) | u64::from(code))
@@ -1772,7 +1772,7 @@ impl FileStore {
     /// node reads see it.
     #[inline]
     fn slot_header(&self, file: usize, index: usize) -> NodeHeader {
-        self.records[index].header(file, |i| self.foreign_parents[i])
+        self.records[index].header(file, &self.foreign_parents)
     }
 
     /// `record_resolve` of slot `index` of this store, which has id `file`.
@@ -3869,10 +3869,10 @@ pub fn store_ast_node(n: Node) -> &'static crate::astdata::Node {
 #[must_use]
 pub fn store_header(n: Node) -> NodeHeader {
     let (file, index) = (n.file_index(), slot_index(n));
-    if let Some(header) = frozen_static!(file, records, |_, _, records| {
-        let record = &records[index];
+    if let Some(header) = frozen_static!(file, per_store, |f, local, s| {
+        let record = &f.records[local][index];
         debug_assert!(record.is_node(), "store handle does not name a node slot");
-        record.header(file, |i| frozen_foreign_parent(file, i))
+        record.header(file, s.foreign)
     }) {
         return header;
     }
@@ -3907,8 +3907,8 @@ pub fn try_store_header(n: Node) -> Option<NodeHeader> {
 /// `try_store_header` for a node that is not in the active store.
 #[inline(never)]
 fn try_store_header_slow(file: usize, index: usize) -> Option<NodeHeader> {
-    if let Some(header) = frozen!(file, records, |_, _, records| records[index]
-        .header(file, |i| frozen_foreign_parent(file, i)))
+    if let Some(header) = frozen!(file, per_store, |f, local, s| f.records[local][index]
+        .header(file, s.foreign))
     {
         return Some(header);
     }
@@ -4012,55 +4012,65 @@ pub fn frozen_store_any_symbol(
 /// AST node records, step 2 (`BoundFile::install`): writes the binder
 /// output of published store file `file` into its records (tier 0, tier 1,
 /// or the node shell of a freeable file version). `nodes` gives, in slot
-/// order, each node slot that has binder data, with the index of its data
-/// entry and the data (`FileNodeBind::nodes`). The symbol, the added flags
-/// and the flow node go into the record; the other fields go into the
-/// returned extras, and the record keeps their index + 1 (`NodeRecord`,
-/// `bind`). Slots that share a data entry share one extras entry.
+/// order, each node slot that has binder data or a flow node: its slot
+/// index, the index of its data entry, the data (`None` for a node with
+/// only a flow node) and the flow node (`binder::BoundNodes`). The symbol,
+/// the added flags and the flow node go into the record; the other fields
+/// go into the returned extras, and the record keeps their index + 1
+/// (`NodeRecord`, `bind`). Slots that share a data entry share one extras
+/// entry.
 // PORT: only this writes a published record (see `NodeRecord`). The
 // writes are `Relaxed` stores; the bind of a file ends before its binder
 // fields are read on another thread.
+// PERF: the fields of an entry are found once for a run of slots that
+// share it, and a node with only a flow node writes one word.
 pub fn bind_store_records<'d>(
     file: usize,
-    nodes: impl Iterator<Item = (usize, usize, &'d NodeBindData)>,
+    nodes: impl Iterator<Item = (usize, usize, Option<&'d NodeBindData>, FlowNodeId)>,
 ) -> Vec<NodeBindExtra> {
     let records: &'static [NodeRecord] = static_frozen_of(file, |f| f.records)
         .unwrap_or_else(|_| panic!("file {file} has no published records"))
         .2;
     let flow_file = (file as u64) << 32;
     let mut extras: Vec<NodeBindExtra> = Vec::new();
-    // The data entry of the last extras entry, and its index + 1.
-    let mut last = (usize::MAX, 0u32);
-    for (index, entry, data) in nodes {
+    // The last data entry, and its symbol, added flags and extras index + 1.
+    let mut last = (usize::MAX, SymbolId::NIL, NodeFlags::NONE, 0u32);
+    for (index, entry, data, flow) in nodes {
         let record = &records[index];
-        assert!(
-            record.is_node(),
-            "binder data on slot {index} of file {file}, not a node"
-        );
-        debug_assert!(
-            super::node::BINDER_ADDED_FLAGS.contains(data.added_flags),
-            "binder added {:#x}, outside BINDER_ADDED_FLAGS",
-            data.added_flags
-                .without(super::node::BINDER_ADDED_FLAGS)
-                .bits()
-        );
-        let flow = data.flow_node;
         assert!(
             flow.is_nil() || flow.0 & !0xffff_ffff == flow_file,
             "flow node of slot {index} of file {file} is in another file"
         );
-        let extra = NodeBindExtra::of(data);
-        let extra = if extra == NodeBindExtra::default() {
-            0
-        } else if last.0 == entry {
-            last.1
-        } else {
-            extras.push(extra);
-            last = (entry, u32::try_from(extras.len()).expect("binder extras"));
-            last.1
+        let flow = flow.0 & 0xffff_ffff;
+        let Some(data) = data else {
+            record.write_bind(SymbolId::NIL, NodeFlags::NONE, flow);
+            continue;
         };
-        let bind = (flow.0 & 0xffff_ffff) | (u64::from(extra) << 32);
-        record.write_bind(data.symbol, data.added_flags, bind);
+        if last.0 != entry {
+            debug_assert!(
+                super::node::BINDER_ADDED_FLAGS.contains(data.added_flags),
+                "binder added {:#x}, outside BINDER_ADDED_FLAGS",
+                data.added_flags
+                    .without(super::node::BINDER_ADDED_FLAGS)
+                    .bits()
+            );
+            let extra = NodeBindExtra::of(data);
+            let extra = if extra == NodeBindExtra::NONE {
+                0
+            } else {
+                extras.push(extra);
+                u32::try_from(extras.len()).expect("binder extras")
+            };
+            last = (entry, data.symbol, data.added_flags, extra);
+        }
+        let (_, symbol, added, extra) = last;
+        // A symbol goes into `up`, which holds the target of a slot with
+        // no node.
+        assert!(
+            symbol.is_nil() || record.is_node(),
+            "binder data on slot {index} of file {file}, not a node"
+        );
+        record.write_bind(symbol, added, flow | (u64::from(extra) << 32));
     }
     extras
 }
@@ -4072,15 +4082,22 @@ pub fn frozen_store_loc(n: Node) -> Option<TextRange> {
     frozen_record(n).map(NodeRecord::loc)
 }
 
-/// Go `node.Parent` of a published store node (see `frozen_record`).
+/// Go `node.Parent` of a published store node (see `frozen_record`) when
+/// it is nil or a node of the same store. `None` for a parent in another
+/// store (`ParentCode`): the caller reads the header (`try_store_header`).
+// PERF: AST node records, step 2. No call here, so `Node::parent` stays
+// inline: with the foreign table read in this path, it went out of line
+// and `goport -p` on effect ran about 1.4% more instructions in it.
 #[inline]
 #[must_use]
 pub fn frozen_store_parent(n: Node) -> Option<Node> {
-    let file = n.file_index();
-    frozen_record(n).map(|r| {
-        debug_assert!(r.is_node(), "store handle does not name a node slot");
-        r.parent_with(file, |i| frozen_foreign_parent(file, i))
-    })
+    let r = frozen_record(n)?;
+    debug_assert!(r.is_node(), "store handle does not name a node slot");
+    let code = r.parent_code();
+    if code & FOREIGN_PARENT != 0 {
+        return None;
+    }
+    Some(local_parent_of_code(code, n.file_index()))
 }
 
 /// The astdata node of a published store node: the inlined fast path of
@@ -5305,11 +5322,7 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 record.bits(),
                 record.flags(),
                 record.loc(),
-                if record.is_node() {
-                    local(record.parent_with(file, |i| s.foreign_parents[i]))
-                } else {
-                    local(record.target_node())
-                },
+                local(record.header(file, &s.foreign_parents).parent),
                 record.bind.load(Ordering::Relaxed),
                 s.nodes[index].is_some(),
                 kids.children(),

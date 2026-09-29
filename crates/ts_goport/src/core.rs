@@ -2630,14 +2630,14 @@ impl FileNodeBind {
     }
 }
 
-/// The binder data of every node of one file, stored compactly, as the
-/// binder hands it over (`BoundFile`) and the lib bind snapshot keeps it
-/// (`parts`). Most nodes have no data, or the same data as the node before
-/// them (a run of identifiers in one flow region), so they share one entry.
-/// Each node keeps one byte: the offset of its entry from the first entry
-/// of its block. The install writes it into the node records and a
-/// `FileNodeBind` (`ast::bind_store_records`).
-#[derive(Debug, Default)]
+/// The binder data of every node of one file, stored compactly, as the lib
+/// bind snapshot keeps it (`parts`, `binder::BoundNodes`). Most nodes have
+/// no data, or the same data as the node before them (a run of identifiers
+/// in one flow region), so they share one entry. Each node keeps one byte:
+/// the offset of its entry from the first entry of its block. The install
+/// writes it into the node records and a `FileNodeBind`
+/// (`ast::bind_store_records`).
+#[derive(Clone, Debug, Default)]
 pub struct NodeBindParts {
     /// Per node, by `NodeId::index()`: entry offset in its block, or
     /// `NO_NODE_BIND` for the empty data.
@@ -2710,22 +2710,12 @@ impl NodeBindParts {
     /// and the data.
     pub fn nodes(&self) -> impl Iterator<Item = (usize, usize, &NodeBindData)> {
         self.slots
-            .chunks(NODE_BIND_BLOCK)
-            .zip(&self.bases)
+            .iter()
             .enumerate()
-            .flat_map(move |(block, (slots, &base))| {
-                slots
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &offset)| offset != NO_NODE_BIND)
-                    .map(move |(i, &offset)| {
-                        let entry = base as usize + offset as usize;
-                        (
-                            (block << NODE_BIND_BLOCK_BITS) + i,
-                            entry,
-                            &self.entries[entry],
-                        )
-                    })
+            .filter(|&(_, &offset)| offset != NO_NODE_BIND)
+            .map(|(index, &offset)| {
+                let entry = self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize;
+                (index, entry, &self.entries[entry])
             })
     }
 

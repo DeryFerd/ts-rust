@@ -2289,7 +2289,8 @@ impl Node {
                 debug_assert_eq!(flags & mask, self.flags() & mask);
                 flags & mask
             }
-            None => self.flags() & mask,
+            // `Node::flags` after its record missed.
+            None => self.flags_slow() & mask,
         }
     }
 
