@@ -166,7 +166,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
         return None;
     }
     let mut args = std::env::args_os();
-    let arg0 = args.next()?;
+    let program = args.next()?;
     let args: Vec<_> = args.collect();
     let watch = |a: &std::ffi::OsString| {
         a.to_str()
@@ -180,7 +180,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // same number. THP off (`prctl`) stays off in the worker.
     let (read, write) = rustix::pipe::pipe().ok()?;
     let mut worker = std::process::Command::new(exe)
-        .arg0(arg0)
+        .arg0(program)
         .args(args)
         .env(WORKER_FD, write.as_raw_fd().to_string())
         .spawn()
