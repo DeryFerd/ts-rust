@@ -1971,11 +1971,17 @@ impl Node {
 
     #[inline(never)]
     fn kind_slow(self) -> SyntaxKind {
+        // PERF: perf15 S0. A synthetic node reads its kind in the arena, with
+        // no store lookup and no data chunk clone (`synthetic_kind`).
+        if is_synthetic_node(self) {
+            return synthetic_kind(self);
+        }
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
         }
-        with_ast_node(self, |r| r.kind)
+        assert!(self.is_some(), "nil node dereference");
+        unreachable!("node {self:?} is not synthetic and has no store")
     }
 
     /// Go `node.Flags`: parser flags plus the flags the binder adds.
