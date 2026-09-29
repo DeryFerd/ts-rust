@@ -25,6 +25,6 @@ pub use ts_ast::SyntaxKind;
 
 // Names that more than one glob above exports. Pick one explicitly so the
 // globs are not ambiguous.
-pub use crate::ast::{factory, jsdoc, utilities_p1, utilities_p2};
+pub use crate::ast::{factory, utilities_p1, utilities_p2};
 pub use crate::checker::{TypeMapperKind, types};
 pub use crate::printer::EmitHost;

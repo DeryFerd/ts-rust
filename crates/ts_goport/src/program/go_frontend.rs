@@ -1,4 +1,4 @@
-//! The `GOPORT_FRONTEND=go` loader: Go tsc config parsing
+//! The goport program loader: Go tsc config parsing
 //! (`tsoptions.GetParsedCommandLineOfConfigFile`), the Go program loader
 //! (`compiler.NewProgram`: scanner, parser, module resolution, file order)
 //! and the `GoProgram` built from its node stores.
@@ -166,12 +166,6 @@ impl ParseConfigHost for System {
     fn get_current_directory(&self) -> String {
         self.current_directory.clone()
     }
-}
-
-/// True unless `GOPORT_FRONTEND=legacy` selects the old ts_compiler loader.
-/// The Go frontend is the default.
-pub(super) fn enabled() -> bool {
-    std::env::var("GOPORT_FRONTEND").map_or(true, |value| value != "legacy")
 }
 
 /// `try_load_with` for the Go frontend.
@@ -404,7 +398,6 @@ fn go_files_of_unpublished_stores(
         // never bound or checked, so its root is not read.
         let root = file.map_or(Node::NIL, |file| file.root);
         files.push(GoFile {
-            source: None,
             root,
             parser_flags: file_store_parser_flags(store),
             info,
@@ -528,7 +521,6 @@ fn build_program(
     cwd: String,
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
-    let legacy_fs = ts_vfs::OsFileSystem::default();
     let case_sensitivity = case_sensitivity();
     let options = np.options().clone();
 
@@ -598,7 +590,6 @@ fn build_program(
     }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
-        program: None,
         source_file_order,
         options,
         bound_symbols: OnceLock::new(),
@@ -644,7 +635,6 @@ fn build_program(
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
         case_sensitivity,
-        fs: legacy_fs,
         resolved_modules: OnceLock::new(),
         common_source_directory: OnceLock::from(common_source_directory_of(np)),
         alias_resolver: false,
@@ -720,7 +710,6 @@ fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFil
         jsdoc_diagnostics: &file.jsdoc_diagnostics,
         has_lazy_js_doc: file.has_lazy_js_doc,
         contains_non_ascii: file.contains_non_ascii,
-        trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {
@@ -761,7 +750,6 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         has_lazy_js_doc: false,
         // The parser flag of the config file, when the store was parsed.
         contains_non_ascii: file_store_contains_non_ascii(store),
-        trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {

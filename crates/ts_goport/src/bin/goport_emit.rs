@@ -48,10 +48,6 @@
 //! returns (Go uses 0 to 5), and says so on stderr. A Go panic that the
 //! port keeps (`core::go_panic`) ends the run as in Go: the output so far,
 //! `panic: <message>` on stderr and exit 2.
-//!
-//! `GOPORT_FRONTEND=legacy` has no effect here: the Go config parser and
-//! program loader always run. No script uses the legacy loader with this
-//! bin.
 
 use std::any::Any;
 use std::cell::{Cell, OnceCell};

@@ -107,7 +107,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -125,15 +125,6 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
  "zlib-rs",
-]
-
-[[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -174,26 +165,6 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
-]
-
-[[package]]
-name = "inotify"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "533e68a5842e734946fe159fb03fc9bbbb254f590dd0d8ad321ae5ff7beca2c1"
-dependencies = [
- "bitflags 2.13.0",
- "inotify-sys",
- "libc",
-]
-
-[[package]]
-name = "inotify-sys"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -240,26 +211,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kqueue"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "273c0752728918e0ac4976f2b275b6fefb9ecd400585dec929419f3844cd87b5"
-dependencies = [
- "kqueue-sys",
- "libc",
-]
-
-[[package]]
-name = "kqueue-sys"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
-dependencies = [
- "bitflags 2.13.0",
- "libc",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,18 +245,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mio"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
-dependencies = [
- "libc",
- "log",
- "wasi",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "name-to-handle-at"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,33 +263,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "notify"
-version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
-dependencies = [
- "bitflags 2.13.0",
- "fsevent-sys",
- "inotify",
- "kqueue",
- "libc",
- "log",
- "mio",
- "notify-types",
- "walkdir",
- "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "notify-types"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
-dependencies = [
- "bitflags 2.13.0",
 ]
 
 [[package]]
@@ -430,7 +342,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -438,15 +350,6 @@ name = "ryu-js"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
-
-[[package]]
-name = "same-file"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
-dependencies = [
- "winapi-util",
-]
 
 [[package]]
 name = "serde"
@@ -484,7 +387,6 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
- "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -608,107 +510,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ts_binder"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_core",
- "ts_diagnostics",
- "ts_options",
- "ts_parser",
- "ts_path",
- "ts_scanner",
-]
-
-[[package]]
-name = "ts_bundled"
-version = "7.0.0-dev"
-dependencies = [
- "ts_options",
-]
-
-[[package]]
-name = "ts_checker"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_binder",
- "ts_core",
- "ts_diagnostics",
- "ts_evaluator",
- "ts_jsnum",
- "ts_options",
- "ts_parser",
- "ts_path",
- "ts_scanner",
- "xxhash-rust",
-]
-
-[[package]]
-name = "ts_cli"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_compiler",
- "ts_config",
- "ts_diagnostic_writer",
- "ts_lsp",
- "ts_module",
- "ts_options",
- "ts_parser",
- "ts_project",
- "ts_scanner",
- "ts_vfs",
- "ts_watch",
-]
-
-[[package]]
-name = "ts_compare"
-version = "7.0.0-dev"
-
-[[package]]
-name = "ts_compiler"
-version = "7.0.0-dev"
-dependencies = [
- "serde",
- "serde_json",
- "ts_ast",
- "ts_binder",
- "ts_bundled",
- "ts_checker",
- "ts_config",
- "ts_core",
- "ts_diagnostics",
- "ts_glob",
- "ts_module",
- "ts_options",
- "ts_outputpaths",
- "ts_parser",
- "ts_path",
- "ts_printer",
- "ts_scanner",
- "ts_sourcemap",
- "ts_vfs",
-]
-
-[[package]]
-name = "ts_config"
-version = "7.0.0-dev"
-dependencies = [
- "ts_diagnostics",
- "ts_vfs",
-]
-
-[[package]]
 name = "ts_core"
 version = "7.0.0-dev"
-
-[[package]]
-name = "ts_diagnostic_writer"
-version = "7.0.0-dev"
-dependencies = [
- "ts_core",
-]
 
 [[package]]
 name = "ts_diagnostics"
@@ -720,51 +523,6 @@ version = "7.0.0-dev"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "ts_evaluator"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_jsnum",
- "ts_parser",
-]
-
-[[package]]
-name = "ts_fixture"
-version = "7.0.0-dev"
-dependencies = [
- "serde",
- "serde_json",
- "ts_ast",
- "ts_binder",
- "ts_checker",
- "ts_compiler",
- "ts_config",
- "ts_core",
- "ts_diagnostics",
- "ts_module",
- "ts_options",
- "ts_parser",
- "ts_path",
- "ts_vfs",
- "xxhash-rust",
-]
-
-[[package]]
-name = "ts_fswatch"
-version = "7.0.0-dev"
-dependencies = [
- "notify",
-]
-
-[[package]]
-name = "ts_glob"
-version = "7.0.0-dev"
-dependencies = [
- "ts_path",
- "ts_vfs",
 ]
 
 [[package]]
@@ -786,26 +544,12 @@ dependencies = [
  "smallvec",
  "tikv-jemallocator",
  "ts_ast",
- "ts_compiler",
  "ts_core",
- "ts_diagnostic_writer",
  "ts_diagnostics",
  "ts_jsnum",
- "ts_module",
- "ts_options",
- "ts_parser",
  "ts_path",
  "ts_scanner",
- "ts_vfs",
  "xxhash-rust",
-]
-
-[[package]]
-name = "ts_incremental"
-version = "7.0.0-dev"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -818,98 +562,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ts_jsonrpc"
-version = "7.0.0-dev"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ts_lsp"
-version = "7.0.0-dev"
-dependencies = [
- "serde",
- "serde_json",
- "ts_ast",
- "ts_binder",
- "ts_compiler",
- "ts_jsonrpc",
- "ts_module",
- "ts_options",
- "ts_parser",
- "ts_vfs",
-]
-
-[[package]]
-name = "ts_module"
-version = "7.0.0-dev"
-dependencies = [
- "serde_json",
- "ts_path",
- "ts_semver",
- "ts_vfs",
-]
-
-[[package]]
-name = "ts_options"
-version = "7.0.0-dev"
-dependencies = [
- "ts_config",
- "ts_diagnostics",
- "ts_module",
- "ts_path",
-]
-
-[[package]]
-name = "ts_outputpaths"
-version = "7.0.0-dev"
-dependencies = [
- "ts_options",
- "ts_path",
-]
-
-[[package]]
-name = "ts_parser"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_core",
- "ts_diagnostics",
- "ts_scanner",
-]
-
-[[package]]
 name = "ts_path"
 version = "7.0.0-dev"
-
-[[package]]
-name = "ts_printer"
-version = "7.0.0-dev"
-dependencies = [
- "ts_ast",
- "ts_binder",
- "ts_checker",
- "ts_jsnum",
- "ts_options",
- "ts_parser",
- "ts_sourcemap",
-]
-
-[[package]]
-name = "ts_project"
-version = "7.0.0-dev"
-dependencies = [
- "ts_compiler",
- "ts_config",
- "ts_core",
- "ts_diagnostics",
- "ts_incremental",
- "ts_outputpaths",
- "ts_path",
- "ts_printer",
- "ts_vfs",
-]
 
 [[package]]
 name = "ts_scanner"
@@ -923,57 +577,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ts_semver"
-version = "7.0.0-dev"
-
-[[package]]
-name = "ts_sourcemap"
-version = "7.0.0-dev"
-
-[[package]]
-name = "ts_vfs"
-version = "7.0.0-dev"
-
-[[package]]
-name = "ts_watch"
-version = "7.0.0-dev"
-dependencies = [
- "ts_compiler",
- "ts_fswatch",
- "ts_module",
- "ts_vfs",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "walkdir"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
-dependencies = [
- "same-file",
- "winapi-util",
-]
-
-[[package]]
-name = "wasi"
-version = "0.11.1+wasi-snapshot-preview1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
-
-[[package]]
-name = "winapi-util"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "windows-link"
@@ -983,86 +590,12 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
-
-[[package]]
-name = "windows-targets"
-version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
-dependencies = [
- "windows-link",
- "windows_aarch64_gnullvm",
- "windows_aarch64_msvc",
- "windows_i686_gnu",
- "windows_i686_gnullvm",
- "windows_i686_msvc",
- "windows_x86_64_gnu",
- "windows_x86_64_gnullvm",
- "windows_x86_64_msvc",
-]
-
-[[package]]
-name = "windows_aarch64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
-
-[[package]]
-name = "windows_aarch64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
-
-[[package]]
-name = "windows_i686_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
-
-[[package]]
-name = "windows_i686_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
-
-[[package]]
-name = "windows_i686_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
-
-[[package]]
-name = "windows_x86_64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "xxhash-rust"

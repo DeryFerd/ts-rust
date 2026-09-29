@@ -893,19 +893,6 @@ pub fn string_to_token(s: &str) -> SyntaxKind {
     text_to_keyword(s)
 }
 
-// Go: scanner/scanner.go:2288 GetViableKeywordSuggestions
-// PORT: Go ranges over the `textToKeyword` map, so its order is random. Here
-// the order is the keyword table order.
-pub fn get_viable_keyword_suggestions() -> Vec<String> {
-    let mut result = Vec::with_capacity(TEXT_TO_KEYWORD.len());
-    for &(text, _) in TEXT_TO_KEYWORD {
-        if text.len() > 2 {
-            result.push(text.to_string());
-        }
-    }
-    result
-}
-
 const MAX_ASCII_CHARACTER: u8 = 127;
 
 // Go: scanner/scanner.go:2298 couldStartTrivia

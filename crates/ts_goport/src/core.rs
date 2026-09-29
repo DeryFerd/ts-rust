@@ -2866,11 +2866,7 @@ pub use goport_util::core::*;
 /// this value. Parser data is ready when the file is published. The binder
 /// fills the `OnceLock` fields once per file version.
 pub struct GoFile {
-    /// The ts_compiler source file (arena, text, file name). None for a
-    /// file parsed by the Go frontend (`GOPORT_FRONTEND=go`), whose nodes
-    /// live in a node store (`ast::store`).
-    pub source: Option<&'static ts_compiler::SourceFile>,
-    /// The `SourceFile` node.
+    /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,
     /// Go `node.Flags` from the parser for each node, indexed by
     /// `NodeId::index()`. It includes the Go parser context flags.
@@ -2891,8 +2887,6 @@ pub struct GoProgram {
     /// Unique in the process, from `next_program_id`. It keys the checker
     /// pool and the frontend of the program on the loading thread.
     pub id: u32,
-    /// The legacy graph. None on the Go frontend path.
-    pub program: Option<&'static ts_compiler::Program>,
     /// File ids in Go `Program.SourceFiles()` order.
     pub source_file_order: Vec<usize>,
     pub options: crate::options::CompilerOptions,
@@ -2901,16 +2895,6 @@ pub struct GoProgram {
     /// Program state (`program::state()`). Set once, after the files are
     /// published.
     pub(crate) state: std::sync::OnceLock<&'static crate::program::ProgramState>,
-}
-
-impl GoFile {
-    /// The legacy source file. Panics for a Go frontend file; callers check
-    /// `ast::store::has_file_store` first.
-    #[must_use]
-    pub fn legacy_source(&self) -> &'static ts_compiler::SourceFile {
-        self.source
-            .expect("legacy source read for a Go frontend file")
-    }
 }
 
 impl GoProgram {
