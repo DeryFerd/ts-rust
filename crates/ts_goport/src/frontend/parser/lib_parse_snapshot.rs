@@ -17,7 +17,8 @@
 //! (`SOURCES_HASH`), a hash of the parse options that the parse reads (file
 //! name, script kind, module indicator options) and the xxh3 hash of the
 //! text. Any mismatch or load error parses the file live, so a stale blob
-//! costs time, not output.
+//! costs time, not output. A lib file is found by its base name
+//! (`bundled_lib_name`), so the embed and noembed builds share the blob.
 //!
 //! The load leaves the state of the thread as a live parse does: the names
 //! of the file are interned in the order in which the parse interns them
@@ -212,10 +213,14 @@ impl ParseKey {
 /// the file name (`is_declaration_file_name`, the store file name), the
 /// script kind and the module indicator options. The path is not read; the
 /// load takes the options of the caller, as the parse does.
+/// For a lib file only its base name is hashed: the parse reads only the
+/// name's extension, so the embed name (`bundled:///libs/lib.dom.d.ts`) and
+/// the noembed path (`<lib dir>/lib.dom.d.ts`) load the same section.
 fn options_hash(opts: &SourceFileParseOptions, script_kind: ScriptKind) -> u64 {
+    let name = bundled_lib_name(&opts.file_name).unwrap_or(&opts.file_name);
     let mut hasher = Xxh3::new();
-    hasher.update(&(opts.file_name.len() as u64).to_le_bytes());
-    hasher.update(opts.file_name.as_bytes());
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name.as_bytes());
     hasher.update(&script_kind.0.to_le_bytes());
     let indicator = opts.external_module_indicator_options;
     hasher.update(&[u8::from(indicator.jsx), u8::from(indicator.force)]);
@@ -1810,7 +1815,7 @@ fn encode_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binder::lib_snapshot::{snapshot_libs, write_blob};
+    use crate::binder::lib_snapshot::{lib_text, snapshot_libs, write_blob};
     use crate::frontend::parser::utilities::{
         module_indicator_options_read, reset_module_indicator_options_read,
     };
@@ -1837,7 +1842,7 @@ mod tests {
     /// loader gives them (the path is not read by the parse).
     fn lib_input(lib: &str) -> (SourceFileParseOptions, &'static str) {
         let file_name = format!("{}/{lib}", crate::frontend::bundled::lib_path());
-        let text = bundled_text(&file_name).unwrap_or_else(|| panic!("no bundled {lib}"));
+        let text = lib_text(lib).unwrap_or_else(|| panic!("no bundled {lib}"));
         let opts = SourceFileParseOptions {
             file_name,
             ..Default::default()

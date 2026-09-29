@@ -36,9 +36,6 @@ use ts_goport::execute::tsc::{
 use ts_goport::frontend::tspath::{normalize_path, resolve_path};
 use ts_goport::prelude::*;
 
-/// Stack size for the loading thread, as in `goport`.
-const STACK_SIZE: usize = 1 << 30;
-
 const USAGE: &str = "usage: goport_multiprog pair <tsconfig> <changed-file> <new-text-file> <out-dir> [--first <other-tsconfig>]
        goport_multiprog cycles <tsconfig> <changed-file> <count>";
 
@@ -51,7 +48,7 @@ fn main() {
     // version, so the whole run stays on it.
     let worker = std::thread::Builder::new()
         .name("goport_multiprog".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&args));
     let code = match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(Ok(()))) => 0,

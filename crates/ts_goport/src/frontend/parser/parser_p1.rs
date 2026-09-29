@@ -812,8 +812,10 @@ impl Parser {
             // `resolve_file_store_js_doc`).
             set_file_store_lazy_js_doc(result.store, &result.parse_options, result.script_kind);
         }
-        self.reparsed_clones
-            .sort_by(|a, b| compare_node_positions(*a, *b).cmp(&0));
+        // Go: parser/parser.go:485 slices.SortFunc(p.reparsedClones, ast.CompareNodePositions)
+        crate::gostd::slices::sort_func(&mut self.reparsed_clones, |a, b| {
+            compare_node_positions(*a, *b)
+        });
         result.reparsed_clones = self.reparsed_clones.clone();
         set_external_module_indicator(result, self.opts.external_module_indicator_options);
     }

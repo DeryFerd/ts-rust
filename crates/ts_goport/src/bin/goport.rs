@@ -47,13 +47,9 @@ use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the worker thread. The checker recurses deeply on large
-/// projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `set_malloc_tunables`.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -98,11 +94,11 @@ fn main() {
     // The loading thread keeps the frontend program and the checker pool, so
     // the whole run stays on it. The checkers run on their own threads.
     // The thread ends the process itself once `run` has written the output,
-    // so the exit does not wait for the thread stacks (1 GiB each) to unmap,
-    // the thread-local destructors or the join.
+    // so the exit does not wait for the thread stacks (up to 1 GiB each,
+    // `max_stack_size`) to unmap, the thread-local destructors or the join.
     let worker = std::thread::Builder::new()
         .name("goport".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || std::process::exit(run(&args, start)));
     // Reached only when the thread cannot start or `run` panics.
     let _ = worker.map(std::thread::JoinHandle::join);
@@ -153,34 +149,40 @@ fn main() {
 ///   fixed `mmap_threshold=33554432` had mixed results on query, so it is
 ///   not set.
 ///
+/// Under an address space or data limit (`ulimit -v`, `ulimit -d`),
+/// `GLIBC_TUNABLES` sets `arena_max=1`, with jemalloc too
+/// (`ThreadBudget::glibc_tunables`).
+///
 /// The allocator reads these settings only at process start, so this runs
-/// the same binary again once with them set. It does nothing when the caller
-/// already set the variable (`_RJEM_MALLOC_CONF` or `GLIBC_TUNABLES`), so the
-/// caller can override the values. The run continues without the settings
-/// when the exec fails. A jemalloc build with `JEMALLOC_CONF` built in (see
-/// there) has the settings from its start and does not exec.
+/// the same binary again once with them set. It leaves out each variable
+/// that the caller already set (`_RJEM_MALLOC_CONF` or `GLIBC_TUNABLES`), so
+/// the caller can override the values, and does nothing when none is left.
+/// The run continues without the settings when the exec fails. A jemalloc
+/// build with `JEMALLOC_CONF` built in (see there) has the jemalloc settings
+/// from its start and execs only under a limit.
 // PERF (perf11 qprof, dbook, perf10 release tsgo with `_RJEM_MALLOC_CONF`
 // set by the caller): without the exec, `--version` takes 0.46 to 0.53 ms
 // less and the time to `main` drops from 4.06 to 3.21 ms.
 fn set_malloc_tunables(budget: &ThreadBudget) {
-    // Unused off Linux and with jemalloc.
+    // Unused off Linux.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        let mut vars = Vec::new();
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
-        // needs no exec: jemalloc reads it at its start, and
+        // needs no exec for it: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
-        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
-            return;
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") != Some(JEMALLOC_CONF) {
+            vars.push(("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF)));
         }
-        #[cfg(not(feature = "jemalloc"))]
-        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
-        #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
-        if std::env::var_os(name).is_some() {
+        if let Some(value) = budget.glibc_tunables() {
+            vars.push(("GLIBC_TUNABLES", value));
+        }
+        vars.retain(|(name, _)| std::env::var_os(name).is_none());
+        if vars.is_empty() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -192,7 +194,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(name, value).exec();
+        let _ = command.args(args).envs(vars).exec();
     }
 }
 

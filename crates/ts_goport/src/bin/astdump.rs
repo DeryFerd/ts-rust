@@ -101,7 +101,7 @@ fn main() {
     };
     // Program state is thread-local; run on one big-stack thread like goport.
     std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&project, &out_dir))
         .expect("spawn")
         .join()

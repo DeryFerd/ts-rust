@@ -2813,10 +2813,10 @@ pub mod syntax {
     /// merges them, and eliminates duplicates.
     fn clean_class(r: &mut Vec<Rune>) {
         // Sort by lo increasing, hi decreasing to break ties.
-        // PORT: Go's sort.Sort is not stable, but equal pairs are the same
-        // values, so any sort gives the same slice.
+        // Go: regexp/syntax/parse.go:1926 sort.Sort(ranges{rp})
+        // PORT: the pairs of `r` are one slice of pairs here.
         let mut pairs: Vec<(Rune, Rune)> = r.chunks_exact(2).map(|p| (p[0], p[1])).collect();
-        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        crate::gostd::slices::sort_slice(&mut pairs, |a, b| a.0 < b.0 || a.0 == b.0 && a.1 > b.1);
         for (k, (lo, hi)) in pairs.into_iter().enumerate() {
             r[2 * k] = lo;
             r[2 * k + 1] = hi;

@@ -1170,10 +1170,6 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 // (`take_prefetched`) and reads the answers the workers resolved
 // (`SharedResolutionCache`), so the output is the same.
 
-/// Stack size of a parse worker. The parser recurses as deeply as on the
-/// loading thread.
-const PARSE_STACK_SIZE: usize = 1 << 30;
-
 /// Number of parse workers next to the loading thread at the start of a
 /// load: the parse threads of a program that is not large
 /// (`ThreadBudget::parse_threads`), less the loading thread.
@@ -1735,7 +1731,7 @@ impl PrefetchPool {
             // A worker that cannot start only makes the parse less parallel.
             let spawned = std::thread::Builder::new()
                 .name("goport-parse".to_string())
-                .stack_size(PARSE_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || run_prefetch_worker(&shared));
             self.threads.extend(spawned.ok());
         }
