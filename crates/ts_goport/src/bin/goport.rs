@@ -47,10 +47,6 @@ use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the worker thread. The checker recurses deeply on large
-/// projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `set_malloc_tunables`.
 #[cfg(feature = "jemalloc")]
@@ -98,11 +94,11 @@ fn main() {
     // The loading thread keeps the frontend program and the checker pool, so
     // the whole run stays on it. The checkers run on their own threads.
     // The thread ends the process itself once `run` has written the output,
-    // so the exit does not wait for the thread stacks (1 GiB each) to unmap,
-    // the thread-local destructors or the join.
+    // so the exit does not wait for the thread stacks (up to 1 GiB each,
+    // `max_stack_size`) to unmap, the thread-local destructors or the join.
     let worker = std::thread::Builder::new()
         .name("goport".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || std::process::exit(run(&args, start)));
     // Reached only when the thread cannot start or `run` panics.
     let _ = worker.map(std::thread::JoinHandle::join);

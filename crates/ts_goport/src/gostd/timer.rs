@@ -16,10 +16,6 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-// PORT: Go stacks grow to 1 GB; the goroutine that runs an AfterFunc
-// callback gets the same maximum stack as the crate's checker threads.
-const GOROUTINE_STACK_SIZE: usize = 1 << 30;
-
 // PORT: Go mutexes do not poison.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -165,7 +161,7 @@ fn run_timer(t: Arc<TimerShared>) {
                 let f = f.clone();
                 std::thread::Builder::new()
                     .name("goroutine".to_string())
-                    .stack_size(GOROUTINE_STACK_SIZE)
+                    .stack_size(crate::gostd::stack::max_stack_size())
                     .spawn(move || {
                         // PORT: Go may run two calls of f at once after a
                         // Reset; here they take turns.

@@ -41,10 +41,6 @@ use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the main work thread. The checker recurses deeply on
-/// large projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
 /// `set_malloc_tunables`.
@@ -72,11 +68,12 @@ fn main() {
     let start = Instant::now();
     install_panic_hook();
     // The thread ends the process itself once `run_main` has written the
-    // output, so the exit does not wait for the thread stacks (1 GiB each)
-    // to unmap, the thread-local destructors or the join.
+    // output, so the exit does not wait for the thread stacks (up to 1 GiB
+    // each, `max_stack_size`) to unmap, the thread-local destructors or the
+    // join.
     let work = std::thread::Builder::new()
         .name("tsgo".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || std::process::exit(run_main(start)));
     // Reached only when the thread cannot start or `run_main` panics.
     let _ = work.map(std::thread::JoinHandle::join);

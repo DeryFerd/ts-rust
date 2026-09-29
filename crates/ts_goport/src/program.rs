@@ -387,7 +387,7 @@ fn create_emit_pool(count: usize) -> EmitPool {
             let released = Arc::clone(&released);
             std::thread::Builder::new()
                 .name(format!("emit-{index}"))
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     seed.install();
                     loop {
@@ -1416,7 +1416,7 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
             let seed = WorkerSeed::take();
             let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
             std::thread::Builder::new()
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn_scoped(scope, move || {
                     seed.install();
                     let mut state = queue.lock();
@@ -2313,10 +2313,6 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
 // results match the Go grouping and do not depend on thread timing.
 // ---------------------------------------------------------------------------
 
-/// Stack size of a checker worker thread. The checker recurses deeply on
-/// large projects.
-const CHECKER_STACK_SIZE: usize = 1 << 30;
-
 thread_local! {
     /// The checker pools of the loading thread, by `GoProgram::id`.
     static POOLS: RefCell<FxHashMap<u32, CheckerPool>> = RefCell::new(FxHashMap::default());
@@ -2420,7 +2416,7 @@ fn create_checkers() -> CheckerPool {
             let seed = WorkerSeed::take();
             let thread = std::thread::Builder::new()
                 .name(format!("checker-{index}"))
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     seed.install();
                     let checker = Checker::new(index);

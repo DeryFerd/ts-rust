@@ -32,10 +32,6 @@ use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the main work thread. The checker recurses deeply on
-/// large projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
 /// `set_malloc_tunables`.
@@ -61,7 +57,7 @@ fn main() {
     install_panic_hook();
     let work = std::thread::Builder::new()
         .name("goport_build".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&args));
     let code = if let Ok(Ok(code)) = work.map(std::thread::JoinHandle::join) {
         code

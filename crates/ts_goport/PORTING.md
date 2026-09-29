@@ -378,6 +378,12 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   up to 32 threads with no checker, one per core, made on the first emit
   that uses it. There is no pool when the cores are not more than the
   checkers: then it has no spare core and only slows the checker threads.
+- A thread that runs Go code (the work thread of a binary, and the parse,
+  bind, checker, emit, search and goroutine threads) gets the stack size of
+  `gostd::stack::max_stack_size`: 1 GiB, the Go maximum goroutine stack. A
+  Rust stack does not grow, so it is reserved at the start. Under an address
+  space or data limit (`ulimit -v`, `ulimit -d`), the size is 1/64 of the
+  limit, so the threads start and the heap keeps room.
   The JS part of a file goes there when its transforms make no checker
   call (`emitter::emitter::js_emit_needs_checker`: Go's binder
   reference resolver case of `getScriptTransformers`, and no enum in the
