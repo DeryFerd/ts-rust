@@ -22,10 +22,10 @@ export const GOPORT_BASELINE_SHA256 = "d1b90114690033ea0d3450182b7340c7f87df27d7
 // Unit test suites of the kept legacy crates. A name map may remove their tests when goport's Go
 // port replaces a crate (legacy removal stages 5 and 6); other removals need a Go pin change.
 const KEPT_CRATE_SUITE = /^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$/;
-// R131 is the last revision accepted under the legacy cargo roster (rule goport-protected-set).
-// A later revision needs protectedSet "goport": the legacy check, and with it the roster
-// carry-forward, is only for revisions up to this one.
-export const LAST_LEGACY_REVISION = 131;
+// R132 is the last revision under the legacy cargo roster (rule goport-protected-set). It was opened
+// in batch port-18 under the legacy rules before stage 1 merged. A later revision needs protectedSet
+// "goport": the legacy check, and with it the roster carry-forward, is only for revisions up to this one.
+export const LAST_LEGACY_REVISION = 132;
 // A Go pin (commit hash) as upstreamPin.to names it: 7 to 64 hex characters.
 const GO_PIN = /^[0-9a-f]{7,64}$/i;
 const ROOT = fileURLToPath(new URL("../", import.meta.url));

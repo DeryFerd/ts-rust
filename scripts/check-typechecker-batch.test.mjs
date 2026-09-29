@@ -437,12 +437,12 @@ function atRevision(f, n) {
   return f;
 }
 
-test("the legacy roster check, with or without the carry-forward, ends at R131", () => {
-  assert.equal(LAST_LEGACY_REVISION, 131);
+test("the legacy roster check, with or without the carry-forward, ends at R132", () => {
+  assert.equal(LAST_LEGACY_REVISION, 132);
   for (const make of [continuationFixture, carryFixture]) {
-    assert.equal(checkBatch(atRevision(make(), 131).state, make().read).verdict, "PASS");
-    const f = atRevision(make(), 132);
-    stopped(f, /R132 is after R131, the last revision under the legacy cargo roster\. It needs protectedSet "goport"/);
+    assert.equal(checkBatch(atRevision(make(), 132).state, make().read).verdict, "PASS");
+    const f = atRevision(make(), 133);
+    stopped(f, /R133 is after R132, the last revision under the legacy cargo roster\. It needs protectedSet "goport"/);
   }
 });
 

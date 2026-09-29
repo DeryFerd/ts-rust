@@ -41,10 +41,10 @@ runs it first (the oracle sweeps write their build info under `/tmp/port`), and 
 
 The protected set is goport's own tests and the gate items (`docs/typechecker-accountability.md`,
 "Protected set"). The base of a candidate is the last accepted revision: its goport test results
-(for the first goport batch, `docs/goport-protected/tests-r131.json.gz`), its gate manifest and its LSP
-and API oracle results (for the first goport batch, the R131 LSP run `lsp-r131` and the rule's
-`apiBaseline`, an API run of the R131 bins). `open_revision.py --base` prints it. The legacy roster
-drive is retired.
+(after a legacy batch, `docs/goport-protected/tests-r131.json.gz`), its gate manifest and its LSP
+and API oracle results (after a legacy batch, its LSP run and the rule's `apiBaseline` `api-r131`,
+an API run of the R131 bins). `open_revision.py --base` prints it. The legacy roster drive is
+retired. R132 is the last legacy revision.
 
 1. `candidate.sh check <branch>`: scope and rustfmt of the branch against the checkout
    `target/worktrees/checker-port`. A goport batch may change every path except
