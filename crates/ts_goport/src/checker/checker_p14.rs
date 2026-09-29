@@ -232,7 +232,7 @@ impl Checker {
         diagnostic_message: &'static Message,
     ) {
         let containing_class_decl = container.parent();
-        let base_type_node = get_extends_heritage_clause_element(containing_class_decl);
+        let base_type_node = get_class_extends_heritage_element(containing_class_decl);
         // If a containing class does not have extends clause or the class extends null
         // skip checking whether super statement is called before "this" accessing.
         if base_type_node.is_some() && !self.class_declaration_extends_null(containing_class_decl) {
@@ -259,6 +259,22 @@ impl Checker {
     // Go: checker/checker.go:12254 checkAssertion
     pub fn check_assertion(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         if node.kind() == SyntaxKind::TypeAssertionExpression {
+            let file = get_source_file_of_node(node);
+            if file.is_some()
+                && crate::frontend::tspath::file_extension_is_one_of(
+                    source_file_file_name(file),
+                    &[
+                        crate::frontend::tspath::EXTENSION_MTS,
+                        crate::frontend::tspath::EXTENSION_CTS,
+                    ],
+                )
+            {
+                self.grammar_error_on_node(
+                    node,
+                    diag::This_syntax_is_reserved_in_files_with_the_mts_or_cts_extension_Use_an_as_expression_instead,
+                    args![],
+                );
+            }
             if self.should_check_erasable_syntax(node) {
                 let sf = get_source_file_of_node(node);
                 self.add_diagnostic(new_diagnostic(
@@ -274,6 +290,10 @@ impl Checker {
         }
         let type_node = node.type_();
         let expr_type = self.check_expression_ex(node.expression(), check_mode);
+        // Always check the type node so its identifiers are resolved. resolveName knows not
+        // to resolve (or report an error for) the `const` in a `const` assertion, so this is
+        // safe even for `x as const` and keeps diagnostics stable regardless of traversal order.
+        self.check_source_element(type_node);
         if is_const_type_reference(type_node) {
             if !self.is_valid_const_assertion_argument(node.expression()) {
                 self.error(
@@ -285,7 +305,6 @@ impl Checker {
             return self.get_regular_type_of_literal_type(expr_type);
         }
         self.assertion_links.get(node).expr_type = expr_type;
-        self.check_source_element(type_node);
         self.check_node_deferred(node);
         self.get_type_from_type_node(type_node)
     }
@@ -1537,18 +1556,29 @@ impl Checker {
             | SyntaxKind::ThisKeyword => PredicateSemantics::SOMETIMES,
             SyntaxKind::BinaryExpression => {
                 // List of operators that can produce null/undefined:
-                // || ||= && &&=
+                // || ||= && &&= ?? ??=
                 match node.operator_token().kind() {
                     SyntaxKind::BarBarToken
                     | SyntaxKind::BarBarEqualsToken
                     | SyntaxKind::AmpersandAmpersandToken
                     | SyntaxKind::AmpersandAmpersandEqualsToken => PredicateSemantics::SOMETIMES,
                     // For these operator kinds, the right operand is effectively controlling
-                    SyntaxKind::CommaToken
-                    | SyntaxKind::EqualsToken
-                    | SyntaxKind::QuestionQuestionToken
-                    | SyntaxKind::QuestionQuestionEqualsToken => {
+                    SyntaxKind::CommaToken | SyntaxKind::EqualsToken => {
                         self.get_syntactic_nullishness_semantics(node.right())
+                    }
+                    // For nullish coalescing: result is the left operand when left is non-null,
+                    // or the right operand when left is null/undefined. The nullishness of the
+                    // result combines both paths: the left's non-null path contributes Never,
+                    // and when left can be null, the right's semantics are also included.
+                    SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken => {
+                        let left_semantics = self.get_syntactic_nullishness_semantics(node.left());
+                        // The non-null path (left is non-null): left branch taken, result has Never bit
+                        let mut result = left_semantics & PredicateSemantics::NEVER;
+                        // The null path (left is null/undefined): right branch taken, result inherits right's semantics
+                        if left_semantics.intersects(PredicateSemantics::ALWAYS) {
+                            result |= self.get_syntactic_nullishness_semantics(node.right());
+                        }
+                        result
                     }
                     _ => PredicateSemantics::NEVER,
                 }

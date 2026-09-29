@@ -8,15 +8,25 @@ use crate::ls::prelude::*;
 
 use crate::frontend::core_textchange::TextChange;
 use crate::frontend::scanner::get_trailing_comment_ranges;
+use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/format.go:16 toLSProtoTextEdits
+    // Go: ls/format.go:18 toLSProtoTextEdits
+    // PORT: Go returns a nil slice when an edit does not map exactly; that
+    // is an empty `Vec`. The callers put `&edits` in the response, and Go
+    // JSON (v2) writes a nil slice as `[]`, as for an empty one.
     fn to_ls_proto_text_edits(&self, file: Node, changes: &[TextChange]) -> Vec<lsproto::TextEdit> {
         let mut result = Vec::with_capacity(changes.len());
         for c in changes {
+            let (lsp_range, fidelity) = self
+                .converters
+                .to_lsp_range(&file, TextRange::new(c.pos(), c.end()));
+            if !fidelity.is_exact() {
+                return Vec::new();
+            }
             result.push(lsproto::TextEdit {
                 new_text: c.new_text.clone(),
-                range: self.create_lsp_range_from_bounds(c.pos(), c.end(), file),
+                range: lsp_range,
             });
         }
         result
@@ -56,14 +66,15 @@ impl LanguageService {
         }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
+        let ranges =
+            lsconv::from_lsp_range_for_source_file(&self.converters, file, r, Feature::FORMATTING);
+        if ranges.len() != 1 || !ranges[0].fidelity.is_exact() {
+            return Ok(lsproto::TextEditsOrNull::default());
+        }
+        let file = ranges[0].script;
         let edits = self.to_ls_proto_text_edits(
             file,
-            &self.get_formatting_edits_for_range(
-                ctx,
-                file,
-                &format_opts,
-                self.converters.from_lsp_range(&file, &r),
-            ),
+            &self.get_formatting_edits_for_range(ctx, file, &format_opts, ranges[0].span),
         );
         Ok(lsproto::TextEditsOrNull {
             text_edits: Some(edits),
@@ -84,14 +95,23 @@ impl LanguageService {
         }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            position,
+            Feature::FORMATTING,
+        );
+        if positions.len() != 1 || !positions[0].fidelity.is_exact() {
+            return Ok(lsproto::TextEditsOrNull::default());
+        }
+        let file = positions[0].script;
         let edits = self.to_ls_proto_text_edits(
             file,
             &self.get_formatting_edits_after_keystroke(
                 ctx,
                 file,
                 &format_opts,
-                self.converters
-                    .line_and_character_to_position(&file, &position),
+                positions[0].position,
                 character,
             ),
         );

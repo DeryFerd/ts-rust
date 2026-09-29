@@ -95,17 +95,13 @@ impl Checker {
         // We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
         // mapper to the type parameters to produce the effective list of type arguments, and compute the
         // instantiation cache key from the type IDs of the type arguments.
-        // PORT: Go maps through `c.combineTypeMappers(t.Mapper(), m)`. The
-        // composite mapper is used only here, so its `Map` is inlined instead
-        // of adding a mapper to the arena on every call. Mapper ids never
-        // affect output.
         // PORT: the type arguments stay on the stack, because a cache hit only
         // hashes them.
         let t_mapper = self.ty(t).mapper();
         let mut type_arguments: SmallVec<[TypeId; 8]> =
             SmallVec::with_capacity(outer_type_parameters.len());
         for &tp in outer_type_parameters.iter() {
-            type_arguments.push(self.map_with_combined_mappers(t_mapper, m, tp));
+            type_arguments.push(self.map_type_with_composite_mapper(tp, t_mapper, m));
         }
         // PORT: Go `c.instantiateTypeAlias(t.alias, m)` when `alias` is nil.
         // PERF: the instantiated alias type arguments go into a stack list,
@@ -415,7 +411,7 @@ impl Checker {
             let mut type_arguments: SmallVec<[TypeId; 8]> =
                 SmallVec::with_capacity(outer_type_parameters.len());
             for &tp in outer_type_parameters.iter() {
-                type_arguments.push(self.map_with_combined_mappers(m1, m2, tp));
+                type_arguments.push(self.map_type_with_composite_mapper(tp, m1, m2));
             }
             let key = get_conditional_type_key(
                 &self.symbols,
@@ -479,19 +475,6 @@ impl Checker {
             return result;
         }
         t
-    }
-
-    /// Go `c.combineTypeMappers(m1, m2).Map(t)`, without adding a composite
-    /// mapper to the arena. Mapper ids never affect output.
-    pub fn map_with_combined_mappers(&mut self, m1: MapperId, m2: MapperId, t: TypeId) -> TypeId {
-        if m1.is_some() {
-            // Go: checker/mapper.go:265 (*CompositeTypeMapper).Map
-            let t1 = self.mapper_map(m1, t);
-            if t1 != t {
-                return self.instantiate_type(t1, m2);
-            }
-        }
-        self.mapper_map(m2, t)
     }
 
     // Go: checker/checker.go:22418 cloneTypeParameter
@@ -741,7 +724,7 @@ impl Checker {
             && modifiers.intersects(MappedTypeModifiers::EXCLUDE_OPTIONAL)
             && is_optional
         {
-            self.get_type_with_facts(prop_type, TypeFacts::NE_UNDEFINED)
+            self.remove_missing_or_undefined_type(prop_type)
         } else {
             prop_type
         }
@@ -1368,16 +1351,13 @@ impl Checker {
     // Go: checker/checker.go:22977 getSymbolFromTypeReference
     pub fn get_symbol_from_type_reference(&mut self, node: Node) -> SymbolId {
         if self.symbol_node_links.get(node).resolved_symbol.is_nil() {
-            let resolved =
-                if is_const_type_reference(node) && is_assertion_expression(node.parent()) {
-                    self.unknown_symbol
-                } else {
-                    self.resolve_type_reference_name(
-                        node,
-                        SymbolFlags::TYPE,
-                        false, /*ignoreErrors*/
-                    )
-                };
+            // The `const` in a `const` assertion resolves to nothing; resolveName knows not to
+            // report an error for it, so no special-casing is needed here.
+            let resolved = self.resolve_type_reference_name(
+                node,
+                SymbolFlags::TYPE,
+                false, /*ignoreErrors*/
+            );
             self.symbol_node_links.get(node).resolved_symbol = resolved;
         }
         self.symbol_node_links.get(node).resolved_symbol

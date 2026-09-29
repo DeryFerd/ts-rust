@@ -80,6 +80,42 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
         self.entries.borrow().contains_key(identity)
     }
 
+    // Go: project/refcountcache.go:60 AcquireOrError (tsgo#4712)
+    // AcquireOrError retrieves an existing entry (incrementing its refcount) or produces a new one via
+    // produce. If produce returns an error, no entry is stored and the error is returned, so callers can
+    // cache only successful results. produce runs while holding the new entry's lock, so concurrent
+    // acquisitions of the same identity that miss serialize on it.
+    //
+    // The caller is responsible for calling Deref when a value is returned without error.
+    // PORT: Go returns the zero `V` with the error; here the error alone.
+    pub fn acquire_or_error<E>(
+        &self,
+        identity: K,
+        produce: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        let (entry, loaded) = self.load_or_store_new_locked_entry(identity.clone());
+        if loaded {
+            // PORT: on one thread a loaded entry always has its value.
+            return Ok(entry
+                .value
+                .borrow()
+                .clone()
+                .expect("RefCountCache: entry value not set"));
+        }
+        match produce() {
+            Err(err) => {
+                // Undo the speculative entry so failures are not cached.
+                entry.ref_count.set(0);
+                self.entries.borrow_mut().remove(&identity);
+                Err(err)
+            }
+            Ok(value) => {
+                *entry.value.borrow_mut() = Some(value.clone());
+                Ok(value)
+            }
+        }
+    }
+
     // Go: project/refcountcache.go:62 Ref
     // Ref increments the reference count for an existing entry.
     // Panics if the entry does not exist.

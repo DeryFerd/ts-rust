@@ -10,7 +10,7 @@ use crate::prelude::*;
 // holds that output until `bind_source_file` fills the `GoFile` cells:
 // - `self.flow_nodes: Vec<FlowNode>`, indexed by `FlowNodeId::local_index()`.
 // - `self.node_bind: NodeBindBuilder`, indexed by `node.node_id().index()`.
-// - `self.file_bind: FileBindData` (bind and suggestion diagnostics).
+// - `self.file_bind: FileBindData` (bind diagnostics and the other file data).
 // - `self.symbols: SymbolArena` (Go `symbolArena`).
 // - `self.active_label_list: Option<Rc<RefCell<ActiveLabel>>>`.
 // All direct access goes through the `p3_*` helpers below so a storage
@@ -199,12 +199,23 @@ impl Binder {
 
     // Go: binder/binder.go:1885 bindForStatement
     pub fn bind_for_statement(&mut self, node: Node) {
+        self.bind(node.initializer());
+        if self.current_flow == self.unreachable_flow {
+            // Unlike while/do, the for-loop initializer is bound inside this function before the loop's
+            // flow graph is constructed. If it makes flow unreachable (e.g. a throwing IIFE), addAntecedent
+            // will filter out the unreachable entry to preLoopLabel, leaving only the back-edge from the
+            // incrementor. This creates a cycle with no exit that crashes isReachableFlowNodeWorker.
+            // Bail out early and just bind the remaining children with unreachable flow.
+            self.bind(node.condition());
+            self.bind(node.statement());
+            self.bind(node.incrementor());
+            return;
+        }
         let loop_label = self.create_loop_label();
         let pre_loop_label = self.set_continue_target(node, loop_label);
         let pre_body_label = self.create_branch_label();
         let pre_incrementor_label = self.create_branch_label();
         let post_loop_label = self.create_branch_label();
-        self.bind(node.initializer());
         self.add_antecedent(pre_loop_label, self.current_flow);
         self.current_flow = pre_loop_label;
         self.bind_condition(node.condition(), pre_body_label, post_loop_label);
@@ -1327,38 +1338,6 @@ impl Binder {
     ) {
         let span = get_range_of_token_at_position(self.file, node.pos());
         self.add_diagnostic(new_diagnostic(self.file, span, message, args));
-    }
-
-    // Go: binder/binder.go:2715 errorOrSuggestionOnNode
-    pub fn error_or_suggestion_on_node(
-        &mut self,
-        is_error: bool,
-        node: Node,
-        message: &'static crate::diagnostics::Message,
-    ) {
-        self.error_or_suggestion_on_range(is_error, node, node, message);
-    }
-
-    // Go: binder/binder.go:2719 errorOrSuggestionOnRange
-    pub fn error_or_suggestion_on_range(
-        &mut self,
-        is_error: bool,
-        start_node: Node,
-        end_node: Node,
-        message: &'static crate::diagnostics::Message,
-    ) {
-        // PORT: Go `core.NewTextRange(pos, end)` -> `TextRange::new(pos, end)`.
-        let text_range = TextRange::new(
-            get_range_of_token_at_position(self.file, start_node.pos()).pos(),
-            end_node.end(),
-        );
-        let mut diagnostic = new_diagnostic(self.file, text_range, message, Vec::new());
-        if is_error {
-            self.add_diagnostic(diagnostic);
-        } else {
-            diagnostic.category = crate::diagnostics::Category::Suggestion;
-            self.file_bind.bind_suggestion_diagnostics.push(diagnostic);
-        }
     }
 
     // Go: binder/binder.go:2733 createDiagnosticForNode

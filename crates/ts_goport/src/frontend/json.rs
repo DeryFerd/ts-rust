@@ -847,7 +847,53 @@ pub fn json_marshal<T: MarshalerTo + ?Sized>(
     let _ = JsonOptions::from_options(&all);
     let mut out = String::new();
     input.marshal_json_to(&mut out)?;
+    json_check_nesting_depth(&out)?;
     Ok(out)
+}
+
+// Go: jsontext/state.go:302 pushObject and :337 pushArray, the
+// `len(m.Stack) == maxNestingDepth` case (errMaxDepth, tsgo pin B
+// go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68).
+// PORT: the Go encoder checks each `{` and `[` as it writes it, so a value
+// nested more than `maxNestingDepth` (10000) levels deep fails to marshal.
+// The Rust marshalers write the compact text with no state, so this checks
+// the finished text instead: the result is the same error and no output.
+// A value that deep has more than 10000 `{` and `[` bytes, so a text with
+// fewer is not scanned. The error text is Go's `errMaxDepth` text without
+// the v2 wrapping (see the file header).
+fn json_check_nesting_depth(compact: &str) -> Result<(), JsonError> {
+    if compact.len() <= 2 * MAX_NESTING_DEPTH
+        || memchr::memchr2_iter(b'{', b'[', compact.as_bytes()).count() <= MAX_NESTING_DEPTH
+    {
+        return Ok(());
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &c in compact.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                if depth == MAX_NESTING_DEPTH {
+                    return Err(JsonError::new("exceeded max depth"));
+                }
+                depth += 1;
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // Go: json/json.go:23 MarshalEncode
@@ -1217,6 +1263,40 @@ pub fn json_new_port_form_decoder(r: &[u8]) -> JsonDecoder<'_> {
 // (BeginObject, EndObject, Null, BeginArray, EndArray).
 // PORT: `JsonToken` variants and `JsonToken::kind` stand in for the token
 // values. `Value` is `&[u8]`, `Kind` is `u8`, `Decoder` is `JsonDecoder`.
+
+#[cfg(test)]
+mod marshal_depth_tests {
+    use super::*;
+
+    /// A value that writes `self.0` nested arrays, with a string that holds
+    /// brackets in the middle.
+    struct Nested(usize);
+
+    impl MarshalerTo for Nested {
+        fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+            for _ in 0..self.0 {
+                enc.push('[');
+            }
+            enc.push_str(r#""[{\"[""#);
+            for _ in 0..self.0 {
+                enc.push(']');
+            }
+            Ok(())
+        }
+    }
+
+    // Go JSON v2 `json.Marshal` accepts 10000 nested arrays and fails with
+    // `exceeded max depth` for 10001 (jsontext `maxNestingDepth`).
+    #[test]
+    fn marshal_fails_past_max_nesting_depth() {
+        assert!(json_marshal(&Nested(MAX_NESTING_DEPTH), &[]).is_ok());
+        let err = json_marshal(&Nested(MAX_NESTING_DEPTH + 1), &[]).unwrap_err();
+        assert_eq!(err.message, "exceeded max depth");
+        let mut out: Vec<u8> = Vec::new();
+        assert!(json_marshal_write(&mut out, &Nested(MAX_NESTING_DEPTH + 1), &[]).is_err());
+        assert!(out.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod marshal_indent_tests {

@@ -19,6 +19,7 @@ fn create_overlay_fs() -> Rc<OverlayFS> {
         [
             ("/test1.ts", "// existing content"),
             ("/test2.ts", "// existing content"),
+            ("/script", "// extensionless content"),
         ],
         false, /* useCaseSensitiveFileNames */
     );
@@ -170,6 +171,36 @@ fn open_falls_back_to_file_extension_for_unknown_language_kind() {
 
     let fh = file(&fs, u);
     assert_eq!(fh.kind(), ScriptKind::TS);
+}
+
+// Go: overlayfs_test.go:187 TestProcessChanges/open extensionless file preserves unknown script kind
+// PORT: tsgo #4712 renamed this #4628 test (was "open extensionless file with
+// unknown language kind falls back to TS") and flipped it to `ScriptKindUnknown`.
+#[test]
+fn open_extensionless_file_preserves_unknown_script_kind() {
+    let fs = create_overlay_fs();
+    let u = "file:///script";
+
+    fs.process_changes(&[open_change(
+        u,
+        1,
+        "const x = 1;",
+        lsproto::LanguageKind("plaintext".into()),
+    )]);
+
+    let fh = file(&fs, u);
+    assert_eq!(fh.kind(), ScriptKind::UNKNOWN);
+}
+
+// Go: overlayfs_test.go:207 TestProcessChanges/extensionless disk file preserves unknown script kind
+// PORT: tsgo #4712 renamed this #4628 test (was "extensionless disk file falls
+// back to TS") and flipped it to `ScriptKindUnknown`.
+#[test]
+fn extensionless_disk_file_preserves_unknown_script_kind() {
+    let fs = create_overlay_fs();
+
+    let fh = fs.get_file("/script").expect("file handle");
+    assert_eq!(fh.kind(), ScriptKind::UNKNOWN);
 }
 
 // Go: overlayfs_test.go:186 TestProcessChanges/watch change on overlay marks as not matching disk

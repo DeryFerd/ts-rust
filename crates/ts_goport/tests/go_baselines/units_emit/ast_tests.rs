@@ -1,9 +1,14 @@
-//! Ports of internal/ast/deepclone_test.go and positionmap_test.go.
+//! Ports of internal/ast/deepclone_test.go, diagnostic_test.go and
+//! positionmap_test.go.
 
 use super::Subtests;
 use super::childprog::in_child;
 use super::parsetestutil::parse_type_script_published;
 use ts_goport::ast::{NodeVisitor, NodeVisitorHooks, compute_position_map, new_node_visitor};
+use ts_goport::diagnostics::Message;
+use ts_goport::frontend::core_ext::get_script_kind_from_file_name;
+use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
+use ts_goport::frontend::tspath::Path;
 use ts_goport::prelude::*;
 
 /// Go `NodeComparisonWorkItem`: (original, copy).
@@ -619,6 +624,190 @@ fn deep_clone_node_sanity_check() {
         });
     }
     t.finish();
+}
+
+// Go: ast/diagnostic_test.go:12 TestDiagnosticsCollectionDeduplicatesExactDiagnosticsOnAdd
+// PORT: `add` returns `&mut Diagnostic`. Go compares the returned pointers;
+// here the addresses are compared while no `add` stores a new diagnostic in
+// between, and the other checks compare values.
+#[test]
+fn test_diagnostics_collection_deduplicates_exact_diagnostics_on_add() {
+    let new_diagnostic_with_related = |name: &str| {
+        let mut diagnostic = new_compiler_diagnostic(diag::Cannot_find_name_0, args!["x"]);
+        diagnostic.add_related_info(Some(new_compiler_diagnostic(
+            diag::X_0_is_declared_here,
+            args![name],
+        )));
+        diagnostic
+    };
+    let mut collection = DiagnosticsCollection::default();
+    let first = new_diagnostic_with_related("first");
+    let second = new_diagnostic_with_related("first");
+    let different = new_diagnostic_with_related("second");
+
+    let got = collection.add(first.clone());
+    assert!(
+        equal_diagnostics(got, &first),
+        "first add() did not return first"
+    );
+    let first_address: *const Diagnostic = got;
+    let canonical: *const Diagnostic = collection.add(second);
+    assert!(
+        std::ptr::eq(canonical, first_address),
+        "second add() returned {canonical:p}, want canonical {first_address:p}"
+    );
+    let got = collection.add(different.clone());
+    assert!(
+        equal_diagnostics(got, &different),
+        "different add() did not return different"
+    );
+
+    // PORT: Go changes `canonical` through its pointer. A borrow cannot live
+    // across the `add` above, so `lookup` finds the stored first again.
+    let third = new_compiler_diagnostic(diag::X_0_is_declared_here, args!["third"]);
+    collection
+        .lookup(&first)
+        .expect("first is stored")
+        .add_related_info(Some(third.clone()));
+    let collected = collection.get_global_diagnostics();
+    assert_eq!(
+        collected.len(),
+        2,
+        "get_global_diagnostics() returned {} diagnostics, want 2",
+        collected.len()
+    );
+    // Go reads `first.RelatedInformation()`: the stored first now has the
+    // two related diagnostics.
+    let mut want = first;
+    want.add_related_info(Some(third));
+    let got = collection
+        .lookup(&want)
+        .map(|d| d.related_information().len());
+    assert_eq!(
+        got,
+        Some(2),
+        "canonical diagnostic has {got:?} related diagnostics, want 2"
+    );
+}
+
+// Go `ast.NewCompilerDiagnostic(diagnostics.NewAdHocMessage(message))`.
+// PORT: as `compiler_runner::harness::new_ad_hoc_compiler_diagnostic`: a
+// `ts_goport::diagnostics::Message` code is a `u32`, so the Go code -1 is set on the
+// diagnostic, and the message is leaked.
+fn new_ad_hoc_compiler_diagnostic(text: &'static str) -> Diagnostic {
+    let message: &'static Message = Box::leak(Box::new(Message::new(
+        0,
+        ts_goport::diagnostics::Category::Error,
+        "-1",
+        text,
+        false,
+        false,
+        false,
+    )));
+    let mut diagnostic = new_compiler_diagnostic(message, Vec::new());
+    diagnostic.code = -1;
+    diagnostic
+}
+
+// Go: ast/diagnostic_test.go:44 TestDiagnosticsCollectionPreservesDistinctAdHocMessages
+#[test]
+fn test_diagnostics_collection_preserves_distinct_ad_hoc_messages() {
+    let mut collection = DiagnosticsCollection::default();
+    let first = new_ad_hoc_compiler_diagnostic("first");
+    let second = new_ad_hoc_compiler_diagnostic("second");
+
+    collection.add(first);
+    collection.add(second);
+    let collected = collection.get_global_diagnostics();
+    assert_eq!(
+        collected.len(),
+        2,
+        "get_global_diagnostics() returned {} diagnostics, want 2",
+        collected.len()
+    );
+}
+
+// Go: ast/diagnostic_test.go:59 TestDiagnosticsCollectionGetsDiagnosticsForEquivalentSourceFile
+// PORT: Go makes two bare SourceFile values with the same path. Here each
+// file is an empty parse with that name, in its own store. Go compares the
+// returned pointer; here the stored diagnostic must keep its own file.
+#[test]
+fn test_diagnostics_collection_gets_diagnostics_for_equivalent_source_file() {
+    let parse = |file_name: &str| {
+        parse_source_file(
+            &SourceFileParseOptions {
+                file_name: file_name.to_string(),
+                path: Path(file_name.to_string()),
+                ..Default::default()
+            },
+            "",
+            get_script_kind_from_file_name(file_name),
+        )
+        .root
+    };
+    let path = "/src/file.ts";
+    let diagnostic_file = parse(path);
+    let requested_file = parse(path);
+    let diagnostic = new_diagnostic(
+        diagnostic_file,
+        TextRange::new(0, 0),
+        diag::Cannot_find_name_0,
+        args!["x"],
+    );
+
+    let mut collection = DiagnosticsCollection::default();
+    collection.add(diagnostic.clone());
+
+    let collected = collection.get_diagnostics_for_file(requested_file);
+    assert!(
+        collected.len() == 1
+            && collected[0].file() == diagnostic_file
+            && equal_diagnostics(&collected[0], &diagnostic),
+        "get_diagnostics_for_file() returned {collected:?}, want diagnostic for equivalent source file"
+    );
+}
+
+// Go: ast/diagnostic_test.go:80 TestExternalDiagnosticIdentity (tsgo#4712)
+// PORT: Go makes a bare SourceFile with this name and path. Here the file is
+// an empty parse with that name. Go compares each diagnostic with the
+// pointer `first`; here `first` is the entry at index 0.
+#[test]
+fn test_external_diagnostic_identity() {
+    let file_name = "/src/file.vue";
+    let file = parse_source_file(
+        &SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path: Path(file_name.to_string()),
+            ..Default::default()
+        },
+        "",
+        ScriptKind::TS,
+    )
+    .root;
+    let loc = TextRange::new(1, 2);
+    let error = ts_goport::diagnostics::Category::Error;
+    let first = new_external_diagnostic(file, loc, "mapper-a", error, 0, "first");
+    let diagnostics = [
+        first.clone(),
+        new_external_diagnostic(file, loc, "mapper-a", error, 0, "second"),
+        new_external_diagnostic(file, loc, "mapper-b", error, 0, "first"),
+        new_external_diagnostic(
+            file,
+            loc,
+            "mapper-a",
+            ts_goport::diagnostics::Category::Warning,
+            0,
+            "first",
+        ),
+    ];
+
+    let mut collection = DiagnosticsCollection::default();
+    for (i, diagnostic) in diagnostics.iter().enumerate() {
+        assert!(!equal_diagnostics_no_related_info(&first, diagnostic) || i == 0);
+        assert!(compare_diagnostics(&first, diagnostic) != 0 || i == 0);
+        collection.add(diagnostic.clone());
+    }
+    assert_eq!(collection.get_diagnostics().len(), diagnostics.len());
 }
 
 // Go: ast/positionmap_test.go:11 TestPositionMapASCII

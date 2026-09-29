@@ -72,7 +72,7 @@ impl LanguageService {
                 )),
                 sort_text: Some("\u{0}".to_string()),
                 insert_text_format,
-                text_edit: Some(edit_range),
+                text_edit: edit_range,
                 commit_characters,
                 ..Default::default()
             },
@@ -85,47 +85,51 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/jsdoc_snippet.go:85 getJSDocSnippetCompletionRange
+    // Go: ls/jsdoc_snippet.go:86 getJSDocSnippetCompletionRange
+    // PORT: Go returns `*lsproto.TextEditOrInsertReplaceEdit`; nil is `None`.
     fn get_js_doc_snippet_completion_range(
         &self,
         ctx: &Context,
         file: Node,
         position: i32,
         new_text: &str,
-    ) -> lsproto::TextEditOrInsertReplaceEdit {
+    ) -> Option<lsproto::TextEditOrInsertReplaceEdit> {
         let text = source_file_text(file);
         let line_start = crate::format::get_line_start_position_for_position(position, file);
-        let prefix = &text[line_start as usize..position as usize];
+        let prefix = go_text_slice(text, line_start, position);
         let mut start = position;
         if let Some(prefix_start) = get_js_doc_snippet_prefix_start(prefix) {
             start = line_start + prefix_start as i32;
         }
 
         let line_end = get_line_end_of_position(file, position);
-        let suffix = &text[position as usize..line_end as usize];
+        let suffix = go_text_slice(text, position, line_end);
         let mut end = position;
         if let Some(suffix_end) = get_js_doc_snippet_suffix_end(suffix) {
             end += suffix_end as i32;
         }
 
-        let replacement_range = self.create_lsp_range_from_bounds(start, end, file);
+        let (replacement_range, fidelity) = self.create_lsp_range_from_bounds(start, end, file);
+        if !fidelity.is_exact() {
+            return None;
+        }
         if client_supports_item_insert_replace(ctx) {
-            return lsproto::TextEditOrInsertReplaceEdit {
+            return Some(lsproto::TextEditOrInsertReplaceEdit {
                 insert_replace_edit: Some(lsproto::InsertReplaceEdit {
                     new_text: new_text.to_string(),
                     insert: replacement_range,
                     replace: replacement_range,
                 }),
                 ..Default::default()
-            };
+            });
         }
-        lsproto::TextEditOrInsertReplaceEdit {
+        Some(lsproto::TextEditOrInsertReplaceEdit {
             text_edit: Some(lsproto::TextEdit {
                 new_text: new_text.to_string(),
                 range: replacement_range,
             }),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -133,14 +137,36 @@ impl LanguageService {
 pub fn is_potentially_valid_js_doc_snippet_completion_position(file: Node, position: i32) -> bool {
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
-    let prefix = &text[line_start as usize..position as usize];
+    let prefix = go_text_slice(text, line_start, position);
     if !is_js_doc_snippet_prefix(prefix) {
         return false;
     }
 
     let line_end = get_line_end_of_position(file, position);
-    let suffix = &text[position as usize..line_end as usize];
+    let suffix = go_text_slice(text, position, line_end);
     is_js_doc_snippet_suffix(suffix)
+}
+
+// Go `text[lo:hi]` on a string, with the Go runtime panic text when a bound
+// is out of range. Go checks `hi` against the length first, then `lo`
+// against `hi`; a negative bound is printed alone. A content-mapped file
+// reaches the snippet checks with empty text in Go at B too, so the panic
+// text must be Go's (the LSP error response carries it).
+fn go_text_slice(text: &str, lo: i32, hi: i32) -> &str {
+    let len = text.len();
+    if hi < 0 {
+        panic!("runtime error: slice bounds out of range [:{hi}]");
+    }
+    if hi as usize > len {
+        panic!("runtime error: slice bounds out of range [:{hi}] with length {len}");
+    }
+    if lo < 0 {
+        panic!("runtime error: slice bounds out of range [{lo}:]");
+    }
+    if lo > hi {
+        panic!("runtime error: slice bounds out of range [{lo}:{hi}]");
+    }
+    &text[lo as usize..hi as usize]
 }
 
 // Go: ls/jsdoc_snippet.go:118 getDocCommentTemplateAtPosition
@@ -284,8 +310,8 @@ fn get_doc_comment_end_at_position(file: Node, position: i32) -> (i32, bool, boo
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
     let line_end = get_line_end_of_position(file, position);
-    let prefix = &text[line_start as usize..position as usize];
-    let suffix = &text[position as usize..line_end as usize];
+    let prefix = go_text_slice(text, line_start, position);
+    let suffix = go_text_slice(text, position, line_end);
     if !trim_right_single_line_whitespace(prefix).ends_with("/**") {
         return (0, false, false);
     }

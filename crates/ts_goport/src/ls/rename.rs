@@ -12,8 +12,9 @@
 use crate::ls::prelude::*;
 
 use crate::diagnostics::Message;
+use crate::spanmap::Feature;
 
-// Go: ls/rename.go:24 RenameInfo
+// Go: ls/rename.go:25 RenameInfo
 // RenameInfo represents the result of a rename validation check.
 // It is used by the `textDocument/prepareRename` LSP handler.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,8 +27,54 @@ pub struct RenameInfo {
     pub new_file_name: String,
 }
 
+// Go: ls/rename.go:34 mappedRenameEdit
+struct MappedRenameEdit {
+    uri: lsproto::DocumentUri,
+    edit: lsproto::TextEdit,
+}
+
+// Go: ls/rename.go:39 renameEditKey
+#[derive(PartialEq, Eq, Hash)]
+struct RenameEditKey {
+    uri: lsproto::DocumentUri,
+    text_range: lsproto::Range,
+}
+
+// Go: ls/rename.go:44 deduplicateRenameEdits
+// PORT: Go returns `(nil, false)` on a conflict; here `None`. Go map order
+// is random, so the IndexMap keeps first-insert order, as the old
+// `changes` map of `symbolAndEntriesToRename` did.
+fn deduplicate_rename_edits(
+    mapped_edits: Vec<MappedRenameEdit>,
+) -> Option<IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>>> {
+    let mut edit_texts: FxHashMap<RenameEditKey, String> = FxHashMap::default();
+    let mut unique_edits: Vec<MappedRenameEdit> = Vec::with_capacity(mapped_edits.len());
+    for mapped_edit in mapped_edits {
+        let key = RenameEditKey {
+            uri: mapped_edit.uri.clone(),
+            text_range: mapped_edit.edit.range,
+        };
+        if let Some(existing_text) = edit_texts.get(&key) {
+            if *existing_text != mapped_edit.edit.new_text {
+                return None;
+            }
+            continue;
+        }
+        edit_texts.insert(key, mapped_edit.edit.new_text.clone());
+        unique_edits.push(mapped_edit);
+    }
+    let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
+    for mapped_edit in unique_edits {
+        changes
+            .entry(mapped_edit.uri)
+            .or_default()
+            .push(mapped_edit.edit);
+    }
+    Some(changes)
+}
+
 impl LanguageService {
-    // Go: ls/rename.go:33 ProvideRename
+    // Go: ls/rename.go:65 ProvideRename
     // PORT: Go `orchestrator CrossProjectOrchestrator` is an interface value
     // that can be nil: `Option<&dyn CrossProjectOrchestrator>`.
     pub fn provide_rename(
@@ -50,7 +97,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/rename.go:47 GetRenameInfo
+    // Go: ls/rename.go:79 GetRenameInfo
     pub fn get_rename_info(
         &self,
         ctx: &Context,
@@ -59,18 +106,25 @@ impl LanguageService {
         position: lsproto::Position,
     ) -> RenameInfo {
         let (program, source_file) = self.get_program_and_file(document_uri);
-        let pos = self
-            .converters
-            .line_and_character_to_position(&source_file, &position);
-
-        let node = astnav::get_touching_property_name(source_file, pos);
-        let node = get_adjusted_location(node, true /*forRename*/, source_file);
-
-        if node_is_eligible_for_rename(node) {
-            let (rename_info, ok) =
-                self.get_rename_info_for_node(ctx, new_name, node, source_file, program);
-            if ok {
-                return rename_info;
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            position,
+            Feature::RENAME,
+        );
+        for mapped in &positions {
+            if !mapped.fidelity.is_exact() {
+                continue;
+            }
+            let source_file = mapped.script;
+            let node = astnav::get_touching_property_name(source_file, mapped.position);
+            let node = get_adjusted_location(node, true /*forRename*/, source_file);
+            if node_is_eligible_for_rename(node) {
+                let (rename_info, ok) =
+                    self.get_rename_info_for_node(ctx, new_name, node, source_file, program);
+                if ok {
+                    return rename_info;
+                }
             }
         }
         get_rename_info_error(ctx, diag::You_cannot_rename_this_element)
@@ -78,7 +132,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/rename.go:62 symbolAndEntriesToRename
+    // Go: ls/rename.go:98 symbolAndEntriesToRename
     pub fn symbol_and_entries_to_rename(
         &self,
         ctx: &Context,
@@ -112,9 +166,7 @@ impl<P: ProgramView> LanguageService<P> {
             .iter()
             .flat_map(|s| s.borrow().references.clone())
             .collect();
-        // PORT: Go `map[lsproto.DocumentUri][]*lsproto.TextEdit`; Go map order
-        // is random, so the IndexMap keeps first-insert order.
-        let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
+        let mut mapped_edits: Vec<MappedRenameEdit> = Vec::new();
         // Go: `defer done()`; `_done` releases the lease at the end of the scope.
         let (checker, _done) = program.get_type_checker(ctx);
         let ch = &mut *checker.borrow_mut();
@@ -135,8 +187,14 @@ impl<P: ProgramView> LanguageService<P> {
             {
                 continue;
             }
+            let (rng, ok) = self.rename_edit_range(entry);
+            if !ok {
+                // The occurrence lies outside a verbatim span of a content-mapped file, so it cannot be
+                // written back to the original text. Skip it and keep renaming the remaining occurrences.
+                continue;
+            }
             let text_edit = lsproto::TextEdit {
-                range: self.get_range_of_entry(entry),
+                range: rng,
                 new_text: self.get_text_for_rename(
                     data.original_node,
                     entry,
@@ -146,8 +204,14 @@ impl<P: ProgramView> LanguageService<P> {
                     use_aliases_for_rename,
                 ),
             };
-            changes.entry(uri).or_default().push(text_edit);
+            mapped_edits.push(MappedRenameEdit {
+                uri,
+                edit: text_edit,
+            });
         }
+        let Some(changes) = deduplicate_rename_edits(mapped_edits) else {
+            return Ok(lsproto::WorkspaceEditOrNull::default());
+        };
         Ok(lsproto::WorkspaceEditOrNull {
             workspace_edit: Some(lsproto::WorkspaceEdit {
                 changes: Some(changes),
@@ -156,7 +220,38 @@ impl<P: ProgramView> LanguageService<P> {
         })
     }
 
-    // Go: ls/rename.go:103 getRenameInfoForNode
+    // Go: ls/rename.go:153 renameEditRange
+    // renameEditRange returns the LSP range at which a rename occurrence should be edited. For occurrences in
+    // content-mapped files it maps the transformed range strictly, returning ok=false when the occurrence is
+    // not fully within a single verbatim span, so the caller can skip an edit that cannot be applied to the
+    // original text.
+    pub fn rename_edit_range(&self, entry: &Rc<RefCell<ReferenceEntry>>) -> (lsproto::Range, bool) {
+        self.resolve_entry(entry);
+        let (node, entry_source_file, text_range) = {
+            let e = entry.borrow();
+            (
+                e.node,
+                e.source_file,
+                e.text_range
+                    .expect("runtime error: invalid memory address or nil pointer dereference"),
+            )
+        };
+        if node.is_nil() {
+            let (location, fidelity) =
+                self.source_file_range_to_lsp_location(entry_source_file, text_range);
+            return (location.range, fidelity.is_exact());
+        }
+        let source_file = get_source_file_of_node(node);
+        // PORT: Go `sourceFile == nil || sourceFile.SpanMap() == nil`; the
+        // span map of a nil file is `None`.
+        if source_file_span_map(source_file).is_none() {
+            return (self.get_range_of_entry(entry), true);
+        }
+        let (lsp_range, fidelity) = self.converters.to_lsp_range(&source_file, text_range);
+        (lsp_range, fidelity.is_exact())
+    }
+
+    // Go: ls/rename.go:168 getRenameInfoForNode
     // getRenameInfoForNode performs detailed validation for a rename operation on a specific node.
     pub fn get_rename_info_for_node(
         &self,
@@ -253,8 +348,11 @@ impl CrossProjectSearch for RenameSearch {
     }
 }
 
-// Go: ls/rename.go:144 nodeIsEligibleForRename
+// Go: ls/rename.go:209 nodeIsEligibleForRename
 pub fn node_is_eligible_for_rename(node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
     match node.kind() {
         SyntaxKind::Identifier
         | SyntaxKind::PrivateIdentifier
@@ -267,7 +365,7 @@ pub fn node_is_eligible_for_rename(node: Node) -> bool {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/rename.go:161 renameBlockedReason
+    // Go: ls/rename.go:229 renameBlockedReason
     // renameBlockedReason returns a non-nil diagnostic message if the rename should be blocked
     // because the symbol is a library definition, a default keyword, or would cross node_modules boundaries.
     pub fn rename_blocked_reason(
@@ -306,7 +404,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/rename.go:181 isDefinedInLibraryFile
+// Go: ls/rename.go:249 isDefinedInLibraryFile
 // isDefinedInLibraryFile checks if a declaration is from a default library file (e.g., lib.d.ts).
 pub fn is_defined_in_library_file<P: ProgramView>(program: &P, declaration: Node) -> bool {
     let decl_source_file = get_source_file_of_node(declaration);
@@ -315,7 +413,7 @@ pub fn is_defined_in_library_file<P: ProgramView>(program: &P, declaration: Node
     )) && tspath::is_declaration_file_name(source_file_file_name(decl_source_file))
 }
 
-// Go: ls/rename.go:188 wouldRenameInOtherNodeModules
+// Go: ls/rename.go:255 wouldRenameInOtherNodeModules
 // wouldRenameInOtherNodeModules checks if renaming the symbol would affect node_modules.
 pub fn would_rename_in_other_node_modules(
     original_file: Node,
@@ -375,7 +473,7 @@ pub fn would_rename_in_other_node_modules(
     None
 }
 
-// Go: ls/rename.go:222 ClientSupportsWillRenameFiles
+// Go: ls/rename.go:290 ClientSupportsWillRenameFiles
 pub fn client_supports_will_rename_files(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .workspace
@@ -383,7 +481,7 @@ pub fn client_supports_will_rename_files(ctx: &Context) -> bool {
         .will_rename
 }
 
-// Go: ls/rename.go:226 ClientSupportsDocumentChanges
+// Go: ls/rename.go:294 ClientSupportsDocumentChanges
 pub fn client_supports_document_changes(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .workspace
@@ -391,7 +489,7 @@ pub fn client_supports_document_changes(ctx: &Context) -> bool {
         .document_changes
 }
 
-// Go: ls/rename.go:230 ClientSupportsRenameResourceOperations
+// Go: ls/rename.go:298 ClientSupportsRenameResourceOperations
 pub fn client_supports_rename_resource_operations(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .workspace
@@ -401,7 +499,7 @@ pub fn client_supports_rename_resource_operations(ctx: &Context) -> bool {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/rename.go:235 getRenameInfoForModule
+    // Go: ls/rename.go:303 getRenameInfoForModule
     // getRenameInfoForModule handles rename validation for module specifiers.
     // PORT: Go reads `moduleSymbol.Declarations` without a checker; the
     // symbol arena is an extra first parameter, as for ast helpers.
@@ -459,16 +557,22 @@ impl<P: ProgramView> LanguageService<P> {
         // Span should only be the last component of the path. + 1 to account for the quote character.
         // PORT: Go `strings.LastIndex(..) + 1` is 0 when "/" is absent.
         let index_after_last_slash = specifier.text().rfind('/').map_or(0, |i| i + 1);
-        let start = specifier.pos() + 1 + index_after_last_slash as i32;
+        let start = astnav::get_start_of_node(specifier, source_file, false /*includeJSDoc*/)
+            + 1
+            + index_after_last_slash as i32;
         let length = specifier.text().len() as i32 - index_after_last_slash as i32;
 
+        let (trigger_span, fidelity) = self
+            .converters
+            .to_lsp_range(&source_file, TextRange::new(start, start + length));
+        if !fidelity.is_exact() {
+            return (RenameInfo::default(), false);
+        }
         (
             RenameInfo {
                 can_rename: true,
                 display_name: specifier.text()[index_after_last_slash..].to_string(),
-                trigger_span: self
-                    .converters
-                    .to_lsp_range(&source_file, TextRange::new(start, start + length)),
+                trigger_span,
                 file_to_rename: display_name,
                 new_file_name,
                 ..Default::default()
@@ -477,7 +581,7 @@ impl<P: ProgramView> LanguageService<P> {
         )
     }
 
-    // Go: ls/rename.go:279 getNewFileNameForModuleRename
+    // Go: ls/rename.go:351 getNewFileNameForModuleRename
     // Adjust the new name based on the old path that an import specifier resolves to.
     // For example, if specifier "a.js" resolves to file a.ts, renaming "a.js" -> "b.js" should mean file rename a.ts -> b.ts.
     pub fn get_new_file_name_for_module_rename(
@@ -515,7 +619,7 @@ impl<P: ProgramView> LanguageService<P> {
         new_path
     }
 
-    // Go: ls/rename.go:297 getTextForRename
+    // Go: ls/rename.go:368 getTextForRename
     // PORT: Go `entry *ReferenceEntry` is the shared entry handle.
     pub fn get_text_for_rename(
         &self,
@@ -601,7 +705,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/rename.go:351 getQuoteFromPreference
+// Go: ls/rename.go:423 getQuoteFromPreference
 pub fn get_quote_from_preference(quote_preference: lsutil::QuotePreference) -> &'static str {
     if quote_preference == lsutil::QuotePreference::SINGLE {
         return "'";
@@ -609,7 +713,7 @@ pub fn get_quote_from_preference(quote_preference: lsutil::QuotePreference) -> &
     "\""
 }
 
-// Go: ls/rename.go:358 getRenameInfoError
+// Go: ls/rename.go:430 getRenameInfoError
 pub fn get_rename_info_error(ctx: &Context, message: &'static Message) -> RenameInfo {
     RenameInfo {
         can_rename: false,
@@ -622,7 +726,7 @@ pub fn get_rename_info_error(ctx: &Context, message: &'static Message) -> Rename
     }
 }
 
-// Go: ls/rename.go:365 getRenameInfoSuccess
+// Go: ls/rename.go:437 getRenameInfoSuccess
 pub fn get_rename_info_success(
     node: Node,
     source_file: Node,
@@ -636,10 +740,18 @@ pub fn get_rename_info_success(
         start += 1;
         end -= 1;
     }
+    let (trigger_span, fidelity) =
+        converters.to_lsp_range(&source_file, TextRange::new(start, end));
+    if !fidelity.is_exact() {
+        return RenameInfo {
+            can_rename: false,
+            ..Default::default()
+        };
+    }
     RenameInfo {
         can_rename: true,
         display_name: display_name.to_string(),
-        trigger_span: converters.to_lsp_range(&source_file, TextRange::new(start, end)),
+        trigger_span,
         ..Default::default()
     }
 }

@@ -221,12 +221,21 @@ impl TypeWriterWalker {
         self.visit_node(source_file, true /*isSymbolWalk*/)
     }
 
-    // Go: type_symbol_baseline.go:313 visitNode
+    // Go: type_symbol_baseline.go:304 visitNode
     pub fn visit_node(&mut self, node: Node, is_symbol_walk: bool) -> Vec<TypeWriterResult> {
         let nodes = for_each_ast_node(node);
         let mut results = Vec::new();
         for n in nodes {
-            if is_expression_node(n) || n.kind() == SyntaxKind::Identifier || is_declaration_name(n)
+            // tsgo#4797: a heritage clause type reference name (`A.B` in
+            // `interface I extends A.B`) is a QualifiedName, not an
+            // expression. The symbol walk writes each such name. The type
+            // walk writes only the inner ones (parent is a QualifiedName).
+            if is_expression_node(n)
+                || n.kind() == SyntaxKind::Identifier
+                || is_declaration_name(n)
+                || (is_qualified_name(n)
+                    && is_name_of_heritage_clause_type_reference(n)
+                    && (is_symbol_walk || is_qualified_name(n.parent())))
             {
                 let result = if self.catch_panics {
                     self.write_type_or_symbol_guarded(n, is_symbol_walk)

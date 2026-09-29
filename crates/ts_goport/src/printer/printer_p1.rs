@@ -14,7 +14,7 @@ use std::cell::{Cell, RefMut};
 pub struct PrinterOptions {
     pub remove_comments: bool,
     pub new_line: NewLineKind,
-    // OmitTrailingSemicolon         bool
+    pub omit_trailing_semicolon: bool,
     pub no_emit_helpers: bool,
     // Module                        core.ModuleKind
     // ModuleResolution              core.ModuleResolutionKind
@@ -70,20 +70,6 @@ pub(crate) fn source_file_is_declaration_file(file: Node) -> bool {
         return with_synthetic_source_file(file, |d| d.is_declaration_file);
     }
     source_file_info(file).is_declaration_file
-}
-
-/// The SourceFile whose Go `Identifiers` a SourceFile has.
-// PORT: Go `UpdateSourceFile` and `Clone` copy `Identifiers` from the old
-// file (`copyFrom`). The Rust factory SourceFile does not keep them, so a
-// copy maps to its most original file through the emit context (the
-// `onUpdate` and `onClone` hooks set the original). A file made by
-// `NewSourceFile` has no original and maps to itself, and
-// `is_file_level_unique_name` gives it no identifiers, as Go nil.
-pub(crate) fn identifiers_source_file(emit_context: &EmitContext, file: Node) -> Node {
-    if is_synthetic_node(file) {
-        return emit_context.most_original(file);
-    }
-    file
 }
 
 // Go: printer/printer.go:114 Printer
@@ -298,8 +284,8 @@ pub fn new_printer(
             Some(Rc::new(move |name: &str, _private_name: bool| {
                 let current_source_file = source_file.get();
                 if current_source_file.is_some() {
-                    is_file_level_unique_name(
-                        identifiers_source_file(&emit_context, current_source_file),
+                    emit_context.is_file_level_unique_name(
+                        current_source_file,
                         name,
                         has_global_name.as_deref(),
                     )
@@ -616,8 +602,12 @@ fn get_text_of_node_worker(
 }
 
 /// Go `scanner.GetSourceTextOfNodeFromSourceFile` that borrows the source
-/// slice. The missing-node and reparser-literal cases use the String form.
+/// slice. The missing-node, reparser-literal and JSDoc cases use the String
+/// form.
 // PERF: no new String for the common case.
+// PORT: the JSDoc test is a cheap superset of the private scanner
+// `isJSDocTypeExpressionOrChild` (tsgo#4839). The String form makes the exact
+// check and strips the ` * ` line prefixes of a JSDoc type.
 fn source_text_of_node_cow(
     source_file: Node,
     node: Node,
@@ -625,9 +615,10 @@ fn source_text_of_node_cow(
     skip_trivia_memo: &SkipTriviaMemo,
 ) -> Cow<'static, str> {
     if node_is_missing(node)
-        || node
-            .flags()
-            .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
+        || is_js_doc_type_expression(node)
+        || node.flags().intersects(
+            NodeFlags::REPARSER_TRANSFORMED_LITERAL | NodeFlags::JS_DOC | NodeFlags::REPARSED,
+        )
     {
         return Cow::Owned(get_source_text_of_node_from_source_file(
             source_file,
@@ -1800,7 +1791,23 @@ impl Printer {
     // Snippet Elements
     //
 
-    // !!! Snippet elements
+    // Go: printer/printer.go:1097 emitSnippetNode
+    pub(crate) fn emit_snippet_node(&mut self, node: Node, snippet_element: &SnippetElement) {
+        match snippet_element.kind {
+            SnippetKind::TAB_STOP => self.emit_tab_stop(node, snippet_element),
+            kind => panic!("Unhandled snippet element kind: {}", kind.0),
+        }
+    }
+
+    // Go: printer/printer.go:1106 emitTabStop
+    pub(crate) fn emit_tab_stop(&mut self, node: Node, snippet_element: &SnippetElement) {
+        debug_assert!(
+            node.kind() == SyntaxKind::EmptyStatement,
+            "Snippet tab stops can only be emitted on empty statements"
+        );
+        self.writer()
+            .raw_write(&format!("${}", snippet_element.order));
+    }
 
     //
     // Names
@@ -1948,7 +1955,7 @@ impl Printer {
         let state = self.enter_node(node);
         self.emit_entity_name(node.left());
         self.write_punctuation(".");
-        self.emit_identifier_name(node.right());
+        self.emit_member_name(node.right());
         self.exit_node(node, state);
     }
 

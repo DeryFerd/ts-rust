@@ -15,6 +15,11 @@ pub mod printer_p2;
 pub mod printer_p3;
 pub mod printer_p4;
 pub mod printer_p5;
+// PORT: not glob-exported. Its Go names are unexported, and the checker
+// still has its own `get_trailing_semicolon_deferring_writer` until the
+// checker lane ports its part of tsgo#3949.
+pub mod semicolon_writer;
+pub mod syntheticfile;
 pub mod utilities;
 
 pub use change_tracker_writer::*;
@@ -27,6 +32,7 @@ pub use printer_p3::*;
 pub use printer_p4::*;
 pub use printer_p5::*;
 pub use single_line_writer::*;
+pub use syntheticfile::*;
 pub use text_writer::*;
 pub use types::*;
 pub use utilities::*;

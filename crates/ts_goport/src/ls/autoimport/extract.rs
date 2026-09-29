@@ -198,27 +198,49 @@ impl ExportExtractor<'_> {
             return self.extract_from_module(file);
         }
         if !source_file_info(file).ambient_module_names.is_empty() {
-            let module_declarations: Vec<Node> = file
-                .statements()
-                .iter()
-                .filter(|n| is_module_with_string_literal_name(*n))
-                .collect();
             let mut export_count: usize = 0;
-            for decl in &module_declarations {
-                let decl_exports = self.checker.sym(decl.symbol()).exports;
-                export_count += self.checker.symbols.len(decl_exports);
+            for statement in file.statements().iter() {
+                if is_module_with_string_literal_name(statement)
+                    && is_non_pattern_ambient_module_declaration(file, statement)
+                {
+                    let decl_exports = self.checker.sym(statement.symbol()).exports;
+                    export_count += self.checker.symbols.len(decl_exports);
+                }
             }
             let mut exports: Vec<Rc<Export>> = Vec::with_capacity(export_count);
-            for &decl in &module_declarations {
-                let module_id = ModuleID(decl.name().text().to_string());
-                self.extract_from_module_declaration(decl, file, &module_id, "", &mut exports);
+            for statement in file.statements().iter() {
+                if is_module_with_string_literal_name(statement)
+                    && is_non_pattern_ambient_module_declaration(file, statement)
+                {
+                    let module_id = ModuleID(statement.name().text().to_string());
+                    self.extract_from_module_declaration(
+                        statement,
+                        file,
+                        &module_id,
+                        "",
+                        &mut exports,
+                    );
+                }
             }
             return exports;
         }
         Vec::new()
     }
+}
 
-    // Go: ls/autoimport/extract.go:125 extractFromModule
+// Go: ls/autoimport/extract.go:128 isNonPatternAmbientModuleDeclaration
+// Reports whether `decl` is not a pattern ambient module (`declare module
+// "*.css"`). Auto-import skips pattern modules: no import can name them.
+fn is_non_pattern_ambient_module_declaration(file: Node, decl: Node) -> bool {
+    let decl_symbol = decl.symbol();
+    !file_bind_data(file)
+        .pattern_ambient_modules
+        .iter()
+        .any(|module| module.symbol == decl_symbol)
+}
+
+impl ExportExtractor<'_> {
+    // Go: ls/autoimport/extract.go:137 extractFromModule
     pub fn extract_from_module(&mut self, file: Node) -> Vec<Rc<Export>> {
         let module_augmentations: Vec<Node> = crate::frontend::core_ls_ext::map_non_nil(
             source_file_info(file).module_augmentations.iter().copied(),
@@ -288,7 +310,7 @@ impl ExportExtractor<'_> {
         exports
     }
 
-    // Go: ls/autoimport/extract.go:161 extractFromModuleDeclaration
+    // Go: ls/autoimport/extract.go:173 extractFromModuleDeclaration
     pub fn extract_from_module_declaration(
         &mut self,
         decl: Node,
@@ -305,7 +327,7 @@ impl ExportExtractor<'_> {
 }
 
 impl SymbolExtractor<'_> {
-    // Go: ls/autoimport/extract.go:167 extractFromSymbol
+    // Go: ls/autoimport/extract.go:179 extractFromSymbol
     pub fn extract_from_symbol(
         &mut self,
         name: &str,
@@ -451,7 +473,7 @@ impl SymbolExtractor<'_> {
         }
     }
 
-    // Go: ls/autoimport/extract.go:249 createExport
+    // Go: ls/autoimport/extract.go:261 createExport
     // createExport creates an Export for the given symbol, returning the Export and the target symbol if the export is an alias.
     // PORT: Go returns `*Export`; the port returns the owned value (`None` is
     // nil) so the caller can finish it (`Target`, `through`) before sharing it
@@ -635,7 +657,7 @@ impl SymbolExtractor<'_> {
         (Some(export), target_symbol)
     }
 
-    // Go: ls/autoimport/extract.go:356 tryResolveSymbol
+    // Go: ls/autoimport/extract.go:368 tryResolveSymbol
     pub fn try_resolve_symbol(
         &mut self,
         symbol: SymbolId,
@@ -720,7 +742,7 @@ impl SymbolExtractor<'_> {
     }
 }
 
-// Go: ls/autoimport/extract.go:400 shouldIgnoreSymbol
+// Go: ls/autoimport/extract.go:412 shouldIgnoreSymbol
 // PORT: the arena parameter as in `try_get_module_id_and_file_name_of_module_symbol`.
 pub fn should_ignore_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     if symbols.sym(symbol).flags.intersects(SymbolFlags::PROTOTYPE) {
@@ -729,7 +751,7 @@ pub fn should_ignore_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     false
 }
 
-// Go: ls/autoimport/extract.go:407 getSyntax
+// Go: ls/autoimport/extract.go:419 getSyntax
 // PORT: the arena parameter as in `try_get_module_id_and_file_name_of_module_symbol`.
 pub fn get_syntax(symbols: &SymbolArena, symbol: SymbolId) -> ExportSyntax {
     for &decl in symbols.sym(symbol).declarations.iter() {
@@ -768,7 +790,7 @@ pub fn get_syntax(symbols: &SymbolArena, symbol: SymbolId) -> ExportSyntax {
     ExportSyntax::NONE
 }
 
-// Go: ls/autoimport/extract.go:438 isUnusableName
+// Go: ls/autoimport/extract.go:450 isUnusableName
 pub fn is_unusable_name(name: &str) -> bool {
     name.is_empty()
         || name == "_default"
@@ -777,7 +799,7 @@ pub fn is_unusable_name(name: &str) -> bool {
         || name == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
 }
 
-// Go: ls/autoimport/extract.go:451 fileNameForDefaultExportName
+// Go: ls/autoimport/extract.go:463 fileNameForDefaultExportName
 // fileNameForDefaultExportName returns the best file name to use when deriving
 // a fallback identifier for a default-like export. It prefers the target symbol's
 // source file (closest to the export origin), falls back to the module's original

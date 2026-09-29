@@ -2,7 +2,6 @@ use crate::ls::autoimport::prelude::*;
 
 // Port of Go `ls/autoimport/specifiers.go`.
 
-use crate::frontend::tspath;
 use crate::modulespecifiers;
 
 /// Go runtime panic text for a nil pointer dereference.
@@ -81,9 +80,7 @@ impl View {
         let cache = self
             .registry
             .specifier_cache
-            .get(&tspath::Path(
-                source_file_info(self.importing_file).path.clone(),
-            ))
+            .get(&self.importing_file_path)
             .cloned();
         if export.package_name.is_empty() {
             let loaded = cache

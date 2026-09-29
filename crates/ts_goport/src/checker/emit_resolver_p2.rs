@@ -99,8 +99,11 @@ impl EmitResolver {
         }
         if is_declaration_readonly(node) || is_variable_declaration(node) && is_var_const(node) {
             return self.with_checker(|c| {
-                let symbol = c.get_symbol_of_declaration(node);
-                let t = c.get_type_of_symbol(symbol);
+                let s = c.get_symbol_of_declaration(node);
+                if s.is_nil() {
+                    return false;
+                }
+                let t = c.get_type_of_symbol(s);
                 c.is_fresh_literal_type(t)
             });
         }

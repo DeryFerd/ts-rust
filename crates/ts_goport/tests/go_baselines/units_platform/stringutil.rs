@@ -2,14 +2,9 @@
 //!
 //! PORT: Go `stringutil.ToLowerJS`, `ToUpperJS` and `EncodeJSStringRune` are
 //! in `scanner_util`; `EncodeURI` is `emitter::emitter::encode_uri`. A lone
-//! surrogate is the port form of `encode_js_string_rune`, not WTF-8. Go
-//! `ContainsNonASCII` has no Rust function: `ParsedSourceFile::new` sets
-//! `contains_non_ascii` from the text, so its test parses the text.
+//! surrogate is the port form of `encode_js_string_rune`, not WTF-8.
 
 use ts_goport::emitter::emitter::encode_uri;
-use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
-use ts_goport::frontend::tspath::Path;
-use ts_goport::prelude::ScriptKind;
 use ts_goport::scanner_util::{encode_js_string_rune, to_lower_js, to_upper_js};
 
 use super::Failures;
@@ -155,32 +150,6 @@ fn test_encode_uri() {
     let mut failures = Failures::new("TestEncodeURI");
     for (name, input, expected) in tests {
         failures.check_eq(name, encode_uri(input), expected.to_string());
-    }
-    failures.finish();
-}
-
-// Go: util_test.go:39 TestContainsNonASCII
-#[test]
-fn test_contains_non_ascii() {
-    let tests = [
-        ("ascii", "abc".to_string(), false),
-        ("non-ascii", "é".to_string(), true),
-        (
-            "lone surrogate sentinel",
-            encode_js_string_rune(0xD800),
-            true,
-        ),
-    ];
-    let opts = SourceFileParseOptions {
-        file_name: "/index.ts".to_string(),
-        path: Path("/index.ts".to_string()),
-        ..Default::default()
-    };
-    let mut failures = Failures::new("TestContainsNonASCII");
-    for (name, text, want) in tests {
-        let text: &'static str = Box::leak(text.into_boxed_str());
-        let file = parse_source_file(&opts, text, ScriptKind::TS);
-        failures.check_eq(name, file.contains_non_ascii, want);
     }
     failures.finish();
 }

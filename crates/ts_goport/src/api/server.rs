@@ -3,26 +3,27 @@
 use crate::api::prelude::*;
 
 use crate::api::callbackfs::{CallbackFS, new_callback_fs};
-use crate::api::conn::{Conn, Handler};
-use crate::api::conn_async::new_async_conn_with_protocol;
-use crate::api::conn_sync::new_sync_conn;
-use crate::api::protocol_jsonrpc::new_jsonrpc_protocol;
 use crate::api::protocol_msgpack::new_message_pack_protocol;
-use crate::api::transport::{Transport, new_pipe_transport, new_stdio_transport};
+use crate::contentmapper;
 use crate::frontend::bundled;
 use crate::frontend::vfs::{self, Fs};
 use crate::gostd::{Context, GoError, errors};
-use crate::locale;
+use crate::ipc::{
+    Conn, Handler, Transport, new_async_conn_with_protocol, new_jsonrpc_protocol,
+    new_pipe_transport, new_stdio_transport, new_sync_conn,
+};
 use crate::lsp::lsproto;
 use crate::project;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-// Go: server.go:15 StdioServerOptions
+// Go: server.go:17 StdioServerOptions
 // StdioServerOptions configures the STDIO-based API server.
 // PORT: Go `io.ReadCloser` / `io.WriteCloser` / `io.Writer` are boxed
 // `Read` / `Write` values; a nil one is `None`. `In` and `Async` are Rust
-// keywords, so the fields are `in_` and `async_`.
+// keywords, so the fields are `in_` and `async_`. The Go
+// `contentmapper.Spawner` interface is `Rc<dyn contentmapper::Spawner>`,
+// and a nil one is `None` (tsgo#4712).
 #[derive(Default)]
 pub struct StdioServerOptions {
     pub in_: Option<Box<dyn Read + Send>>,
@@ -45,9 +46,12 @@ pub struct StdioServerOptions {
     // left unchanged; the client folds this data into its own timing snapshot
     // on demand via getServerTiming / resetServerTiming requests.
     pub collect_timing: bool,
+    // RunExternalCode allows configured content mappers to execute.
+    pub run_external_code: bool,
+    pub content_mapper_spawner: Option<Rc<dyn contentmapper::Spawner>>,
 }
 
-// Go: server.go:35 StdioServer
+// Go: server.go:46 StdioServer
 // StdioServer runs an API session over STDIO using MessagePack protocol.
 // This is the entry point for the synchronous STDIO-based API used by
 // native TypeScript tooling integration.
@@ -55,7 +59,7 @@ pub struct StdioServer {
     options: StdioServerOptions,
 }
 
-// Go: server.go:40 NewStdioServer
+// Go: server.go:51 NewStdioServer
 // NewStdioServer creates a new STDIO-based API server.
 // PORT: Go keeps the `*StdioServerOptions` pointer; the server owns the
 // options here (they hold the stdin and stdout handles).
@@ -78,7 +82,7 @@ impl<F: FnMut()> Drop for Defer<F> {
 }
 
 impl StdioServer {
-    // Go: server.go:51 Run
+    // Go: server.go:62 Run
     // Run starts the server and blocks until the connection closes.
     // PORT: `&mut self` because Accept moves the stdin and stdout handles
     // out of the options.
@@ -123,18 +127,22 @@ impl StdioServer {
                 default_library_path: self.options.default_library_path.clone(),
                 position_encoding: lsproto::PositionEncodingKind::UTF8,
                 logging_enabled: false,
+                run_external_code: self.options.run_external_code,
                 // PORT: Go leaves the other fields at their zero values.
                 typings_location: String::new(),
                 watch_enabled: false,
                 telemetry_enabled: false,
                 push_diagnostics_enabled: false,
                 debounce_delay: Duration::ZERO,
-                locale: locale::Locale::default(),
                 checker_pool_options: project::CheckerPoolOptions::default(),
             }),
+            spawner: self.options.content_mapper_spawner.clone(),
+            // PORT: Go leaves the other fields at their zero values.
             client: None,
             npm_executor: None,
+            content_mapper_logger: None,
             parse_cache: None,
+            content_mapped_parse_cache: None,
         });
 
         let session = new_session(

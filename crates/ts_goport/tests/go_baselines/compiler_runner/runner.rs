@@ -87,6 +87,7 @@ impl CompilerBaselineRunner {
                 go_regex::has_ts_or_tsx_suffix,
                 true, /*recursive*/
             )
+            .unwrap_or_else(|err| panic!("Could not read compiler test files: {err}"))
         })
     }
 }
@@ -208,6 +209,7 @@ pub struct CompilerTest {
     pub filename: String,
     pub basename: String,
     pub configured_name: String, // name with configuration description, e.g. `file`
+    pub current_directory: String,
     pub options: CompilerOptions,
     pub harness_options: HarnessOptions,
     pub result: CompilationResult,
@@ -377,7 +379,7 @@ pub fn new_compiler_test(
         named_configuration.map(|named| named.name.as_str()),
     );
 
-    let result = compile_files(
+    let mut result = compile_files(
         &inputs.to_be_compiled,
         &inputs.other_files,
         inputs.harness_config.as_ref(),
@@ -386,17 +388,41 @@ pub fn new_compiler_test(
         &inputs.symlinks,
     );
 
+    // Go: compiler_runner.go:350 (tsgo#4712)
+    // Content-mapped files are transformed during program construction; the transformed text is what the
+    // compiler actually parses and reports positions against. Baseline that text (rather than the original
+    // foreign source) so the type, symbol, and error baselines line up with the compiler's positions.
+    let mut to_be_compiled = inputs.to_be_compiled;
+    let mut other_files = inputs.other_files;
+    let mut changed = false;
+    for file in to_be_compiled.iter_mut().chain(other_files.iter_mut()) {
+        if result
+            .source_file_content_mapper(&file.unit_name)
+            .is_some_and(|content_mapper| !content_mapper.is_empty())
+        {
+            file.content = result
+                .source_file_text(&file.unit_name)
+                .expect("the program has the file");
+            changed = true;
+        }
+    }
+    // PORT: Go changes the shared `*TestFile` values; `Repeat` sees them.
+    if changed {
+        result.set_repeat_files(&to_be_compiled, &other_files);
+    }
+
     CompilerTest {
         test_name: test_name.to_string(),
         filename: filename.to_string(),
         basename,
         configured_name,
+        current_directory: inputs.current_directory,
         options: result.options.clone(),
         harness_options: result.harness_options.clone(),
         result,
         ts_config_files: inputs.ts_config_files,
-        to_be_compiled: inputs.to_be_compiled,
-        other_files: inputs.other_files,
+        to_be_compiled,
+        other_files,
         has_non_dts_files: inputs.has_non_dts_files,
     }
 }
@@ -440,7 +466,7 @@ pub fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Go `t.Run(name, ...)` with `defer testutil.RecoverAndFail(t, message)`:
 /// a panic fails the subtest, `skip` skips it.
-fn run_subtest(
+pub fn run_subtest(
     report: Report<'_>,
     kind: &str,
     message: &str,
@@ -485,17 +511,34 @@ impl CompilerTest {
             ),
             || {
                 let _scope = self.result.enter();
-                let files: Vec<TestFile> = self
+                let mut files: Vec<TestFile> = self
                     .ts_config_files
                     .iter()
                     .chain(&self.to_be_compiled)
                     .chain(&self.other_files)
                     .cloned()
                     .collect();
+                let mut diagnostics = self.result.diagnostics.clone();
+                // tsgo#4712
+                // Content-mapped files' diagnostics are baselined separately (see verifyContentMapper), where they can
+                // be rendered against the correct text; the squiggle renderer here assumes a single coordinate space.
+                let content_mapped = self.content_mapped_file_names();
+                if !content_mapped.is_empty() {
+                    files.retain(|f| {
+                        !content_mapped.contains(&get_normalized_absolute_path(
+                            &f.unit_name,
+                            &self.current_directory,
+                        ))
+                    });
+                    diagnostics.retain(|d| {
+                        tsbaseline::diagnostic_file_name(d)
+                            .is_none_or(|name| !content_mapped.contains(&name))
+                    });
+                }
                 tsbaseline::do_error_baseline(
                     &self.configured_name,
                     &files,
-                    &self.result.diagnostics,
+                    &diagnostics,
                     self.result.options.pretty.is_true(),
                     &Options {
                         subfolder: suite_name.to_string(),
@@ -506,6 +549,42 @@ impl CompilerTest {
                 )
             },
         );
+    }
+
+    // Go: compiler_runner.go:416 verifyContentMapper
+    pub fn verify_content_mapper(&self, report: Report<'_>, suite_name: &str, is_submodule: bool) {
+        run_subtest(
+            report,
+            "contentmapper",
+            &format!(
+                "Panic on creating content mapper baseline for test {}",
+                self.filename
+            ),
+            || {
+                let _scope = self.result.enter();
+                tsbaseline::do_content_mapper_baseline(
+                    &self.configured_name,
+                    &self.result,
+                    &self.result.diagnostics,
+                    &Options {
+                        subfolder: suite_name.to_string(),
+                        is_submodule,
+                        ..Options::default()
+                    },
+                )
+            },
+        );
+    }
+
+    // Go: compiler_runner.go:427 contentMappedFileNames
+    // contentMappedFileNames returns the set of absolute file names that were produced by a content mapper.
+    // PORT: Go returns a nil map when there are none; that is an empty set.
+    fn content_mapped_file_names(&self) -> HashSet<String> {
+        self.result
+            .content_mapped_source_files()
+            .into_iter()
+            .map(|(file, _)| source_file_file_name(file).to_string())
+            .collect()
     }
 
     // Go: compiler_runner.go:373 skippedEmitTests
@@ -1066,6 +1145,7 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
     let suite = case.suite;
     let is_submodule = case.is_submodule;
     compiler_test.verify_diagnostics(report, suite, is_submodule);
+    compiler_test.verify_content_mapper(report, suite, is_submodule);
     compiler_test.verify_java_script_output(report, suite, is_submodule);
     compiler_test.verify_source_map_output(report, suite, is_submodule);
     compiler_test.verify_source_map_record(report, suite, is_submodule);

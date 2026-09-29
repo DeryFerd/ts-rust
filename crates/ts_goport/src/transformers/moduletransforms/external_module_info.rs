@@ -419,21 +419,18 @@ pub(crate) fn create_external_helpers_import_declaration_if_needed(
                 }
             }
             if !helper_names.is_empty() {
+                // Go: transformers/moduletransforms/externalmoduleinfo.go:290
+                // slices.SortFunc(helperNames, stringutil.CompareStringsCaseSensitive)
                 // PORT: Go `stringutil.CompareStringsCaseSensitive` is an ordinal compare.
-                helper_names.sort_unstable();
+                crate::gostd::slices::sort_func(&mut helper_names, |a, b| a.cmp(b) as i32);
                 // Alias the imports if the names are used somewhere in the file.
                 // NOTE: We don't need to care about global import collisions as this is a module.
 
-                // PORT: Go `sourceFile.Identifiers` of a factory SourceFile is the
-                // parsed file's set (`copyFrom`). The Rust set of a factory
-                // SourceFile is built from its transformed tree, which already
-                // holds the helper names, so ask the parsed file instead.
-                let identifiers_file = emit_context.most_original(source_file);
                 let import_specifiers: Vec<Node> = helper_names
                     .iter()
                     .map(|name| {
-                        if is_file_level_unique_name(
-                            identifiers_file,
+                        if emit_context.is_file_level_unique_name(
+                            source_file,
                             name,
                             None, /*hasGlobalName*/
                         ) {

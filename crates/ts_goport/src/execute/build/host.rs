@@ -10,11 +10,13 @@
 //! PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero) and
 //! `time.Duration` is `Duration`, as in build_task.rs.
 
+use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
 use crate::frontend::prelude::*;
+use crate::gostd::GoError;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -81,7 +83,7 @@ impl Hash for SourceFileCacheKey {
     }
 }
 
-// Go: build/host.go:17 host
+// Go: build/host.go:18 host
 pub struct BuildHost {
     // PORT: in place of Go `orchestrator *Orchestrator` (see top).
     sys: Rc<dyn System>,
@@ -107,9 +109,9 @@ pub struct BuildHost {
 
 impl BuildHost {
     // PORT: Go builds the host inline in `NewOrchestrator`
-    // (orchestrator.go:618): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
-    // sys.DefaultLibraryPath(), nil, nil)` and an empty mTimes map.
-    // `NewCachedFSCompilerHost` is written out (compiler/host.go:34) to keep
+    // (orchestrator.go:764): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
+    // sys.DefaultLibraryPath(), nil, nil, nil)` and an empty mTimes map.
+    // `NewCachedFSCompilerHost` is written out (compiler/host.go:44) to keep
     // the cached file system.
     pub fn new(
         sys: Rc<dyn System>,
@@ -121,6 +123,7 @@ impl BuildHost {
             &sys.get_current_directory(),
             cached_fs.clone(),
             &sys.default_library_path(),
+            None,
             None,
             None,
         );
@@ -138,7 +141,7 @@ impl BuildHost {
         }
     }
 
-    // Go: orchestrator.go:87 (*Orchestrator).toPath, as the host reaches it.
+    // Go: orchestrator.go:91 (*Orchestrator).toPath, as the host reaches it.
     pub fn to_path(&self, file_name: &str) -> Path {
         to_path(
             file_name,
@@ -147,17 +150,17 @@ impl BuildHost {
         )
     }
 
-    // Go: build/host.go:83 (*host).GetMTime
+    // Go: build/host.go:94 (*host).GetMTime
     pub fn get_m_time(&self, file: &str) -> Option<SystemTime> {
         self.load_or_store_m_time(file, None, true)
     }
 
-    // Go: build/host.go:87 (*host).SetMTime
+    // Go: build/host.go:98 (*host).SetMTime
     pub fn set_m_time(&self, file: &str, m_time: Option<SystemTime>) -> Result<(), FsError> {
         CompilerHost::fs(self).chtimes(file, None, m_time)
     }
 
-    // Go: build/host.go:91 (*host).loadOrStoreMTime
+    // Go: build/host.go:102 (*host).loadOrStoreMTime
     pub fn load_or_store_m_time(
         &self,
         file: &str,
@@ -198,7 +201,7 @@ impl BuildHost {
         m_time
     }
 
-    // Go: build/host.go:111 (*host).storeMTime
+    // Go: build/host.go:121 (*host).storeMTime
     pub fn store_m_time(&self, file: &str, m_time: Option<SystemTime>) {
         let path = self.to_path(file);
         self.m_times
@@ -207,7 +210,7 @@ impl BuildHost {
             .insert(path, m_time);
     }
 
-    // Go: build/host.go:116 (*host).storeMTimeFromOldCache
+    // Go: build/host.go:126 (*host).storeMTimeFromOldCache
     pub fn store_m_time_from_old_cache(
         &self,
         file: &str,
@@ -222,7 +225,7 @@ impl BuildHost {
         }
     }
 
-    // Go: build/host.go:77 (*host).ReadBuildInfo
+    // Go: build/host.go:87 (*host).ReadBuildInfo
     // PORT: Go reads the build info cache of the config's task
     // (`loadOrStoreBuildInfo`). Its only caller is `ReadBuildInfoProgram` in
     // `compileAndEmit`, with the config of the task that compiles, so
@@ -231,29 +234,29 @@ impl BuildHost {
 }
 
 impl CompilerHost for BuildHost {
-    // Go: build/host.go:36 (*host).FS
+    // Go: build/host.go:38 (*host).FS
     fn fs(&self) -> Rc<dyn Fs> {
         self.host.fs()
     }
 
-    // Go: build/host.go:40 (*host).DefaultLibraryPath
+    // Go: build/host.go:42 (*host).DefaultLibraryPath
     fn default_library_path(&self) -> String {
         self.host.default_library_path()
     }
 
-    // Go: build/host.go:44 (*host).GetCurrentDirectory
+    // Go: build/host.go:46 (*host).GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         self.host.get_current_directory()
     }
 
-    // Go: build/host.go:48 (*host).Trace
+    // Go: build/host.go:50 (*host).Trace
     fn trace(&self, _msg: &'static Message, _args: Vec<String>) {
         panic!(
-            "build.Orchestrator.host does not support tracing, use a different host for tracing"
+            "build.Orchestrator.host does not support tracing; use a different host for tracing"
         );
     }
 
-    // Go: build/host.go:52 (*host).GetSourceFile
+    // Go: build/host.go:54 (*host).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         if is_declaration_file_name(&opts.file_name)
             || file_extension_is(&opts.file_name, EXTENSION_JSON)
@@ -280,6 +283,22 @@ impl CompilerHost for BuildHost {
         self.host.get_source_file(opts)
     }
 
+    // Go: build/host.go:62 (*host).GetContentMappedSourceFiles (tsgo#4712)
+    fn get_content_mapped_source_files(
+        &self,
+        _parse_options: &SourceFileParseOptions,
+        _mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError> {
+        Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone())
+    }
+
+    // Go: build/host.go:66 (*host).ContentMapperProject (tsgo#4712)
+    fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
+        panic!(
+            "build.Orchestrator.host does not support content mapper project; use an individual project's compiler host instead"
+        );
+    }
+
     // PORT: not in Go (see `CompilerHost::cached_source_file_names`). The
     // `.d.ts` and `.json` files that `get_source_file` keeps.
     fn cached_source_file_names(&self) -> FxHashSet<String> {
@@ -290,7 +309,7 @@ impl CompilerHost for BuildHost {
         names
     }
 
-    // Go: build/host.go:60 (*host).GetResolvedProjectReference
+    // Go: build/host.go:70 (*host).GetResolvedProjectReference
     fn get_resolved_project_reference(
         &self,
         file_name: &str,
@@ -347,7 +366,7 @@ impl ParseConfigHost for BuildHost {
     }
 }
 
-// Go: build/host.go:31 `_ incremental.Host = (*host)(nil)`
+// Go: build/host.go:35 `_ incremental.Host = (*host)(nil)`
 impl incremental::Host for BuildHost {
     fn fs(&self) -> Rc<dyn Fs> {
         CompilerHost::fs(self)
@@ -362,41 +381,71 @@ impl incremental::Host for BuildHost {
     }
 }
 
-// Go: build/compilerHost.go:12 compilerHost
+// Go: build/compilerHost.go:13 compilerHost
 // PORT: the host that the build task gives `compiler.NewProgram`: the
-// build host with the task's trace writer.
+// build host with the task's trace writer. Go nil `contentMapperProject`
+// is `None`.
 pub struct BuildCompilerHost {
     pub host: Rc<BuildHost>,
     pub trace: TraceFn,
+    pub content_mapper_project: Option<Rc<dyn Project>>,
 }
 
 impl CompilerHost for BuildCompilerHost {
-    // Go: build/compilerHost.go:19 (*compilerHost).FS
+    // Go: build/compilerHost.go:21 (*compilerHost).FS
     fn fs(&self) -> Rc<dyn Fs> {
         CompilerHost::fs(&*self.host)
     }
 
-    // Go: build/compilerHost.go:23 (*compilerHost).DefaultLibraryPath
+    // Go: build/compilerHost.go:25 (*compilerHost).DefaultLibraryPath
     fn default_library_path(&self) -> String {
         self.host.default_library_path()
     }
 
-    // Go: build/compilerHost.go:27 (*compilerHost).GetCurrentDirectory
+    // Go: build/compilerHost.go:29 (*compilerHost).GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         CompilerHost::get_current_directory(&*self.host)
     }
 
-    // Go: build/compilerHost.go:31 (*compilerHost).Trace
+    // Go: build/compilerHost.go:33 (*compilerHost).Trace
     fn trace(&self, msg: &'static Message, args: Vec<String>) {
         (self.trace)(msg, args);
     }
 
-    // Go: build/compilerHost.go:35 (*compilerHost).GetSourceFile
+    // Go: build/compilerHost.go:37 (*compilerHost).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         self.host.get_source_file(opts)
     }
 
-    // Go: build/compilerHost.go:39 (*compilerHost).GetResolvedProjectReference
+    // Go: build/compilerHost.go:41 (*compilerHost).GetContentMappedSourceFiles (tsgo#4712)
+    // PORT: Go returns `(files, err)`; a file that cannot be read is `Ok`
+    // with no canonical file, as in the compiler host.
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &SourceFileParseOptions,
+        mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError> {
+        let Some(project) = self.content_mapper_project() else {
+            return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
+        };
+        let fs = CompilerHost::fs(self);
+        let (content, ok) = fs.read_file(&parse_options.file_name);
+        if !ok {
+            return Ok(SourceFiles::default());
+        }
+        let files = contentmapper::transform_and_parse(parse_options, &content, mapper, &*project)?;
+        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
+            fs.file_exists(name)
+        })?;
+        Ok(files)
+    }
+
+    // Go: build/compilerHost.go:56 (*compilerHost).ContentMapperProject (tsgo#4712)
+    fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
+        self.content_mapper_project.clone()
+    }
+
+    // Go: build/compilerHost.go:60 (*compilerHost).GetResolvedProjectReference
     fn get_resolved_project_reference(
         &self,
         file_name: &str,

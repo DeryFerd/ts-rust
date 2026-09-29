@@ -123,8 +123,9 @@ fn run(edit: impl FnOnce(&mut CompilerOptions)) -> Run {
             let targets = source_files()
                 .into_iter()
                 .map(|file| EmitOptions {
-                    target_source_file: file,
+                    target_source_files: Some(vec![file]),
                     emit_only: EmitOnly::All,
+                    force_emit: false,
                     write_file: Some(write_file.clone()),
                 })
                 .collect();

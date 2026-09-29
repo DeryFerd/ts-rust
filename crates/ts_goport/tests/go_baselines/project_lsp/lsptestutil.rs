@@ -13,11 +13,13 @@
 //! the `initialized` handler to its end before it reads the next message.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ts_goport::contentmapper;
 use ts_goport::frontend::bundled;
 use ts_goport::frontend::json::UnmarshalerFrom;
 use ts_goport::frontend::json_ext::AnyValue;
@@ -90,6 +92,10 @@ pub struct ServerSetup {
     /// global typings location and an `npm` runner (`os_server_setup`).
     pub files: Option<MapFs>,
     pub default_library_path: String,
+    /// Go `ServerOptions.Spawn` (tsgo#4712): `Some(contentmappertest::new_spawner)`
+    /// gives the server `contentmappertest.NewSpawner().Spawn`.
+    /// PORT: a spawner is `Rc`, so the server thread makes it.
+    pub spawner: Option<fn() -> Rc<dyn contentmapper::Spawner>>,
 }
 
 // Go: lspclient.go:66 LSPClient
@@ -111,6 +117,7 @@ pub fn server_setup(cwd: &str, files: FileMap) -> ServerSetup {
         cwd: cwd.to_string(),
         files: Some(map),
         default_library_path: bundled::lib_path(),
+        spawner: None,
     }
 }
 
@@ -123,6 +130,7 @@ pub fn os_server_setup(cwd: &str) -> ServerSetup {
         cwd: cwd.to_string(),
         files: None,
         default_library_path: bundled::lib_path(),
+        spawner: None,
     }
 }
 
@@ -166,6 +174,7 @@ pub fn new_lsp_client(
                 typings_location,
                 parse_cache: None,
                 npm_install,
+                spawn: setup.spawner.map(spawn_fn),
                 progress_delay: Duration::ZERO,
                 set_parent_process_id: None,
             });
@@ -225,6 +234,16 @@ fn npm_install(cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>) {
         ),
         Err(err) => (Vec::new(), Some(errors::new(err.to_string()))),
     }
+}
+
+/// Go `spawner.Spawn` as a `ServerOptions.Spawn` function.
+fn spawn_fn(new_spawner: fn() -> Rc<dyn contentmapper::Spawner>) -> Rc<contentmapper::SpawnFn> {
+    let spawner = new_spawner();
+    Rc::new(
+        move |command: &[String], dir: &str, stderr: Option<Box<dyn std::io::Write + Send>>| {
+            contentmapper::Spawner::spawn(&*spawner, command, dir, stderr)
+        },
+    )
 }
 
 // Go: lspclient.go:137 MessageRouter

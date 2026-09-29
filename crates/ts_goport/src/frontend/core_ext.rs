@@ -14,9 +14,28 @@ pub struct TypeAcquisition {
 // Go: core/projectreference.go:5 ProjectReference
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectReference {
+    // Path is a normalized path on disk.
     pub path: String,
+    // OriginalPath is the path as it was originally written.
     pub original_path: String,
+    // Circular indicates that this reference is intended to form a circularity.
     pub circular: bool,
+}
+
+// Go: core/projectreference.go:5 ProjectReference (JSON v2 struct marshaler)
+// PORT: Go marshals the struct by reflection in field order with the tags
+// `json:"path"`, `json:"originalPath"` and `json:"circular"` (tsgo#4627).
+impl MarshalerTo for ProjectReference {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("{\"path\":");
+        self.path.marshal_json_to(enc)?;
+        enc.push_str(",\"originalPath\":");
+        self.original_path.marshal_json_to(enc)?;
+        enc.push_str(",\"circular\":");
+        self.circular.marshal_json_to(enc)?;
+        enc.push('}');
+        Ok(())
+    }
 }
 
 // Go: core/projectreference.go:11 ResolveProjectReferencePath
@@ -71,4 +90,28 @@ pub fn get_script_kind_from_file_name(file_name: &str) -> ScriptKind {
         }
     }
     ScriptKind::UNKNOWN
+}
+
+// Go: core/core.go:546 GetDefaultExtensionForScriptKind (tsgo#4712)
+#[must_use]
+pub fn get_default_extension_for_script_kind(script_kind: ScriptKind) -> &'static str {
+    match script_kind {
+        ScriptKind::JS => EXTENSION_JS,
+        ScriptKind::JSX => EXTENSION_JSX,
+        ScriptKind::TSX => EXTENSION_TSX,
+        ScriptKind::JSON => EXTENSION_JSON,
+        _ => EXTENSION_TS,
+    }
+}
+
+// EnsureScriptKindFromFileName is like GetScriptKindFromFileName, but defaults to
+// ScriptKindTS when the file name has no recognized extension (e.g. files included
+// with allowNonTsExtensions), so the result is always safe to hand to the parser.
+// Go: core/core.go:564 EnsureScriptKindFromFileName
+pub fn ensure_script_kind_from_file_name(file_name: &str) -> ScriptKind {
+    let kind = get_script_kind_from_file_name(file_name);
+    if kind != ScriptKind::UNKNOWN {
+        return kind;
+    }
+    ScriptKind::TS
 }

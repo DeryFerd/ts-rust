@@ -299,6 +299,16 @@ pub static COMMON_OPTIONS_WITH_BUILD: LazyLock<Vec<&'static CommandLineOption>> 
         min_value: 1,
         ..Default::default()
     }),
+    // tsgo#4712
+    opt(CommandLineOption {
+        name: "runExternalCode",
+        kind: CommandLineOptionKind::BOOLEAN,
+        category: Some(diag::Command_line_Options),
+        is_command_line_only: true,
+        description: Some(diag::Allow_loading_external_content_mapper_plugins_that_execute_code_during_compilation),
+        default_value_description: CompilerOptionsValue::Bool(false),
+        ..Default::default()
+    }),
     ]
     },
 );
@@ -1602,6 +1612,7 @@ pub fn compiler_options_field_values(
         ("Build", V::Tristate(o.build)),
         ("Help", V::Tristate(o.help)),
         ("All", V::Tristate(o.all)),
+        ("RunExternalCode", V::Tristate(o.run_external_code)),
         ("PprofDir", V::String(o.pprof_dir.clone())),
         ("SingleThreaded", V::Tristate(o.single_threaded)),
         ("Quiet", V::Tristate(o.quiet)),

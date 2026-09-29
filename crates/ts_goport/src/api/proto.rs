@@ -12,6 +12,11 @@
 //! Go `*T` fields are `Option<T>`; Go `[]*T` fields are `Vec<T>` (no Go
 //! code stores a nil element). Go `any` in `TypeResponse.Value` only holds
 //! JSON primitives, so it is `LspAny`.
+//!
+//! PORT: tsgo#4915 generates the TS API from this Go source
+//! (`_tools/gen-proto`). Its `nonnil`, `deprecated` and `internal` struct
+//! tags and the `@gen-proto-*` comments on the session handlers only steer
+//! that generator. They do not change the JSON, so the port leaves them out.
 
 use crate::api::prelude::*;
 
@@ -82,30 +87,6 @@ macro_rules! proto_json {
     (@field omitempty, $enc:ident, $first:ident, $name:literal, $value:expr) => {
         marshal_field_omitempty($enc, &mut $first, $name, $value)?;
     };
-}
-
-/// Go v2 `omitempty`: the member is dropped when its value marshals as
-/// `null`, `""`, `{}` or `[]` (v2 `UnwriteEmptyObjectMember`). A `false`
-/// or `0` is written.
-pub fn marshal_field_omitempty<T: MarshalerTo + ?Sized>(
-    enc: &mut String,
-    first: &mut bool,
-    name: &str,
-    value: &T,
-) -> Result<(), JsonError> {
-    let mut v = String::new();
-    value.marshal_json_to(&mut v)?;
-    if matches!(v.as_str(), "null" | "\"\"" | "{}" | "[]") {
-        return Ok(());
-    }
-    if !*first {
-        enc.push(',');
-    }
-    *first = false;
-    name.marshal_json_to(enc)?;
-    enc.push(':');
-    enc.push_str(&v);
-    Ok(())
 }
 
 // Go: proto.go:20
@@ -224,26 +205,31 @@ pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
 
-    // MethodGetServerTiming retrieves the server's collected per-request
-    // processing-time totals and recent-request ring buffer. It is handled by
-    // the connection itself (not the session) and is not recorded in the timing
-    // it reports.
-    pub const GET_SERVER_TIMING: Method = Method(Cow::Borrowed("getServerTiming"));
-
-    // MethodResetServerTiming clears the server's collected timing totals and
-    // recent-request ring buffer. Like MethodGetServerTiming, it is handled by
-    // the connection itself and is not recorded.
-    pub const RESET_SERVER_TIMING: Method = Method(Cow::Borrowed("resetServerTiming"));
-
+    // tsgo#4915: MethodGetServerTiming and MethodResetServerTiming are gone;
+    // the connection answers them (`ipc::timing`).
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
+    // tsgo#4642
+    pub const UPDATE_TEMPORARY_SNAPSHOT: Method = Method(Cow::Borrowed("updateTemporarySnapshot"));
+    pub const PARSE_COMMAND_LINE: Method = Method(Cow::Borrowed("parseCommandLine"));
+    pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
+    pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
+    // tsgo#4849
+    pub const TRANSPILE_MODULE: Method = Method(Cow::Borrowed("transpileModule"));
+    pub const TRANSPILE_MODULE_FROM_FILE: Method = Method(Cow::Borrowed("transpileModuleFromFile"));
+    pub const TRANSPILE_DECLARATION: Method = Method(Cow::Borrowed("transpileDeclaration"));
+    pub const TRANSPILE_DECLARATION_FROM_FILE: Method =
+        Method(Cow::Borrowed("transpileDeclarationFromFile"));
     pub const GET_DEFAULT_PROJECT_FOR_FILE: Method =
         Method(Cow::Borrowed("getDefaultProjectForFile"));
     pub const GET_SYMBOL_AT_POSITION: Method = Method(Cow::Borrowed("getSymbolAtPosition"));
     pub const GET_SYMBOLS_AT_POSITIONS: Method = Method(Cow::Borrowed("getSymbolsAtPositions"));
     pub const GET_SYMBOL_AT_LOCATION: Method = Method(Cow::Borrowed("getSymbolAtLocation"));
     pub const GET_SYMBOLS_AT_LOCATIONS: Method = Method(Cow::Borrowed("getSymbolsAtLocations"));
+    pub const GET_SYMBOL_OF_SOURCE_FILE: Method = Method(Cow::Borrowed("getSymbolOfSourceFile"));
+    pub const GET_SYMBOLS_OF_SOURCE_FILES: Method =
+        Method(Cow::Borrowed("getSymbolsOfSourceFiles"));
     pub const GET_TYPE_OF_SYMBOL: Method = Method(Cow::Borrowed("getTypeOfSymbol"));
     pub const GET_TYPES_OF_SYMBOLS: Method = Method(Cow::Borrowed("getTypesOfSymbols"));
     pub const GET_DECLARED_TYPE_OF_SYMBOL: Method =
@@ -251,7 +237,10 @@ impl Method {
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
     pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
+    pub const GET_CONFIG_FILE_NAMES: Method = Method(Cow::Borrowed("getConfigFileNames"));
+    pub const GET_CONFIG_SOURCE_FILE: Method = Method(Cow::Borrowed("getConfigSourceFile"));
     pub const RESOLVE_NAME: Method = Method(Cow::Borrowed("resolveName"));
+    pub const GET_SYMBOLS_IN_SCOPE: Method = Method(Cow::Borrowed("getSymbolsInScope"));
     pub const GET_SIGNATURES_OF_TYPE: Method = Method(Cow::Borrowed("getSignaturesOfType"));
     pub const GET_RESOLVED_SIGNATURE: Method = Method(Cow::Borrowed("getResolvedSignature"));
     pub const GET_TYPE_AT_LOCATION: Method = Method(Cow::Borrowed("getTypeAtLocation"));
@@ -305,6 +294,8 @@ impl Method {
     pub const GET_TYPE_FROM_TYPE_NODE: Method = Method(Cow::Borrowed("getTypeFromTypeNode"));
     pub const GET_WIDENED_TYPE: Method = Method(Cow::Borrowed("getWidenedType"));
     pub const GET_PARAMETER_TYPE: Method = Method(Cow::Borrowed("getParameterType"));
+    pub const GET_TYPE_PARAMETER_AT_POSITION: Method =
+        Method(Cow::Borrowed("getTypeParameterAtPosition"));
     pub const IS_ARRAY_LIKE_TYPE: Method = Method(Cow::Borrowed("isArrayLikeType"));
     pub const IS_TYPE_ASSIGNABLE_TO: Method = Method(Cow::Borrowed("isTypeAssignableTo"));
     pub const GET_SHORTHAND_ASSIGNMENT_VALUE_SYMBOL: Method =
@@ -323,14 +314,20 @@ impl Method {
         Method(Cow::Borrowed("getTypePredicateOfSignature"));
     pub const GET_BASE_TYPES: Method = Method(Cow::Borrowed("getBaseTypes"));
     pub const GET_PROPERTIES_OF_TYPE: Method = Method(Cow::Borrowed("getPropertiesOfType"));
+    pub const GET_APPARENT_PROPERTIES_OF_TYPE: Method =
+        Method(Cow::Borrowed("getApparentPropertiesOfType"));
     pub const GET_APPARENT_TYPE: Method = Method(Cow::Borrowed("getApparentType"));
     pub const GET_PROPERTY_OF_TYPE: Method = Method(Cow::Borrowed("getPropertyOfType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
         Method(Cow::Borrowed("getConstraintOfTypeParameter"));
+    pub const GET_DEFAULT_FROM_TYPE_PARAMETER: Method =
+        Method(Cow::Borrowed("getDefaultFromTypeParameter"));
     pub const GET_BASE_CONSTRAINT_OF_TYPE: Method =
         Method(Cow::Borrowed("getBaseConstraintOfType"));
     pub const GET_TYPE_ARGUMENTS: Method = Method(Cow::Borrowed("getTypeArguments"));
+    // tsgo#3881
+    pub const GET_IMPORT_ADDER_EDITS: Method = Method(Cow::Borrowed("getImportAdderEdits"));
     pub const GET_TRUE_TYPE_OF_CONDITIONAL_TYPE: Method =
         Method(Cow::Borrowed("getTrueTypeOfConditionalType"));
     pub const GET_FALSE_TYPE_OF_CONDITIONAL_TYPE: Method =
@@ -343,6 +340,7 @@ impl Method {
     pub const GET_ALIASED_SYMBOL: Method = Method(Cow::Borrowed("getAliasedSymbol"));
     pub const GET_IMMEDIATE_ALIASED_SYMBOL: Method =
         Method(Cow::Borrowed("getImmediateAliasedSymbol"));
+    pub const GET_FULLY_QUALIFIED_NAME: Method = Method(Cow::Borrowed("getFullyQualifiedName"));
     pub const GET_EXPORTS_OF_MODULE: Method = Method(Cow::Borrowed("getExportsOfModule"));
     pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
         Method(Cow::Borrowed("getMemberInModuleExports"));
@@ -377,6 +375,12 @@ impl Method {
 
     // Emitter methods
     pub const PRINT_NODE: Method = Method(Cow::Borrowed("printNode"));
+    pub const FORMAT_NODE_FOR_INSERTION: Method = Method(Cow::Borrowed("formatNodeForInsertion"));
+    // tsgo#4699
+    pub const EMIT: Method = Method(Cow::Borrowed("emit"));
+    pub const EMIT_TO_STRING: Method = Method(Cow::Borrowed("emitToString"));
+    pub const GET_JAVA_SCRIPT_EMIT: Method = Method(Cow::Borrowed("getJavaScriptEmit"));
+    pub const GET_DECLARATION_EMIT: Method = Method(Cow::Borrowed("getDeclarationEmit"));
 
     // Intrinsic type getters
     pub const GET_ANY_TYPE: Method = Method(Cow::Borrowed("getAnyType"));
@@ -390,9 +394,13 @@ impl Method {
     pub const GET_UNKNOWN_TYPE: Method = Method(Cow::Borrowed("getUnknownType"));
     pub const GET_BIG_INT_TYPE: Method = Method(Cow::Borrowed("getBigIntType"));
     pub const GET_ES_SYMBOL_TYPE: Method = Method(Cow::Borrowed("getESSymbolType"));
+    pub const GET_NON_PRIMITIVE_TYPE: Method = Method(Cow::Borrowed("getNonPrimitiveType"));
 
     // Well-known per-checker symbols
     pub const GET_WELL_KNOWN_SYMBOLS: Method = Method(Cow::Borrowed("getWellKnownSymbols"));
+
+    // Well-known per-checker signatures
+    pub const GET_WELL_KNOWN_SIGNATURES: Method = Method(Cow::Borrowed("getWellKnownSignatures"));
 
     // Profiling methods
     pub const START_CPU_PROFILE: Method = Method(Cow::Borrowed("startCPUProfile"));
@@ -417,6 +425,16 @@ proto_json!(marshal InitializeResponse {
 
 // DocumentIdentifier identifies a document by either a file name (plain string) or a URI object.
 // On the wire it is string | { uri: string }.
+//
+// @example
+//
+// Using a file name:
+//
+//	project.program.getSourceFile("/path/to/file.ts");
+//
+// Using a URI:
+//
+//	project.program.getSourceFile({ uri: "file:///path/to/file.ts" });
 // Go: proto.go:180 DocumentIdentifier
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocumentIdentifier {
@@ -615,6 +633,25 @@ proto_json!(both UpdateSnapshotParams {
     close_files: "closeFiles" omitempty,
 });
 
+// UpdateTemporarySnapshotParams are the parameters for creating a temporary
+// snapshot that overrides a single file's content.
+// Go: proto.go:360 UpdateTemporarySnapshotParams (tsgo#4642)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateTemporarySnapshotParams {
+    // Snapshot is the current client snapshot on which to layer the temporary update.
+    pub snapshot: SnapshotID,
+    // File identifies the file whose content is temporarily overridden.
+    pub file: DocumentIdentifier,
+    // NewText is the temporary content for the file.
+    pub new_text: String,
+}
+
+proto_json!(both UpdateTemporarySnapshotParams {
+    snapshot: "snapshot" plain,
+    file: "file" plain,
+    new_text: "newText" plain,
+});
+
 // ProjectFileChanges describes what source files changed within a single project.
 // Go: proto.go:278 ProjectFileChanges
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -723,8 +760,41 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<UpdateSnapshotParams>,
     );
     m.insert(
+        Method::UPDATE_TEMPORARY_SNAPSHOT,
+        unmarshaller_for::<UpdateTemporarySnapshotParams>,
+    );
+    m.insert(
+        Method::PARSE_COMMAND_LINE,
+        unmarshaller_for::<ParseCommandLineParams>,
+    );
+    m.insert(
+        Method::READ_CONFIG_FILE,
+        unmarshaller_for::<ReadConfigFileParams>,
+    );
+    m.insert(
+        Method::PARSE_JSON_CONFIG_FILE,
+        unmarshaller_for::<ParseJsonConfigFileContentParams>,
+    );
+    m.insert(
         Method::PARSE_CONFIG_FILE,
         unmarshaller_for::<ParseConfigFileParams>,
+    );
+    // tsgo#4849
+    m.insert(
+        Method::TRANSPILE_MODULE,
+        unmarshaller_for::<TranspileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_MODULE_FROM_FILE,
+        unmarshaller_for::<TranspileFromFileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_DECLARATION,
+        unmarshaller_for::<TranspileParams>,
+    );
+    m.insert(
+        Method::TRANSPILE_DECLARATION_FROM_FILE,
+        unmarshaller_for::<TranspileFromFileParams>,
     );
     m.insert(
         Method::GET_DEFAULT_PROJECT_FOR_FILE,
@@ -740,6 +810,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_SOURCE_FILE_METADATA,
+        unmarshaller_for::<GetSourceFileParams>,
+    );
+    m.insert(
+        Method::GET_CONFIG_FILE_NAMES,
+        unmarshaller_for::<GetProjectDiagnosticsParams>,
+    );
+    m.insert(
+        Method::GET_CONFIG_SOURCE_FILE,
         unmarshaller_for::<GetSourceFileParams>,
     );
     m.insert(
@@ -759,6 +837,14 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetSymbolsAtLocationsParams>,
     );
     m.insert(
+        Method::GET_SYMBOL_OF_SOURCE_FILE,
+        unmarshaller_for::<GetSymbolOfSourceFileParams>,
+    );
+    m.insert(
+        Method::GET_SYMBOLS_OF_SOURCE_FILES,
+        unmarshaller_for::<GetSymbolsOfSourceFilesParams>,
+    );
+    m.insert(
         Method::GET_TYPE_OF_SYMBOL,
         unmarshaller_for::<GetTypeOfSymbolParams>,
     );
@@ -771,6 +857,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetTypeOfSymbolParams>,
     );
     m.insert(Method::RESOLVE_NAME, unmarshaller_for::<ResolveNameParams>);
+    m.insert(
+        Method::GET_SYMBOLS_IN_SCOPE,
+        unmarshaller_for::<GetSymbolsInScopeParams>,
+    );
     m.insert(
         Method::GET_SIGNATURES_OF_TYPE,
         unmarshaller_for::<GetSignaturesOfTypeParams>,
@@ -913,7 +1003,7 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_NON_NULLABLE_TYPE,
-        unmarshaller_for::<GetNonNullableTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_TYPE_FROM_TYPE_NODE,
@@ -925,6 +1015,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_PARAMETER_TYPE,
+        unmarshaller_for::<GetParameterTypeParams>,
+    );
+    m.insert(
+        Method::GET_TYPE_PARAMETER_AT_POSITION,
         unmarshaller_for::<GetParameterTypeParams>,
     );
     m.insert(
@@ -961,7 +1055,7 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_RETURN_TYPE_OF_SIGNATURE,
-        unmarshaller_for::<CheckerSignatureParams>,
+        unmarshaller_for::<GetSignaturePropertyParams>,
     );
     m.insert(
         Method::GET_REST_TYPE_OF_SIGNATURE,
@@ -980,8 +1074,12 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_APPARENT_PROPERTIES_OF_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
         Method::GET_APPARENT_TYPE,
-        unmarshaller_for::<CheckerTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_PROPERTY_OF_TYPE,
@@ -993,15 +1091,23 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_CONSTRAINT_OF_TYPE_PARAMETER,
-        unmarshaller_for::<CheckerTypeParams>,
+        unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
         Method::GET_BASE_CONSTRAINT_OF_TYPE,
         unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
+        Method::GET_DEFAULT_FROM_TYPE_PARAMETER,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
         Method::GET_TYPE_ARGUMENTS,
         unmarshaller_for::<CheckerTypeParams>,
+    );
+    m.insert(
+        Method::GET_IMPORT_ADDER_EDITS,
+        unmarshaller_for::<GetImportAdderEditsParams>,
     );
     m.insert(
         Method::GET_CONSTANT_VALUE,
@@ -1021,6 +1127,10 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_IMMEDIATE_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    m.insert(
+        Method::GET_FULLY_QUALIFIED_NAME,
         unmarshaller_for::<CheckerSymbolParams>,
     );
     m.insert(
@@ -1058,6 +1168,21 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetCompletionsAtPositionParams>,
     );
     m.insert(Method::PRINT_NODE, unmarshaller_for::<PrintNodeParams>);
+    m.insert(
+        Method::FORMAT_NODE_FOR_INSERTION,
+        unmarshaller_for::<FormatNodeForInsertionParams>,
+    );
+    // tsgo#4699
+    m.insert(Method::EMIT, unmarshaller_for::<EmitParams>);
+    m.insert(Method::EMIT_TO_STRING, unmarshaller_for::<EmitParams>);
+    m.insert(
+        Method::GET_JAVA_SCRIPT_EMIT,
+        unmarshaller_for::<SelectedFilesEmitParams>,
+    );
+    m.insert(
+        Method::GET_DECLARATION_EMIT,
+        unmarshaller_for::<SelectedFilesEmitParams>,
+    );
     m.insert(
         Method::GET_ANY_TYPE,
         unmarshaller_for::<GetIntrinsicTypeParams>,
@@ -1103,7 +1228,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<GetIntrinsicTypeParams>,
     );
     m.insert(
+        Method::GET_NON_PRIMITIVE_TYPE,
+        unmarshaller_for::<GetIntrinsicTypeParams>,
+    );
+    m.insert(
         Method::GET_WELL_KNOWN_SYMBOLS,
+        unmarshaller_for::<GetIntrinsicTypeParams>,
+    );
+    m.insert(
+        Method::GET_WELL_KNOWN_SIGNATURES,
         unmarshaller_for::<GetIntrinsicTypeParams>,
     );
     m.insert(
@@ -1154,6 +1287,162 @@ proto_json!(both ParseConfigFileParams {
     file: "file" plain,
 });
 
+// Go: proto.go:550 ParseCommandLineParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseCommandLineParams {
+    pub command_line: Vec<String>,
+}
+
+proto_json!(both ParseCommandLineParams {
+    command_line: "commandLine" plain,
+});
+
+// Go: proto.go:554 ReadConfigFileParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReadConfigFileParams {
+    pub file: DocumentIdentifier,
+}
+
+proto_json!(both ReadConfigFileParams {
+    file: "file" plain,
+});
+
+// Go: proto.go:558 ParseJsonConfigFileContentParams
+// PORT: Go `JSON packagejson.JSONValue` is `LspAny`. A decoded request value
+// must be `Send` (`AnyValue`), and `packagejson::JSONValue` holds `Rc`.
+// Both decode a JSON value to the same tree: null, bool, float64, string,
+// array, and an object that keeps its member order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseJsonConfigFileContentParams {
+    pub json: LspAny,
+    pub config_directory: Option<String>,
+    pub config_file_name: Option<DocumentIdentifier>,
+}
+
+proto_json!(both ParseJsonConfigFileContentParams {
+    json: "json" plain,
+    config_directory: "configDirectory" omitempty,
+    config_file_name: "configFileName" omitempty,
+});
+
+// Go: proto.go:564 jsonValueToAny
+// PORT: Go `any` from the tsoptions JSON code is `CompilerOptionsValue`
+// (nil, string, float64, bool, `[]any`, `*collections.OrderedMap`). The
+// input is the `LspAny` that stands for `packagejson.JSONValue` (see
+// `ParseJsonConfigFileContentParams`); Go's "not present" is `Null` there.
+pub fn json_value_to_any(value: &LspAny) -> tsoptions::CompilerOptionsValue {
+    use crate::frontend::tsoptions::CompilerOptionsValue;
+    match value {
+        LspAny::Null => CompilerOptionsValue::Nil,
+        LspAny::String(value) => CompilerOptionsValue::String(value.clone()),
+        LspAny::Number(value) => CompilerOptionsValue::Number(*value),
+        LspAny::Bool(value) => CompilerOptionsValue::Bool(*value),
+        LspAny::Array(array) => {
+            let mut result = Vec::with_capacity(array.len());
+            for child in array {
+                result.push(json_value_to_any(child));
+            }
+            CompilerOptionsValue::List(result)
+        }
+        LspAny::Object(object) => {
+            let mut result = IndexMap::with_capacity(object.len());
+            for (key, child) in object {
+                result.insert(key.clone(), json_value_to_any(child));
+            }
+            CompilerOptionsValue::Map(result)
+        }
+    }
+}
+
+// Go: proto.go:589 TranspileOptions (tsgo#4849)
+// PORT: Go `*core.CompilerOptions` is `Option<CompilerOptions>` (nil is
+// `None`). Its JSON form is the Go struct default (`CompilerOptionsJSON` to
+// write, the `CompilerOptions` `UnmarshalerFrom` below to read).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileOptions {
+    pub compiler_options: Option<CompilerOptions>,
+    pub file_name: String,
+    pub report_diagnostics: bool,
+}
+
+impl MarshalerTo for TranspileOptions {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &self.compiler_options.as_ref().map(CompilerOptionsJSON),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "fileName", &self.file_name)?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "reportDiagnostics",
+            &self.report_diagnostics,
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl UnmarshalerFrom for TranspileOptions {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.TranspileOptions", |name, dec| {
+            match name {
+                "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                "fileName" => json_unmarshal_decode(dec, &mut self.file_name)?,
+                "reportDiagnostics" => json_unmarshal_decode(dec, &mut self.report_diagnostics)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = TranspileOptions::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go:595 TranspileParams (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileParams {
+    pub input: String,
+    pub options: TranspileOptions,
+}
+
+proto_json!(both TranspileParams {
+    input: "input" plain,
+    options: "options" plain,
+});
+
+// Go: proto.go:600 TranspileFromFileParams (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileFromFileParams {
+    pub file_name: String,
+    pub options: TranspileOptions,
+}
+
+proto_json!(both TranspileFromFileParams {
+    file_name: "fileName" plain,
+    options: "options" plain,
+});
+
+// Go: proto.go:605 TranspileOutputResponse (tsgo#4849)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranspileOutputResponse {
+    pub output_text: String,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub source_map_text: String,
+}
+
+proto_json!(marshal TranspileOutputResponse {
+    output_text: "outputText" plain,
+    diagnostics: "diagnostics" omitempty,
+    source_map_text: "sourceMapText" omitempty,
+});
+
 // ReleaseParams are the parameters for the release method.
 // Go: proto.go:410 ReleaseParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1190,6 +1479,11 @@ proto_json!(marshal ProfileResult {
 pub struct ConfigFileResponse {
     pub file_names: Vec<String>,
     pub options: Option<CompilerOptions>,
+    pub project_references: Vec<crate::frontend::core_ext::ProjectReference>,
+    pub type_acquisition: Option<crate::frontend::core_ext::TypeAcquisition>,
+    pub compile_on_save: Option<bool>,
+    pub raw: tsoptions::CompilerOptionsValue,
+    pub errors: Vec<DiagnosticResponse>,
 }
 
 impl MarshalerTo for ConfigFileResponse {
@@ -1203,8 +1497,52 @@ impl MarshalerTo for ConfigFileResponse {
             "options",
             &self.options.as_ref().map(CompilerOptionsJSON),
         )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "projectReferences",
+            &self.project_references,
+        )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "typeAcquisition",
+            &self.type_acquisition.as_ref().map(TypeAcquisitionJSON),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "compileOnSave", &self.compile_on_save)?;
+        marshal_field_omitempty(enc, &mut first, "raw", &AnyJSON(&self.raw))?;
+        marshal_field(enc, &mut first, "errors", &self.errors)?;
         write_object_end(enc);
         Ok(())
+    }
+}
+
+// Go: proto.go:634 ReadConfigFileResponse
+// PORT: Go `Config any` is `CompilerOptionsValue` (see `json_value_to_any`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadConfigFileResponse {
+    pub config: tsoptions::CompilerOptionsValue,
+    pub error: Option<DiagnosticResponse>,
+}
+
+impl MarshalerTo for ReadConfigFileResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "config", &AnyJSON(&self.config))?;
+        marshal_field_omitempty(enc, &mut first, "error", &self.error)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+/// Go `any` that holds a tsoptions JSON value: the v2 marshaler of its
+/// dynamic type (`build_info::marshal_any`).
+pub struct AnyJSON<'a>(pub &'a tsoptions::CompilerOptionsValue);
+
+impl MarshalerTo for AnyJSON<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        crate::execute::incremental::build_info::marshal_any(enc, self.0)
     }
 }
 
@@ -1225,7 +1563,10 @@ proto_json!(both GetDefaultProjectForFileParams {
 pub struct ProjectResponse {
     pub id: ProjectID,
     pub config_file_name: String,
+    pub parsed_command_line: Option<ConfigFileResponse>,
+    // Deprecated: Use parsedCommandLine.fileNames.
     pub root_files: Vec<String>,
+    // Deprecated: Use parsedCommandLine.options.
     pub compiler_options: Option<CompilerOptions>,
 }
 
@@ -1235,6 +1576,12 @@ impl MarshalerTo for ProjectResponse {
         let mut first = true;
         marshal_field(enc, &mut first, "id", &self.id)?;
         marshal_field(enc, &mut first, "configFileName", &self.config_file_name)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "parsedCommandLine",
+            &self.parsed_command_line,
+        )?;
         marshal_field(enc, &mut first, "rootFiles", &self.root_files)?;
         marshal_field(
             enc,
@@ -1247,7 +1594,64 @@ impl MarshalerTo for ProjectResponse {
     }
 }
 
-// Go: proto.go:439 NewProjectResponse
+// Go: proto.go:654 NewConfigFileResponse
+// PORT: Go shares the `*core.CompilerOptions`, `*core.TypeAcquisition` and
+// project reference pointers; the response keeps copies (see
+// `new_project_response`). Go `Raw.(*collections.OrderedMap[string, any])`
+// is `CompilerOptionsValue::Map`.
+pub fn new_config_file_response(
+    parsed_command_line: Option<&tsoptions::ParsedCommandLine>,
+) -> Option<ConfigFileResponse> {
+    let parsed_command_line = parsed_command_line?;
+    let mut compile_on_save = parsed_command_line.compile_on_save;
+    if compile_on_save.is_none()
+        && let tsoptions::CompilerOptionsValue::Map(raw_config) = &parsed_command_line.raw
+        && let Some(tsoptions::CompilerOptionsValue::Bool(value)) = raw_config.get("compileOnSave")
+    {
+        compile_on_save = Some(*value);
+    }
+    let compiler_options = parsed_command_line.compiler_options();
+    // PORT: Go replaces a nil slice with an empty one; a `Vec` is never nil.
+    let errors = new_diagnostic_responses(&parsed_command_line.errors);
+    Some(ConfigFileResponse {
+        file_names: parsed_command_line.file_names().to_vec(),
+        options: Some((**compiler_options).clone()),
+        project_references: parsed_command_line.project_references().to_vec(),
+        type_acquisition: parsed_command_line.type_acquisition().cloned(),
+        compile_on_save,
+        raw: to_protocol_json_value(&parsed_command_line.raw),
+        errors,
+    })
+}
+
+// Go: proto.go:682 toProtocolJSONValue
+pub fn to_protocol_json_value(
+    value: &tsoptions::CompilerOptionsValue,
+) -> tsoptions::CompilerOptionsValue {
+    use crate::frontend::tsoptions::CompilerOptionsValue;
+    match value {
+        CompilerOptionsValue::WatchFileKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::WatchDirectoryKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::PollingKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::Map(value) => {
+            let mut result = IndexMap::with_capacity(value.len());
+            for (key, child) in value {
+                result.insert(key.clone(), to_protocol_json_value(child));
+            }
+            CompilerOptionsValue::Map(result)
+        }
+        CompilerOptionsValue::List(value) => {
+            let mut result = Vec::with_capacity(value.len());
+            for child in value {
+                result.push(to_protocol_json_value(child));
+            }
+            CompilerOptionsValue::List(result)
+        }
+        value => value.clone(),
+    }
+}
+
+// Go: proto.go:707 NewProjectResponse
 // PORT: Go shares the `*core.CompilerOptions` pointer; the response keeps
 // a copy (responses cross into `Box<dyn AnyValue>`, which is `Send`).
 pub fn new_project_response(p: &project::Project) -> ProjectResponse {
@@ -1257,6 +1661,7 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
     ProjectResponse {
         id: project_handle(p),
         config_file_name: p.name(),
+        parsed_command_line: new_config_file_response(Some(command_line)),
         root_files: command_line.file_names().to_vec(),
         compiler_options: Some((**command_line.compiler_options()).clone()),
     }
@@ -1294,6 +1699,34 @@ proto_json!(both GetSymbolsAtPositionsParams {
     positions: "positions" plain,
 });
 
+// Go: proto.go:734 GetSymbolOfSourceFileParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolOfSourceFileParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+}
+
+proto_json!(both GetSymbolOfSourceFileParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+});
+
+// Go: proto.go:740 GetSymbolsOfSourceFilesParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolsOfSourceFilesParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub files: Vec<DocumentIdentifier>,
+}
+
+proto_json!(both GetSymbolsOfSourceFilesParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    files: "files" plain,
+});
+
 // Go: proto.go:462 GetSymbolAtLocationParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolAtLocationParams {
@@ -1326,6 +1759,8 @@ proto_json!(both GetSymbolsAtLocationsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SymbolResponse {
     pub id: SymbolID,
+    // Project is the project in which the symbol was first observed. It is the
+    // default project for follow-up lookups whose results can vary by project.
     pub project: ProjectID,
     pub name: String,
     pub flags: u32,
@@ -1395,7 +1830,8 @@ pub struct TypeResponse {
     pub flags: u32,
     pub object_flags: u32,
 
-    // LiteralType data
+    // Value is literal type data. BigInt literals are encoded as signed decimal
+    // strings because JSON cannot represent bigint; absent values are null.
     pub value: LspAny,
 
     // ObjectType / TypeReference / StringMappingType / IndexType target
@@ -1705,6 +2141,28 @@ proto_json!(both ResolveNameParams {
     exclude_globals: "excludeGlobals" omitempty,
 });
 
+// GetSymbolsInScopeParams are parameters for getSymbolsInScope, which returns
+// all symbols visible at a given location.
+// Go: proto.go:1007 GetSymbolsInScopeParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetSymbolsInScopeParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub location: NodeHandle, // Optional: node handle for location context
+    pub file: Option<DocumentIdentifier>, // Optional: file for location context (alternative to Location)
+    pub position: Option<u32>, // Optional: position in file for location context (with File)
+    pub meaning: u32,          // SymbolFlags for what kind of symbols to find
+}
+
+proto_json!(both GetSymbolsInScopeParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    location: "location" omitempty,
+    file: "file" omitempty,
+    position: "position" omitempty,
+    meaning: "meaning" plain,
+});
+
 // GetTypePropertyParams is used for all type sub-property endpoints.
 // Go: proto.go:702 GetTypePropertyParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1961,6 +2419,19 @@ proto_json!(marshal WellKnownSymbolsResponse {
     arguments: "arguments" plain,
 });
 
+// WellKnownSignaturesResponse carries the handle id of the per-checker singleton
+// unknown signature (the signature the checker yields when a call cannot be
+// resolved) so the client can identify it by id without a round-trip on every check.
+// Go: proto.go:1140 WellKnownSignaturesResponse
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WellKnownSignaturesResponse {
+    pub unknown: SignatureID,
+}
+
+proto_json!(marshal WellKnownSignaturesResponse {
+    unknown: "unknown" plain,
+});
+
 // GetBaseTypeOfLiteralTypeParams returns the base type of a literal type.
 // Go: proto.go:811 GetBaseTypeOfLiteralTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2160,6 +2631,60 @@ proto_json!(both GetTypesAtPositionsParams {
     positions: "positions" plain,
 });
 
+// Go: proto.go:1234 ImportAdderActionKind (tsgo#3881)
+// PORT: a Go string type, a newtype as the handles are (see `handle_json!`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImportAdderActionKind(pub String);
+
+handle_json!(string: ImportAdderActionKind);
+
+// Go: proto.go:1237 ImportAdderActionKindImportSymbol (tsgo#3881)
+pub const IMPORT_ADDER_ACTION_KIND_IMPORT_SYMBOL: &str = "importSymbol";
+
+// Go: proto.go:1240 ImportAdderAction (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImportAdderAction {
+    pub kind: ImportAdderActionKind,
+    pub symbol: SymbolID,
+    pub is_valid_type_only_use_site: Option<bool>,
+}
+
+proto_json!(both ImportAdderAction {
+    kind: "kind" plain,
+    symbol: "symbol" omitempty,
+    is_valid_type_only_use_site: "isValidTypeOnlyUseSite" omitempty,
+});
+
+// Go: proto.go:1246 GetImportAdderEditsParams (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetImportAdderEditsParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub actions: Vec<ImportAdderAction>,
+}
+
+proto_json!(both GetImportAdderEditsParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    actions: "actions" plain,
+});
+
+// Go: proto.go:1253 TextEdit (tsgo#3881)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextEdit {
+    pub pos: i32,
+    pub end: i32,
+    pub new_text: String,
+}
+
+proto_json!(marshal TextEdit {
+    pos: "pos" plain,
+    end: "end" plain,
+    new_text: "newText" plain,
+});
+
 // TypeToTypeNodeParams are the parameters for the typeToTypeNode method.
 // Go: proto.go:901 TypeToTypeNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2215,6 +2740,98 @@ proto_json!(both PrintNodeParams {
     preserve_source_newlines: "preserveSourceNewlines" omitempty,
     never_ascii_escape: "neverAsciiEscape" omitempty,
     terminate_unterminated_literals: "terminateUnterminatedLiterals" omitempty,
+});
+
+// Go: proto.go:1286 EmitParams (tsgo#4699)
+// PORT: Go `*uint32` is `Option<u32>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub emit_only: Option<u32>,
+}
+
+proto_json!(both EmitParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    emit_only: "emitOnly" omitempty,
+});
+
+// Go: proto.go:1292 SelectedFilesEmitParams (tsgo#4699)
+// PORT: Go tells a nil `Files` (absent or `null`) from an empty one, so it
+// is `Option<Vec>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectedFilesEmitParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub files: Option<Vec<DocumentIdentifier>>,
+}
+
+proto_json!(both SelectedFilesEmitParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    files: "files" plain,
+});
+
+// Go: proto.go:1298 EmitResponse (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitResponse {
+    pub emit_skipped: bool,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub emitted_files: Vec<String>,
+}
+
+proto_json!(marshal EmitResponse {
+    emit_skipped: "emitSkipped" plain,
+    diagnostics: "diagnostics" plain,
+    emitted_files: "emittedFiles" plain,
+});
+
+// Go: proto.go:1304 EmitOutputFile (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitOutputFile {
+    pub file_name: String,
+    pub text: String,
+    pub source_file_name: Option<String>,
+}
+
+proto_json!(marshal EmitOutputFile {
+    file_name: "fileName" plain,
+    text: "text" plain,
+    source_file_name: "sourceFileName" omitempty,
+});
+
+// Go: proto.go:1310 EmitOutputResponse (tsgo#4699)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmitOutputResponse {
+    pub emit_skipped: bool,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub output_files: Vec<EmitOutputFile>,
+}
+
+proto_json!(marshal EmitOutputResponse {
+    emit_skipped: "emitSkipped" plain,
+    diagnostics: "diagnostics" plain,
+    output_files: "outputFiles" plain,
+});
+
+// FormatNodeForInsertionParams are the parameters for the formatNodeForInsertion method.
+// Go: proto.go:1317 FormatNodeForInsertionParams
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FormatNodeForInsertionParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier, // target file where the node will be inserted
+    pub position: u32, // UTF-16 code-unit offset of the insertion position in the target file
+    pub data: String,  // base64-encoded binary AST data for the synthesized node
+}
+
+proto_json!(both FormatNodeForInsertionParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    position: "position" plain,
+    data: "data" plain,
 });
 
 // CheckerTypeParams are parameters for checker methods that operate on a type.
@@ -2364,6 +2981,7 @@ proto_json!(marshal IndexInfoResponse {
 // Go: proto.go:959 SourceFileResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SourceFileResponse {
+    // Data is the base64-encoded binary AST data in the encoder's format.
     pub data: String,
 }
 
@@ -2374,16 +2992,19 @@ proto_json!(marshal SourceFileResponse {
 // GetDiagnosticsParams are parameters for per-file diagnostic methods.
 // Go: proto.go:964 GetDiagnosticsParams
 #[derive(Clone, Debug, Default, PartialEq)]
+// PORT: Go `Files []DocumentIdentifier` is `Option`: `None` is a nil slice
+// (no `files`, or `null`) and `Some(vec![])` is `[]`. `getDiagnostics`
+// tells them apart.
 pub struct GetDiagnosticsParams {
     pub snapshot: SnapshotID,
     pub project: ProjectID,
-    pub file: Option<DocumentIdentifier>,
+    pub files: Option<Vec<DocumentIdentifier>>,
 }
 
 proto_json!(both GetDiagnosticsParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
-    file: "file" omitempty,
+    files: "files" omitempty,
 });
 
 // GetProjectDiagnosticsParams are parameters for project-wide diagnostic methods.
@@ -2561,338 +3182,12 @@ pub fn no_params(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
     Ok(None)
 }
 
-// ---------------------------------------------------------------------------
-// core.CompilerOptions JSON
-// ---------------------------------------------------------------------------
-
-/// Go v2 marshal of `*core.CompilerOptions` (`ConfigFileResponse.Options`,
-/// `ProjectResponse.CompilerOptions`).
-/// PORT: Go marshals the struct by reflection over its `json` tags
-/// (core/compileroptions.go:16, every field `omitzero`). The port has no
-/// `MarshalerTo` for `CompilerOptions`, so this view writes the same members
-/// in Go order: a `Tristate` writes its `MarshalJSON` text
-/// (core/tristate.go:55), the enum types are Go integers, a `[]string` is
-/// omitted only when nil, and `Paths` is an `OrderedMap` (insertion order;
-/// a nil `[]string` value writes `[]`).
-pub struct CompilerOptionsJSON<'a>(pub &'a CompilerOptions);
-
-// A `Tristate` member with `omitzero` (`TSUnknown` is the zero value).
-fn marshal_tristate_omitzero(
-    enc: &mut String,
-    first: &mut bool,
-    name: &str,
-    value: Tristate,
-) -> Result<(), JsonError> {
-    if value == Tristate::Unknown {
-        return Ok(());
-    }
-    if !*first {
-        enc.push(',');
-    }
-    *first = false;
-    name.marshal_json_to(enc)?;
-    enc.push(':');
-    enc.push_str(std::str::from_utf8(value.marshal_json()).expect("Tristate JSON is ASCII"));
-    Ok(())
-}
-
-// Go `collections.OrderedMap[string, []string]` MarshalJSONTo.
-struct PathsJSON<'a>(&'a IndexMap<String, Option<Vec<String>>>);
-
-impl MarshalerTo for PathsJSON<'_> {
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        enc.push('{');
-        for (i, (k, v)) in self.0.iter().enumerate() {
-            if i > 0 {
-                enc.push(',');
-            }
-            k.marshal_json_to(enc)?;
-            enc.push(':');
-            match v {
-                // A nil slice marshals as `[]` in v2.
-                None => enc.push_str("[]"),
-                Some(v) => v.marshal_json_to(enc)?,
-            }
-        }
-        enc.push('}');
-        Ok(())
-    }
-}
-
-impl MarshalerTo for CompilerOptionsJSON<'_> {
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        let o = self.0;
-        let first = &mut true;
-        write_object_start(enc);
-        marshal_tristate_omitzero(enc, first, "allowJs", o.allow_js)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "allowArbitraryExtensions",
-            o.allow_arbitrary_extensions,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "allowImportingTsExtensions",
-            o.allow_importing_ts_extensions,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "allowNonTsExtensions",
-            o.allow_non_ts_extensions,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "allowUmdGlobalAccess",
-            o.allow_umd_global_access,
-        )?;
-        marshal_tristate_omitzero(enc, first, "allowUnreachableCode", o.allow_unreachable_code)?;
-        marshal_tristate_omitzero(enc, first, "allowUnusedLabels", o.allow_unused_labels)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "assumeChangesOnlyAffectDirectDependencies",
-            o.assume_changes_only_affect_direct_dependencies,
-        )?;
-        marshal_tristate_omitzero(enc, first, "checkJs", o.check_js)?;
-        marshal_opt_field(enc, first, "customConditions", &o.custom_conditions)?;
-        marshal_tristate_omitzero(enc, first, "composite", o.composite)?;
-        marshal_tristate_omitzero(enc, first, "emitDeclarationOnly", o.emit_declaration_only)?;
-        marshal_tristate_omitzero(enc, first, "emitBOM", o.emit_bom)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "emitDecoratorMetadata",
-            o.emit_decorator_metadata,
-        )?;
-        marshal_tristate_omitzero(enc, first, "declaration", o.declaration)?;
-        marshal_field_omitzero(enc, first, "declarationDir", &o.declaration_dir)?;
-        marshal_tristate_omitzero(enc, first, "declarationMap", o.declaration_map)?;
-        marshal_tristate_omitzero(enc, first, "deduplicatePackages", o.deduplicate_packages)?;
-        marshal_tristate_omitzero(enc, first, "disableSizeLimit", o.disable_size_limit)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "disableSourceOfProjectReferenceRedirect",
-            o.disable_source_of_project_reference_redirect,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "disableSolutionSearching",
-            o.disable_solution_searching,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "disableReferencedProjectLoad",
-            o.disable_referenced_project_load,
-        )?;
-        marshal_tristate_omitzero(enc, first, "erasableSyntaxOnly", o.erasable_syntax_only)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "exactOptionalPropertyTypes",
-            o.exact_optional_property_types,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "experimentalDecorators",
-            o.experimental_decorators,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "forceConsistentCasingInFileNames",
-            o.force_consistent_casing_in_file_names,
-        )?;
-        marshal_tristate_omitzero(enc, first, "isolatedModules", o.isolated_modules)?;
-        marshal_tristate_omitzero(enc, first, "isolatedDeclarations", o.isolated_declarations)?;
-        marshal_tristate_omitzero(enc, first, "ignoreConfig", o.ignore_config)?;
-        marshal_field_omitzero(enc, first, "ignoreDeprecations", &o.ignore_deprecations)?;
-        marshal_tristate_omitzero(enc, first, "importHelpers", o.import_helpers)?;
-        marshal_tristate_omitzero(enc, first, "inlineSourceMap", o.inline_source_map)?;
-        marshal_tristate_omitzero(enc, first, "inlineSources", o.inline_sources)?;
-        marshal_tristate_omitzero(enc, first, "init", o.init)?;
-        marshal_tristate_omitzero(enc, first, "incremental", o.incremental)?;
-        marshal_field_omitzero(enc, first, "jsx", &o.jsx.0)?;
-        marshal_field_omitzero(enc, first, "jsxFactory", &o.jsx_factory)?;
-        marshal_field_omitzero(enc, first, "jsxFragmentFactory", &o.jsx_fragment_factory)?;
-        marshal_field_omitzero(enc, first, "jsxImportSource", &o.jsx_import_source)?;
-        marshal_opt_field(enc, first, "lib", &o.lib)?;
-        marshal_tristate_omitzero(enc, first, "libReplacement", o.lib_replacement)?;
-        marshal_field_omitzero(enc, first, "locale", &o.locale)?;
-        marshal_field_omitzero(enc, first, "mapRoot", &o.map_root)?;
-        marshal_field_omitzero(enc, first, "module", &o.module.0)?;
-        marshal_field_omitzero(enc, first, "moduleResolution", &o.module_resolution.0)?;
-        marshal_opt_field(enc, first, "moduleSuffixes", &o.module_suffixes)?;
-        marshal_field_omitzero(enc, first, "moduleDetection", &o.module_detection.0)?;
-        marshal_field_omitzero(enc, first, "newLine", &o.new_line.0)?;
-        marshal_tristate_omitzero(enc, first, "noEmit", o.no_emit)?;
-        marshal_tristate_omitzero(enc, first, "noCheck", o.no_check)?;
-        marshal_tristate_omitzero(enc, first, "noErrorTruncation", o.no_error_truncation)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "noFallthroughCasesInSwitch",
-            o.no_fallthrough_cases_in_switch,
-        )?;
-        marshal_tristate_omitzero(enc, first, "noImplicitAny", o.no_implicit_any)?;
-        marshal_tristate_omitzero(enc, first, "noImplicitThis", o.no_implicit_this)?;
-        marshal_tristate_omitzero(enc, first, "noImplicitReturns", o.no_implicit_returns)?;
-        marshal_tristate_omitzero(enc, first, "noEmitHelpers", o.no_emit_helpers)?;
-        marshal_tristate_omitzero(enc, first, "noLib", o.no_lib)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "noPropertyAccessFromIndexSignature",
-            o.no_property_access_from_index_signature,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "noUncheckedIndexedAccess",
-            o.no_unchecked_indexed_access,
-        )?;
-        marshal_tristate_omitzero(enc, first, "noEmitOnError", o.no_emit_on_error)?;
-        marshal_tristate_omitzero(enc, first, "noUnusedLocals", o.no_unused_locals)?;
-        marshal_tristate_omitzero(enc, first, "noUnusedParameters", o.no_unused_parameters)?;
-        marshal_tristate_omitzero(enc, first, "noResolve", o.no_resolve)?;
-        marshal_tristate_omitzero(enc, first, "noImplicitOverride", o.no_implicit_override)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "noUncheckedSideEffectImports",
-            o.no_unchecked_side_effect_imports,
-        )?;
-        marshal_field_omitzero(enc, first, "outDir", &o.out_dir)?;
-        marshal_opt_field(enc, first, "paths", &o.paths.as_ref().map(PathsJSON))?;
-        marshal_tristate_omitzero(enc, first, "preserveConstEnums", o.preserve_const_enums)?;
-        marshal_tristate_omitzero(enc, first, "preserveSymlinks", o.preserve_symlinks)?;
-        marshal_field_omitzero(enc, first, "project", &o.project)?;
-        marshal_tristate_omitzero(enc, first, "resolveJsonModule", o.resolve_json_module)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "resolvePackageJsonExports",
-            o.resolve_package_json_exports,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "resolvePackageJsonImports",
-            o.resolve_package_json_imports,
-        )?;
-        marshal_tristate_omitzero(enc, first, "removeComments", o.remove_comments)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "rewriteRelativeImportExtensions",
-            o.rewrite_relative_import_extensions,
-        )?;
-        marshal_field_omitzero(enc, first, "reactNamespace", &o.react_namespace)?;
-        marshal_field_omitzero(enc, first, "rootDir", &o.root_dir)?;
-        marshal_opt_field(enc, first, "rootDirs", &o.root_dirs)?;
-        marshal_tristate_omitzero(enc, first, "skipLibCheck", o.skip_lib_check)?;
-        marshal_tristate_omitzero(enc, first, "stableTypeOrdering", o.stable_type_ordering)?;
-        marshal_tristate_omitzero(enc, first, "strict", o.strict)?;
-        marshal_tristate_omitzero(enc, first, "strictBindCallApply", o.strict_bind_call_apply)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "strictBuiltinIteratorReturn",
-            o.strict_builtin_iterator_return,
-        )?;
-        marshal_tristate_omitzero(enc, first, "strictFunctionTypes", o.strict_function_types)?;
-        marshal_tristate_omitzero(enc, first, "strictNullChecks", o.strict_null_checks)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "strictPropertyInitialization",
-            o.strict_property_initialization,
-        )?;
-        marshal_tristate_omitzero(enc, first, "stripInternal", o.strip_internal)?;
-        marshal_tristate_omitzero(enc, first, "skipDefaultLibCheck", o.skip_default_lib_check)?;
-        marshal_tristate_omitzero(enc, first, "sourceMap", o.source_map)?;
-        marshal_field_omitzero(enc, first, "sourceRoot", &o.source_root)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "suppressOutputPathCheck",
-            o.suppress_output_path_check,
-        )?;
-        marshal_field_omitzero(enc, first, "target", &o.target.0)?;
-        marshal_tristate_omitzero(enc, first, "traceResolution", o.trace_resolution)?;
-        marshal_field_omitzero(enc, first, "tsBuildInfoFile", &o.ts_build_info_file)?;
-        marshal_opt_field(enc, first, "typeRoots", &o.type_roots)?;
-        marshal_opt_field(enc, first, "types", &o.types)?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "useDefineForClassFields",
-            o.use_define_for_class_fields,
-        )?;
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "useUnknownInCatchVariables",
-            o.use_unknown_in_catch_variables,
-        )?;
-        marshal_tristate_omitzero(enc, first, "verbatimModuleSyntax", o.verbatim_module_syntax)?;
-        marshal_opt_field(
-            enc,
-            first,
-            "maxNodeModuleJsDepth",
-            &o.max_node_module_js_depth,
-        )?;
-
-        // Deprecated: Do not use outside of options parsing and validation.
-        marshal_tristate_omitzero(
-            enc,
-            first,
-            "allowSyntheticDefaultImports",
-            o.allow_synthetic_default_imports,
-        )?;
-        marshal_tristate_omitzero(enc, first, "alwaysStrict", o.always_strict)?;
-        marshal_field_omitzero(enc, first, "baseUrl", &o.base_url)?;
-        marshal_tristate_omitzero(enc, first, "downlevelIteration", o.downlevel_iteration)?;
-        marshal_tristate_omitzero(enc, first, "esModuleInterop", o.es_module_interop)?;
-        marshal_field_omitzero(enc, first, "outFile", &o.out_file)?;
-
-        // Internal fields
-        marshal_field_omitzero(enc, first, "configFilePath", &o.config_file_path)?;
-        marshal_tristate_omitzero(enc, first, "noDtsResolution", o.no_dts_resolution)?;
-        marshal_field_omitzero(enc, first, "pathsBasePath", &o.paths_base_path)?;
-        marshal_tristate_omitzero(enc, first, "diagnostics", o.diagnostics)?;
-        marshal_tristate_omitzero(enc, first, "extendedDiagnostics", o.extended_diagnostics)?;
-        marshal_field_omitzero(enc, first, "generateCpuProfile", &o.generate_cpu_profile)?;
-        marshal_field_omitzero(enc, first, "generateTrace", &o.generate_trace)?;
-        marshal_tristate_omitzero(enc, first, "listEmittedFiles", o.list_emitted_files)?;
-        marshal_tristate_omitzero(enc, first, "listFiles", o.list_files)?;
-        marshal_tristate_omitzero(enc, first, "explainFiles", o.explain_files)?;
-        marshal_tristate_omitzero(enc, first, "listFilesOnly", o.list_files_only)?;
-        marshal_tristate_omitzero(enc, first, "noEmitForJsFiles", o.no_emit_for_js_files)?;
-        marshal_tristate_omitzero(enc, first, "preserveWatchOutput", o.preserve_watch_output)?;
-        marshal_tristate_omitzero(enc, first, "pretty", o.pretty)?;
-        marshal_tristate_omitzero(enc, first, "version", o.version)?;
-        marshal_tristate_omitzero(enc, first, "watch", o.watch)?;
-        marshal_tristate_omitzero(enc, first, "showConfig", o.show_config)?;
-        marshal_tristate_omitzero(enc, first, "build", o.build)?;
-        marshal_tristate_omitzero(enc, first, "help", o.help)?;
-        marshal_tristate_omitzero(enc, first, "all", o.all)?;
-
-        marshal_field_omitzero(enc, first, "pprofDir", &o.pprof_dir)?;
-        marshal_tristate_omitzero(enc, first, "singleThreaded", o.single_threaded)?;
-        marshal_tristate_omitzero(enc, first, "quiet", o.quiet)?;
-        marshal_opt_field(enc, first, "checkers", &o.checkers)?;
-        write_object_end(enc);
-        Ok(())
-    }
-}
+// PORT: the JSON form of `core.CompilerOptions` (`CompilerOptionsJSON`,
+// `TypeAcquisitionJSON` and the `CompilerOptions` decode) and
+// `marshal_field_omitempty` live in `crate::options_json`, so the compiler
+// side (content mappers) does not depend on `api`. Go keeps them in `core`
+// (struct tags) and in the json package.
+pub use crate::options_json::{CompilerOptionsJSON, TypeAcquisitionJSON, marshal_field_omitempty};
 
 #[cfg(test)]
 mod unmarshal_error_tests {
@@ -2926,5 +3221,34 @@ mod unmarshal_error_tests {
             err_text::<GetSourceFileParams>(r#"{"snapshot":1,"file":5}"#),
             r#"failed to unmarshal *api.GetSourceFileParams: json: cannot unmarshal into Go api.DocumentIdentifier within "/file": DocumentIdentifier: expected string or object, got number"#
         );
+    }
+
+    // tsgo#4849: the client sends back the `compilerOptions` that the API
+    // wrote (`CompilerOptionsJSON`). Decoding them and writing them again
+    // gives the same text. The options are those of the hono-ext traces.
+    #[test]
+    fn transpile_compiler_options_round_trip() {
+        let options = r#"{"composite":true,"declaration":true,"forceConsistentCasingInFileNames":true,"module":6,"moduleResolution":100,"noUnusedLocals":true,"noUnusedParameters":true,"outDir":"/p/dist/types","paths":{"a/*":["b/*"],"c":["d"]},"rootDir":"/p/src","skipLibCheck":true,"strict":true,"target":9,"types":["node"],"esModuleInterop":true,"configFilePath":"/p/tsconfig.build.json"}"#;
+        let data = format!(
+            r#"{{"fileName":"/p/src/a.ts","options":{{"compilerOptions":{options},"reportDiagnostics":true}}}}"#
+        );
+        let parsed = unmarshaller_for::<TranspileFromFileParams>(data.as_bytes())
+            .expect("valid params")
+            .expect("params value");
+        let params = parsed
+            .downcast_ref::<TranspileFromFileParams>()
+            .expect("TranspileFromFileParams");
+        assert!(params.options.report_diagnostics);
+        let compiler_options = params
+            .options
+            .compiler_options
+            .as_ref()
+            .expect("compilerOptions");
+        assert_eq!(compiler_options.module, ModuleKind(6));
+        assert_eq!(compiler_options.strict, Tristate::True);
+        let written =
+            crate::frontend::json::json_marshal(&CompilerOptionsJSON(compiler_options), &[])
+                .expect("marshal");
+        assert_eq!(written, options);
     }
 }

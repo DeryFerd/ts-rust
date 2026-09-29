@@ -1290,7 +1290,7 @@ impl CommonJSModuleTransformer {
         let mut arguments_list = node.argument_list();
         let args = node.arguments().to_vec();
         if !args.is_empty() {
-            let mut first_argument = args[0];
+            let mut first_argument = self.visit_node_with(VisitorKind::Root, args[0]);
             let first_argument_changed;
             if is_string_literal_like(first_argument) {
                 let rewritten =

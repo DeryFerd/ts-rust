@@ -155,26 +155,38 @@ impl Checker {
             symbol = self.get_symbol_of_declaration(declaration);
         }
         if t.is_nil() {
-            t = nb_ctx(b, |c| c.enclosing_symbol_types.get(&symbol).copied())
-                .unwrap_or(TypeId::NIL);
-            if t.is_nil() {
-                let mapper = nb_ctx(b, |c| c.mapper);
-                if self.sym(symbol).flags.intersects(SymbolFlags::ACCESSOR)
-                    && declaration.kind() == SyntaxKind::SetAccessor
-                {
-                    let write_type = self.get_write_type_of_symbol(symbol);
-                    t = self.instantiate_type(write_type, mapper);
-                } else if symbol.is_some()
-                    && !self
-                        .sym(symbol)
-                        .flags
-                        .intersects(SymbolFlags::TYPE_LITERAL | SymbolFlags::SIGNATURE)
-                {
-                    let symbol_type = self.get_type_of_symbol(symbol);
-                    let widened = self.get_widened_literal_type(symbol_type);
-                    t = self.instantiate_type(widened, mapper);
+            if symbol.is_nil() {
+                if is_variable_like(declaration) {
+                    t = self.get_type_for_variable_like_declaration(
+                        declaration,
+                        false,
+                        CheckMode::NORMAL,
+                    );
                 } else {
                     t = self.error_type;
+                }
+            } else {
+                t = nb_ctx(b, |c| c.enclosing_symbol_types.get(&symbol).copied())
+                    .unwrap_or(TypeId::NIL);
+                if t.is_nil() {
+                    let mapper = nb_ctx(b, |c| c.mapper);
+                    if self.sym(symbol).flags.intersects(SymbolFlags::ACCESSOR)
+                        && declaration.kind() == SyntaxKind::SetAccessor
+                    {
+                        let write_type = self.get_write_type_of_symbol(symbol);
+                        t = self.instantiate_type(write_type, mapper);
+                    } else if symbol.is_some()
+                        && !self
+                            .sym(symbol)
+                            .flags
+                            .intersects(SymbolFlags::TYPE_LITERAL | SymbolFlags::SIGNATURE)
+                    {
+                        let symbol_type = self.get_type_of_symbol(symbol);
+                        let widened = self.get_widened_literal_type(symbol_type);
+                        t = self.instantiate_type(widened, mapper);
+                    } else {
+                        t = self.error_type;
+                    }
                 }
             }
         }
@@ -231,7 +243,10 @@ impl Checker {
                         .object_flags()
                         .intersects(ObjectFlags::REQUIRES_WIDENING)))
         {
-            let remove = self.add_symbol_type_to_context(b, symbol, t);
+            let mut remove = None;
+            if symbol.is_some() {
+                remove = Some(self.add_symbol_type_to_context(b, symbol, t));
+            }
             let pc = nb_pc(b);
             // PORT: Go `pt == nil` checks are dropped. The pseudochecker returns
             // `Rc<PseudoType>`, which is never nil (Go returns nil only after debug.Fail).
@@ -240,7 +255,10 @@ impl Checker {
             } else {
                 pc.get_type_of_declaration(&self.symbols, declaration)
             };
-            if pt.kind == PseudoTypeKind::NO_RESULT && is_binary_expression(declaration) {
+            if pt.kind == PseudoTypeKind::NO_RESULT
+                && is_binary_expression(declaration)
+                && symbol.is_some()
+            {
                 let decl = self
                     .sym(symbol)
                     .declarations
@@ -303,7 +321,9 @@ impl Checker {
                     }
                 }
             }
-            remove();
+            if let Some(remove) = remove {
+                remove();
+            }
         }
         if result.is_nil() {
             if reported_inference_fallback {
@@ -499,6 +519,7 @@ impl Checker {
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
         symbol: SymbolId,
+        enclosing_declaration: Node,
     ) -> Node {
         // For hash-private names, clone the original private identifier from the declaration
         let value_declaration = self.sym(symbol).value_declaration;
@@ -527,6 +548,7 @@ impl Checker {
         let from_name_type = self.get_property_name_node_for_symbol_from_name_type(
             b,
             symbol,
+            enclosing_declaration,
             single_quote,
             string_named,
             is_method,
@@ -559,6 +581,7 @@ impl Checker {
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
         symbol: SymbolId,
+        enclosing_declaration: Node,
         single_quote: bool,
         string_named: bool,
         is_method: bool,
@@ -572,6 +595,32 @@ impl Checker {
             .map_or(TypeId::NIL, |l| l.name_type);
         if name_type.is_nil() {
             return Node::NIL;
+        }
+        let mut enum_enclosing_declaration = enclosing_declaration;
+        let enclosing_file = nb_ctx(b, |c| c.enclosing_file);
+        if enum_enclosing_declaration.is_nil() && enclosing_file.is_some() {
+            enum_enclosing_declaration = enclosing_file;
+        }
+        if self.ty(name_type).flags.intersects(TypeFlags::ENUM_LITERAL) {
+            let name_type_symbol = self.ty(name_type).symbol;
+            let mut enum_symbol = self.sym(name_type_symbol).parent;
+            if enum_symbol.is_nil() {
+                enum_symbol = name_type_symbol;
+            }
+            if enum_enclosing_declaration.is_some()
+                && self.is_symbol_accessible_by_flags(
+                    enum_symbol,
+                    enum_enclosing_declaration,
+                    SymbolFlags::VALUE,
+                )
+            {
+                let save_enclosing_declaration = nb_ctx(b, |c| c.enclosing_declaration);
+                nb_ctx_mut(b, |c| c.enclosing_declaration = enum_enclosing_declaration);
+                let expression = self.symbol_to_expression(b, name_type_symbol, SymbolFlags::VALUE);
+                let result = nb_e(b).factory().new_computed_property_name(expression);
+                nb_ctx_mut(b, |c| c.enclosing_declaration = save_enclosing_declaration);
+                return result;
+            }
         }
         let e = nb_e(b);
         let f = e.factory();
@@ -692,7 +741,8 @@ impl Checker {
         } else {
             nb_ctx_mut(b, |c| c.enclosing_declaration = save_enclosing_declaration);
         }
-        let property_name = self.get_property_name_node_for_symbol(b, property_symbol);
+        let property_name =
+            self.get_property_name_node_for_symbol(b, property_symbol, save_enclosing_declaration);
         nb_ctx_mut(b, |c| c.enclosing_declaration = save_enclosing_declaration);
         let name_length = go_len(&symbol_name(&self.symbols, property_symbol)) as i32;
         nb_ctx_mut(b, |c| c.approximate_length += name_length + 1);
@@ -1447,6 +1497,9 @@ impl Checker {
         no_mapped_types: bool,
     ) -> TypeId {
         // !!! noMappedTypes optional param support
+        if node.parent().is_nil() {
+            return self.error_type;
+        }
         let t = self.get_type_from_type_node(node);
         let mapper = nb_ctx(b, |c| c.mapper);
         if mapper.is_nil() {

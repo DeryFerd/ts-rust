@@ -3,7 +3,9 @@ use crate::api::prelude::*;
 // Port of Go `internal/api/session.go`, lines 1-1271: the snapshot
 // registries, `Session`, `NewSession`, the checker and language service
 // setup, the `HandleRequest` dispatch and the snapshot, project, symbol and
-// type handlers up to `handleGetTargetOfSignature`. Lines 1272-2484 are
+// type handlers up to `handleGetTargetOfSignature`, the transpile handlers
+// (tsgo#4849), then `handleGetImportAdderEdits` and `toAPITextEdits`
+// (tsgo#3881) and `originalTextOffset` (tsgo#4712). Lines 1272-2484 are
 // `session_p2.rs`.
 //
 // PORT notes for both files:
@@ -36,6 +38,7 @@ use crate::api::prelude::*;
 
 use crate::api::encoder;
 use crate::astnav;
+use crate::emitter::emitter::EmitOnly;
 use crate::frontend::compiler;
 use crate::frontend::core_context::{self, CheckerLifetime};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
@@ -45,8 +48,10 @@ use crate::frontend::vfs;
 use crate::frontend::vfs::Fs as _;
 use crate::gostd::{self, Context, GoError, errors};
 use crate::ls;
+use crate::ls::autoimport;
 use crate::program::ls_program;
 use crate::project;
+use crate::transpile;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -765,6 +770,41 @@ impl CheckerSetup {
     ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
         self.sd.resolve_signature_handle(&self.project_id, id)
     }
+
+    // Go: api/session.go:525 checkerSetup.resolveLocation
+    // resolveLocation resolves an optional location, given either as a node handle or as a
+    // file and position. Returns nil when neither is provided.
+    pub fn resolve_location(
+        &self,
+        handle: &NodeHandle,
+        file: Option<&DocumentIdentifier>,
+        position: Option<u32>,
+    ) -> Result<Node, GoError> {
+        if !handle.0.is_empty() {
+            return self.sd.resolve_node_handle(&self.program, handle);
+        }
+        if let (Some(file), Some(position)) = (file, position) {
+            let source_file = self
+                .program
+                .get_source_file(&file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            return Ok(astnav::get_touching_property_name(
+                source_file,
+                source_file_get_position_map(source_file).utf16_to_utf8(position as i32),
+            ));
+        }
+        Ok(Node::NIL)
+    }
 }
 
 /// PORT: Go returns a typed handler result as `any`. A typed nil pointer or
@@ -810,6 +850,37 @@ impl Session {
             ));
         };
         Ok(sd)
+    }
+
+    // Go: api/session.go:463 retainSnapshotData (tsgo#4642)
+    // retainSnapshotData pins snapshot data while an operation builds a derived snapshot.
+    pub fn retain_snapshot_data(&self, handle: SnapshotID) -> Result<Rc<SnapshotData>, GoError> {
+        let sd = self.snapshots.borrow().get(&handle).cloned();
+        let Some(sd) = sd else {
+            return Err(errors::errorf(
+                format!("{}: snapshot {} not found", *ERR_CLIENT_ERROR, handle.0),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        sd.ref_count.set(sd.ref_count.get() + 1);
+        Ok(sd)
+    }
+
+    // Go: api/session.go:474 releaseSnapshot (tsgo#4642)
+    pub fn release_snapshot(&self, handle: SnapshotID) -> Result<(), GoError> {
+        let sd = self.snapshots.borrow().get(&handle).cloned();
+        let Some(sd) = sd else {
+            return Err(errors::errorf(
+                format!("{}: snapshot {} not found", *ERR_CLIENT_ERROR, handle.0),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        sd.ref_count.set(sd.ref_count.get() - 1);
+        if sd.ref_count.get() <= 0 {
+            self.snapshots.borrow_mut().remove(&handle);
+            project::Snapshot::deref(&sd.snapshot, &self.project_session);
+        }
+        Ok(())
     }
 
     // Go: api/session.go:342 setupChecker
@@ -883,7 +954,7 @@ impl Session {
     }
 }
 
-impl Handler for Session {
+impl ipc::Handler for Session {
     // Go: api/session.go:375 HandleRequest
     // HandleRequest implements Handler.
     fn handle_request(
@@ -923,8 +994,33 @@ impl Handler for Session {
             m if m == Method::UPDATE_SNAPSHOT.0 => self
                 .handle_update_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::UPDATE_TEMPORARY_SNAPSHOT.0 => self
+                .handle_update_temporary_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::PARSE_COMMAND_LINE.0 => self
+                .handle_parse_command_line(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::READ_CONFIG_FILE.0 => self
+                .handle_read_config_file(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::PARSE_JSON_CONFIG_FILE.0 => self
+                .handle_parse_json_config_file_content(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::PARSE_CONFIG_FILE.0 => self
                 .handle_parse_config_file(ctx, assert_params(&parsed))
+                .map(to_any),
+            // tsgo#4849
+            m if m == Method::TRANSPILE_MODULE.0 => self
+                .handle_transpile(ctx, assert_params(&parsed), false)
+                .map(to_any),
+            m if m == Method::TRANSPILE_MODULE_FROM_FILE.0 => self
+                .handle_transpile_from_file(ctx, assert_params(&parsed), false)
+                .map(to_any),
+            m if m == Method::TRANSPILE_DECLARATION.0 => self
+                .handle_transpile(ctx, assert_params(&parsed), true)
+                .map(to_any),
+            m if m == Method::TRANSPILE_DECLARATION_FROM_FILE.0 => self
+                .handle_transpile_from_file(ctx, assert_params(&parsed), true)
                 .map(to_any),
             m if m == Method::GET_DEFAULT_PROJECT_FOR_FILE.0 => self
                 .handle_get_default_project_for_file(ctx, assert_params(&parsed))
@@ -938,6 +1034,12 @@ impl Handler for Session {
             m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
                 .handle_get_source_file_metadata(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_CONFIG_FILE_NAMES.0 => self
+                .handle_get_config_file_names(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_CONFIG_SOURCE_FILE.0 => {
+                self.handle_get_config_source_file(ctx, assert_params(&parsed))
+            }
             m if m == Method::GET_SYMBOL_AT_POSITION.0 => self
                 .handle_get_symbol_at_position(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -950,6 +1052,12 @@ impl Handler for Session {
             m if m == Method::GET_SYMBOLS_AT_LOCATIONS.0 => self
                 .handle_get_symbols_at_locations(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_SYMBOL_OF_SOURCE_FILE.0 => self
+                .handle_get_symbol_of_source_file(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_SYMBOLS_OF_SOURCE_FILES.0 => self
+                .handle_get_symbols_of_source_files(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TYPE_OF_SYMBOL.0 => self
                 .handle_get_type_of_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -961,6 +1069,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::RESOLVE_NAME.0 => self
                 .handle_resolve_name(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_SYMBOLS_IN_SCOPE.0 => self
+                .handle_get_symbols_in_scope(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_SIGNATURES_OF_TYPE.0 => self
                 .handle_get_signatures_of_type(ctx, assert_params(&parsed))
@@ -1076,6 +1187,9 @@ impl Handler for Session {
             m if m == Method::GET_PARAMETER_TYPE.0 => self
                 .handle_get_parameter_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_TYPE_PARAMETER_AT_POSITION.0 => self
+                .handle_get_type_parameter_at_position(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::IS_ARRAY_LIKE_TYPE.0 => self
                 .handle_is_array_like_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1100,6 +1214,20 @@ impl Handler for Session {
             m if m == Method::PRINT_NODE.0 => self
                 .handle_print_node(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::FORMAT_NODE_FOR_INSERTION.0 => self
+                .handle_format_node_for_insertion(ctx, assert_params(&parsed))
+                .map(to_any),
+            // tsgo#4699
+            m if m == Method::EMIT.0 => self.handle_emit(ctx, assert_params(&parsed)).map(to_any),
+            m if m == Method::EMIT_TO_STRING.0 => self
+                .handle_emit_to_string(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_JAVA_SCRIPT_EMIT.0 => self
+                .handle_selected_files_emit(ctx, assert_params(&parsed), EmitOnly::Js)
+                .map(to_any),
+            m if m == Method::GET_DECLARATION_EMIT.0 => self
+                .handle_selected_files_emit(ctx, assert_params(&parsed), EmitOnly::Dts)
+                .map(to_any),
             m if m == Method::IS_CONTEXT_SENSITIVE.0 => self
                 .handle_is_context_sensitive(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1118,6 +1246,9 @@ impl Handler for Session {
             m if m == Method::GET_PROPERTIES_OF_TYPE.0 => self
                 .handle_get_properties_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_APPARENT_PROPERTIES_OF_TYPE.0 => self
+                .handle_get_apparent_properties_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_APPARENT_TYPE.0 => self
                 .handle_get_apparent_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1133,8 +1264,14 @@ impl Handler for Session {
             m if m == Method::GET_BASE_CONSTRAINT_OF_TYPE.0 => self
                 .handle_get_base_constraint_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            m if m == Method::GET_DEFAULT_FROM_TYPE_PARAMETER.0 => self
+                .handle_get_default_from_type_parameter(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TYPE_ARGUMENTS.0 => self
                 .handle_get_type_arguments(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_IMPORT_ADDER_EDITS.0 => self
+                .handle_get_import_adder_edits(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_CONSTANT_VALUE.0 => {
                 self.handle_get_constant_value(ctx, assert_params(&parsed))
@@ -1150,6 +1287,9 @@ impl Handler for Session {
                 .map(to_any),
             m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
                 .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_FULLY_QUALIFIED_NAME.0 => self
+                .handle_get_fully_qualified_name(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_EXPORTS_OF_MODULE.0 => self
                 .handle_get_exports_of_module(ctx, assert_params(&parsed))
@@ -1202,8 +1342,18 @@ impl Handler for Session {
             m if m == Method::GET_ES_SYMBOL_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_es_symbol_type)
                 .map(to_any),
+            m if m == Method::GET_NON_PRIMITIVE_TYPE.0 => self
+                .handle_get_intrinsic_type(
+                    ctx,
+                    assert_params(&parsed),
+                    Checker::get_non_primitive_type,
+                )
+                .map(to_any),
             m if m == Method::GET_WELL_KNOWN_SYMBOLS.0 => self
                 .handle_get_well_known_symbols(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_WELL_KNOWN_SIGNATURES.0 => self
+                .handle_get_well_known_signatures(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_SYNTACTIC_DIAGNOSTICS.0 => self
                 .handle_get_syntactic_diagnostics(ctx, assert_params(&parsed))
@@ -1514,6 +1664,81 @@ impl Session {
         })
     }
 
+    // Go: api/session.go:1076 handleUpdateTemporarySnapshot (tsgo#4642)
+    // handleUpdateTemporarySnapshot creates a temporary snapshot that overrides the
+    // content of a single file, without opening/closing any projects or files and
+    // without advancing the session's latest snapshot.
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
+    // body runs in a closure, and the release runs after it on every path.
+    pub fn handle_update_temporary_snapshot(
+        &self,
+        ctx: &Context,
+        params: &UpdateTemporarySnapshotParams,
+    ) -> Result<UpdateSnapshotResponse, GoError> {
+        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        let result = (|| {
+            let uri = params
+                .file
+                .to_uri(&self.project_session.get_current_directory());
+
+            let snapshot = match self.project_session.api_update_temporary(
+                ctx,
+                &base_sd.snapshot,
+                &uri,
+                params.new_text.clone(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return Err(errors::errorf(
+                        format!(
+                            "{}: failed to update temporary snapshot: {}",
+                            *ERR_CLIENT_ERROR, err
+                        ),
+                        vec![ERR_CLIENT_ERROR.clone(), err],
+                    ));
+                }
+            };
+
+            let handle = snapshot_handle(&snapshot);
+            let existing = self.snapshots.borrow().get(&handle).cloned();
+            if let Some(sd) = existing {
+                project::Snapshot::deref(&snapshot, &self.project_session);
+                sd.ref_count.set(sd.ref_count.get() + 1);
+            } else {
+                let sd = Rc::new(SnapshotData {
+                    snapshot: snapshot.clone(),
+                    ref_count: Cell::new(1),
+                    symbol_registry: RefCell::new(FxHashMap::default()),
+                    symbol_canonical_projects: RefCell::new(FxHashMap::default()),
+                    project_registries: RefCell::new(FxHashMap::default()),
+                });
+                self.snapshots.borrow_mut().insert(handle, sd);
+            }
+
+            // Build projects list
+            let projects = snapshot.project_collection.projects();
+            let mut project_responses = Vec::with_capacity(projects.len());
+            for proj in &projects {
+                if proj.borrow().command_line.is_none() {
+                    continue;
+                }
+                project_responses.push(new_project_response(&proj.borrow()));
+            }
+
+            // Compute changes from the requested base snapshot so the client can retain
+            // cached source files for unchanged files.
+            let changes = compute_snapshot_changes(&base_sd.snapshot, &snapshot);
+
+            Ok(UpdateSnapshotResponse {
+                snapshot: handle,
+                projects: project_responses,
+                changes: Some(changes),
+            })
+        })();
+        let _ = self.release_snapshot(params.snapshot);
+        result
+    }
+
     // Go: api/session.go:699 handleRelease
     // handleRelease decrements the ref count for a snapshot.
     // The snapshot and its registries are only cleaned up when the ref count reaches zero.
@@ -1529,22 +1754,7 @@ impl Session {
             ));
         };
 
-        let sd = self.snapshots.borrow().get(&params.snapshot).cloned();
-        let Some(sd) = sd else {
-            return Err(errors::errorf(
-                format!(
-                    "{}: snapshot {} not found",
-                    *ERR_CLIENT_ERROR, params.snapshot.0
-                ),
-                vec![ERR_CLIENT_ERROR.clone()],
-            ));
-        };
-        sd.ref_count.set(sd.ref_count.get() - 1);
-        if sd.ref_count.get() <= 0 {
-            self.snapshots.borrow_mut().remove(&params.snapshot);
-            // Release the API session's ref on the project snapshot.
-            project::Snapshot::deref(&sd.snapshot, &self.project_session);
-        }
+        self.release_snapshot(params.snapshot)?;
         Ok(to_any(true))
     }
 
@@ -1567,6 +1777,99 @@ impl Session {
         };
 
         Ok(Some(new_project_response(&proj.borrow())))
+    }
+
+    // Go: api/session.go:1161 handleParseCommandLine
+    // handleParseCommandLine parses command-line arguments.
+    pub fn handle_parse_command_line(
+        &self,
+        _ctx: &Context,
+        params: &ParseCommandLineParams,
+    ) -> Result<Option<ConfigFileResponse>, GoError> {
+        Ok(new_config_file_response(Some(
+            &tsoptions::parse_command_line(&params.command_line, &*self.project_session),
+        )))
+    }
+
+    // Go: api/session.go:1166 handleReadConfigFile
+    // handleReadConfigFile reads and parses a JSON configuration file.
+    pub fn handle_read_config_file(
+        &self,
+        _ctx: &Context,
+        params: &ReadConfigFileParams,
+    ) -> Result<ReadConfigFileResponse, GoError> {
+        let config_file_name = params
+            .file
+            .to_absolute_file_name(&self.project_session.get_current_directory());
+        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+        if !ok {
+            return Ok(ReadConfigFileResponse {
+                config: tsoptions::CompilerOptionsValue::Map(IndexMap::new()),
+                error: Some(new_diagnostic_response(&new_compiler_diagnostic(
+                    diag::Cannot_read_file_0,
+                    args![config_file_name],
+                ))),
+            });
+        }
+
+        let (config, parse_errors) = tsoptions::parse_config_file_text_to_json(
+            &config_file_name,
+            self.to_path(&config_file_name),
+            &config_file_content,
+        );
+        let mut response = ReadConfigFileResponse {
+            config,
+            error: None,
+        };
+        if !parse_errors.is_empty() {
+            response.error = Some(new_diagnostic_response(&parse_errors[0]));
+        }
+        Ok(response)
+    }
+
+    // Go: api/session.go:1189 handleParseJsonConfigFileContent
+    // handleParseJsonConfigFileContent parses an in-memory JSON configuration.
+    pub fn handle_parse_json_config_file_content(
+        &self,
+        _ctx: &Context,
+        params: &ParseJsonConfigFileContentParams,
+    ) -> Result<Option<ConfigFileResponse>, GoError> {
+        if params.config_directory.is_none() == params.config_file_name.is_none() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: exactly one of configDirectory or configFileName is required",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let base_path;
+        let mut config_file_name = String::new();
+        if let Some(config_directory) = &params.config_directory {
+            base_path = tspath::get_normalized_absolute_path(
+                config_directory,
+                &self.project_session.get_current_directory(),
+            );
+        } else {
+            config_file_name = params
+                .config_file_name
+                .as_ref()
+                .expect("configFileName is set")
+                .to_absolute_file_name(&self.project_session.get_current_directory());
+            base_path = tspath::get_directory_path(&config_file_name);
+        }
+
+        let parsed_command_line = tsoptions::parse_json_config_file_content(
+            &json_value_to_any(&params.json),
+            &*self.project_session,
+            &base_path,
+            None, /*existingOptions*/
+            &config_file_name,
+            &[],  /*resolutionStack*/
+            None, /*extendedConfigCache*/
+        );
+        Ok(new_config_file_response(Some(&parsed_command_line)))
     }
 
     // Go: api/session.go:737 handleParseConfigFile
@@ -1605,18 +1908,83 @@ impl Session {
             None, /*existingOptionsRaw*/
             &config_file_name,
             &[],  /*resolutionStack*/
-            &[],  /*extraFileExtensions*/
             None, /*extendedConfigCache*/
         );
 
-        // PORT: Go shares the `*core.CompilerOptions`; the response holds a
-        // copy (a response value must be `Send`).
-        Ok(ConfigFileResponse {
-            file_names: parsed_command_line.file_names().to_vec(),
-            options: Some((**parsed_command_line.compiler_options()).clone()),
-        })
+        // PORT: Go returns a `*ConfigFileResponse` that is never nil here.
+        Ok(new_config_file_response(Some(&parsed_command_line))
+            .expect("NewConfigFileResponse of a parsed command line"))
     }
 
+    // Go: api/session.go:1242 handleTranspile (tsgo#4849)
+    pub fn handle_transpile(
+        &self,
+        ctx: &Context,
+        params: &TranspileParams,
+        declaration: bool,
+    ) -> Result<TranspileOutputResponse, GoError> {
+        transpile_output(ctx, &params.input, &params.options, declaration)
+    }
+
+    // Go: api/session.go:1246 handleTranspileFromFile (tsgo#4849)
+    pub fn handle_transpile_from_file(
+        &self,
+        ctx: &Context,
+        params: &TranspileFromFileParams,
+        declaration: bool,
+    ) -> Result<TranspileOutputResponse, GoError> {
+        let file_name = tspath::get_normalized_absolute_path(
+            &params.file_name,
+            &self.project_session.get_current_directory(),
+        );
+        let (input, ok) = self.project_session.fs().read_file(&file_name);
+        if !ok {
+            return Err(errors::errorf(
+                format!(
+                    "{}: could not read file {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(&file_name)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let mut options = params.options.clone();
+        options.file_name = file_name;
+        transpile_output(ctx, &input, &options, declaration)
+    }
+}
+
+// Go: api/session.go:1257 transpileOutput (tsgo#4849)
+fn transpile_output(
+    ctx: &Context,
+    input: &str,
+    options: &TranspileOptions,
+    declaration: bool,
+) -> Result<TranspileOutputResponse, GoError> {
+    let transpile_options = transpile::Options {
+        compiler_options: options.compiler_options.clone(),
+        file_name: options.file_name.clone(),
+        report_diagnostics: options.report_diagnostics,
+    };
+    let output = if declaration {
+        transpile::transpile_declaration(ctx, input, transpile_options)
+    } else {
+        transpile::transpile_module(ctx, input, transpile_options)
+    };
+    let Some(output) = output else {
+        if let Some(err) = ctx.err() {
+            return Err(err);
+        }
+        return Err(errors::new("transpilation produced no output"));
+    };
+    Ok(TranspileOutputResponse {
+        output_text: output.output_text,
+        diagnostics: new_diagnostic_responses(&output.diagnostics),
+        source_map_text: output.source_map_text,
+    })
+}
+
+impl Session {
     // Go: api/session.go:769 handleGetSourceFile
     // handleGetSourceFile returns a source file from a project within a snapshot.
     pub fn handle_get_source_file(
@@ -1630,9 +1998,104 @@ impl Session {
         // The encoder reads lazy JSDoc (file header, "Current program").
         let _program = ls_program::enter(program);
 
-        let source_file = program
-            .get_source_file(&params.file.to_file_name())
-            .map_or(Node::NIL, |f| f.root);
+        self.encode_source_file_response(
+            program
+                .get_source_file(&params.file.to_file_name())
+                .map_or(Node::NIL, |f| f.root),
+        )
+    }
+
+    // Go: api/session.go:1301 handleGetConfigFileNames
+    // handleGetConfigFileNames returns tsconfig file names associated with the project's command line.
+    // PORT: Go `program.CommandLine()` is never nil in the port.
+    pub fn handle_get_config_file_names(
+        &self,
+        _ctx: &Context,
+        params: &GetProjectDiagnosticsParams,
+    ) -> Result<Vec<String>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+
+        let command_line = program.command_line();
+        let Some(config_file) = command_line
+            .config_file
+            .as_ref()
+            .filter(|f| f.source_file.is_some())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let extended_files = command_line.extended_source_files();
+        let mut config_files = Vec::with_capacity(extended_files.len() + 1);
+        config_files.push(config_file.file_name.clone());
+        config_files.extend(extended_files.iter().cloned());
+        Ok(config_files)
+    }
+
+    // Go: api/session.go:1327 handleGetConfigSourceFile
+    // handleGetConfigSourceFile returns a tsconfig source file associated with the project's command line.
+    pub fn handle_get_config_source_file(
+        &self,
+        _ctx: &Context,
+        params: &GetSourceFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let program = sd.get_program(&params.project)?;
+        // The encoder reads lazy JSDoc (file header, "Current program").
+        let _program = ls_program::enter(&program);
+
+        let command_line = program.command_line();
+        let Some(root_config_source_file) = command_line
+            .config_file
+            .as_ref()
+            .filter(|f| f.source_file.is_some())
+        else {
+            return self.encode_source_file_response(Node::NIL);
+        };
+
+        let requested_path = tspath::to_path(
+            &params.file.to_file_name(),
+            &program.get_current_directory(),
+            program.use_case_sensitive_file_names(),
+        );
+        if root_config_source_file.path == requested_path {
+            return self.encode_source_file_response(root_config_source_file.source_file);
+        }
+
+        for config_file_name in command_line.extended_source_files() {
+            if tspath::to_path(
+                config_file_name,
+                &program.get_current_directory(),
+                program.use_case_sensitive_file_names(),
+            ) != requested_path
+            {
+                continue;
+            }
+
+            let (config_file_content, ok) = sd.snapshot.read_file(config_file_name);
+            if !ok {
+                return self.encode_source_file_response(Node::NIL);
+            }
+
+            let config_source_file = tsoptions::new_tsconfig_source_file_from_file_path(
+                config_file_name,
+                requested_path,
+                &config_file_content,
+            );
+            return self.encode_source_file_response(config_source_file.source_file);
+        }
+
+        self.encode_source_file_response(Node::NIL)
+    }
+
+    // Go: api/session.go:1366 encodeSourceFileResponse
+    // PORT: Go `*ast.SourceFile` is the root node; `Node::NIL` is nil.
+    pub fn encode_source_file_response(
+        &self,
+        source_file: Node,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         if source_file.is_nil() {
             if self.use_binary_responses {
                 return Ok(to_any(RawBinary(Vec::new())));
@@ -1651,7 +2114,6 @@ impl Session {
             }
         };
 
-        // Return raw binary for msgpack protocol, or base64 for JSON
         if self.use_binary_responses {
             return Ok(to_any(RawBinary(data)));
         }
@@ -1747,6 +2209,78 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1468 handleGetSymbolOfSourceFile
+    // handleGetSymbolOfSourceFile returns the module symbol for a source file, if any.
+    // For non-module (script) files, returns nil.
+    pub fn handle_get_symbol_of_source_file(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolOfSourceFileParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let source_file = setup
+            .program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    params.file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let symbol = setup
+            .checker
+            .borrow_mut()
+            .get_symbol_at_location_exported(source_file);
+        if symbol.is_nil() {
+            return Ok(None);
+        }
+        Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1488 handleGetSymbolsOfSourceFiles
+    // handleGetSymbolsOfSourceFiles returns the module symbols for multiple source files.
+    pub fn handle_get_symbols_of_source_files(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolsOfSourceFilesParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let mut results: Vec<Option<SymbolResponse>> =
+            (0..params.files.len()).map(|_| None).collect();
+        for (i, file) in params.files.iter().enumerate() {
+            let source_file = setup
+                .program
+                .get_source_file(&file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            let symbol = setup
+                .checker
+                .borrow_mut()
+                .get_symbol_at_location_exported(source_file);
+            if symbol.is_some() {
+                results[i] = setup.new_symbol_response(symbol);
+            }
+        }
+        Ok(results)
     }
 
     // Go: api/session.go:831 handleGetSymbolsAtPositions
@@ -1861,19 +2395,12 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
-        if symbol.is_nil() {
-            return Ok(None);
-        }
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
         let t = setup
             .checker
             .borrow_mut()
             .get_type_of_symbol_exported(symbol);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -1890,17 +2417,14 @@ impl Session {
             (0..params.symbols.len()).map(|_| None).collect();
         for (i, &sym_handle) in params.symbols.iter().enumerate() {
             let (owner, symbol) = setup.resolve_symbol_handle(sym_handle)?;
-            if symbol.is_nil() {
-                continue;
-            }
             let symbol = checker_symbol(&setup.checker, &owner, symbol);
+            // resolveSymbolHandle errors on an unresolvable handle and GetTypeOfSymbol
+            // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup
                 .checker
                 .borrow_mut()
                 .get_type_of_symbol_exported(symbol);
-            if t.is_some() {
-                results[i] = setup.new_type_response(t);
-            }
+            results[i] = setup.new_type_response(t);
         }
 
         Ok(results)
@@ -1916,19 +2440,12 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
-        if symbol.is_nil() {
-            return Ok(None);
-        }
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
         let t = setup
             .checker
             .borrow_mut()
             .get_declared_type_of_symbol_exported(symbol);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -1942,31 +2459,8 @@ impl Session {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         // Resolve location node - either from node handle or from fileName+position
-        let mut location = Node::NIL;
-        if !params.location.0.is_empty() {
-            location = setup
-                .sd
-                .resolve_node_handle(&setup.program, &params.location)?;
-        } else if let (Some(file), Some(position)) = (&params.file, params.position) {
-            let source_file = setup
-                .program
-                .get_source_file(&file.to_file_name())
-                .map_or(Node::NIL, |f| f.root);
-            if source_file.is_nil() {
-                return Err(errors::errorf(
-                    format!(
-                        "{}: source file not found: {}",
-                        *ERR_CLIENT_ERROR,
-                        file.string()
-                    ),
-                    vec![ERR_CLIENT_ERROR.clone()],
-                ));
-            }
-            location = astnav::get_touching_property_name(
-                source_file,
-                source_file_get_position_map(source_file).utf16_to_utf8(position as i32),
-            );
-        }
+        let location =
+            setup.resolve_location(&params.location, params.file.as_ref(), params.position)?;
 
         let symbol = setup.checker.borrow_mut().resolve_name_exported(
             &params.name,
@@ -1979,6 +2473,41 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(symbol))
+    }
+
+    // Go: api/session.go:1667 handleGetSymbolsInScope
+    // handleGetSymbolsInScope returns all symbols with the given meaning that are visible at a location.
+    // PORT: Go builds the list from Go maps, so its order is random; the
+    // port's order is stable (`Checker::get_symbols_in_scope`).
+    pub fn handle_get_symbols_in_scope(
+        &self,
+        ctx: &Context,
+        params: &GetSymbolsInScopeParams,
+    ) -> Result<Vec<Option<SymbolResponse>>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let location =
+            setup.resolve_location(&params.location, params.file.as_ref(), params.position)?;
+        if location.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: getSymbolsInScope requires a location",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let symbols = setup
+            .checker
+            .borrow_mut()
+            .get_symbols_in_scope_exported(location, SymbolFlags(params.meaning));
+        let mut results = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            results.push(setup.new_symbol_response(symbol));
+        }
+
+        Ok(results)
     }
 
     // Go: api/session.go:1015 handleGetSignaturesOfType
@@ -2017,9 +2546,6 @@ impl Session {
         let node = setup
             .sd
             .resolve_node_handle(&setup.program, &params.location)?;
-        if node.is_nil() {
-            return Ok(None);
-        }
 
         let sig = setup
             .checker
@@ -2040,15 +2566,8 @@ impl Session {
         let node = setup
             .sd
             .resolve_node_handle(&setup.program, &params.location)?;
-        if node.is_nil() {
-            return Ok(None);
-        }
 
         let t = setup.checker.borrow_mut().get_type_at_location(node);
-        if t.is_nil() {
-            return Ok(None);
-        }
-
         Ok(setup.new_type_response(t))
     }
 
@@ -2065,13 +2584,10 @@ impl Session {
             (0..params.locations.len()).map(|_| None).collect();
         for (i, loc) in params.locations.iter().enumerate() {
             let node = setup.sd.resolve_node_handle(&setup.program, loc)?;
-            if node.is_nil() {
-                continue;
-            }
+            // resolveNodeHandle errors on an unresolvable handle and GetTypeAtLocation
+            // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup.checker.borrow_mut().get_type_at_location(node);
-            if t.is_some() {
-                results[i] = setup.new_type_response(t);
-            }
+            results[i] = setup.new_type_response(t);
         }
 
         Ok(results)
@@ -2378,6 +2894,8 @@ impl Session {
     }
 
     // Go: api/session.go:1252 handleGetConstraintOfType
+    // handleGetConstraintOfType returns the constraint of a substitution type.
+    // Type parameter constraints are handled by handleGetConstraintOfTypeParameter.
     pub fn handle_get_constraint_of_type(
         &self,
         _ctx: &Context,
@@ -2430,5 +2948,271 @@ impl Session {
         self.resolve_signature_property_of_signature(params, &|c: &Checker, sig: SignatureId| {
             c.sig(sig).target()
         })
+    }
+
+    // Go: api/session.go:1953 handleGetImportAdderEdits (tsgo#3881, tsgo#4712)
+    // PORT: Go returns `[]*TextEdit`, and `toAPITextEdits` can return nil
+    // (JSON `null`); nil is `None`.
+    // PORT: Go `defer preparedSnapshot.Deref(s.projectSession)` is the
+    // `Release` guard `_deref_prepared`. It is declared before the checker
+    // lease, so the lease (`defer done()`) ends first, as in Go. Go passes
+    // `ch` to `NewImportAdder`; the port's adder takes the checker in
+    // `AddImportFromExportedSymbol` (import_adder.rs header). A symbol handle
+    // indexes the arena of the checker that made it, so `checker_symbol` maps
+    // it into `ch` (file header).
+    pub fn handle_get_import_adder_edits(
+        &self,
+        ctx: &Context,
+        params: &GetImportAdderEditsParams,
+    ) -> Result<Option<Vec<TextEdit>>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+
+        let project_path = parse_project_handle(&params.project);
+        let mut working_snapshot = sd.snapshot.clone();
+        let mut program = sd.get_program(&params.project)?;
+        let mut source_file = program
+            .get_source_file(&params.file.to_file_name())
+            .map_or(Node::NIL, |f| f.root);
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file not found: {}",
+                    *ERR_CLIENT_ERROR,
+                    params.file.string()
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+
+        let mut user_preferences = working_snapshot.user_preferences();
+        let mut _deref_prepared = ls_program::Release::noop();
+        let registry = working_snapshot.auto_import_registry();
+        if registry.is_none()
+            || !autoimport::Registry::is_prepared_for_importing_file(
+                registry.as_deref(),
+                source_file_file_name(source_file),
+                &project_path,
+                &user_preferences,
+            )
+        {
+            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+                ctx,
+                &working_snapshot,
+                &params
+                    .file
+                    .to_uri(&self.project_session.get_current_directory()),
+            );
+            _deref_prepared = {
+                let (snapshot, session) = (prepared_snapshot.clone(), self.project_session.clone());
+                ls_program::Release::new(move || project::Snapshot::deref(&snapshot, &session))
+            };
+
+            working_snapshot = prepared_snapshot;
+            let proj = working_snapshot
+                .project_collection
+                .get_project_by_path(&project_path);
+            let Some(proj) = proj else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: project {} not found",
+                        *ERR_CLIENT_ERROR,
+                        project_path.as_str()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let proj_program = proj.borrow().get_program();
+            let Some(proj_program) = proj_program else {
+                return Err(errors::errorf(
+                    format!("{}: project has no program", *ERR_CLIENT_ERROR),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            program = proj_program;
+            source_file = program
+                .get_source_file(&params.file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: source file not found: {}",
+                        *ERR_CLIENT_ERROR,
+                        params.file.string()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            user_preferences = working_snapshot.user_preferences();
+        }
+
+        let registry = working_snapshot.auto_import_registry();
+        let Some(registry) = registry else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let (ch, _done) = ls_program::get_type_checker(&program, ctx);
+
+        let view = autoimport::new_view(
+            registry,
+            source_file,
+            project_path,
+            program.clone(),
+            user_preferences.module_specifier_preferences(),
+        );
+        let mut import_adder = autoimport::new_import_adder(
+            ctx,
+            &program,
+            source_file,
+            Rc::new(view),
+            working_snapshot
+                .get_preferences(source_file_file_name(source_file))
+                .format_code_settings,
+            working_snapshot.converters(),
+            user_preferences,
+        );
+
+        for (i, action) in params.actions.iter().enumerate() {
+            match action.kind.0.as_str() {
+                IMPORT_ADDER_ACTION_KIND_IMPORT_SYMBOL => {
+                    if action.symbol.0 == 0 {
+                        return Err(errors::errorf(
+                            format!(
+                                "{}: import adder action {} missing symbol",
+                                *ERR_CLIENT_ERROR, i
+                            ),
+                            vec![ERR_CLIENT_ERROR.clone()],
+                        ));
+                    }
+                    let (owner, symbol) = sd.resolve_symbol_handle(action.symbol)?;
+                    let symbol = checker_symbol(&ch, &owner, symbol);
+                    let mut is_valid_type_only_use_site = true;
+                    if let Some(value) = action.is_valid_type_only_use_site {
+                        is_valid_type_only_use_site = value;
+                    }
+                    import_adder.add_import_from_exported_symbol(
+                        &mut ch.borrow_mut(),
+                        symbol,
+                        is_valid_type_only_use_site,
+                    );
+                }
+                _ => {
+                    return Err(errors::errorf(
+                        format!(
+                            "{}: unknown import adder action kind {}",
+                            *ERR_CLIENT_ERROR,
+                            gostd::strconv::quote(&action.kind.0)
+                        ),
+                        vec![ERR_CLIENT_ERROR.clone()],
+                    ));
+                }
+            }
+        }
+
+        if !import_adder.has_fixes() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(to_api_text_edits(source_file, &import_adder.edits()))
+    }
+}
+
+// Go: api/session.go:2044 toAPITextEdits (tsgo#3881, tsgo#4712)
+// PORT: Go returns nil when an edit position is outside the original text;
+// nil is `None`.
+pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Option<Vec<TextEdit>> {
+    let original_text = source_file_original_text(source_file);
+    let line_map = lsconv::compute_lsp_line_starts(original_text);
+    let position_map = compute_position_map(original_text);
+    let mut result = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let (start, ok) = original_text_offset(&line_map, &edit.range.start, original_text.len());
+        if !ok {
+            return None;
+        }
+        let (end, ok) = original_text_offset(&line_map, &edit.range.end, original_text.len());
+        if !ok {
+            return None;
+        }
+        result.push(TextEdit {
+            pos: position_map.utf8_to_utf16(start),
+            end: position_map.utf8_to_utf16(end),
+            new_text: edit.new_text.clone(),
+        });
+    }
+    Some(result)
+}
+
+// Go: api/session.go:2067 originalTextOffset (tsgo#4712)
+// PORT: Go `int` arithmetic is `i64` here; the offset is at most the text
+// length, so it fits the `i32` that `PositionMap` takes.
+pub fn original_text_offset(
+    line_map: &lsconv::LSPLineMap,
+    position: &lsproto::Position,
+    text_length: usize,
+) -> (i32, bool) {
+    let line = i64::from(position.line);
+    if line < 0 || line >= line_map.line_starts.len() as i64 {
+        return (0, false);
+    }
+    let line_start = i64::from(line_map.line_starts[line as usize]);
+    let offset = line_start + i64::from(position.character);
+    if offset < line_start || offset > text_length as i64 {
+        return (0, false);
+    }
+    (offset as i32, true)
+}
+
+// Go: api/session_textedit_test.go (tsgo#4712)
+#[cfg(test)]
+mod textedit_tests {
+    use super::*;
+    use crate::frontend::parser::{self, SourceFileParseOptions};
+
+    // Go: api/session_textedit_test.go:14 TestToAPITextEditsUsesOriginalCoordinates
+    // PORT: Go sets the info on the parsed `*ast.SourceFile`. Here the parse
+    // is recorded (`program::note_parsed_source_file`) and the info is set on
+    // the `ParsedSourceFile`, as the content mapper transform does.
+    #[test]
+    fn test_to_api_text_edits_uses_original_coordinates() {
+        let source_file = Rc::new(parser::parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/app.vue".to_string(),
+                path: tspath::Path("/app.vue".to_string()),
+                ..Default::default()
+            },
+            "const transformed = true;",
+            ScriptKind::TS,
+        ));
+        crate::program::note_parsed_source_file(&source_file);
+        source_file.set_content_mapper_info(ContentMapperSourceFileInfo {
+            original_text: "😀\nabc".to_string(),
+            content_mapper: "mapper".to_string(),
+            ..Default::default()
+        });
+
+        let edits = to_api_text_edits(
+            source_file.root,
+            &[lsproto::TextEdit {
+                range: lsproto::Range {
+                    start: lsproto::Position {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: lsproto::Position {
+                        line: 1,
+                        character: 2,
+                    },
+                },
+                new_text: "x".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            edits,
+            Some(vec![TextEdit {
+                pos: 4,
+                end: 5,
+                new_text: "x".to_string(),
+            }])
+        );
     }
 }

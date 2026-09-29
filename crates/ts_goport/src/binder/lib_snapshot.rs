@@ -667,7 +667,10 @@ impl Decoder<'_> {
             end,
             code,
             category,
+            // tsgo#4712: a lib file has no external diagnostic.
+            source: String::new(),
             message,
+            message_text: String::new(),
             message_args,
             message_chain,
             related_information,
@@ -680,8 +683,6 @@ impl Decoder<'_> {
 
     fn file_bind(&mut self) -> Option<FileBindData> {
         let bind_diagnostics = self.diagnostics()?;
-        let bind_suggestion_diagnostics = self.diagnostics()?;
-        let end_flow_node = self.flow()?;
         let symbol_count = self.r.u32()? as i32;
         let pattern_count = self.r.count()?;
         let mut pattern_ambient_modules = Vec::with_capacity(pattern_count);
@@ -694,8 +695,6 @@ impl Decoder<'_> {
         }
         Some(FileBindData {
             bind_diagnostics,
-            bind_suggestion_diagnostics,
-            end_flow_node,
             symbol_count,
             pattern_ambient_modules,
             global_exports: self.table()?,
@@ -1030,8 +1029,6 @@ impl Encoder {
 
     fn file_bind(&mut self, data: &FileBindData) -> Result<(), String> {
         self.diagnostics(&data.bind_diagnostics)?;
-        self.diagnostics(&data.bind_suggestion_diagnostics)?;
-        self.flow(data.end_flow_node)?;
         self.u32(data.symbol_count as u32);
         self.count(data.pattern_ambient_modules.len())?;
         for module in &data.pattern_ambient_modules {
@@ -1147,12 +1144,24 @@ pub(crate) fn snapshot_libs() -> Vec<&'static str> {
     let mut libs: Vec<(&'static str, usize)> = bundled::LIB_NAMES
         .iter()
         .filter_map(|&name| {
-            let text = bundled::bundled_text(&format!("{}/{name}", bundled::lib_path()))?;
+            let text = lib_text(name)?;
             (text.len() >= MIN_TEXT_LEN).then_some((name, text.len()))
         })
         .collect();
     libs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
     libs.into_iter().map(|(name, _)| name).collect()
+}
+
+/// The text of bundled lib `name`: the embedded text, or in a `noembed`
+/// build the file in `bundled::lib_path()` (read and leaked on each call).
+/// The lib snapshot tests use it, so they run on both builds.
+#[cfg(test)]
+pub(crate) fn lib_text(name: &str) -> Option<&'static str> {
+    let path = format!("{}/{name}", bundled::lib_path());
+    bundled::bundled_text(&path).or_else(|| {
+        let text = std::fs::read_to_string(&path).ok()?;
+        Some(Box::leak(text.into_boxed_str()))
+    })
 }
 
 #[cfg(test)]

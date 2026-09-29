@@ -237,10 +237,15 @@ pub fn init(fanotify_watcher: &mut WatcherStruct) {
     }
 }
 
-// Go: fanotify_linux.go:188 fanotifyAvailable
+// Go: fanotify_linux.go:190 fanotifyAvailable
 /// fanotifyAvailable probes whether fanotify_init succeeds with the flags
 /// this backend needs.
+///
+/// PORT: Go `runtime.GOOS` is `std::env::consts::OS`.
 pub fn fanotify_available() -> bool {
+    if std::env::consts::OS == "android" {
+        return false;
+    }
     let fd = match unix::fanotify_init(
         FANOTIFY_INIT_FLAGS,
         (unix::O_RDONLY | unix::O_CLOEXEC) as u32,
@@ -534,19 +539,21 @@ impl FanotifyBackend {
         }
     }
 
-    // Go: fanotify_linux.go:345 fanotifyBackend.markDir
+    // Go: fanotify_linux.go:351 fanotifyBackend.markDir
     pub fn mark_dir(&self, w: &Arc<DirWatch>, path: &str, mark_path: &str) -> Result<(), GoError> {
         let (fanotify_fd, mark_mask) = {
             let l = self.locked.lock().unwrap();
             (l.fanotify_fd, l.mark_mask)
         };
-        unix::fanotify_mark(
+        if let Err(err) = unix::fanotify_mark(
             fanotify_fd,
             FANOTIFY_MARK_ADD_FLAGS,
             mark_mask,
             unix::AT_FDCWD,
             mark_path,
-        )?;
+        ) {
+            return Err(maybe_wrap_unsupported_filesystem(err));
+        }
         let handle = match unix::name_to_handle_at(unix::AT_FDCWD, mark_path, 0) {
             Ok((handle, _)) => handle,
             Err(err) => {
@@ -558,10 +565,10 @@ impl FanotifyBackend {
                     unix::AT_FDCWD,
                     mark_path,
                 );
-                return Err(errors::errorf(
+                return Err(maybe_wrap_unsupported_filesystem(errors::errorf(
                     format!("name_to_handle_at: {}", err.error()),
                     vec![err],
-                ));
+                )));
             }
         };
         let mut st = unix::Statfs_t::default();
@@ -927,6 +934,22 @@ impl FanotifyBackend {
             !list.is_empty()
         });
     }
+}
+
+// Go: fanotify_linux.go:372 maybeWrapUnsupportedFilesystem
+// PORT: a free function after the `fanotifyBackend` methods (Go puts it
+// after `markDir`).
+pub fn maybe_wrap_unsupported_filesystem(err: GoError) -> GoError {
+    if errors::is(&err, &errors::from_value(unix::EOPNOTSUPP))
+        || errors::is(&err, &errors::from_value(unix::ENOTSUP))
+        || errors::is(&err, &errors::from_value(unix::ENODEV))
+    {
+        return errors::errorf(
+            format!("{}: {}", err.error(), ERR_FILESYSTEM_UNSUPPORTED.error()),
+            vec![err, ERR_FILESYSTEM_UNSUPPORTED.clone()],
+        );
+    }
+    err
 }
 
 // Go: fanotify_linux.go:589 parseFanotifyDfidNames

@@ -1,4 +1,6 @@
-//! Port of internal/api/timing_test.go (tsgo#4512).
+//! Port of internal/ipc/timing_test.go (tsgo#4512; internal/api/timing_test.go
+//! before tsgo#4712). The file keeps its `api_timing` name, so the test
+//! names do not change.
 //!
 //! PORT: Go `time.Duration` is signed and a `std::time::Duration` is not, so
 //! the Go cases with a negative duration ("negative durations clamp to zero"
@@ -6,12 +8,12 @@
 
 use super::Subtests;
 use std::time::Duration;
-use ts_goport::api::{
+use ts_goport::ipc::{
     SERVER_RECENT_REQUEST_CAPACITY, duration_to_millis, new_timing_collector,
     server_timing_snapshot,
 };
 
-// Go: api/timing_test.go:10 TestTimingCollector
+// Go: ipc/timing_test.go:10 TestTimingCollector
 #[test]
 fn test_timing_collector() {
     let mut t = Subtests::new("TestTimingCollector");
@@ -58,7 +60,7 @@ fn test_timing_collector() {
     t.finish();
 }
 
-// Go: api/timing_test.go:59 TestServerTimingSnapshotDisabled
+// Go: ipc/timing_test.go:59 TestServerTimingSnapshotDisabled
 #[test]
 fn test_server_timing_snapshot_disabled() {
     let snap = server_timing_snapshot(None);
@@ -67,7 +69,7 @@ fn test_server_timing_snapshot_disabled() {
     assert_eq!(snap.recent_requests.len(), 0);
 }
 
-// Go: api/timing_test.go:67 TestTimingCollectorReset
+// Go: ipc/timing_test.go:67 TestTimingCollectorReset
 #[test]
 fn test_timing_collector_reset() {
     let mut c = new_timing_collector();
@@ -88,7 +90,7 @@ fn test_timing_collector_reset() {
     assert_eq!(snap.recent_requests[0].method, "c");
 }
 
-// Go: api/timing_test.go:87 TestDurationToMillis
+// Go: ipc/timing_test.go:87 TestDurationToMillis
 #[test]
 fn test_duration_to_millis() {
     assert_eq!(duration_to_millis(Duration::from_micros(1500)), 1.5);

@@ -507,11 +507,6 @@ pub fn get_class_extends_heritage_element(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ast/utilities.go:3071 GetImplementsTypeNodes
-pub fn get_implements_type_nodes(node: Node) -> Vec<Node> {
-    get_heritage_elements(node, SyntaxKind::ImplementsKeyword)
-}
-
 // Go: ast/utilities.go:3075 IsTypeKeywordToken
 pub fn is_type_keyword_token(node: Node) -> bool {
     node.kind() == SyntaxKind::TypeKeyword

@@ -161,7 +161,8 @@ impl NewProgram {
             .iter()
             .flat_map(|m| m.values())
             .collect();
-        redirect_files.sort_by_key(|r| r.index);
+        // Go: compiler/program.go:2063 slices.SortFunc(redirectFiles, a.index - b.index)
+        crate::gostd::slices::sort_func(&mut redirect_files, |a, b| a.index.cmp(&b.index) as i32);
 
         let files = self.get_source_files();
         let mut source_file_index = 0;
@@ -274,7 +275,8 @@ impl NewProgram {
         source_file: &ParsedSourceFile,
         force_dts_emit: bool,
     ) -> bool {
-        source_file_may_be_emitted(source_file, self, force_dts_emit)
+        // #4699: Go passes `false` for the new `forceJsEmit`.
+        source_file_may_be_emitted(source_file, self, force_dts_emit, false)
     }
 
     // Go: program.go:1930 (*Program).ResolvedPackageNames
@@ -486,6 +488,7 @@ impl NewProgram {
                             RESOLUTION_MODE_COMMON_JS,
                             None,
                         ) && package_resolution.is_resolved()
+                            && !package_resolution.original_path.is_empty()
                         {
                             known_symlinks.process_resolution(
                                 &combine_paths(
@@ -828,7 +831,9 @@ impl NewProgram {
                         .files
                         .iter()
                         .filter(|file| {
-                            self.source_file_may_be_emitted(file, false)
+                            // #4699: Go `sourceFileMayBeEmitted(file, p, false
+                            // /*forceDtsEmit*/, false /*forceJsEmit*/)`.
+                            source_file_may_be_emitted(file, self, false, false)
                                 && !file.is_declaration_file
                         })
                         .map(|file| file.file_name().to_string())
@@ -849,18 +854,21 @@ impl NewProgram {
     }
 
     // Go: program.go:714 (*Program).getSourceFilesToEmit
+    // PORT: Go nil `targetSourceFiles` is `None`; an empty slice is
+    // `Some(&[])` (#4699: a slice of targets and `forceJsEmit`).
     pub fn get_source_files_to_emit(
         &self,
-        target_source_file: Option<&Rc<ParsedSourceFile>>,
+        target_source_files: Option<&[Rc<ParsedSourceFile>]>,
         force_dts_emit: bool,
+        force_js_emit: bool,
     ) -> Vec<Rc<ParsedSourceFile>> {
-        if target_source_file.is_none() && !force_dts_emit {
+        if target_source_files.is_none() && !force_dts_emit && !force_js_emit {
             return self
                 .source_files_to_emit
-                .get_or_init(|| get_source_files_to_emit(self, None, false))
+                .get_or_init(|| get_source_files_to_emit(self, None, false, false))
                 .clone();
         }
-        get_source_files_to_emit(self, target_source_file, force_dts_emit)
+        get_source_files_to_emit(self, target_source_files, force_dts_emit, force_js_emit)
     }
 }
 
@@ -871,17 +879,29 @@ pub fn source_file_may_be_emitted(
     source_file: &ParsedSourceFile,
     host: &NewProgram,
     force_dts_emit: bool,
+    force_js_emit: bool,
 ) -> bool {
     // TODO: move this to outputpaths?
 
     let options = host.options();
     // Js files are emitted only if option is enabled
-    if options.no_emit_for_js_files.is_true() && source_file.is_js() {
+    // #4699: a forced JS emit keeps JS files.
+    if !force_js_emit && options.no_emit_for_js_files.is_true() && source_file.is_js() {
         return false;
     }
 
     // Declaration files are not emitted
     if source_file.is_declaration_file {
+        return false;
+    }
+
+    // Runtime output for content-mapped files is owned by the external content mapper or build tool. Only
+    // include them in the emit set when their transformed TypeScript can produce declarations.
+    // tsgo#4712
+    if !source_file.content_mapper().is_empty()
+        && !force_dts_emit
+        && !options.get_emit_declarations()
+    {
         return false;
     }
 
@@ -891,7 +911,8 @@ pub fn source_file_may_be_emitted(
     }
 
     // forcing dts emit => file needs to be emitted
-    if force_dts_emit {
+    // #4699: a forced JS emit too.
+    if force_dts_emit || force_js_emit {
         return true;
     }
 
@@ -951,18 +972,24 @@ pub fn source_file_may_be_emitted(
 }
 
 // Go: emitter.go:506 getSourceFilesToEmit
+// PORT: Go nil `targetSourceFiles` is `None` (#4699: a slice of targets and
+// `forceJsEmit`).
 pub fn get_source_files_to_emit(
     host: &NewProgram,
-    target_source_file: Option<&Rc<ParsedSourceFile>>,
+    target_source_files: Option<&[Rc<ParsedSourceFile>]>,
     force_dts_emit: bool,
+    force_js_emit: bool,
 ) -> Vec<Rc<ParsedSourceFile>> {
-    let source_files: Vec<Rc<ParsedSourceFile>> = match target_source_file {
-        Some(target_source_file) => vec![target_source_file.clone()],
-        None => host.processed_files.files.clone(),
+    let target_source_files: &[Rc<ParsedSourceFile>] = match target_source_files {
+        Some(target_source_files) => target_source_files,
+        None => &host.processed_files.files,
     };
-    source_files
-        .into_iter()
-        .filter(|source_file| source_file_may_be_emitted(source_file, host, force_dts_emit))
+    target_source_files
+        .iter()
+        .filter(|source_file| {
+            source_file_may_be_emitted(source_file, host, force_dts_emit, force_js_emit)
+        })
+        .cloned()
         .collect()
 }
 
@@ -976,6 +1003,10 @@ impl OutputPathsHost for NewProgram {
     }
     fn use_case_sensitive_file_names(&self) -> bool {
         NewProgram::use_case_sensitive_file_names(self)
+    }
+    // tsgo#4712
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        NewProgram::content_mapper_extensions(self)
     }
 }
 

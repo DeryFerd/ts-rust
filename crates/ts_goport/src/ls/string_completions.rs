@@ -18,10 +18,8 @@ use crate::ls::prelude::*;
 //   collected with `slices.Collect(maps.Values(...))`. It is an `IndexMap`
 //   in insertion order. PORT: Go map order is random; the oracle compares
 //   that output without order.
-// - Go `fromPaths []*pathCompletion` is nil exactly when it is empty: every
-//   producer (`slices.Collect`, `deduplicateModuleCompletions` over appended
-//   values, `core.Map` of those) returns nil for no entries. So Go
-//   `fromPaths != nil` is `!from_paths.is_empty()`.
+// - Go `fromPaths *pathCompletions` (tsgo#4712) is `Option<PathCompletions>`.
+//   It is set even when it has no entries.
 // - Go byte-offset string cuts whose boundary is not guaranteed by a prefix
 //   check use `String::from_utf8_lossy` on the bytes (Go keeps raw bytes;
 //   Rust text must stay valid UTF-8).
@@ -35,6 +33,7 @@ use crate::gostd::Context;
 use crate::ls::lsutil;
 use crate::lsp::lsproto;
 use crate::modulespecifiers;
+use crate::spanmap::Fidelity;
 
 // Go: ls/string_completions.go:30 completionsFromTypes
 #[derive(Clone, Debug, Default)]
@@ -56,17 +55,23 @@ struct PathCompletion {
     name: String,
     kind: lsutil::ScriptElementKind,
     extension: String,
-    text_range: Option<TextRange>,
 }
 
-// Go: ls/string_completions.go:47 stringLiteralCompletions
-// PORT: Go `*T` fields are `Option<T>`; `from_paths` is empty for Go nil
-// (see the file header).
+// Go: ls/string_completions.go:46 pathCompletions
+// PORT: Go `replacementSpan *lsproto.Range`; nil is `None`.
+#[derive(Clone, Debug, Default)]
+struct PathCompletions {
+    entries: Vec<PathCompletion>,
+    replacement_span: Option<lsproto::Range>,
+}
+
+// Go: ls/string_completions.go:51 stringLiteralCompletions
+// PORT: Go `*T` fields are `Option<T>`.
 #[derive(Clone, Debug, Default)]
 struct StringLiteralCompletions {
     from_types: Option<CompletionsFromTypes>,
     from_properties: Option<CompletionsFromProperties>,
-    from_paths: Vec<PathCompletion>,
+    from_paths: Option<PathCompletions>,
 }
 
 impl LanguageService {
@@ -82,13 +87,13 @@ impl LanguageService {
         include_symbols: bool,
     ) -> Option<CompletionList> {
         if is_in_reference_comment(file, position) {
-            let entries = self.get_triple_slash_reference_completions(
+            let completion = self.get_triple_slash_reference_completions(
                 file,
                 position,
                 self.get_program(),
                 checker,
             );
-            return self.convert_path_completions(ctx, &entries, file, position);
+            return self.convert_path_completions(ctx, completion.as_ref(), file, position);
         }
         if is_in_string(file, position, context_token) {
             if context_token.is_nil() || !is_string_literal_like(context_token) {
@@ -133,9 +138,13 @@ impl LanguageService {
 
         let optional_replacement_range =
             self.create_range_from_string_literal_like_content(file, context_token, position);
-        if !completion.from_paths.is_empty() {
-            let completion = completion.from_paths;
-            return self.convert_path_completions(ctx, &completion, file, position);
+        if completion.from_paths.is_some() {
+            return self.convert_path_completions(
+                ctx,
+                completion.from_paths.as_ref(),
+                file,
+                position,
+            );
         } else if let Some(completion) = completion.from_properties {
             // PORT: every `completionDataData` field is written; the ones Go
             // leaves out get their Go zero value.
@@ -164,7 +173,7 @@ impl LanguageService {
                 has_unresolved_auto_imports: false,
                 default_commit_characters: None,
             };
-            let (_, mut items) = self.get_completion_entries_from_symbols(
+            let (_, mut items) = match self.get_completion_entries_from_symbols(
                 ctx,
                 type_checker,
                 &data,
@@ -173,7 +182,10 @@ impl LanguageService {
                 file,
                 options,
                 include_symbols, /*includeSymbols*/
-            );
+            ) {
+                Ok(result) => result,
+                Err(err) => panic!("{}", err.error()),
+            };
             let default_commit_characters =
                 get_default_commit_characters(completion.has_index_signature);
             let item_defaults = self.set_item_defaults(
@@ -227,6 +239,7 @@ impl LanguageService {
                         false, /*preselect*/
                         "",    /*source*/
                         None,  /*autoImportEntryData*/
+                        None,  /*additionalTextEdits*/
                         None,  /*detail*/
                     );
                     CompletionItem {
@@ -255,28 +268,24 @@ impl LanguageService {
         None
     }
 
-    // Go: ls/string_completions.go:199 convertPathCompletions
-    // PORT: Go returns a non-nil `*CompletionList`; this always returns `Some`.
+    // Go: ls/string_completions.go:206 convertPathCompletions
+    // PORT: Go `completion *pathCompletions`; nil is `None`.
     fn convert_path_completions(
         &self,
         ctx: &Context,
-        path_completions: &[PathCompletion],
+        completion: Option<&PathCompletions>,
         file: Node,
         position: i32,
     ) -> Option<CompletionList> {
+        let Some(completion) = completion else {
+            return None;
+        };
         let is_new_identifier_location = true; // The user may type in a path that doesn't yet exist, creating a "new identifier" with respect to the collection of identifiers the server is aware of.
         let default_commit_characters = get_default_commit_characters(is_new_identifier_location);
-        let mut items: Vec<CompletionItem> = path_completions
+        let mut items: Vec<CompletionItem> = completion
+            .entries
             .iter()
             .map(|path_completion| {
-                let mut replacement_span = None;
-                if let Some(text_range) = path_completion.text_range {
-                    replacement_span = Some(self.create_lsp_range_from_bounds(
-                        text_range.pos(),
-                        text_range.end(),
-                        file,
-                    ));
-                }
                 let mut detail = path_completion.name.clone();
                 if !path_completion
                     .name
@@ -292,7 +301,7 @@ impl LanguageService {
                     SORT_TEXT_LOCATION_PRIORITY,
                     path_completion.kind,
                     kind_modifiers_from_extension(&path_completion.extension),
-                    replacement_span,
+                    completion.replacement_span,
                     None, /*commitCharacters*/
                     None, /*labelDetails*/
                     file,
@@ -303,6 +312,7 @@ impl LanguageService {
                     false, /*preselect*/
                     "",    /*source*/
                     None,  /*autoImportEntryData*/
+                    None,  /*additionalTextEdits*/
                     Some(detail),
                 );
                 CompletionItem {
@@ -341,12 +351,12 @@ impl LanguageService {
             SyntaxKind::LiteralType => {
                 let grandparent = walk_up_parentheses(parent.parent());
                 if grandparent.kind() == SyntaxKind::ImportType {
-                    return Some(self.get_string_literal_completions_from_module_names(
+                    return self.get_string_literal_completions_from_module_names(
                         file,
                         node,
                         self.get_program(),
                         type_checker,
-                    ));
+                    );
                 }
                 from_unionable_literal_type(grandparent, parent, position, type_checker)
             }
@@ -474,12 +484,12 @@ impl LanguageService {
                 //      import x = require("/*completion position*/");
                 //      var y = require("/*completion position*/");
                 //      export * from "/*completion position*/";
-                Some(self.get_string_literal_completions_from_module_names(
+                self.get_string_literal_completions_from_module_names(
                     file,
                     node,
                     self.get_program(),
                     type_checker,
-                ))
+                )
             }
             SyntaxKind::CaseClause => {
                 let clauses = parent.parent().clauses().nodes().to_vec();
@@ -793,40 +803,66 @@ fn string_literal_completions_from_properties(
 }
 
 impl LanguageService {
-    // Go: ls/string_completions.go:580 getStringLiteralCompletionsFromModuleNames
+    // Go: ls/string_completions.go:587 getStringLiteralCompletionsFromModuleNames
+    // PORT: Go returns `*stringLiteralCompletions`; nil is `None`.
     fn get_string_literal_completions_from_module_names(
         &self,
         file: Node,
         node: Node,
         program: &compiler::NewProgram,
         checker: &mut Checker,
-    ) -> StringLiteralCompletions {
+    ) -> Option<StringLiteralCompletions> {
+        let text_start = astnav::get_start_of_node(node, file, false /*includeJSDoc*/) + 1;
+        let (replacement_span, ok) = self.path_completion_replacement_span(
+            file,
+            get_directory_fragment_range(node.text(), text_start),
+        );
+        if !ok {
+            return None;
+        }
         let name_and_kinds = self
             .get_string_literal_completions_from_module_names_worker(file, node, program, checker);
-        let text_start = astnav::get_start_of_node(node, file, false /*includeJSDoc*/) + 1;
-        StringLiteralCompletions {
-            from_paths: add_replacement_spans(node.text(), text_start, name_and_kinds),
+        Some(StringLiteralCompletions {
+            from_paths: Some(PathCompletions {
+                entries: to_path_completions(name_and_kinds),
+                replacement_span,
+            }),
             ..Default::default()
-        }
+        })
     }
 }
 
-// Go: ls/string_completions.go:598 addReplacementSpans
-fn add_replacement_spans(
-    text: &str,
-    text_start: i32,
-    names: Vec<ModuleCompletionNameAndKind>,
-) -> Vec<PathCompletion> {
-    let text_range = get_directory_fragment_range(text, text_start);
+// Go: ls/string_completions.go:612 toPathCompletions
+fn to_path_completions(names: Vec<ModuleCompletionNameAndKind>) -> Vec<PathCompletion> {
     names
         .into_iter()
         .map(|name_and_kind| PathCompletion {
             name: name_and_kind.name,
             kind: modulet_to_script_element_kind(name_and_kind.kind),
             extension: name_and_kind.extension,
-            text_range,
         })
         .collect()
+}
+
+impl LanguageService {
+    // Go: ls/string_completions.go:622 pathCompletionReplacementSpan
+    // PORT: Go `textRange *core.TextRange` and the `*lsproto.Range` result;
+    // nil is `None`.
+    fn path_completion_replacement_span(
+        &self,
+        file: Node,
+        text_range: Option<TextRange>,
+    ) -> (Option<lsproto::Range>, bool) {
+        let Some(text_range) = text_range else {
+            return (None, true);
+        };
+        let (lsp_range, fidelity): (lsproto::Range, Fidelity) =
+            self.create_lsp_range_from_bounds(text_range.pos(), text_range.end(), file);
+        if !fidelity.is_exact() {
+            return (None, false);
+        }
+        (Some(lsp_range), true)
+    }
 }
 
 // Go: ls/string_completions.go:610 moduletToScriptElementKind
@@ -1355,24 +1391,20 @@ impl LanguageService {
     }
 }
 
-// Go: ls/string_completions.go:969 tryRemoveDirectoryPrefix
+// Go: ls/string_completions.go:992 tryRemoveDirectoryPrefix
+// tsgo#4900: `TrimFilePathPrefix` cuts the prefix by runes, not by its byte
+// length.
 fn try_remove_directory_prefix(
     path: &str,
     prefix: &str,
     use_case_sensitive_file_names: bool,
 ) -> Option<String> {
-    let canonical_path = tspath::get_canonical_file_name(path, use_case_sensitive_file_names);
-    let canonical_prefix = tspath::get_canonical_file_name(prefix, use_case_sensitive_file_names);
-    if canonical_path.starts_with(canonical_prefix.as_str()) {
-        // PORT: Go `path[len(prefix):]` cuts bytes; see the file header.
-        let mut without_prefix =
-            String::from_utf8_lossy(&path.as_bytes()[prefix.len()..]).into_owned();
-        if without_prefix.starts_with('/') || without_prefix.starts_with('\\') {
-            without_prefix = without_prefix[1..].to_string();
-        }
-        return Some(without_prefix);
+    let without_prefix =
+        tspath::trim_file_path_prefix(path, prefix, use_case_sensitive_file_names)?;
+    if without_prefix.starts_with('/') || without_prefix.starts_with('\\') {
+        return Some(without_prefix[1..].to_string());
     }
-    None
+    Some(without_prefix.into_owned())
 }
 
 impl LanguageService {
@@ -1417,7 +1449,14 @@ impl LanguageService {
         mode: ResolutionMode,
         checker: Option<&mut Checker>,
     ) -> ExtensionOptions {
-        let extensions_to_search = get_supported_extensions_for_module_resolution(options, checker);
+        let extensions_to_search = get_supported_extensions_for_module_resolution(
+            options,
+            &self
+                .get_program()
+                .command_line()
+                .content_mapper_extensions(),
+            checker,
+        );
 
         ExtensionOptions {
             extensions_to_search,
@@ -1432,6 +1471,7 @@ impl LanguageService {
 // Go: ls/string_completions.go:1021 getSupportedExtensionsForModuleResolution
 fn get_supported_extensions_for_module_resolution(
     options: &CompilerOptions,
+    extra_extensions: &[String],
     checker: Option<&mut Checker>,
 ) -> Vec<String> {
     /* file extensions from ambient modules declarations e.g. *.css */
@@ -1446,8 +1486,7 @@ fn get_supported_extensions_for_module_resolution(
             extensions.push(name[1..].to_string());
         }
     }
-    let supported_extensions =
-        tsoptions::get_supported_extensions(options, &[] /*extraFileExtensions*/);
+    let supported_extensions = tsoptions::get_supported_extensions(options, extra_extensions);
     for ext in supported_extensions {
         extensions.extend(ext);
     }
@@ -2714,7 +2753,7 @@ impl LanguageService {
         checker: &mut Checker,
         doc_format: lsproto::MarkupKind,
     ) -> lsproto::CompletionItem {
-        if !completion.from_paths.is_empty() {
+        if completion.from_paths.is_some() {
             // Path completions have eagerly-resolved details so the client can show an accurate icon
             // for items of file kind based on the file extension provided in the item detail.
             return item;
@@ -2845,7 +2884,7 @@ impl LanguageService {
         position: i32,
         program: &compiler::NewProgram,
         _checker: &mut Checker,
-    ) -> Vec<PathCompletion> {
+    ) -> Option<PathCompletions> {
         let compiler_options = program.options();
         let token = astnav::get_token_at_position(file, position);
         let comment_ranges = get_leading_comment_ranges(
@@ -2862,13 +2901,20 @@ impl LanguageService {
             }
         }
         let Some(found_range) = found_range else {
-            return Vec::new();
+            return None;
         };
 
         let text = &source_file_text(file)[found_range.pos() as usize..position as usize];
         let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(text);
         if !ok {
-            return Vec::new();
+            return None;
+        }
+        let (replacement_span, ok) = self.path_completion_replacement_span(
+            file,
+            get_directory_fragment_range(to_complete, found_range.pos() + prefix.len() as i32),
+        );
+        if !ok {
+            return None;
         }
 
         let script_path = tspath::get_directory_path(&source_file_info(file).path);
@@ -2919,6 +2965,28 @@ impl LanguageService {
             _ => Vec::new(),
         };
 
-        add_replacement_spans(to_complete, found_range.pos() + prefix.len() as i32, names)
+        Some(PathCompletions {
+            entries: to_path_completions(names),
+            replacement_span,
+        })
+    }
+}
+
+// Go: ls/string_completions_test.go (tsgo#4900)
+#[cfg(test)]
+mod tests {
+    use super::try_remove_directory_prefix;
+
+    // Go: ls/string_completions_test.go:17 TestTryRemoveDirectoryPrefixCaseFoldingShrinksPrefix
+    // Each Kelvin sign '\u212A' below case-folds to the single-byte 'k', so the raw
+    // prefix is longer in bytes (15) than path (12), even though path's canonical
+    // form is case-insensitively prefixed by prefix's canonical form.
+    #[test]
+    fn test_try_remove_directory_prefix_case_folding_shrinks_prefix() {
+        let prefix = "/a/\u{212A}\u{212A}\u{212A}\u{212A}";
+        let path = "/a/kkkk/x.ts";
+        let actual =
+            try_remove_directory_prefix(path, prefix, false /*useCaseSensitiveFileNames*/);
+        assert_eq!(actual.as_deref(), Some("x.ts"));
     }
 }

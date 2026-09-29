@@ -7,8 +7,10 @@
 
 use crate::ls::prelude::*;
 
+use crate::spanmap::Feature;
+
 impl LanguageService {
-    // Go: ls/definition.go:17 ProvideDefinition
+    // Go: ls/definition.go:19 ProvideDefinition
     pub fn provide_definition(
         &self,
         ctx: &Context,
@@ -21,7 +23,7 @@ impl LanguageService {
         self.provide_definition_worker(ctx, document_uri, position)
     }
 
-    // Go: ls/definition.go:28 provideDefinitionWorker
+    // Go: ls/definition.go:30 provideDefinitionWorker
     pub fn provide_definition_worker(
         &self,
         ctx: &Context,
@@ -32,25 +34,55 @@ impl LanguageService {
         let client_supports_link = caps.text_document.definition.link_support;
 
         let (program, file) = self.get_program_and_file(document_uri);
-        let pos = self
-            .converters
-            .line_and_character_to_position(&file, &position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            position,
+            Feature::DEFINITION,
+        );
+        let mut results = Vec::with_capacity(positions.len());
+        for mapped in &positions {
+            if mapped.fidelity.is_single_segment() {
+                results.push(self.provide_definition_at_position(
+                    ctx,
+                    program,
+                    mapped.script,
+                    mapped.position,
+                    client_supports_link,
+                ));
+            }
+        }
+        Ok(combine_definition_responses(results, client_supports_link))
+    }
+
+    // Go: ls/definition.go:49 provideDefinitionAtPosition
+    // PORT: Go `core.TextPos` is `i32`.
+    pub fn provide_definition_at_position(
+        &self,
+        ctx: &Context,
+        program: &compiler::NewProgram,
+        file: Node,
+        text_pos: i32,
+        client_supports_link: bool,
+    ) -> lsproto::DefinitionResponse {
+        let pos = text_pos;
         let node = astnav::get_touching_property_name(file, pos);
         let reference = get_reference_at_position(file, pos, program);
 
         if node.kind() == SyntaxKind::SourceFile {
-            return Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default());
+            return lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default();
         }
 
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
         if let Some(reference) = &reference {
             if reference.file.is_some() {
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &[],
                     Some(reference),
-                ));
+                    Feature::DEFINITION,
+                );
             }
         }
 
@@ -62,12 +94,13 @@ impl LanguageService {
             let sym = get_symbol_for_overridden_member(c, node);
             if sym.is_some() {
                 let declarations = c.sym(sym).declarations.to_vec();
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &declarations,
                     None, /*reference*/
-                ));
+                    Feature::DEFINITION,
+                );
             }
         }
 
@@ -76,12 +109,13 @@ impl LanguageService {
         if crate::ast::is_jump_statement_target(node) {
             let label = get_target_label(node.parent(), node.text());
             if label.is_some() {
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &[label],
                     None, /*reference*/
-                ));
+                    Feature::DEFINITION,
+                );
             }
         }
 
@@ -91,10 +125,11 @@ impl LanguageService {
             let stmt = find_ancestor(node.parent(), is_switch_statement);
             if stmt.is_some() {
                 let file = get_source_file_of_node(stmt);
-                return Ok(self.create_location_from_file_and_range(
+                return self.create_location_from_file_and_range(
                     file,
                     get_range_of_token_at_position(file, stmt.pos()),
-                ));
+                    Feature::DEFINITION,
+                );
             }
         }
 
@@ -104,12 +139,13 @@ impl LanguageService {
         {
             let fn_ = find_ancestor(node, is_function_like_declaration);
             if fn_.is_some() {
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &[fn_],
                     None, /*reference*/
-                ));
+                    Feature::DEFINITION,
+                );
             }
         }
 
@@ -146,15 +182,16 @@ impl LanguageService {
             }
             declarations.push(called_declaration);
         }
-        Ok(self.create_definition_locations(
+        self.create_definition_locations(
             origin_selection_range,
             client_supports_link,
             &declarations,
             reference.as_ref(),
-        ))
+            Feature::DEFINITION,
+        )
     }
 
-    // Go: ls/definition.go:100 ProvideTypeDefinition
+    // Go: ls/definition.go:113 ProvideTypeDefinition
     pub fn provide_type_definition(
         &self,
         ctx: &Context,
@@ -165,15 +202,43 @@ impl LanguageService {
         let client_supports_link = caps.text_document.type_definition.link_support;
 
         let (program, file) = self.get_program_and_file(document_uri);
-        let mut node = astnav::get_touching_property_name(
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
             file,
-            self.converters
-                .line_and_character_to_position(&file, &position),
+            position,
+            Feature::TYPE_DEFINITION,
         );
-        if node.kind() == SyntaxKind::SourceFile {
-            return Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default());
+        let mut results = Vec::with_capacity(positions.len());
+        for mapped in &positions {
+            if mapped.fidelity.is_single_segment() {
+                results.push(self.provide_type_definition_at_position(
+                    ctx,
+                    program,
+                    mapped.script,
+                    mapped.position,
+                    client_supports_link,
+                ));
+            }
         }
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        Ok(combine_definition_responses(results, client_supports_link))
+    }
+
+    // Go: ls/definition.go:132 provideTypeDefinitionAtPosition
+    // PORT: Go `core.TextPos` is `i32`.
+    pub fn provide_type_definition_at_position(
+        &self,
+        ctx: &Context,
+        program: &compiler::NewProgram,
+        file: Node,
+        text_pos: i32,
+        client_supports_link: bool,
+    ) -> lsproto::TypeDefinitionResponse {
+        let pos = text_pos;
+        let mut node = astnav::get_touching_property_name(file, pos);
+        if node.kind() == SyntaxKind::SourceFile {
+            return lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default();
+        }
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
 
         let (checker, _done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let c = &mut *checker.borrow_mut();
@@ -191,30 +256,95 @@ impl LanguageService {
                 declarations = concatenated;
             }
             if !declarations.is_empty() {
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &declarations,
                     None, /*reference*/
-                ));
+                    Feature::TYPE_DEFINITION,
+                );
             }
             let flags = c.sym(symbol).flags;
             if !flags.intersects(SymbolFlags::VALUE) && flags.intersects(SymbolFlags::TYPE) {
                 let declarations = c.sym(symbol).declarations.to_vec();
-                return Ok(self.create_definition_locations(
+                return self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &declarations,
                     None, /*reference*/
-                ));
+                    Feature::TYPE_DEFINITION,
+                );
             }
         }
 
-        Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default())
+        lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default()
     }
 }
 
-// Go: ls/definition.go:137 getDeclarationNameForKeyword
+// Go: ls/definition.go:162 combineDefinitionResponses
+// PORT: Go takes the slice; here the results are moved in. Go appends the
+// same `*LocationLink` it read; here the link is moved. Go `seen` is a
+// `collections.Set[lsproto.Location]`. Go returns a pointer to a possibly
+// nil slice, which marshals as `[]`; here `Some` of a possibly empty `Vec`.
+#[must_use]
+pub fn combine_definition_responses(
+    results: Vec<lsproto::DefinitionResponse>,
+    links: bool,
+) -> lsproto::DefinitionResponse {
+    let mut locations: Vec<lsproto::Location> = Vec::new();
+    let mut definition_links: Vec<lsproto::LocationLink> = Vec::new();
+    let mut seen: FxHashSet<lsproto::Location> = FxHashSet::default();
+    for result in results {
+        if let Some(result_links) = result.definition_links {
+            for link in result_links {
+                let location = lsproto::Location {
+                    uri: link.target_uri.clone(),
+                    range: link.target_selection_range,
+                };
+                if seen.insert(location.clone()) {
+                    definition_links.push(link);
+                    locations.push(location);
+                }
+            }
+        }
+        if let Some(location) = result.location {
+            if seen.insert(location.clone()) {
+                definition_links.push(lsproto::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: location.uri.clone(),
+                    target_range: location.range,
+                    target_selection_range: location.range,
+                });
+                locations.push(location);
+            }
+        }
+        if let Some(result_locations) = result.locations {
+            for location in result_locations {
+                if seen.insert(location.clone()) {
+                    definition_links.push(lsproto::LocationLink {
+                        origin_selection_range: None,
+                        target_uri: location.uri.clone(),
+                        target_range: location.range,
+                        target_selection_range: location.range,
+                    });
+                    locations.push(location);
+                }
+            }
+        }
+    }
+    if links {
+        return lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
+            definition_links: Some(definition_links),
+            ..Default::default()
+        };
+    }
+    lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
+        locations: Some(locations),
+        ..Default::default()
+    }
+}
+
+// Go: ls/definition.go:195 getDeclarationNameForKeyword
 pub fn get_declaration_name_for_keyword(node: Node) -> Node {
     if (node.kind() as u16) >= (SyntaxKind::FIRST_KEYWORD as u16)
         && (node.kind() as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
@@ -235,15 +365,17 @@ pub fn get_declaration_name_for_keyword(node: Node) -> Node {
     node
 }
 
-// Go: ls/definition.go:150 fileRange
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+// Go: ls/definition.go:208 fileRange
+// PORT: Go `file *ast.SourceFile` compares by pointer; here the file root
+// `Node`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileRange {
-    pub file_name: String,
+    pub file: Node,
     pub file_range: TextRange,
 }
 
 impl LanguageService {
-    // Go: ls/definition.go:155 createDefinitionLocations
+    // Go: ls/definition.go:213 createDefinitionLocations
     // PORT: Go `reference *refInfo` is `Option<&RefInfo>`.
     pub fn create_definition_locations(
         &self,
@@ -251,9 +383,12 @@ impl LanguageService {
         client_supports_link: bool,
         declarations: &[Node],
         reference: Option<&RefInfo>,
+        feature: Feature,
     ) -> lsproto::DefinitionResponse {
         let mut locations: Vec<lsproto::LocationLink> = Vec::new();
         let mut location_ranges: FxHashSet<FileRange> = FxHashSet::default();
+        let mut concrete_targets: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
+        let mut file_fallbacks: Vec<lsproto::LocationLink> = Vec::new();
 
         if let Some(reference) = reference {
             let target_range = lsproto::Range {
@@ -276,7 +411,6 @@ impl LanguageService {
 
         for &decl in declarations {
             let file = get_source_file_of_node(decl);
-            let file_name = source_file_file_name(file);
             let name = {
                 let name = get_name_of_declaration(decl);
                 if name.is_some() { name } else { decl }
@@ -287,7 +421,7 @@ impl LanguageService {
                 create_range_from_node(name, file)
             };
             if location_ranges.insert(FileRange {
-                file_name: file_name.to_string(),
+                file,
                 file_range: name_range,
             }) {
                 let context_node = {
@@ -298,16 +432,47 @@ impl LanguageService {
                         decl
                     }
                 };
-                let context_range =
+                let mut context_range =
                     to_context_range(Some(name_range), file, context_node).unwrap_or(name_range);
-                let target_selection_loc = self.get_mapped_location(file_name, name_range);
-                let target_loc = self.get_mapped_location(file_name, context_range);
+                if !name_range.contained_by(context_range) {
+                    context_range = TextRange::new(
+                        name_range.pos().min(context_range.pos()),
+                        name_range.end().max(context_range.end()),
+                    );
+                }
+                let (target_selection_loc, selection_fidelity) =
+                    self.source_file_range_to_lsp_location_for_feature(file, name_range, feature);
+                if !selection_fidelity.is_single_segment() {
+                    let zero_range = lsproto::Range::default();
+                    file_fallbacks.push(lsproto::LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_selection_range: zero_range,
+                        target_uri: target_selection_loc.uri,
+                        target_range: zero_range,
+                    });
+                    continue;
+                }
+                let (mut target_loc, context_fidelity) =
+                    self.source_file_range_to_lsp_location(file, context_range);
+                if context_fidelity.is_none()
+                    || target_loc.uri != target_selection_loc.uri
+                    || !lsp_range_contains(target_loc.range, target_selection_loc.range)
+                {
+                    target_loc = target_selection_loc.clone();
+                }
+                concrete_targets.insert(target_selection_loc.uri.clone());
                 locations.push(lsproto::LocationLink {
                     origin_selection_range: Some(origin_selection_range),
                     target_selection_range: target_selection_loc.range,
                     target_uri: target_loc.uri,
                     target_range: target_loc.range,
                 });
+            }
+        }
+        for fallback in file_fallbacks {
+            if !concrete_targets.contains(&fallback.target_uri) {
+                concrete_targets.insert(fallback.target_uri.clone());
+                locations.push(fallback);
             }
         }
 
@@ -321,7 +486,14 @@ impl LanguageService {
     }
 }
 
-// Go: ls/definition.go:213 createLocationsFromLinks
+// Go: ls/definition.go:297 lspRangeContains
+#[must_use]
+pub fn lsp_range_contains(outer: lsproto::Range, inner: lsproto::Range) -> bool {
+    lsproto::compare_positions(outer.start, inner.start) <= 0
+        && lsproto::compare_positions(inner.end, outer.end) <= 0
+}
+
+// Go: ls/definition.go:302 createLocationsFromLinks
 pub fn create_locations_from_links(links: &[lsproto::LocationLink]) -> lsproto::DefinitionResponse {
     let locations: Vec<lsproto::Location> = links
         .iter()
@@ -337,13 +509,18 @@ pub fn create_locations_from_links(links: &[lsproto::LocationLink]) -> lsproto::
 }
 
 impl LanguageService {
-    // Go: ls/definition.go:223 createLocationFromFileAndRange
+    // Go: ls/definition.go:312 createLocationFromFileAndRange
     pub fn create_location_from_file_and_range(
         &self,
         file: Node,
         text_range: TextRange,
+        feature: Feature,
     ) -> lsproto::DefinitionResponse {
-        let mapped_location = self.get_mapped_location(source_file_file_name(file), text_range);
+        let (mut mapped_location, fidelity) =
+            self.source_file_range_to_lsp_location_for_feature(file, text_range, feature);
+        if fidelity.is_none() {
+            mapped_location.range = lsproto::Range::default();
+        }
         lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
             location: Some(mapped_location),
             ..Default::default()
@@ -351,7 +528,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/definition.go:230 getDeclarationsFromLocation
+// Go: ls/definition.go:322 getDeclarationsFromLocation
 pub fn get_declarations_from_location(c: &mut Checker, node: Node) -> Vec<Node> {
     if is_identifier(node) && is_shorthand_property_assignment(node.parent()) {
         // Because name in short-hand property assignment has two different meanings: property name and property value,
@@ -449,7 +626,7 @@ pub fn get_declarations_from_location(c: &mut Checker, node: Node) -> Vec<Node> 
     Vec::new()
 }
 
-// Go: ls/definition.go:304 getDeclarationsFromObjectLiteralElement
+// Go: ls/definition.go:396 getDeclarationsFromObjectLiteralElement
 // getDeclarationsFromObjectLiteralElement returns declarations from the contextual type
 // of an object literal element, if available.
 pub fn get_declarations_from_object_literal_element(c: &mut Checker, node: Node) -> Vec<Node> {
@@ -496,7 +673,7 @@ pub fn get_declarations_from_object_literal_element(c: &mut Checker, node: Node)
     result
 }
 
-// Go: ls/definition.go:334 getAncestorCallLikeExpression
+// Go: ls/definition.go:426 getAncestorCallLikeExpression
 // Returns a CallLikeExpression where `node` is the target being invoked.
 pub fn get_ancestor_call_like_expression(node: Node) -> Node {
     // PORT: Go calls `ast.IsRightSideOfPropertyAccess`; the ls prelude picks
@@ -512,7 +689,7 @@ pub fn get_ancestor_call_like_expression(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/definition.go:345 tryGetSignatureDeclaration
+// Go: ls/definition.go:437 tryGetSignatureDeclaration
 pub fn try_get_signature_declaration(type_checker: &mut Checker, node: Node) -> Node {
     let mut signature = SignatureId::NIL;
     let call_like = get_ancestor_call_like_expression(node);
@@ -529,7 +706,7 @@ pub fn try_get_signature_declaration(type_checker: &mut Checker, node: Node) -> 
     Node::NIL
 }
 
-// Go: ls/definition.go:362 isJsxConstructorLike
+// Go: ls/definition.go:454 isJsxConstructorLike
 pub fn is_jsx_constructor_like(node: Node) -> bool {
     is_constructor_declaration(node)
         || is_constructor_type_node(node)
@@ -537,7 +714,7 @@ pub fn is_jsx_constructor_like(node: Node) -> bool {
         || is_construct_signature_declaration(node)
 }
 
-// Go: ls/definition.go:374 symbolMatchesSignature
+// Go: ls/definition.go:466 symbolMatchesSignature
 // PORT: Go reads symbol fields without a checker; the symbol arena is the
 // first parameter, as for ast helpers that take a symbol.
 pub fn symbol_matches_signature(
@@ -562,7 +739,7 @@ pub fn symbol_matches_signature(
                 && symbol == parent.symbol())
 }
 
-// Go: ls/definition.go:387 getSymbolForOverriddenMember
+// Go: ls/definition.go:479 getSymbolForOverriddenMember
 pub fn get_symbol_for_overridden_member(type_checker: &mut Checker, node: Node) -> SymbolId {
     let class_element = find_ancestor(node, is_class_element);
     if class_element.is_nil() || class_element.name().is_nil() {
@@ -594,7 +771,7 @@ pub fn get_symbol_for_overridden_member(type_checker: &mut Checker, node: Node) 
     type_checker.get_property_of_type_exported(t, &name)
 }
 
-// Go: ls/definition.go:417 getTypeOfSymbolAtLocation
+// Go: ls/definition.go:509 getTypeOfSymbolAtLocation
 // PORT: a free function; `Checker::get_type_of_symbol_at_location` is the
 // checker method it calls (a method and a free fn do not clash).
 pub fn get_type_of_symbol_at_location(c: &mut Checker, symbol: SymbolId, node: Node) -> TypeId {
@@ -617,7 +794,7 @@ pub fn get_type_of_symbol_at_location(c: &mut Checker, symbol: SymbolId, node: N
     t
 }
 
-// Go: ls/definition.go:430 getDeclarationsFromType
+// Go: ls/definition.go:522 getDeclarationsFromType
 // PORT: Go reads type and symbol fields without a checker; the checker is
 // the first parameter.
 pub fn get_declarations_from_type(c: &Checker, t: TypeId) -> Vec<Node> {

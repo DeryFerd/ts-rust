@@ -8,7 +8,7 @@ use ts_goport::frontend::prelude::*;
 use super::go_regex;
 use super::harness::get_config_name_from_file_name;
 use super::runner::SRC_FOLDER;
-use crate::tsoptions::tsoptionstest::new_vfs_parse_config_host;
+use crate::tsoptions::tsoptionstest::new_vfs_parse_config_host_with_symlinks;
 
 // Go: test_case_parser.go:25 rawCompilerSettings
 // This maps a compiler setting to its value as written in the test file. For example, if a test file contains:
@@ -37,13 +37,14 @@ pub struct TestCaseContent {
 
 // Go: test_case_parser.go:46 fourslashDirectives
 // File-specific directives used by fourslash tests
-const FOURSLASH_DIRECTIVES: &[&str] = &["emitthisfile"];
+// tsgo#4712 adds "noopen".
+const FOURSLASH_DIRECTIVES: &[&str] = &["emitthisfile", "noopen"];
 
 // Go: test_case_parser.go:50 makeUnitsFromTest
 // Given a test file containing // @FileName directives,
 // return an array of named units of code to be added to an existing compiler instance.
 pub fn make_units_from_test(code: &str, file_name: &str) -> TestCaseContent {
-    let (mut test_units, symlinks, mut current_directory, _, _) =
+    let (mut test_units, symlinks, mut current_directory, global_options, _) =
         parse_test_files_and_symlinks(code, file_name, |filename, content, _file_options| {
             Ok(TestUnit {
                 content: content.to_string(),
@@ -63,11 +64,23 @@ pub fn make_units_from_test(code: &str, file_name: &str) -> TestCaseContent {
             data.content.clone(),
         );
     }
-    let parse_config_host = new_vfs_parse_config_host(
+    let parse_config_host = new_vfs_parse_config_host_with_symlinks(
         &all_files,
+        &symlinks,
         &current_directory,
         true, /*useCaseSensitiveFileNames*/
     );
+
+    // Go: test_case_parser.go:71 (tsgo#4712)
+    // Content mappers are gated behind --runExternalCode, a command-line-only option. A test
+    // opts in with a top-level `// @runExternalCode: true`, which we surface to the config
+    // parse as an existing option so the gate passes and the mappers register.
+    let existing_options = (global_options.get("runexternalcode").map(String::as_str)
+        == Some("true"))
+    .then(|| CompilerOptions {
+        run_external_code: Tristate::True,
+        ..CompilerOptions::default()
+    });
 
     // check if project has tsconfig.json in the list of files
     let mut ts_config = None;
@@ -90,11 +103,10 @@ pub fn make_units_from_test(code: &str, file_name: &str) -> TestCaseContent {
                 ts_config_source_file,
                 &parse_config_host,
                 &config_dir,
-                None, /*existingOptions*/
+                existing_options.as_ref(),
                 None, /*existingOptionsRaw*/
                 &config_file_name,
                 &[],  /*resolutionStack*/
-                &[],  /*extraFileExtensions*/
                 None, /*extendedConfigCache*/
             )));
             ts_config_file_unit_data = Some(data.clone());

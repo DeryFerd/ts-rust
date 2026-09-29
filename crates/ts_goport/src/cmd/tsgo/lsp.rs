@@ -7,7 +7,7 @@ use crate::cmd::tsgo::isprocessalive_other::{PROCESS_ALIVE_SUPPORTED, is_process
 #[cfg(unix)]
 use crate::cmd::tsgo::isprocessalive_unix::{PROCESS_ALIVE_SUPPORTED, is_process_alive};
 use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
-use crate::execute::tsc::compile::Writer;
+use crate::execute::tsc::compile::{Writer, spawn_process};
 use crate::frontend::bundled;
 use crate::frontend::tspath;
 use crate::frontend::vfs::osvfs;
@@ -28,6 +28,11 @@ pub fn run_lsp(args: &[String]) -> i32 {
     let _ = pipe;
     let socket = flag.string("socket", "", "use socket for communication");
     let _ = socket;
+    let client_process_id = flag.int(
+        "clientProcessId",
+        0,
+        "use the given PID for the parent process watchdog",
+    );
     if flag.parse(args).is_err() {
         return 2;
     }
@@ -86,8 +91,11 @@ pub fn run_lsp(args: &[String]) -> i32 {
                 Err(err) => (Vec::new(), Some(errors::new(err.to_string()))),
             }
         })),
+        // Go: Spawn: spawnProcess (tsgo#4712; Go cmd/tsgo/sys.go spawnProcess is
+        // ported in `execute::tsc::compile`).
+        spawn: Some(Rc::new(spawn_process)),
         progress_delay: Duration::from_millis(250),
-        set_parent_process_id: new_parent_process_watchdog(&ctx, &stop),
+        set_parent_process_id: new_parent_process_watchdog(&ctx, &stop, client_process_id.get()),
     });
 
     let result = s.run(&ctx);
@@ -100,14 +108,22 @@ pub fn run_lsp(args: &[String]) -> i32 {
     0
 }
 
-// Go: cmd/tsgo/lsp.go:76 newParentProcessWatchdog
+// Go: cmd/tsgo/lsp.go:79 newParentProcessWatchdog
 // newParentProcessWatchdog returns a SetParentProcessID callback if the platform
-// supports process-alive checking, or nil otherwise.
+// supports process-alive checking and no client process ID override was provided,
+// or nil otherwise.
+// PORT: Go `clientProcessID` is an `int` (64 bits, see `FlagValue`); the
+// watchdog takes the `i32` pid, as Linux `kill` takes a 32-bit `pid_t`.
 pub fn new_parent_process_watchdog(
     ctx: &Context,
     stop: &CancelFunc,
+    client_process_id: i64,
 ) -> Option<Box<dyn Fn(i32) + Send + Sync>> {
     if !PROCESS_ALIVE_SUPPORTED {
+        return None;
+    }
+    if client_process_id > 0 {
+        start_parent_process_watchdog(ctx, stop, client_process_id as i32);
         return None;
     }
     let ctx = ctx.clone();
@@ -117,7 +133,7 @@ pub fn new_parent_process_watchdog(
     }))
 }
 
-// Go: cmd/tsgo/lsp.go:88 startParentProcessWatchdog
+// Go: cmd/tsgo/lsp.go:95 startParentProcessWatchdog
 // startParentProcessWatchdog starts a goroutine that monitors the parent process
 // and cancels the context if the parent dies. This prevents orphaned language
 // server processes when the editor crashes or is killed.

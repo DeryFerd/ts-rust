@@ -1088,6 +1088,15 @@ impl Checker {
                     return self.non_primitive_type;
                 }
             }
+            if !double_equals
+                && value_flags.intersects(TypeFlags::PRIMITIVE)
+                && self.is_uniform_union_type(t)
+            {
+                let regular_type = self.get_regular_type_of_literal_type(value_type);
+                if self.union_contains_type(t, regular_type, false /*matchSymbol*/) {
+                    return regular_type;
+                }
+            }
             let filtered_type = self.filter_type(t, &mut |c, t| {
                 c.are_types_comparable(t, value_type)
                     || double_equals && c.is_coercible_under_double_equals(t, value_type)
@@ -1095,6 +1104,13 @@ impl Checker {
             return self.replace_primitives_with_literals(filtered_type, value_type);
         }
         if self.is_unit_type(value_type) {
+            if self.is_uniform_union_type(t) {
+                let regular_type = self.get_regular_type_of_literal_type(value_type);
+                let filtered_type = self.remove_type(t, regular_type);
+                if filtered_type != t {
+                    return filtered_type;
+                }
+            }
             return self.filter_type(t, &mut |c, t| {
                 !(c.is_unit_like_type(t) && c.are_types_comparable(t, value_type))
             });
@@ -1337,17 +1353,18 @@ impl Checker {
         f: &Rc<RefCell<FlowState>>,
         expr: Node,
     ) -> bool {
-        if is_access_expression(expr) {
-            let (accessed_name, ok) = self.get_accessed_property_name(expr);
-            let reference = f.borrow().reference;
-            if ok
-                && accessed_name == "constructor"
-                && self.is_matching_reference(reference, expr.expression())
-            {
-                return true;
-            }
+        let mut name = Node::NIL;
+        if is_property_access_expression(expr) {
+            name = expr.name();
+        } else if is_element_access_expression(expr)
+            && is_string_literal_like(expr.argument_expression())
+        {
+            name = expr.argument_expression();
         }
-        false
+        let reference = f.borrow().reference;
+        name.is_some()
+            && name.text() == "constructor"
+            && self.is_matching_reference(reference, expr.expression())
     }
 
     // Go: checker/flow.go:749 narrowTypeByConstructor

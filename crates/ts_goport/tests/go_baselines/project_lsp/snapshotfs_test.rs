@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::tspath::Path;
 use ts_goport::frontend::vfs::Fs;
@@ -1168,7 +1168,7 @@ fn expand_realpath_aliases_is_a_no_op_with_no_aliases() {
     assert!(expanded.changed.contains(&uri("file:///some/file.ts")));
 }
 
-// Go: snapshotfs_test.go:1220 TestRealpathAliasLifecycle/markDirtyFiles invalidates symlinked file via realpath event
+// Go: snapshotfs_test.go:1267 TestRealpathAliasLifecycle/markDirtyFiles invalidates symlinked file via realpath event
 #[test]
 fn mark_dirty_files_invalidates_symlinked_file_via_realpath_event() {
     let test_fs = any_fs(
@@ -1209,7 +1209,7 @@ fn mark_dirty_files_invalidates_symlinked_file_via_realpath_event() {
     // Expand the realpath event to include the symlink path.
     let change = snapshot1.expand_realpath_aliases(change);
     // Now mark dirty — should find the file under the symlink key.
-    builder2.mark_dirty_files(&change);
+    builder2.mark_dirty_files(change);
 
     // Trigger reload by reading the file (simulates program construction).
     assert_eq!(
@@ -1360,7 +1360,7 @@ fn preserves_node_modules_directory_deletion_even_when_untracked() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///project/node_modules"));
 
-    let expanded = b.expand_and_filter_watch_events(change);
+    let expanded = b.expand_and_filter_watch_events(change, &[], None);
     assert!(
         expanded
             .deleted
@@ -1382,7 +1382,7 @@ fn preserves_deletion_of_a_package_directory_inside_node_modules() {
         .deleted
         .insert(uri("file:///project/node_modules/@scope/pkg"));
 
-    let expanded = b.expand_and_filter_watch_events(change);
+    let expanded = b.expand_and_filter_watch_events(change, &[], None);
     assert!(
         expanded
             .deleted
@@ -1402,11 +1402,36 @@ fn drops_irrelevant_untracked_deletion_outside_node_modules() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///project/build"));
 
-    let expanded = b.expand_and_filter_watch_events(change);
+    let expanded = b.expand_and_filter_watch_events(change, &[], None);
     assert_eq!(
         expanded.deleted.len(),
         0,
         "untracked non-node_modules directory deletion should be dropped"
+    );
+}
+
+// Go: snapshotfs_test.go:1500 TestExpandAndFilterWatchEvents/preserves exact content mapper dependencies (tsgo#4712)
+#[test]
+fn preserves_exact_content_mapper_dependencies() {
+    let b = empty_builder(text_fs(
+        &[("/project/index.ts", "export const x = 1;")],
+        false,
+    ));
+    let watched: FxHashSet<Path> = [p("/project/mapper.config")].into_iter().collect();
+    let mut change = FileChangeSummary::default();
+    change.changed.insert(uri("file:///project/mapper.config"));
+    change.deleted.insert(uri("file:///project/mapper.config"));
+
+    let expanded = b.expand_and_filter_watch_events(change, &[], Some(&watched));
+    assert!(
+        expanded
+            .changed
+            .contains(&uri("file:///project/mapper.config"))
+    );
+    assert!(
+        expanded
+            .deleted
+            .contains(&uri("file:///project/mapper.config"))
     );
 }
 
@@ -1427,7 +1452,7 @@ fn expands_tracked_directory_deletion_into_file_deletions() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///src"));
 
-    let expanded = b.expand_and_filter_watch_events(change);
+    let expanded = b.expand_and_filter_watch_events(change, &[], None);
     assert!(
         expanded.deleted.contains(&uri("file:///src/foo.ts")),
         "tracked directory deletion should expand to contained file deletions"

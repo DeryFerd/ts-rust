@@ -143,7 +143,21 @@ pub fn remove_file_extension(path: &str) -> &str {
     path
 }
 
-// Go: tspath/extension.go:56 TryGetExtensionFromPath
+// Go: tspath/extension.go:56 RemoveAnyFileExtension (tsgo#4712)
+/// Removes a known extension, or else any extension after the last ".".
+pub fn remove_any_file_extension(path: &str) -> &str {
+    let without_extension = remove_file_extension(path);
+    if without_extension != path {
+        return without_extension;
+    }
+    let extension = get_any_extension_from_path(path, &[], false);
+    if !extension.is_empty() {
+        return remove_extension(path, &extension);
+    }
+    path
+}
+
+// Go: tspath/extension.go:66 TryGetExtensionFromPath
 pub fn try_get_extension_from_path(p: &str) -> &'static str {
     for ext in EXTENSIONS_TO_REMOVE {
         if file_extension_is(p, ext) {

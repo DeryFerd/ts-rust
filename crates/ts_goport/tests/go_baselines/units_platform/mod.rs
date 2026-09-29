@@ -23,6 +23,7 @@ mod core;
 mod debug;
 mod diagnostics;
 mod fswatch_eventlist;
+mod fswatch_fallback;
 mod fswatch_n;
 mod fswatch_walkdir;
 mod fswatch_watcher;
@@ -37,6 +38,7 @@ mod tracing;
 mod tspath;
 mod vfsmatch;
 mod vfsmock;
+mod watchmanager;
 
 use std::fmt::Debug;
 

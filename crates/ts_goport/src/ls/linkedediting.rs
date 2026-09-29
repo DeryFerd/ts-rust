@@ -2,23 +2,33 @@
 
 use crate::ls::prelude::*;
 
-// Go: ls/linkedediting.go:15 jsxTagWordPattern
+use crate::spanmap::Feature;
+
+// Go: ls/linkedediting.go:17 jsxTagWordPattern
 // allow the client to match more than valid tag names. This allows linked editing when typing is in progress or tag name is incomplete
 // PORT: Go `*string` built with `new(...)`; the value never changes, so a
 // `&'static str` holds it and each response copies it into `word_pattern`.
 pub static JSX_TAG_WORD_PATTERN: &str = "[a-zA-Z0-9:\\-\\._$]*";
 
 impl LanguageService {
-    // Go: ls/linkedediting.go:17 ProvideLinkedEditingRange
+    // Go: ls/linkedediting.go:19 ProvideLinkedEditingRange
     pub fn provide_linked_editing_range(
         &self,
         _ctx: &Context,
         params: &lsproto::LinkedEditingRangeParams,
     ) -> Result<lsproto::LinkedEditingRangeResponse, GoError> {
         let (_, source_file) = self.get_program_and_file(&params.text_document.uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&source_file, &params.position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            params.position,
+            Feature::LINKED_EDITING,
+        );
+        if positions.len() != 1 || !positions[0].fidelity.is_exact() {
+            return Ok(lsproto::LinkedEditingRangeResponse::default());
+        }
+        let source_file = positions[0].script;
+        let position = positions[0].position;
         let token = astnav::find_preceding_token(source_file, position);
 
         if token.is_nil() || token.parent().kind() == SyntaxKind::SourceFile {
@@ -49,12 +59,19 @@ impl LanguageService {
                 return Ok(lsproto::LinkedEditingRangeResponse::default());
             }
 
-            let open_line_char = self
-                .converters
-                .position_to_line_and_character(&source_file, open_pos);
-            let close_line_char = self
-                .converters
-                .position_to_line_and_character(&source_file, close_pos);
+            let (open_line_char, open_fidelity) = self.converters.to_lsp_position_for_feature(
+                &source_file,
+                open_pos,
+                Feature::LINKED_EDITING,
+            );
+            let (close_line_char, close_fidelity) = self.converters.to_lsp_position_for_feature(
+                &source_file,
+                close_pos,
+                Feature::LINKED_EDITING,
+            );
+            if !open_fidelity.is_exact() || !close_fidelity.is_exact() {
+                return Ok(lsproto::LinkedEditingRangeResponse::default());
+            }
             Ok(lsproto::LinkedEditingRangeResponse {
                 linked_editing_ranges: Some(lsproto::LinkedEditingRanges {
                     ranges: vec![
@@ -119,26 +136,23 @@ impl LanguageService {
                 return Ok(lsproto::LinkedEditingRangeResponse::default());
             }
 
+            let (open_range, open_fidelity) = self.converters.to_lsp_range_for_feature(
+                &source_file,
+                TextRange::new(open_tag_name_start, open_tag_name_end),
+                Feature::LINKED_EDITING,
+            );
+            let (close_range, close_fidelity) = self.converters.to_lsp_range_for_feature(
+                &source_file,
+                TextRange::new(close_tag_name_start, close_tag_name_end),
+                Feature::LINKED_EDITING,
+            );
+            if !open_fidelity.is_exact() || !close_fidelity.is_exact() {
+                return Ok(lsproto::LinkedEditingRangeResponse::default());
+            }
+
             Ok(lsproto::LinkedEditingRangeResponse {
                 linked_editing_ranges: Some(lsproto::LinkedEditingRanges {
-                    ranges: vec![
-                        lsproto::Range {
-                            start: self
-                                .converters
-                                .position_to_line_and_character(&source_file, open_tag_name_start),
-                            end: self
-                                .converters
-                                .position_to_line_and_character(&source_file, open_tag_name_end),
-                        },
-                        lsproto::Range {
-                            start: self
-                                .converters
-                                .position_to_line_and_character(&source_file, close_tag_name_start),
-                            end: self
-                                .converters
-                                .position_to_line_and_character(&source_file, close_tag_name_end),
-                        },
-                    ],
+                    ranges: vec![open_range, close_range],
                     word_pattern: Some(JSX_TAG_WORD_PATTERN.to_string()),
                 }),
             })

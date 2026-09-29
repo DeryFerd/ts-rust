@@ -107,7 +107,15 @@ pub fn can_have_module_specifier(node: Node) -> bool {
 
 // Go: checker/nodebuilderimpl.go:2145 hasTypeAnnotation
 pub fn has_type_annotation(declaration: Node) -> bool {
-    declaration.is_some() && declaration.type_().is_some()
+    if declaration.is_nil() || declaration.type_().is_nil() {
+        return false;
+    }
+    // Type alias declarations have a .Type() that is their type definition, not a type annotation on a value.
+    // Exclude them so callers don't mistake them for annotated value declarations.
+    if is_type_alias_declaration(declaration) || is_js_type_alias_declaration(declaration) {
+        return false;
+    }
+    true
 }
 
 impl Checker {
@@ -257,8 +265,10 @@ impl Checker {
                         });
                     }
                 }
-                // PORT: `sort_by` is stable, like Go `slices.SortStableFunc`.
-                parent_specifiers.sort_by(|x, y| self.sort_by_best_name(x, y).cmp(&0));
+                // Go: checker/nodebuilderimpl.go:1108 slices.SortStableFunc(parentSpecifiers, b.sortByBestName)
+                crate::gostd::slices::sort_stable_func(&mut parent_specifiers, |x, y| {
+                    self.sort_by_best_name(x, y)
+                });
                 for pair in &parent_specifiers {
                     let parent = pair.sym;
                     let parent_chain = self.get_symbol_chain(

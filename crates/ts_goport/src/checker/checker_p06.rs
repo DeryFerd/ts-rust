@@ -550,9 +550,11 @@ impl Checker {
         }
         self.check_object_type_for_duplicate_declarations(node, false /*checkPrivateNames*/);
         for heritage_element in get_extends_heritage_clause_elements(node) {
-            let expr = heritage_element.expression();
-            if !is_entity_name_expression(expr) || is_optional_chain(expr) {
-                self.error(expr, diag::An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments, args![]);
+            if is_expression_with_type_arguments(heritage_element) {
+                let expr = heritage_element.expression();
+                if !is_entity_name_expression(expr) || is_optional_chain(expr) {
+                    self.error(expr, diag::An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments, args![]);
+                }
             }
             self.check_type_reference_node(heritage_element);
         }
@@ -965,6 +967,7 @@ impl Checker {
         };
         if self.check_grammar_module_element_context(node, diagnostic) {
             // If we hit an import declaration in an illegal context, just bail out to avoid cascading errors.
+            self.check_external_module_name_in_global_scope(node);
             return;
         }
         if !self.check_grammar_modifiers(node) && !node.modifiers().is_nil() {
@@ -1255,6 +1258,7 @@ impl Checker {
             diag::An_import_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module
         };
         if self.check_grammar_module_element_context(node, diagnostic) {
+            self.check_external_module_name_in_global_scope(node);
             return; // If we hit an import declaration in an illegal context, just bail out to avoid cascading errors.
         }
         self.check_grammar_modifiers(node);
@@ -1338,6 +1342,7 @@ impl Checker {
             diag::An_export_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module
         };
         if self.check_grammar_module_element_context(node, diagnostic) {
+            self.check_external_module_name_in_global_scope(node);
             return; // If we hit an export in an illegal context, just bail out to avoid cascading errors.
         }
         if !self.check_grammar_modifiers(node) && !node.modifiers().is_nil() {
@@ -1408,6 +1413,20 @@ impl Checker {
         self.check_import_attributes(node);
     }
 
+    // Go: checker/checker.go:5605 checkExternalModuleNameInGlobalScope
+    pub fn check_external_module_name_in_global_scope(&mut self, node: Node) {
+        if get_enclosing_container(node).kind() != SyntaxKind::SourceFile
+            || (is_import_declaration_or_js_import_declaration(node)
+                && node.import_clause().is_nil())
+        {
+            return;
+        }
+        let module_name = get_external_module_name(node);
+        if module_name.is_some() {
+            self.resolve_external_module_name(node, module_name, false);
+        }
+    }
+
     // Go: checker/checker.go:5532 checkExportSpecifier
     pub fn check_export_specifier(&mut self, node: Node) {
         self.check_alias_symbol(node);
@@ -1460,10 +1479,25 @@ impl Checker {
             self.check_external_emit_helpers(node, ExternalEmitHelpers::IMPORT_DEFAULT);
         }
     }
+}
 
-    // Go: checker/checker.go:5556 checkExportAssignment
+// Go: checker/checker.go:5564 isContainedByNamespace
+pub fn is_contained_by_namespace(node: Node) -> bool {
+    let mut container = node.parent();
+    if !is_source_file(container) {
+        container = container.parent();
+    }
+    is_module_declaration(container) && !is_ambient_module(container)
+}
+
+impl Checker {
+    // Go: checker/checker.go:5572 checkExportAssignment
     pub fn check_export_assignment(&mut self, node: Node) {
         let is_export_equals = node.is_export_equals();
+        // Always check the exported expression so its identifiers are resolved even when the
+        // export assignment is misplaced (grammar error), keeping diagnostics stable
+        // regardless of traversal order.
+        let expr_type = self.check_expression_cached(node.expression());
         let illegal_context_message = if is_export_equals {
             diag::An_export_assignment_must_be_at_the_top_level_of_a_file_or_module_declaration
         } else {
@@ -1482,11 +1516,7 @@ impl Checker {
                 args![],
             );
         }
-        let mut container = node.parent();
-        if !is_source_file(container) {
-            container = container.parent();
-        }
-        if is_module_declaration(container) && !is_ambient_module(container) {
+        if is_contained_by_namespace(node) {
             // Go upstream note (danielr): should these be grammar errors?
             if is_export_equals {
                 self.error(
@@ -1540,7 +1570,6 @@ impl Checker {
                 // If not a value, we're interpreting the identifier as a type export, along the lines of (`export { Id as default }`)
                 if self.get_symbol_flags(sym).intersects(SymbolFlags::VALUE) {
                     // However if it is a value, we need to check it's being used correctly
-                    self.check_expression_cached(id);
                     if !is_illegal_export_default_in_cjs
                         && !node.flags().intersects(NodeFlags::AMBIENT)
                         && self.compiler_options.verbatim_module_syntax.is_true()
@@ -1615,12 +1644,7 @@ impl Checker {
                         self.add_diagnostic(diagnostic);
                     }
                 }
-            } else {
-                self.check_expression_cached(id);
-                // doesn't resolve, check as expression to mark as error
             }
-        } else {
-            self.check_expression_cached(node.expression());
         }
         if is_illegal_export_default_in_cjs {
             self.error(
@@ -1629,13 +1653,16 @@ impl Checker {
                 args![],
             );
         }
+        let mut container = node.parent();
+        if !is_source_file(container) {
+            container = container.parent();
+        }
         self.check_external_module_exports(container);
         let type_node = node.type_();
         if type_node.is_some() && node.kind() == SyntaxKind::ExportAssignment {
             let t = self.get_type_from_type_node(type_node);
-            let initializer_type = self.check_expression_cached(node.expression());
             self.check_type_assignable_to_and_optionally_elaborate(
-                initializer_type,
+                expr_type,
                 t,
                 node.expression(),
                 node.expression(),

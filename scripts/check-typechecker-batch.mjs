@@ -33,7 +33,7 @@ const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
 const SCOPE = "Original 6055 and later 6330 PASS names only. Later added passes and corpus parity need independent review.";
 const GOPORT_SCOPE = "goport protected set: every base ok test name and every base gate item, plus bound runs, LSP and API oracles "
-  + "and quality. Name maps, gate noise and allow-list conditions need independent review.";
+  + "and quality. Name maps, gate id maps, gate noise and allow-list conditions need independent review.";
 const TEST_STATUSES = new Set(["ok", "failed", "ignored", "unrun"]);
 
 function requireValue(condition, message) {
@@ -171,8 +171,9 @@ function goportRule(state) {
 }
 
 // goport is the goport-protected-set rule for a goport batch, else null. A goport batch has
-// no full result: its current history row and verdicts carry goportTestsSha256, gateSha256 and
-// nameMapSha256 (the goportTests name map sha256; absent or null when the batch has no map).
+// no full result: its current history row and verdicts carry goportTestsSha256, gateSha256,
+// nameMapSha256 (the goportTests name map sha256) and gateIdMapSha256 (the batch.gateIdMap
+// sha256); a map sha256 is absent or null when the batch has no such map.
 function validateBatch(state, goport = null) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
   const continuation = state.phase === "recovery-continuation";
@@ -214,11 +215,13 @@ function validateBatch(state, goport = null) {
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
-  // A goport row and verdict bind to the goport test results, the gate manifest and the name map instead.
+  // A goport row and verdict bind to the goport test results, the gate manifest, the name map and the
+  // gate id map instead. checkGoport checks that the gate id map file has batch.gateIdMap.sha256.
   const evidence = item => goport ? item.goportTestsSha256 === batch.goportTests?.sha256 && item.gateSha256 === batch.gate?.sha256
     && (item.nameMapSha256 ?? null) === (batch.goportTests?.nameMap?.sha256 ?? null)
+    && (item.gateIdMapSha256 ?? null) === (batch.gateIdMap?.sha256 ?? null)
     : item.fullResultSha256 === batch.fullResult.sha256;
-  const bound = goport ? "goport test, gate and name map hashes" : "full result";
+  const bound = goport ? "goport test, gate, name map and gate id map hashes" : "full result";
   requireValue(last.hypothesis === batch.hypothesis && last.sourceFingerprint === batch.sourceFingerprint && evidence(last),
     `Current history row does not match the batch source, hypothesis, and ${bound}.`);
   const verdicts = [batch.auditor, batch.reviewer];
@@ -425,13 +428,15 @@ function runPython(script, args) {
 // Runs scripts/goport/gate-compare.py, the one implementation of the gate item rules (removed
 // ids, MATCH stays MATCH, ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth
 // noise rule), on two gate manifest files (absolute paths, already hash-checked) and the
-// batch's openDefects and gateToolChanges (the tool changes the batch lists for the reviewer).
+// batch's openDefects, gateToolChanges (the tool changes the batch lists for the reviewer) and
+// gateIdMap ({path, sha256} with an absolute path, or null: the id map of a pin bump).
 // It reads files next to the base manifest (runs/editor/result.json), so it gets the real paths.
-function runGateCompare(basePath, newPath, openDefects, gateToolChanges) {
+function runGateCompare(basePath, newPath, openDefects, gateToolChanges, gateIdMap = null) {
   const dir = mkdtempSync(join(tmpdir(), "check-gate-"));
   try {
     const state = join(dir, "state.json");
-    writeFileSync(state, JSON.stringify({ batch: { openDefects: openDefects ?? [], gateToolChanges: gateToolChanges ?? [] } }));
+    writeFileSync(state, JSON.stringify({ batch: { openDefects: openDefects ?? [], gateToolChanges: gateToolChanges ?? [],
+      ...(gateIdMap && { gateIdMap }) } }));
     const { exit, output } = runPython("gate-compare.py", [basePath, newPath, "--state", state]);
     requireValue(Array.isArray(output?.regressions) && Array.isArray(output.knownOpen) && (exit === 1) === (output.regressions.length > 0),
       "gate-compare.py output lacks its regressions and knownOpen lists.");
@@ -473,6 +478,15 @@ function keptGateRuns(dir) {
     throw new Error(`Cannot list the gate evidence dir ${dir}.`);
   }
   return names.filter(name => /^gate-compare-fail-.+\.json$/.test(name)).sort().map(name => join(dir, name));
+}
+
+// batch.gateIdMap {path, sha256}: the gate id map of a pin bump (gate-compare.py uses it only when the
+// base and new gates are at different Go pins). The file must have that sha256. Returns the
+// reference with an absolute path for gate-compare.py, which checks the hash again, or null.
+function gateIdMapRef(ref, readEvidence) {
+  if (ref == null) return null;
+  readEvidence(ref, { json: false });
+  return { path: resolve(ROOT, ref.path), sha256: ref.sha256 };
 }
 
 // The external tools of the goport check. Tests may replace them.
@@ -572,7 +586,7 @@ function namesWord(value, name, path = false) {
 // list. The check runs gate-compare.py again on each earlier run. Each regressed item needs a
 // saved flake note flake-r<revision>-<name> whose text names the item id and the run label, or it
 // is a loss. Returns the flakes and the number of runs.
-function checkGateRuns(state, batch, baseManifest, inputs, pin, tools, readEvidence, reasons) {
+function checkGateRuns(state, batch, baseManifest, idMap, inputs, pin, tools, readEvidence, reasons) {
   const runs = batch.gateRuns, last = Array.isArray(runs) ? runs.at(-1) : undefined;
   requireValue(samePath(last?.manifest, batch.gate.manifest) && last.sha256 === batch.gate.sha256,
     "gateRuns must list every gate run of the source, oldest first, with batch.gate last.");
@@ -590,7 +604,7 @@ function checkGateRuns(state, batch, baseManifest, inputs, pin, tools, readEvide
       `Gate run ${run.label} is not a run of the batch source at the batch Go pin.`);
     const compare = readEvidence(run.compare);
     requireValue(compare?.new?.sha256 === run.sha256, `gateRuns ${run.label}: compare is not the gate-compare.py output of its manifest.`);
-    const { regressions } = tools.gateCompare(baseManifest, resolve(ROOT, run.manifest), batch.openDefects, batch.gateToolChanges);
+    const { regressions } = tools.gateCompare(baseManifest, resolve(ROOT, run.manifest), batch.openDefects, batch.gateToolChanges, idMap);
     const ids = list => JSON.stringify(list.map(item => item?.id).sort());
     requireValue(ids(run.regressions) === ids(regressions), `gateRuns ${run.label}: its regressions differ from gate-compare.py now.`);
     for (const item of regressions) {
@@ -691,15 +705,17 @@ function checkGoport(state, rule, readEvidence, tools) {
     `Gate manifest comes from commit ${newGate.commit}, whose crates tree, Cargo.toml or Cargo.lock differ from batch commit ${batch.commit}.`);
   requireValue(sameHash(newGate.upstreamPin, pin), `Gate manifest is not at the batch Go pin ${pin}.`);
   readEvidence({ path: previous.gate.manifest, sha256: previous.gate.sha256 });
-  const gate = tools.gateCompare(resolve(ROOT, previous.gate.manifest), resolve(ROOT, gateCompare.new), batch.openDefects, batch.gateToolChanges);
+  const idMap = gateIdMapRef(batch.gateIdMap, readEvidence);
+  const gate = tools.gateCompare(resolve(ROOT, previous.gate.manifest), resolve(ROOT, gateCompare.new), batch.openDefects, batch.gateToolChanges, idMap);
   const output = readEvidence(gateCompare.output);
-  requireValue(output?.base?.sha256 === previous.gate.sha256 && output.new?.sha256 === batch.gate.sha256,
-    "gateCompare.output must be the gate-compare.py output for the base gate and batch.gate.");
+  requireValue(output?.base?.sha256 === previous.gate.sha256 && output.new?.sha256 === batch.gate.sha256
+    && (output.idMap?.sha256 ?? null) === (idMap?.sha256 ?? null),
+  "gateCompare.output must be the gate-compare.py output for the base gate, batch.gate and batch.gateIdMap.");
   if (size(gateCompare.regressions, "gateCompare.regressions") > 0 || !Array.isArray(output.regressions) || output.regressions.length) {
     reasons.push("gateCompare reports gate regressions.");
   }
   if (gate.regressions.length) reasons.push(`${gate.regressions.length} gate items regressed against ${previous.gate.manifest}.`);
-  const gateRuns = checkGateRuns(state, batch, resolve(ROOT, previous.gate.manifest), inputs, pin, tools, readEvidence, reasons);
+  const gateRuns = checkGateRuns(state, batch, resolve(ROOT, previous.gate.manifest), idMap, inputs, pin, tools, readEvidence, reasons);
 
   checkRunEvidence(batch, readEvidence);
   const lsp = checkOracle("languageServerOracle", batch.languageServerOracle, lspBase, tools, readEvidence, reasons);
@@ -850,9 +866,10 @@ history rows that may keep a null source (as unbound-history-rows does, for
 every batch). The batch has no fullResult, corpus, roster baselines or
 rosterCarryForward. The history rules above still apply. The current history
 row and both verdicts (PASS, batchId, sourceFingerprint) carry
-goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256 and
-nameMapSha256 = goportTests.nameMap.sha256 (absent or null without a map)
-instead of fullResultSha256.
+goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256,
+nameMapSha256 = goportTests.nameMap.sha256 and gateIdMapSha256 =
+gateIdMap.sha256 (each map sha256 absent or null without that map) instead of
+fullResultSha256.
 
 The base is batch.previousBatch.archive {path, sha256}, the saved record of the
 last accepted batch: it must be the last batchRecords entry (open_revision.py
@@ -891,6 +908,18 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   batch.openDefects, so the gate rules (removed ids, MATCH stays MATCH,
   ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth noise rule)
   have one implementation. Its known-open items are in knownOpenGateItems.
+- gateIdMap {path, sha256} (optional): the gate id map of a pin bump, a TSV
+  of old id, new id and case path (format in gate-compare.py). It only moves
+  ids: no line can remove a case. The file must have that sha256, and the
+  history row and both verdicts carry it as gateIdMapSha256. The check passes
+  it and batch.gateToolChanges to gate-compare.py for the batch gate and each
+  gateRuns run. gate-compare.py uses it only when the base and new manifests
+  are at different Go pins: a mapped id is the same item, and a base allow
+  entry moves only with its own case. A line's case path must equal the case
+  path of the base item and of the new item. An unmapped base id of a mapped
+  family, a missing new id and a line that names two cases give a removed id.
+  gateCompare.output must name the same map sha256 in idMap (no idMap without
+  a map).
 - gateRuns [{label, manifest, sha256, compare {path, sha256}, regressions
   [{id, base, new, why, flake}]}]: every gate run of the source, oldest
   first, with batch.gate last (accept_revision.py). Each failed run that

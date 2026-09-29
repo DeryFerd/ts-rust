@@ -175,6 +175,36 @@ pub fn checker_is_const_type_reference(node: Node) -> bool {
         && node.type_name().text() == "const"
 }
 
+// Go: checker/utilities.go:134 isConstTypeReferenceName
+// isConstTypeReferenceName reports whether node is the `const` type name of a `const`
+// assertion (`x as const` / `<const>x`), which must not be resolved as a real name.
+pub fn is_const_type_reference_name(node: Node) -> bool {
+    node.is_some()
+        && is_identifier(node)
+        && node.parent().is_some()
+        && is_const_type_reference(node.parent())
+        && node.parent().parent().is_some()
+        && is_assertion_expression(node.parent().parent())
+}
+
+// Go: checker/utilities.go:144 isExportAssignmentExpressionName
+// isExportAssignmentExpressionName reports whether node is (the root entity name of) the
+// expression of an `export =` / `export default` assignment. Referencing a namespace or
+// type-only name there is legal, and checkExportAssignment decides whether it is an error,
+// so checkIdentifier must not report a value-usage error for it.
+pub fn is_export_assignment_expression_name(node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
+    let mut current = node;
+    while current.parent().is_some() && is_property_access_or_qualified_name(current.parent()) {
+        current = current.parent();
+    }
+    current.parent().is_some()
+        && is_export_assignment(current.parent())
+        && current.parent().expression() == current
+}
+
 // Go: checker/utilities.go:132 GetSingleVariableOfVariableStatement
 pub fn get_single_variable_of_variable_statement(node: Node) -> Node {
     if !is_variable_statement(node) {
@@ -484,10 +514,8 @@ impl Checker {
     // Go: checker/utilities.go:339 sortSymbols
     // PORT: Go sorts with `c.compareSymbols`, which is always
     // `c.compareSymbolsWorker` ("closure optimization"), so this needs only
-    // `&self`. Go `slices.SortFunc` is not stable, but the comparator is a
-    // total order (it falls back to symbol ids), so a stable sort gives the
-    // same result. Each symbol's first declaration, file index and position
-    // are read once into a `SymbolSortKey`; `compare_symbol_sort_keys` is
+    // `&self`. Each symbol's first declaration, file index and position are
+    // read once into a `SymbolSortKey`; `compare_symbol_sort_keys` is
     // `compareSymbolsWorker` on those cached values.
     pub fn sort_symbols(&self, symbols: &mut [SymbolId]) {
         if symbols.len() < 2 {
@@ -510,20 +538,27 @@ impl Checker {
     /// uses it with its reusable key buffer. The sort and the comparator are
     /// the ones `sort_symbols` uses, so the comparisons (and the lazy
     /// `get_symbol_id` calls in them) happen in the same order.
+    // Go: checker/utilities.go:363 slices.SortFunc(symbols, c.compareSymbols)
+    // PORT: the comparator is not a total order. A file that is not in
+    // `file_index_map` reads as index 0, as in Go, so it ties with the file at
+    // index 0 and the order is not transitive (the auto-import registry
+    // checks package files that are not in the program). Rust std `sort_by`
+    // can panic on that; `gostd::slices::sort_func` is Go's pdqsort, which
+    // does not, and gives Go's order (and Go's order of the `get_symbol_id`
+    // calls) for any comparator.
     pub(crate) fn sort_symbol_sort_keys(&self, keys: &mut [SymbolSortKey]) {
-        keys.sort_by(|a, b| {
+        crate::gostd::slices::sort_func(keys, |a, b| {
             // PERF: two different packed orders give the sign that the full
             // comparator gets from `compare_nodes` (see `SymbolSortKey::order`),
             // and the full comparator returns there before its name and id
-            // steps. So every comparison has the same result, the stable sort
-            // makes the same comparisons, and `get_symbol_id` runs in the same
-            // order.
+            // steps. So every comparison has the same sign, the sort makes the
+            // same comparisons, and `get_symbol_id` runs in the same order.
             if a.order != b.order && a.order != NO_SORT_ORDER && b.order != NO_SORT_ORDER {
                 let r = a.order.cmp(&b.order);
                 debug_assert_eq!(r, self.compare_symbol_sort_keys(a, b).cmp(&0));
-                return r;
+                return r as i32;
             }
-            self.compare_symbol_sort_keys(a, b).cmp(&0)
+            self.compare_symbol_sort_keys(a, b)
         });
     }
 
@@ -710,11 +745,6 @@ pub(crate) struct SymbolSortKey {
     /// Its text is read only when the declarations tie.
     name: Name,
 }
-
-// The std stable small-sort picks its algorithm by `size_of::<T>()`, so a
-// key of another size changes the comparison sequence and with it the order
-// of the lazy `get_symbol_id` calls. Keep the key at 48 bytes.
-const _: () = assert!(std::mem::size_of::<SymbolSortKey>() == 48);
 
 /// `SymbolSortKey::order` when the packed order does not apply. A real
 /// order is below 2^63.

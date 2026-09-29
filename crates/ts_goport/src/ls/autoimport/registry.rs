@@ -1461,9 +1461,10 @@ impl RegistryBuilder {
 
         // For packages whose main extraction yielded nothing, fall back to @types.
         for pkg in &types_fallback_candidates {
-            if extraction_cache.get(&pkg.realpath).is_some()
-                || seen.get(&pkg.types_realpath).copied().unwrap_or(false)
-            {
+            // Go: extractionMu.Lock() (PORT: one thread, no lock)
+            let main_extracted = extraction_cache.get(&pkg.realpath).is_some();
+            // Go: extractionMu.Unlock()
+            if main_extracted || seen.get(&pkg.types_realpath).copied().unwrap_or(false) {
                 continue;
             }
             seen.insert(pkg.types_realpath.clone(), true);
@@ -1711,7 +1712,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1116 hasNewNonNodeModulesFiles
+// Go: ls/autoimport/registry.go:1119 hasNewNonNodeModulesFiles
 // PORT: Go `program` can be nil; it is read only for a
 // `newProgramStructureDifferentFileNames` bucket, where nil panics as in Go.
 pub fn has_new_non_node_modules_files(
@@ -1733,7 +1734,7 @@ pub fn has_new_non_node_modules_files(
     false
 }
 
-// Go: ls/autoimport/registry.go:1131 isIgnoredFile
+// Go: ls/autoimport/registry.go:1134 isIgnoredFile
 // PORT: only `FileName()` and `Path()` are read, so the program's
 // `ParsedSourceFile` is passed (see the file header).
 pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) -> bool {
@@ -1741,7 +1742,7 @@ pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) 
         || ls_program::is_global_typings_file(program, file.file_name())
 }
 
-// Go: ls/autoimport/registry.go:1138 hasSymlinkToNodeModules
+// Go: ls/autoimport/registry.go:1141 hasSymlinkToNodeModules
 // hasSymlinkToNodeModules checks if a file's realpath has a symlink that points
 // to a node_modules directory. This is used to skip files in the project bucket
 // that would be duplicated by the node_modules bucket via their symlink.
@@ -1749,11 +1750,17 @@ pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) 
 // port's maps always exist, so those nil checks always pass.
 pub fn has_symlink_to_node_modules(
     file_path: &tspath::Path,
+    project_root_path: &tspath::Path,
     symlink_cache: Option<&KnownSymlinks>,
 ) -> bool {
     let Some(symlink_cache) = symlink_cache else {
         return false;
     };
+    // Keep files inside this project indexed in project buckets even if they are
+    // reachable through a node_modules symlink from elsewhere.
+    if project_root_path.contains_path(file_path) {
+        return false;
+    }
 
     // First check if the file itself has a symlink to node_modules
     let files_by_realpath = symlink_cache.files_by_realpath();
@@ -1791,7 +1798,7 @@ pub fn has_symlink_to_node_modules(
     found
 }
 
-// Go: ls/autoimport/registry.go:1184 failedAmbientModuleLookupSource
+// Go: ls/autoimport/registry.go:1192 failedAmbientModuleLookupSource
 // PORT: Go `mu sync.Mutex` is dropped (one thread).
 #[derive(Clone, Debug, Default)]
 pub struct FailedAmbientModuleLookupSource {
@@ -1799,7 +1806,7 @@ pub struct FailedAmbientModuleLookupSource {
     pub package_name: String,
 }
 
-// Go: ls/autoimport/registry.go:1190 bucketBuildResult
+// Go: ls/autoimport/registry.go:1198 bucketBuildResult
 // PORT: Go `error` is `Option<GoError>`; Go nil sync maps and sets are
 // `None`.
 pub struct BucketBuildResult {
@@ -1836,7 +1843,7 @@ fn new_bucket_build_result(
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1207 buildProjectBucket
+    // Go: ls/autoimport/registry.go:1215 buildProjectBucket
     // PORT: Go `result.bucket = &RegistryBucket{}` comes first and its fields
     // are set at the end; the port makes the bucket at the end (nothing reads
     // it in between). `getChecker` is `create_checker_pool` (serial).
@@ -1872,6 +1879,7 @@ impl RegistryBuilder {
             .get_program_for_project(project_path)
             .expect(NIL_DEREF);
         let program = &*program;
+        let project_root_path = (self.base.to_path)(&program.get_current_directory());
         let symlink_cache = program.get_symlink_cache();
         let (get_checker, close_pool, checker_count) = create_checker_pool(program);
         // PORT: Go map order is random; insertion (program file) order here.
@@ -1889,14 +1897,16 @@ impl RegistryBuilder {
                     continue;
                 }
             }
-            // Skip all node_modules files - they are always handled by node_modules buckets.
-            // This simplifies the logic and ensures exports are indexed consistently.
-            if file.file_name().contains("/node_modules/") {
-                continue;
-            }
-            // Skip files that are realpaths of symlinks in node_modules.
-            // These files will be indexed via their symlinked path in node_modules buckets.
-            if has_symlink_to_node_modules(file.path(), Some(&*symlink_cache)) {
+            // Ordinary node_modules files are owned by node_modules buckets. Content-mapped files are not
+            // discovered by those buckets, but files already transformed in the Program can be indexed here.
+            if file.content_mapper().is_empty()
+                && (file.file_name().contains("/node_modules/")
+                    || has_symlink_to_node_modules(
+                        file.path(),
+                        &project_root_path,
+                        Some(&*symlink_cache),
+                    ))
+            {
                 continue;
             }
             // Go: wg.Go(func() {...})
@@ -1972,7 +1982,7 @@ impl RegistryBuilder {
         close_pool();
     }
 
-    // Go: ls/autoimport/registry.go:1294 computeDependenciesForNodeModulesDirectory
+    // Go: ls/autoimport/registry.go:1299 computeDependenciesForNodeModulesDirectory
     // PORT: Go returns a `*collections.Set[string]`; nil is `None`.
     pub fn compute_dependencies_for_node_modules_directory(
         &self,
@@ -2028,7 +2038,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1329 discoveredPackage
+// Go: ls/autoimport/registry.go:1334 discoveredPackage
 // discoveredPackage represents a package found during the discovery phase.
 // It holds the resolved package.json and realpath for deduplication.
 // When both a real package and a corresponding @types package exist (e.g., react + @types/react),
@@ -2045,7 +2055,7 @@ pub struct DiscoveredPackage {
     pub is_local: bool,         // true if realpath is within the workspace root
 }
 
-// Go: ls/autoimport/registry.go:1342 perPackageExtractionResult
+// Go: ls/autoimport/registry.go:1347 perPackageExtractionResult
 // perPackageExtractionResult holds the extraction output for one physical package.
 // Produced once per unique realpath during the extraction phase, then installed
 // into every bucket that needs it during the bucket-building phase.
@@ -2065,7 +2075,7 @@ pub struct PerPackageExtractionResult {
     pub failed_ambient_module_lookup_targets: Rc<RefCell<IndexSet<String>>>,
 }
 
-// Go: ls/autoimport/registry.go:1356 packageExtractionResult
+// Go: ls/autoimport/registry.go:1361 packageExtractionResult
 // packageExtractionResult holds the results of extracting exports from a set of packages.
 pub struct PackageExtractionResult {
     pub exports: IndexMap<tspath::Path, Vec<Rc<Export>>>,
@@ -2081,7 +2091,7 @@ pub struct PackageExtractionResult {
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1370 discoverBucketPackages
+    // Go: ls/autoimport/registry.go:1375 discoverBucketPackages
     // discoverBucketPackages resolves the package.json and realpath for each package name
     // in a node_modules directory. This is the discovery phase of the three-phase extraction pipeline.
     // PORT: `ctx` is the port's, for `should_stop_build` (Go has no context
@@ -2155,7 +2165,7 @@ impl RegistryBuilder {
         result
     }
 
-    // Go: ls/autoimport/registry.go:1417 extractPackage
+    // Go: ls/autoimport/registry.go:1422 extractPackage
     // extractPackage extracts exports from a single package.json.
     // This runs once per unique realpath during the extraction phase.
     // Returns nil if the package has no extractable entrypoints.
@@ -2372,7 +2382,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1548 installExtractions
+// Go: ls/autoimport/registry.go:1553 installExtractions
 // installExtractions aggregates pre-extracted per-package results into a single
 // packageExtractionResult for one bucket. This is the install phase of the three-phase pipeline.
 pub fn install_extractions(
@@ -2463,7 +2473,7 @@ pub fn install_extractions(
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1597 buildNodeModulesBucket
+    // Go: ls/autoimport/registry.go:1602 buildNodeModulesBucket
     pub fn build_node_modules_bucket(
         &self,
         ctx: &Context,
@@ -2594,7 +2604,7 @@ impl RegistryBuilder {
         result.err = ctx.err();
     }
 
-    // Go: ls/autoimport/registry.go:1686 updateNodeModulesBucket
+    // Go: ls/autoimport/registry.go:1691 updateNodeModulesBucket
     // updateNodeModulesBucket performs a granular update of the node_modules bucket,
     // re-extracting only the dirty packages and merging with the existing bucket.
     pub fn update_node_modules_bucket(
@@ -2773,7 +2783,7 @@ impl RegistryBuilder {
         result.err = ctx.err();
     }
 
-    // Go: ls/autoimport/registry.go:1805 getNearestAncestorDirectoryWithPackageJson
+    // Go: ls/autoimport/registry.go:1810 getNearestAncestorDirectoryWithPackageJson
     pub fn get_nearest_ancestor_directory_with_package_json(
         &self,
         file_path: &tspath::Path,
@@ -2798,7 +2808,7 @@ impl RegistryBuilder {
         .0
     }
 
-    // Go: ls/autoimport/registry.go:1814 resolveAmbientModuleName
+    // Go: ls/autoimport/registry.go:1819 resolveAmbientModuleName
     pub fn resolve_ambient_module_name(
         &self,
         module_name: &str,

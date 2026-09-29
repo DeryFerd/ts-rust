@@ -28,6 +28,18 @@ impl LanguageService {
                 Vec::new(),
             ));
         }
+        let file = source_file_for_supplemental_file_index(file, data.supplemental_file_index);
+        if file.is_nil() {
+            // PORT: Go reads `*data.SupplementalFileIndex` here. A nil index
+            // returns the file, so the index is set when the file is nil.
+            let index = data
+                .supplemental_file_index
+                .expect("invalid memory address or nil pointer dereference");
+            return Err(gostd::errors::errorf(
+                format!("supplemental source file index not found: {index}"),
+                Vec::new(),
+            ));
+        }
 
         let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let mut checker_ref = checker.borrow_mut();
@@ -87,7 +99,13 @@ impl LanguageService {
         }
 
         if let Some(auto_import) = &data.auto_import {
-            let (edits, description) = autoimport::Fix {
+            if data.is_import_statement_completion {
+                return item;
+            }
+            // Auto-imports in content-mapped files are evaluated eagerly so edits outside
+            // of verbatim spans can cause the completion item to be filtered out entirely.
+            // Only real files take this code path, so the final Edits() is guaranteed ok.
+            let (edits, description, _) = autoimport::Fix {
                 auto_import_fix: auto_import.clone(),
                 ..Default::default()
             }
@@ -343,12 +361,13 @@ impl LanguageService {
         _position: i32,
         doc_format: lsproto::MarkupKind,
     ) -> lsproto::CompletionItem {
-        let (quick_info, documentation) = self.get_quick_info_and_documentation_for_symbol(
+        let (quick_info, documentation, _, _) = self.get_quick_info_and_documentation_for_symbol(
             checker,
             symbol,
             location,
             doc_format.clone(),
             None,
+            false, /*vsCapability*/
         );
         create_completion_details(item, &quick_info, &documentation, doc_format)
     }
@@ -464,7 +483,11 @@ impl LanguageService {
         // Use token position (excluding JSDoc/trivia) instead of node.Pos() to avoid including JSDoc comments
         let token_pos = get_token_pos_of_node(node, source_file, false /*includeJSDoc*/);
         if get_lines_between_positions(source_file, token_pos, node.end()) == 0 {
-            return Some(self.create_lsp_range_from_node(node, source_file));
+            let (lsp_range, fidelity) = self.create_lsp_range_from_node(node, source_file);
+            if !fidelity.is_exact() {
+                return None;
+            }
+            return Some(lsp_range);
         }
 
         if node.kind() == SyntaxKind::ImportKeyword || node.kind() == SyntaxKind::ImportSpecifier {
@@ -517,11 +540,15 @@ impl LanguageService {
             without_module_specifier.end(),
         ) == 0
         {
-            return Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 without_module_specifier.pos(),
                 without_module_specifier.end(),
                 source_file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return None;
+            }
+            return Some(lsp_range);
         }
         None
     }
@@ -1495,11 +1522,14 @@ impl LanguageService {
                 .editor_settings
                 .new_line_character
                 .clone();
-            let mut printer = create_snippet_printer(PrinterOptions {
-                remove_comments: true,
-                new_line: get_new_line_kind(&new_line_char),
-                ..Default::default()
-            });
+            let mut printer = create_snippet_printer(
+                PrinterOptions {
+                    remove_comments: true,
+                    new_line: get_new_line_kind(&new_line_char),
+                    ..Default::default()
+                },
+                None, /*emitContext*/
+            );
             // Go: core.MapIndex(newClauses, func(clause, i) string { ... })
             let mut clause_texts: Vec<String> = Vec::with_capacity(new_clauses.len());
             for (i, &clause) in new_clauses.iter().enumerate() {
@@ -1518,7 +1548,10 @@ impl LanguageService {
 
             let mut additional_text_edits: Option<Vec<lsproto::TextEdit>> = None;
             if let Some(import_adder) = import_adder.as_mut() {
-                additional_text_edits = Some(import_adder.edits());
+                let edits = import_adder.edits();
+                if !edits.is_empty() {
+                    additional_text_edits = Some(edits);
+                }
             }
 
             return Ok(Some(lsproto::CompletionItem {
@@ -1533,11 +1566,13 @@ impl LanguageService {
                     None
                 },
                 data: Some(lsproto::CompletionItemData {
-                    file_name: source_file_file_name(file).to_string(),
+                    file_name: source_file_original_file_name(file).to_string(),
                     position,
+                    supplemental_file_index: supplemental_file_index(file),
                     name,
                     source: COMPLETION_SOURCE_SWITCH_CASES.to_string(),
                     auto_import: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }));
@@ -1631,19 +1666,27 @@ pub fn entity_name_to_expression(
     )
 }
 
-// Go: completions.go:6154 snippetPrinter
+// Go: completions.go:6654 snippetPrinter
 // PORT: Go keeps `baseWriter` and the writer that embeds it as two pointers
 // to one `ChangeTrackerWriter`. In Rust the snippet writer owns it, so Go
 // `p.baseWriter` is `p.writer.borrow().change_tracker_writer`. The printer
 // writes through `Rc<RefCell<dyn EmitTextWriter>>`, so the writer is shared.
+// Go `factory` is `emitContext.Factory.AsNodeFactory()`, a pointer into the
+// context; here it is the method `factory()`.
 pub struct SnippetPrinter {
+    pub emit_context: Rc<EmitContext>,
     pub printer: Printer,
     pub writer: Rc<RefCell<SnippetEmitTextWriter>>,
-    pub factory: NodeFactory,
 }
 
 impl SnippetPrinter {
-    // Go: completions.go:6162 printNode
+    /// Go `p.factory` (`emitContext.Factory.AsNodeFactory()`).
+    #[must_use]
+    pub fn factory(&self) -> &NodeFactory {
+        self.emit_context.factory().as_node_factory()
+    }
+
+    // Go: completions.go:6663 printNode
     /** Snippet-escaping version of `printer.printNode`. */
     pub fn print_node(&mut self, node: Node) -> String {
         let unescaped = self.print_unescaped_node(node);
@@ -1654,7 +1697,7 @@ impl SnippetPrinter {
         unescaped
     }
 
-    // Go: completions.go:6170 printUnescapedNode
+    // Go: completions.go:6671 printUnescapedNode
     pub fn print_unescaped_node(&mut self, node: Node) -> String {
         {
             let mut writer = self.writer.borrow_mut();
@@ -1671,22 +1714,47 @@ impl SnippetPrinter {
         self.writer.borrow().string()
     }
 
-    // Go: completions.go:6177 printAndFormatNode
+    // Go: completions.go:6678 printAndFormatNode
     pub fn print_and_format_node(
         &mut self,
         ctx: &Context,
         node: Node,
         source_file: Node,
     ) -> String {
+        let format_options = crate::format::get_format_code_settings_from_context(ctx);
+        self.print_and_format_node_with_settings(ctx, node, source_file, &format_options)
+    }
+
+    // Go: completions.go:6682 printAndFormatNodeWithSettings
+    pub fn print_and_format_node_with_settings(
+        &mut self,
+        ctx: &Context,
+        node: Node,
+        source_file: Node,
+        format_options: &lsutil::FormatCodeSettings,
+    ) -> String {
         let text = self.print_unescaped_node(node);
         let node_with_pos = self
             .writer
             .borrow()
             .change_tracker_writer
-            .assign_positions_to_node(node, &self.factory);
-        let synthetic_file = self.create_synthetic_file(node_with_pos, &text, source_file);
-        let changes = crate::format::format_node_given_indentation(
+            .assign_positions_to_node(node, self.factory());
+        // PORT: Go passes `sourceFile.ParseOptions()`; the Rust function
+        // takes the file name and path (see its PORT note).
+        let synthetic_file = create_synthetic_source_file(
+            self.factory(),
+            node_with_pos,
+            &text,
+            source_file_file_name(source_file),
+            &source_file_info(source_file).path,
+        );
+        let ctx = crate::format::with_format_code_settings(
             ctx,
+            format_options,
+            &format_options.editor_settings.new_line_character,
+        );
+        let changes = crate::format::format_node_given_indentation(
+            &ctx,
             node_with_pos,
             synthetic_file,
             source_file_info(source_file).language_variant,
@@ -1705,56 +1773,36 @@ impl SnippetPrinter {
 
         apply_bulk_edits(source_file_text(synthetic_file), &all_changes)
     }
-
-    // Go: completions.go:6202 createSyntheticFile
-    // Creates a source file containing `node` for formatting purposes.
-    // `node` and descendants need to be synthetic nodes with positions assigned.
-    // This function also assigns parent pointers.
-    pub fn create_synthetic_file(&self, node: Node, text: &str, target_file: Node) -> Node {
-        let eof = self.factory.new_token(SyntaxKind::EndOfFile);
-        set_node_loc(eof, TextRange::new(text.len() as i32, text.len() as i32));
-        // PORT: Go sets `statements.Loc` after `NewNodeList`. A list `Loc` is
-        // fixed when the list is made, so it is made with the loc.
-        let statements = self
-            .factory
-            .new_node_list_with_loc(&[node], TextRange::new(node.pos(), node.end()));
-        // PORT: Go passes `targetFile.ParseOptions()`; a factory SourceFile
-        // keeps its file name and path. It keeps `&'static` text, like the
-        // leaked synthetic nodes, so the printed text is leaked.
-        let text: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let synthetic_file = self.factory.new_source_file(
-            source_file_file_name(target_file),
-            &source_file_info(target_file).path,
-            text,
-            statements,
-            eof,
-        );
-        set_node_loc(synthetic_file, TextRange::new(0, text.len() as i32));
-        set_parent_in_children(synthetic_file);
-        synthetic_file
-    }
 }
 
-// Go: completions.go:6218 createSnippetPrinter
-pub fn create_snippet_printer(options: PrinterOptions) -> SnippetPrinter {
+// Go: completions.go:6705 createSnippetPrinter
+// PORT: a nil Go `emitContext` is `None`.
+pub fn create_snippet_printer(
+    options: PrinterOptions,
+    emit_context: Option<Rc<EmitContext>>,
+) -> SnippetPrinter {
+    let emit_context = match emit_context {
+        Some(emit_context) => emit_context,
+        None => new_emit_context(),
+    };
     let base_writer = new_change_tracker_writer(options.new_line.get_new_line_character(), -1);
     let printer = new_printer(
         options,
         base_writer.get_print_handlers(),
-        None, /*emitContext*/
+        Some(Rc::clone(&emit_context)),
     );
     let writer = Rc::new(RefCell::new(SnippetEmitTextWriter {
         change_tracker_writer: base_writer,
         escapes: Vec::new(),
     }));
     SnippetPrinter {
+        emit_context,
         printer,
         writer,
-        factory: NodeFactory::new_with_hooks(NodeFactoryHooks::default()),
     }
 }
 
-// Go: completions.go:6233 snippetEmitTextWriter
+// Go: completions.go:6724 snippetEmitTextWriter
 // Override base writer methods to perform snippet escaping.
 // PORT: Go embeds `*printer.ChangeTrackerWriter`; here it is the owned field
 // `change_tracker_writer`. The `EmitTextWriter` impl below forwards every
@@ -1765,12 +1813,7 @@ pub struct SnippetEmitTextWriter {
 }
 
 impl SnippetEmitTextWriter {
-    // Go: completions.go:6238 nonEscapingWrite
-    pub fn non_escaping_write(&mut self, s: &str) {
-        self.change_tracker_writer.write(s);
-    }
-
-    // Go: completions.go:6270 escapingWrite
+    // Go: completions.go:6757 escapingWrite
     // The formatter/scanner will have issues with snippet-escaped text,
     // so instead of writing the escaped text directly to the writer,
     // generate a set of changes that can be applied to the unescaped text

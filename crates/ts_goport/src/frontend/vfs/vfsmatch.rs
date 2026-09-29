@@ -114,8 +114,10 @@ fn get_base_paths(
         }
 
         // Sort the offsets array using either the literal or canonical path representations.
-        // PORT: Go `slices.SortStableFunc`; Rust `sort_by` is stable.
-        include_base_paths.sort_by(|a, b| string_comparer(a, b).cmp(&0));
+        // Go: vfs/vfsmatch/vfsmatch.go:82 slices.SortStableFunc(includeBasePaths, stringComparer)
+        crate::gostd::slices::sort_stable_func(&mut include_base_paths, |a, b| {
+            string_comparer(a, b)
+        });
 
         // Iterate over each include base path and include unique base paths that are not a
         // subpath of an existing base path

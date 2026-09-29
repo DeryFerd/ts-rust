@@ -521,7 +521,6 @@ dependencies = [
  "indexmap",
  "jiff",
  "memchr",
- "name-to-handle-at",
  "nix",
  "rustc-hash",
  "rustix",

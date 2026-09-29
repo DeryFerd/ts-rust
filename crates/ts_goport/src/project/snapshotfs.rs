@@ -608,16 +608,28 @@ impl SnapshotFSBuilder {
         });
     }
 
-    // Go: project/snapshotfs.go:468 snapshotFSBuilder.markDirtyFiles
-    // PORT: Go passes the summary by value; here by reference.
-    pub fn mark_dirty_files(&self, change: &FileChangeSummary) {
-        for uri in &change.changed {
-            let path = (self.to_path)(&uri.file_name());
-            if let (Some(entry), true) = self.disk_files.load(&path) {
-                entry.change(&mut |file: &Rc<RefCell<DiskFile>>| {
-                    file.borrow_mut().needs_reload = true;
-                });
+    // Go: project/snapshotfs.go:480 snapshotFSBuilder.markDirtyFiles
+    // PORT: Go reloads the changed disk files in a work group; the port
+    // reloads them one after another (one thread). The result is a set, so
+    // the order does not matter.
+    pub fn mark_dirty_files(&self, mut change: FileChangeSummary) -> FileChangeSummary {
+        if !change.changed.is_empty() {
+            let mut filtered_changed: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
+            for uri in &change.changed {
+                let path = (self.to_path)(&uri.file_name());
+                if self.overlays.contains_key(&path) {
+                    filtered_changed.insert(uri.clone());
+                    continue;
+                }
+                let (Some(entry), true) = self.disk_files.load(&path) else {
+                    filtered_changed.insert(uri.clone());
+                    continue;
+                };
+                if self.reload_entry_if_content_changed(&entry) {
+                    filtered_changed.insert(uri.clone());
+                }
             }
+            change.changed = filtered_changed;
         }
         for uri in &change.deleted {
             let path = (self.to_path)(&uri.file_name());
@@ -625,14 +637,73 @@ impl SnapshotFSBuilder {
                 entry.delete();
             }
         }
+        change
     }
 
-    // Go: project/snapshotfs.go:526 snapshotFSBuilder.isRelevantFileName
+    // Go: project/snapshotfs.go:517 snapshotFSBuilder.reloadEntryIfContentChanged
+    // PORT: Go named result `(changed bool)`.
+    pub fn reload_entry_if_content_changed(
+        &self,
+        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>>,
+    ) -> bool {
+        let Some(file) = entry.value() else {
+            return true;
+        };
+        let file_name = file.borrow().file_base.file_name.clone();
+        let (content, ok) = self.fs.read_file(&file_name);
+        let mut changed = true;
+        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+            let Some(cur) = e.value() else {
+                return;
+            };
+            if !ok {
+                e.delete();
+                return;
+            }
+            if content == cur.borrow().file_base.content {
+                changed = false;
+                if !cur.borrow().matches_disk_text() {
+                    e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                        file.borrow_mut().needs_reload = false;
+                    });
+                }
+                return;
+            }
+            e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                let mut file = file.borrow_mut();
+                file.file_base.content = content.clone();
+                file.file_base.hash.set(xxh3_128(content.as_bytes()));
+                file.needs_reload = false;
+            });
+        });
+        changed
+    }
+
+    // Go: project/snapshotfs.go:592 snapshotFSBuilder.isRelevantFileName
     // isRelevantFileName returns true if the given URI refers to a file that
-    // could affect the project: it has a TypeScript-relevant extension, is a
-    // dynamic (e.g. untitled) file, or is currently open as an overlay.
-    pub fn is_relevant_file_name(&self, uri: &lsproto::DocumentUri) -> bool {
+    // could affect the project: it has a TypeScript-relevant or configured content-mapper extension,
+    // is a dynamic (e.g. untitled) file, or is currently open as an overlay.
+    // PORT: tsgo#4712 adds the content mapper arguments. Go nil
+    // `*collections.Set` is `None`.
+    pub fn is_relevant_file_name(
+        &self,
+        uri: &lsproto::DocumentUri,
+        content_mapper_extensions: &[String],
+        content_mapper_watched_files: Option<&FxHashSet<tspath::Path>>,
+    ) -> bool {
         let file_name = uri.file_name();
+        if let Some(content_mapper_watched_files) = content_mapper_watched_files
+            && content_mapper_watched_files.contains(&(self.to_path)(&file_name))
+        {
+            return true;
+        }
+        let content_mapper_extensions: Vec<&str> = content_mapper_extensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if tspath::file_extension_is_one_of(&file_name, &content_mapper_extensions) {
+            return true;
+        }
         if tspath::is_dynamic_file_name(&file_name) {
             return true;
         }
@@ -643,10 +714,7 @@ impl SnapshotFSBuilder {
         let Some(i) = path.0.rfind('.') else {
             return false;
         };
-        matches!(
-            &path.0[i..],
-            ".js" | ".jsx" | ".mjs" | ".cjs" | ".ts" | ".tsx" | ".mts" | ".cts" | ".json"
-        )
+        is_relevant_extension(&path.0[i..])
     }
 
     // Go: project/snapshotfs.go:550 snapshotFSBuilder.expandAndFilterWatchEvents
@@ -657,6 +725,8 @@ impl SnapshotFSBuilder {
     pub fn expand_and_filter_watch_events(
         &self,
         mut change: FileChangeSummary,
+        content_mapper_extensions: &[String],
+        content_mapper_watched_files: Option<&FxHashSet<tspath::Path>>,
     ) -> FileChangeSummary {
         if !change.deleted.is_empty() {
             let mut filtered_deleted: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
@@ -664,7 +734,12 @@ impl SnapshotFSBuilder {
                 let path = (self.to_path)(&uri.file_name());
                 if let (_, true) = self.disk_directories.get(&path) {
                     self.collect_files_recursive(&path, &mut filtered_deleted);
-                } else if self.is_relevant_file_name(uri) || is_node_modules_path(&path) {
+                } else if self.is_relevant_file_name(
+                    uri,
+                    content_mapper_extensions,
+                    content_mapper_watched_files,
+                ) || is_node_modules_path(&path)
+                {
                     // node_modules deletions must always be preserved for auto-import registry change handlers.
                     // They won't be in diskDirectories since the registry doesn't use the snapshotFSBuilder for
                     // its file system, since we don't want to retain files read there.
@@ -677,7 +752,11 @@ impl SnapshotFSBuilder {
         if !change.changed.is_empty() {
             let mut filtered_changed: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
             for uri in &change.changed {
-                if self.is_relevant_file_name(uri) {
+                if self.is_relevant_file_name(
+                    uri,
+                    content_mapper_extensions,
+                    content_mapper_watched_files,
+                ) {
                     filtered_changed.insert(uri.clone());
                 }
             }
@@ -835,7 +914,17 @@ impl FileSource for SnapshotFSBuilder {
     }
 }
 
-// Go: project/snapshotfs.go:587 isNodeModulesPath
+// Go: project/snapshotfs.go:616 isRelevantExtension
+// isRelevantExtension returns true if the given extension is a known TypeScript
+// or JavaScript extension that can affect the project.
+pub fn is_relevant_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        ".js" | ".jsx" | ".mjs" | ".cjs" | ".ts" | ".tsx" | ".mts" | ".cts" | ".json"
+    )
+}
+
+// Go: project/snapshotfs.go:665 isNodeModulesPath
 // isNodeModulesPath reports whether path is a node_modules directory itself or
 // lives inside one. Used to preserve node_modules watch deletions, whose package
 // files are read transiently and therefore never tracked in diskDirectories.

@@ -41,16 +41,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
-use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, WriteFileData};
+use ts_goport::emitter::program_emit::{WriteFile, WriteFileData};
 use ts_goport::execute::tsc::{
     CompileTimes, CompilerProgram, EmitInput, ProgramLike, Writer, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, new_os_system,
 };
 use ts_goport::frontend::tspath::{normalize_path, resolve_path};
 use ts_goport::prelude::*;
-
-/// Stack size for the loading threads, as in `goport`.
-const STACK_SIZE: usize = 1 << 30;
 
 const USAGE: &str = "usage: goport_live_programs live <out-dir> <check|emit>:<tsconfig>...
        goport_live_programs release <out-dir> <tsconfig-p> <tsconfig-q>";
@@ -59,7 +56,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let worker = std::thread::Builder::new()
         .name("goport_live_programs".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&args));
     let code = match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(Ok(()))) => 0,
@@ -237,13 +234,14 @@ fn load_live(dir: &Path, mode: Mode, config: &str) -> Live {
 }
 
 /// Step 3 of `live`: two checkers of each program on this thread, which
-/// check the files of every program by turns. Returns the checkers.
-fn check_on_this_thread(lives: &[Live]) -> Vec<[Checker; 2]> {
-    let mut checkers: Vec<[Checker; 2]> = lives
+/// check the files of every program by turns. Returns the checkers, each
+/// in a box (a `Checker` is too large for an array on the stack).
+fn check_on_this_thread(lives: &[Live]) -> Vec<[Box<Checker>; 2]> {
+    let mut checkers: Vec<[Box<Checker>; 2]> = lives
         .iter()
         .map(|live| {
             let _scope = enter_program(Some(live.program));
-            [Checker::new(0), Checker::new(1)]
+            [Box::new(Checker::new(0)), Box::new(Checker::new(1))]
         })
         .collect();
     let mut texts: Vec<[String; 2]> = vec![[String::new(), String::new()]; lives.len()];
@@ -364,7 +362,7 @@ fn release(out: &Path, p_config: &str, q_config: &str) {
     // Q loads after P is loaded and bound, so the two loads do not overlap.
     let q_thread = std::thread::Builder::new()
         .name("second-loading-thread".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || {
             let q = load_check(&q_config);
             let q_first = report_check(q);
@@ -466,10 +464,11 @@ fn report(live: &Live) -> Report {
             ))
         }
     };
-    let program_like: &dyn ProgramLike = match live.mode {
-        Mode::Check => &GoportProgram,
-        Mode::Emit => &CompilerProgram,
-    };
+    // #4407: under `noEmit`, Go's incremental `Program.Emit` gives the
+    // result of the plain one (goport writes no build info), so `check`
+    // uses the plain program as `emit` does, and its report equals a fresh
+    // `goport` run.
+    let program_like: &dyn ProgramLike = &CompilerProgram;
     let (result, _statistics) = emit_and_report_statistics(&EmitInput {
         sys: &sys,
         program_like,
@@ -497,38 +496,6 @@ fn report(live: &Live) -> Report {
         stdout: buffer.take(),
         status: result.status.code(),
         outputs,
-    }
-}
-
-/// `CompilerProgram` with the `goport` emit rule: under `noEmit` an
-/// incremental program skips the emit (Go `incremental.Program.Emit`), so
-/// a report equals a fresh `goport` run.
-struct GoportProgram;
-
-impl ProgramLike for GoportProgram {
-    fn options(&self) -> &'static CompilerOptions {
-        CompilerProgram.options()
-    }
-    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_bind_diagnostics(file)
-    }
-    fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
-        CompilerProgram.get_global_diagnostics()
-    }
-    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_semantic_diagnostics(file)
-    }
-    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
-        CompilerProgram.get_declaration_diagnostics(file)
-    }
-    fn emit(&self, emit_options: EmitOptions) -> EmitResult {
-        if options().is_incremental() {
-            return EmitResult {
-                emit_skipped: true,
-                ..EmitResult::default()
-            };
-        }
-        CompilerProgram.emit(emit_options)
     }
 }
 

@@ -2477,8 +2477,6 @@ impl FileNodeBind {
 #[derive(Clone, Debug, Default)]
 pub struct FileBindData {
     pub bind_diagnostics: Vec<Diagnostic>,
-    pub bind_suggestion_diagnostics: Vec<Diagnostic>,
-    pub end_flow_node: FlowNodeId,
     pub symbol_count: i32,
     // PORT: Go also keeps `ClassifiableNames` here. Nothing reads it, so the
     // binder does not collect it.
@@ -2504,7 +2502,17 @@ pub struct Diagnostic {
     pub end: i32,
     pub code: i32,
     pub category: crate::diagnostics::Category,
+    /// Go `source` (tsgo#4712). When non-empty, a custom prefix (e.g. a
+    /// content mapper's name) shown instead of "TS" before the code. It
+    /// marks the diagnostic as coming from an external source whose ranges
+    /// point into the file's original, untransformed text.
+    pub source: String,
+    /// Go `message`. The Go nil message is `crate::ast::NIL_MESSAGE`.
     pub message: &'static crate::diagnostics::Message,
+    /// Go `messageText` (tsgo#4712): an already-localized message used when
+    /// the message is nil, e.g. a diagnostic deserialized from an external
+    /// process that owns its own localization.
+    pub message_text: String,
     pub message_args: Vec<String>,
     pub message_chain: Vec<Diagnostic>,
     pub related_information: Vec<Diagnostic>,
@@ -3012,9 +3020,15 @@ pub fn prog() -> &'static GoProgram {
 }
 
 // Go: core/version.go:8 version
-// PORT: Go keeps this in a var that ldflags can override. The pinned
-// reference build does not override it.
-const VERSION: &str = "7.1.0-dev";
+// This is a var so it can be overridden by ldflags.
+// PORT: Go release builds set it with `-ldflags -X ...core.version=<v>`
+// (Herebyfile.mjs getReleaseBuildFlags). The port reads the build-time env
+// var GOPORT_BUILD_VERSION instead (build-release.sh: RELEASE_VERSION).
+// Without it the value is Go's default, as in the pinned reference build.
+pub(crate) const VERSION: &str = match option_env!("GOPORT_BUILD_VERSION") {
+    Some(version) => version,
+    None => "7.1.0-dev",
+};
 
 // Go: core/version.go:10 Version
 pub fn version() -> &'static str {
@@ -3022,20 +3036,26 @@ pub fn version() -> &'static str {
 }
 
 // Go: core/version.go:14 versionMajorMinor
-// Go: core/version.go:31 VersionMajorMinor
-pub fn version_major_minor() -> &'static str {
+// PORT: a const, so a GOPORT_BUILD_VERSION with no second '.' stops the
+// build where Go panics at start.
+const VERSION_MAJOR_MINOR: &str = {
+    let bytes = VERSION.as_bytes();
     let mut seen_major = false;
-    let i = VERSION.find(|r: char| {
-        if r == '.' {
+    let mut i = 0;
+    loop {
+        assert!(i < bytes.len(), "invalid version string");
+        if bytes[i] == b'.' {
             if seen_major {
-                return true;
+                break;
             }
             seen_major = true;
         }
-        false
-    });
-    match i {
-        Some(i) => &VERSION[..i],
-        None => panic!("invalid version string: {VERSION}"),
+        i += 1;
     }
+    VERSION.split_at(i).0
+};
+
+// Go: core/version.go:31 VersionMajorMinor
+pub fn version_major_minor() -> &'static str {
+    VERSION_MAJOR_MINOR
 }

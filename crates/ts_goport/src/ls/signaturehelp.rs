@@ -1,6 +1,17 @@
 use crate::ls::prelude::*;
 
-// Go: ls/signaturehelp.go:20 callInvocation
+use crate::spanmap::Feature;
+
+// Go: ls/signaturehelp.go:25 SignatureHelpTriggerCharacters
+// SignatureHelpTriggerCharacters and SignatureHelpRetriggerCharacters are the characters that trigger and
+// re-trigger signature help. They are advertised both in the static server capabilities and in the dynamic
+// content-mapper registration, so they live here to keep those two declarations in sync.
+// PORT: Go `[]string` package variables; here constant slices.
+pub const SIGNATURE_HELP_TRIGGER_CHARACTERS: &[&str] = &["(", ",", "<"];
+// Go: ls/signaturehelp.go:26 SignatureHelpRetriggerCharacters
+pub const SIGNATURE_HELP_RETRIGGER_CHARACTERS: &[&str] = &[")"];
+
+// Go: ls/signaturehelp.go:30 callInvocation
 #[derive(Clone, Copy, Debug)]
 pub struct CallInvocation {
     pub node: Node,
@@ -47,14 +58,18 @@ impl LanguageService {
         context: Option<&lsproto::SignatureHelpContext>,
     ) -> Result<lsproto::SignatureHelpResponse, GoError> {
         let (program, source_file) = self.get_program_and_file(document_uri);
-        let items = self.get_signature_help_items(
-            ctx,
-            self.converters
-                .line_and_character_to_position(&source_file, &position),
-            program,
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
             source_file,
-            context,
+            position,
+            Feature::SIGNATURE_HELP,
         );
+        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
+            return Ok(lsproto::SignatureHelpOrNull::default());
+        }
+        let source_file = positions[0].script;
+        let pos = positions[0].position;
+        let items = self.get_signature_help_items(ctx, pos, program, source_file, context);
         Ok(lsproto::SignatureHelpOrNull {
             signature_help: items,
         })
@@ -681,7 +696,8 @@ impl LanguageService {
         let mut documentation: Option<String> = None;
         let declaration = c.sig(candidate).declaration;
         if declaration.is_some() {
-            let doc = self.get_documentation_from_declaration(
+            let doc = get_documentation_from_declaration(
+                &self.documentation_location_mapper(Feature::SIGNATURE_HELP),
                 c,
                 SymbolId::NIL,
                 declaration,
@@ -1052,7 +1068,8 @@ impl LanguageService {
         let mut documentation: Option<lsproto::StringOrMarkupContent> = None;
         let value_declaration = c.sym(parameter).value_declaration;
         if value_declaration.is_some() {
-            let doc = self.get_documentation_from_declaration(
+            let doc = get_documentation_from_declaration(
+                &self.documentation_location_mapper(Feature::SIGNATURE_HELP),
                 c,
                 SymbolId::NIL,
                 value_declaration,

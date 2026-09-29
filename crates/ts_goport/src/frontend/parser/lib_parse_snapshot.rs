@@ -17,7 +17,8 @@
 //! (`SOURCES_HASH`), a hash of the parse options that the parse reads (file
 //! name, script kind, module indicator options) and the xxh3 hash of the
 //! text. Any mismatch or load error parses the file live, so a stale blob
-//! costs time, not output.
+//! costs time, not output. A lib file is found by its base name
+//! (`bundled_lib_name`), so the embed and noembed builds share the blob.
 //!
 //! The load leaves the state of the thread as a live parse does: the names
 //! of the file are interned in the order in which the parse interns them
@@ -212,10 +213,14 @@ impl ParseKey {
 /// the file name (`is_declaration_file_name`, the store file name), the
 /// script kind and the module indicator options. The path is not read; the
 /// load takes the options of the caller, as the parse does.
+/// For a lib file only its base name is hashed: the parse reads only the
+/// name's extension, so the embed name (`bundled:///libs/lib.dom.d.ts`) and
+/// the noembed path (`<lib dir>/lib.dom.d.ts`) load the same section.
 fn options_hash(opts: &SourceFileParseOptions, script_kind: ScriptKind) -> u64 {
+    let name = bundled_lib_name(&opts.file_name).unwrap_or(&opts.file_name);
     let mut hasher = Xxh3::new();
-    hasher.update(&(opts.file_name.len() as u64).to_le_bytes());
-    hasher.update(opts.file_name.as_bytes());
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name.as_bytes());
     hasher.update(&script_kind.0.to_le_bytes());
     let indicator = opts.external_module_indicator_options;
     hasher.update(&[u8::from(indicator.jsx), u8::from(indicator.force)]);
@@ -375,12 +380,7 @@ fn decode(
     // The store writes of Go `finishSourceFile` (parser_p1.rs), then the
     // freeze of `parse_into_store`.
     set_file_store_js_doc_cache(store, &file.jsdoc_cache);
-    set_file_store_parse_fields(
-        store,
-        file.language_variant,
-        &file.diagnostics,
-        file.contains_non_ascii,
-    );
+    set_file_store_parse_fields(store, file.language_variant, &file.diagnostics);
     if file.has_lazy_js_doc {
         set_file_store_lazy_js_doc(store, &file.parse_options, file.script_kind);
     }
@@ -735,7 +735,10 @@ impl<'a> Decoder<'a> {
             end,
             code,
             category,
+            // tsgo#4712: a lib file has no external diagnostic.
+            source: String::new(),
             message,
+            message_text: String::new(),
             message_args,
             message_chain,
             related_information,
@@ -852,7 +855,6 @@ impl<'a> Decoder<'a> {
             language_variant: LanguageVariant(self.i32()?),
             script_kind: ScriptKind(self.i32()?),
             is_declaration_file: self.flag()?,
-            contains_non_ascii: self.flag()?,
             uses_uri_style_node_core_modules: self.tristate()?,
             identifier_count: self.i32()?,
             imports: self.nodes()?,
@@ -1610,7 +1612,6 @@ impl Encoder {
             language_variant,
             script_kind,
             is_declaration_file,
-            contains_non_ascii,
             uses_uri_style_node_core_modules,
             identifier_count,
             imports,
@@ -1641,7 +1642,6 @@ impl Encoder {
         self.zz(i64::from(language_variant.0));
         self.zz(i64::from(script_kind.0));
         self.u8(u8::from(*is_declaration_file));
-        self.u8(u8::from(*contains_non_ascii));
         self.u8(*uses_uri_style_node_core_modules as u8);
         self.zz(i64::from(*identifier_count));
         self.nodes(imports)?;
@@ -1810,7 +1810,7 @@ fn encode_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binder::lib_snapshot::{snapshot_libs, write_blob};
+    use crate::binder::lib_snapshot::{lib_text, snapshot_libs, write_blob};
     use crate::frontend::parser::utilities::{
         module_indicator_options_read, reset_module_indicator_options_read,
     };
@@ -1837,7 +1837,7 @@ mod tests {
     /// loader gives them (the path is not read by the parse).
     fn lib_input(lib: &str) -> (SourceFileParseOptions, &'static str) {
         let file_name = format!("{}/{lib}", crate::frontend::bundled::lib_path());
-        let text = bundled_text(&file_name).unwrap_or_else(|| panic!("no bundled {lib}"));
+        let text = lib_text(lib).unwrap_or_else(|| panic!("no bundled {lib}"));
         let opts = SourceFileParseOptions {
             file_name,
             ..Default::default()

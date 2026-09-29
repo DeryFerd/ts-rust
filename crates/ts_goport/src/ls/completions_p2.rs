@@ -126,7 +126,7 @@ impl LanguageService {
             file,
             compiler_options,
             include_symbols,
-        );
+        )?;
 
         if data.keyword_filters != KeywordCompletionFilters::NONE {
             let keyword_completions = get_keyword_completions(
@@ -232,10 +232,11 @@ impl LanguageService {
         file: Node,
         compiler_options: &CompilerOptions,
         include_symbols: bool,
-    ) -> (FxHashSet<String>, Vec<CompletionItem>) {
+    ) -> Result<(FxHashSet<String>, Vec<CompletionItem>), GoError> {
         let closest_symbol_declaration =
             get_closest_symbol_declaration(data.context_token, data.location);
         let use_semicolons = lsutil::probably_uses_semicolons(file);
+        let preferences = self.user_preferences();
         let is_member_completion = is_member_completion_kind(data.completion_kind);
         let mut sorted_entries: Vec<CompletionItem> =
             Vec::with_capacity(data.symbols.len() + data.auto_imports.len());
@@ -308,7 +309,7 @@ impl LanguageService {
                 use_semicolons,
                 compiler_options,
                 is_member_completion,
-            );
+            )?;
             let Some(entry) = entry else {
                 continue;
             };
@@ -338,9 +339,30 @@ impl LanguageService {
             // !!! check for type-only in JS
             // !!! deprecation
 
-            if data.import_statement_completion.is_some() {
-                // !!!
-                continue;
+            let mut replacement_span: Option<lsproto::Range> = None;
+            let mut insert_text = String::new();
+            let mut filter_text = String::new();
+            let mut is_snippet = false;
+            let mut sort_text: SortText = SORT_TEXT_AUTO_IMPORT_SUGGESTIONS.to_string();
+
+            if let Some(import_statement_completion) = &data.import_statement_completion {
+                is_snippet = client_supports_item_snippet(ctx);
+                (insert_text, replacement_span) =
+                    get_insert_text_and_replacement_span_for_import_completion(
+                        &auto_import.fix,
+                        autoimport::get_import_kind_for_import_statement(
+                            file,
+                            &auto_import.export,
+                            self.get_program(),
+                        ),
+                        import_statement_completion,
+                        use_semicolons,
+                        file,
+                        &preferences,
+                        is_snippet,
+                    );
+                filter_text = auto_import.fix.name.clone();
+                sort_text = SORT_TEXT_LOCATION_PRIORITY.to_string();
             }
 
             // Non-contextual keywords (e.g., `function`, `class`, `const`) cannot be used as identifiers,
@@ -357,20 +379,22 @@ impl LanguageService {
                     {
                         continue;
                     }
-                } else if !auto_import.export.flags.intersects(SymbolFlags::VALUE) {
+                } else if data.import_statement_completion.is_none()
+                    && !auto_import.export.flags.intersects(SymbolFlags::VALUE)
+                {
                     continue;
                 }
             }
 
-            let entry = self.create_lsp_completion_item(
+            let mut entry = self.create_lsp_completion_item(
                 ctx,
                 &auto_import.fix.name,
-                "",
-                "",
-                SORT_TEXT_AUTO_IMPORT_SUGGESTIONS,
+                &insert_text,
+                &filter_text,
+                &sort_text,
                 auto_import.export.script_element_kind,
                 auto_import.export.script_element_kind_modifiers,
-                None,
+                replacement_span,
                 None,
                 Some(lsproto::CompletionItemLabelDetails {
                     description: Some(auto_import.fix.module_specifier.clone()),
@@ -379,13 +403,20 @@ impl LanguageService {
                 file,
                 position,
                 false, /*isMemberCompletion*/
-                false, /*isSnippet*/
-                true,  /*hasAction*/
-                false, /*preselect*/
+                is_snippet,
+                data.import_statement_completion.is_none(), /*hasAction*/
+                false,                                      /*preselect*/
                 &auto_import.fix.module_specifier,
                 Some(auto_import.fix.auto_import_fix.clone()),
+                None, /*additionalTextEdits*/
                 None, /*detail*/
             );
+
+            entry
+                .data
+                .as_mut()
+                .expect("invalid memory address or nil pointer dereference")
+                .is_import_statement_completion = data.import_statement_completion.is_some();
 
             let is_shadowed = uniques.get(&auto_import.fix.name).copied().unwrap_or(false);
             if !is_shadowed {
@@ -402,7 +433,7 @@ impl LanguageService {
         for name in uniques.keys() {
             unique_set.insert(name.clone());
         }
-        (unique_set, sorted_entries)
+        Ok((unique_set, sorted_entries))
     }
 }
 
@@ -424,6 +455,64 @@ pub fn completion_name_for_literal(
     }
 }
 
+// Go: ls/completions.go:2065 getInsertTextAndReplacementSpanForImportCompletion
+pub fn get_insert_text_and_replacement_span_for_import_completion(
+    fix: &autoimport::Fix,
+    import_kind: lsproto::ImportKind,
+    import_statement_completion: &ImportStatementCompletionInfo,
+    use_semicolons: bool,
+    file: Node,
+    preferences: &lsutil::UserPreferences,
+    is_snippet: bool,
+) -> (String, Option<lsproto::Range>) {
+    let quoted_module_specifier =
+        escape_snippet_text(&quote(file, preferences, &fix.module_specifier));
+    let tab_stop = if is_snippet { "$1" } else { "" };
+    let suffix = if use_semicolons { ";" } else { "" };
+    let top_level_type_only_text = if import_statement_completion.is_top_level_type_only {
+        format!(" {} ", token_to_string(SyntaxKind::TypeKeyword))
+    } else {
+        " ".to_string()
+    };
+    let name = escape_snippet_text(&fix.name);
+    let replacement_span = import_statement_completion.replacement_span;
+
+    match import_kind {
+        lsproto::ImportKind::COMMON_JS => (
+            format!(
+                "import{top_level_type_only_text}{name}{tab_stop} = require({quoted_module_specifier}){suffix}"
+            ),
+            replacement_span,
+        ),
+        lsproto::ImportKind::DEFAULT => (
+            format!(
+                "import{top_level_type_only_text}{name}{tab_stop} from {quoted_module_specifier}{suffix}"
+            ),
+            replacement_span,
+        ),
+        lsproto::ImportKind::NAMESPACE => (
+            format!(
+                "import{top_level_type_only_text}* as {name} from {quoted_module_specifier}{suffix}"
+            ),
+            replacement_span,
+        ),
+        lsproto::ImportKind::NAMED => {
+            let type_only = if import_statement_completion.could_be_type_only_import_specifier {
+                format!("{} ", token_to_string(SyntaxKind::TypeKeyword))
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "import{top_level_type_only_text}{{ {type_only}{name}{tab_stop} }} from {quoted_module_specifier}{suffix}"
+                ),
+                replacement_span,
+            )
+        }
+        _ => panic!("unhandled import kind: {}", import_kind.string()),
+    }
+}
+
 // Go: ls/completions.go:2020 createCompletionItemForLiteral
 pub fn create_completion_item_for_literal(
     file: Node,
@@ -440,7 +529,7 @@ pub fn create_completion_item_for_literal(
 }
 
 impl LanguageService {
-    // Go: ls/completions.go:2033 createCompletionItem
+    // Go: ls/completions.go:2096 createCompletionItem
     // PORT: Go returns a nil `*lsproto.CompletionItem` when there is no dot
     // to convert; that is `None`. Go reassigns the `sortText` and `name`
     // parameters, so they are copied into locals.
@@ -460,12 +549,12 @@ impl LanguageService {
         use_semicolons: bool,
         compiler_options: &CompilerOptions,
         is_member_completion: bool,
-    ) -> Option<lsproto::CompletionItem> {
+    ) -> Result<Option<lsproto::CompletionItem>, GoError> {
         let mut sort_text: SortText = sort_text.to_string();
         let mut name: String = name.to_string();
         let context_token = data.context_token;
         let mut insert_text = String::new();
-        let filter_text = String::new();
+        let mut filter_text = String::new();
         let mut replacement_span =
             self.get_replacement_range_for_context_token(file, replacement_token, position);
         let mut is_snippet = false;
@@ -525,7 +614,7 @@ impl LanguageService {
             }
 
             if dot.is_nil() {
-                return None;
+                return Ok(None);
             }
 
             // If the text after the '.' starts with this name, write over it. Else, add new text.
@@ -534,11 +623,15 @@ impl LanguageService {
             } else {
                 dot.end()
             };
-            replacement_span = Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 astnav::get_start_of_node(dot, file, false /*includeJSDoc*/),
                 end,
                 file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return Ok(None);
+            }
+            replacement_span = Some(lsp_range);
         }
 
         if data.jsx_initializer.is_initializer {
@@ -547,8 +640,12 @@ impl LanguageService {
             }
             insert_text = format!("{{{insert_text}}}");
             if data.jsx_initializer.initializer.is_some() {
-                replacement_span =
-                    Some(self.create_lsp_range_from_node(data.jsx_initializer.initializer, file));
+                let (lsp_range, fidelity) =
+                    self.create_lsp_range_from_node(data.jsx_initializer.initializer, file);
+                if !fidelity.is_exact() {
+                    return Ok(None);
+                }
+                replacement_span = Some(lsp_range);
             }
         }
 
@@ -586,11 +683,15 @@ impl LanguageService {
             } else {
                 data.property_access_to_convert.expression()
             };
-            replacement_span = Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 astnav::get_start_of_node(wrap_node, file, false /*includeJSDoc*/),
                 data.property_access_to_convert.end(),
                 file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return Ok(None);
+            }
+            replacement_span = Some(lsp_range);
         }
 
         if origin_is_type_only_alias(origin) {
@@ -637,20 +738,41 @@ impl LanguageService {
             }
         }
 
+        let mut additional_text_edits: Option<Vec<lsproto::TextEdit>> = None;
         if preferences
             .include_completions_with_class_member_snippets
             .is_true()
             && data.completion_kind == CompletionKind::MEMBER_LIKE
-            && is_class_like_member_completion(symbol, data.location, file)
+            && is_class_like_member_completion(&type_checker.symbols, symbol, data.location, file)
         {
-            // !!! class member completions
+            let member_completion_entry = self.get_entry_for_member_completion(
+                ctx,
+                type_checker,
+                symbol,
+                &name,
+                data.location,
+                position,
+                context_token,
+                file,
+            )?;
+            let Some(member_completion_entry) = member_completion_entry else {
+                return Ok(None);
+            };
+            insert_text = member_completion_entry.insert_text;
+            filter_text = member_completion_entry.filter_text;
+            is_snippet = member_completion_entry.is_snippet;
+            if !member_completion_entry.additional_text_edits.is_empty() {
+                additional_text_edits = Some(member_completion_entry.additional_text_edits);
+                has_action = true;
+                source = COMPLETION_SOURCE_CLASS_MEMBER_SNIPPET.to_string();
+            }
         }
 
         if origin_is_object_literal_method(origin) {
             let origin = origin.unwrap();
             insert_text = origin.as_object_literal_method().insert_text.clone();
             is_snippet = origin.as_object_literal_method().is_snippet;
-            label_details = origin.as_object_literal_method().label_details.clone(); // !!! check if this can conflict with case above where we set label details
+            label_details = origin.as_object_literal_method().label_details.clone();
             if !client_supports_item_label_details(ctx) {
                 // PORT: Go dereferences `labelDetails.Detail`; a nil pointer
                 // panics there, as the unwraps do here.
@@ -779,7 +901,7 @@ impl LanguageService {
             is_recommended_completion_match(symbol, data.recommended_completion, type_checker);
         let kind_modifiers = lsutil::get_symbol_modifiers(Some(&mut *type_checker), symbol);
 
-        Some(self.create_lsp_completion_item(
+        Ok(Some(self.create_lsp_completion_item(
             ctx,
             &name,
             &insert_text,
@@ -798,8 +920,668 @@ impl LanguageService {
             preselect,
             &source,
             None, /*autoImportFix*/
+            additional_text_edits,
             None, /*detail*/
-        ))
+        )))
+    }
+}
+
+// Go: ls/completions.go:2377 memberCompletionEntry
+#[derive(Clone, Debug, Default)]
+pub struct MemberCompletionEntry {
+    pub insert_text: String,
+    pub filter_text: String,
+    pub is_snippet: bool,
+    pub additional_text_edits: Vec<lsproto::TextEdit>,
+}
+
+impl LanguageService {
+    // Go: ls/completions.go:2384 getEntryForObjectLiteralMethodCompletion
+    // PORT: Go returns `*symbolOriginInfoObjectLiteralMethod`; nil is `None`.
+    pub fn get_entry_for_object_literal_method_completion(
+        &self,
+        ctx: &Context,
+        type_checker: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        file: Node,
+    ) -> Option<SymbolOriginInfoObjectLiteralMethod> {
+        let mut snippet_printer = create_snippet_printer(
+            PrinterOptions {
+                remove_comments: true,
+                new_line: get_new_line_kind(
+                    &self.format_options().editor_settings.new_line_character,
+                ),
+                target: self.get_program().options().get_emit_script_target(),
+                ..Default::default()
+            },
+            None, /*emitContext*/
+        );
+
+        let is_snippet = client_supports_item_snippet(ctx);
+        let method = self.create_object_literal_method(
+            &snippet_printer,
+            type_checker,
+            symbol,
+            enclosing_declaration,
+            file,
+            is_snippet,
+        );
+        if method.is_nil() {
+            return None;
+        }
+
+        let mut insert_text = snippet_printer.print_and_format_node_with_settings(
+            ctx,
+            method,
+            file,
+            &change::get_format_code_settings_for_writing(self.format_options(), file),
+        );
+        insert_text += ",";
+
+        Some(SymbolOriginInfoObjectLiteralMethod {
+            insert_text,
+            label_details: Some(lsproto::CompletionItemLabelDetails {
+                detail: Some(self.print_object_literal_method_label_detail(
+                    method,
+                    file,
+                    snippet_printer.factory(),
+                )),
+                ..Default::default()
+            }),
+            is_snippet,
+        })
+    }
+
+    // Go: ls/completions.go:2409 createObjectLiteralMethod
+    pub fn create_object_literal_method(
+        &self,
+        snippet_printer: &SnippetPrinter,
+        type_checker: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        file: Node,
+        is_snippet: bool,
+    ) -> Node {
+        let factory = snippet_printer.factory();
+        let emit_context = &snippet_printer.emit_context;
+
+        let declaration = type_checker
+            .sym(symbol)
+            .declarations
+            .first()
+            .copied()
+            .unwrap_or(Node::NIL);
+        if !is_object_literal_method_completion_candidate_declaration(declaration) {
+            return Node::NIL;
+        }
+
+        let type_of_symbol =
+            type_checker.get_type_of_symbol_at_location(symbol, enclosing_declaration);
+        let mut effective_type = type_checker.get_widened_type_exported(type_of_symbol);
+        if type_checker
+            .ty(effective_type)
+            .flags
+            .intersects(TypeFlags::UNION)
+            && type_checker.ty(effective_type).types().len() < 10
+        {
+            let types = type_checker.ty(effective_type).types().to_vec();
+            effective_type =
+                type_checker.get_union_type_ex_exported(&types, UnionReduction::SUBTYPE);
+        }
+        if type_checker
+            .ty(effective_type)
+            .flags
+            .intersects(TypeFlags::UNION)
+        {
+            let mut function_type = TypeId::NIL;
+            let types = type_checker.ty(effective_type).types().to_vec();
+            for union_type in types {
+                if type_checker
+                    .get_signatures_of_type_exported(union_type, SignatureKind::CALL)
+                    .is_empty()
+                {
+                    continue;
+                }
+                if function_type.is_some() {
+                    return Node::NIL;
+                }
+                function_type = union_type;
+            }
+            if function_type.is_nil() {
+                return Node::NIL;
+            }
+            effective_type = function_type;
+        }
+
+        let signatures =
+            type_checker.get_signatures_of_type_exported(effective_type, SignatureKind::CALL);
+        if signatures.len() != 1 {
+            return Node::NIL;
+        }
+
+        let mut flags = NodeBuilderFlags::OMIT_THIS_PARAMETER;
+        if lsutil::get_quote_preference(file, &self.user_preferences())
+            == lsutil::QuotePreference::SINGLE
+        {
+            flags |= NodeBuilderFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE;
+        }
+        let type_node = type_checker.type_to_type_node_exported(
+            effective_type,
+            enclosing_declaration,
+            flags,
+            None, /*idToSymbol*/
+        );
+        if type_node.is_nil() || type_node.kind() != SyntaxKind::FunctionType {
+            return Node::NIL;
+        }
+
+        let type_node_parameters = type_node.parameters();
+        let mut parameters: Vec<Node> = Vec::with_capacity(type_node_parameters.len());
+        for parameter in type_node_parameters.iter() {
+            parameters.push(factory.new_parameter_declaration(
+                ModifierList::NIL, /*modifiers*/
+                parameter.dot_dot_dot_token(),
+                factory.clone_node(parameter.name()),
+                Node::NIL, /*questionToken*/
+                Node::NIL, /*typeNode*/
+                parameter.initializer(),
+            ));
+        }
+
+        let mut body = factory.new_block(
+            factory.new_node_list(&[] /*nodes*/),
+            true, /*multiLine*/
+        );
+        if is_snippet {
+            body = create_snippet_tab_stop_body(factory, emit_context);
+        }
+
+        factory.new_method_declaration(
+            ModifierList::NIL, /*modifiers*/
+            Node::NIL,         /*asteriskToken*/
+            factory.clone_node(declaration.name()),
+            Node::NIL,     /*postfixToken*/
+            NodeList::NIL, /*typeParameters*/
+            factory.new_node_list(&parameters),
+            Node::NIL, /*typeNode*/
+            Node::NIL, /*fullSignature*/
+            body,
+        )
+    }
+}
+
+// Go: ls/completions.go:2483 isObjectLiteralMethodCompletionCandidateDeclaration
+pub fn is_object_literal_method_completion_candidate_declaration(declaration: Node) -> bool {
+    if declaration.is_nil() {
+        return false;
+    }
+    matches!(
+        declaration.kind(),
+        SyntaxKind::PropertySignature
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::MethodDeclaration
+    )
+}
+
+// Go: ls/completions.go:2495 objectLiteralMethodSymbol
+// PORT: Go `origin *symbolOriginInfo` is never nil here; it is held by value.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectLiteralMethodSymbol {
+    pub symbol: SymbolId,
+    pub origin: SymbolOriginInfo,
+}
+
+impl LanguageService {
+    // Go: ls/completions.go:2500 collectObjectLiteralMethodSymbols
+    pub fn collect_object_literal_method_symbols(
+        &self,
+        ctx: &Context,
+        type_checker: &mut Checker,
+        members: &[SymbolId],
+        enclosing_declaration: Node,
+        file: Node,
+    ) -> Vec<ObjectLiteralMethodSymbol> {
+        if is_source_file_js(file) {
+            return Vec::new();
+        }
+
+        let mut methods: Vec<ObjectLiteralMethodSymbol> = Vec::new();
+        for &member in members {
+            if !is_object_literal_method_symbol(&type_checker.symbols, member) {
+                continue;
+            }
+            let (display_name, _) = get_completion_entry_display_name_for_symbol(
+                &type_checker.symbols,
+                member,
+                None, /*origin*/
+                CompletionKind::OBJECT_PROPERTY_DECLARATION,
+                false, /*isJsxIdentifierExpected*/
+            );
+            if display_name.is_empty() {
+                continue;
+            }
+            let Some(entry) = self.get_entry_for_object_literal_method_completion(
+                ctx,
+                type_checker,
+                member,
+                enclosing_declaration,
+                file,
+            ) else {
+                continue;
+            };
+            methods.push(ObjectLiteralMethodSymbol {
+                symbol: member,
+                origin: SymbolOriginInfo {
+                    kind: SymbolOriginInfoKind::OBJECT_LITERAL_METHOD,
+                    data: SymbolOriginInfoData::ObjectLiteralMethod(entry),
+                    ..Default::default()
+                },
+            });
+        }
+        methods
+    }
+}
+
+// Go: ls/completions.go:2529 isObjectLiteralMethodSymbol
+// PORT: Go reads `symbol.Flags` through the pointer; `symbols` is the arena
+// that holds `symbol`.
+pub fn is_object_literal_method_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
+    symbols
+        .sym(symbol)
+        .flags
+        .intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD)
+}
+
+impl LanguageService {
+    // Go: ls/completions.go:2533 printObjectLiteralMethodLabelDetail
+    pub fn print_object_literal_method_label_detail(
+        &self,
+        method: Node,
+        file: Node,
+        factory: &NodeFactory,
+    ) -> String {
+        let method_signature = factory.new_method_signature_declaration(
+            ModifierList::NIL, /*modifiers*/
+            factory.new_identifier(""),
+            method.postfix_token(),
+            method.type_parameter_list(),
+            method.parameter_list(),
+            method.type_(),
+        );
+        let mut signature_printer = new_printer(
+            PrinterOptions {
+                remove_comments: true,
+                omit_trailing_semicolon: true,
+                new_line: get_new_line_kind(
+                    &self.format_options().editor_settings.new_line_character,
+                ),
+                target: self.get_program().options().get_emit_script_target(),
+                ..Default::default()
+            },
+            PrintHandlers::default(),
+            None, /*emitContext*/
+        );
+        signature_printer.emit(method_signature, file)
+    }
+
+    // Go: ls/completions.go:2552 getEntryForMemberCompletion
+    // PORT: Go returns `(*memberCompletionEntry, error)`; nil is `None`. The
+    // missing member fixer borrows the change tracker, the checker and the
+    // import adder; it is last used for `createMemberFromSymbol`, so the Go
+    // uses after that call read them directly.
+    pub fn get_entry_for_member_completion(
+        &self,
+        ctx: &Context,
+        type_checker: &mut Checker,
+        symbol: SymbolId,
+        name: &str,
+        location: Node,
+        position: i32,
+        context_token: Node,
+        file: Node,
+    ) -> Result<Option<MemberCompletionEntry>, GoError> {
+        let class_like_declaration = find_ancestor(location, is_class_like);
+        if class_like_declaration.is_nil() {
+            return Ok(None);
+        }
+
+        let mut import_adder = self.create_import_adder(ctx, type_checker, file)?;
+
+        let mut change_tracker = change::new_tracker(
+            ctx,
+            self.get_program().options(),
+            self.format_options(),
+            Rc::clone(&self.converters),
+        );
+        let mut fixer = new_missing_member_fixer(
+            &mut change_tracker,
+            self.get_program(),
+            &mut *type_checker,
+            self.user_preferences(),
+            import_adder.as_deref_mut(),
+            locale::from_context(ctx),
+        );
+
+        let present_modifiers = self.get_present_member_modifiers(context_token, file, position);
+        let abstract_ = present_modifiers
+            .modifiers
+            .intersects(ModifierFlags::ABSTRACT)
+            && class_like_declaration
+                .modifier_flags()
+                .intersects(ModifierFlags::ABSTRACT);
+        let is_snippet = client_supports_item_snippet(ctx);
+        let factory = fixer.change_tracker.node_factory();
+        let mut body = factory.new_block(factory.new_node_list(&[]), true /*multiLine*/);
+        if is_snippet {
+            body = create_snippet_tab_stop_body(
+                fixer.change_tracker.node_factory(),
+                &fixer.change_tracker.emit_context,
+            );
+        }
+
+        let nodes = fixer.create_member_from_symbol(
+            symbol,
+            class_like_declaration,
+            file,
+            body,
+            PreserveOptionalFlags::PROPERTY,
+            abstract_,
+        );
+        let mut additional_text_edits: Vec<lsproto::TextEdit> = Vec::new();
+        if let Some(import_adder) = import_adder.as_mut() {
+            if import_adder.has_fixes() {
+                additional_text_edits = import_adder.edits();
+            }
+        }
+        if let Some(erase_range) = present_modifiers.erase_range {
+            additional_text_edits.push(lsproto::TextEdit {
+                range: erase_range,
+                new_text: String::new(),
+            });
+        }
+
+        let mut modifiers = ModifierFlags::NONE;
+        let mut completion_nodes: Vec<Node> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if node.is_nil() {
+                continue;
+            }
+            if completion_nodes.is_empty() {
+                modifiers = node.modifier_flags();
+                if abstract_ {
+                    modifiers |= ModifierFlags::ABSTRACT;
+                }
+                if is_class_element(node)
+                    && type_checker.get_member_override_modifier_status_exported(
+                        class_like_declaration,
+                        node,
+                        symbol,
+                    ) == MemberOverrideStatus::NEEDS_OVERRIDE
+                {
+                    modifiers |= ModifierFlags::OVERRIDE;
+                }
+            }
+            completion_nodes.push(node);
+        }
+
+        if completion_nodes.is_empty() {
+            return Ok(Some(MemberCompletionEntry {
+                insert_text: name.to_string(),
+                filter_text: name.to_string(),
+                is_snippet,
+                additional_text_edits,
+            }));
+        }
+
+        let mut allowed_modifiers = modifiers | ModifierFlags::OVERRIDE | ModifierFlags::PUBLIC;
+        if type_checker
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::METHOD)
+        {
+            allowed_modifiers |= ModifierFlags::ASYNC;
+        } else {
+            allowed_modifiers |= ModifierFlags::AMBIENT | ModifierFlags::READONLY;
+        }
+
+        let allowed_and_present = present_modifiers.modifiers & allowed_modifiers;
+        if present_modifiers.modifiers.without(allowed_modifiers) != ModifierFlags::NONE {
+            return Ok(None);
+        }
+
+        if modifiers.intersects(ModifierFlags::PROTECTED)
+            && allowed_and_present.intersects(ModifierFlags::PUBLIC)
+        {
+            modifiers = modifiers.without(ModifierFlags::PROTECTED);
+        }
+
+        if allowed_and_present != ModifierFlags::NONE
+            && !allowed_and_present.intersects(ModifierFlags::PUBLIC)
+        {
+            modifiers = modifiers.without(ModifierFlags::PUBLIC);
+        }
+
+        modifiers |= allowed_and_present;
+        let new_line = self.format_options().editor_settings.new_line_character;
+        let mut snippet_printer = create_snippet_printer(
+            PrinterOptions {
+                remove_comments: true,
+                new_line: get_new_line_kind(&new_line),
+                target: self.get_program().options().get_emit_script_target(),
+                ..Default::default()
+            },
+            Some(Rc::clone(&change_tracker.emit_context)),
+        );
+
+        let mut decorated_node = Node::NIL;
+        if !present_modifiers.decorators.is_empty() {
+            let last_node_index = completion_nodes.len() - 1;
+            if can_have_decorators(completion_nodes[last_node_index]) {
+                decorated_node = completion_nodes[last_node_index];
+            }
+        }
+
+        let mut texts: Vec<String> = Vec::with_capacity(completion_nodes.len());
+        for node in completion_nodes {
+            let decorators: &[Node] = if node == decorated_node {
+                &present_modifiers.decorators
+            } else {
+                &[]
+            };
+            let node = replace_modifiers(
+                change_tracker.node_factory(),
+                node,
+                create_modifier_list(change_tracker.node_factory(), modifiers, decorators),
+            );
+            let text = snippet_printer.print_and_format_node_with_settings(
+                ctx,
+                node,
+                file,
+                &change::get_format_code_settings_for_writing(self.format_options(), file),
+            );
+            texts.push(text);
+        }
+
+        let insert_text = texts.join(new_line.as_str());
+        if insert_text.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(MemberCompletionEntry {
+            insert_text,
+            filter_text: name.to_string(),
+            is_snippet,
+            additional_text_edits,
+        }))
+    }
+}
+
+// Go: ls/completions.go:2669 presentMemberModifiers
+#[derive(Clone, Debug, Default)]
+pub struct PresentMemberModifiers {
+    pub modifiers: ModifierFlags,
+    pub decorators: Vec<Node>,
+    pub erase_range: Option<lsproto::Range>,
+}
+
+impl LanguageService {
+    // Go: ls/completions.go:2675 getPresentMemberModifiers
+    pub fn get_present_member_modifiers(
+        &self,
+        context_token: Node,
+        file: Node,
+        position: i32,
+    ) -> PresentMemberModifiers {
+        if context_token.is_nil()
+            || get_line_of_position(file, position)
+                > get_line_of_position(file, context_token.end())
+        {
+            return PresentMemberModifiers::default();
+        }
+
+        let mut modifiers = ModifierFlags::NONE;
+        let mut decorators: Vec<Node> = Vec::new();
+        let mut range_pos = position;
+        let mut range_end = position;
+
+        if is_property_declaration(context_token.parent()) {
+            let context_modifier_kind = modifier_like_kind(context_token);
+            if context_modifier_kind == SyntaxKind::Unknown {
+                return PresentMemberModifiers::default();
+            }
+
+            let modifier_nodes = context_token.parent().modifier_nodes().to_vec();
+            if !modifier_nodes.is_empty() {
+                modifiers |= modifiers_to_flags(&modifier_nodes) & ModifierFlags::MODIFIER;
+                for &modifier in &modifier_nodes {
+                    if is_decorator(modifier) {
+                        decorators.push(modifier);
+                    }
+                    range_pos = range_pos.min(get_token_pos_of_node(
+                        modifier, file, false, /*includeJSDoc*/
+                    ));
+                }
+            }
+
+            let context_modifier_flag = modifier_to_flag(context_modifier_kind);
+            if !modifiers.intersects(context_modifier_flag) {
+                modifiers |= context_modifier_flag;
+                range_pos = range_pos.min(astnav::get_start_of_node(
+                    context_token,
+                    file,
+                    false, /*includeJSDoc*/
+                ));
+            }
+
+            if context_token.parent().name() != context_token {
+                range_end = astnav::get_start_of_node(
+                    context_token.parent().name(),
+                    file,
+                    false, /*includeJSDoc*/
+                );
+            }
+        }
+
+        let mut erase_range: Option<lsproto::Range> = None;
+        if range_pos < range_end {
+            let (lsp_range, fidelity) =
+                self.create_lsp_range_from_bounds(range_pos, range_end, file);
+            if fidelity.is_exact() {
+                erase_range = Some(lsp_range);
+            }
+        }
+
+        PresentMemberModifiers {
+            modifiers,
+            decorators,
+            erase_range,
+        }
+    }
+}
+
+// Go: ls/completions.go:2725 modifierLikeKind
+pub fn modifier_like_kind(node: Node) -> SyntaxKind {
+    if node.is_nil() {
+        return SyntaxKind::Unknown;
+    }
+    if is_modifier(node) {
+        return node.kind();
+    }
+    if is_identifier(node) {
+        let keyword_kind = identifier_to_keyword_kind(node);
+        if keyword_kind != SyntaxKind::Unknown && is_modifier_kind(keyword_kind) {
+            return keyword_kind;
+        }
+    }
+    SyntaxKind::Unknown
+}
+
+// Go: ls/completions.go:2741 createModifierList
+// PORT: Go returns a nil `*ast.ModifierList` when there are no nodes; that is
+// `ModifierList::NIL`.
+pub fn create_modifier_list(
+    factory: &NodeFactory,
+    flags: ModifierFlags,
+    decorators: &[Node],
+) -> ModifierList {
+    let mut nodes: Vec<Node> = Vec::new();
+    for &decorator in decorators {
+        nodes.push(factory.clone_node(decorator));
+    }
+    nodes.extend(create_modifiers_from_modifier_flags(flags, &mut |kind| {
+        factory.new_modifier(kind)
+    }));
+    if nodes.is_empty() {
+        return ModifierList::NIL;
+    }
+    factory.new_modifier_list(&nodes)
+}
+
+// Go: ls/completions.go:2753 createSnippetTabStopBody
+pub fn create_snippet_tab_stop_body(factory: &NodeFactory, emit_context: &EmitContext) -> Node {
+    let empty_statement = factory.new_empty_statement();
+    emit_context.set_snippet_element(
+        empty_statement,
+        SnippetElement {
+            kind: SnippetKind::TAB_STOP,
+            order: 0,
+        },
+    );
+    factory.new_block(
+        factory.new_node_list(&[empty_statement]),
+        true, /*multiLine*/
+    )
+}
+
+impl LanguageService {
+    // Go: ls/completions.go:2762 createImportAdder
+    // PORT: Go returns a nil-able `autoimport.ImportAdder` interface; here an
+    // `Option<Box<dyn ImportAdder>>`. Go passes the checker; the Rust adder
+    // does not store it (as in `getExhaustiveCaseSnippets`).
+    pub fn create_import_adder(
+        &self,
+        ctx: &Context,
+        type_checker: &mut Checker,
+        file: Node,
+    ) -> Result<Option<Box<dyn autoimport::ImportAdder>>, GoError> {
+        if tspath::is_dynamic_file_name(source_file_file_name(file)) {
+            return Ok(None);
+        }
+        let view = self.get_prepared_auto_import_view(file)?;
+        let Some(view) = view else {
+            return Ok(None);
+        };
+        Ok(Some(autoimport::new_import_adder(
+            ctx,
+            self.get_program(),
+            file,
+            view,
+            self.format_options(),
+            Rc::clone(&self.converters),
+            self.user_preferences(),
+        )))
     }
 }
 
@@ -1037,10 +1819,30 @@ pub fn get_line_end_of_position(file: Node, pos: i32) -> i32 {
     last_char_pos
 }
 
-// Go: ls/completions.go:2475 isClassLikeMemberCompletion
-pub fn is_class_like_member_completion(symbol: SymbolId, location: Node, file: Node) -> bool {
-    // !!! class member completions
-    false
+// Go: ls/completions.go:2955 isClassLikeMemberCompletion
+// PORT: Go reads `symbol.Flags` through the pointer; `symbols` is the arena
+// that holds `symbol`.
+pub fn is_class_like_member_completion(
+    symbols: &SymbolArena,
+    symbol: SymbolId,
+    location: Node,
+    file: Node,
+) -> bool {
+    if is_in_js_file(location) {
+        return false;
+    }
+    let member_flags = SymbolFlags::CLASS_MEMBER & SymbolFlags::ENUM_MEMBER_EXCLUDES;
+    symbols.sym(symbol).flags.intersects(member_flags)
+        && (is_class_like(location)
+            || (location.parent().is_some()
+                && location.parent().parent().is_some()
+                && is_class_element(location.parent())
+                && location == location.parent().name()
+                && lsutil::get_last_token(location.parent(), file) == location.parent().name()
+                && is_class_like(location.parent().parent()))
+            || (location.parent().is_some()
+                && is_syntax_list(location)
+                && is_class_like(location.parent())))
 }
 
 // Go: ls/completions.go:2480 symbolAppearsToBeTypeOnly
@@ -1973,7 +2775,13 @@ impl LanguageService {
             SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral => {
                 self.create_range_from_string_literal_like_content(file, context_token, position)
             }
-            _ => Some(self.create_lsp_range_from_node(context_token, file)),
+            _ => {
+                let (lsp_range, fidelity) = self.create_lsp_range_from_node(context_token, file);
+                if !fidelity.is_exact() {
+                    return None;
+                }
+                Some(lsp_range)
+            }
         }
     }
 
@@ -1993,7 +2801,12 @@ impl LanguageService {
             }
             replacement_end = position.min(node.end());
         }
-        Some(self.create_lsp_range_from_bounds(node_start + 1, replacement_end, file))
+        let (lsp_range, fidelity) =
+            self.create_lsp_range_from_bounds(node_start + 1, replacement_end, file);
+        if !fidelity.is_exact() {
+            return None;
+        }
+        Some(lsp_range)
     }
 }
 
@@ -2433,7 +3246,11 @@ impl LanguageService {
                 || location.kind() == SyntaxKind::PrivateIdentifier)
         {
             let start = astnav::get_start_of_node(location, file, false /*includeJSDoc*/);
-            return Some(self.create_lsp_range_from_bounds(start, location.end(), file));
+            let (lsp_range, fidelity) =
+                self.create_lsp_range_from_bounds(start, location.end(), file);
+            if fidelity.is_exact() {
+                return Some(lsp_range);
+            }
         }
         None
     }
