@@ -265,6 +265,11 @@ impl Checker {
         self.get_type_of_symbol(symbol)
     }
 
+    // Go: checker/exports.go:188 GetNonMissingTypeOfSymbol
+    pub fn get_non_missing_type_of_symbol_exported(&mut self, symbol: SymbolId) -> TypeId {
+        self.get_non_missing_type_of_symbol(symbol)
+    }
+
     // Go: checker/exports.go:168 GetConstraintOfTypeParameter
     pub fn get_constraint_of_type_parameter_exported(&mut self, type_parameter: TypeId) -> TypeId {
         self.get_constraint_of_type_parameter(type_parameter)
