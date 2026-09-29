@@ -1,67 +1,77 @@
-# TypeScript compiler in Rust
+# ts-rust
 
-This repository is a Rust port of
-[`microsoft/typescript-go`](https://github.com/microsoft/typescript-go). It is
-under active development and is not yet a replacement for `tsgo` or `tsc`.
+`ts-rust` is an experimental attempt to port
+[`microsoft/typescript-go`](https://github.com/microsoft/typescript-go) to
+Rust. It is not currently a replacement for `tsgo` or `tsc`.
 
-The current sellable experiment is the deliberately narrow
-[minimal working v0](docs/minimal-working-v0.md): `--noCheck`, ESNext,
-preserved ESM, type erasure, and preserved JSX with explicit parity and
-performance gates.
+Current typechecker work follows the [reset plan](docs/typechecker-reset-plan.md)
+and [accountability rules](docs/typechecker-accountability.md). Read the
+[saved state](docs/typechecker-state/current.json) before resuming work.
 
-The implementation is split into compiler layers so each layer can be tested
-against the upstream TypeScript fixtures independently:
+The newest checker is `crates/ts_goport`, a direct port of the pinned Go
+checker. It checks TanStack Query core and Hono with diagnostics identical to
+`tsgo`, and is faster than `tsgo` on every measured project. Accepted
+revisions and evidence are in the saved state.
 
-- `ts_core`: source positions and diagnostics
-- `ts_ast`: generated syntax kinds and arena-backed AST nodes
-- `ts_scanner`: lexical analysis
-- `ts_parser`: the TypeScript grammar and error recovery
-- `ts_binder` / `ts_checker`: symbols, scopes, and semantic types
-- `ts_module` / `ts_glob`: module resolution and project file discovery
-- `ts_project`: project-reference graph loading and ordered builds
-- `ts_incremental`: deterministic build information and project invalidation
-- `ts_fswatch`: portable recursive file watching and event coalescing
-- `ts_watch`: watch-mode compilation orchestration
-- `ts_options`: normalized compiler options
-- `ts_outputpaths`: JavaScript/declaration output path calculation
-- `ts_semver`: npm-style semantic versions and package range matching
-- `ts_jsnum`: JavaScript number operations, formatting, and pseudo-bigints
-- `ts_evaluator`: compile-time expression and constant evaluation
-- `ts_jsonrpc`: typed JSON-RPC messages and LSP protocol framing
-- `ts_lsp`: document synchronization, diagnostics, navigation, and editor protocol handling
-- `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
-- `ts_printer` / `ts_sourcemap`: target-aware JavaScript and source-map emission
-- `ts_bundled`: the pinned TypeScript default-library declarations
-- `ts_diagnostics`: generated TypeScript diagnostic catalog
-- `ts_diagnostic_writer`: plain and contextual diagnostic formatting
-- `ts_config`: JSONC and `tsconfig.json` parsing
-- `ts_path` / `ts_vfs`: compiler path and filesystem abstractions
-- `ts_cli`: the `tsgo` executable
+## The model experiment
 
-Run the current checks with:
+This repository is also an experiment in how capable `gpt-5.6-sol` is at
+understanding, validating, and completing a compiler-sized systems port through
+Codex and its subagents.
+
+There is an important provenance caveat: the archived Codex log labels 236 of
+the original implementation turns as an earlier model, one later turn as
+`gpt-5.5`, and only the brief July 8 resume as `gpt-5.6-sol`. The existing code
+is therefore the starting artifact for the `gpt-5.6-sol` experiment, not
+evidence that every existing line was produced by that model name.
+
+## Current state
+
+`crates/ts_goport` has two parts crates, `goport_util` and `goport_lsproto`, in
+`crates/ts_goport/parts`. It still uses six small crates from the first
+prototype (`ts_ast`, `ts_core`, `ts_diagnostics`, `ts_jsnum`, `ts_path` and
+`ts_scanner`) and the lib files in `crates/ts_bundled/libs`. `tools/ts_ast_codegen` and
+`tools/ts_diagnostics_codegen` generate parts of `ts_ast` and `ts_diagnostics`.
+
+On 2026-09-28 the rest of the first prototype (the legacy parser, binder,
+checker, printer, compiler, CLI, LSP and their tools) was deleted. It is in the
+git history.
+
+## How the project got here
+
+The implementation logs show three distinct Codex goal runs:
+
+| Goal run | Outcome | Goal-accounted tokens |
+| --- | --- | ---: |
+| Full Rust port, June 22–26 | Produced the broad prototype. A later audit found 70 failing tests and measured the broad compiler 2.6–3.4x slower than Go for equivalent work. Paused. | 207,170,354 |
+| `minimal-working-v0`, June 26 | Narrowed the claim to the explicit five-file no-check contract and built its oracle, runtime, and benchmark gates. Completed. | 1,439,471 |
+| Type-checking parity, June 27–July 8 | Added substantial checker work, but never demonstrated full `tsgo` parity. Paused. | 7,438,681 |
+| **Total** |  | **216,048,506 (~216 million)** |
+
+The estimate uses Codex's goal-level `tokensUsed` counters for the three runs
+that were explicitly tied to this repository. Those counters equal uncached
+input plus output tokens. The raw session log records about 8.34 billion
+input-plus-output tokens, but about 8.12 billion of those are cached context
+replay, so that larger number is not a useful estimate of new inference spent
+on the project. Work between goals and this README update are not included.
+
+The history also explains why breadth is not the same as completion here. The
+first goal landed hundreds of commits across many compiler subsystems before
+the parity harness was authoritative. A recovery audit then reduced the scope
+to one measurable path. The later checker goal expanded the scope again and
+was suspended before cleanup and full verification were complete.
+
+## Building
 
 ```sh
-./scripts/run-cargo-capped.sh test --workspace
-./scripts/run-cargo-capped.sh clippy --workspace --all-targets -- -D warnings
-```
-
-Or run the complete local gate, including generated-source checks:
-
-```sh
+./scripts/run-cargo-capped.sh build --release -p ts_goport --bins
 ./scripts/verify.sh
 ```
 
-With an upstream checkout available, compiler emit baselines can be sampled
-directly and filtered deterministically:
-
-```sh
-TS_GO_REPO=/path/to/typescript-go ./scripts/run-fixture-baseline.sh \
-  --filter ClassDeclaration --limit 20
-```
-
-`tsgo file.ts` and `tsgo --project tsconfig.json` run the standard compilation
-pipeline, including default libraries, checking, JavaScript/declaration emit,
-and source maps. Project-reference builds support incremental `.tsbuildinfo`
-state, and `--watch` works for file and build invocations. `tsgo --lsp` runs the
-editor protocol server. Development-only `--tokenize`, `--parse`, and
-`--compile-dev` modes expose individual layers.
+The bins are `goport` (type check) and `tsgo` (the Go `tsgo` command line).
+The Go baseline tests run with
+`TS_GO_REPO=/path/to/typescript-go ./scripts/run-cargo-capped.sh test -p ts_goport --test go_baselines`.
+The measurement and gate scripts are in [scripts/goport](scripts/goport/README.md).
+The port rules are in [crates/ts_goport/PORTING.md](crates/ts_goport/PORTING.md).
+The port is pinned to the upstream revision recorded in [UPSTREAM.md](UPSTREAM.md)
+and [UPSTREAM.json](UPSTREAM.json).

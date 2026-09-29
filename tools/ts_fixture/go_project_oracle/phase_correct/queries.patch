@@ -1,8 +1,0 @@
---- a/type_symbol_baseline.go
-+++ b/type_symbol_baseline.go
-@@ -375,0 +376 @@
-+			phaseOracleObserveTypeQuery(fileChecker, node, node.Parent)
-@@ -379,0 +381 @@
-+			phaseOracleObserveTypeQuery(fileChecker, node, node)
-@@ -421,0 +424 @@
-+	phaseOracleObserveSymbolQuery(fileChecker, node)

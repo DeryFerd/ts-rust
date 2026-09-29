@@ -130,20 +130,11 @@ impl<'a> DataList<'a> {
     }
 }
 
-/// `ModifierList::modifier_flags` of a modifier list read in place from the
-/// data of a node of `file`.
-fn in_place_modifier_flags(file: usize, m: &Option<ts_ast::ModifierList>) -> ModifierFlags {
-    let Some(m) = m else {
-        return ModifierFlags::NONE;
-    };
-    if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
-        return ModifierFlags(m.flags.0);
-    }
-    let mut flags = ModifierFlags::NONE;
-    for modifier in DataList::req(file, &m.list).nodes() {
-        flags |= modifier_to_flag(modifier.kind());
-    }
-    flags
+/// `ModifierList::modifier_flags` of a modifier list read in place from
+/// node data (store or synthetic).
+fn in_place_modifier_flags(m: &Option<ts_ast::ModifierList>) -> ModifierFlags {
+    m.as_ref()
+        .map_or(ModifierFlags::NONE, |m| ModifierFlags(m.flags.0))
 }
 
 /// True when data variant `$v` fits a node of kind `$k`. This mirrors
@@ -1159,8 +1150,8 @@ fn text_range_of(r: &ts_core::TextRange) -> TextRange {
 // PERF: U1 (d). A store node made by `alloc_store_name_node` or
 // `alloc_store_shared_name_node` (S1) has an empty data text; its text is
 // the name of its slot (`store_identifier_name`). A
-// data text that is not empty is the text: synthetic, cloned and legacy
-// nodes keep it, and a store slot whose data has one has that name.
+// data text that is not empty is the text: synthetic and cloned nodes
+// keep it, and a store slot whose data has one has that name.
 #[inline]
 fn name_node_text(n: Node, text: &'static str) -> &'static str {
     if !text.is_empty() {
@@ -1175,88 +1166,6 @@ fn question_of_postfix(postfix: Node) -> Node {
         return postfix;
     }
     Node::NIL
-}
-
-/// Go `MappedTypeNode.Members` of mapped type `n`, whose data holds the list
-/// `members`.
-// PORT: Go parseMappedType always parses a member list, which is empty
-// unless there are (erroneous) members. The Rust parser stores `None` for
-// the empty list. For a parsed mapped type we make one leaked empty list per
-// node, placed just before the closing brace like Go's.
-fn mapped_type_members(n: Node, members: NodeList) -> NodeList {
-    let f = n.file_index();
-    // A ported-parser file (and a factory node) keeps the Go list as parsed.
-    if members.is_some() || has_file_store(f) || try_go_file(f).is_none() {
-        return members;
-    }
-    let Some(node) = static_ast_node(n) else {
-        return members;
-    };
-    let l = MAPPED_TYPE_MEMBERS.with(|cache| {
-        *cache.borrow_mut().entry(n).or_insert_with(|| {
-            let close = node.range.end.get().saturating_sub(1);
-            let at = ts_core::TextPos::new(close);
-            Box::leak(Box::new(ts_ast::NodeList {
-                range: ts_core::TextRange::new(at, at),
-                nodes: Vec::new(),
-                has_trailing_comma: false,
-            }))
-        })
-    });
-    list(f, l)
-}
-
-/// The Go kind of a parsed node whose ts_ast kind differs from Go.
-// PORT: the Rust parser reuses node types where the Go parser makes its own:
-// - a PropertyDeclaration in an interface, type literal or mapped type is Go
-//   `PropertySignature` (parser.go parsePropertyOrMethodSignature);
-// - a QualifiedName in an ExpressionWithTypeArguments is Go
-//   `PropertyAccessExpression` (parser.go parseExpressionWithTypeArguments
-//   parses a left-hand-side expression);
-// - an OmittedExpression in an array binding pattern is Go `BindingElement`
-//   with nil fields (parser.go parseArrayBindingElement).
-// The data stays the same. The accessors in this file and fields.rs read the
-// Go fields from it.
-fn go_kind(file: usize, id: ts_ast::NodeId, n: &ts_ast::Node) -> SyntaxKind {
-    let Some(f) = try_go_file(file) else {
-        return n.kind;
-    };
-    let arena = &f.legacy_source().parse.arena;
-    let Some(parent_id) = n.parent else {
-        return n.kind;
-    };
-    let Some(parent) = arena.get(parent_id) else {
-        return n.kind;
-    };
-    match n.kind {
-        SyntaxKind::PropertyDeclaration
-            if matches!(
-                parent.kind,
-                SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral | SyntaxKind::MappedType
-            ) =>
-        {
-            SyntaxKind::PropertySignature
-        }
-        SyntaxKind::QualifiedName => {
-            let is_expression = match &parent.data {
-                NodeData::ExpressionWithTypeArguments(d) => d.expression == id,
-                NodeData::QualifiedName(d) => {
-                    d.left == id
-                        && go_kind(file, parent_id, parent) == SyntaxKind::PropertyAccessExpression
-                }
-                _ => false,
-            };
-            if is_expression {
-                SyntaxKind::PropertyAccessExpression
-            } else {
-                n.kind
-            }
-        }
-        SyntaxKind::OmittedExpression if parent.kind == SyntaxKind::ArrayBindingPattern => {
-            SyntaxKind::BindingElement
-        }
-        k => k,
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1404,8 +1313,7 @@ enum SliceIds {
     Nodes(&'static [Node]),
     /// The ids of the slice, of a frozen store (`frozen_store_ids`).
     Frozen(&'static [ts_ast::NodeId], FrozenIds),
-    /// `NodeSlice::get` per node: ids before freeze and of legacy files, and
-    /// synthetic lists.
+    /// `NodeSlice::get` per node: ids before freeze and synthetic lists.
     Slow,
 }
 
@@ -1507,9 +1415,8 @@ enum ListRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A ts_ast list of parsed data (store or legacy) of file `file`: a list
-    /// field of node data, or a leaked list (lists of the legacy frontend).
-    /// It lives for the process.
+    /// A ts_ast list field of the node data of store `file`. It lives for
+    /// the process.
     Ts {
         file: u32,
         list: &'static ts_ast::NodeList,
@@ -1602,8 +1509,8 @@ impl NodeList {
         Self(ListRef::synthetic(list))
     }
 
-    /// The file of the list: a store id, a legacy file index or
-    /// `SYNTHETIC_NODE_FILE`. 0 for `NodeList::NIL`.
+    /// The file of the list: a store id or `SYNTHETIC_NODE_FILE`. 0 for
+    /// `NodeList::NIL`.
     #[inline]
     #[must_use]
     pub fn file(self) -> usize {
@@ -1736,53 +1643,24 @@ impl NodeList {
 
     /// Go `list.Loc`. Panics when nil, like Go.
     #[must_use]
-    // PORT: the Rust list ranges include the delimiters or start at the
-    // first token. Go ranges start after the opener (or at the full start)
-    // and end after the last element or its trailing comma.
     pub fn loc(self) -> TextRange {
-        let (file, l) = match self.0 {
+        match self.0 {
             ListRef::Nil => panic!("nil NodeList dereference"),
-            ListRef::Ts { file, list } => (file as usize, list),
-            // A store list: it holds the Go `Loc`.
+            // Store lists hold the Go `Loc`.
+            ListRef::Ts { list, .. } => {
+                assert!(!is_nil_list_marker(list), "nil NodeList dereference");
+                text_range_of(&list.range)
+            }
             ListRef::Pending { list, .. } => {
                 assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
-                return text_range_of(&list.range);
+                text_range_of(&list.range)
             }
             // A synthetic list holds the Go `Loc`.
             repr => {
                 let list = repr.synthetic_list().expect("synthetic list");
-                return with_synthetic_list(list, |l| text_range_of(&l.nodes().range));
+                with_synthetic_list(list, |l| text_range_of(&l.nodes().range))
             }
-        };
-        assert!(!is_nil_list_marker(l), "nil NodeList dereference");
-        // Store lists hold the Go `Loc`.
-        if has_file_store(file) {
-            return text_range_of(&l.range);
         }
-        let Some(file) = try_go_file(file) else {
-            return text_range_of(&l.range);
-        };
-        let arena = &file.legacy_source().parse.arena;
-        let text = file.legacy_source().source_text.as_bytes();
-        let span = |id: &ts_ast::NodeId| {
-            arena
-                .get(*id)
-                .map(|n| crate::ast::go_view::go_node_range(&file.info.trivia, text, arena, n))
-        };
-        let elements = match (
-            l.nodes.first().and_then(span),
-            l.nodes.last().and_then(span),
-        ) {
-            (Some(first), Some(last)) => Some((first, last)),
-            _ => None,
-        };
-        let (pos, end) = crate::ast::go_view::go_list_range(
-            &file.info.trivia,
-            text,
-            (l.range.start.get(), l.range.end.get()),
-            elements,
-        );
-        TextRange::new(pos as i32, end as i32)
     }
 
     // Go: ast.go:134 Pos
@@ -2011,30 +1889,13 @@ impl ModifierList {
     pub fn modifier_flags(self) -> ModifierFlags {
         match self.0 {
             ModifiersRef::Nil => ModifierFlags::NONE,
-            ModifiersRef::Ts { file, list } => {
-                if has_file_store(file as usize) {
-                    return ModifierFlags(list.flags.0);
-                }
-                self.legacy_modifier_flags()
-            }
             // A store list.
+            ModifiersRef::Ts { list, .. } => ModifierFlags(list.flags.0),
             ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
             repr => with_synthetic_list(repr.synthetic_list().expect("synthetic list"), |m| {
                 ModifierFlags(m.modifiers().flags.0)
             }),
         }
-    }
-
-    // PORT: lists of the legacy frontend (ts_parser) store ts_parser flag
-    // bits, so the Go flags are computed from the modifier nodes, like
-    // `modifiers_to_flags`, without copying the list.
-    #[inline(never)]
-    fn legacy_modifier_flags(self) -> ModifierFlags {
-        let mut flags = ModifierFlags::NONE;
-        for modifier in self.nodes() {
-            flags |= modifier_to_flag(modifier.kind());
-        }
-        flags
     }
 }
 
@@ -2089,9 +1950,6 @@ thread_local! {
     static SUBTREE_FACTS: RefCell<FxHashMap<Node, SubtreeFacts>> = RefCell::new(FxHashMap::default());
     /// Go `Node.Text()` results that Go builds with string concatenation.
     static JOINED_TEXT: RefCell<FxHashMap<Node, &'static str>> = RefCell::new(FxHashMap::default());
-    /// Empty Go member lists of parsed mapped types (see `mapped_type_members`).
-    static MAPPED_TYPE_MEMBERS: RefCell<FxHashMap<Node, &'static ts_ast::NodeList>> =
-        RefCell::new(FxHashMap::default());
 }
 
 impl Node {
@@ -2112,12 +1970,7 @@ impl Node {
         if let Some(h) = try_store_header(self) {
             return h.kind;
         }
-        with_ast_node(self, |r| match r.kind {
-            SyntaxKind::PropertyDeclaration
-            | SyntaxKind::QualifiedName
-            | SyntaxKind::OmittedExpression => go_kind(self.file_index(), nid(self), r),
-            k => k,
-        })
+        with_ast_node(self, |r| r.kind)
     }
 
     /// Go `node.Flags`: parser flags plus the flags the binder adds.
@@ -2188,7 +2041,7 @@ impl Node {
             }
             return h.flags;
         }
-        self.go_file().parser_flags[nid(self).index()] | self.added_flags()
+        unreachable!("node {self:?} is not synthetic and has no store")
     }
 
     /// Go `node.Parent`.
@@ -2209,7 +2062,7 @@ impl Node {
         if let Some(h) = try_store_header(self) {
             return h.parent;
         }
-        opt(self.file_index(), with_ast_node(self, |r| r.parent))
+        unreachable!("node {self:?} is not synthetic and has no store")
     }
 
     /// Go `node.Loc`.
@@ -2222,8 +2075,6 @@ impl Node {
         }
     }
 
-    // PORT: the Rust parser starts a node at its first token. Go starts it
-    // at the full start, before the leading trivia (see `ast::go_view`).
     #[inline(never)]
     fn loc_slow(self) -> TextRange {
         if is_synthetic_node(self) {
@@ -2235,16 +2086,7 @@ impl Node {
         let Some(r) = static_ast_node(self) else {
             unreachable!("a synthetic node takes the slot path");
         };
-        let Some(file) = try_go_file(self.file_index()) else {
-            return text_range_of(&r.range);
-        };
-        let (pos, end) = crate::ast::go_view::go_node_range(
-            &file.info.trivia,
-            file.legacy_source().source_text.as_bytes(),
-            &file.legacy_source().parse.arena,
-            r,
-        );
-        TextRange::new(pos as i32, end as i32)
+        text_range_of(&r.range)
     }
 
     // Go: ast.go:192 Pos
@@ -2843,9 +2685,6 @@ impl Node {
                 TypeLiteralNode,
             ] => req members,
         );
-        if list.is_nil() && self.kind() == SyntaxKind::MappedType {
-            return mapped_type_members(self, list);
-        }
         list
     }
 
@@ -3466,8 +3305,6 @@ trait ChildVisit<'d> {
     fn ids(&mut self, ids: &'d [ts_ast::NodeId]) -> bool;
     /// Go `CaseOrDefaultClause.Expression` (see `case_expression`).
     fn case_expression(&mut self, id: ts_ast::NodeId) -> bool;
-    /// Go `MappedTypeNode.Members` (see `mapped_type_members`).
-    fn mapped_type_members(&mut self, members: &'d Option<ts_ast::NodeList>) -> bool;
 }
 
 /// The generic walk of `for_each_child_impl`.
@@ -3533,11 +3370,6 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     #[inline(always)]
     fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
         visit(self.v, case_expression(self.n, self.file, id))
-    }
-
-    #[inline(always)]
-    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool {
-        self.visit_list(mapped_type_members(self.n, opt_list(self.file, members)))
     }
 }
 
@@ -3610,11 +3442,6 @@ impl<'d> ChildVisit<'d> for SyntheticChildVisit<'_, '_> {
     fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
         visit(self.v, case_expression(self.n, SYNTHETIC_NODE_FILE, id))
     }
-
-    // A factory node keeps the Go list as it was made (`mapped_type_members`).
-    fn mapped_type_members(&mut self, members: &'d Option<ts_ast::NodeList>) -> bool {
-        self.opt_list(members)
-    }
 }
 
 /// R3-2: the walk of `for_each_store_child_id`. The ids are slot indexes of
@@ -3662,12 +3489,6 @@ impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
     #[inline(always)]
     fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
         self.kind == SyntaxKind::CaseClause && self.node(id)
-    }
-
-    // A store file keeps the Go list as parsed (`mapped_type_members`).
-    #[inline(always)]
-    fn mapped_type_members(&mut self, members: &'static Option<ts_ast::NodeList>) -> bool {
-        self.opt_list(members)
     }
 }
 
@@ -3953,7 +3774,7 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
                 || o!(d.name_type)
                 || o!(d.question_token)
                 || o!(d.type_)
-                || w.mapped_type_members(&d.members)
+                || ol!(d.members)
         }
         NodeData::TypeLiteralNode(d) => l!(d.members),
         NodeData::TupleTypeNode(d) => l!(d.elements),
@@ -4298,7 +4119,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         };
     }
     let ambient = |m: &Option<ts_ast::ModifierList>| {
-        in_place_modifier_flags(f, m).intersects(ModifierFlags::AMBIENT)
+        in_place_modifier_flags(m).intersects(ModifierFlags::AMBIENT)
     };
     let jsx = SubtreeFacts::SUBTREE_CONTAINS_JSX;
     match d {
@@ -4586,7 +4407,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
             if d.body.is_none() {
                 TS
             } else {
-                let is_async = modifiers_have_async(f, &d.modifiers);
+                let is_async = modifiers_have_async(&d.modifiers);
                 let is_generator = d.asterisk_token.is_some();
                 pm!(d.modifiers)
                     | po!(d.asterisk_token)
@@ -4677,7 +4498,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         }
         // Go: ast.go:2079 (*FunctionExpression).computeSubtreeFacts
         NodeData::FunctionExpression(d) => {
-            let is_async = modifiers_have_async(f, &d.modifiers);
+            let is_async = modifiers_have_async(&d.modifiers);
             let is_generator = d.asterisk_token.is_some();
             pm!(d.modifiers)
                 | po!(d.asterisk_token)
@@ -4868,9 +4689,9 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 }
 
 /// Go `node.modifiers != nil && node.modifiers.ModifierFlags&ModifierFlagsAsync != 0`
-/// for the modifier list `m` of a node of `file`, read in place.
-fn modifiers_have_async(file: usize, m: &Option<ts_ast::ModifierList>) -> bool {
-    in_place_modifier_flags(file, m).intersects(ModifierFlags::ASYNC)
+/// for the modifier list `m` of a node, read in place.
+fn modifiers_have_async(m: &Option<ts_ast::ModifierList>) -> bool {
+    in_place_modifier_flags(m).intersects(ModifierFlags::ASYNC)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5194,10 +5015,8 @@ impl Node {
     /// to the source file.
     // PORT: Go resolves a lazy cache miss with the parser hook
     // `parseJSDocForNode`. A file that is not published yet runs it through
-    // `resolve_file_store_js_doc`. The Go frontend path
-    // (`GOPORT_FRONTEND=go`) runs it through `program::resolve_lazy_js_doc`.
-    // The legacy path has no hook, so a miss on a lazy file stops at
-    // `unported!`.
+    // `resolve_file_store_js_doc`; a program file runs it through
+    // `program::resolve_lazy_js_doc`.
     // PERF: U4 (CH7). `HAS_JS_DOC` is a parser bit (`Node::parser_flags`).
     #[must_use]
     pub fn js_doc(self, file: Node) -> NodeSlice {
@@ -5349,10 +5168,7 @@ pub fn source_file_text(file: Node) -> &'static str {
     if is_synthetic_node(file) {
         return synthetic_source_file_text(file);
     }
-    if has_file_store(file.file_index()) {
-        return file_store_text(file.file_index());
-    }
-    &file.go_file().legacy_source().source_text
+    file_store_text(file.file_index())
 }
 
 // Go: ast.go:2570 (*SourceFile).FileName
@@ -5361,10 +5177,7 @@ pub fn source_file_file_name(file: Node) -> &'static str {
     if is_synthetic_node(file) {
         return synthetic_source_file_file_name(file);
     }
-    if has_file_store(file.file_index()) {
-        return file_store_file_name(file.file_index());
-    }
-    &file.go_file().legacy_source().file_name
+    file_store_file_name(file.file_index())
 }
 
 // Go: ast.go:2578 (*SourceFile).Imports

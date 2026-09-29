@@ -2656,9 +2656,9 @@ pub static Remove_Unused_Imports: &Message = &CATALOG[2151];
 pub static Sort_Imports: &Message = &CATALOG[2152];
 
 // PORT: messages that Go at the pin has and `ts_diagnostics::CATALOG` (old pin) lacks.
-// `crates/ts_diagnostics` stays at the old pin because the protected `ts_compiler` crate
-// shares it (as `crates/ts_bundled/libs` does for the libs). Only the language service uses
-// these, so no code or key lookup (`message_by_code`, `message_by_key`) needs to find them.
+// `crates/ts_diagnostics` is still at the old pin (as `crates/ts_bundled/libs` is for the
+// libs). Only the language service uses these, so no code or key lookup (`message_by_code`,
+// `message_by_key`) needs to find them.
 pub static JSDoc_comment: &Message = &Message::new(
     100_019,
     Category::Message,

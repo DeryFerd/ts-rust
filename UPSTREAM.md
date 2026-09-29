@@ -16,12 +16,32 @@ checkout with Go 1.26.4:
 
 ```sh
 CGO_ENABLED=0 go build -o ~/.local/bin/tsgo-oracle ./cmd/tsgo
-./scripts/run-cargo-capped.sh run -p ts_compare -- \
-  ~/.local/bin/tsgo-oracle target/debug/tsgo -- --version
 ```
 
-The upstream TypeScript submodule must be initialized for the full compiler
-corpus. `TS_GO_REPO=/path/to/typescript-go ./scripts/run-cargo-capped.sh test
--p ts_fixture --test upstream_cases` validates fixture parsing across the
-available cases and keeps invalid-UTF-8 scanner cases visible as a known
-source-text requirement.
+## Pins and the pin selector
+
+`UPSTREAM.json` is the machine-readable pin file: the current pin, every known pin (commit,
+Go checkout, oracle path and sha256) and the oracle caches that belong to a pin. The default
+paths above hold the current pin and do not change when a pin is added.
+
+`GOPORT_PIN=<key>` (the first 12 hex digits of a pin commit) runs one command against another
+pin. `scripts/goport/gate.sh`, `sweep-wide.sh`, `compare-build.sh`, `scripts/tsgo-oracle.sh`
+and `scripts/upstream/corpus.py` honor it directly; `remote.sh run` passes it on. Any other
+command honors it through `scripts/upstream/pin.py exec -- <command>`. The run gets a private
+mount namespace where the default oracle, Go checkout and caches show the pin's files
+(`target/continuation-r97-goport/pins/<key>/...`). With the variable unset nothing changes.
+
+- `scripts/upstream/pin.py`: show, path, exec, binds, add (checkout and oracle), sync (to a host).
+- `scripts/upstream/drift.py O N --out DIR`: upstream commits from O to N as lane work lists,
+  with the Rust functions each Go change reaches.
+- `scripts/upstream/rerecord.sh <key> [host]`: re-records the Go-side evidence for a pin into
+  its pin-keyed dirs; `record.py` holds the recorders it adds.
+
+The `tests/go_baselines` harness reads `TS_GO_REPO`; under `pin.py exec` its default path is
+the pin checkout.
+
+Some pin caches are inputs, not oracle outputs, because they come from the pin's Go tests or
+API: the API traces (`tests2/api/traces`, built by `scripts/goport/api_oracle.py build` under
+`GOPORT_PIN`; pins after `dc37b5249ab6` speak API protocol 2), the fourslash LS traces
+(`ls-oracle/fourslash`, recorded from the pin's fourslash tests) and the f1 sample case files
+(`record.py corpus`). Build them at each pin before its oracle recording.

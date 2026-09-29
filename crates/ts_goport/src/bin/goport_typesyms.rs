@@ -15,7 +15,7 @@
 //! Each node's checker work runs under `catch_unwind`. A panicking node gets
 //! `<<goport panic: MESSAGE>>` as its type or symbol text; the checker is
 //! kept so later type ids do not shift. stderr gets `unported: <name>
-//! <count>` lines and the frontend setting. Exit 2 when anything panicked.
+//! <count>` lines. Exit 2 when anything panicked.
 //!
 //! A Go panic that the port keeps (`core::go_panic`) ends the run as the
 //! Go dumper ends it: `panic: <message>` on stderr, exit 2 and no output
@@ -226,8 +226,6 @@ struct Unit {
 }
 
 fn run(project: &str, out_dir: &str) -> i32 {
-    let frontend = std::env::var("GOPORT_FRONTEND").unwrap_or_else(|_| "go (default)".to_string());
-    eprintln!("frontend: {frontend}");
     match catch_unwind(AssertUnwindSafe(|| try_load(project))) {
         Ok(Ok(_)) => {}
         Ok(Err(message)) => {

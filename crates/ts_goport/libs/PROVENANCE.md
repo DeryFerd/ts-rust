@@ -13,9 +13,8 @@ tsgo#4477 (`e7efb4b21`, TypeScript submodule `c3bd12d888` to `4d4f005c8`).
 | `lib.es2020.intl.d.ts` | `db839fa0625981ae6e20a55e079c3613184310ca246879245b294573e7cc6926` |
 | `lib.es5.d.ts` | `6388847232654d7fcbed7fe89ea511a65ad1f5104b41e905c43f90910e1408b6` |
 
-`crates/ts_bundled/libs` stays at the old pin, because the protected
-`ts_compiler` crate uses it. ts_goport takes these 6 names from here and every
-other lib from `crates/ts_bundled/libs` (`src/frontend/bundled.rs`,
+`crates/ts_bundled/libs` is still at the old pin. ts_goport takes these 6 names
+from here and every other lib from `crates/ts_bundled/libs` (`src/frontend/bundled.rs`,
 `bundled_lib!(goport ...)`). With these overrides the lib set equals
 `internal/bundled/libs` at the pin byte for byte.
 

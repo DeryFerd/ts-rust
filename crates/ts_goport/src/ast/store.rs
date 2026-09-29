@@ -16,9 +16,8 @@
 //! - Go `nil` in a field that ts_ast stores as a required `NodeId` uses
 //!   slot 0, which resolves to `Node::NIL`.
 //!
-//! `node.rs` reads kind, loc, flags and parent from the header for files that
-//! have a store. Files of the legacy loader (ts_parser) never have a store,
-//! so their reads do not change.
+//! `node.rs` reads kind, loc, flags and parent from the header of every
+//! parsed node. Only synthetic nodes have no store.
 //!
 //! Phases of a store:
 //! - Build: the parser runs on one thread and writes the stores of that
@@ -48,8 +47,8 @@
 //! - One file id is one file version. Ids only grow (`PUBLISHED` is the
 //!   next unused id), and a published file is never changed or freed. A new
 //!   program version shares the ids of its unchanged files.
-//! - Tier 0 (`FROZEN`) is the first publish: program 1, or the files of the
-//!   legacy loader. Its dense tables are indexed by file id.
+//! - Tier 0 (`FROZEN`) is the first publish: program 1. Its dense tables
+//!   are indexed by file id.
 //! - Tier 1 (`LATER`) holds every later publish (edited files, other
 //!   programs). One slot per id points at the `Frozen` of its publish.
 //! - Every read of a published store goes through one inline lookup
@@ -64,10 +63,6 @@
 //!
 //! Binder data is not stored here: it stays in `GoFile::node_bind`, indexed
 //! by slot index.
-//!
-//! PORT: a program is either all legacy files or all store files. A legacy
-//! publish has only `GoFile`s. It must be the only publish: file ids are
-//! store ids, so no store can be made or published after it.
 
 use crate::frontend::parser::SourceFileParseOptions;
 use crate::prelude::*;
@@ -755,8 +750,6 @@ struct Frozen {
     per_store: Box<[FrozenStore]>,
     /// The `GoFile` of each file id of the publish.
     go_files: Box<[GoFile]>,
-    /// True for the legacy loader: `go_files` only, no stores.
-    legacy: bool,
 }
 
 /// The per-store part of `Frozen` that `Node::new` reads.
@@ -847,8 +840,7 @@ fn later_publish_path() {}
 /// columns are read through one helper): for published store file `file`,
 /// its publish, the index of `file` in that publish, and that entry of the
 /// table that `table` picks. Tier 0 first, then tier 1 (`later`). `None`
-/// for any other file: unpublished, synthetic, provisional or legacy (a
-/// legacy publish has entries in `go_files` only).
+/// for any other file: unpublished, synthetic or provisional.
 // PERF: M3. The tier 0 test is the bounds check of the picked table. The
 // entry is found before the two tiers join, so the caller indexes it with
 // no second bounds check.
@@ -892,14 +884,13 @@ fn slot_index(n: Node) -> usize {
 
 /// The unpublished store `file` of this thread (active, detached or built),
 /// after a registry miss (`frozen_of`). Before the first publish every
-/// store is here. After it, a synthetic id (or any id when tier 0 is
-/// legacy) has no store (a few compares, no call), and any other id takes
-/// one cold call.
+/// store is here. After it, a synthetic id has no store (a few compares,
+/// no call), and any other id takes one cold call.
 #[inline]
 fn unpublished_store(file: usize) -> Option<StoreCell> {
     match FROZEN.get() {
         None => build_store(file),
-        Some(tier0) if tier0.legacy || is_storeless_id(file) => None,
+        Some(_) if is_storeless_id(file) => None,
         Some(_) => unpublished_store_after_publish(file),
     }
 }
@@ -972,7 +963,6 @@ fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut NodeHeader) -> R) -> R {
 /// follow parse order (see `BuildStores`). The store becomes the active
 /// store of this thread.
 pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    assert_no_legacy_publish();
     let store: StoreCell = leak_in_ast_arena(RefCell::new(FileStore::new(file_name, text)));
     let id = BUILD.with(|b| {
         let mut b = b.borrow_mut();
@@ -982,15 +972,6 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
     });
     ACTIVE.set(Some((id, store)));
     id
-}
-
-/// Panics when tier 0 is a legacy publish: its file ids would collide with
-/// store ids.
-fn assert_no_legacy_publish() {
-    assert!(
-        FROZEN.get().is_none_or(|tier0| !tier0.legacy),
-        "a legacy program is published; file ids would collide with store ids"
-    );
 }
 
 /// Text bytes per slot that a new store reserves for (`FileStore::new`).
@@ -1205,7 +1186,6 @@ impl StoreRemap {
 /// handle map for the values the parse returned with it. The store becomes
 /// the active store of this thread.
 pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
-    assert_no_legacy_publish();
     assert!(
         detached.is_self_contained(),
         "cannot adopt a store that names other stores"
@@ -1733,7 +1713,7 @@ pub fn file_store_slot_count(file: usize) -> usize {
 
 /// The parser `node.Flags` of every slot, indexed by slot index. Nil and
 /// alias slots give no flags. The loader fills `GoFile::parser_flags` from
-/// this, so the binder reads the same flags as for a legacy file.
+/// this for the binder.
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
     let computed = |s: &FileStore| s.headers.iter().map(|h| h.flags).collect();
@@ -1746,8 +1726,8 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 }
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
-/// `GoFile` of id `unpublished_file_ids().start + i`. The legacy loader has
-/// no stores and passes its files. The loader calls this once per program,
+/// `GoFile` of id `unpublished_file_ids().start + i`. The loader calls this
+/// once per program,
 /// before `core::set_prog`. The stores are then read-only, and any thread
 /// can read them. The first publish is tier 0; later ones go to tier 1. An
 /// empty later publish does nothing.
@@ -1765,24 +1745,17 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     } else {
         base
     };
-    let legacy = cells.is_empty() && !go_files.is_empty();
     assert!(
-        legacy || go_files.len() == cells.len(),
+        go_files.len() == cells.len(),
         "a publish needs one GoFile per store ({} stores, {} GoFiles)",
         cells.len(),
         go_files.len()
     );
     let tier0 = FROZEN.get();
-    if let Some(tier0) = tier0 {
-        assert!(
-            !tier0.legacy && !legacy,
-            "a legacy program must be the only publish; file ids would collide with store ids"
-        );
-        if go_files.is_empty() {
-            return;
-        }
+    if tier0.is_some() && go_files.is_empty() {
+        return;
     }
-    let count = cells.len().max(go_files.len());
+    let count = cells.len();
     assert!(base + count <= TIER1_LIMIT, "too many file ids");
     if let Err(published) =
         PUBLISHED.compare_exchange(base, base + count, Ordering::AcqRel, Ordering::Acquire)
@@ -1816,7 +1789,6 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
             })
             .collect(),
         go_files: go_files.into_boxed_slice(),
-        legacy,
     };
     if tier0.is_none() {
         assert_eq!(base, 0, "the first publish must start at file id 0");
@@ -1955,7 +1927,7 @@ pub fn store_header(n: Node) -> NodeHeader {
 /// The header of `n` when it is a store node (kind, parser flags, parent,
 /// loc): one thread-local load for the active store, one table lookup in
 /// the registry (`frozen_of`), one more thread-local access for another
-/// unpublished store. `None` for nil, synthetic and legacy nodes. With it a
+/// unpublished store. `None` for nil and synthetic nodes. With it a
 /// node read needs no separate `has_file_store` call.
 // PERF: query Q8. The active store is checked first and inline; every
 // other case is out of line.
@@ -1995,7 +1967,7 @@ pub fn active_store_header(n: Node) -> Option<NodeHeader> {
 }
 
 /// Go `node.Kind` of a published store node (tier 0 or tier 1, see
-/// `frozen_of`). `None` for any other node: nil, synthetic, legacy and
+/// `frozen_of`). `None` for any other node: nil, synthetic and
 /// unpublished store nodes.
 #[inline]
 #[must_use]
@@ -2054,7 +2026,7 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 }
 
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
-/// `try_store_header`). `None` for nil, synthetic and legacy nodes.
+/// `try_store_header`). `None` for nil and synthetic nodes.
 #[inline]
 #[must_use]
 pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
@@ -2125,7 +2097,7 @@ fn identifier_text(node: &ts_ast::Node) -> &str {
 /// U1 (d): Go `node.Text()` of an Identifier or PrivateIdentifier store
 /// node, from the name column of its slot (`FileStore::names`, or
 /// `build_names` while the file is parsed), in tier 0, tier 1 or an
-/// unpublished store of this thread. `None` for nil, synthetic and legacy
+/// unpublished store of this thread. `None` for nil and synthetic
 /// nodes. `Name::default()` (the empty text) for other slots.
 #[inline]
 #[must_use]
@@ -2185,8 +2157,8 @@ pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
 
 /// Hook for `Node::new(file, id)` on a published store (tier 0 or tier 1):
 /// `try_resolve_store_id(file, id)` without a per-slot table load for an
-/// alias-free store. `None` for any other file (unpublished, synthetic or
-/// legacy).
+/// alias-free store. `None` for any other file (unpublished or
+/// synthetic).
 #[inline]
 #[must_use]
 pub fn frozen_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
@@ -2203,7 +2175,7 @@ pub fn frozen_store_facts(file: usize) -> Option<StoreFacts> {
 }
 
 /// The `StoreFacts` of the store of `n` when it is a published store node.
-/// `None` for any other node: nil, synthetic, legacy and unpublished store
+/// `None` for any other node: nil, synthetic and unpublished store
 /// nodes.
 #[inline]
 #[must_use]
@@ -2242,7 +2214,7 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
 /// U1 (a): Go `node.Text()` of a published Identifier or PrivateIdentifier
 /// store node (tier 0 or tier 1), interned when its slot was made
 /// (`FileStore::names`). `None` for other kinds and for any other node:
-/// nil, synthetic, legacy and unpublished store nodes.
+/// nil, synthetic and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_text_name(n: Node) -> Option<Name> {
@@ -2276,7 +2248,7 @@ pub fn frozen_store_text_is_keyword(n: Node) -> Option<bool> {
 /// U1 (b): Go `node.ModifierFlags()` (the flags of the node's own modifier
 /// list) of a published store node (tier 0 or tier 1), from
 /// `FileStore::modifier_bits`. `None` for a store whose column is empty and
-/// for any other node: nil, synthetic, legacy and unpublished store nodes.
+/// for any other node: nil, synthetic and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
@@ -2293,7 +2265,7 @@ pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
 /// tier 1), from the `children` column of its store (`SlotChildren`),
 /// resolved like `Node::new`. C2: also Go `n.Type()`, `n.Initializer()` and
 /// `n.AsTypeReference().TypeName`. `None` when the entry is unknown and for
-/// any other node (nil, synthetic, legacy, unpublished): the caller reads
+/// any other node (nil, synthetic, unpublished): the caller reads
 /// the node data.
 #[inline]
 #[must_use]
@@ -2358,7 +2330,7 @@ pub fn frozen_store_child(n: Node, which: StoreChild) -> Option<Node> {
 /// C2: true when `n` is a published store node whose Go `TypeArgumentList()`
 /// is nil with no list in its node data (`SlotChildren` `NO_TYPE_ARGUMENTS`),
 /// so `Node::type_argument_list` is `NodeList::NIL`. False when not known and
-/// for any other node (nil, synthetic, legacy, unpublished).
+/// for any other node (nil, synthetic, unpublished).
 #[inline]
 #[must_use]
 pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
@@ -2375,7 +2347,7 @@ pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
 /// R2-5: the children of a published store node (tier 0 or tier 1) in Go
 /// `ForEachChild` order, from the link column of its store (`SlotLinks`),
 /// without its node data. `None` when the chain of `n` is not known and for
-/// any other node (nil, synthetic, legacy, unpublished): the caller uses
+/// any other node (nil, synthetic, unpublished): the caller uses
 /// `for_each_child`.
 #[inline]
 #[must_use]
@@ -2543,7 +2515,7 @@ impl FrozenIds {
 }
 
 /// U1 (c): the `FrozenIds` of published store `file` (tier 0 or tier 1).
-/// `None` for any other file (unpublished, synthetic or legacy).
+/// `None` for any other file (unpublished or synthetic).
 #[inline]
 #[must_use]
 pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
@@ -2585,7 +2557,7 @@ fn thread_build_cell(n: Node) -> Option<StoreCell> {
     // two compares, as the one-program `FROZEN` check. The active store is
     // never in tier 0 (its id is at least the published count).
     if let Some(tier0) = FROZEN.get()
-        && (file < tier0.headers.len() || is_storeless_id(file) || tier0.legacy)
+        && (file < tier0.headers.len() || is_storeless_id(file))
     {
         return None;
     }
