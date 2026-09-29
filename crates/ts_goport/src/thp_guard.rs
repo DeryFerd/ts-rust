@@ -92,23 +92,13 @@ const PAGE_BYTES: u64 = 4096;
 ///
 /// A file that cannot be read keeps THP on and starts no watcher. The flag
 /// stays set for the whole process and its children.
-pub fn thp_guard() {
-    guard(true);
-}
-
-/// The start check of `thp_guard` without the watcher, for a process that
-/// sets the jemalloc settings of the process it starts or execs
-/// (`bin/tsgo.rs` `early_thp_conf`). True when THP stays on for this process
-/// and its children, false when it is off (the check turned it off, or it
-/// was off already). Call it before the first large allocation, like
-/// `thp_guard`.
-pub fn thp_start_check() -> bool {
-    guard(false)
-}
-
-/// `thp_guard` with the watcher allowed when `watch`. True when THP stays
-/// on (see `thp_start_check`).
-fn guard(watch: bool) -> bool {
+///
+/// Returns false when the run will get 4 KiB pages: THP is off (the start
+/// check turned it off, or it was off already), THP is `never`, or the check
+/// kept THP on (its faults cannot wait for compaction) with less than the
+/// limit free in 2 MiB blocks. `bin/tsgo.rs` then runs the work in a worker
+/// process (`launch`). True otherwise, also when a file cannot be read.
+pub fn thp_guard() -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         use nix::sys::prctl::{get_thp_disable, set_thp_disable};
@@ -126,8 +116,8 @@ fn guard(watch: bool) -> bool {
                 );
                 return !ok;
             }
-            Some(mode) => watch && mode != "start",
-            None => watch,
+            Some(mode) => mode != "start",
+            None => true,
         };
         let min_free_mib: u64 = std::env::var_os("GOPORT_THP_GUARD_MIB")
             .and_then(|mib| mib.to_str()?.parse().ok())
@@ -173,13 +163,14 @@ fn guard(watch: bool) -> bool {
                 if watching { ", watcher started" } else { "" },
             ),
         );
-        step != Start::Off || failed
+        match step {
+            Start::Off => failed,
+            Start::Watch => true,
+            Start::Keep => selected_mode(enabled) != Some("never") && free >= min_free,
+        }
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    {
-        let _ = watch;
-        true
-    }
+    true
 }
 
 /// Prints `args` as one `goport thp_guard:` line on stderr when `debug`.

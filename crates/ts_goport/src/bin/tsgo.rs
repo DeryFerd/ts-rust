@@ -52,19 +52,10 @@ const STACK_SIZE: usize = 1 << 30;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The jemalloc settings at start, without huge pages: jemalloc maps and
-/// touches its first memory before `main`, and a huge page fault there
-/// waits in compaction on fragmented memory (perf16: about 10 ms).
-/// `early_thp_conf` then picks `JEMALLOC_THP_CONF` for the work when THP
-/// stays on. `scripts/build-release.sh` reads this line: it builds the value
-/// into jemalloc and sets it for its BOLT runs.
+/// Same as `goport.rs` `JEMALLOC_CONF`. `scripts/build-release.sh` reads it
+/// from this line for its BOLT runs.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:default,metadata_thp:disabled";
-
-/// The jemalloc settings of a run that keeps THP. Same as `goport.rs`
-/// `JEMALLOC_CONF`, which explains them.
-#[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_THP_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
 /// Set in a worker (see `launch`): the number of its end of the pipe that
 /// takes the exit code.
@@ -73,15 +64,11 @@ const WORKER_FD: &str = "GOPORT_WORKER_FD";
 
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
-    // First: before the first large allocation.
-    let thp_conf = early_thp_conf();
+    // First: it must run before the first heap allocation.
+    let huge_pages = ts_goport::thp_guard::thp_guard();
     #[cfg(target_os = "linux")]
-    if let Some(code) = launch(thp_conf) {
+    if let Some(code) = launch(huge_pages) {
         std::process::exit(code);
-    }
-    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-    if let Some(conf) = thp_conf {
-        exec_self("_RJEM_MALLOC_CONF", conf);
     }
     // A worker ends when its launcher is killed.
     #[cfg(target_os = "linux")]
@@ -89,7 +76,6 @@ fn main() {
         let _ =
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL));
     }
-    ts_goport::thp_guard::thp_guard();
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
     // `notify_context` signal thread.
@@ -126,6 +112,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
+        use std::os::unix::process::CommandExt;
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
         // needs no exec: jemalloc reads it at its start, and
@@ -141,55 +128,41 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
         if std::env::var_os(name).is_some() {
             return;
         }
-        exec_self(name, &value);
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut args = std::env::args_os();
+        let mut command = std::process::Command::new(exe);
+        if let Some(arg0) = args.next() {
+            command.arg0(arg0);
+        }
+        // `exec` returns only when it fails.
+        let _ = command.args(args).env(name, value).exec();
     }
-}
-
-/// Runs this binary again in this process, with the same arguments and
-/// `name` set to `value`. Returns only when the exec fails.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn exec_self(name: &str, value: &str) {
-    use std::os::unix::process::CommandExt;
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut args = std::env::args_os();
-    let mut command = std::process::Command::new(exe);
-    if let Some(arg0) = args.next() {
-        command.arg0(arg0);
-    }
-    let _ = command.args(args).env(name, value).exec();
-}
-
-/// Decides THP before jemalloc maps its large memory (perf16 option 2). The
-/// THP guard start check runs here, and on fragmented memory it turns THP
-/// off for this process and its children. When THP stays on and
-/// `_RJEM_MALLOC_CONF` is not set (by the user, or by `launch` or the exec
-/// in `main` for this process), returns the settings that the work must
-/// run with.
-fn early_thp_conf() -> Option<&'static str> {
-    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-    if std::env::var_os("_RJEM_MALLOC_CONF").is_none() && ts_goport::thp_guard::thp_start_check() {
-        return Some(JEMALLOC_THP_CONF);
-    }
-    None
 }
 
 /// Runs the work in a worker copy of this binary and returns its exit code
-/// (perf16 option 1). The worker sends the code over a pipe once its output
-/// is written (`exit`), so this process exits before the worker unmaps its
-/// memory: 1.3 GB of 4 KiB pages takes about 50 ms at exit. The worker gets
-/// `thp_conf` as `_RJEM_MALLOC_CONF`. None when this process runs the work:
-/// it is a worker, `GOPORT_LAUNCH=0`, `--lsp`, `--api` or watch mode (they
-/// end on their own), or the worker cannot start.
+/// (perf16). The worker sends the code over a pipe once its output is
+/// written (`exit`), so this process exits before the worker unmaps its
+/// memory. With 4 KiB pages that unmap takes about 50 ms for effect (1.3 GB);
+/// with huge pages it takes about 4 ms, less than a second process costs
+/// (about 1 ms on query check). So by default the worker runs only when
+/// `thp_guard` says the run gets 4 KiB pages (`huge_pages` false).
+/// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
+/// does. None when this process runs the work: it is a worker, no worker is
+/// wanted, `--lsp`, `--api` or watch mode (they end on their own), or the
+/// worker cannot start.
 #[cfg(target_os = "linux")]
-fn launch(thp_conf: Option<&str>) -> Option<i32> {
+fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    if std::env::var_os(WORKER_FD).is_some()
-        || std::env::var_os("GOPORT_LAUNCH").is_some_and(|v| v == "0")
-    {
+    let wanted = match std::env::var_os("GOPORT_LAUNCH") {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => !huge_pages,
+    };
+    if !wanted || std::env::var_os(WORKER_FD).is_some() {
         return None;
     }
     let mut args = std::env::args_os();
@@ -204,17 +177,14 @@ fn launch(thp_conf: Option<&str>) -> Option<i32> {
     }
     let exe = std::env::current_exe().ok()?;
     // `pipe` sets no close-on-exec flag, so the worker gets `write` at the
-    // same number.
+    // same number. THP off (`prctl`) stays off in the worker.
     let (read, write) = rustix::pipe::pipe().ok()?;
-    let mut command = std::process::Command::new(exe);
-    command
+    let mut worker = std::process::Command::new(exe)
         .arg0(arg0)
         .args(args)
-        .env(WORKER_FD, write.as_raw_fd().to_string());
-    if let Some(conf) = thp_conf {
-        command.env("_RJEM_MALLOC_CONF", conf);
-    }
-    let mut worker = command.spawn().ok()?;
+        .env(WORKER_FD, write.as_raw_fd().to_string())
+        .spawn()
+        .ok()?;
     drop(write);
     let mut code = [0; 4];
     if std::fs::File::from(read).read_exact(&mut code).is_ok() {
