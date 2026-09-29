@@ -324,11 +324,17 @@ fn run_case_in_child(case: &ConfigCase, timeout: Duration) -> CaseResult {
         .stderr(stderr_file)
         .spawn();
     let mut crash = None;
+    // How the child ended, for a crash message: "exit status: 101", or
+    // "signal: 9 (SIGKILL)" when the memory cap of the run killed it.
+    let mut exit = None;
     match spawned {
         Err(err) => crash = Some(format!("cannot run {CHILD_TEST}: {err}")),
         Ok(mut child) => loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => {
+                    exit = Some(status);
+                    break;
+                }
                 Ok(None) => {
                     if start.elapsed() > timeout {
                         let _ = child.kill();
@@ -364,8 +370,11 @@ fn run_case_in_child(case: &ConfigCase, timeout: Duration) -> CaseResult {
     }
     if !done && crash.is_none() {
         let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let how = exit
+            .map(|status| format!(" ({status})"))
+            .unwrap_or_default();
         crash = Some(format!(
-            "child ended without a result; stderr tail:\n{}",
+            "child ended without a result{how}; stderr tail:\n{}",
             tail(&stderr)
         ));
     }
