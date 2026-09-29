@@ -1,5 +1,10 @@
 //! Faithful Rust port of the pinned typescript-go binder and checker.
 //! Read `crates/ts_goport/PORTING.md` before editing.
+//!
+//! Two parts of `src` build as their own crates (`parts/`): `goport_util`
+//! (`src/goport_util_root.rs`) and `goport_lsproto`
+//! (`src/goport_lsproto_root.rs`). Their root files declare their modules;
+//! this crate re-exports them at the same paths.
 
 #![allow(
     dead_code,
@@ -20,17 +25,20 @@ pub mod cmd;
 pub mod contentmapper;
 pub mod core;
 pub mod declarations;
-pub mod diag;
+pub use goport_util::diag;
 pub mod diagnostics_loc;
 pub mod emitter;
 pub mod evaluator;
 pub mod execute;
 pub mod flags;
-mod flags_macros;
+/// `go_enum!` and `go_flags!` (`#[macro_export]` in goport_util).
+mod flags_macros {
+    pub(crate) use goport_util::{go_enum, go_flags};
+}
 pub mod frontend;
 // Go `internal/ipc` (tsgo#4712).
 pub mod ipc;
-pub mod locale;
+pub use goport_util::locale;
 pub mod modulespecifiers;
 pub mod options;
 // The JSON form of `core.CompilerOptions` (moved out of `api` in bump B wave 3).
@@ -48,13 +56,15 @@ pub mod tracing;
 pub mod transformers;
 pub mod transpile;
 
+// Macros that goport_util exports. `crate::go_assert` and `crate::unported`
+// keep working.
+pub use goport_util::{go_assert, unported};
+
 // Language-service port (Go `internal/{ls,lsp,project,format,astnav,fswatch,jsonrpc,api}`).
 pub mod api;
 pub mod astnav;
 pub mod format;
-pub mod fswatch;
-pub mod gostd;
-pub mod jsonrpc;
+pub use goport_util::{fswatch, gostd, jsonrpc};
 pub mod ls;
 pub mod lsp;
 pub mod project;
