@@ -50,10 +50,10 @@ pub trait CompilerHost {
 
     /// The cache where `fs()` keeps its `FileExists`, `DirectoryExists`,
     /// `Realpath` and `GetAccessibleEntries` lookups, when it keeps them
-    /// where the parse workers can use them too (`SharedStatCache`). Only
+    /// where the parse workers can use them too (`BuildStatCache`). Only
     /// the `tsc -b` host does: its cache lasts for all programs of a build.
     // PORT: not in Go. Go parse tasks share the host's cachedvfs.
-    fn stat_cache(&self) -> Option<std::sync::Arc<StatCache>> {
+    fn stat_cache(&self) -> Option<std::sync::Arc<BuildStatCache>> {
         None
     }
 

@@ -252,14 +252,13 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     // PERF: Go resolves in all parse tasks with one shared cache. Here the
     // parse workers resolve ahead of the loader, and the loader reads their
     // answers. Only when every resolver sees the same files: the plain OS
-    // file system (for `tsc -b`, the workers use the host's stat cache,
-    // `CompilerHost::stat_cache`), no project reference faking host (only a
+    // file system (for `tsc -b`, the workers read the host's cache,
+    // `BuildStatCache`), no project reference faking host (only a
     // program that uses the sources of its references has one) and no
     // traced resolution (Go then skips the cache too). A worker resolves
-    // with no project reference redirect; the loader resolves the imports
-    // of a redirected file with its redirect, which is part of the cache
-    // key, so it does not take a worker answer for them. A program with
-    // project references shares answers only in `tsc -b`.
+    // the output `.d.ts` file of a project reference with its redirect, as
+    // the loader does; the redirect is part of the cache key. A program
+    // with project references shares answers only in `tsc -b`.
     if !single_threaded
         && super::files_parser::parse_workers_enabled()
         && workers_resolve_imports(&compiler_options)
@@ -333,6 +332,18 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
 
     let root_tasks = loader.root_tasks.clone();
     loader.files_parser.borrow_mut().parse(&loader, &root_tasks);
+    // The parse workers have ended. The `tsc -b` host's cache keeps the
+    // lookups of the worker answers that the loader took, as Go's cache
+    // keeps the lookups of its parse tasks, and drops the other worker
+    // lookups (`BuildStatCache`).
+    if let Some(stats) = loader.opts.host.stat_cache() {
+        let taken = loader
+            .resolver
+            .as_ref()
+            .map(|resolver| resolver.take_worker_lookups())
+            .unwrap_or_default();
+        stats.end_load(&taken);
+    }
 
     // Clear out loader and host to ensure its not used post program creation
     {

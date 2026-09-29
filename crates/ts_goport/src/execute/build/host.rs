@@ -89,18 +89,17 @@ impl Hash for SourceFileCacheKey {
 // (`cachedvfs.From(sys.FS())`, orchestrator.go:764).
 // PORT: the same cache as `CachedFs` (always enabled: the build host
 // never disables it), but the `FileExists`, `DirectoryExists`,
-// `Realpath` and `GetAccessibleEntries` lookups live in a `StatCache` that
-// the parse workers of each program load use too
+// `Realpath` and `GetAccessibleEntries` lookups live in a
+// `BuildStatCache` that the parse workers of each program load read too
 // (`CompilerHost::stat_cache`), as Go parse tasks share the host's
 // cachedvfs. This cache lasts for the whole build, and a write does not
 // update it (cachedvfs.go:148), so a later program can find a lookup here
-// that an earlier program made before the build wrote that path. The
-// workers read the same cached answer, so they resolve as the loader
-// does, and the lookups of a resolution that the loader takes from a
-// worker are here for the later programs, as in Go.
+// that an earlier program made before the build wrote that path. It holds
+// only the lookups that Go makes: the workers' own lookups stay out of it
+// unless the loader uses them (see `BuildStatCache`).
 pub struct BuildCachedFs {
     fs: Rc<dyn Fs>,
-    stats: Arc<StatCache>,
+    stats: Arc<BuildStatCache>,
     stat_cache: RefCell<FxHashMap<String, Option<FileInfo>>>,
 }
 
@@ -451,7 +450,7 @@ impl CompilerHost for BuildHost {
     }
 
     // PORT: not in Go (see `CompilerHost::stat_cache`).
-    fn stat_cache(&self) -> Option<Arc<StatCache>> {
+    fn stat_cache(&self) -> Option<Arc<BuildStatCache>> {
         Some(self.cached_fs.stats.clone())
     }
 
@@ -645,7 +644,7 @@ impl CompilerHost for BuildCompilerHost {
     }
 
     // PORT: not in Go (see `CompilerHost::stat_cache`).
-    fn stat_cache(&self) -> Option<Arc<StatCache>> {
+    fn stat_cache(&self) -> Option<Arc<BuildStatCache>> {
         self.host.stat_cache()
     }
 
