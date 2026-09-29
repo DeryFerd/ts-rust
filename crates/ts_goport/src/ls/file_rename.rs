@@ -120,43 +120,17 @@ impl LanguageService {
     }
 
     // Go: ls/file_rename.go:89 createPathUpdater
-    // PORT: the Go closure calls `l.UseCaseSensitiveFileNames()` on each call;
-    // the boxed closure borrows `self` for that.
+    // PORT: the body is `new_path_updater`, which takes Go's
+    // `l.UseCaseSensitiveFileNames()` as a value. The Go closure reads it on
+    // each call; the host is a snapshot, so each call gets the same value.
+    // The split lets the Go test run with no LanguageService (a Rust
+    // LanguageService needs a program).
     pub fn create_path_updater<'a>(
         &'a self,
         old_path: &str,
         new_path: &str,
     ) -> Box<PathUpdater<'a>> {
-        let compare_options = tspath::ComparePathsOptions {
-            use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
-            ..Default::default()
-        };
-        let trimmed_old_path = tspath::remove_trailing_directory_separator(old_path).to_string();
-        let old_path = old_path.to_string();
-        let new_path = new_path.to_string();
-        Box::new(move |path: &str| -> (String, bool) {
-            if tspath::compare_paths(path, &old_path, &compare_options) == 0 {
-                return (new_path.clone(), true);
-            }
-            // Trim the directory prefix ourselves (rather than using
-            // tspath.StartsWithDirectory followed by a separate slice on
-            // len(oldPath)) so the containment check and the suffix we return can
-            // never disagree, and so we don't slice path by a byte count derived
-            // from a canonicalized/differently-cased string: case-folding can
-            // change a path's UTF-8 byte length without changing its rune count
-            // (e.g. the Kelvin sign '\u212A' folds to the single-byte 'k'), which
-            // could otherwise put len(oldPath) out of range of path.
-            // (tsgo#4900)
-            if let Some(suffix) = tspath::trim_file_path_prefix(
-                path,
-                &trimmed_old_path,
-                self.use_case_sensitive_file_names(),
-            ) && (suffix.starts_with('/') || suffix.starts_with('\\'))
-            {
-                return (format!("{new_path}{suffix}"), true);
-            }
-            (String::new(), false)
-        })
+        new_path_updater(self.use_case_sensitive_file_names(), old_path, new_path)
     }
 
     // Go: ls/file_rename.go:94 updateTsconfigFiles
@@ -352,6 +326,43 @@ pub fn try_update_config_string(
         &relative_path_from_directory(config_dir, &updated, use_case_sensitive_file_names),
     );
     true
+}
+
+// Go: ls/file_rename.go:89 createPathUpdater (the body, see
+// `LanguageService::create_path_updater`)
+fn new_path_updater(
+    use_case_sensitive_file_names: bool,
+    old_path: &str,
+    new_path: &str,
+) -> Box<PathUpdater<'static>> {
+    let compare_options = tspath::ComparePathsOptions {
+        use_case_sensitive_file_names,
+        ..Default::default()
+    };
+    let trimmed_old_path = tspath::remove_trailing_directory_separator(old_path).to_string();
+    let old_path = old_path.to_string();
+    let new_path = new_path.to_string();
+    Box::new(move |path: &str| -> (String, bool) {
+        if tspath::compare_paths(path, &old_path, &compare_options) == 0 {
+            return (new_path.clone(), true);
+        }
+        // Trim the directory prefix ourselves (rather than using
+        // tspath.StartsWithDirectory followed by a separate slice on
+        // len(oldPath)) so the containment check and the suffix we return can
+        // never disagree, and so we don't slice path by a byte count derived
+        // from a canonicalized/differently-cased string: case-folding can
+        // change a path's UTF-8 byte length without changing its rune count
+        // (e.g. the Kelvin sign '\u212A' folds to the single-byte 'k'), which
+        // could otherwise put len(oldPath) out of range of path.
+        // (tsgo#4900)
+        if let Some(suffix) =
+            tspath::trim_file_path_prefix(path, &trimmed_old_path, use_case_sensitive_file_names)
+            && (suffix.starts_with('/') || suffix.starts_with('\\'))
+        {
+            return (format!("{new_path}{suffix}"), true);
+        }
+        (String::new(), false)
+    })
 }
 
 impl LanguageService {
@@ -689,4 +700,35 @@ pub fn is_ambient_module_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool
         .declarations
         .iter()
         .any(|&declaration| is_module_with_string_literal_name(declaration))
+}
+
+// Go: ls/file_rename_test.go (tsgo#4900)
+#[cfg(test)]
+mod tests {
+    use super::new_path_updater;
+
+    // Go: ls/file_rename_test.go:45 TestCreatePathUpdaterCaseFoldingShrinksOldPath
+    // TestCreatePathUpdaterCaseFoldingShrinksOldPath reproduces a panic that used to occur when
+    // createPathUpdater confirmed a case-insensitive directory match via tspath.StartsWithDirectory,
+    // then sliced the raw (non-canonicalized) file path using the raw byte length of oldPath. Each
+    // Kelvin sign '\u212A' below case-folds to the single-byte 'k', so the raw oldPath is longer in
+    // bytes (15) than path (12), even though path's canonical form is case-insensitively prefixed by
+    // oldPath's canonical form. Slicing path[len(oldPath):] used to panic with "slice bounds out of
+    // range [15:12]"; createPathUpdater must instead trim by rune count via
+    // tspath.TrimFilePathPrefix.
+    // PORT: Go builds `&LanguageService{host: caseInsensitiveHost{}}`, whose
+    // only used method is `UseCaseSensitiveFileNames() == false`. A Rust
+    // LanguageService needs a program, so the test calls the updater body
+    // with that value.
+    #[test]
+    fn test_create_path_updater_case_folding_shrinks_old_path() {
+        let old_path = "/a/\u{212A}\u{212A}\u{212A}\u{212A}";
+        let new_path = "/a/new";
+        let updater =
+            new_path_updater(false /*useCaseSensitiveFileNames*/, old_path, new_path);
+
+        let (updated, ok) = updater("/a/kkkk/x.ts");
+        assert!(ok);
+        assert_eq!(updated, "/a/new/x.ts");
+    }
 }

@@ -373,12 +373,6 @@ go_enum!(CompletionKind, i32 {
 pub static COMPLETION_TRIGGER_CHARACTERS: [&str; 10] =
     [".", "\"", "'", "`", "/", "@", "<", "#", " ", "*"];
 
-// PORT: tsgo#4712 renamed Go `TriggerCharacters` to
-// `CompletionTriggerCharacters`. `lsp/server.rs` (server lane) still reads
-// the old name. Remove this alias when it reads
-// `COMPLETION_TRIGGER_CHARACTERS` (lane ls notes for root).
-pub use self::COMPLETION_TRIGGER_CHARACTERS as TRIGGER_CHARACTERS;
-
 // Go: ls/completions.go:192 allCommitCharacters
 // All commit characters, valid when `isNewIdentifierLocation` is false.
 pub static ALL_COMMIT_CHARACTERS: &[&str] = &[".", ",", ";"];

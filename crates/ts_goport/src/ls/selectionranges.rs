@@ -319,13 +319,8 @@ fn get_smart_selection_range(
         if pos1 == pos2 {
             return true;
         }
-        let lsp_pos1 = l
-            .converters
-            .position_to_line_and_character(&source_file, pos1);
-        let lsp_pos2 = l
-            .converters
-            .position_to_line_and_character(&source_file, pos2);
-        lsp_pos1.line == lsp_pos2.line
+        let line_starts = get_ecma_line_starts(source_file);
+        compute_line_of_position(line_starts, pos1) == compute_line_of_position(line_starts, pos2)
     };
 
     let should_skip_node = |node: Node, parent: Node| -> bool {

@@ -3,7 +3,6 @@
 use crate::ls::lsconv::prelude::*;
 
 use crate::frontend::bundled::is_bundled;
-use crate::frontend::core_textchange::TextChange;
 use crate::frontend::scanner::scanner_p1::{RUNE_ERROR, utf8_decode_rune_in_string};
 use crate::frontend::tspath;
 use crate::gostd;
@@ -279,34 +278,6 @@ impl Converters {
             },
             fidelity,
         )
-    }
-
-    // PORT: Go removed `(*Converters).FromLSPRange` (the one-span form) in
-    // tsgo#4712; the free `from_lsp_range` below replaces it. This one stays
-    // only for `from_lsp_text_change`, see there.
-    fn from_lsp_range_raw(&self, script: &dyn Script, text_range: &lsproto::Range) -> TextRange {
-        TextRange::new(
-            self.line_and_character_to_position(script, &text_range.start),
-            self.line_and_character_to_position(script, &text_range.end),
-        )
-    }
-
-    // PORT: Go removed `(*Converters).FromLSPTextChange` in tsgo#4712. At pin
-    // B, Go project/overlayfs.go:369 calls `lsconv.FromLSPRange(converters,
-    // o, partialChange.Range, spanmap.FeatureAll)`, asserts one range and
-    // builds the `core.TextChange` itself. The server lane's
-    // `project/overlayfs.rs` still calls this method. An overlay has no span
-    // map, so the result is the same. Remove this method when overlayfs.rs
-    // takes the Go B form (lane ls notes for root).
-    pub fn from_lsp_text_change(
-        &self,
-        script: &dyn Script,
-        change: &lsproto::TextDocumentContentChangePartial,
-    ) -> TextChange {
-        TextChange {
-            text_range: self.from_lsp_range_raw(script, &change.range),
-            new_text: change.text.clone(),
-        }
     }
 }
 
@@ -786,13 +757,9 @@ fn utf16_rune_len(r: i32) -> i32 {
 impl Converters {
     // Go: ls/lsconv/converters.go:359 lineAndCharacterToPosition
     // PORT: Go passes the position by value; here by reference.
-    // PORT: Go makes this raw conversion private in tsgo#4712 (the LS uses
-    // `from_lsp_position`, `from_lsp_range` and their SourceFile forms). It
-    // stays `pub` because the converters tests in
-    // `tests/go_baselines/units_emit/ls_tests.rs` (not lane ls) still call it.
-    // Make it private when that file takes the Go B test form (lane ls notes
-    // for root). Do not call it from LS code.
-    pub fn line_and_character_to_position(
+    // Private as in Go since tsgo#4712: the LS uses `from_lsp_position`,
+    // `from_lsp_range` and their SourceFile forms.
+    fn line_and_character_to_position(
         &self,
         script: &dyn Script,
         line_and_character: &lsproto::Position,
@@ -853,10 +820,8 @@ impl Converters {
     }
 
     // Go: ls/lsconv/converters.go:410 positionToLineAndCharacter
-    // PORT: private in Go since tsgo#4712, `pub` here for the same reason as
-    // `line_and_character_to_position`. Do not call it from LS code; use
-    // `to_lsp_position`.
-    pub fn position_to_line_and_character(
+    // Private as in Go since tsgo#4712: the LS uses `to_lsp_position`.
+    fn position_to_line_and_character(
         &self,
         script: &dyn Script,
         position: i32,
@@ -1205,5 +1170,82 @@ fn flatten_diagnostic_message_chain(
     writer.push_str(&chain.localize(locale));
     for child in chain.message_chain() {
         flatten_diagnostic_message_chain(writer, child, new_line, locale, level + 1);
+    }
+}
+
+// Go: ls/lsconv/converters_test.go (tsgo#4712)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::ContentMapperSourceFileInfo;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::spanmap::{Kind, Segment};
+    use std::sync::Arc;
+
+    // Go: ls/lsconv/converters_test.go:121 TestConvertersSourceFileProjectionExpansion
+    // PORT: Go links the two `*ast.SourceFile` values by pointer; here the
+    // parsed files are `Rc`, as `set_content_mapper_info` takes them.
+    #[test]
+    fn test_converters_source_file_projection_expansion() {
+        let original = "x";
+        let parse_options = SourceFileParseOptions {
+            file_name: "/component.vue".to_string(),
+            path: tspath::Path("/component.vue".to_string()),
+            ..Default::default()
+        };
+        let canonical = Rc::new(parse_source_file(&parse_options, " x", ScriptKind::TS));
+        let mut supplemental_options = parse_options.clone();
+        supplemental_options.path = tspath::Path("/component.vue::supplemental".to_string());
+        let supplemental = Rc::new(parse_source_file(
+            &supplemental_options,
+            "  x",
+            ScriptKind::TS,
+        ));
+        canonical.set_content_mapper_info(ContentMapperSourceFileInfo {
+            original_text: original.to_string(),
+            content_mapper: "mapper".to_string(),
+            span_map: Some(Arc::new(spanmap::new(&[Segment {
+                virtual_start: 1,
+                virtual_end: 2,
+                original_end: 1,
+                kind: Kind::VERBATIM,
+                features: Feature::ALL,
+                ..Default::default()
+            }]))),
+            supplemental_source_files: vec![Rc::clone(&supplemental)],
+            ..Default::default()
+        });
+        supplemental.set_content_mapper_info(ContentMapperSourceFileInfo {
+            original_text: original.to_string(),
+            content_mapper: "mapper".to_string(),
+            span_map: Some(Arc::new(spanmap::new(&[Segment {
+                virtual_start: 2,
+                virtual_end: 3,
+                original_end: 1,
+                kind: Kind::VERBATIM,
+                features: Feature::ALL,
+                ..Default::default()
+            }]))),
+            canonical_source_file: Some(Rc::clone(&canonical)),
+            ..Default::default()
+        });
+        let line_map = compute_lsp_line_starts(original);
+        let converters = new_converters(lsproto::PositionEncodingKind::UTF16, move |_| {
+            Some(Rc::clone(&line_map))
+        });
+
+        let positions = from_lsp_position_for_source_file(
+            &converters,
+            canonical.root,
+            lsproto::Position::default(),
+            Feature::HOVER,
+        );
+        assert_eq!(positions.len(), 2);
+        let projected_file: Node = positions[0].script;
+        assert!(projected_file == canonical.root);
+        assert!(positions[0].script == canonical.root);
+        assert_eq!(positions[0].position, 1);
+        assert!(positions[1].script == supplemental.root);
+        assert_eq!(positions[1].position, 2);
     }
 }
