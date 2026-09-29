@@ -443,6 +443,25 @@ pub fn from_lsp_position_for_source_file(
     lsp_position_to_virtual(c, &files, position, feature)
 }
 
+// Go: ls/lsconv/converters.go:225 FromLSPRangeToOriginal
+// FromLSPRangeToOriginal converts an LSP range in a content-mapped document directly to original-text offsets.
+// PORT: Go takes the `Script` interface value; here `&dyn Script`.
+#[must_use]
+pub fn from_lsp_range_to_original(
+    c: &Converters,
+    script: &dyn Script,
+    text_range: lsproto::Range,
+) -> TextRange {
+    let original = OriginalTextScript {
+        file_name: script.original_file_name(),
+        text: script.original_text(),
+    };
+    TextRange::new(
+        c.line_and_character_to_position(&original, &text_range.start),
+        c.line_and_character_to_position(&original, &text_range.end),
+    )
+}
+
 // Go: ls/lsconv/converters.go:225 sourceFileProjections
 fn source_file_projections(file: Node) -> Vec<Node> {
     let supplemental = source_file_supplemental_source_files(file);

@@ -866,6 +866,7 @@ impl LanguageService {
             false,
             false,
             SymbolEntryTransformOptions::default(),
+            None, /*defaultProjectData*/
         )?;
         if let Some(calls) = result.call_hierarchy_incoming_calls.as_mut() {
             gostd::slices::sort_func(calls, |a, b| {

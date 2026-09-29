@@ -68,6 +68,10 @@ pub struct ProjectAndTextDocumentPosition<'l> {
     pub ls: Option<&'l LanguageService>,
     pub uri: lsproto::DocumentUri,
     pub position: lsproto::Position,
+    /// Go `symbolData *SymbolAndEntriesData`; nil is `None`. Only the
+    /// default project's item (item 0, which runs on the dispatch thread)
+    /// can carry it.
+    pub symbol_data: Option<SymbolAndEntriesData>,
     pub for_original_location: bool,
 }
 
@@ -151,6 +155,7 @@ pub fn handle_cross_project<Req, Resp>(
     is_rename: bool,
     implementations: bool,
     options: SymbolEntryTransformOptions,
+    default_project_data: Option<SymbolAndEntriesData>,
 ) -> Result<Resp, GoError>
 where
     Req: HasTextDocumentPosition,
@@ -160,13 +165,20 @@ where
 
     // Single project
     let Some(orchestrator) = orchestrator else {
-        let (data, _) = default_ls.provide_symbols_and_entries(
-            ctx,
-            &params.text_document_uri(),
-            params.text_document_position(),
-            is_rename,
-            implementations,
-        );
+        let data = match default_project_data {
+            Some(default_project_data) => default_project_data,
+            None => {
+                default_ls
+                    .provide_symbols_and_entries(
+                        ctx,
+                        &params.text_document_uri(),
+                        params.text_document_position(),
+                        is_rename,
+                        implementations,
+                    )
+                    .0
+            }
+        };
         return symbol_and_entries_to_resp(default_ls, ctx, params, data, options);
     };
 
@@ -191,13 +203,16 @@ where
     };
 
     // Initial set of projects and locations in the queue, starting with default project
-    state.enqueue_item(ProjectAndTextDocumentPosition {
+    let mut initial_item = ProjectAndTextDocumentPosition {
         project: Rc::clone(&state.default_project),
         ls: Some(default_ls),
         uri: params.text_document_uri(),
         position: params.text_document_position(),
+        symbol_data: None,
         for_original_location: false,
-    });
+    };
+    initial_item.symbol_data = default_project_data;
+    state.enqueue_item(initial_item);
     for project in &state.all_projects {
         if !Rc::ptr_eq(project, &state.default_project) {
             state.enqueue_item(ProjectAndTextDocumentPosition {
@@ -206,6 +221,7 @@ where
                 // TODO!! symlinks need to change the URI
                 uri: params.text_document_uri(),
                 position: params.text_document_position(),
+                symbol_data: None,
                 for_original_location: false,
             });
         }
@@ -273,6 +289,7 @@ where
                             ls: None,
                             uri: default_definition.text_document_uri(),
                             position: default_definition.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -284,6 +301,7 @@ where
                             ls: None,
                             uri: source_pos.text_document_uri(),
                             position: source_pos.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -296,6 +314,7 @@ where
                             ls: None,
                             uri: generated_pos.text_document_uri(),
                             position: generated_pos.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -351,7 +370,50 @@ pub fn search_item<P: ProgramView, Req, Resp>(
     on_entry: &mut dyn FnMut(&Rc<RefCell<SymbolAndEntries>>),
     locations: &mut Vec<(lsproto::DocumentUri, lsproto::Position)>,
 ) -> Option<Result<Resp, GoError>> {
-    let (data, ok) = ls.provide_symbols_and_entries(ctx, uri, position, is_rename, implementations);
+    search_item_with_data(
+        ls,
+        ctx,
+        params,
+        uri,
+        position,
+        is_rename,
+        implementations,
+        options,
+        None, /*symbolData*/
+        to_resp,
+        on_entry,
+        locations,
+    )
+}
+
+// Go: ls/crossproject.go:96 steps 3 to 5 of the queued function
+// PORT: `search_item` for an item that can carry Go `item.symbolData`
+// (`symbol_data`; only item 0, on the dispatch thread).
+#[allow(clippy::too_many_arguments)]
+pub fn search_item_with_data<P: ProgramView, Req, Resp>(
+    ls: &LanguageService<P>,
+    ctx: &Context,
+    params: &Req,
+    uri: &lsproto::DocumentUri,
+    position: lsproto::Position,
+    is_rename: bool,
+    implementations: bool,
+    options: SymbolEntryTransformOptions,
+    symbol_data: Option<SymbolAndEntriesData>,
+    to_resp: impl FnOnce(
+        &LanguageService<P>,
+        &Context,
+        &Req,
+        SymbolAndEntriesData,
+        SymbolEntryTransformOptions,
+    ) -> Result<Resp, GoError>,
+    on_entry: &mut dyn FnMut(&Rc<RefCell<SymbolAndEntries>>),
+    locations: &mut Vec<(lsproto::DocumentUri, lsproto::Position)>,
+) -> Option<Result<Resp, GoError>> {
+    let (data, ok) = match symbol_data {
+        Some(symbol_data) => (symbol_data, true),
+        None => ls.provide_symbols_and_entries(ctx, uri, position, is_rename, implementations),
+    };
     if ctx.err().is_some() {
         return None;
     }
@@ -677,7 +739,7 @@ where
                 // PORT: other language services can be alive (the items that
                 // run on search threads); make this one's program current.
                 let _program = ls.enter_program();
-                search_item(
+                search_item_with_data(
                     ls,
                     ctx,
                     self.params,
@@ -686,6 +748,7 @@ where
                     self.is_rename,
                     self.implementations,
                     self.options,
+                    item.symbol_data.clone(),
                     |ls, ctx, params, data, options| {
                         (self.symbol_and_entries_to_resp)(ls, ctx, params, data, options)
                     },
@@ -761,6 +824,7 @@ where
                             ls: None,
                             uri: uri.clone(),
                             position,
+                            symbol_data: None,
                             for_original_location: true,
                         });
                     }

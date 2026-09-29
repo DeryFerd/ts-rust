@@ -22,27 +22,38 @@ impl LanguageService {
         }
 
         // PORT: the recursive Go closure `visit` and the variables it
-        // captures (`lastSymbol`, `result`) are the `CodeLensVisitor` below.
-        let mut visitor = CodeLensVisitor {
-            ls: self,
-            ctx,
-            document_uri,
-            file,
-            user_prefs,
-            // Keeps track of the last symbol to avoid duplicating code lenses across overloads.
-            last_symbol: SymbolId::NIL,
-            result: Vec::new(),
-        };
+        // captures (`lastSymbol`, `result`, `seen`) are the
+        // `CodeLensVisitor` below. `result` and `seen` carry over from one
+        // projection to the next.
+        let mut result: Vec<lsproto::CodeLens> = Vec::new();
+        let mut seen: FxHashSet<CodeLensKey> = FxHashSet::default();
+        let mut projections = vec![file];
+        projections.extend_from_slice(source_file_supplemental_source_files(file));
+        for projection in projections {
+            let mut visitor = CodeLensVisitor {
+                ls: self,
+                ctx,
+                document_uri,
+                file: projection,
+                user_prefs,
+                // Keeps track of the last symbol to avoid duplicating code lenses across overloads.
+                last_symbol: SymbolId::NIL,
+                result: std::mem::take(&mut result),
+                seen: std::mem::take(&mut seen),
+            };
 
-        visitor.visit(file);
+            visitor.visit(projection);
+            result = visitor.result;
+            seen = visitor.seen;
+        }
 
         Ok(lsproto::CodeLensResponse {
-            code_lenses: Some(visitor.result),
+            code_lenses: Some(result),
         })
     }
 }
 
-// Go: ls/codelens.go:24 (the state of the `visit` closure in ProvideCodeLenses)
+// Go: ls/codelens.go:30 (the state of the `visit` closure in ProvideCodeLenses)
 struct CodeLensVisitor<'a> {
     ls: &'a LanguageService,
     ctx: &'a Context,
@@ -51,10 +62,11 @@ struct CodeLensVisitor<'a> {
     user_prefs: lsutil::CodeLensUserPreferences,
     last_symbol: SymbolId,
     result: Vec<lsproto::CodeLens>,
+    seen: FxHashSet<CodeLensKey>,
 }
 
 impl CodeLensVisitor<'_> {
-    // Go: ls/codelens.go:27 visit
+    // Go: ls/codelens.go:33 visit
     fn visit(&mut self, node: Node) -> bool {
         if self.ctx.err().is_some() {
             return true;
@@ -72,7 +84,8 @@ impl CodeLensVisitor<'_> {
                     self.file,
                     node,
                     lsproto::CodeLensKind::REFERENCES,
-                ) {
+                ) && self.seen.insert(key_for_code_lens(&code_lens))
+                {
                     self.result.push(code_lens);
                 }
             }
@@ -85,7 +98,8 @@ impl CodeLensVisitor<'_> {
                     self.file,
                     node,
                     lsproto::CodeLensKind::IMPLEMENTATIONS,
-                ) {
+                ) && self.seen.insert(key_for_code_lens(&code_lens))
+                {
                     self.result.push(code_lens);
                 }
             }
@@ -98,8 +112,34 @@ impl CodeLensVisitor<'_> {
     }
 }
 
+// Go: ls/codelens.go:67 codeLensKey
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CodeLensKey {
+    kind: lsproto::CodeLensKind,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+// Go: ls/codelens.go:72 keyForCodeLens
+fn key_for_code_lens(code_lens: &lsproto::CodeLens) -> CodeLensKey {
+    // PORT: Go dereferences `codeLens.Data`; every lens made here sets it.
+    let data = code_lens
+        .data
+        .as_ref()
+        .expect("invalid memory address or nil pointer dereference");
+    CodeLensKey {
+        kind: data.kind.clone(),
+        start_line: code_lens.range.start.line,
+        start_character: code_lens.range.start.character,
+        end_line: code_lens.range.end.line,
+        end_character: code_lens.range.end.character,
+    }
+}
+
 impl LanguageService {
-    // Go: ls/codelens.go:57 ResolveCodeLens
+    // Go: ls/codelens.go:82 ResolveCodeLens
     // PORT: Go mutates `*codeLens` and returns the same pointer; here the
     // lens is taken by value and returned. Go `*string` is `Option<String>`.
     pub fn resolve_code_lens(
@@ -116,11 +156,33 @@ impl LanguageService {
             .expect("invalid memory address or nil pointer dereference");
         let uri = data.uri.clone();
         let text_doc = lsproto::TextDocumentIdentifier { uri: uri.clone() };
+        let (program, file) = self.get_program_and_file(&uri);
+        let file = source_file_for_supplemental_file_index(file, data.supplemental_file_index);
+        if file.is_nil() {
+            // PORT: Go reads `*codeLens.Data.SupplementalFileIndex` here. A
+            // nil index returns the file, so the index is set when the file
+            // is nil.
+            let index = data
+                .supplemental_file_index
+                .expect("invalid memory address or nil pointer dereference");
+            return Err(gostd::errors::errorf(
+                format!("supplemental source file index not found: {index}"),
+                Vec::new(),
+            ));
+        }
         let locale = locale::from_context(ctx);
         let mut locs: Vec<lsproto::Location> = Vec::new();
         let mut lens_title = String::new();
         if data.kind == lsproto::CodeLensKind::REFERENCES {
-            let references_resp = self.provide_references(
+            let (symbol_data, _) = self.provide_symbols_and_entries_at_position(
+                ctx,
+                program,
+                file,
+                data.position,
+                false,
+                false,
+            );
+            let references_resp = self.provide_references_from_data(
                 ctx,
                 &lsproto::ReferenceParams {
                     text_document: text_doc.clone(),
@@ -132,6 +194,7 @@ impl LanguageService {
                     ..Default::default()
                 },
                 orchestrator,
+                symbol_data,
             )?;
             if let Some(locations) = references_resp.locations {
                 locs = locations;
@@ -151,7 +214,15 @@ impl LanguageService {
                 );
             }
         } else if data.kind == lsproto::CodeLensKind::IMPLEMENTATIONS {
-            let implementations = self.provide_implementations_ex(
+            let (symbol_data, _) = self.provide_symbols_and_entries_at_position(
+                ctx,
+                program,
+                file,
+                data.position,
+                false,
+                true,
+            );
+            let implementations = self.provide_implementations_from_data(
                 ctx,
                 &lsproto::ImplementationParams {
                     text_document: text_doc.clone(),
@@ -165,6 +236,7 @@ impl LanguageService {
                     drop_origin_nodes: true,
                 },
                 orchestrator,
+                symbol_data,
             )?;
 
             if let Some(locations) = implementations.locations {
@@ -219,7 +291,7 @@ fn to_lsp_any<T: MarshalerTo + ?Sized>(value: &T) -> LspAny {
 }
 
 impl LanguageService {
-    // Go: ls/codelens.go:137 newCodeLensForNode
+    // Go: ls/codelens.go:167 newCodeLensForNode
     // PORT: Go returns `*lsproto.CodeLens`; nil is `None`.
     pub fn new_code_lens_for_node(
         &self,
@@ -249,9 +321,7 @@ impl LanguageService {
                 kind,
                 uri: file_uri.clone(),
                 position: pos,
-                // PORT: Go `supplementalFileIndex(file)` (#63936, ls lane). The
-                // port has no supplemental projections here yet: `nil`.
-                supplemental_file_index: None,
+                supplemental_file_index: supplemental_file_index(file),
             }),
             ..Default::default()
         })

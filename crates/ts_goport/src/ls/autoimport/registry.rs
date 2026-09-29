@@ -1724,7 +1724,10 @@ pub fn has_new_non_node_modules_files(
     }
     let program = program.expect(NIL_DEREF);
     for file in program.get_source_files() {
-        if file.file_name().contains("/node_modules/") || is_ignored_file(program, file) {
+        if file.is_content_mapper_supplemental()
+            || file.file_name().contains("/node_modules/")
+            || is_ignored_file(program, file)
+        {
             continue;
         }
         if !bucket.paths.contains_key(file.path()) {
@@ -1888,7 +1891,7 @@ impl RegistryBuilder {
         let combined_stats = ExtractorStats::default();
 
         for file in program.get_source_files() {
-            if is_ignored_file(program, file) {
+            if file.is_content_mapper_supplemental() || is_ignored_file(program, file) {
                 continue;
             }
             if let Some(file_exclude_patterns) = &file_exclude_patterns {
