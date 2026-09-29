@@ -1198,7 +1198,8 @@ fn sort_import_specifiers(a: &Node, b: &Node) -> std::cmp::Ordering {
 // Go: transformers/jsxtransforms/jsx.go:191 getSortedSpecifiers
 fn get_sorted_specifiers(m: &FxHashMap<String, Node>) -> Vec<Node> {
     let mut res: Vec<Node> = m.values().copied().collect();
-    res.sort_by(sort_import_specifiers);
+    // Go: transformers/jsxtransforms/jsx.go:193 slices.SortFunc(res, sortImportSpecifiers)
+    crate::gostd::slices::sort_func(&mut res, |a, b| sort_import_specifiers(a, b) as i32);
     res
 }
 

@@ -754,19 +754,12 @@ impl Checker {
 
         if !candidate_chains.is_empty() {
             // pick first, shortest
-            // PORT: Go `slices.SortStableFunc(candidateChains, c.compareSymbolChains)`.
-            // The comparator needs `&mut self`, so this is a stable insertion sort.
-            // A stable sort gives one result for a given comparator.
-            for i in 1..candidate_chains.len() {
-                let mut j = i;
-                while j > 0
-                    && self.compare_symbol_chains(&candidate_chains[j], &candidate_chains[j - 1])
-                        < 0
-                {
-                    candidate_chains.swap(j, j - 1);
-                    j -= 1;
-                }
-            }
+            // Go: checker/symbolaccessibility.go:584 slices.SortStableFunc(candidateChains, c.compareSymbolChains)
+            // PORT: compareSymbolChains calls compareSymbols, which is not a
+            // total order, so this uses Go's stable sort to get Go's order.
+            crate::gostd::slices::sort_stable_func(&mut candidate_chains, |a, b| {
+                self.compare_symbol_chains(a, b)
+            });
             return candidate_chains.swap_remove(0);
         }
 

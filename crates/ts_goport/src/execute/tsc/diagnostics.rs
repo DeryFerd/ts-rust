@@ -828,9 +828,11 @@ fn get_error_summary(diags: &[Diagnostic]) -> ErrorSummary<'_> {
     // !!!
     // Need an ordered map here, but sorting for consistency.
     let mut sorted_files: Vec<Node> = errors_by_file.keys().copied().collect();
+    // Go: diagnosticwriter/diagnosticwriter.go:400 slices.SortedFunc(maps.Keys(errorsByFile), ...)
     // PORT: Go compares the bytes of the names (see `compare_go_bytes`).
-    sorted_files
-        .sort_by(|a, b| compare_go_bytes(source_file_file_name(*a), source_file_file_name(*b)));
+    crate::gostd::slices::sort_func(&mut sorted_files, |a, b| {
+        compare_go_bytes(source_file_file_name(*a), source_file_file_name(*b)) as i32
+    });
 
     ErrorSummary {
         total_error_count,

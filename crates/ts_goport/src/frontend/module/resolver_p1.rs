@@ -1277,9 +1277,8 @@ impl ResolutionState<'_> {
                 expanding_keys.push(key);
             }
         }
-        // PORT: Go `slices.SortFunc` (pdqsort) is not stable; Rust `sort_by`
-        // is. Both use insertion sort (stable) for up to 12 keys.
-        expanding_keys.sort_by(|a, b| compare_pattern_keys(a, b).cmp(&0));
+        // Go: module/resolver.go:721 slices.SortFunc(expandingKeys, ComparePatternKeys)
+        crate::gostd::slices::sort_func(&mut expanding_keys, |a, b| compare_pattern_keys(a, b));
 
         // PORT: Go matches and slices bytes. The names are port forms, so
         // this works on their Go bytes (see `scanner_util::GO_STRING_MARKER`).

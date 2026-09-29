@@ -457,9 +457,10 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
         });
     }
     // Go sorts by the name bytes.
-    entries.sort_by(|a, b| {
+    // Go: os/dir.go:122 ReadDir: slices.SortFunc(dirs, bytealg.CompareString on the names)
+    crate::gostd::slices::sort_func(&mut entries, |a, b| {
         crate::scanner_util::go_string_bytes(&a.name)
-            .cmp(&crate::scanner_util::go_string_bytes(&b.name))
+            .cmp(&crate::scanner_util::go_string_bytes(&b.name)) as i32
     });
     Ok(entries)
 }

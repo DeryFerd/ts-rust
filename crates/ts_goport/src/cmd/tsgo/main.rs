@@ -356,7 +356,8 @@ impl FlagSet {
     pub fn print_defaults(&self) {
         // Go: VisitAll visits the flags in lexicographical order.
         let mut flags: Vec<&Flag> = self.formal.values().collect();
-        flags.sort_by(|a, b| a.name.cmp(&b.name));
+        // Go: flag/flag.go:423 sortFlags: slices.SortFunc(result, strings.Compare on the names)
+        crate::gostd::slices::sort_func(&mut flags, |a, b| a.name.cmp(&b.name) as i32);
         for flag in flags {
             let mut b = String::new();
             b.push_str(&format!("  -{}", flag.name)); // Two spaces before -; see next two comments.

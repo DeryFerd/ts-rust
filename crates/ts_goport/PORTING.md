@@ -645,8 +645,10 @@ program version:
 | `defer f()` | a guard, or an explicit call on every return path |
 | `recover()` | `std::panic::catch_unwind(AssertUnwindSafe(..))`; `unported!` panics are recovered like Go panics |
 | `panic(x)` | `panic!` with the Go text |
-| `slices.SortFunc`, `sort.Slice` (not stable) | `gostd::slices::sort_func(&mut v, cmp)`, `gostd::slices::sort_slice(&mut v, less)` (Go pdqsort: equal elements end where Go puts them) |
-| `slices.SortStableFunc`, `sort.SliceStable` | `v.sort_by(..)` (all stable sorts agree) |
+| `slices.SortFunc`, `sort.Sort`, `sort.Slice` (not stable) | `gostd::slices::sort_func(&mut v, cmp)`, `gostd::slices::sort_slice(&mut v, less)` (Go pdqsort: equal elements end where Go puts them) |
+| `slices.SortStableFunc`, `sort.Stable`, `sort.SliceStable` | `gostd::slices::sort_stable_func(&mut v, cmp)` |
+| `slices.Sort`, `sort.Strings` (ordered values) | std `v.sort()` (equal values are the same value) |
+| any sort with a comparator | never std `sort_by`, `sort_by_key` or `sort_unstable_by`: they can panic when the comparator is not a total order, and Go's sorts do not. The `gostd::slices` sorts give Go's order for any comparator. A port-only sort on an `Ord` key can use std. |
 | `slices.BinarySearchFunc` | `gostd::slices::binary_search_func(&v, target, cmp) -> (usize, bool)` |
 | `strconv.Quote`, `%q` | `gostd::strconv::quote(s)` |
 | `net/url` (`Parse`, `PathEscape`, `QueryEscape`, `PathUnescape`), `net/netip.ParseAddr` | `gostd::url::{parse, path_escape, query_escape, path_unescape}`, `gostd::netip` |

@@ -257,8 +257,10 @@ impl Checker {
                         });
                     }
                 }
-                // PORT: `sort_by` is stable, like Go `slices.SortStableFunc`.
-                parent_specifiers.sort_by(|x, y| self.sort_by_best_name(x, y).cmp(&0));
+                // Go: checker/nodebuilderimpl.go:1102 slices.SortStableFunc(parentSpecifiers, b.sortByBestName)
+                crate::gostd::slices::sort_stable_func(&mut parent_specifiers, |x, y| {
+                    self.sort_by_best_name(x, y)
+                });
                 for pair in &parent_specifiers {
                     let parent = pair.sym;
                     let parent_chain = self.get_symbol_chain(

@@ -55,7 +55,10 @@ pub fn walk_dir_generic_visit(
         return Err(path_error("open", dir, &err));
     }
     // PORT: os.ReadDir returns the entries sorted by file name.
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    // Go: os/dir.go:122 slices.SortFunc(dirs, bytealg.CompareString on the names)
+    crate::gostd::slices::sort_func(&mut entries, |a, b| {
+        a.file_name().cmp(&b.file_name()) as i32
+    });
     if let Some(f) = fn_.as_deref_mut() {
         f(dir, true)?;
     }

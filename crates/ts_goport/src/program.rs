@@ -3383,7 +3383,8 @@ fn is_comment_or_blank_line(text: &str, mut pos: usize) -> bool {
 
 // Go: compiler/program.go:1431 SortAndDeduplicateDiagnostics
 pub fn sort_and_deduplicate_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+    // Go: compiler/program.go:1438 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
+    crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
     compact_and_merge_related_infos(diagnostics)
 }
 
@@ -3412,7 +3413,8 @@ fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnost
             // PORT: Go tests `relatedInfos != nil`; appending empty slices
             // keeps it nil, so an empty list means "leave d alone".
             if !related_infos.is_empty() {
-                related_infos.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+                // Go: compiler/program.go:1462 slices.SortFunc(relatedInfos, ast.CompareDiagnostics)
+                crate::gostd::slices::sort_func(&mut related_infos, compare_diagnostics);
                 related_infos.dedup_by(|b, a| equal_diagnostics(a, b));
                 merged.set_related_info(related_infos);
             }
