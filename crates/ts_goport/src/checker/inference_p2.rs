@@ -1226,6 +1226,11 @@ impl Checker {
 
     // Go: checker/inference.go:1560 isFromInferenceBlockedSource
     pub fn is_from_inference_blocked_source(&self, t: TypeId) -> bool {
+        // PERF: the skip set is empty outside the language service, and then
+        // no declaration is in it. The reads below have no side effects.
+        if self.skip_direct_inference_nodes.is_empty() {
+            return false;
+        }
         let symbol = self.ty(t).symbol;
         symbol.is_some()
             && self

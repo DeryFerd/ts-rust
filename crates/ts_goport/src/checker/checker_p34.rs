@@ -63,16 +63,11 @@ impl Checker {
             SyntaxKind::ObjectLiteralExpression => {
                 return node
                     .properties()
-                    .to_vec()
-                    .into_iter()
+                    .iter()
                     .any(|p| self.is_context_sensitive(p));
             }
             SyntaxKind::ArrayLiteralExpression => {
-                return node
-                    .elements()
-                    .to_vec()
-                    .into_iter()
-                    .any(|e| self.is_context_sensitive(e));
+                return node.elements().iter().any(|e| self.is_context_sensitive(e));
             }
             SyntaxKind::ConditionalExpression => {
                 return self.is_context_sensitive(node.when_true())
@@ -94,8 +89,7 @@ impl Checker {
             SyntaxKind::JsxAttributes => {
                 return node
                     .properties()
-                    .to_vec()
-                    .into_iter()
+                    .iter()
                     .any(|p| self.is_context_sensitive(p))
                     || is_jsx_opening_element(node.parent())
                         && node
@@ -103,8 +97,7 @@ impl Checker {
                             .parent()
                             .children()
                             .nodes()
-                            .to_vec()
-                            .into_iter()
+                            .iter()
                             .any(|ch| self.is_context_sensitive(ch));
             }
             SyntaxKind::JsxAttribute => {
@@ -865,8 +858,7 @@ impl Checker {
             return self.is_symbol_assigned(symbol);
         }
         node.elements()
-            .to_vec()
-            .into_iter()
+            .iter()
             .any(|e| e.name().is_some() && self.is_some_symbol_assigned_worker(e.name()))
     }
 
@@ -1123,7 +1115,7 @@ impl Checker {
             } else if is_js_doc_parameter_tag(parent) && parent.name() == node {
                 let fn_ = get_node_at_position(get_source_file_of_node(node), node.pos(), false);
                 if fn_.is_some() && is_function_like(fn_) {
-                    for param in fn_.parameters().to_vec() {
+                    for param in fn_.parameters() {
                         if is_identifier(param.name()) && param.name().text() == node.text() {
                             return self.get_symbol_of_node(param);
                         }

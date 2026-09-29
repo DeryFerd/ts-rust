@@ -962,6 +962,17 @@ pub fn synthetic_loc(n: Node) -> TextRange {
     with_node(n, |s| s.loc)
 }
 
+/// Hook for `Node::kind` on a synthetic node. It reads the kind while it
+/// borrows the arena, so it does not clone the data chunk
+/// (`synthetic_ast_node`).
+#[must_use]
+pub fn synthetic_kind(n: Node) -> SyntaxKind {
+    ARENA.with(|a| {
+        let a = a.borrow();
+        a.data(a.node(n).data).kind
+    })
+}
+
 /// Hook for `Node::bind` on a synthetic node. The data belongs to the
 /// thread, so it is read by value.
 #[must_use]

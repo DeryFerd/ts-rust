@@ -1437,12 +1437,7 @@ impl Checker {
 
 // Go: checker/checker.go:27654 hasRestParameter
 pub fn has_rest_parameter(signature: Node) -> bool {
-    let last = signature
-        .parameters()
-        .to_vec()
-        .last()
-        .copied()
-        .unwrap_or(Node::NIL);
+    let last = signature.parameters().last().unwrap_or(Node::NIL);
     last.is_some() && is_rest_parameter(last)
 }
 

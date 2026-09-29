@@ -1705,7 +1705,6 @@ impl Checker {
     ) -> bool {
         let declaration_file = get_source_file_of_node(declaration);
         let use_file = get_source_file_of_node(usage);
-        let decl_container = get_enclosing_block_scope_container(declaration);
         if declaration_file != use_file {
             // nodes are in different files and order cannot be determined
             return true;
@@ -1717,6 +1716,10 @@ impl Checker {
         {
             return true;
         }
+        // PERF: Go reads `declContainer` before the two early returns above.
+        // It is a walk up the parents that changes nothing, so it is read
+        // after them.
+        let decl_container = get_enclosing_block_scope_container(declaration);
         if declaration.pos() <= usage.pos()
             && !(is_property_declaration(declaration)
                 && is_this_property(usage.parent())
@@ -1876,8 +1879,7 @@ impl Checker {
                                 let static_blocks: Vec<Node> = declaration
                                     .parent()
                                     .members()
-                                    .to_vec()
-                                    .into_iter()
+                                    .iter()
                                     .filter(|&m| is_class_static_block_declaration(m))
                                     .collect();
                                 if self.is_property_initialized_in_static_blocks(

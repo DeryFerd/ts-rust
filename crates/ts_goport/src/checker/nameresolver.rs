@@ -201,13 +201,20 @@ impl NameResolver {
         let mut grandparent: Node;
         let original_location = location; // needed for did-you-mean error reporting, which gathers candidates starting from the original location
         let name_is_const = name == "const";
+        // PERF: `kind` is `location.kind()`, read once per scope. Each
+        // `kind()` call reads the file's kind table, and the Go tests below
+        // (`IsModuleOrEnumDeclaration`, `IsGlobalSourceFile`,
+        // `IsFunctionLike`, `getIsDeferredContext`, the switch and
+        // `isSelfReferenceLocation`) read the kind about 8 times per scope.
+        // It is read again each time `location` changes.
         'loop_: while location.is_some() {
+            let mut kind = location.kind();
             if name_is_const && is_const_assertion(location) {
                 // `const` in an `as const` has no symbol, but issues no error because there is no *actual* lookup of the type
                 // (it refers to the constant type of the expression instead)
                 return SymbolId::NIL;
             }
-            if is_module_or_enum_declaration(location)
+            if (kind == SyntaxKind::ModuleDeclaration || kind == SyntaxKind::EnumDeclaration)
                 && last_location.is_some()
                 && location.name() == last_location
             {
@@ -215,14 +222,19 @@ impl NameResolver {
                 // conflict.
                 last_location = location;
                 location = location.parent();
+                kind = location.kind();
             }
             let locals = location.locals();
             // Locals of a source file are not in scope (because they get merged into the global symbol table)
-            if locals.is_some() && !is_global_source_file(location) {
+            // PORT: `!is_global_source_file(location)` with the kind read.
+            if locals.is_some()
+                && !(kind == SyntaxKind::SourceFile && !is_external_or_common_js_module(location))
+            {
                 result = self.lookup(c, locals, &name_key, meaning);
                 if result.is_some() {
                     let mut use_result = true;
-                    if is_function_like(location)
+                    // PORT: `is_function_like(location)`; `location` is not nil.
+                    if is_function_like_kind(kind)
                         && last_location.is_some()
                         && last_location != location.body()
                     {
@@ -273,7 +285,7 @@ impl NameResolver {
                                         .is_some();
                             }
                         }
-                    } else if location.kind() == SyntaxKind::ConditionalType {
+                    } else if kind == SyntaxKind::ConditionalType {
                         // A type parameter declared using 'infer T' in a conditional type is visible only in
                         // the true branch of the conditional type.
                         use_result = last_location == location.true_type();
@@ -285,13 +297,13 @@ impl NameResolver {
                 }
             }
             within_deferred_context =
-                within_deferred_context || get_is_deferred_context(location, last_location);
+                within_deferred_context || get_is_deferred_context(location, kind, last_location);
             // PORT: Go `break` inside the switch leaves the switch; `break 'switch_` does the same here.
             'switch_: {
-                match location.kind() {
+                match kind {
                     SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration => {
                         // PORT: Go `case KindSourceFile: if !external { break }; fallthrough`.
-                        if location.kind() == SyntaxKind::SourceFile
+                        if kind == SyntaxKind::SourceFile
                             && !is_external_or_common_js_module(location)
                         {
                             break 'switch_;
@@ -301,8 +313,8 @@ impl NameResolver {
                             break 'switch_;
                         }
                         let module_exports = c.symbol_arena().sym(module_symbol).exports;
-                        if is_source_file(location)
-                            || (is_module_declaration(location)
+                        if kind == SyntaxKind::SourceFile
+                            || (kind == SyntaxKind::ModuleDeclaration
                                 && location.flags().intersects(NodeFlags::AMBIENT)
                                 && !is_global_scope_augmentation(location))
                         {
@@ -361,7 +373,7 @@ impl NameResolver {
                                 meaning & SymbolFlags::MODULE_MEMBER,
                             );
                             if result.is_some() {
-                                if is_source_file(location)
+                                if kind == SyntaxKind::SourceFile
                                     && with_source_file_info(location, |info| {
                                         info.common_js_module_indicator
                                     })
@@ -471,7 +483,9 @@ impl NameResolver {
                             }
                             break 'loop_;
                         }
-                        if is_class_expression(location) && meaning.intersects(SymbolFlags::CLASS) {
+                        if kind == SyntaxKind::ClassExpression
+                            && meaning.intersects(SymbolFlags::CLASS)
+                        {
                             let class_name = location.name();
                             if class_name.is_some() && name == class_name.text() {
                                 result = location.symbol();
@@ -581,6 +595,7 @@ impl NameResolver {
                         {
                             location = location.parent();
                         }
+                        kind = location.kind();
                     }
                     SyntaxKind::Parameter => {
                         if last_location.is_some()
@@ -626,12 +641,13 @@ impl NameResolver {
                             && location.parent().parent().module_specifier().is_some()
                         {
                             location = location.parent().parent().parent();
+                            kind = location.kind();
                         }
                     }
                     _ => {}
                 }
             }
-            if is_self_reference_location(location, last_location) {
+            if is_self_reference_location(location, kind, last_location) {
                 last_self_reference_location = location;
             }
             last_location = location;
@@ -902,15 +918,23 @@ pub fn is_export_default_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool
 }
 
 // Go: binder/nameresolver.go:459 getIsDeferredContext
-pub fn get_is_deferred_context(location: Node, last_location: Node) -> bool {
-    if location.kind() != SyntaxKind::ArrowFunction
-        && location.kind() != SyntaxKind::FunctionExpression
-    {
+// PERF: `kind` is `location.kind()`, which the caller has read (see
+// `resolve_name`). `location` is not nil.
+pub fn get_is_deferred_context(location: Node, kind: SyntaxKind, last_location: Node) -> bool {
+    if kind != SyntaxKind::ArrowFunction && kind != SyntaxKind::FunctionExpression {
         // initializers in instance property declaration of class like entities are executed in constructor and thus deferred
         // A name is evaluated within the enclosing scope - so it shouldn't count as deferred
-        return is_type_query_node(location)
-            || (is_function_like_declaration(location)
-                || location.kind() == SyntaxKind::PropertyDeclaration && !is_static(location))
+        // PORT: `ast.IsFunctionLikeDeclaration(location)` on a kind that is
+        // not an arrow function or function expression.
+        return kind == SyntaxKind::TypeQuery
+            || (matches!(
+                kind,
+                SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::MethodDeclaration
+                    | SyntaxKind::Constructor
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+            ) || kind == SyntaxKind::PropertyDeclaration && !is_static(location))
                 && (last_location.is_nil() || last_location != location.name());
     }
     if last_location.is_some() && last_location == location.name() {
@@ -943,8 +967,9 @@ pub fn is_type_parameter_symbol_declared_in_container(
 }
 
 // Go: binder/nameresolver.go:489 isSelfReferenceLocation
-pub fn is_self_reference_location(node: Node, last_location: Node) -> bool {
-    match node.kind() {
+// PERF: `kind` is `node.kind()`, which the caller has read.
+pub fn is_self_reference_location(node: Node, kind: SyntaxKind, last_location: Node) -> bool {
+    match kind {
         SyntaxKind::Parameter => last_location.is_some() && last_location == node.name(),
         SyntaxKind::FunctionDeclaration
         | SyntaxKind::ClassDeclaration

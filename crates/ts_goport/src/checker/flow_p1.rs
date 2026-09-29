@@ -3,6 +3,7 @@
 //! `getNarrowedTypeWorker`.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 // Go: checker/flow.go:19 FlowType
@@ -38,9 +39,38 @@ pub struct SharedFlow {
     pub flow_type: FlowType,
 }
 
+/// Go `*ast.FlowReduceLabelData` on the flow state: the target label and
+/// the temporary antecedent list of a reduce label flow node.
+// PERF: the parts come from the flow node's `antecedents`
+// (`[target, antecedents...]`, see `FlowNode::as_flow_reduce_label_data`).
+// The list is a copy: a flow node of a freeable file version (lsshells M3b)
+// is not `'static`, so the flow state cannot borrow it. Reduce labels come
+// only from `finally` blocks; `get_branch_label_antecedents` still borrows
+// the list of an ordinary branch label (perf14).
+#[derive(Clone, Debug)]
+pub struct ReduceLabel {
+    pub target: FlowNodeId,
+    pub antecedents: Box<[FlowNodeId]>,
+}
+
+impl ReduceLabel {
+    /// Go `flow.Node.AsFlowReduceLabelData()` of a reduce label flow node.
+    #[must_use]
+    pub fn of(flow_data: &FlowNode) -> Self {
+        assert!(
+            flow_data.flags.intersects(FlowFlags::REDUCE_LABEL),
+            "not a reduce label flow node"
+        );
+        Self {
+            target: flow_data.antecedents[0],
+            antecedents: flow_data.antecedents[1..].into(),
+        }
+    }
+}
+
 // Go: checker/flow.go:40 FlowState
 // PORT: Go `*FlowState` is `Rc<RefCell<FlowState>>` (see `Checker::free_flow_state`).
-// Go `[]*ast.FlowReduceLabelData` holds the data by value.
+// Go `[]*ast.FlowReduceLabelData` is a list of `ReduceLabel`.
 #[derive(Clone, Debug, Default)]
 pub struct FlowState {
     pub reference: Node,
@@ -50,7 +80,7 @@ pub struct FlowState {
     pub ref_key: CacheHashKey,
     pub depth: i32,
     pub shared_flow_start: i32,
-    pub reduce_labels: Vec<FlowReduceLabelData>,
+    pub reduce_labels: Vec<ReduceLabel>,
     pub next: Option<Rc<RefCell<FlowState>>>,
 }
 
@@ -230,23 +260,24 @@ impl Checker {
             } else if flags.intersects(FlowFlags::CONDITION) {
                 t = self.get_type_at_flow_condition(f, flow_data);
             } else if flags.intersects(FlowFlags::SWITCH_CLAUSE) {
-                t = self.get_type_at_switch_clause(f, flow);
+                t = self.get_type_at_switch_clause(f, flow_data);
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
-                let antecedents = get_branch_label_antecedents(flow, &f.borrow().reduce_labels);
+                let antecedents =
+                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
                 // PORT: Go `antecedents.Next == nil` (a one-element FlowList).
                 if antecedents.len() <= 1 {
                     flow = antecedents[0];
                     continue;
                 }
-                t = self.get_type_at_flow_branch_label(f, flow, &antecedents);
+                t = self.get_type_at_flow_branch_label(f, &antecedents);
             } else if flags.intersects(FlowFlags::LOOP_LABEL) {
                 if flow_data.antecedents.len() <= 1 {
                     flow = flow_data.antecedents[0];
                     continue;
                 }
-                t = self.get_type_at_flow_loop_label(f, flow);
+                t = self.get_type_at_flow_loop_label(f, flow, flow_data);
             } else if flags.intersects(FlowFlags::ARRAY_MUTATION) {
-                t = self.get_type_at_flow_array_mutation(f, flow);
+                t = self.get_type_at_flow_array_mutation(f, flow_data);
                 if t.is_nil() {
                     flow = flow_data.antecedent;
                     continue;
@@ -254,7 +285,7 @@ impl Checker {
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
                 f.borrow_mut()
                     .reduce_labels
-                    .push(flow_data.as_flow_reduce_label_data());
+                    .push(ReduceLabel::of(flow_data));
                 t = self.get_type_at_flow_node(f, flow_data.antecedent);
                 f.borrow_mut().reduce_labels.pop();
             } else if flags.intersects(FlowFlags::START) {
@@ -264,13 +295,16 @@ impl Checker {
                     let fb = f.borrow();
                     (fb.reference, fb.flow_container, fb.initial_type)
                 };
-                if container.is_some()
-                    && container != flow_container
-                    && !is_property_access_expression(reference)
-                    && !is_element_access_expression(reference)
-                    && !(reference.kind() == SyntaxKind::ThisKeyword
-                        && !is_arrow_function(container))
-                {
+                // PERF: Go `IsPropertyAccessExpression`,
+                // `IsElementAccessExpression` and the `KindThisKeyword` test
+                // on one read of the reference kind.
+                if container.is_some() && container != flow_container && {
+                    let reference_kind = reference.kind();
+                    reference_kind != SyntaxKind::PropertyAccessExpression
+                        && reference_kind != SyntaxKind::ElementAccessExpression
+                        && !(reference_kind == SyntaxKind::ThisKeyword
+                            && !is_arrow_function(container))
+                } {
                     flow = container.flow_node();
                     continue;
                 }
@@ -302,28 +336,32 @@ impl Checker {
 }
 
 // Go: checker/flow.go:204 getBranchLabelAntecedents
-// PORT: Go returns the `*ast.FlowList`; the list is a `Vec<FlowNodeId>` here
-// (see `core::FlowNode::antecedents`), so a copy is returned.
-pub fn get_branch_label_antecedents(
+// PORT: Go returns the `*ast.FlowList`; here it is the antecedent slice of a
+// flow node (see `core::FlowNode::antecedents` and `ReduceLabel`): borrowed
+// from `flow_data`, or a copy of a reduce label's list (the caller changes
+// the flow state while it walks the list).
+// `flow_data` is `flow.get_flow()`, which the caller has read.
+pub fn get_branch_label_antecedents<'a>(
     flow: FlowNodeId,
-    reduce_labels: &[FlowReduceLabelData],
-) -> Vec<FlowNodeId> {
+    flow_data: &'a FlowNode,
+    reduce_labels: &[ReduceLabel],
+) -> Cow<'a, [FlowNodeId]> {
     let mut i = reduce_labels.len();
     while i != 0 {
         i -= 1;
         let data = &reduce_labels[i];
         if data.target == flow {
-            return data.antecedents.clone();
+            return Cow::Owned(data.antecedents.to_vec());
         }
     }
-    flow.get_flow().antecedents.clone()
+    Cow::Borrowed(&flow_data.antecedents)
 }
 
 impl Checker {
     // Go: checker/flow.go:216 getTypeAtFlowAssignment
-    // PERF: lsshells M3 repair. `flow_data` is `flow.get_flow()`, which the
-    // caller has read (as main's perf14), so a freeable file version is not
-    // pinned again.
+    // PERF: `flow_data` is `flow.get_flow()`, which the caller has read
+    // (perf14), so a freeable file version is not pinned again (lsshells M3
+    // repair).
     pub fn get_type_at_flow_assignment(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -357,7 +395,7 @@ impl Checker {
                         incomplete: false,
                     };
                 }
-                let initial_or_assigned = self.get_initial_or_assigned_type(f, flow);
+                let initial_or_assigned = self.get_initial_or_assigned_type(f, node);
                 let assigned_type = self.get_widened_literal_type(initial_or_assigned);
                 if self.is_type_assignable_to(assigned_type, declared_type) {
                     return FlowType {
@@ -375,7 +413,7 @@ impl Checker {
                 t = self.get_base_type_of_literal_type(t);
             }
             if self.ty(t).flags.intersects(TypeFlags::UNION) {
-                let assigned = self.get_initial_or_assigned_type(f, flow);
+                let assigned = self.get_initial_or_assigned_type(f, node);
                 return FlowType {
                     t: self.get_assignment_reduced_type(t, assigned),
                     incomplete: false,
@@ -431,12 +469,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:280 getInitialOrAssignedType
+    // PORT: takes `flow.Node` (`node`), the only part of the flow node it reads.
     pub fn get_initial_or_assigned_type(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        node: Node,
     ) -> TypeId {
-        let node = flow.get_flow().node;
         let reference = f.borrow().reference;
         if is_variable_declaration(node) || is_binding_element(node) {
             let initial_type = self.get_initial_type(node);
@@ -461,8 +499,7 @@ impl Checker {
     }
 
     // Go: checker/flow.go:292 getTypeAtFlowCall
-    // PERF: lsshells M3 repair. `flow_data` is the flow node that the caller
-    // has read (see `get_type_at_flow_assignment`).
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_call(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -596,8 +633,7 @@ impl Checker {
     }
 
     // Go: checker/flow.go:353 getTypeAtFlowCondition
-    // PERF: lsshells M3 repair. `flow_data` is the flow node that the caller
-    // has read (see `get_type_at_flow_assignment`).
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_condition(
         &mut self,
         f: &Rc<RefCell<FlowState>>,

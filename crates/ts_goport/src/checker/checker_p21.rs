@@ -5,6 +5,7 @@
 
 use crate::prelude::*;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 
 impl Checker {
     // Go: checker/checker.go:18536 addOptionality
@@ -119,18 +120,21 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18610 getEffectivePropertyNameForPropertyNameNode
+    // PERF: a name read from the tree is borrowed (`property_name_text`), so
+    // most calls make no String.
     pub fn get_effective_property_name_for_property_name_node(
         &mut self,
         node: Node,
-    ) -> (String, bool) {
-        let name = get_property_name_for_property_name_node(node);
+    ) -> (Cow<'static, str>, bool) {
+        let name = property_name_text(node);
         if name != INTERNAL_SYMBOL_NAME_MISSING {
             return (name, true);
         } else if is_computed_property_name(node) {
             let t = self.get_type_of_expression(node.expression());
-            return self.try_get_name_from_type(t);
+            let (name, ok) = self.try_get_name_from_type(t);
+            return (Cow::Owned(name), ok);
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 
     // Go: checker/checker.go:18621 tryGetNameFromType
