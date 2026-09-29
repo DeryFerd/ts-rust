@@ -132,7 +132,8 @@ pub fn prepare_range_contains_error_function(
     if sorted.is_empty() {
         return Box::new(range_has_no_errors);
     }
-    sorted.sort_by(|a, b| a.pos().cmp(&b.pos()));
+    // Go: format/span.go:124 slices.SortStableFunc(sorted, a.Pos() - b.Pos())
+    crate::gostd::slices::sort_stable_func(&mut sorted, |a, b| a.pos().cmp(&b.pos()) as i32);
 
     let mut index = 0;
     Box::new(move |r: TextRange| -> bool {

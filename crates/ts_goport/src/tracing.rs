@@ -687,9 +687,10 @@ impl Tracing {
         }
 
         // Sort legend entries by typesPath for deterministic output
-        state
-            .legend
-            .sort_by(|a, b| a.types_path.as_str().cmp(b.types_path.as_str()));
+        // Go: tracing/tracing.go:467 slices.SortFunc(tr.legend, ...)
+        crate::gostd::slices::sort_func(&mut state.legend, |a, b| {
+            a.types_path.as_str().cmp(b.types_path.as_str()) as i32
+        });
 
         // Write the legend file
         let legend_path = crate::frontend::tspath::combine_paths(&self.trace_dir, &["legend.json"]);

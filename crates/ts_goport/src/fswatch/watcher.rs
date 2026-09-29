@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::frontend::vfs::osvfs::{filepath_clean, go_string_from_os, os_path};
-use crate::fswatch::unix;
+use crate::fswatch::syscall;
 use crate::fswatch::walkdir::path_error;
 use crate::gostd::errors;
 
@@ -731,7 +731,7 @@ pub fn validate_watch_directory(dir: &str) -> Result<(), GoError> {
         Err(err) => return Err(path_error("stat", dir, &err)),
     };
     if !info.is_dir() {
-        return Err(errors::from_value(unix::ENOTDIR));
+        return Err(errors::from_value(syscall::ENOTDIR));
     }
     Ok(())
 }

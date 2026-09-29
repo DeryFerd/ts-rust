@@ -30,10 +30,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
-/// Stack size of a search thread. The checker recurses deeply on large
-/// projects (the compile path uses the same size).
-const SEARCH_STACK_SIZE: usize = 1 << 30;
-
 /// A search thread drops its checker after this long with no job.
 // Go: project/checkerpool.go newCheckerPool (the default idle timeout of a
 // checker).
@@ -352,7 +348,7 @@ fn spawn_search_thread(program: &compiler::NewProgram) -> mpsc::Sender<Job> {
     let (jobs, receiver) = mpsc::channel::<Job>();
     std::thread::Builder::new()
         .name("ls-search".to_string())
-        .stack_size(SEARCH_STACK_SIZE)
+        .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || search_thread_main(seed, data, receiver))
         .expect("cannot start a search thread");
     jobs

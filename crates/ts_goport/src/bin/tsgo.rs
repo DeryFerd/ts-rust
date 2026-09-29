@@ -18,9 +18,12 @@
 //! Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is
 //! `cmd::tsgo::main::notify_context`. Only watch and build mode read the
 //! context; a plain compile goes on after a signal, as in Go.
+//! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
+//! the work, so the exit does not wait for its memory to unmap (`launch`).
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
-//! debug setting and is skipped. The work runs on a thread with a 1 GiB
-//! stack, like the other goport bins.
+//! debug setting and is skipped. The work runs on a thread with the stack
+//! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
+//! data limit), like the other goport bins.
 //! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
 //! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
@@ -41,14 +44,10 @@ use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the main work thread. The checker recurses deeply on
-/// large projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
 /// `set_malloc_tunables`.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -57,10 +56,37 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 
+/// Set in a worker (see `launch`): the number of its end of the pipe that
+/// takes the exit code.
+#[cfg(target_os = "linux")]
+const WORKER_FD: &str = "GOPORT_WORKER_FD";
+
+/// Set in a worker (see `launch`): the process id of its launcher.
+#[cfg(target_os = "linux")]
+const LAUNCHER_PID: &str = "GOPORT_LAUNCHER_PID";
+
+/// A worker's link to its launcher (see `launch`).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct Worker {
+    /// The number of the pipe end that takes the exit code (`WORKER_FD`).
+    fd: u32,
+    /// The launcher (`LAUNCHER_PID`).
+    launcher: rustix::process::Pid,
+}
+
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
     // First: it must run before the first heap allocation.
-    ts_goport::thp_guard::thp_guard();
+    let huge_pages = ts_goport::thp_guard::thp_guard();
+    #[cfg(target_os = "linux")]
+    if let Some(code) = launch(huge_pages) {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(worker) = worker() {
+        end_with_launcher(worker.launcher);
+    }
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
     // `notify_context` signal thread.
@@ -72,12 +98,13 @@ fn main() {
     let start = Instant::now();
     install_panic_hook();
     // The thread ends the process itself once `run_main` has written the
-    // output, so the exit does not wait for the thread stacks (1 GiB each)
-    // to unmap, the thread-local destructors or the join.
+    // output, so the exit does not wait for the thread stacks (up to 1 GiB
+    // each, `max_stack_size`) to unmap, the thread-local destructors or the
+    // join.
     let work = std::thread::Builder::new()
         .name("tsgo".to_string())
-        .stack_size(STACK_SIZE)
-        .spawn(move || std::process::exit(run_main(start)));
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
+        .spawn(move || exit(run_main(start)));
     // Reached only when the thread cannot start or `run_main` panics.
     let _ = work.map(std::thread::JoinHandle::join);
     eprintln!("tsgo: work thread failed");
@@ -89,28 +116,30 @@ fn main() {
 /// comes from `budget` (`ThreadBudget::one_program`): with the signal thread
 /// it is 7 here, and 10 at 8 or more cores (3 spare arenas for the parse
 /// workers that a large program adds). At 6, two checkers share one arena
-/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). The variable
-/// stays set, so the exec runs once. A jemalloc build with `JEMALLOC_CONF`
-/// built in does not exec.
+/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). Under an address
+/// space or data limit, glibc malloc gets `arena_max=1`, with jemalloc too.
+/// The variables stay set, so the exec runs once. A jemalloc build with
+/// `JEMALLOC_CONF` built in execs only under a limit.
 fn set_malloc_tunables(budget: &ThreadBudget) {
-    // Unused off Linux and with jemalloc.
+    // Unused off Linux.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        let mut vars = Vec::new();
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
-        // needs no exec: jemalloc reads it at its start, and
+        // needs no exec for it: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
-        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
-            return;
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") != Some(JEMALLOC_CONF) {
+            vars.push(("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF)));
         }
-        #[cfg(not(feature = "jemalloc"))]
-        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
-        #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
-        if std::env::var_os(name).is_some() {
+        if let Some(value) = budget.glibc_tunables() {
+            vars.push(("GLIBC_TUNABLES", value));
+        }
+        vars.retain(|(name, _)| std::env::var_os(name).is_none());
+        if vars.is_empty() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -122,8 +151,176 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(name, value).exec();
+        let _ = command.args(args).envs(vars).exec();
     }
+}
+
+/// Runs the work in a worker copy of this binary and returns its exit code
+/// (perf16). The worker sends the code over a pipe once its output is
+/// written (`exit`), so this process exits before the worker unmaps its
+/// memory. With 4 KiB pages that unmap takes about 50 ms for effect (1.3 GB);
+/// with huge pages it takes about 4 ms, less than a second process costs
+/// (about 1 ms on query check). So by default the worker runs only when
+/// `thp_guard` says the run gets 4 KiB pages (`huge_pages` false).
+/// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
+/// does. None when this process runs the work: it is a worker, no worker is
+/// wanted, `--lsp`, `--api` or watch mode (they end on their own), or the
+/// worker cannot start. The launcher sends SIGINT and SIGTERM on to the
+/// worker (`forward_signals`). When a signal kills the worker, the launcher
+/// ends by the same signal, so the caller sees what a run without a worker
+/// would give.
+#[cfg(target_os = "linux")]
+fn launch(huge_pages: bool) -> Option<i32> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let wanted = match std::env::var_os("GOPORT_LAUNCH") {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => !huge_pages,
+    };
+    if !wanted || worker().is_some() {
+        return None;
+    }
+    let mut args = std::env::args_os();
+    let program = args.next()?;
+    let args: Vec<_> = args.collect();
+    // Go `getInputOptionName`: an option name has one or two leading '-'.
+    let watch = |a: &std::ffi::OsString| {
+        a.to_str()
+            .and_then(|a| a.strip_prefix('-'))
+            .map(|a| a.strip_prefix('-').unwrap_or(a))
+            .is_some_and(|a| a.eq_ignore_ascii_case("watch") || a.eq_ignore_ascii_case("w"))
+    };
+    if args.first().is_some_and(|a| a == "--lsp" || a == "--api") || args.iter().any(watch) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    // `read` keeps its close-on-exec flag, so the worker gets only `write`,
+    // at the same number. The worker's copy has no close-on-exec flag: it
+    // must stay open through the exec in `set_malloc_tunables`, and std and
+    // rustix have no safe call that sets the flag on an inherited number. A
+    // compile starts no process, and a process that a worker starts is not
+    // a worker (`worker`). THP off (`prctl`) stays off in the worker.
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::empty()).ok()?;
+    let mut worker = std::process::Command::new(exe)
+        .arg0(program)
+        .args(args)
+        .env(WORKER_FD, write.as_raw_fd().to_string())
+        .env(
+            LAUNCHER_PID,
+            rustix::process::getpid().as_raw_pid().to_string(),
+        )
+        .spawn()
+        .ok()?;
+    drop(write);
+    forward_signals(&worker);
+    let mut code = [0; 4];
+    if std::fs::File::from(read).read_exact(&mut code).is_ok() {
+        return Some(i32::from_le_bytes(code));
+    }
+    // The worker ended without sending a code.
+    let status = worker.wait();
+    if let Some(signal) = status.as_ref().ok().and_then(ExitStatusExt::signal) {
+        // End by the same signal. This sets the default action of the
+        // signal (the launcher catches SIGINT and SIGTERM, and Rust ignores
+        // SIGPIPE) and raises it. It returns for a signal that is not in its
+        // table (SIGPWR, SIGSTKFLT) or that it takes as ignored (SIGIO).
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+        // Such a signal has its default action here, so sending it ends
+        // this process. A real-time signal has no rustix name and falls
+        // through to 128 + N.
+        if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
+            let _ = rustix::process::kill_process(rustix::process::getpid(), signal);
+        }
+    }
+    Some(match status {
+        Ok(status) => status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        Err(_) => EXIT_UNPORTED,
+    })
+}
+
+/// This process as a worker (see `launch`): `WORKER_FD` and `LAUNCHER_PID`
+/// are set, and the parent is that launcher. A process that a worker starts
+/// inherits the variables, but its parent is the worker, so it runs as a
+/// plain tsgo and sends no code. So does a worker whose launcher ends
+/// before the first call. The first call decides, at the start of `main`.
+#[cfg(target_os = "linux")]
+fn worker() -> Option<Worker> {
+    static WORKER: std::sync::OnceLock<Option<Worker>> = std::sync::OnceLock::new();
+    *WORKER.get_or_init(|| {
+        let fd = std::env::var(WORKER_FD).ok()?.parse().ok()?;
+        let launcher = std::env::var(LAUNCHER_PID)
+            .ok()?
+            .parse()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)?;
+        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, launcher })
+    })
+}
+
+/// Makes a worker (see `launch`) end when `launcher` ends: it sets a
+/// parent-death SIGKILL. std and rustix have no safe way to set it between
+/// fork and exec, so the launcher can die after `worker` and before this
+/// runs. Then no signal comes and this process already has a new parent,
+/// so it kills itself as the signal would have.
+#[cfg(target_os = "linux")]
+fn end_with_launcher(launcher: rustix::process::Pid) {
+    use rustix::process::{Signal, getpid, getppid, kill_process, set_parent_process_death_signal};
+    let _ = set_parent_process_death_signal(Some(Signal::KILL));
+    if getppid() != Some(launcher) {
+        let _ = kill_process(getpid(), Signal::KILL);
+        std::process::exit(EXIT_UNPORTED);
+    }
+}
+
+/// Sends each SIGINT and SIGTERM that the launcher gets on to `worker`, on
+/// a thread. So a signal reaches the work as in a run without a worker:
+/// `notify_context` catches it there, and a plain compile goes on, as in
+/// Go. Without this, the signal would end the launcher and then the parent
+/// death signal would kill the worker.
+#[cfg(target_os = "linux")]
+fn forward_signals(worker: &std::process::Child) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let pid = rustix::process::Pid::from_child(worker);
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("forward-signals".to_string())
+        .spawn(move || {
+            for signal in signals.forever() {
+                if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
+                    let _ = rustix::process::kill_process(pid, signal);
+                }
+            }
+        });
+}
+
+/// Ends the process with `code`. A worker (see `launch`) first points its
+/// stdout and stderr at /dev/null, so a reader of the launcher's output
+/// gets its end of file, and sends the code.
+fn exit(code: i32) -> ! {
+    #[cfg(target_os = "linux")]
+    if let Some(worker) = worker() {
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
+            let _ = rustix::stdio::dup2_stdout(&null);
+            let _ = rustix::stdio::dup2_stderr(&null);
+        }
+        // The inherited end of the pipe, opened again by its number.
+        if let Ok(mut pipe) = std::fs::File::options()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", worker.fd))
+        {
+            let _ = pipe.write_all(&code.to_le_bytes());
+        }
+    }
+    std::process::exit(code)
 }
 
 // Go: cmd/tsgo/main.go:17 runMain

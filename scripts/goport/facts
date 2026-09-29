@@ -59,16 +59,26 @@ def main_():
 
 
 def accepted():
-    b = load(f'{REPO}/docs/typechecker-state/current.json').get('batch', {})
-    pin = b.get('upstreamPin', {}).get('to', '?')
+    cur = load(f'{REPO}/docs/typechecker-state/current.json')
+    b = cur.get('batch', {})
+    if not b.get('compilerAccepted'):
+        # A revision is open: the accepted one is the last archived batch record.
+        opened = f"open R{b.get('recoveryRevision')} in {b.get('id')}; "
+        recs = cur.get('batchRecords') or []
+        b = load(f"{REPO}/{recs[-1]['path']}") if recs else {}
+    else:
+        opened = ''
+    if opened:
+        print(f'open       {opened[5:].rstrip("; ")}')
+    pin = (b.get('upstreamPin') or {}).get('to', '?')
     print(f'accepted   R{b.get("recoveryRevision")} commit {b.get("commit")} fp {b.get("sourceFingerprint", "")[:12]} '
           f'checkout {b.get("checkout")} Go pin {pin}')
-    g = load(f'{REPO}/{b.get("gate", {}).get("manifest", "")}')
+    g = load(f'{REPO}/{(b.get("gate") or {}).get("manifest", "")}') if (b.get("gate") or {}).get("manifest") else {}
     bins = g.get('binaries', {})
     ok = sum(os.path.exists(v['path']) and sha256(v['path']) == v['sha256'] for v in bins.values())
     print(f'           gate {g.get("label")} {g.get("verdict")}; bins {short(g.get("binsDir", "?"))} '
           f'({ok} of {len(bins)} match the gate manifest; tsgo is there too)')
-    print(f'           quality evidence {b.get("qualityEvidence", {}).get("dir")}')
+    print(f'           quality evidence {(b.get("qualityEvidence") or {}).get("dir")}')
 
 
 def pins():

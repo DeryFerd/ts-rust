@@ -82,6 +82,10 @@ out="${1:-$data_root/target/goport-pgo}"
 features="${CARGO_FEATURES:-}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
+# The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
+# launcher exits, the parent death signal can kill the worker before it has
+# written its profile.
+export GOPORT_LAUNCH=0
 mkdir -p "$out"
 out="$(cd -- "$out" && pwd)"
 # Run rustc and cargo from the repository. RUSTUP_TOOLCHAIN overrides any
