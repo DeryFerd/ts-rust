@@ -8,8 +8,10 @@ verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, 
 and quality.json. The LSP and API records must compare with the base results of protectedBase and
 show no lost, unrun or absent request. Every failed gate run of the source that side kept
 (gate-compare-fail-<label>.json) needs a flake note for each regressed item (failed_gate_runs), or
-the acceptance is refused. The history row and both verdicts carry goportTestsSha256, gateSha256 and
-nameMapSha256 (null without a name map). It sets the state to ready/PASS, runs the local check, and
+the acceptance is refused. The batch keeps every gate run of the source in gateRuns (the failed runs
+with their regressions and flake notes, then the batch gate), and the check requires the same flake
+notes, so a failed run stays in the state after the acceptance. The history row and both verdicts
+carry goportTestsSha256, gateSha256 and nameMapSha256 (null without a name map). It sets the state to ready/PASS, runs the local check, and
 records the acceptance only when the check passes.
 
 Usage:
@@ -121,7 +123,8 @@ def main():
     for k, c in (('tests', tests['commit']), ('gate', gate['commit'])):
         if not b['commit'].startswith(c[:9]) and not c.startswith(b['commit']):
             print(f'note: {k} evidence ran on commit {c[:9]}, the batch commit is {b["commit"][:9]} (same crates tree)')
-    for run in failed_gate_runs(s, a.revision, C, gate['label']):
+    fruns = failed_gate_runs(s, a.revision, C, gate['label'])
+    for run in fruns:
         for r in run['regressions']:
             if not r['flake']:
                 problems.append(f"failed gate run {run['label']}: {r['id']} {r['base']} -> {r['new']} ({r['why']}) has no flake note "
@@ -145,6 +148,13 @@ def main():
                         'knownOpen': [f"{k['id']} growth {k['growth']:.2f} (cap {k['cap']:.2f}, base {k['baseGrowth']:.2f})"
                                       for k in gc['knownOpen']],
                         'output': {'path': rel(f'{C}/gate-compare.json'), 'sha256': sha(f'{C}/gate-compare.json')}}
+    # Every gate run of the source, oldest first, the batch gate last (repeat-run rule). The check reads
+    # it, requires each kept gate-compare-fail-<label>.json in it and a flake note for each regression.
+    gate_run = lambda label, manifest, digest, compare, regs: {
+        'label': label, 'manifest': rel(manifest), 'sha256': digest, 'compare': {'path': rel(compare), 'sha256': sha(compare)},
+        'regressions': regs}
+    b['gateRuns'] = [gate_run(r['label'], r['manifest'], r['sha256'], r['compare'], r['regressions']) for r in fruns] + [
+        gate_run(gate['label'], gate['manifest'], gate['sha256'], f'{C}/gate-compare.json', [])]
     b['gateVerdict'] = {'label': gate['label'], 'verdict': gate['verdict'], 'host': gate['host'], 'counts': gate['counts'],
                         'failing': [f"{f['id']} {f['detail']}" for f in gate['failing']]}
     oracle = lambda x: {'label': x['label'], 'summary': rel(x['summary']), 'dir': rel(x['resultsDir']), 'host': x.get('host'),

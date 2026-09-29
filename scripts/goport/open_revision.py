@@ -68,7 +68,7 @@ PROTECTED = list(dict.fromkeys([
 # candidate.sh check and open read it through --allowed. "!" entries exclude.
 ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '!target/**', *(f'!{p}' for p in PROTECTED)]
 # Evidence of one revision. open clears it, so a new revision never shows the last one's evidence.
-EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateVerdict', 'languageServerOracle', 'apiOracle', 'quality',
+EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateRuns', 'gateVerdict', 'languageServerOracle', 'apiOracle', 'quality',
             'qualityEvidence', 'ordinaryQuery', 'localCheck', 'acceptance']
 AUDITOR = {'role': 'audit_accepted_roster', 'agent': 'aae6dbb734c07335a', 'verdict': 'PENDING'}
 REVIEWER = {'role': 'independent_reviewer', 'agent': 'a0bc38f3370585da3', 'verdict': 'PENDING'}

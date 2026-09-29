@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -463,8 +463,20 @@ function gitInputs(commit) {
   return { crates, toml, lock };
 }
 
+// The failed gate runs that candidate.sh side kept in an evidence dir (relative to the repository
+// root): the paths of their gate-compare-fail-<label>.json files, in name order.
+function keptGateRuns(dir) {
+  let names;
+  try {
+    names = readdirSync(resolve(ROOT, dir));
+  } catch {
+    throw new Error(`Cannot list the gate evidence dir ${dir}.`);
+  }
+  return names.filter(name => /^gate-compare-fail-.+\.json$/.test(name)).sort().map(name => join(dir, name));
+}
+
 // The external tools of the goport check. Tests may replace them.
-export const TOOLS = { gitInputs, gateCompare: runGateCompare, oracleCompare: runOracleCompare };
+export const TOOLS = { gitInputs, gateCompare: runGateCompare, oracleCompare: runOracleCompare, keptGateRuns };
 
 function sameInputs(a, b) {
   return a.crates === b.crates && a.toml === b.toml && a.lock === b.lock;
@@ -544,6 +556,51 @@ function checkApiRun(record, baseRun, gateManifest, readEvidence, reasons) {
     `apiOracle ran another goport binary than the gate's tsgo${other.length ? ` (batteries ${other.join(", ")})` : ""}.`);
   const missing = Object.keys(batteries(baseRun)).filter(name => !Object.hasOwn(now, name));
   if (missing.length) reasons.push(`apiOracle did not run the base batteries ${missing.join(", ")}.`);
+}
+
+// True when a note's JSON text names name as a whole word, as accept_revision.py named() does: an
+// item id does not match a longer id, and a run label may also be one segment of a path.
+function namesWord(value, name, path = false) {
+  const [before, after] = path ? ["(?<![\\w.-])", "(?![\\w.-])"] : ["(?<![\\w./-])", "(?![\\w.-]|/\\w)"];
+  return new RegExp(before + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + after).test(JSON.stringify(value));
+}
+
+// Every gate run of the batch source (repeat-run rule). batch.gateRuns (accept_revision.py) lists
+// them oldest first, the batch gate last: {label, manifest, sha256, compare {path, sha256},
+// regressions [{id, base, new, why, flake}]}. candidate.sh side keeps each failed run's compare
+// as gate-compare-fail-<label>.json next to gateCompare.output, and each of them must be in the
+// list. The check runs gate-compare.py again on each earlier run. Each regressed item needs a
+// saved flake note flake-r<revision>-<name> whose text names the item id and the run label, or it
+// is a loss. Returns the flakes and the number of runs.
+function checkGateRuns(state, batch, baseManifest, inputs, pin, tools, readEvidence, reasons) {
+  const runs = batch.gateRuns, last = Array.isArray(runs) ? runs.at(-1) : undefined;
+  requireValue(samePath(last?.manifest, batch.gate.manifest) && last.sha256 === batch.gate.sha256,
+    "gateRuns must list every gate run of the source, oldest first, with batch.gate last.");
+  requireValue(runs.every(run => text(run?.label) && Array.isArray(run.regressions)) && new Set(runs.map(run => run.label)).size === runs.length,
+    "Each gateRuns entry needs its own label and a regressions list.");
+  for (const path of tools.keptGateRuns(dirname(batch.gateCompare.output.path))) {
+    const kept = readEvidence({ path }, { pinned: false });
+    requireValue(runs.some(run => run.sha256 === kept?.new?.sha256), `The failed gate run ${path} of the source is not in gateRuns.`);
+  }
+  const prefix = `flake-r${batch.recoveryRevision}-`, notes = Object.keys(state).filter(name => name.startsWith(prefix)).sort();
+  const flakes = [];
+  for (const run of runs.slice(0, -1)) {
+    const manifest = readEvidence({ path: run.manifest, sha256: run.sha256 });
+    requireValue(sameInputs(tools.gitInputs(manifest.commit), inputs) && sameHash(manifest.upstreamPin, pin),
+      `Gate run ${run.label} is not a run of the batch source at the batch Go pin.`);
+    const compare = readEvidence(run.compare);
+    requireValue(compare?.new?.sha256 === run.sha256, `gateRuns ${run.label}: compare is not the gate-compare.py output of its manifest.`);
+    const { regressions } = tools.gateCompare(baseManifest, resolve(ROOT, run.manifest), batch.openDefects);
+    const ids = list => JSON.stringify(list.map(item => item?.id).sort());
+    requireValue(ids(run.regressions) === ids(regressions), `gateRuns ${run.label}: its regressions differ from gate-compare.py now.`);
+    for (const item of regressions) {
+      const note = notes.find(name => namesWord(state[name], item.id) && namesWord(state[name], run.label, true));
+      if (note) flakes.push({ run: run.label, id: item.id, note });
+      else reasons.push(`Gate run ${run.label}: ${item.id} ${item.base} -> ${item.new} (${item.why}) has no flake note ${prefix}<name> `
+        + "that names the item and the run.");
+    }
+  }
+  return { runs: runs.length, flakes };
 }
 
 // The Query core and Hono bound runs and the quality record of the batch source.
@@ -642,6 +699,7 @@ function checkGoport(state, rule, readEvidence, tools) {
     reasons.push("gateCompare reports gate regressions.");
   }
   if (gate.regressions.length) reasons.push(`${gate.regressions.length} gate items regressed against ${previous.gate.manifest}.`);
+  const gateRuns = checkGateRuns(state, batch, resolve(ROOT, previous.gate.manifest), inputs, pin, tools, readEvidence, reasons);
 
   checkRunEvidence(batch, readEvidence);
   const lsp = checkOracle("languageServerOracle", batch.languageServerOracle, lspBase, tools, readEvidence, reasons);
@@ -652,9 +710,11 @@ function checkGoport(state, rule, readEvidence, tools) {
   return { verdict: reasons.length ? "STOP" : "PASS", scope: GOPORT_SCOPE, protectedSet: "goport", rule: GOPORT_RULE, reasons,
     base: { batch: previous.id, tests: baseRef.path, gate: previous.gate.manifest },
     counts: { goportTests: { ...counts, removedByMap: removed.length, lost: lost.length, absent: absent.length, unrun: unrun.length },
-      gate: { baseItems: gate.counts?.baseItems, items: gate.counts?.items, regressions: gate.regressions.length, knownOpen: gate.knownOpen.length } },
+      gate: { baseItems: gate.counts?.baseItems, items: gate.counts?.items, regressions: gate.regressions.length, knownOpen: gate.knownOpen.length,
+        runs: gateRuns.runs, flakes: gateRuns.flakes.length } },
     oracles: { lsp, api },
     knownOpenGateItems: gate.knownOpen,
+    gateFlakes: gateRuns.flakes,
     nameMapRemoved: removed,
     losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions.map(item => ({ id: item.id, base: item.base, now: item.new, why: item.why })) } };
 }
@@ -831,6 +891,16 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   batch.openDefects, so the gate rules (removed ids, MATCH stays MATCH,
   ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth noise rule)
   have one implementation. Its known-open items are in knownOpenGateItems.
+- gateRuns [{label, manifest, sha256, compare {path, sha256}, regressions
+  [{id, base, new, why, flake}]}]: every gate run of the source, oldest
+  first, with batch.gate last (accept_revision.py). Each failed run that
+  candidate.sh side kept next to gateCompare.output
+  (gate-compare-fail-<label>.json) must be in the list. Each earlier run has
+  the build inputs of batch.commit and the batch pin, and the check runs
+  gate-compare.py on it again. Each regressed item needs a saved flake note
+  flake-r<recoveryRevision>-<name> whose text names the item id and the run
+  label (repeat-run rule), or the batch is STOP. The output lists the flakes
+  in gateFlakes for the reviewer.
 - ordinaryQuery and latestHono: complete, exitCode 0, matchesOracle, the batch
   sourceFingerprint, and runs [{manifest, sha256}] whose manifests name it.
 - languageServerOracle and apiOracle {label, dir, base {label, dir}, compare,

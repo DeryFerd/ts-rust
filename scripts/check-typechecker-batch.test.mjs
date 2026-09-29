@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, GOPORT_BASELINE_SHA256, GOPORT_RULE, INHERITED_PIN, LAST_LEGACY_REVISION,
@@ -503,6 +503,7 @@ function fixtureTools(f) {
       }
       return TOOLS.oracleCompare(join(dir, "base"), join(dir, "new"));
     }),
+    keptGateRuns: dir => Object.keys(f.files).filter(path => dirname(path) === dir && /^gate-compare-fail-.+\.json$/.test(basename(path))).sort(),
   };
 }
 
@@ -614,6 +615,7 @@ function goportFixture() {
       compare: { lost: 0, absent: [], unrun: 0, retained: 4, recovered: 1 } },
     gate: { manifest: gate.path, sha256: gate.sha256 },
     gateCompare: { base: previousGate.path, baseSha256: previousGate.sha256, new: gate.path, sha256: gate.sha256, regressions: 0, output },
+    gateRuns: [{ label: "r132", manifest: gate.path, sha256: gate.sha256, compare: output, regressions: [] }],
     ordinaryQuery: run, latestHono: structuredClone(run),
     languageServerOracle: { label: "lsp-r132", summary: "lsp/lsp-r132/summary.md", dir: "lsp/lsp-r132", base: { ...lspBase } },
     apiOracle: { label: "api-r132", summary: "api/api-r132/summary.md", dir: "api/api-r132", base: { ...apiBase } },
@@ -672,7 +674,8 @@ test("goport batch passes on its own tests, gate and oracles, without roster evi
   assert.equal(result.rule, GOPORT_RULE);
   assert.deepEqual(result.counts, {
     goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
-    gate: { baseItems: 5, items: 6, regressions: 0, knownOpen: 2 } });
+    gate: { baseItems: 5, items: 6, regressions: 0, knownOpen: 2, runs: 1, flakes: 0 } });
+  assert.deepEqual(result.gateFlakes, []);
   assert.deepEqual(result.base, { batch: "batch-0", tests: BASELINE_PATH, gate: "gate/r131/manifest.json" });
   // editor/hono/long is judged by its growth, not its status: base MATCH at 1.13, now FAIL at 1.13.
   assert.deepEqual(result.knownOpenGateItems.map(item => [item.id, item.growth, item.baseGrowth, item.baseStatus]),
@@ -811,6 +814,64 @@ test("the saved gate compare must show no regression and name the pinned manifes
   stopped(f, /hash mismatch: gate-compare.json/);
   f = goportFixture(); delete f.state.batch.gateCompare.output;
   stopped(f, /Missing evidence/);
+});
+
+// A failed earlier gate run r132-fail of the same source (measure/query MATCH to FAIL), kept by
+// candidate.sh side as gate-compare-fail-r132-fail.json next to gate-compare.json. listed puts it
+// in gateRuns, as accept_revision.py does.
+function failedGateRun(f, { listed = true, commit = COMMIT } = {}) {
+  const manifest = structuredClone(f.gateNew);
+  manifest.commit = commit;
+  Object.assign(manifest.results.find(item => item.id === "measure/query"), { status: "FAIL", detail: "query exit=1" });
+  const gate = f.put("gate/r132-fail/manifest.json", "1234".repeat(16), manifest);
+  const regressions = [{ id: "measure/query", base: "MATCH", new: "FAIL", why: "base MATCH is not MATCH", flake: null }];
+  const compare = f.put("gate-compare-fail-r132-fail.json", "5678".repeat(16), { new: { manifest: gate.path, sha256: gate.sha256 }, regressions });
+  if (listed) f.state.batch.gateRuns.unshift({ label: "r132-fail", manifest: gate.path, sha256: gate.sha256, compare, regressions });
+}
+
+const flakeNote = (item, run) => ({ item, source: "r132", runs: [{ label: run, result: "FAIL" }, { label: "r132", result: "MATCH" }],
+  evidence: "timeout at load 14 on zbook, MATCH on dbook-lan" });
+
+test("every failed gate run of the source needs a flake note for each regressed item (repeat-run rule)", () => {
+  // Without a flake note the failed run is a loss, although batch.gate passes.
+  let f = goportFixture();
+  failedGateRun(f);
+  let result = stopped(f, /Gate run r132-fail: measure\/query MATCH -> FAIL \(base MATCH is not MATCH\) has no flake note flake-r7-<name>/);
+  assert.equal(result.reasons.length, 1);
+  // A note that names another run, another item, a longer id or another revision does not count.
+  for (const [name, note] of [["flake-r7-query", flakeNote("measure/query", "r132-fail-2")],
+    ["flake-r7-query", flakeNote("measure/hono", "r132-fail")], ["flake-r7-query", flakeNote("measure/query/x", "r132-fail")],
+    ["flake-r6-query", flakeNote("measure/query", "r132-fail")]]) {
+    f = goportFixture(); failedGateRun(f); f.state[name] = note;
+    stopped(f, /Gate run r132-fail: measure\/query .* has no flake note/);
+  }
+  // A saved note that names the item and the run: PASS, and the output lists the flake.
+  f = goportFixture(); failedGateRun(f); f.state["flake-r7-query"] = flakeNote("measure/query", "r132-fail");
+  result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.deepEqual(result.gateFlakes, [{ run: "r132-fail", id: "measure/query", note: "flake-r7-query" }]);
+  assert.deepEqual([result.counts.gate.runs, result.counts.gate.flakes], [2, 1]);
+});
+
+test("gateRuns must list every kept gate run, the batch gate last, with its true regressions", () => {
+  const note = f => { f.state["flake-r7-query"] = flakeNote("measure/query", "r132-fail"); };
+  for (const [change, pattern] of [
+    // The kept failed run is left out of gateRuns (the accept refusal bypassed and the record dropped).
+    [f => { failedGateRun(f, { listed: false }); }, /failed gate run gate-compare-fail-r132-fail.json of the source is not in gateRuns/],
+    [f => { failedGateRun(f, { listed: false }); note(f); }, /is not in gateRuns/],
+    [f => { delete f.state.batch.gateRuns; }, /gateRuns must list every gate run/],
+    [f => { f.state.batch.gateRuns = []; }, /gateRuns must list every gate run/],
+    [f => { failedGateRun(f); note(f); f.state.batch.gateRuns.reverse(); }, /batch.gate last/],
+    [f => { failedGateRun(f); note(f); f.state.batch.gateRuns[0].label = "r132"; }, /its own label/],
+    [f => { failedGateRun(f); note(f); f.state.batch.gateRuns[0].regressions = []; }, /its regressions differ from gate-compare.py now/],
+    [f => { failedGateRun(f); note(f); f.state.batch.gateRuns[0].sha256 = "e".repeat(64); }, /is not in gateRuns/],
+    [f => { failedGateRun(f); note(f); f.state.batch.gateRuns[0].compare = f.state.batch.gateCompare.output; }, /compare is not the gate-compare.py output/],
+    [f => { failedGateRun(f, { commit: OTHER_INPUTS }); note(f); }, /Gate run r132-fail is not a run of the batch source/],
+  ]) { const f = goportFixture(); change(f); stopped(f, pattern); }
+  // A run compared again after a state fix: the batch gate is the kept run, and the check judges it as batch.gate.
+  const f = goportFixture();
+  f.put("gate-compare-fail-r132.json", "9abc".repeat(16), { new: { sha256: f.state.batch.gate.sha256 }, regressions: [{ id: "editor/hono/long" }] });
+  assert.equal(check(f).verdict, "PASS");
 });
 
 test("the editor long-growth FAIL passes only while its open defect is recorded", () => {

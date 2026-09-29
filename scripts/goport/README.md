@@ -77,8 +77,11 @@ drive is retired.
 5. After two PASS verdicts: `accept_revision.py --revision <rev> --evidence <cache dir> --scope TEXT
    --outcome TEXT`. It refuses a failed gate run that has no flake note for an item. It records the
    evidence and the verdicts (the history row and both verdicts carry `goportTestsSha256`,
-   `gateSha256` and `nameMapSha256`), runs `check-typechecker-batch.mjs`, and records the
-   acceptance only when the check passes.
+   `gateSha256` and `nameMapSha256`), and every gate run of the source in `gateRuns` (each failed
+   run with its regressions and flake notes, then the batch gate). It runs
+   `check-typechecker-batch.mjs`, and records the acceptance only when the check passes. The check
+   also finds each kept `gate-compare-fail-<label>.json`, runs `gate-compare.py` on that run again
+   and needs a flake note for each regressed item, so skipping the refusal does not pass.
 
 `gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
 MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
