@@ -5,6 +5,16 @@
 //! every compiler and conformance case with `testdata/baselines/reference`
 //! of the Go checkout, byte for byte.
 //!
+//! Two layouts (`support::baseline::is_merged_layout`):
+//! - typescript-go (pin B and older): `TestLocal` runs the cases of
+//!   `testdata/tests/cases`, `TestSubmodule` the cases of
+//!   `_submodules/TypeScript/tests/cases` against `reference/submodule`
+//!   and writes `.diff` files against the submodule's baselines.
+//! - microsoft/TypeScript `tsc/` (5f647a841a, "Apply the TypeScript 7
+//!   repository layout"): the submodule cases are in `testdata/tests/cases`,
+//!   `TestLocal` runs all of them against `reference/<suite>`, there is no
+//!   `TestSubmodule` (`test_submodule` skips) and there are no `.diff` files.
+//!
 //! Files:
 //! - `runner.rs`: compiler_runner.go (the runner, the test cases, the
 //!   subtests).
@@ -20,12 +30,15 @@
 //! - `child.rs`: each test configuration runs in a child process; the
 //!   environment variables and `known_failures.txt` are described there.
 //! - `transpile_runner.rs`: transpile_runner.go (`TestTranspile`, #4849):
-//!   the `submodule/transpile` baselines of `ts_goport::transpile`.
+//!   the `submodule/transpile` (merged layout: `transpile`) baselines of
+//!   `ts_goport::transpile`.
 //!
 //! Run: `scripts/run-cargo-capped.sh test --release -p ts_goport --test
 //! go_baselines -- compiler_runner` (TestLocal and TestTranspile).
 //! TestSubmodule is ignored (long): run it with `--include-ignored
 //! compiler_runner::test_submodule` and `COMPILER_RUNNER_SHARD=<i>/<n>`.
+//! At the merged layout `TestLocal` has every case (about 12,700 files),
+//! so run it in shards the same way.
 
 mod child;
 mod go_regex;
@@ -46,6 +59,7 @@ fn test_local() {
 // Go: compiler_runner_test.go:18 TestSubmodule
 // Runs the old compiler tests, and produces new baselines (e.g. `test1.symbols`)
 // and a diff between the new and old baselines (e.g. `test1.symbols.diff`).
+// Typescript-go layout only: it skips at the merged layout.
 #[test]
 #[ignore = "long: about 15,000 child processes; run in shards (COMPILER_RUNNER_SHARD)"]
 fn test_submodule() {
