@@ -221,7 +221,7 @@ impl Binder {
     pub fn bind_property_or_method_or_accessor(
         &mut self,
         node: Node,
-        d: &'static NodeData,
+        d: LoadedData,
         symbol_flags: SymbolFlags,
         symbol_excludes: SymbolFlags,
     ) {

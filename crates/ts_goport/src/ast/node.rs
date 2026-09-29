@@ -368,7 +368,8 @@ fn is_data_of(d: &NodeData, n: Node) -> bool {
 /// `$name(self)` reads the node like `by_data!`, and `$name_in(self, d)`
 /// reads `d`, the data of the same node, which the caller already loaded
 /// with `parsed_node_data`. `$n` names the node in the arms. The arms are
-/// those of `by_data!`.
+/// those of `by_data!`. With `d` `None` (a node that a freeable parse owns,
+/// lsshells M3c, `LoadedData`) `$name_in` is `$name`.
 ///
 /// PERF: query Q7-3. Each `$name` call repeats the `FROZEN` lookup, the
 /// kind-table test and the data load. A caller that reads several fields of
@@ -391,7 +392,10 @@ macro_rules! data_accessor {
 
         #[doc = concat!("`Node::", stringify!($name), "` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`).")]
         #[must_use]
-        $vis fn $name_in(self, d: &'static NodeData) -> $ty {
+        $vis fn $name_in(self, d: LoadedData) -> $ty {
+            let Some(d) = d else {
+                return self.$name();
+            };
             let $n: Node = self;
             debug_assert!(is_data_of(d, $n), "data of another node");
             match_data!($n.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
@@ -460,7 +464,10 @@ macro_rules! modifiers_accessor {
         /// `Node::modifiers` on `d`, the data of this node that the caller
         /// already loaded with `parsed_node_data` (see `data_accessor!`).
         #[must_use]
-        pub fn modifiers_in(self, d: &'static NodeData) -> ModifierList {
+        pub fn modifiers_in(self, d: LoadedData) -> ModifierList {
+            let Some(d) = d else {
+                return self.modifiers();
+            };
             debug_assert!(is_data_of(d, self), "data of another node");
             match_data!(
                 self.file_index(),
@@ -1188,6 +1195,16 @@ fn name_node_text(n: Node, text: &'static str) -> &'static str {
     store_identifier_name(n).map_or("", |name| name.as_str())
 }
 
+/// `name_node_text` for data text `text` that is not `'static` (a node that
+/// a freeable parse owns, lsshells M3c, or a factory node): a text that is
+/// not empty is interned.
+fn scoped_name_text(n: Node, text: &str) -> &'static str {
+    if !text.is_empty() {
+        return Name::from(text).as_str();
+    }
+    store_identifier_name(n).map_or("", |name| name.as_str())
+}
+
 /// The last step of Go `QuestionToken`: the postfix token when it is `?`.
 fn question_of_postfix(postfix: Node) -> Node {
     if postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken {
@@ -1220,9 +1237,13 @@ enum SliceRepr {
     /// A list of `len` nodes of freeable file version `file` (lsshells M3b),
     /// read at each use (`file_list_node`): Go `SourceFile.Imports()` when
     /// `host` is nil (`NodeSlice::from_file_imports`), else the eager JSDoc
-    /// of `host` in its JSDoc cache (`NodeSlice::from_file_js_doc`). A
-    /// published list does not change, so its length is kept here.
+    /// of `host` in its JSDoc cache (`NodeSlice::from_file_js_doc`; before
+    /// the publish, the cache of its store, lsshells M3c). A published list
+    /// does not change, so its length is kept here.
     FileList { file: u32, len: u32, host: Node },
+    /// The `len` nodes of a list of a store that owns its nodes (a freeable
+    /// parse, lsshells M3c), read at each use (`with_store_list`).
+    Store { list: StoreList, len: u32 },
 }
 
 impl Default for NodeSlice {
@@ -1275,6 +1296,16 @@ impl NodeSlice {
         })
     }
 
+    /// The nodes of list `list` of a store that owns its nodes (lsshells
+    /// M3c).
+    #[must_use]
+    pub fn from_store(list: StoreList) -> Self {
+        Self(SliceRepr::Store {
+            list,
+            len: with_store_list(list, |l| l.ids().len()) as u32,
+        })
+    }
+
     /// The nodes of a list of this thread's synthetic arena.
     #[must_use]
     pub fn from_synthetic(list: SyntheticList) -> Self {
@@ -1292,6 +1323,7 @@ impl NodeSlice {
             SliceRepr::Nodes(nodes) => nodes.len(),
             SliceRepr::Synthetic { len, .. } => len as usize,
             SliceRepr::FileList { len, .. } => len as usize,
+            SliceRepr::Store { len, .. } => len as usize,
         }
     }
 
@@ -1315,6 +1347,7 @@ impl NodeSlice {
                 synthetic_list_node(list, i)
             }
             SliceRepr::FileList { file, host, .. } => file_list_node(file as usize, host, i),
+            SliceRepr::Store { list, .. } => store_list_node(list, i),
         }
     }
 
@@ -1348,6 +1381,10 @@ impl NodeSlice {
                 None => SliceIds::Slow,
             },
             SliceRepr::Synthetic { .. } | SliceRepr::FileList { .. } => SliceIds::Slow,
+            // An empty slice reads no node.
+            SliceRepr::Store { len: 0, .. } => SliceIds::Nodes(&[]),
+            // lsshells M3c: the nodes are read once for the loop.
+            SliceRepr::Store { list, .. } => SliceIds::Read(store_list_nodes(list)),
         };
         NodeSliceIter {
             slice: self,
@@ -1365,13 +1402,28 @@ impl NodeSlice {
 
 /// The length of the list of `SliceRepr::FileList { file, host }`.
 fn file_list_len(file: usize, host: Node) -> usize {
-    crate::ast::with_go_file(file, |g| {
+    let published = crate::ast::try_with_go_file(file, |g| {
         if host.is_nil() {
             g.info.imports.len()
         } else {
             g.info.jsdoc_cache[&host].len()
         }
-    })
+    });
+    // lsshells M3c: the JSDoc of a store that owns its nodes, before the
+    // publish.
+    published.unwrap_or_else(|| owned_store_js_doc(file, host, <[Node]>::len))
+}
+
+/// `read` on the JSDoc cache entry of `host` in unpublished store `file`,
+/// which owns its nodes (lsshells M3c). Panics as `with_go_file` for any
+/// other file.
+#[cold]
+#[inline(never)]
+fn owned_store_js_doc<R>(file: usize, host: Node, read: impl FnOnce(&[Node]) -> R) -> R {
+    match with_owned_store_js_doc(file, host, read) {
+        Some(result) => result,
+        None => panic!("file {file} is not published"),
+    }
 }
 
 /// Node `i` of `SliceRepr::FileList { file, host }`. Panics when `i` is
@@ -1381,12 +1433,33 @@ fn file_list_len(file: usize, host: Node) -> usize {
 #[cold]
 #[inline(never)]
 fn file_list_node(file: usize, host: Node, i: usize) -> Node {
-    crate::ast::with_go_file(file, |g| {
+    let published = crate::ast::try_with_go_file(file, |g| {
         if host.is_nil() {
             g.info.imports[i]
         } else {
             g.info.jsdoc_cache[&host][i]
         }
+    });
+    published.unwrap_or_else(|| owned_store_js_doc(file, host, |jsdocs| jsdocs[i]))
+}
+
+/// Node `i` of `SliceRepr::Store { list }`. Panics when `i` is out of
+/// range, like Go.
+#[cold]
+#[inline(never)]
+fn store_list_node(list: StoreList, i: usize) -> Node {
+    let id = with_store_list(list, |l| l.ids()[i]);
+    Node::new(list.file(), id)
+}
+
+/// The nodes of `SliceRepr::Store { list }`, read once for a loop
+/// (`NodeSliceIter`).
+#[cold]
+#[inline(never)]
+fn store_list_nodes(list: StoreList) -> Rc<[Node]> {
+    let file = list.file();
+    with_store_list(list, |l| {
+        l.ids().iter().map(|&id| Node::new(file, id)).collect()
     })
 }
 
@@ -1396,14 +1469,17 @@ const _: () = assert!(std::mem::size_of::<NodeSlice>() == 24);
 
 /// How a `NodeSliceIter` turns position `i` into a node, read once for the
 /// whole loop.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum SliceIds {
     /// The nodes of the slice (`NodeSlice::from_nodes`).
     Nodes(&'static [Node]),
     /// The ids of the slice, of a frozen store (`frozen_store_ids`).
     Frozen(&'static [crate::astdata::NodeId], FrozenIds),
+    /// The nodes of a list of a store that owns its nodes, read once
+    /// (lsshells M3c, `store_list_nodes`).
+    Read(Rc<[Node]>),
     /// `NodeSlice::get` per node: ids before freeze, synthetic lists and
-    /// the slices of freeable file versions.
+    /// the file lists of freeable file versions.
     Slow,
 }
 
@@ -1423,13 +1499,14 @@ impl NodeSliceIter {
     // no table load (`FrozenIds::Direct`).
     #[inline]
     fn at(&self, i: usize) -> Node {
-        match self.ids {
+        match &self.ids {
             SliceIds::Nodes(nodes) => nodes[i],
-            SliceIds::Frozen(slice_ids, ids) => {
+            &SliceIds::Frozen(slice_ids, ids) => {
                 let n = ids.node(slice_ids[i]);
                 debug_assert_eq!(n, self.slice.get(i));
                 n
             }
+            SliceIds::Read(nodes) => nodes[i],
             SliceIds::Slow => self.slice.get(i),
         }
     }
@@ -1520,6 +1597,10 @@ enum ListRef {
     Field { data: u32, sel: ListSel },
     /// A synthetic factory list (`SyntheticList::Own`).
     Own { index: u32 },
+    /// A list of a store that owns its nodes (a freeable parse, lsshells
+    /// M3c): a list field of node data or a pending list, read at each use
+    /// (`with_store_list`).
+    Store(StoreList),
 }
 
 const _: () = assert!(std::mem::size_of::<NodeList>() == 16);
@@ -1537,7 +1618,7 @@ impl ListRef {
         match self {
             Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
             Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
         }
     }
 }
@@ -1553,6 +1634,7 @@ impl PartialEq for NodeList {
                 (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
                     std::ptr::eq(a, b)
                 }
+                (ListRef::Store(a), ListRef::Store(b)) => same_store_list(a, b),
                 (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
                     (Some(a), Some(b)) => synthetic_list_eq(a, b),
                     _ => false,
@@ -1599,6 +1681,14 @@ impl NodeList {
         Self(ListRef::synthetic(list))
     }
 
+    /// The handle of list `list` of a store that owns its nodes (lsshells
+    /// M3c).
+    #[inline]
+    #[must_use]
+    pub fn store(list: StoreList) -> Self {
+        Self(ListRef::Store(list))
+    }
+
     /// The file of the list: a store id or `SYNTHETIC_NODE_FILE`. 0 for
     /// `NodeList::NIL`.
     #[inline]
@@ -1607,6 +1697,7 @@ impl NodeList {
         match self.0 {
             ListRef::Nil => 0,
             ListRef::Ts { file, .. } | ListRef::Pending { file, .. } => file as usize,
+            ListRef::Store(list) => list.file(),
             ListRef::Field { .. } | ListRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
@@ -1639,16 +1730,29 @@ impl NodeList {
         }
     }
 
+    /// The list of a store that owns its nodes (lsshells M3c), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn store_list(self) -> Option<StoreList> {
+        match self.0 {
+            ListRef::Store(list) => Some(list),
+            _ => None,
+        }
+    }
+
     /// The address of the list, for Go pointer compares and keys. `None` for
     /// `NodeList::NIL`. A Go `nil` marker list (`store::NIL_LIST_POS`) has an
     /// address. A synthetic list keeps its address while its thread's arena
-    /// lives (`synthetic_list_ptr`).
+    /// lives (`synthetic_list_ptr`), and a list of a store that owns its
+    /// nodes while that store lives (lsshells M3c): an address can repeat
+    /// after the store is freed, so keep it only for keys of one request.
     #[must_use]
     pub fn list_ptr(self) -> Option<*const ()> {
         match self.0 {
             ListRef::Nil => None,
             ListRef::Ts { list, .. } => Some(std::ptr::from_ref(list).cast()),
             ListRef::Pending { list, .. } => Some(std::ptr::from_ref(list).cast()),
+            ListRef::Store(list) => Some(with_store_list(list, |l| l.ptr())),
             repr => repr.synthetic_list().map(synthetic_list_ptr),
         }
     }
@@ -1664,6 +1768,7 @@ impl NodeList {
             ListRef::Nil => false,
             ListRef::Ts { list, .. } => list.has_trailing_comma,
             ListRef::Pending { list, .. } => list.has_trailing_comma,
+            ListRef::Store(list) => with_store_list(list, |l| l.has_trailing_comma()),
             repr => repr
                 .synthetic_list()
                 .is_some_and(|list| with_synthetic_list(list, |l| l.nodes().has_trailing_comma)),
@@ -1693,6 +1798,11 @@ impl NodeList {
                     has_trailing_comma: true,
                 }),
             }),
+            // lsshells M3c: the store that owns its nodes keeps the list.
+            ListRef::Store(list) => {
+                let range = with_store_list(list, |l| l.range());
+                Self(ListRef::Store(new_store_missing_list(list.file(), range)))
+            }
             // A factory parse (lazy JSDoc): the thread's arena owns the list.
             repr => match repr.synthetic_list() {
                 Some(list) => Self::synthetic(synthetic_missing_list(list)),
@@ -1711,6 +1821,7 @@ impl NodeList {
             ListRef::Nil => true,
             ListRef::Ts { list, .. } => is_nil_list_marker(list),
             ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
+            ListRef::Store(list) => is_nil_list_range(&with_store_list(list, |l| l.range())),
             ListRef::Field { .. } | ListRef::Own { .. } => false,
         }
     }
@@ -1727,6 +1838,7 @@ impl NodeList {
             ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, &list.nodes),
             ListRef::Nil => NodeSlice::NIL,
             ListRef::Pending { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
+            ListRef::Store(list) => NodeSlice::from_store(list),
             repr => NodeSlice::from_synthetic(repr.synthetic_list().expect("synthetic list")),
         }
     }
@@ -1744,6 +1856,11 @@ impl NodeList {
             ListRef::Pending { list, .. } => {
                 assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
                 text_range_of(&list.range)
+            }
+            ListRef::Store(list) => {
+                let range = with_store_list(list, |l| l.range());
+                assert!(!is_nil_list_range(&range), "nil NodeList dereference");
+                text_range_of(&range)
             }
             // A synthetic list holds the Go `Loc`.
             repr => {
@@ -1808,6 +1925,9 @@ enum ModifiersRef {
     Field { data: u32, sel: ListSel },
     /// A synthetic factory modifier list (`SyntheticList::Own`).
     Own { index: u32 },
+    /// A modifier list of a store that owns its nodes (lsshells M3c, see
+    /// `ListRef::Store`).
+    Store(StoreList),
 }
 
 const _: () = assert!(std::mem::size_of::<ModifierList>() == 16);
@@ -1817,7 +1937,7 @@ impl ModifiersRef {
         match self {
             Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
             Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
         }
     }
 }
@@ -1832,6 +1952,7 @@ impl PartialEq for ModifierList {
             (ModifiersRef::Pending { list: a, .. }, ModifiersRef::Pending { list: b, .. }) => {
                 std::ptr::eq(a, b)
             }
+            (ModifiersRef::Store(a), ModifiersRef::Store(b)) => same_store_list(a, b),
             (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
                 (Some(a), Some(b)) => synthetic_list_eq(a, b),
                 _ => false,
@@ -1876,8 +1997,18 @@ impl ModifierList {
         Self(match ListRef::synthetic(list) {
             ListRef::Field { data, sel } => ModifiersRef::Field { data, sel },
             ListRef::Own { index } => ModifiersRef::Own { index },
-            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } => unreachable!(),
+            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } | ListRef::Store(_) => {
+                unreachable!()
+            }
         })
+    }
+
+    /// The handle of modifier list `list` of a store that owns its nodes
+    /// (lsshells M3c).
+    #[inline]
+    #[must_use]
+    pub fn store(list: StoreList) -> Self {
+        Self(ModifiersRef::Store(list))
     }
 
     /// The file of the list (see `NodeList::file`). 0 for
@@ -1888,6 +2019,7 @@ impl ModifierList {
         match self.0 {
             ModifiersRef::Nil => 0,
             ModifiersRef::Ts { file, .. } | ModifiersRef::Pending { file, .. } => file as usize,
+            ModifiersRef::Store(list) => list.file(),
             ModifiersRef::Field { .. } | ModifiersRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
@@ -1920,6 +2052,16 @@ impl ModifierList {
         }
     }
 
+    /// The list of a store that owns its nodes (lsshells M3c), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn store_list(self) -> Option<StoreList> {
+        match self.0 {
+            ModifiersRef::Store(list) => Some(list),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn is_nil(self) -> bool {
         matches!(self.0, ModifiersRef::Nil)
@@ -1945,6 +2087,7 @@ impl ModifierList {
             }),
             ModifiersRef::Field { data, sel } => NodeList(ListRef::Field { data, sel }),
             ModifiersRef::Own { index } => NodeList(ListRef::Own { index }),
+            ModifiersRef::Store(list) => NodeList(ListRef::Store(list)),
         }
     }
 
@@ -1982,6 +2125,7 @@ impl ModifierList {
             // A store list.
             ModifiersRef::Ts { list, .. } => ModifierFlags(list.flags.0),
             ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
+            ModifiersRef::Store(list) => with_store_list(list, |l| l.modifier_flags()),
             repr => with_synthetic_list(repr.synthetic_list().expect("synthetic list"), |m| {
                 ModifierFlags(m.modifiers().flags.0)
             }),
@@ -2035,7 +2179,9 @@ thread_local! {
     /// Go `Node.Decorators()` results. Go allocates a new slice on each call;
     /// we keep one per node: a leaked slice for a parsed node, a slice of the
     /// thread's synthetic arena for a factory node (see `Node::decorators`).
-    static DECORATORS: RefCell<FxHashMap<Node, NodeSlice>> = RefCell::new(FxHashMap::default());
+    /// It forgets the nodes of dead file versions (`PerFileMap`, lsshells
+    /// M3c); their small slices stay leaked.
+    static DECORATORS: RefCell<PerFileMap<NodeSlice>> = const { RefCell::new(PerFileMap::new()) };
     /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node. It forgets
     /// the nodes of dead file versions (`PerFileMap`, lsshells M3a).
     static SUBTREE_FACTS: RefCell<PerFileMap<SubtreeFacts>> = const { RefCell::new(PerFileMap::new()) };
@@ -2268,7 +2414,7 @@ impl Node {
     /// `Node::name` on `d`, the data of this node that the caller already
     /// loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn name_in(self, d: &'static NodeData) -> Node {
+    pub fn name_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::Name) {
             Some(name) => {
                 debug_assert_eq!(name, self.name_data_in(d), "U4 name column");
@@ -2354,7 +2500,7 @@ impl Node {
         } else {
             NodeSlice::from_synthetic(new_synthetic_slice(filtered))
         };
-        DECORATORS.with(|c| c.borrow_mut().insert(self, slice));
+        DECORATORS.with(|c| c.borrow_mut().write().insert(self, slice));
         slice
     }
 
@@ -2620,7 +2766,7 @@ impl Node {
     #[must_use]
     pub fn text(self) -> &'static str {
         let Some(node) = static_ast_node(self) else {
-            return self.synthetic_node_text();
+            return self.scoped_node_text();
         };
         match &node.data {
             NodeData::Identifier(d) => name_node_text(self, &d.text),
@@ -2653,46 +2799,62 @@ impl Node {
         }
     }
 
-    /// `text` of a factory node, whose data is read in a scope (see
-    /// `synthetic_text`).
+    /// `text` of a node with no `'static` node, whose data is read in a
+    /// scope (see `synthetic_text`): a factory node, or a node that a
+    /// freeable parse owns (lsshells M3c).
+    // PERF: lsshells M3c. The text of a node of a published freeable file
+    // version is interned once per thread and node (`JOINED_TEXT`, which
+    // forgets the nodes of dead versions), not at each read: the checker
+    // reads the texts of the edited file many times.
     #[cold]
     #[inline(never)]
-    fn synthetic_node_text(self) -> &'static str {
+    fn scoped_node_text(self) -> &'static str {
+        // An Identifier or PrivateIdentifier of a published store has its
+        // text in the name column of its node shell (`name_node_text`), with
+        // no data read.
+        if let Some(name) = frozen_store_text_name(self) {
+            return name.as_str();
+        }
+        let synthetic = is_synthetic_node(self);
+        if !synthetic && let Some(text) = JOINED_TEXT.with(|c| c.borrow().get(&self).copied()) {
+            return text;
+        }
         let file = self.file_index();
-        let joined = with_synthetic_ast_node(self, |node| match &node.data {
-            NodeData::MetaProperty(_) => Some(self.name().text()),
-            NodeData::JsxNamespacedName(d) => Some(joined_text(self, || {
+        let interned = |text: &str| -> &'static str { Name::from(text).as_str() };
+        let text = read_scoped_ast_node(self, |node| match &node.data {
+            // A store Identifier keeps its text in its name column
+            // (`name_node_text`); a synthetic one in its data.
+            NodeData::Identifier(d) => scoped_name_text(self, &d.text),
+            NodeData::PrivateIdentifier(d) => scoped_name_text(self, &d.text),
+            NodeData::StringLiteral(d) => interned(d.text.as_str()),
+            NodeData::NumericLiteral(d) => interned(d.text.as_str()),
+            NodeData::BigIntLiteral(d) => interned(d.text.as_str()),
+            NodeData::MetaProperty(_) => self.name().text(),
+            NodeData::NoSubstitutionTemplateLiteral(d) => interned(d.text.as_str()),
+            NodeData::TemplateHead(d) => interned(d.text.as_str()),
+            NodeData::TemplateMiddle(d) => interned(d.text.as_str()),
+            NodeData::TemplateTail(d) => interned(d.text.as_str()),
+            NodeData::JsxNamespacedName(d) => joined_text(self, || {
                 format!(
                     "{}:{}",
                     req(file, d.namespace).text(),
                     req(file, d.name).text()
                 )
-            })),
-            NodeData::JsDocText(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLink(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLinkCode(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLinkPlain(d) => Some(joined_text(self, || d.text.concat())),
-            _ => None,
+            }),
+            NodeData::RegularExpressionLiteral(d) => interned(d.text.as_str()),
+            NodeData::JsDocText(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLink(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLinkCode(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLinkPlain(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsxText(d) => interned(d.text.as_str()),
+            _ => "",
         });
-        if let Some(text) = joined {
-            return text;
+        // A published file does not change, so its text stays. A store that
+        // is still parsed can get new node data (`replace_node_data`).
+        if !synthetic && is_published(file) {
+            JOINED_TEXT.with(|c| c.borrow_mut().write().insert(self, text));
         }
-        // A synthetic Identifier keeps its text in its data
-        // (`name_node_text`).
-        synthetic_text(self, |d| match d {
-            NodeData::Identifier(d) => Some(&d.text),
-            NodeData::PrivateIdentifier(d) => Some(&d.text),
-            NodeData::StringLiteral(d) => Some(&d.text),
-            NodeData::NumericLiteral(d) => Some(&d.text),
-            NodeData::BigIntLiteral(d) => Some(&d.text),
-            NodeData::NoSubstitutionTemplateLiteral(d) => Some(&d.text),
-            NodeData::TemplateHead(d) => Some(&d.text),
-            NodeData::TemplateMiddle(d) => Some(&d.text),
-            NodeData::TemplateTail(d) => Some(&d.text),
-            NodeData::RegularExpressionLiteral(d) => Some(&d.text),
-            NodeData::JsxText(d) => Some(&d.text),
-            _ => None,
-        })
+        text
     }
 
     /// `Name::from(self.text())`: the interned Go `node.Text()`.
@@ -2999,7 +3161,7 @@ impl Node {
     /// `Node::initializer` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn initializer_in(self, d: &'static NodeData) -> Node {
+    pub fn initializer_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::Initializer) {
             Some(initializer) => {
                 debug_assert_eq!(
@@ -3274,7 +3436,7 @@ impl Node {
     /// `Node::postfix_token` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn postfix_token_in(self, d: &'static NodeData) -> Node {
+    pub fn postfix_token_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::PostfixToken) {
             Some(token) => {
                 debug_assert_eq!(token, self.postfix_token_data_in(d), "U4 postfix column");
@@ -3304,7 +3466,7 @@ impl Node {
     /// `Node::question_token` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn question_token_in(self, d: &'static NodeData) -> Node {
+    pub fn question_token_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::QuestionToken) {
             Some(token) => {
                 debug_assert_eq!(token, self.question_token_data_in(d), "U4 question column");
@@ -3323,7 +3485,7 @@ impl Node {
     }
 
     /// `question_token_data` on `d` (see `data_accessor!`).
-    fn question_token_data_in(self, d: &'static NodeData) -> Node {
+    fn question_token_data_in(self, d: LoadedData) -> Node {
         match self.own_question_token_in(d) {
             Some(token) => token,
             None => question_of_postfix(self.postfix_token_data_in(d)),
@@ -3453,7 +3615,7 @@ impl Node {
 
 fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     let Some(node) = static_ast_node(n) else {
-        return for_each_synthetic_child(n, v, lists);
+        return for_each_scoped_child(n, v, lists);
     };
     let mut visit = NodeChildVisit {
         n,
@@ -3464,17 +3626,27 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<L
     walk_children(&node.data, &mut visit)
 }
 
-/// `for_each_child_impl` for a factory node, whose data is read in a scope
-/// (`SyntheticChildVisit`).
+/// `for_each_child_impl` for a node with no `'static` node (a factory node,
+/// or a node that a freeable parse owns, lsshells M3c), whose data is read
+/// in a scope (`ScopedChildVisit`). The node is held, so `v` can make and
+/// change nodes.
 #[cold]
 #[inline(never)]
-fn for_each_synthetic_child(
+fn for_each_scoped_child(
     n: Node,
     v: &mut dyn FnMut(Node) -> bool,
     lists: Option<ListHook>,
 ) -> bool {
-    with_synthetic_ast_node(n, |node| {
-        walk_children(&node.data, &mut SyntheticChildVisit { n, v, lists })
+    with_scoped_ast_node(n, |node| {
+        walk_children(
+            &node.data,
+            &mut ScopedChildVisit {
+                n,
+                file: n.file_index(),
+                v,
+                lists,
+            },
+        )
     })
 }
 
@@ -3491,7 +3663,7 @@ fn for_each_synthetic_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    node: &'static crate::astdata::Node,
+    node: &crate::astdata::Node,
     v: impl FnMut(u32) -> bool,
 ) -> bool {
     walk_children(&node.data, &mut StoreChildIds { kind, v })
@@ -3502,8 +3674,9 @@ pub(crate) fn for_each_store_child_id(
 /// generic walk (`NodeChildVisit`) turns the ids into `Node` handles; the
 /// parser's walk over a store node (`StoreChildIds`) keeps the slot
 /// indexes. One match serves both, so they visit the same fields. `'d` is
-/// the lifetime of the node data: `'static` for a parsed node, a read scope
-/// for a factory node (`SyntheticChildVisit`).
+/// the lifetime of the node data: `'static` for a parsed node of a static
+/// parse, a read scope for a factory node and for a node that a freeable
+/// parse owns (`ScopedChildVisit`, `StoreChildIds`).
 trait ChildVisit<'d> {
     /// A required child field (Go `visit`).
     fn node(&mut self, id: crate::astdata::NodeId) -> bool;
@@ -3587,22 +3760,36 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     }
 }
 
-/// The walk of `for_each_child_impl` over the data of a factory node. The
-/// data is read in a scope, so each list is read in place (`DataList`), and
-/// the list hook gets a copy of it that the thread's synthetic arena owns
-/// (`copy_synthetic_list`). Otherwise it visits like `NodeChildVisit`.
-struct SyntheticChildVisit<'a, 'b> {
+/// The walk of `for_each_child_impl` over the data of a node of `file`
+/// with no `'static` node: a factory node, or a node that a freeable parse
+/// owns (lsshells M3c). The data is read in a scope, so each list is read
+/// in place (`DataList`), and the list hook gets a copy of it that the
+/// thread's synthetic arena owns (`copy_synthetic_list`, or a factory list
+/// of the same nodes for a store list). Otherwise it visits like
+/// `NodeChildVisit`.
+struct ScopedChildVisit<'a, 'b> {
     n: Node,
+    /// `SYNTHETIC_NODE_FILE` or the store id of `n`.
+    file: usize,
     v: &'a mut dyn FnMut(Node) -> bool,
     lists: Option<ListHook<'b>>,
 }
 
-impl SyntheticChildVisit<'_, '_> {
+impl ScopedChildVisit<'_, '_> {
     /// `NodeChildVisit::report` for a list read in place.
+    // PORT: only the `astdump` tool reads the lists. The copy of a store
+    // list has the nodes and `Loc` of the list, not its missing-list bit.
     fn report(&mut self, l: DataList<'_>, is_mod: bool) {
+        let file = self.file;
         if let (Some(h), Some(list)) = (self.lists.as_mut(), l.list) {
             if l.is_some() {
-                h(copy_synthetic_list(list), is_mod);
+                let copy = if file == SYNTHETIC_NODE_FILE {
+                    copy_synthetic_list(list)
+                } else {
+                    let nodes: Vec<Node> = l.nodes().collect();
+                    new_synthetic_node_list(&nodes, text_range_of(&list.range))
+                };
+                h(copy, is_mod);
             }
         }
     }
@@ -3624,37 +3811,37 @@ impl SyntheticChildVisit<'_, '_> {
     }
 }
 
-impl<'d> ChildVisit<'d> for SyntheticChildVisit<'_, '_> {
+impl<'d> ChildVisit<'d> for ScopedChildVisit<'_, '_> {
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
-        visit(self.v, req(SYNTHETIC_NODE_FILE, id))
+        visit(self.v, req(self.file, id))
     }
 
     fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
-        visit(self.v, opt(SYNTHETIC_NODE_FILE, id))
+        visit(self.v, opt(self.file, id))
     }
 
     fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
-        self.visit_list(DataList::req(SYNTHETIC_NODE_FILE, l))
+        self.visit_list(DataList::req(self.file, l))
     }
 
     fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
-        self.visit_list(DataList::opt(SYNTHETIC_NODE_FILE, l))
+        self.visit_list(DataList::opt(self.file, l))
     }
 
     // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
     fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
-        let l = DataList::mods(SYNTHETIC_NODE_FILE, m);
+        let l = DataList::mods(self.file, m);
         self.report(l, true);
         l.list.is_some() && self.visit_nodes(l)
     }
 
     fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
-        ids.iter()
-            .any(|&id| (self.v)(Node::new(SYNTHETIC_NODE_FILE, id)))
+        let file = self.file;
+        ids.iter().any(|&id| (self.v)(Node::new(file, id)))
     }
 
     fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
-        visit(self.v, case_expression(self.n, SYNTHETIC_NODE_FILE, id))
+        visit(self.v, case_expression(self.n, self.file, id))
     }
 }
 
@@ -3667,7 +3854,7 @@ struct StoreChildIds<F> {
     v: F,
 }
 
-impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
+impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
     #[inline(always)]
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         id.index() != 0 && (self.v)(id.index() as u32)
@@ -3680,23 +3867,23 @@ impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
 
     // `NodeList::is_nil` of a store list: the nil marker list.
     #[inline(always)]
-    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+    fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
         !is_nil_list_marker(l) && self.ids(&l.nodes)
     }
 
     #[inline(always)]
-    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
+    fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
         l.as_ref().is_some_and(|l| self.list(l))
     }
 
     // `ModifierList::is_nil` is only `None`.
     #[inline(always)]
-    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
+    fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
         m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
     }
 
     #[inline(always)]
-    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
+    fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
         ids.iter().any(|id| (self.v)(id.index() as u32))
     }
 
@@ -4290,7 +4477,7 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
     }
     match static_ast_node(n) {
         Some(node) => subtree_facts_of_data(n, &node.data),
-        None => with_synthetic_ast_node(n, |node| subtree_facts_of_data(n, &node.data)),
+        None => read_scoped_ast_node(n, |node| subtree_facts_of_data(n, &node.data)),
     }
 }
 
@@ -5257,8 +5444,7 @@ impl Node {
         // the astnav tests do) the store file is not in a program; its cache
         // and lazy JSDoc inputs are in the store.
         if is_file_store_before_program(file.file_index()) {
-            return resolve_file_store_js_doc(file.file_index(), self)
-                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
+            return resolve_file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
         let info = source_file_info(file);
         match cached_js_doc(file, &info, self) {
@@ -5291,8 +5477,7 @@ impl Node {
             return NodeSlice::NIL;
         }
         if is_file_store_before_program(file.file_index()) {
-            return file_store_js_doc(file.file_index(), self)
-                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
+            return file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
         cached_js_doc(file, &source_file_info(file), self).unwrap_or(NodeSlice::NIL)
     }

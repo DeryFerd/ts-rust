@@ -8,8 +8,8 @@
 //!
 //! Each slot has a header (Go kind plus the mutable Go `NodeBase` fields:
 //! parent, flags, loc) and, for a node slot, a leaked `crate::astdata::Node` that
-//! holds the node data. Child ids inside that data are slot indexes of the
-//! same store:
+//! holds the node data (a freeable parse owns it instead, `OwnedAst`).
+//! Child ids inside that data are slot indexes of the same store:
 //! - a child in the same file uses its own slot index;
 //! - a child from another file or a synthetic child (Go shares the pointer)
 //!   uses an alias slot, which `Node::new` resolves to that node;
@@ -57,7 +57,13 @@
 //! - A freeable file version (an edited file in a language server or API
 //!   process): its `FileVersion` owns its store and `GoFile`
 //!   (`VersionStore`), and its tier 1 slot names its node shell, a leaked
-//!   publish with only its node columns (`node_shell`).
+//!   publish with only its node columns (`node_shell`). Its parse was a
+//!   freeable parse (`enter_freeable_parse`, lsshells M3c), so its store
+//!   also owns its astdata nodes, its pending lists and its parse lists
+//!   (`OwnedAst`): the shell has no node column, and a node data read of
+//!   the file is a scoped read (`with_scoped_store_node`).
+//!   `GOPORT_OWNED_NODES=0` makes a freeable parse a static parse, whose
+//!   node column is in the shell, as before M3c.
 //! - Every read of a published store goes through one inline lookup
 //!   (`frozen!`, `static_frozen_of`): tier 0 first, then the tier 1 slot of the
 //!   id, then the freeable version (its store and `GoFile`), in a cold
@@ -77,8 +83,8 @@ use crate::astdata::NodeData;
 use crate::frontend::parser::SourceFileParseOptions;
 use crate::prelude::*;
 use std::cell::Cell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
@@ -157,8 +163,13 @@ struct FileStore {
     text: &'static str,
     headers: Vec<NodeHeader>,
     /// The astdata node (kind and data) of each node slot. `None` for the nil
-    /// slot and alias slots.
+    /// slot and alias slots. A node that a freeable parse owns is the marker
+    /// node here (`owned_marker`); its data is in `owned`.
     nodes: Vec<Option<&'static crate::astdata::Node>>,
+    /// lsshells M3c: the astdata nodes, pending lists and parse lists of a
+    /// freeable parse (`enter_freeable_parse`), which the store owns. `None`
+    /// for a static parse, whose nodes are in the leaked AST arena.
+    owned: Option<Box<OwnedAst>>,
     /// Alias slot of each foreign node, so one node gets one slot. Emptied
     /// by `publish_file_stores`.
     aliases: FxHashMap<Node, u32>,
@@ -747,12 +758,18 @@ fn is_storeless_id(file: usize) -> bool {
 /// read of them sees a one-file `Frozen` view that borrows them for the
 /// read (`VersionStore::view`). Its node columns are leaked in its node
 /// shell, the tier 1 publish of its id (`node_shell`), so its nodes
-/// are read inline, as the nodes of a tier 1 file.
+/// are read inline, as the nodes of a tier 1 file. When the store owns its
+/// astdata nodes (lsshells M3c) the shell has no node column (`nodes` is
+/// empty): the version owns the nodes, and a data read of them is a scoped
+/// read.
 struct Frozen<'a> {
     /// The first file id of the publish.
     base: usize,
     stores: &'a [FileStore],
     headers: &'a [&'a [NodeHeader]],
+    /// `FileStore::nodes` of each store. Empty in the node shell of a store
+    /// that owns its nodes (`Frozen::lacks_node_column`), so a node data read
+    /// of that freeable file version misses the static tiers.
     nodes: &'a [&'a [Option<&'static crate::astdata::Node>]],
     /// `headers[file][i].kind`, packed (`FileStore::kinds`). `Node::kind`
     /// reads only this.
@@ -815,16 +832,23 @@ fn frozen_resolve_slot(f: &Frozen<'_>, s: &FrozenStore<'_>, file: usize, index: 
     } else {
         handle(file, index as u32)
     };
-    debug_assert_eq!(
-        n,
-        resolve_slot(
-            file,
-            index,
-            f.nodes[file - f.base],
-            f.headers[file - f.base]
-        )
+    // A node shell has no node column (lsshells M3c).
+    debug_assert!(
+        f.nodes.get(file - f.base).is_none_or(|nodes| {
+            n == resolve_slot(file, index, nodes, f.headers[file - f.base])
+        })
     );
     n
+}
+
+impl Frozen<'_> {
+    /// True for a publish with no node column: the node shell of a freeable
+    /// file version whose store owns its astdata nodes (`node_shell`,
+    /// lsshells M3c). Every other publish has one entry per store.
+    #[inline]
+    fn lacks_node_column(&self) -> bool {
+        self.nodes.is_empty()
+    }
 }
 
 /// The store and `GoFile` of a freeable file version (lsshells M3b), owned
@@ -834,7 +858,9 @@ pub(crate) struct VersionStore {
     /// The file id.
     file: usize,
     /// The store, without its node columns, which are in `shell`, and
-    /// without the columns that only cache node data (`node_shell`).
+    /// without the columns that only cache node data (`node_shell`). A
+    /// store that owns its astdata nodes (`FileStore::owned`, lsshells M3c)
+    /// keeps them and its node column (`FileStore::nodes`).
     store: FileStore,
     go_file: GoFile,
     /// The node shell of the file: its tier 1 publish, with the leaked node
@@ -850,7 +876,9 @@ impl VersionStore {
     }
 
     /// Runs `read` on a one-file `Frozen` view of this version: the file is
-    /// at index 0. Its node tables are the ones of its node shell.
+    /// at index 0. Its node tables are the ones of its node shell, so the
+    /// view has no node column (a `frozen!` read of `nodes` misses; the
+    /// scoped reads use `VersionStore::store`).
     #[inline]
     fn view<R>(&self, read: impl for<'v> FnOnce(&'v Frozen<'v>) -> R) -> R {
         let shell = self.shell;
@@ -1070,6 +1098,24 @@ pub fn freeable_go_file_read<R>(file: usize, read: impl FnOnce(&GoFile) -> R) ->
     freeable_read_inline(file, |f| f.go_files.first().map(read))
 }
 
+/// `read` on the store and `GoFile` of live freeable file version `file`
+/// (lsshells M3c), pinned while `read` runs. `None` for any other id and
+/// before the version is published; `read` then did not run. Panics for a
+/// dead version.
+// PERF: lsshells M3c. The node data reads of the edited file come here
+// (`with_scoped_store_node`, `with_store_list`), so they build no one-file
+// `Frozen` view, as `Node::bind_field_slow` does for the binder data.
+#[inline]
+fn with_version_store<R>(file: usize, read: impl FnOnce(&VersionStore) -> R) -> Option<R> {
+    if !super::file_version::any_freeable_published()
+        || file >= TIER1_LIMIT
+        || file >= PUBLISHED.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    super::file_version::with_file_version(file, |version| version.published().map(read)).flatten()
+}
+
 /// The static part of the registry read (tier 0 and tier 1) for table
 /// `table`, with a `'static` entry. `None` for the store and `GoFile` of a
 /// freeable file version, as for any other file.
@@ -1193,9 +1239,14 @@ fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut NodeHeader) -> R) -> R {
 
 /// Makes the store of the next parsed file and returns its file id. Ids
 /// follow parse order (see `BuildStores`). The store becomes the active
-/// store of this thread.
+/// store of this thread. Inside a freeable parse scope
+/// (`enter_freeable_parse`) the store owns its astdata nodes (`OwnedAst`).
 pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    let store: StoreCell = leak_in_ast_arena(RefCell::new(FileStore::new(file_name, text)));
+    let mut new = FileStore::new(file_name, text);
+    if FREEABLE_PARSE.get() {
+        new.owned = Some(Box::new(OwnedAst::new(new.headers.capacity())));
+    }
+    let store: StoreCell = leak_in_ast_arena(RefCell::new(new));
     let id = BUILD.with(|b| {
         let mut b = b.borrow_mut();
         let id = b.next_id();
@@ -1255,7 +1306,7 @@ impl FileStore {
     fn slot_text_name(
         &mut self,
         kind: SyntaxKind,
-        node: &'static crate::astdata::Node,
+        node: &crate::astdata::Node,
         text: Option<&str>,
     ) -> (Name, bool) {
         if !matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
@@ -1293,20 +1344,17 @@ impl FileStore {
         debug_assert_eq!(self.build_modifier_bits.len(), self.headers.len());
         debug_assert_eq!(self.build_children.len(), self.headers.len());
         debug_assert_eq!(self.build_links.len(), self.headers.len());
+        debug_assert!(
+            self.owned
+                .as_deref()
+                .is_none_or(|owned| owned.cell_of.len() == self.headers.len())
+        );
     }
 
     /// R2-5: frees the chain of slot `index` (no chain holds its old
     /// children then) and makes the chain of `index` unknown.
     fn unlink_children(&mut self, index: usize) {
-        let mut child = std::mem::replace(&mut self.build_links[index].first_child, LINK_NONE);
-        if child == LINK_NONE {
-            return;
-        }
-        while child != LINK_END {
-            let links = &mut self.build_links[child as usize];
-            child = std::mem::replace(&mut links.next_sibling, LINK_NONE);
-            debug_assert_ne!(child, LINK_NONE, "R2-5 chain without an end");
-        }
+        unlink_children(&mut self.build_links, index);
     }
 
     /// R2-5: appends slot `child` to the chain of slot `parent`, whose last
@@ -1314,18 +1362,665 @@ impl FileStore {
     /// written, when a chain already holds `child`.
     #[inline]
     fn link_child(&mut self, parent: usize, last: &mut u32, child: usize) -> bool {
-        if self.build_links[child].next_sibling != LINK_NONE {
-            return false;
+        link_child(&mut self.build_links, parent, last, child)
+    }
+}
+
+/// `FileStore::unlink_children` on the link column `links`.
+fn unlink_children(links: &mut [SlotLinks], index: usize) {
+    let mut child = std::mem::replace(&mut links[index].first_child, LINK_NONE);
+    if child == LINK_NONE {
+        return;
+    }
+    while child != LINK_END {
+        let entry = &mut links[child as usize];
+        child = std::mem::replace(&mut entry.next_sibling, LINK_NONE);
+        debug_assert_ne!(child, LINK_NONE, "R2-5 chain without an end");
+    }
+}
+
+/// `FileStore::link_child` on the link column `links`.
+#[inline]
+fn link_child(links: &mut [SlotLinks], parent: usize, last: &mut u32, child: usize) -> bool {
+    if links[child].next_sibling != LINK_NONE {
+        return false;
+    }
+    links[child].next_sibling = LINK_END;
+    let child = child as u32;
+    if *last == LINK_END {
+        links[parent].first_child = child;
+    } else {
+        links[*last as usize].next_sibling = child;
+    }
+    *last = child;
+    true
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Owned nodes of a freeable parse (lsshells M3c)
+// ──────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Set while a freeable parse runs on this thread
+    /// (`enter_freeable_parse`): `new_file_store` makes a store that owns
+    /// its astdata nodes.
+    static FREEABLE_PARSE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Starts a freeable parse on this thread: the stores that `new_file_store`
+/// makes until the scope ends own their astdata nodes, pending lists and
+/// parse lists (`OwnedAst`), so they are freed with the store, not leaked in
+/// the AST arena. The language server parse cache opens it for a new
+/// version of a published path (`ast::freeable_path`), the version that
+/// gets a `FileVersion`.
+// PORT: Go nodes are heap objects that the GC frees with their file. A
+// static parse keeps its nodes in the leaked AST arena, so its node reads
+// stay `'static`.
+#[must_use]
+pub fn enter_freeable_parse() -> FreeableParseScope {
+    FreeableParseScope {
+        previous: FREEABLE_PARSE.replace(owned_nodes_enabled()),
+    }
+}
+
+/// False when `GOPORT_OWNED_NODES=0`: a freeable parse is a static parse
+/// (its nodes stay in the leaked AST arena, and its node shell has a node
+/// column), as before lsshells M3c, for A/B runs and as a field fallback.
+/// Read once.
+fn owned_nodes_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("GOPORT_OWNED_NODES").as_deref() != Ok("0"))
+}
+
+/// The scope of `enter_freeable_parse`.
+pub struct FreeableParseScope {
+    previous: bool,
+}
+
+impl Drop for FreeableParseScope {
+    fn drop(&mut self) {
+        FREEABLE_PARSE.set(self.previous);
+    }
+}
+
+/// True while a freeable parse runs on this thread (`enter_freeable_parse`).
+#[must_use]
+pub fn is_freeable_parse() -> bool {
+    FREEABLE_PARSE.get()
+}
+
+/// Cells per chunk of `OwnedAst::chunks`.
+// PERF: 256 cells of about 48 bytes is a 12 KiB chunk, one small size
+// class of jemalloc.
+const OWNED_CHUNK: usize = 256;
+
+/// `OwnedAst::cell_of` of a slot that has no owned node: the nil slot, an
+/// alias slot, or a node slot with a static node (a shared name node,
+/// `alloc_store_shared_name_node`, or a lib snapshot slot).
+const NO_CELL: u32 = u32::MAX;
+
+/// A chunk of `OwnedAst::chunks`: cells that fill in order.
+pub type OwnedChunk = Arc<[OnceLock<crate::astdata::Node>]>;
+
+/// The number of astdata nodes that the live freeable stores own
+/// (`OwnedAst`), for tests.
+static OWNED_NODES: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of astdata nodes that the live stores of freeable parses own
+/// (lsshells M3c). A freeable file version frees its nodes when it dies, so
+/// this does not grow with the edits. Tests use it.
+#[must_use]
+pub fn owned_node_count() -> usize {
+    OWNED_NODES.load(Ordering::Relaxed)
+}
+
+/// The astdata nodes, pending lists and parse lists of a freeable parse
+/// (lsshells M3c, `enter_freeable_parse`), owned by its store and so, after
+/// the publish, by its `FileVersion`: they are freed with the version. A
+/// static parse keeps them in the leaked AST arena (`AST_ARENA`).
+///
+/// A node slot names its node by cell (`cell_of`). Its `FileStore::nodes`
+/// entry is the marker node (`owned_marker`), so the node column keeps its
+/// meaning (a node slot is `Some`); the marker is never read as data (every
+/// read of a slot goes through `FileStore::slot_ast_node` or
+/// `FileStore::static_node_of`). A data write (`replace_store_node_data`)
+/// fills a new cell and moves the slot to it, so a list handle taken before
+/// the write (`StoreList`, which names the cell) still reads the old list,
+/// like a Go `*NodeList` pointer.
+pub(crate) struct OwnedAst {
+    /// The cells, in chunks that never move or grow: a read can hold its
+    /// chunk apart from the store borrow (`HeldStoreNode`), and a new node
+    /// fills the next cell.
+    chunks: Vec<OwnedChunk>,
+    /// The number of filled cells.
+    len: usize,
+    /// The cell of each slot, `NO_CELL` for a slot with no owned node. One
+    /// entry per header.
+    cell_of: Vec<u32>,
+    /// The pending lists of the parse (U1 (e), `StoreList` with
+    /// `PENDING_SEL`).
+    pending: Vec<OwnedPending>,
+    /// Go `file.jsdocCache` before the publish: the entries of
+    /// `set_file_store_js_doc_cache` and of `resolve_file_store_js_doc`. A
+    /// static parse leaks them (`FileStore::jsdoc_cache`).
+    jsdoc: FxHashMap<Node, Box<[Node]>>,
+    /// The parse diagnostics before the publish
+    /// (`set_file_store_parse_fields`). A static parse leaks them
+    /// (`FileStore::diagnostics`).
+    diagnostics: Box<[Diagnostic]>,
+}
+
+impl OwnedAst {
+    /// The owned part of a new store with room for `slots` slots, with the
+    /// entry of the nil slot.
+    fn new(slots: usize) -> Self {
+        let mut cell_of = Vec::with_capacity(slots);
+        cell_of.push(NO_CELL);
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+            cell_of,
+            pending: Vec::new(),
+            jsdoc: FxHashMap::default(),
+            diagnostics: Box::default(),
         }
-        self.build_links[child].next_sibling = LINK_END;
-        let child = child as u32;
-        if *last == LINK_END {
-            self.build_links[parent].first_child = child;
-        } else {
-            self.build_links[*last as usize].next_sibling = child;
+    }
+
+    /// The astdata node in cell `cell`.
+    #[inline]
+    fn node(&self, cell: u32) -> &crate::astdata::Node {
+        let cell = cell as usize;
+        self.chunks[cell / OWNED_CHUNK][cell % OWNED_CHUNK]
+            .get()
+            .expect("an owned node cell is filled")
+    }
+
+    /// The node in cell `cell`, held apart from the store borrow.
+    fn held(&self, cell: u32) -> HeldStoreNode {
+        let cell = cell as usize;
+        HeldStoreNode::Owned {
+            chunk: Arc::clone(&self.chunks[cell / OWNED_CHUNK]),
+            index: cell % OWNED_CHUNK,
         }
-        *last = child;
-        true
+    }
+
+    /// Puts `node` in the next cell and returns that cell.
+    fn push(&mut self, node: crate::astdata::Node) -> u32 {
+        let index = self.len % OWNED_CHUNK;
+        if index == 0 {
+            self.chunks
+                .push((0..OWNED_CHUNK).map(|_| OnceLock::new()).collect());
+        }
+        let chunk = self.chunks.last().expect("the chunk of the next cell");
+        assert!(
+            chunk[index].set(node).is_ok(),
+            "an owned node cell is filled once"
+        );
+        let cell = u32::try_from(self.len).expect("too many owned nodes in one store");
+        assert_ne!(cell, NO_CELL, "too many owned nodes in one store");
+        self.len += 1;
+        OWNED_NODES.fetch_add(1, Ordering::Relaxed);
+        cell
+    }
+
+    /// Adds pending list `list` and returns its handle in store `file`.
+    fn push_pending(&mut self, file: usize, list: OwnedPending) -> StoreList {
+        self.pending.push(list);
+        StoreList {
+            file: file as u32,
+            key: u32::try_from(self.pending.len() - 1).expect("too many pending lists"),
+            sel: PENDING_SEL,
+        }
+    }
+}
+
+impl Drop for OwnedAst {
+    fn drop(&mut self) {
+        OWNED_NODES.fetch_sub(self.len, Ordering::Relaxed);
+    }
+}
+
+/// The node that `FileStore::nodes` holds for a slot whose astdata node a
+/// freeable parse owns (`OwnedAst`). It is never read as data.
+fn owned_marker() -> &'static crate::astdata::Node {
+    static MARKER: OnceLock<&'static crate::astdata::Node> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Box::leak(Box::new(ast_node(
+            SyntaxKind::Unknown,
+            NodeData::Token(Box::new(crate::astdata::TokenData)),
+        )))
+    })
+}
+
+/// U1 (e) for a freeable parse: a pending list that the store owns (what
+/// `PendingList` and `PendingModifierList` are for a static parse).
+#[derive(Debug)]
+pub struct OwnedPending {
+    /// Go `list.Loc` in astdata form (`ts_range`).
+    range: crate::astdata::text::TextRange,
+    /// The store ids of the nodes (`store_child_id`).
+    nodes: Box<[crate::astdata::NodeId]>,
+    /// The astdata bit (`NodeList::stored_trailing_comma`).
+    has_trailing_comma: bool,
+    /// Go `ModifiersToFlags(nodes)` of a modifier list; `None` for a node
+    /// list.
+    flags: Option<crate::astdata::ModifierFlags>,
+}
+
+/// `StoreList::sel` of a pending list.
+const PENDING_SEL: u32 = u32::MAX;
+
+/// A list of a store that owns its astdata nodes (a freeable parse,
+/// lsshells M3c), as a `NodeList`, `ModifierList` or `NodeSlice` names it:
+/// the list field that list selector `sel` (`list_selector`) finds in the
+/// data of cell `key` of store `file`, or pending list `key` of that store
+/// when `sel` is `PENDING_SEL`. It is read at each use (`with_store_list`),
+/// so it keeps no borrow. 12 bytes, so the list handles stay 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreList {
+    file: u32,
+    key: u32,
+    sel: u32,
+}
+
+impl StoreList {
+    /// The store id of the list.
+    #[inline]
+    #[must_use]
+    pub fn file(self) -> usize {
+        self.file as usize
+    }
+}
+
+/// A list of a store that owns its nodes, read in place
+/// (`with_store_list`): a list field of node data (`AnyList`) or a pending
+/// list.
+#[derive(Clone, Copy)]
+pub enum StoreListView<'a> {
+    Data(AnyList<'a>),
+    Pending(&'a OwnedPending),
+}
+
+impl<'a> StoreListView<'a> {
+    /// Go `list.Loc` in astdata form.
+    #[must_use]
+    pub fn range(self) -> crate::astdata::text::TextRange {
+        match self {
+            Self::Data(l) => l.nodes().range,
+            Self::Pending(p) => p.range,
+        }
+    }
+
+    /// The store ids of the nodes.
+    #[must_use]
+    pub fn ids(self) -> &'a [crate::astdata::NodeId] {
+        match self {
+            Self::Data(l) => &l.nodes().nodes,
+            Self::Pending(p) => &p.nodes,
+        }
+    }
+
+    /// The astdata `has_trailing_comma` bit.
+    #[must_use]
+    pub fn has_trailing_comma(self) -> bool {
+        match self {
+            Self::Data(l) => l.nodes().has_trailing_comma,
+            Self::Pending(p) => p.has_trailing_comma,
+        }
+    }
+
+    /// Go `modifiers.ModifierFlags` of a modifier list. Panics on a node
+    /// list.
+    #[must_use]
+    pub fn modifier_flags(self) -> ModifierFlags {
+        match self {
+            Self::Data(l) => ModifierFlags(l.modifiers().flags.0),
+            Self::Pending(p) => ModifierFlags(p.flags.expect("a pending modifier list").0),
+        }
+    }
+
+    /// The address of the list, for Go pointer compares and keys
+    /// (`NodeList::list_ptr`). It stays the same while the store lives.
+    #[must_use]
+    pub fn ptr(self) -> *const () {
+        match self {
+            Self::Data(l) => std::ptr::from_ref(l.nodes()).cast(),
+            Self::Pending(p) => std::ptr::from_ref(p).cast(),
+        }
+    }
+
+    /// The astdata list with the same range, ids and bit.
+    #[must_use]
+    pub fn to_ts(self) -> crate::astdata::NodeList {
+        crate::astdata::NodeList {
+            range: self.range(),
+            nodes: self.ids().to_vec(),
+            has_trailing_comma: self.has_trailing_comma(),
+        }
+    }
+
+    /// The astdata modifier list with the same list and flags.
+    #[must_use]
+    pub fn to_ts_modifiers(self) -> crate::astdata::ModifierList {
+        crate::astdata::ModifierList {
+            list: self.to_ts(),
+            flags: crate::astdata::ModifierFlags(self.modifier_flags().0),
+        }
+    }
+}
+
+/// `read` on list `list`, of a store that owns its nodes: a freeable file
+/// version (pinned while `read` runs), an unpublished store of this thread
+/// (borrowed while `read` runs, so `read` must not change that store), or
+/// a static store whose freeable parse lost its version before the publish
+/// (`FileStore::leak_owned_nodes`). Panics for a dead version.
+pub fn with_store_list<R>(list: StoreList, read: impl FnOnce(StoreListView<'_>) -> R) -> R {
+    let file = list.file();
+    let mut read = Some(read);
+    if let Some(result) = with_version_store(file, |version| {
+        (read.take().expect("the list is read once"))(version.store.list_view(list))
+    }) {
+        return result;
+    }
+    let read = read.take().expect("the list is read once");
+    with_store(file, |s| read(s.list_view(list)))
+}
+
+/// Go pointer equality of two lists of stores that own their nodes: the
+/// same pending list, or the same list in the data of the same cell.
+#[must_use]
+pub fn same_store_list(a: StoreList, b: StoreList) -> bool {
+    if a == b {
+        return true;
+    }
+    a.file == b.file
+        && a.key == b.key
+        && a.sel != PENDING_SEL
+        && b.sel != PENDING_SEL
+        && with_store_list(a, |l| l.ptr()) == with_store_list(b, |l| l.ptr())
+}
+
+/// A new pending list of unpublished store `file`, which owns its nodes:
+/// `range`, no nodes, and the astdata `has_trailing_comma` bit (parser
+/// `createMissingList`, `NodeList::with_missing_marker`).
+#[must_use]
+pub fn new_store_missing_list(file: usize, range: crate::astdata::text::TextRange) -> StoreList {
+    with_store_mut(file, |s| {
+        s.owned_mut().push_pending(
+            file,
+            OwnedPending {
+                range,
+                nodes: Box::default(),
+                has_trailing_comma: true,
+                flags: None,
+            },
+        )
+    })
+}
+
+/// The astdata node of a store slot, held apart from the store, so the
+/// reader can make and change nodes of that store: a static node, an
+/// owned cell with its chunk, or a node of a freeable file version with
+/// its pin.
+pub enum HeldStoreNode {
+    Static(&'static crate::astdata::Node),
+    Owned {
+        chunk: OwnedChunk,
+        index: usize,
+    },
+    Pinned {
+        version: super::file_version::VersionPin,
+        slot: usize,
+    },
+}
+
+impl std::ops::Deref for HeldStoreNode {
+    type Target = crate::astdata::Node;
+
+    #[inline]
+    fn deref(&self) -> &crate::astdata::Node {
+        match self {
+            Self::Static(node) => *node,
+            Self::Owned { chunk, index } => {
+                chunk[*index].get().expect("an owned node cell is filled")
+            }
+            Self::Pinned { version, slot } => version
+                .published()
+                .expect("a pinned file version is published")
+                .store
+                .slot_ast_node(*slot),
+        }
+    }
+}
+
+/// What `static_store_node` found for a store node.
+pub enum StaticNode {
+    /// The node has `'static` data.
+    Static(&'static crate::astdata::Node),
+    /// The node has no `'static` data: a node of a freeable file version or
+    /// an owned node of an unpublished store. Read it with
+    /// `with_scoped_store_node` (lsshells M3c).
+    Scoped,
+    /// No store of this thread or of the registry has the node.
+    NoStore,
+}
+
+/// The `'static` astdata node of non-nil store node `n`, or what keeps it
+/// from one (`StaticNode`). The caller already missed the static tiers
+/// (`frozen_store_ast_node`). Panics on a nil or alias slot.
+// PERF: query Q8. The active store is checked first and inline, as in
+// `try_store_ast_node`: the parse reads its own nodes here.
+#[inline]
+#[must_use]
+pub fn static_store_node(n: Node) -> StaticNode {
+    let (file, index) = (n.file_index(), slot_index(n));
+    if let Some(store) = active_store(file) {
+        return store.borrow().static_node_of(index);
+    }
+    static_store_node_slow(file, index)
+}
+
+/// `static_store_node` for a node that is not in the active store.
+// PERF: lsshells M3c. Inline: its callers are out of line already
+// (`static_ast_node_slow`), and a node data read of the edited file comes
+// here, so one call fewer per read.
+#[inline]
+fn static_store_node_slow(file: usize, index: usize) -> StaticNode {
+    // A node shell has no node column (lsshells M3c), and a freeable file
+    // version owns its nodes: the scoped read reads them.
+    if FROZEN.get().is_some()
+        && file < TIER1_LIMIT
+        && later(file).is_some_and(|(f, _)| f.lacks_node_column())
+    {
+        return StaticNode::Scoped;
+    }
+    if let Some(node) = frozen!(file, nodes, |_, _, nodes| slot_node(nodes[index])) {
+        return StaticNode::Static(node);
+    }
+    match unpublished_store(file) {
+        Some(store) => store.borrow().static_node_of(index),
+        None => StaticNode::NoStore,
+    }
+}
+
+/// `read` on the astdata node of store node `n` when it has no `'static`
+/// node (`StaticNode::Scoped`): a node of a freeable file version, pinned
+/// while `read` runs, or an owned node of an unpublished store of this
+/// thread, borrowed while `read` runs. `read` must not change the store of
+/// `n` (a field read); `held_store_node` gives a node that a reader that
+/// makes nodes can hold. Panics for a node with no store and for a dead
+/// version.
+// PERF: lsshells M3c. A pin hit is a thread-local borrow and a short scan
+// (`with_file_version`), with no atomic write, as the binder data reads of
+// the edited file (`Node::bind_field_slow`).
+pub fn with_scoped_store_node<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    let (file, index) = (n.file_index(), slot_index(n));
+    let mut read = Some(read);
+    if let Some(result) = with_version_store(file, |version| {
+        (read.take().expect("the node is read once"))(version.store.slot_ast_node(index))
+    }) {
+        return result;
+    }
+    let read = read.take().expect("the node is read once");
+    match unpublished_store(file) {
+        Some(store) => read(store.borrow().slot_ast_node(index)),
+        None => panic!("node {n:?} is not synthetic and has no store"),
+    }
+}
+
+/// The astdata node of store node `n` held apart from its store
+/// (`HeldStoreNode`), so the reader can make and change nodes of that
+/// store. For a node with no `'static` node, as `with_scoped_store_node`.
+#[must_use]
+pub fn held_store_node(n: Node) -> HeldStoreNode {
+    let (file, index) = (n.file_index(), slot_index(n));
+    if let Some(version) = published_version(file) {
+        return HeldStoreNode::Pinned {
+            version,
+            slot: index,
+        };
+    }
+    match unpublished_store(file) {
+        Some(store) => store.borrow().held_slot_node(index),
+        None => panic!("node {n:?} is not synthetic and has no store"),
+    }
+}
+
+/// A list field that a list selector found in the data of a store node
+/// with no `'static` node (`scoped_store_list_of`).
+pub enum ScopedList {
+    /// The node is static after all (a shared name node, or a freeable
+    /// file version whose parse was not freeable): a `'static` list.
+    Static(AnyList<'static>),
+    /// A list that the store owns.
+    Store(StoreList),
+}
+
+/// The list field that `sel` finds in the data of store node `n`, which
+/// has no `'static` node (see `with_scoped_store_node`): `None` when the
+/// data has no such field, `Some(None)` when the field is Go `nil`.
+/// `sel_id` is the id of `sel` (`SelectorSite::id`).
+#[must_use]
+pub fn scoped_store_list_of(n: Node, sel_id: u32, sel: ListSel) -> Option<Option<ScopedList>> {
+    let (file, index) = (n.file_index(), slot_index(n));
+    let pick = |s: &FileStore| match s.cell_of(index) {
+        NO_CELL => {
+            let node: &'static crate::astdata::Node = slot_node(s.nodes[index]);
+            sel(&node.data).map(|found| found.map(ScopedList::Static))
+        }
+        cell => sel(&s.owned_ref().node(cell).data).map(|found| {
+            found.map(|_| {
+                ScopedList::Store(StoreList {
+                    file: file as u32,
+                    key: cell,
+                    sel: sel_id,
+                })
+            })
+        }),
+    };
+    if let Some(found) = with_version_store(file, |version| pick(&version.store)) {
+        return found;
+    }
+    match unpublished_store(file) {
+        Some(store) => pick(&store.borrow()),
+        None => panic!("node {n:?} is not synthetic and has no store"),
+    }
+}
+
+impl FileStore {
+    /// The owned cell of slot `index`, `NO_CELL` for a static store.
+    #[inline]
+    fn cell_of(&self, index: usize) -> u32 {
+        self.owned
+            .as_deref()
+            .map_or(NO_CELL, |owned| owned.cell_of[index])
+    }
+
+    /// The owned part of a store that owns its nodes. Panics for a static
+    /// store.
+    fn owned_ref(&self) -> &OwnedAst {
+        self.owned
+            .as_deref()
+            .expect("a store that owns its nodes (a freeable parse)")
+    }
+
+    /// `owned_ref` for a write.
+    fn owned_mut(&mut self) -> &mut OwnedAst {
+        self.owned
+            .as_deref_mut()
+            .expect("a store that owns its nodes (a freeable parse)")
+    }
+
+    /// The astdata node of node slot `index`: the node that the store owns
+    /// or its static node. Panics on the nil slot and alias slots.
+    #[inline]
+    fn slot_ast_node(&self, index: usize) -> &crate::astdata::Node {
+        match self.cell_of(index) {
+            NO_CELL => slot_node(self.nodes[index]),
+            cell => self.owned_ref().node(cell),
+        }
+    }
+
+    /// `slot_ast_node` as `StaticNode`: `Scoped` for a node that the store
+    /// owns.
+    #[inline]
+    fn static_node_of(&self, index: usize) -> StaticNode {
+        match self.cell_of(index) {
+            NO_CELL => StaticNode::Static(slot_node(self.nodes[index])),
+            _ => StaticNode::Scoped,
+        }
+    }
+
+    /// `slot_ast_node`, held apart from the store borrow.
+    fn held_slot_node(&self, index: usize) -> HeldStoreNode {
+        match self.cell_of(index) {
+            NO_CELL => HeldStoreNode::Static(slot_node(self.nodes[index])),
+            cell => self.owned_ref().held(cell),
+        }
+    }
+
+    /// The astdata node of each slot, `None` for the nil slot and alias
+    /// slots (`slot_ast_node`).
+    fn slot_nodes(&self) -> impl Iterator<Item = Option<&crate::astdata::Node>> + '_ {
+        (0..self.nodes.len()).map(|i| self.nodes[i].map(|_| self.slot_ast_node(i)))
+    }
+
+    /// The list that `list` names in this store (`with_store_list`).
+    fn list_view(&self, list: StoreList) -> StoreListView<'_> {
+        let owned = self.owned_ref();
+        if list.sel == PENDING_SEL {
+            return StoreListView::Pending(&owned.pending[list.key as usize]);
+        }
+        match list_selector(list.sel)(&owned.node(list.key).data) {
+            Some(Some(found)) => StoreListView::Data(found),
+            _ => panic!("a store list handle names a list that its node data does not have"),
+        }
+    }
+
+    /// Adds the `cell_of` entry of a new slot with no owned node, in a
+    /// store that owns its nodes.
+    #[inline]
+    fn push_no_cell(&mut self) {
+        if let Some(owned) = self.owned.as_deref_mut() {
+            owned.cell_of.push(NO_CELL);
+        }
+    }
+
+    /// A static publish of a store that owns its nodes (a freeable parse
+    /// whose `FileVersion` died before the publish): its nodes are leaked
+    /// and its node column names them, so the static reads find them. The
+    /// owned part stays, for the list handles that name it.
+    fn leak_owned_nodes(&mut self) {
+        let Some(owned) = self.owned.as_deref() else {
+            return;
+        };
+        let chunks: &'static [OwnedChunk] = Vec::leak(owned.chunks.clone());
+        for (slot, &cell) in owned.cell_of.iter().enumerate() {
+            if cell != NO_CELL {
+                let cell = cell as usize;
+                self.nodes[slot] = chunks[cell / OWNED_CHUNK][cell % OWNED_CHUNK].get();
+            }
+        }
     }
 }
 
@@ -1572,13 +2267,23 @@ pub fn file_store_text(file: usize) -> &'static str {
 
 /// Go `result.jsdocCache = p.createJSDocCache()` in `finishSourceFile`.
 // PORT: the lists are leaked so reads can return `&'static` slices, like
-// `GoFile::info.jsdoc_cache` after the program is installed.
+// `GoFile::info.jsdoc_cache` after the program is installed. A store that
+// owns its nodes (a freeable parse, lsshells M3c) keeps them instead.
 pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node>>) {
-    let cache = cache
-        .iter()
-        .map(|(node, jsdocs)| (*node, &*Box::leak(jsdocs.clone().into_boxed_slice())))
-        .collect();
-    with_store_mut(file, |s| s.jsdoc_cache = cache);
+    with_store_mut(file, |s| match s.owned.as_deref_mut() {
+        Some(owned) => {
+            owned.jsdoc = cache
+                .iter()
+                .map(|(node, jsdocs)| (*node, jsdocs.clone().into_boxed_slice()))
+                .collect();
+        }
+        None => {
+            s.jsdoc_cache = cache
+                .iter()
+                .map(|(node, jsdocs)| (*node, &*Box::leak(jsdocs.clone().into_boxed_slice())))
+                .collect();
+        }
+    });
 }
 
 /// Go `result.LanguageVariant` and `result.diagnostics` in
@@ -1586,17 +2291,20 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
 /// from the text (`ParsedSourceFile::new`).
 // PORT: the diagnostics are leaked so reads can return a `&'static` slice,
 // like `GoFile::info.diagnostics` after the publish. A parse without errors
-// leaks nothing.
+// leaks nothing. A store that owns its nodes (a freeable parse, lsshells
+// M3c) keeps them instead.
 pub fn set_file_store_parse_fields(
     file: usize,
     language_variant: LanguageVariant,
     diagnostics: &[Diagnostic],
     contains_non_ascii: bool,
 ) {
-    let diagnostics: &'static [Diagnostic] = Box::leak(diagnostics.to_vec().into_boxed_slice());
     with_store_mut(file, |s| {
         s.language_variant = language_variant;
-        s.diagnostics = diagnostics;
+        match s.owned.as_deref_mut() {
+            Some(owned) => owned.diagnostics = diagnostics.into(),
+            None => s.diagnostics = Box::leak(diagnostics.to_vec().into_boxed_slice()),
+        }
         s.contains_non_ascii = contains_non_ascii;
     });
 }
@@ -1608,9 +2316,15 @@ pub fn file_store_language_variant(file: usize) -> LanguageVariant {
 }
 
 /// Go `file.Diagnostics()` (the parse diagnostics) of a store file.
+// PORT: a store that owns its nodes (lsshells M3c) keeps its diagnostics,
+// so this read leaks a copy. Only a read before the publish comes here
+// (`source_file_diagnostics`), and the language server makes none.
 #[must_use]
 pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
-    with_store(file, |s| s.diagnostics)
+    with_store(file, |s| match s.owned.as_deref() {
+        Some(owned) if !owned.diagnostics.is_empty() => &*Box::leak(owned.diagnostics.clone()),
+        _ => s.diagnostics,
+    })
 }
 
 /// Go `file.ContainsNonASCII` of a store file: true when the text has a
@@ -1621,15 +2335,42 @@ pub fn file_store_contains_non_ascii(file: usize) -> bool {
 }
 
 /// Go `file.jsdocCache[node]` of a store file whose program is not
-/// installed yet. It never parses (Go `EagerJSDoc`).
+/// installed yet. It never parses (Go `EagerJSDoc`). The list of a store
+/// that owns its nodes (lsshells M3c) is read at each use
+/// (`NodeSlice::from_file_js_doc`).
 #[must_use]
-pub fn file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
-    with_store(file, |s| {
-        s.jsdoc_cache
+pub fn file_store_js_doc(file: usize, node: Node) -> Option<NodeSlice> {
+    let found = with_store(file, |s| match s.owned.as_deref() {
+        Some(owned) => owned.jsdoc.contains_key(&node).then_some(None),
+        None => s
+            .jsdoc_cache
             .get(&node)
             .or_else(|| s.lazy_jsdoc_cache.get(&node))
-            .copied()
+            .map(|&jsdocs| Some(jsdocs)),
+    })?;
+    // The slice of an owned list reads the store, so it is made after the
+    // borrow ends.
+    Some(match found {
+        Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
+        None => NodeSlice::from_file_js_doc(file, node),
     })
+}
+
+/// `read` on the JSDoc cache entry of `node` in unpublished store `file`,
+/// which owns its nodes (lsshells M3c; `file_store_js_doc`). `None` when
+/// `file` is no such store or the entry is missing.
+pub fn with_owned_store_js_doc<R>(
+    file: usize,
+    node: Node,
+    read: impl FnOnce(&[Node]) -> R,
+) -> Option<R> {
+    try_with_store(file, |s| {
+        s.owned
+            .as_deref()
+            .and_then(|owned| owned.jsdoc.get(&node))
+            .map(|jsdocs| read(&jsdocs[..]))
+    })
+    .flatten()
 }
 
 /// Go `result.SetHasLazyJSDoc(true)` in `finishSourceFile`. The store keeps
@@ -1650,9 +2391,10 @@ pub fn set_file_store_lazy_js_doc(
 /// `parseJSDocForNode`, whose result the cache keeps. None on a cache miss
 /// in a file that is not lazy.
 // PORT: Go takes `jsdocMu`. A store that is not published has one thread.
-// The lists are leaked so reads can return `&'static` slices.
+// The lists are leaked so reads can return `&'static` slices; a store that
+// owns its nodes keeps them (lsshells M3c).
 #[must_use]
-pub fn resolve_file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
+pub fn resolve_file_store_js_doc(file: usize, node: Node) -> Option<NodeSlice> {
     if let Some(jsdocs) = file_store_js_doc(file, node) {
         return Some(jsdocs);
     }
@@ -1661,12 +2403,25 @@ pub fn resolve_file_store_js_doc(file: usize, node: Node) -> Option<&'static [No
             .clone()
             .map(|(parse_options, script_kind)| (parse_options, script_kind, s.text))
     })?;
-    let jsdocs: &'static [Node] = Box::leak(
-        crate::frontend::parser::parse_js_doc_for_node(&parse_options, text, script_kind, node)
-            .into_boxed_slice(),
-    );
-    with_store_mut(file, |s| s.lazy_jsdoc_cache.insert(node, jsdocs));
-    Some(jsdocs)
+    let jsdocs =
+        crate::frontend::parser::parse_js_doc_for_node(&parse_options, text, script_kind, node);
+    let leaked = with_store_mut(file, |s| match s.owned.as_deref_mut() {
+        Some(owned) => {
+            owned.jsdoc.insert(node, jsdocs.into_boxed_slice());
+            None
+        }
+        None => {
+            let jsdocs: &'static [Node] = Box::leak(jsdocs.into_boxed_slice());
+            s.lazy_jsdoc_cache.insert(node, jsdocs);
+            Some(jsdocs)
+        }
+    });
+    // The slice of an owned list reads the store, so it is made after the
+    // borrow ends.
+    Some(match leaked {
+        Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
+        None => NodeSlice::from_file_js_doc(file, node),
+    })
 }
 
 /// True when node reads of store file `file` must use the store, because
@@ -1793,7 +2548,11 @@ impl FileStore {
     /// equals the value `store_node_children` makes from the final node data
     /// of the slot. Needs `kinds`.
     fn children_column_matches(&self) -> bool {
-        let slots = self.kinds.iter().zip(&self.nodes).zip(&self.children[..]);
+        let slots = self
+            .kinds
+            .iter()
+            .zip(self.slot_nodes())
+            .zip(&self.children[..]);
         slots.enumerate().all(|(i, ((&kind, node), &entry))| {
             let expected = match node {
                 Some(node) if i != NIL_SLOT as usize => {
@@ -1812,7 +2571,7 @@ impl FileStore {
     /// name it was made with.
     #[cfg(debug_assertions)]
     fn debug_check_text_names(&self) {
-        let slots = self.kinds.iter().zip(&self.nodes).zip(&self.headers);
+        let slots = self.kinds.iter().zip(self.slot_nodes()).zip(&self.headers);
         for (((&kind, node), header), name) in slots.zip(&self.names[..]) {
             match (kind, node) {
                 (SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier, Some(node)) => {
@@ -1847,7 +2606,7 @@ impl FileStore {
     // empty column keeps the result exact if that ever changes.
     fn modifier_bits_column(&self) -> Box<[u16]> {
         let mut bits = Vec::with_capacity(self.kinds.len());
-        for (&kind, node) in self.kinds.iter().zip(&self.nodes) {
+        for (&kind, node) in self.kinds.iter().zip(self.slot_nodes()) {
             let flags = node.map_or(0, |node| super::node::store_node_modifier_bits(kind, node));
             match u16::try_from(flags) {
                 Ok(flags) => bits.push(flags),
@@ -1862,6 +2621,10 @@ impl FileStore {
         self.frozen = true;
         self.headers.shrink_to_fit();
         self.nodes.shrink_to_fit();
+        if let Some(owned) = self.owned.as_deref_mut() {
+            owned.cell_of.shrink_to_fit();
+            owned.pending.shrink_to_fit();
+        }
         mark_source_file_roots(self);
     }
 
@@ -1890,6 +2653,12 @@ impl FileStore {
         self.lazy_js_doc = None;
         self.lazy_jsdoc_cache = FxHashMap::default();
         self.parser_flags = None;
+        // lsshells M3c: the `GoFile` holds the JSDoc cache and the
+        // diagnostics of the file from now on.
+        if let Some(owned) = self.owned.as_deref_mut() {
+            owned.jsdoc = FxHashMap::default();
+            owned.diagnostics = Box::default();
+        }
         if self.root_slot != NIL_SLOT {
             self.root = handle(file, self.root_slot);
         }
@@ -2102,7 +2871,16 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
 /// file id is `base` (tier 0 or one tier 1 publish).
 // PERF: query Q7. The per-store tables are made already, so this only
 // collects slices.
-fn leaked_frozen(base: usize, stores: Vec<FileStore>, go_files: Vec<GoFile>) -> Frozen<'static> {
+fn leaked_frozen(
+    base: usize,
+    mut stores: Vec<FileStore>,
+    go_files: Vec<GoFile>,
+) -> Frozen<'static> {
+    // lsshells M3c: a freeable parse whose version died before the publish
+    // is published static, so its nodes are leaked now.
+    for store in &mut stores {
+        store.leak_owned_nodes();
+    }
     let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
     Frozen {
         base,
@@ -2153,31 +2931,46 @@ fn set_later_slot(file: usize, frozen: &'static Frozen<'static>) {
 
 /// The node shell of freeable file version `file`, whose store is `store`:
 /// a leaked one-file tier 1 publish with the node columns of the store
-/// (headers, nodes, kinds, names, modifier bits, children and the resolved
-/// table), moved out of `store`. It has no store and no `GoFile`, and no
-/// child link column (the binder's child walk, `frozen_store_children`,
-/// reads the node data): that column is dropped here. Every read of the
-/// store or the `GoFile` misses the shell and reads the version
-/// (`StaticMiss::MaybeFreeable`). The caller points the tier 1 slot of
-/// `file` at it after the version is published.
+/// (headers, kinds, names, modifier bits, children and the resolved table),
+/// moved out of `store`. It has no store, no `GoFile` and no child link
+/// column. A store that owns its astdata nodes (lsshells M3c) keeps its
+/// node column and its nodes, and the shell has none
+/// (`Frozen::lacks_node_column`), so a node data read misses the shell and
+/// reads the version (`static_store_node`, `StaticNode::Scoped`); a store
+/// with leaked nodes moves its node column into the shell.
+/// The binder's child walk (`frozen_store_children`) reads the node data:
+/// the link column is dropped here. Every read of the store or the `GoFile`
+/// misses the shell and reads the version (`StaticMiss::MaybeFreeable`).
+/// The caller points the tier 1 slot of `file` at it after the version is
+/// published.
 // PERF: lsshells M3 repair. A pinned read of the version (a thread-local
 // pin lookup) for each node read of the edited file made query-core and
 // effect edits 3 to 4 ms slower than R134 (lsshells/m3/final/editor-off),
 // and 1.5 to 2 ms with only the kind column static
 // (lsshells/m3/repair/prof): an edit reads the nodes of the edited file
-// about 400,000 times. The node columns (52 bytes per node) are the part
-// of the store that node reads need, so they are leaked and read inline,
-// as a tier 1 file. Without the children and modifier columns, the child
-// reads of the edited file read the node data, and edits were about 0.3 ms
-// slower (lsshells/m3/repair/r4). The store maps and lists, the link column
-// and the `GoFile` (binder and flow data, parse lists) are freed with the
-// version. A stale read of a node column gives the data of that node: ids
-// are never reused.
+// about 400,000 times. The node columns that the header and child reads
+// need (44 bytes per node) are leaked and read inline, as a tier 1 file.
+// Without the children and modifier columns, the child reads of the edited
+// file read the node data, and edits were about 0.3 ms slower
+// (lsshells/m3/repair/r4). The store maps and lists, the node column, the
+// astdata nodes, the link column and the `GoFile` (binder and flow data,
+// parse lists) are freed with the version. A stale read of a leaked column
+// gives the data of that node (ids are never reused); a stale node data
+// read panics.
 fn node_shell(file: usize, store: &mut FileStore) -> &'static Frozen<'static> {
     let nil = resolve_slot(file, NIL_SLOT as usize, &store.nodes, &store.headers);
+    // lsshells M3c: a store that owns its nodes keeps its node column. A
+    // store with leaked nodes (a prefetched parse, or `GOPORT_OWNED_NODES=0`)
+    // leaks it here, as before M3c, so its node data reads stay inline.
+    let nodes: &'static [&'static [Option<&'static crate::astdata::Node>]] =
+        if store.owned.is_some() {
+            &[]
+        } else {
+            let nodes: &'static [Option<&'static crate::astdata::Node>] =
+                Vec::leak(std::mem::take(&mut store.nodes));
+            Box::leak(Box::new([nodes]))
+        };
     let headers: &'static [NodeHeader] = Vec::leak(std::mem::take(&mut store.headers));
-    let nodes: &'static [Option<&'static crate::astdata::Node>] =
-        Vec::leak(std::mem::take(&mut store.nodes));
     let kinds: &'static [SyntaxKind] = Box::leak(std::mem::take(&mut store.kinds));
     let names: &'static [Name] = Box::leak(std::mem::take(&mut store.names));
     let resolved: &'static [Node] = Box::leak(std::mem::take(&mut store.resolved));
@@ -2196,7 +2989,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> &'static Frozen<'static> {
         base: file,
         stores: &[],
         headers: Box::leak(Box::new([headers])),
-        nodes: Box::leak(Box::new([nodes])),
+        nodes,
         kinds: Box::leak(Box::new([kinds])),
         names: Box::leak(Box::new([names])),
         modifier_bits: Box::leak(Box::new([modifier_bits])),
@@ -2291,10 +3084,16 @@ pub fn resolve_store_id(file: usize, id: crate::astdata::NodeId) -> Node {
     )) {
         return n;
     }
+    // A node shell has no node column (lsshells M3c): its resolved table.
+    if let Some(n) = frozen_resolve_store_id(file, id) {
+        return n;
+    }
     with_store(file, |s| resolve_slot(file, index, &s.nodes, &s.headers))
 }
 
 /// Hook for `raw(n)`: the astdata node (Go kind and data) of a store node.
+/// Panics for a node with no `'static` data (a node that a freeable parse
+/// owns, lsshells M3c): read it with `ast::with_ast_node`.
 #[inline]
 #[must_use]
 pub fn store_ast_node(n: Node) -> &'static crate::astdata::Node {
@@ -2303,7 +3102,16 @@ pub fn store_ast_node(n: Node) -> &'static crate::astdata::Node {
     )) {
         return node;
     }
-    with_store(n.file_index(), |s| slot_node(s.nodes[slot_index(n)]))
+    match static_store_node(n) {
+        StaticNode::Static(node) => node,
+        StaticNode::Scoped => {
+            panic!("node {n:?} is owned by a freeable parse and has no 'static data")
+        }
+        StaticNode::NoStore => panic!(
+            "file {:#x} has no node store on this thread",
+            n.file_index()
+        ),
+    }
 }
 
 /// Hook for `Node::kind`, `flags`, `parent` and `loc` on a store node.
@@ -2312,8 +3120,11 @@ pub fn store_ast_node(n: Node) -> &'static crate::astdata::Node {
 pub fn store_header(n: Node) -> NodeHeader {
     let (file, index) = (n.file_index(), slot_index(n));
     if let Some(header) = frozen_static!(file, headers, |f, local, headers| {
+        // A node shell has no node column (lsshells M3c).
         debug_assert!(
-            f.nodes[local][index].is_some(),
+            f.nodes
+                .get(local)
+                .is_none_or(|nodes| nodes[index].is_some()),
             "store handle does not name a node slot"
         );
         headers[index].read(file)
@@ -2433,28 +3244,19 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
 }
 
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
-/// `try_store_header`). `None` for nil and synthetic nodes.
+/// `try_store_header`). `None` for nil and synthetic nodes, and for a node
+/// with no `'static` data (a node that a freeable parse owns, lsshells M3c;
+/// `static_store_node` tells them apart).
 #[inline]
 #[must_use]
 pub fn try_store_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     if n.is_nil() {
         return None;
     }
-    let (file, index) = (n.file_index(), slot_index(n));
-    // PERF: query Q8, see `ACTIVE`.
-    if let Some(store) = active_store(file) {
-        return Some(slot_node(store.borrow().nodes[index]));
+    match static_store_node(n) {
+        StaticNode::Static(node) => Some(node),
+        StaticNode::Scoped | StaticNode::NoStore => None,
     }
-    try_store_ast_node_slow(file, index)
-}
-
-/// `try_store_ast_node` for a node that is not in the active store.
-#[inline(never)]
-fn try_store_ast_node_slow(file: usize, index: usize) -> Option<&'static crate::astdata::Node> {
-    if let Some(node) = frozen!(file, nodes, |_, _, nodes| slot_node(nodes[index])) {
-        return Some(node);
-    }
-    unpublished_store(file).map(|store| slot_node(store.borrow().nodes[index]))
 }
 
 /// The astdata node of a node slot. Panics on the nil slot and alias slots.
@@ -3203,27 +4005,41 @@ pub fn set_parent_in_store_children(parent: Node) -> bool {
     if s.frozen {
         return false;
     }
-    let Some(node) = s.nodes[index] else {
+    if s.nodes[index].is_none() {
         return false;
+    }
+    // lsshells M3c: the fields are borrowed apart, so the node data (owned
+    // by the store in a freeable parse) is read while the headers and the
+    // links change.
+    let FileStore {
+        nodes,
+        headers,
+        build_links,
+        owned,
+        ..
+    } = s;
+    let node = match owned.as_deref() {
+        Some(owned) if owned.cell_of[index] != NO_CELL => owned.node(owned.cell_of[index]),
+        _ => slot_node(nodes[index]),
     };
-    let kind = s.headers[index].kind;
+    let kind = headers[index].kind;
     // `NodeHeader::stored_parent` of a child in the store of `parent`.
     let stored = handle(LOCAL_STORE, index as u32);
     // `StoreChildLinks::new`.
-    s.unlink_children(index);
-    s.build_links[index].first_child = LINK_END;
+    unlink_children(build_links, index);
+    build_links[index].first_child = LINK_END;
     let mut last = LINK_END;
     let mut linking = true;
     let stopped = super::node::for_each_store_child_id(kind, node, |child| {
         let child = child as usize;
-        if s.nodes[child].is_none() {
+        if nodes[child].is_none() {
             return true;
         }
         // `StoreChildLinks::set_parent`.
-        s.headers[child].parent = stored;
-        if linking && !s.link_child(index, &mut last, child) {
+        headers[child].parent = stored;
+        if linking && !link_child(build_links, index, &mut last, child) {
             linking = false;
-            s.unlink_children(index);
+            unlink_children(build_links, index);
         }
         false
     });
@@ -3278,23 +4094,24 @@ pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
 }
 
 /// Go write to a data field of a node of an unfrozen file (reparser.go,
-/// `internIdentifier`). The new data replaces the old; the old node leaks.
-/// The U1 and U4 build entries and the keyword bit of the slot follow the
-/// new data, and its R2-5 chain becomes unknown.
+/// `internIdentifier`). The new data replaces the old; the old node leaks
+/// (a freeable parse keeps it in its store until the store is freed, so a
+/// list handle taken before the write still reads the old list). The U1 and
+/// U4 build entries and the keyword bit of the slot follow the new data,
+/// and its R2-5 chain becomes unknown.
 pub fn replace_store_node_data(n: Node, data: NodeData) {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
         let index = slot_index(n);
-        let Some(old) = s.nodes[index] else {
+        if s.nodes[index].is_none() {
             panic!("store handle does not name a node slot");
-        };
+        }
+        let old_kind = s.slot_ast_node(index).kind;
         debug_assert!(
-            data.matches_syntax_kind(old.kind),
-            "{:?} does not fit its NodeData",
-            old.kind
+            data.matches_syntax_kind(old_kind),
+            "{old_kind:?} does not fit its NodeData"
         );
-        let node = leak_ast_node(old.kind, data);
-        s.nodes[index] = Some(node);
+        let node = ast_node(old_kind, data);
         // The same code as `alloc_store_node`, on the header kind (the kind
         // `debug_check_text_names` and `modifier_bits_column` read).
         let kind = s.headers[index].kind;
@@ -3304,17 +4121,27 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
         // no empty identifier text here. S1: the new data gets a new node;
         // a shared name node does not change.
         let keeps_name = matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
-            && identifier_text(node).is_empty();
+            && identifier_text(&node).is_empty();
         if !keeps_name {
-            let (name, text_is_keyword) = s.slot_text_name(kind, node, None);
+            let (name, text_is_keyword) = s.slot_text_name(kind, &node, None);
             s.headers[index].text_is_keyword = text_is_keyword;
             s.build_names[index] = name;
         }
-        let modifier_bits = s.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
+        let modifier_bits =
+            s.slot_modifier_bits(super::node::store_node_modifier_bits(kind, &node));
         s.build_modifier_bits[index] = modifier_bits;
         // U4: a reparser write can change a child that the column holds.
         // C2: the same for the `typed` field.
-        s.build_children[index] = super::node::store_node_children(kind, node);
+        s.build_children[index] = super::node::store_node_children(kind, &node);
+        // lsshells M3c: a freeable parse keeps the new node in a new cell.
+        match s.owned.as_deref_mut() {
+            Some(owned) => {
+                let cell = owned.push(node);
+                owned.cell_of[index] = cell;
+                s.nodes[index] = Some(owned_marker());
+            }
+            None => s.nodes[index] = Some(leak_in_ast_arena(node)),
+        }
         // R2-5: the children of the node can change, so its chain is freed
         // and unknown until the parser sets their parents again
         // (`StoreChildLinks`; reparser.go `finishMutatedNode`).
@@ -3424,6 +4251,9 @@ impl FileStore {
             text_is_keyword,
         });
         self.nodes.push(Some(node));
+        // PORT: a snapshot node is leaked in the AST arena, also in a store
+        // that owns its nodes (a lib file is not edited).
+        self.push_no_cell();
         self.build_names.push(name);
         let modifier_bits =
             self.slot_modifier_bits(super::node::store_node_modifier_bits(kind, node));
@@ -3443,7 +4273,11 @@ impl FileStore {
 pub(crate) fn reset_file_store(file: usize) {
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot reset a finished store");
+        let owns_nodes = s.owned.is_some();
         *s = FileStore::new(s.file_name, s.text);
+        if owns_nodes {
+            s.owned = Some(Box::new(OwnedAst::new(s.headers.capacity())));
+        }
     });
 }
 
@@ -3754,7 +4588,12 @@ pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: NodeData, text
 // astdata node as an identity (the `data_accessor!` `_in` debug check only
 // compares the data of one node with itself).
 pub fn alloc_store_shared_name_node(file: usize, kind: SyntaxKind, text: &str) -> Node {
-    alloc_store_slot_node(file, kind, shared_name_node(kind), Some(text))
+    alloc_store_slot_node(
+        file,
+        kind,
+        SlotData::Static(shared_name_node(kind)),
+        Some(text),
+    )
 }
 
 /// `alloc_store_node` with the name text `text` (`slot_text_name`).
@@ -3764,17 +4603,36 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
-    alloc_store_slot_node(file, kind, leak_ast_node(kind, data), text)
+    alloc_store_slot_node(file, kind, SlotData::New(ast_node(kind, data)), text)
 }
 
-/// `alloc_store_slot` for a astdata node that is already made.
+/// The astdata node of a new node slot (`alloc_store_slot_node`).
+enum SlotData {
+    /// A node that is already made: a shared name node (S1).
+    Static(&'static crate::astdata::Node),
+    /// A new node. A static parse leaks it in the AST arena; a store that
+    /// owns its nodes (a freeable parse, lsshells M3c) keeps it.
+    New(crate::astdata::Node),
+}
+
+impl SlotData {
+    fn node(&self) -> &crate::astdata::Node {
+        match self {
+            Self::Static(node) => node,
+            Self::New(node) => node,
+        }
+    }
+}
+
+/// `alloc_store_slot` for the slot node `data`.
 #[inline]
 fn alloc_store_slot_node(
     file: usize,
     kind: SyntaxKind,
-    node: &'static crate::astdata::Node,
+    data: SlotData,
     text: Option<&str>,
 ) -> Node {
+    let node = data.node();
     debug_assert!(
         text.is_none() || identifier_text(node).is_empty(),
         "a name node keeps its text in the name column"
@@ -3785,7 +4643,7 @@ fn alloc_store_slot_node(
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.headers.len() as u32;
-        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, data.node(), text);
         s.headers.push(NodeHeader {
             parent: Node::NIL,
             loc: TextRange::undefined(),
@@ -3794,7 +4652,21 @@ fn alloc_store_slot_node(
             source_file_is_root: false,
             text_is_keyword,
         });
-        s.nodes.push(Some(node));
+        match data {
+            SlotData::Static(node) => {
+                s.nodes.push(Some(node));
+                s.push_no_cell();
+            }
+            SlotData::New(node) => match s.owned.as_deref_mut() {
+                // lsshells M3c: a freeable parse keeps the node in its store.
+                Some(owned) => {
+                    let cell = owned.push(node);
+                    owned.cell_of.push(cell);
+                    s.nodes.push(Some(owned_marker()));
+                }
+                None => s.nodes.push(Some(leak_in_ast_arena(node))),
+            },
+        }
         s.build_names.push(name);
         let modifier_bits = s.slot_modifier_bits(modifier_bits);
         s.build_modifier_bits.push(modifier_bits);
@@ -3833,6 +4705,7 @@ fn store_alias_id(file: usize, n: Node) -> crate::astdata::NodeId {
         let index = s.headers.len() as u32;
         s.headers.push(NodeHeader::target(n));
         s.nodes.push(None);
+        s.push_no_cell();
         s.build_names.push(Name::default());
         s.build_modifier_bits.push(0);
         s.build_children.push(SlotChildren::UNKNOWN);
@@ -3927,10 +4800,46 @@ impl PendingModifierList {
 /// Go `f.NewNodeList(nodes)` followed by `list.Loc = loc`, in store `file`.
 // PERF: U1 (e). A pending handle: the ids go into the AST bump arena, not
 // into a `Vec` that `store_list_value` copied again (two mallocs, and the
-// first copy leaked).
+// first copy leaked). A store that owns its nodes (lsshells M3c) keeps the
+// list (`OwnedPending`).
 #[must_use]
 pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeList {
+    if let Some(list) = new_owned_pending(file, nodes, loc, None) {
+        return NodeList::store(list);
+    }
     NodeList::pending(file, leak_in_ast_arena(PendingList::new(file, nodes, loc)))
+}
+
+/// The pending list of `nodes` at `loc` (with `flags` for a modifier
+/// list) in store `file` when that store owns its nodes (lsshells M3c).
+/// `None`, with nothing made, for a static store.
+fn new_owned_pending(
+    file: usize,
+    nodes: &[Node],
+    loc: TextRange,
+    flags: Option<crate::astdata::ModifierFlags>,
+) -> Option<StoreList> {
+    // PERF: a static parse (every CLI parse) leaves after one thread-local
+    // load. A store that owns its nodes is made and filled only inside a
+    // freeable parse scope.
+    if !FREEABLE_PARSE.get() || !with_store(file, |s| s.owned.is_some()) {
+        return None;
+    }
+    // The alias slots are made in order, as `PendingList::new` does, before
+    // the store borrow below.
+    let nodes: Box<[crate::astdata::NodeId]> =
+        nodes.iter().map(|&n| store_child_id(file, n)).collect();
+    Some(with_store_mut(file, |s| {
+        s.owned_mut().push_pending(
+            file,
+            OwnedPending {
+                range: ts_range(loc),
+                nodes,
+                has_trailing_comma: false,
+                flags,
+            },
+        )
+    }))
 }
 
 /// Go `f.NewModifierList(nodes)` followed by `list.Loc = loc`, in store
@@ -3938,9 +4847,13 @@ pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeL
 // PERF: U1 (e), as `new_store_node_list`.
 #[must_use]
 pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> ModifierList {
+    let flags = crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32);
+    if let Some(list) = new_owned_pending(file, nodes, loc, Some(flags)) {
+        return ModifierList::store(list);
+    }
     let list = leak_in_ast_arena(PendingModifierList {
         list: PendingList::new(file, nodes, loc),
-        flags: crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
+        flags,
     });
     ModifierList::pending(file, list)
 }
@@ -3962,6 +4875,10 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::N
         }
         if let Some(l) = list.ts_list() {
             return Some(l.clone());
+        }
+        // lsshells M3c: a list of a store that owns its nodes.
+        if let Some(l) = list.store_list() {
+            return Some(with_store_list(l, |l| l.to_ts()));
         }
     }
     let nodes = list.nodes().to_vec();
@@ -3999,6 +4916,10 @@ pub fn store_modifiers_value(
         }
         if let Some(m) = modifiers.ts_list() {
             return Some(m.clone());
+        }
+        // lsshells M3c: a list of a store that owns its nodes.
+        if let Some(m) = modifiers.store_list() {
+            return Some(with_store_list(m, |l| l.to_ts_modifiers()));
         }
     }
     let nodes = modifiers.nodes().to_vec();
@@ -4538,7 +5459,119 @@ mod tests {
         for (node, jsdocs) in &adopted.jsdoc_cache {
             let expected: Vec<Node> = jsdocs.iter().map(|&n| to_serial(n)).collect();
             assert_eq!(serial.jsdoc_cache[&to_serial(*node)], expected);
-            assert_eq!(file_store_js_doc(adopted.store, *node), Some(&jsdocs[..]));
+            assert_eq!(
+                file_store_js_doc(adopted.store, *node).map(NodeSlice::to_vec),
+                Some(jsdocs.clone())
+            );
         }
+    }
+
+    /// The nodes of the tree of `root` in `for_each_child` order.
+    fn tree(root: Node) -> Vec<Node> {
+        fn walk(n: Node, out: &mut Vec<Node>) {
+            out.push(n);
+            n.for_each_child(|child| {
+                walk(child, out);
+                false
+            });
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    /// What the node reads give for `n` (lsshells M3c twin parses): header,
+    /// text, modifiers, JSDoc and the lists of its data.
+    fn twin_facts(n: Node) -> String {
+        let mut lists = Vec::new();
+        n.for_each_child_and_lists(&mut |_| false, &mut |l, is_mod| {
+            lists.push((l.nodes().len(), l.pos(), l.end(), is_mod));
+        });
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
+            n.kind(),
+            n.loc(),
+            n.flags(),
+            n.text(),
+            n.modifier_flags(),
+            n.modifiers().nodes().to_vec().len(),
+            n.js_doc(Node::NIL).len(),
+            lists
+        )
+    }
+
+    // lsshells M3c: a freeable parse keeps its astdata nodes in its store
+    // and answers every node read as a static parse of the same text.
+    #[test]
+    fn owned_parse_reads_like_a_static_parse() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let text = "/** doc */\nexport async function f(a: number, b = 1) { return a + b; }\n\
+            let x: Array<string> = [1, 2].map(y => `${y}`);\n\
+            type T = { a?: string } | number;\n\
+            @dec class C<U> extends Object { private m(): U | undefined { return undefined; } }\n\
+            const re = /ab+c/g, s = 'str', n = 0x10, big = 10n;\n";
+        let opts = |name: &str| SourceFileParseOptions {
+            file_name: name.to_string(),
+            ..Default::default()
+        };
+        let fixed = parse_source_file(&opts("/static.ts"), text, ScriptKind::TS);
+        let before = owned_node_count();
+        let owned = {
+            let _scope = enter_freeable_parse();
+            parse_source_file(&opts("/owned.ts"), text, ScriptKind::TS)
+        };
+        assert!(!is_freeable_parse(), "the scope ends");
+        assert!(
+            owned_node_count() > before,
+            "the freeable parse owns its nodes"
+        );
+        assert!(with_store(owned.store, |s| s.owned.is_some()));
+        assert!(with_store(fixed.store, |s| s.owned.is_none()));
+        assert!(try_store_ast_node(fixed.root).is_some());
+        assert!(
+            try_store_ast_node(owned.root).is_none(),
+            "an owned node has no 'static data"
+        );
+        let (a, b) = (tree(fixed.root), tree(owned.root));
+        assert_eq!(a.len(), b.len());
+        for (&a, &b) in a.iter().zip(&b) {
+            assert_eq!(twin_facts(a), twin_facts(b), "{:?}", a.kind());
+        }
+        assert!(owned.root.statement_list().store_list().is_some());
+        assert_eq!(fixed.root.statements().len(), owned.root.statements().len());
+    }
+
+    // lsshells M3c: a data write in a store that owns its nodes fills a new
+    // cell, so a list handle of the old data still reads the old list (a Go
+    // `*NodeList` pointer), and the pending lists are the store's.
+    #[test]
+    fn owned_data_write_keeps_old_list_handles() {
+        let _scope = enter_freeable_parse();
+        let file = new_file_store("/owned-write.ts", "");
+        let f = NodeFactory::for_file(file);
+        let export = f.new_modifier(SyntaxKind::ExportKeyword);
+        let modifiers = f.new_modifier_list(&[export]);
+        assert!(modifiers.store_list().is_some(), "an owned pending list");
+        let list = f.new_variable_declaration_list(NodeList::NIL, NodeFlags::NONE);
+        let statement = f.new_variable_statement(modifiers, list);
+        let old = statement.modifiers();
+        assert!(old.store_list().is_some());
+        assert_eq!(old.nodes().to_vec(), vec![export]);
+        assert_eq!(old.modifier_flags(), ModifierFlags::EXPORT);
+        assert_eq!(old, statement.modifiers(), "one list, one handle identity");
+        assert!(list.declarations().is_nil());
+
+        let mut data = with_ast_data(statement, Clone::clone);
+        if let NodeData::VariableStatement(d) = &mut data {
+            d.modifiers = None;
+        }
+        replace_store_node_data(statement, data);
+        assert!(statement.modifiers().is_nil());
+        assert_eq!(old.nodes().to_vec(), vec![export], "the old list stays");
+        assert_ne!(old, statement.modifiers());
+        freeze_file_store(file);
+        assert_eq!(statement.kind(), SyntaxKind::VariableStatement);
+        assert_eq!(statement.declaration_list(), list);
+        assert!(with_store(file, |s| s.owned_ref().len >= 4));
     }
 }

@@ -789,7 +789,7 @@ impl Binder {
 
     /// `get_declaration_name` on `d`, the data of `node` that the caller
     /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
-    pub fn get_declaration_name_in(&mut self, node: Node, d: &'static NodeData) -> Name {
+    pub fn get_declaration_name_in(&mut self, node: Node, d: LoadedData) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
                 Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
@@ -1696,7 +1696,7 @@ impl Binder {
 
     // Go: binder/binder.go:752 bindPropertyWorker
     // PERF: query Q7-3. `d` is the data of `node`, loaded once by `bind`.
-    pub fn bind_property_worker(&mut self, node: Node, d: &'static NodeData) {
+    pub fn bind_property_worker(&mut self, node: Node, d: LoadedData) {
         // Go `ast.IsAutoAccessorPropertyDeclaration(node)` on the loaded data.
         let is_auto_accessor = is_property_declaration(node)
             && has_syntactic_modifier_in(node, d, ModifierFlags::ACCESSOR);

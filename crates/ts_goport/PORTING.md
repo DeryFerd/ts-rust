@@ -214,18 +214,30 @@ methods reach the AST through it.
   `ast/node.rs`. A list of parsed data points at its astdata list (it lives
   for the process). A list of synthetic data is an index into the thread's
   synthetic arena (`SyntheticList`), so it is valid only on the thread
-  that made it, like a synthetic `Node`. Equality is Go pointer equality.
+  that made it, like a synthetic `Node`. A list of a store that owns its
+  nodes (a freeable parse, lsshells M3c) is a `StoreList` handle (file,
+  node data cell or pending list, and the id of its selector,
+  `SelectorSite`), read at each use; it is valid on any thread while its
+  file version lives, and its `list_ptr` address can repeat after the
+  version is freed, so keep that address only for keys of one request.
+  Equality is Go pointer equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
 - Node data reads are scoped, because a thread owns its synthetic nodes
   and frees them when its program is released (`ast/synthetic.rs`). Read
   a field with `by_data!`, `with_data!` or `with_ast_data(n, |d| ...)`,
   and a list field with `list_of!` or `modifiers_of!` (`list_by_data!` in
-  `node.rs`). Nothing returns a reference into node data. Only parsed data
-  is `&'static` (`static_ast_node`): the binder, which binds parsed nodes
-  only, loads it once with `parsed_node_data` for the `_in` reads
-  (`data_accessor!`). `Node::bind()` returns the binder data by value, and
-  the text of a synthetic node is interned (`Name`).
+  `node.rs`). Nothing returns a reference into node data. Only the data of
+  a static parse is `&'static` (`static_ast_node`); a node that a freeable
+  parse owns (lsshells M3c) is read in a scope like a synthetic node
+  (`with_scoped_ast_node` holds it, `read_scoped_ast_node` reads a field;
+  the body of `with_data!` must not make or change nodes of the store of
+  the node). The binder, which binds parsed nodes only, loads the data
+  once with `parsed_node_data` for the `_in` reads (`data_accessor!`); it
+  gives `LoadedData`, `None` for an owned node, and then an `_in` read reads
+  the node again. `Node::bind()` returns the binder data by value, and the
+  text of a synthetic node or an owned node is interned (`Name`; an owned
+  node of a published file keeps it per thread in `JOINED_TEXT`).
 - Synthetic node owners (`ast/synthetic.rs`): on the language server
   dispatch thread, each program version owns the synthetic nodes, lists
   and data writes made while it is current, and its release frees them
@@ -242,8 +254,11 @@ methods reach the AST through it.
   freeable file version (its store and `GoFile`; out of line, pinned while
   the read runs), so the nodes of a later program (`tsc -b`, an edited
   file) read the same columns as the nodes of the first program. The tier
-  1 slot of a freeable version names its node shell (its node columns,
-  leaked), so its node reads are tier 1 reads. The tier 1 and freeable parts
+  1 slot of a freeable version names its node shell (its header and child
+  columns, leaked; no node column when its store owns its nodes), so its
+  header and child reads are tier 1 reads, and its node data reads miss
+  the static tiers and read the pinned version (`static_store_node`,
+  `with_scoped_store_node`). The tier 1 and freeable parts
   are a cold block, so they add no code to the hot path of a one-program
   process; keep new tier 1 work after `later_publish_path()`, and keep one
   inline copy of the read (after the static tiers join). A read gets
@@ -321,7 +336,7 @@ The batch that adds it is not accepted until Theo approves.
   and the parse tasks of a load. The dispatch loop drops them after each
   message, while no message waits (`drop_garbage`); more than 16 are
   dropped even when messages wait. Other threads drop them at once.
-- Freeable file versions (lsshells M3a and M3b, `ast/file_version.rs`). In
+- Freeable file versions (lsshells M3a, M3b and M3c, `ast/file_version.rs`). In
   a language server or API process (`project::new_session`), a parse cache
   parse of a path that a publish on this thread published before gets a
   `FileVersion`. Its parse holds it (`ParsedSourceFile::version`), and so
@@ -330,20 +345,28 @@ The batch that adds it is not accepted until Theo approves.
   next program release (`release_file_version_pins`, run when a
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
-  and its `GoFile` (M3b). Its node columns (headers, nodes, kinds, names,
-  modifier bits, children; 52 bytes per node) are leaked in its node
-  shell, the tier 1 publish of its id, so a node read of the edited file
-  stays inline (a pinned read per node read made edits 3 to 4 ms slower);
-  the child link column is dropped, and the binder's child walk reads the
-  node data. Its `SourceFileInfo` owns copies of
+  and its `GoFile` (M3b). Its header and child columns (headers, kinds,
+  names, modifier bits, children, resolved; 44 bytes per node) are leaked
+  in its node shell, the tier 1 publish of its id, so a header or child
+  read of the edited file stays inline (a pinned read per node read made
+  edits 3 to 4 ms slower); the child link column is dropped, and the
+  binder's child walk reads the node data. Its parse was a freeable parse
+  (`enter_freeable_parse`, opened by the parse cache, M3c), so its store
+  owns its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  (`OwnedAst`), and they are freed with the version; its node data reads
+  are pinned reads, and its lists are `StoreList` handles. A prefetched
+  parse keeps its nodes leaked (its node column is in the shell), and
+  `GOPORT_OWNED_NODES=0` makes every parse do so, as before M3c. Its
+  `SourceFileInfo` owns copies of
   the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
   its name table, position map and declaration map are fields of the
   version, as in Go. When its last holder lets go, the store and the
   `GoFile` are freed, a later read of the id panics, and each per-file
   thread-local map (`PerFileMap`: `SOURCE_FILE_DATA`, `TOKEN_CACHES`,
-  `TOKEN_FACTORIES`, `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`) forgets
-  the entries of the file at its next write. The node structs and node
-  data (bump arena) and the text stay leaked for now. Tier 0, the first
+  `TOKEN_FACTORIES`, `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`,
+  `DECORATORS`) forgets the entries of the file at its next write. The
+  header columns of the node shell and the text stay leaked for now. Tier
+  0, the first
   version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives

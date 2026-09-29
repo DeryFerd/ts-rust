@@ -74,6 +74,12 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
         |key: &ParseCacheKey, fh: Rc<dyn FileHandle>| -> HashedSourceFile {
             // Program versions share the parse, so its nodes belong to the thread.
             let _base = crate::ast::enter_base_synthetic_owner();
+            // Not in Go: a new version of a published path can be freed
+            // (lsshells M3a). Its parse keeps its nodes in its store, not in
+            // the leaked AST arena, so they are freed with it (M3c). A
+            // prefetched parse keeps its leaked nodes.
+            let freeable = crate::ast::freeable_path(&key.path.0);
+            let _owned_nodes = freeable.then(crate::ast::enter_freeable_parse);
             let opts = key.source_file_parse_options();
             let content = fh.content();
             // PORT: during a program load a parse worker (`FilesParser`
@@ -99,7 +105,7 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             // Not in Go: a new version of a published path can be freed. The
             // holders of the parse (programs, cache entries) keep it alive
             // (lsshells M3a, `ast/file_version.rs`).
-            if crate::ast::freeable_path(&key.path.0) {
+            if freeable {
                 assert!(
                     file.version
                         .set(crate::ast::FileVersion::new(file.store))

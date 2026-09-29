@@ -137,7 +137,7 @@ pub fn has_syntactic_modifier(node: Node, flags: ModifierFlags) -> bool {
 // PERF: U4 (bind A). A tier 0 store node reads the U1 (b) modifier column
 // (`frozen_store_modifier_flags`), as `Node::modifier_flags` does, not its
 // modifier list.
-pub fn has_syntactic_modifier_in(node: Node, d: &'static NodeData, flags: ModifierFlags) -> bool {
+pub fn has_syntactic_modifier_in(node: Node, d: LoadedData, flags: ModifierFlags) -> bool {
     if let Some(modifier_flags) = frozen_store_modifier_flags(node) {
         debug_assert_eq!(modifier_flags, node.modifiers_in(d).modifier_flags());
         return modifier_flags.intersects(flags);
@@ -774,7 +774,7 @@ pub fn get_name_of_declaration(declaration: Node) -> Node {
 /// `get_name_of_declaration` on `d`, the data of the non-nil `declaration`
 /// that the caller already loaded with `parsed_node_data` (query Q7-3, see
 /// `Node::name_in`).
-pub fn get_name_of_declaration_in(declaration: Node, d: &'static NodeData) -> Node {
+pub fn get_name_of_declaration_in(declaration: Node, d: LoadedData) -> Node {
     name_of_declaration(declaration, || declaration.name_in(d))
 }
 
@@ -959,7 +959,7 @@ pub fn has_dynamic_name(declaration: Node) -> bool {
 
 /// `has_dynamic_name` on `d`, the data of the non-nil `declaration` that
 /// the caller already loaded with `parsed_node_data` (query Q7-3).
-pub fn has_dynamic_name_in(declaration: Node, d: &'static NodeData) -> bool {
+pub fn has_dynamic_name_in(declaration: Node, d: LoadedData) -> bool {
     let name = get_name_of_declaration_in(declaration, d);
     name.is_some() && is_dynamic_name(name)
 }

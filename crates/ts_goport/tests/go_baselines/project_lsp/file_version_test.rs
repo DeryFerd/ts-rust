@@ -3,8 +3,9 @@
 //! gives each new version of a path that it published before a
 //! `FileVersion` (lsshells M3a): the parse holds it, and so do the tables
 //! of each program version that has the file. It dies with its last holder,
-//! and its store and `GoFile` die with it (M3b); a later read of it panics.
-//! The first version of a file and every CLI publish stay static.
+//! and its store and `GoFile` die with it (M3b), and so do its astdata
+//! nodes and lists (M3c); a later read of it panics. The first version of a
+//! file and every CLI publish stay static.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -12,8 +13,8 @@ use std::sync::mpsc;
 
 use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
-    source_file_ecma_line_map, source_file_get_declaration_map, source_file_get_name_table,
-    source_file_imports, source_file_info,
+    owned_node_count, source_file_ecma_line_map, source_file_get_declaration_map,
+    source_file_get_name_table, source_file_imports, source_file_info,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -115,6 +116,35 @@ child_test! {
 }
 
 child_test! {
+    // The astdata nodes of each edited version belong to its store
+    // (lsshells M3c): a new version adds its nodes and a dead version frees
+    // them, so the count does not grow with the edits. The first version
+    // of each file is a static parse and owns none.
+    fn edited_file_nodes_die_with_their_version() {
+        let session = open_p1();
+        assert_eq!(owned_node_count(), 0, "a first version is a static parse");
+        body_edit(&session, 2, "2");
+        let one_version = owned_node_count();
+        assert!(one_version > 0, "the edited version owns its nodes");
+        body_edit(&session, 3, "3");
+        assert_eq!(
+            owned_node_count(),
+            one_version,
+            "the nodes of the released version are not freed"
+        );
+        body_edit(&session, 4, "4");
+        assert_eq!(owned_node_count(), one_version);
+        import_edit(&session, 5);
+        let p5 = program(&session, INDEX_URI);
+        let edited = root(&p5, INDEX_FILE);
+        assert!(file_version_probe(edited).is_some());
+        assert!(owned_node_count() > one_version, "the added import has nodes");
+        assert_eq!(edited.statements().len(), 3);
+        assert_eq!(sem_diag_count(&p5, INDEX_FILE), 0);
+    }
+}
+
+child_test! {
     // A holder of the frontend program keeps its file versions through the
     // parse. A thread seeded from a program version keeps them through the
     // version's tables after the release and after the frontend program
@@ -170,9 +200,10 @@ child_test! {
     // A freeable version keeps no parse: its `GoFile` owns copies of the
     // parse diagnostics and the JSDoc cache, and its JSDoc slice reads the
     // cache at each use. When the version dies they go with it, and a read
-    // of its store or `GoFile` panics (a stale read never reads other data).
-    // Its node columns are leaked in its node shell (lsshells M3 repair), so
-    // a stale node read gives the data of that node.
+    // of its store, its `GoFile` or its node data panics (a stale read never
+    // reads other data). Its header columns are leaked in its node shell
+    // (lsshells M3 repair), so a stale header read gives the data of that
+    // node; its node data and lists are freed with it (M3c).
     fn freeable_version_owns_its_lists_and_a_stale_read_panics() {
         let session = bare_session(files(&[
             (
@@ -223,6 +254,14 @@ child_test! {
         });
         assert_eq!(flags.as_deref(), Some(stale.as_str()), "a binder read of a dead version");
         assert_eq!(statement.kind(), statement_kind, "a node column read of a dead version");
+        let data = panic_message(|| {
+            let _ = statement.declaration_list();
+        });
+        assert_eq!(data.as_deref(), Some(stale.as_str()), "a node data read of a dead version");
+        let list = panic_message(|| {
+            let _ = edited.statements();
+        });
+        assert_eq!(list.as_deref(), Some(stale.as_str()), "a list read of a dead version");
         assert_eq!(diagnostics(root(&live, JS_FILE)), static_diagnostics);
         assert_eq!(diagnostics(first), static_diagnostics, "the first version is static");
     }
@@ -250,8 +289,13 @@ struct NodeFacts {
     end: i32,
     flags: u32,
     parent_kind: SyntaxKind,
-    /// The text of an identifier, else empty.
+    /// Go `node.Text()`: empty for a kind without a text.
     text: String,
+    modifier_flags: u32,
+    /// Each non-nil list of the node data: its length and `Loc`, and
+    /// whether it is a modifier list (lsshells M3c).
+    lists: Vec<(usize, i32, i32, bool)>,
+    js_doc: usize,
     has_symbol: bool,
     has_flow_node: bool,
 }
@@ -269,11 +313,16 @@ fn node_facts(n: Node) -> NodeFacts {
         } else {
             parent.kind()
         },
-        text: if n.kind() == SyntaxKind::Identifier {
-            n.text().to_string()
-        } else {
-            String::new()
+        text: n.text().to_string(),
+        modifier_flags: n.modifier_flags().0,
+        lists: {
+            let mut lists = Vec::new();
+            n.for_each_child_and_lists(&mut |_| false, &mut |l, is_mod| {
+                lists.push((l.nodes().len(), l.pos(), l.end(), is_mod));
+            });
+            lists
         },
+        js_doc: n.js_doc(Node::NIL).len(),
         has_symbol: n.symbol().is_some(),
         has_flow_node: n.flow_node().is_some(),
     }
@@ -376,6 +425,7 @@ child_test! {
             .unwrap_or_else(|error| panic!("cannot load {CONFIG}: {error}"));
         assert!(!free_file_versions());
         assert_eq!((file_versions_made(), dead_file_versions()), (0, 0));
+        assert_eq!(owned_node_count(), 0, "a CLI parse is static");
         assert!(
             program
                 .source_files()
@@ -406,8 +456,34 @@ fn flag_off_keeps_every_file_version_static() {
             body_edit(&session, 3, "3");
             import_edit(&session, 4);
             assert_eq!((file_versions_made(), dead_file_versions()), (0, 0));
+            assert_eq!(owned_node_count(), 0, "every parse is static");
             assert_eq!(source_file_info(second).file_name, INDEX_FILE);
             assert!(!tree(second).is_empty());
         },
     );
+}
+
+/// `GOPORT_OWNED_NODES=0` in a session: an edited version is freeable (its
+/// store and `GoFile` go with it), but its parse is static, as before
+/// lsshells M3c: no store owns astdata nodes, and the node data of a dead
+/// version still reads, from its node shell.
+#[test]
+fn owned_nodes_off_keeps_node_data_leaked() {
+    let path = concat!(module_path!(), "::owned_nodes_off_keeps_node_data_leaked");
+    let test = path.split_once("::").map_or(path, |(_, rest)| rest);
+    crate::support::child::run_test_in_child_with_env(test, &[("GOPORT_OWNED_NODES", "0")], || {
+        crate::project_lsp::projecttestutil::install_fs_override();
+        let session = open_p1();
+        body_edit(&session, 2, "2");
+        let second = root(&program(&session, INDEX_URI), INDEX_FILE);
+        let probe = file_version_probe(second).expect("the edited version is freeable");
+        let statements = second.statements().len();
+        body_edit(&session, 3, "3");
+        assert!(
+            probe.is_freed(),
+            "the version of the released program is not freed"
+        );
+        assert_eq!(owned_node_count(), 0, "every parse is static");
+        assert_eq!(second.statements().len(), statements);
+    });
 }

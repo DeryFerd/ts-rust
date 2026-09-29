@@ -1,5 +1,5 @@
 //! Rust-only: the owner and liveness of freeable file versions (lsshells
-//! M3a, M3b).
+//! M3a, M3b, M3c).
 //!
 //! Go frees an `*ast.SourceFile` when no program and no parse cache entry
 //! holds it (project/snapshot.go:537 `dispose`: `parseCache.Deref` for each
@@ -19,11 +19,17 @@
 //!
 //! M3b: at publish the version takes its `FileStore` and its `GoFile`
 //! (info, `node_bind`, `file_bind`, `flow_nodes`)
-//! (`ast::store::VersionStore`). Its node columns (headers, nodes, kinds,
-//! names, modifier bits, children) are leaked in its node shell, the tier
-//! 1 publish of its id, so node reads stay inline
-//! (`ast::store::node_shell`); the child link column is dropped. The node
-//! structs stay in the bump arena.
+//! (`ast::store::VersionStore`). Its header columns (headers, kinds, names,
+//! modifier bits, children, resolved) are leaked in its node shell, the
+//! tier 1 publish of its id, so the header and child reads stay inline
+//! (`ast::store::node_shell`); the child link column is dropped.
+//! M3c: its parse was a freeable parse (`ast::enter_freeable_parse`), so
+//! its store owns its astdata nodes (node structs and data boxes), its
+//! pending lists and its parse lists (`ast::store::OwnedAst`), and they go
+//! with the version. The node shell has no node column: a node data read
+//! of the file is a scoped read of the pinned version
+//! (`ast::with_scoped_store_node`), and a list of its node data is a handle
+//! (`ast::StoreList`) that is read at each use.
 //! When the last holder lets go, the version is dead: its store and
 //! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
@@ -38,7 +44,10 @@
 //! never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
 //! (the behavior before M3a); `=1` turns it on in any process, and then
 //! `program::update_program_version` (`goport_multiprog`) applies the same
-//! rule to its new parses.
+//! rule to its new parses (the compiler host opens the freeable parse scope
+//! for them, M3c). A parse that a parse worker made (prefetch) keeps its
+//! nodes in the leaked AST arena; its version still frees its store and
+//! `GoFile`.
 
 use super::store::VersionStore;
 use crate::prelude::*;

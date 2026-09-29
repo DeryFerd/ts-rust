@@ -261,7 +261,15 @@ pub fn parse_source_file(
 ) -> ParsedSourceFile {
     let mut p = new_parser();
     p.initialize_state(opts, source_text, script_kind);
-    let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
+    // lsshells M3c: each version of an edited file is a new parse, so a
+    // freeable parse (`crate::ast::is_freeable_parse`) interns the name,
+    // which all its versions share, instead of leaking it again.
+    let freeable = crate::ast::is_freeable_parse();
+    let file_name: &'static str = if freeable {
+        crate::core::Name::from(opts.file_name.as_str()).as_str()
+    } else {
+        Box::leak(opts.file_name.clone().into_boxed_str())
+    };
     p.store = new_file_store(file_name, source_text);
     // PERF: R3-1. A large bundled lib whose snapshot key matches is loaded
     // into the new store from `lib_parse.bin` (`lib_parse_snapshot.rs`),
@@ -270,7 +278,12 @@ pub fn parse_source_file(
         Some(loaded) => loaded.file,
         None => p.parse_into_store(),
     };
-    set_source_file_diagnostics(result.root, result.diagnostics.clone());
+    // PORT: only the tsconfig parser reads this table, and it parses no
+    // file of the parse cache. A freeable parse (an edited source file)
+    // does not add to it, so an edit leaks no entry (lsshells M3c).
+    if !freeable {
+        set_source_file_diagnostics(result.root, result.diagnostics.clone());
+    }
     result
 }
 

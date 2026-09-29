@@ -1388,7 +1388,7 @@ impl Binder {
 // Go: binder/binder.go:2749 getOptionalSymbolFlagForNode
 // PERF: query Q7-3. `d` is the data of `node`, which the caller already
 // loaded with `parsed_node_data`.
-pub fn get_optional_symbol_flag_for_node(node: Node, d: &'static NodeData) -> SymbolFlags {
+pub fn get_optional_symbol_flag_for_node(node: Node, d: LoadedData) -> SymbolFlags {
     let postfix_token = node.postfix_token_in(d);
     if postfix_token.is_some() && postfix_token.kind() == SyntaxKind::QuestionToken {
         SymbolFlags::OPTIONAL
