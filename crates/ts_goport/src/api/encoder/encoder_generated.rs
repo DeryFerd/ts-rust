@@ -873,7 +873,8 @@ pub fn get_children_property_mask(node: Node) -> u8 {
             // n := node.AsModuleDeclaration()
             (bool_to_byte(has_modifiers(node.modifiers())) << 0)
                 | (bool_to_byte(node.name().is_some()) << 1)
-                | (bool_to_byte(node.body().is_some()) << 2)
+                | (bool_to_byte(node.attributes().is_some()) << 2)
+                | (bool_to_byte(node.body().is_some()) << 3)
         }
         SyntaxKind::ImportEqualsDeclaration => {
             // n := node.AsImportEqualsDeclaration()

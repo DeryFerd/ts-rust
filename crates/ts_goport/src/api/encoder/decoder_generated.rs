@@ -1554,10 +1554,11 @@ impl AstDecoder<'_> {
                 let mut it = new_child_iter(child_indices);
                 let modifiers = self.modifier_list_at(it.next_if(mask, 0));
                 let name = self.node_at(it.next_if(mask, 1));
-                let body = self.node_at(it.next_if(mask, 2));
+                let attributes = self.node_at(it.next_if(mask, 2));
+                let body = self.node_at(it.next_if(mask, 3));
                 Ok(self
                     .factory
-                    .new_module_declaration(modifiers, keyword, name, body))
+                    .new_module_declaration(modifiers, keyword, name, attributes, body))
             }
             SyntaxKind::ImportEqualsDeclaration => {
                 let is_type_only = common_data & 1 != 0;
