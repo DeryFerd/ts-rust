@@ -343,22 +343,8 @@ thread_local! {
 // inside `read` that misses runs with its own `Arc` and pins nothing.
 #[inline]
 pub(crate) fn with_file_version<R>(file: usize, read: impl FnOnce(&FileVersion) -> R) -> Option<R> {
-    let mut read = Some(read);
-    let hit = PINS
-        .try_with(|pins| {
-            let pins = pins.try_borrow().ok()?;
-            let version = pins.find(file)?;
-            let read = read.take()?;
-            Some(read(&**version))
-        })
-        .ok()
-        .flatten();
-    if hit.is_some() {
-        return hit;
-    }
-    // The closure took `read` only on a hit.
-    let read = read.take()?;
-    let version = pin_file_version(file)?;
+    let version = pinned_file_version(file)?;
+    make_hot(&version);
     Some(read(&**version))
 }
 
@@ -396,6 +382,10 @@ fn pin_file_version(file: usize) -> Option<VersionPin> {
         None => return None,
     };
     let version = Rc::new(version);
+    // A hot version of an older epoch goes with the expired pins.
+    if HOT_KEY.with(Cell::get).1 != PIN_EPOCH.load(Ordering::Relaxed) {
+        drop_hot();
+    }
     let expired = PINS
         .try_with(|pins| {
             let mut pins = pins.try_borrow_mut().ok()?;
@@ -417,6 +407,112 @@ fn pin_file_version(file: usize) -> Option<VersionPin> {
     Some(version)
 }
 
+thread_local! {
+    /// The key of `HOT`: the file id and the pin epoch of its version, or
+    /// `usize::MAX` for no version. It has no `Drop`, so a test of it is one
+    /// thread-local load (`is_hot`).
+    static HOT_KEY: Cell<(usize, usize)> = const { Cell::new((usize::MAX, usize::MAX)) };
+    /// The hot version of this thread (lsshells M3f): the published
+    /// freeable version of its last pinned read, pinned (a clone of its pin
+    /// in `PINS`). The reads of that version test `is_hot` and read it with
+    /// `with_hot`, with no pin lookup. It is borrowed only inside this
+    /// module, never while other code runs.
+    static HOT: RefCell<Option<VersionPin>> = const { RefCell::new(None) };
+}
+
+/// True when published freeable version `file` is the hot version of this
+/// thread, pinned in the current pin epoch: `with_hot` reads it.
+// PERF: lsshells M3f. Two thread-local loads, one atomic load and two
+// compares. A static file misses it with no further load.
+#[inline(always)]
+pub(crate) fn is_hot(file: usize) -> bool {
+    // `try_with` is `#[inline]`; `LocalKey::with` is not, and it was not
+    // inlined at the hot read sites (m3f notes, h3).
+    HOT_KEY
+        .try_with(Cell::get)
+        .is_ok_and(|key| key == (file, PIN_EPOCH.load(Ordering::Relaxed)))
+}
+
+/// `read` on the published store of the hot version. Call it only after
+/// `is_hot` gave true on this thread, with no pinned read in between.
+/// `read` runs inside a shared borrow of `HOT`: a read inside it can read
+/// the hot version again, and a pinned read inside it of another version
+/// does not make that version hot (`make_hot_slow` skips a borrowed `HOT`).
+// PERF: lsshells M3f. `LocalKey::try_with` is `#[inline]`, so a hit is two
+// thread-local tests, a borrow and three loads to the store, with no call
+// and no pin clone. `LocalKey::with` is not `#[inline]`: with it the reads
+// called it out of line, and the calls cost more than the pin lookups they
+// saved (m3f notes, h1 and h3).
+#[inline(always)]
+pub(crate) fn with_hot<R>(read: impl FnOnce(&VersionStore) -> R) -> R {
+    let result = HOT.try_with(|hot| {
+        let hot = hot.borrow();
+        hot.as_deref()
+            .and_then(|version| version.published())
+            .map(read)
+    });
+    match result {
+        Ok(Some(result)) => result,
+        _ => no_hot_version(),
+    }
+}
+
+/// A clone of the pin of the hot version (`with_hot`), for a guard.
+#[inline(always)]
+pub(crate) fn hot_pin() -> VersionPin {
+    match HOT.try_with(|hot| hot.borrow().clone()) {
+        Ok(Some(version)) => version,
+        _ => no_hot_version(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn no_hot_version() -> ! {
+    panic!("no hot file version on this thread")
+}
+
+/// Makes `version` the hot version of this thread when it is published.
+#[inline]
+fn make_hot(version: &VersionPin) {
+    if is_hot(version.file) {
+        return;
+    }
+    make_hot_slow(version);
+}
+
+#[cold]
+#[inline(never)]
+fn make_hot_slow(version: &VersionPin) {
+    if version.published().is_none() {
+        return;
+    }
+    let previous = HOT
+        .try_with(|hot| {
+            let mut hot = hot.try_borrow_mut().ok()?;
+            let previous = hot.replace(Rc::clone(version));
+            HOT_KEY.with(|key| key.set((version.file, PIN_EPOCH.load(Ordering::Relaxed))));
+            Some(previous)
+        })
+        .ok()
+        .flatten();
+    // Dropped after the borrow ends: the last pin of a version frees it.
+    drop(previous);
+}
+
+/// Drops the hot version of this thread, when `HOT` is not borrowed.
+fn drop_hot() {
+    let previous = HOT
+        .try_with(|hot| {
+            let mut hot = hot.try_borrow_mut().ok()?;
+            HOT_KEY.with(|key| key.set((usize::MAX, usize::MAX)));
+            hot.take()
+        })
+        .ok()
+        .flatten();
+    drop(previous);
+}
+
 /// Drops the pins of this thread and makes every other thread drop its
 /// pins at its next pinned read. A program release calls it
 /// (`program::ReleasedProgram`), so a version that only the released
@@ -424,6 +520,7 @@ fn pin_file_version(file: usize) -> Option<VersionPin> {
 /// programs read are pinned again on their next read.
 pub fn release_file_version_pins() {
     PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
+    drop_hot();
     let pins = PINS
         .try_with(|pins| {
             let mut pins = pins.try_borrow_mut().ok()?;

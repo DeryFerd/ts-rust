@@ -1302,7 +1302,7 @@ impl NodeSlice {
     pub fn from_store(list: StoreList) -> Self {
         Self(SliceRepr::Store {
             list,
-            len: with_store_list(list, |l| l.ids().len()) as u32,
+            len: list.len() as u32,
         })
     }
 
@@ -1383,8 +1383,12 @@ impl NodeSlice {
             SliceRepr::Synthetic { .. } | SliceRepr::FileList { .. } => SliceIds::Slow,
             // An empty slice reads no node.
             SliceRepr::Store { len: 0, .. } => SliceIds::Nodes(&[]),
-            // lsshells M3c: the nodes are read once for the loop.
-            SliceRepr::Store { list, .. } => SliceIds::Read(store_list_nodes(list)),
+            // lsshells M3f: a short list is read once into the iterator; a
+            // longer one is read at each step. Neither copies to the heap.
+            SliceRepr::Store { list, len } if len as usize <= INLINE_NODES => {
+                SliceIds::Inline(store_list_first_nodes(list))
+            }
+            SliceRepr::Store { list, .. } => SliceIds::Store(list),
         };
         NodeSliceIter {
             slice: self,
@@ -1443,6 +1447,25 @@ fn file_list_node(file: usize, host: Node, i: usize) -> Node {
     published.unwrap_or_else(|| owned_store_js_doc(file, host, |jsdocs| jsdocs[i]))
 }
 
+/// The most nodes of a store list that `NodeSliceIter` reads once
+/// (`SliceIds::Inline`).
+const INLINE_NODES: usize = 4;
+
+/// The first `INLINE_NODES` nodes of `SliceRepr::Store { list }` (nil after
+/// its end).
+#[cold]
+#[inline(never)]
+fn store_list_first_nodes(list: StoreList) -> [Node; INLINE_NODES] {
+    let file = list.file();
+    let mut nodes = [Node::NIL; INLINE_NODES];
+    with_store_list(list, |l| {
+        for (node, &id) in nodes.iter_mut().zip(l.ids()) {
+            *node = Node::new(file, id);
+        }
+    });
+    nodes
+}
+
 /// Node `i` of `SliceRepr::Store { list }`. Panics when `i` is out of
 /// range, like Go.
 #[cold]
@@ -1452,32 +1475,24 @@ fn store_list_node(list: StoreList, i: usize) -> Node {
     Node::new(list.file(), id)
 }
 
-/// The nodes of `SliceRepr::Store { list }`, read once for a loop
-/// (`NodeSliceIter`).
-#[cold]
-#[inline(never)]
-fn store_list_nodes(list: StoreList) -> Rc<[Node]> {
-    let file = list.file();
-    with_store_list(list, |l| {
-        l.ids().iter().map(|&id| Node::new(file, id)).collect()
-    })
-}
-
 // PERF: 24 bytes. The synthetic list is a variant of `SyntheticList`, whose
 // tag and index fit next to the length.
 const _: () = assert!(std::mem::size_of::<NodeSlice>() == 24);
 
 /// How a `NodeSliceIter` turns position `i` into a node, read once for the
 /// whole loop.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum SliceIds {
     /// The nodes of the slice (`NodeSlice::from_nodes`).
     Nodes(&'static [Node]),
     /// The ids of the slice, of a frozen store (`frozen_store_ids`).
     Frozen(&'static [crate::astdata::NodeId], FrozenIds),
-    /// The nodes of a list of a store that owns its nodes, read once
-    /// (lsshells M3c, `store_list_nodes`).
-    Read(Rc<[Node]>),
+    /// A list of a store that owns its nodes, read at each step
+    /// (`store_list_node`, lsshells M3f).
+    Store(StoreList),
+    /// The nodes of a short list of a store that owns its nodes, read once
+    /// (`store_list_first_nodes`, lsshells M3f).
+    Inline([Node; INLINE_NODES]),
     /// `NodeSlice::get` per node: ids before freeze, synthetic lists and
     /// the file lists of freeable file versions.
     Slow,
@@ -1506,7 +1521,8 @@ impl NodeSliceIter {
                 debug_assert_eq!(n, self.slice.get(i));
                 n
             }
-            SliceIds::Read(nodes) => nodes[i],
+            &SliceIds::Store(list) => store_list_node(list, i),
+            SliceIds::Inline(nodes) => nodes[i],
             SliceIds::Slow => self.slice.get(i),
         }
     }
@@ -1768,7 +1784,7 @@ impl NodeList {
             ListRef::Nil => false,
             ListRef::Ts { list, .. } => list.has_trailing_comma,
             ListRef::Pending { list, .. } => list.has_trailing_comma,
-            ListRef::Store(list) => with_store_list(list, |l| l.has_trailing_comma()),
+            ListRef::Store(list) => list.stored_trailing_comma(),
             repr => repr
                 .synthetic_list()
                 .is_some_and(|list| with_synthetic_list(list, |l| l.nodes().has_trailing_comma)),
@@ -1821,7 +1837,7 @@ impl NodeList {
             ListRef::Nil => true,
             ListRef::Ts { list, .. } => is_nil_list_marker(list),
             ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
-            ListRef::Store(list) => is_nil_list_range(&with_store_list(list, |l| l.range())),
+            ListRef::Store(list) => list.is_nil_marker(),
             ListRef::Field { .. } | ListRef::Own { .. } => false,
         }
     }
@@ -2389,6 +2405,19 @@ impl Node {
     #[cold]
     #[inline(never)]
     fn bind_field_slow<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
+        let file = self.file_index();
+        // lsshells M3f: the hot file version first, with the rest out of
+        // line, so this path saves few registers.
+        if crate::ast::is_hot_file(file) {
+            return crate::ast::with_hot_go_file(|go_file| field(node_bind_in(go_file, index)));
+        }
+        self.bind_field_cold(index, field)
+    }
+
+    /// `bind_field_slow` for a file that is not the hot file version.
+    #[cold]
+    #[inline(never)]
+    fn bind_field_cold<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
         let file = self.file_index();
         match crate::ast::freeable_go_file_read(file, |go_file| *node_bind_in(go_file, index)) {
             Some(bind) => field(&bind),

@@ -855,6 +855,10 @@ fn scoped_ast_node(n: Node) -> ScopedNode {
 #[cold]
 #[inline(never)]
 pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    // A synthetic id is never a hot file.
+    if crate::ast::store::is_hot_store_node(n) {
+        return crate::ast::store::with_hot_store_node(n, f);
+    }
     f(&scoped_ast_node(n))
 }
 
@@ -1061,9 +1065,11 @@ impl SelectorSite {
     #[inline(never)]
     fn new_id(&self, sel: ListSel) -> u32 {
         let id = SELECTOR_COUNT.fetch_add(1, Ordering::Relaxed);
+        // The last id is `ast::store::PENDING_SEL`.
         assert!(
-            id < SELECTOR_LIMIT,
-            "more than {SELECTOR_LIMIT} list selector sites"
+            id < SELECTOR_LIMIT - 1,
+            "more than {} list selector sites",
+            SELECTOR_LIMIT - 1
         );
         // A new id: this is its only write.
         let _ = SELECTORS[id].set(sel);

@@ -1062,6 +1062,9 @@ fn freeable_read<R>(
     file: usize,
     read: impl for<'a> FnOnce(&'a Frozen<'a>) -> Option<R>,
 ) -> Option<R> {
+    if super::file_version::is_hot(file) {
+        return super::file_version::with_hot(|store| store.view(read));
+    }
     if !super::file_version::any_freeable_published() {
         return None;
     }
@@ -1092,6 +1095,9 @@ fn freeable_read_inline<R>(
 /// other file.
 #[inline]
 pub fn freeable_go_file_read<R>(file: usize, read: impl FnOnce(&GoFile) -> R) -> Option<R> {
+    if super::file_version::is_hot(file) {
+        return Some(super::file_version::with_hot(|store| read(&store.go_file)));
+    }
     if !super::file_version::any_freeable_published() {
         return None;
     }
@@ -1107,6 +1113,9 @@ pub fn freeable_go_file_read<R>(file: usize, read: impl FnOnce(&GoFile) -> R) ->
 // `Frozen` view, as `Node::bind_field_slow` does for the binder data.
 #[inline]
 fn with_version_store<R>(file: usize, read: impl FnOnce(&VersionStore) -> R) -> Option<R> {
+    if super::file_version::is_hot(file) {
+        return Some(super::file_version::with_hot(read));
+    }
     if !super::file_version::any_freeable_published()
         || file >= TIER1_LIMIT
         || file >= PUBLISHED.load(Ordering::Acquire)
@@ -1135,6 +1144,9 @@ fn static_frozen<T: 'static>(
 #[cold]
 #[inline(never)]
 fn published_version(file: usize) -> Option<super::file_version::VersionPin> {
+    if super::file_version::is_hot(file) {
+        return Some(super::file_version::hot_pin());
+    }
     if file >= TIER1_LIMIT
         || !super::file_version::any_freeable_published()
         || file >= PUBLISHED.load(Ordering::Acquire)
@@ -1483,11 +1495,9 @@ const OWNED_CHUNK: usize = 256;
 /// `alloc_store_shared_name_node`, or a lib snapshot slot).
 const NO_CELL: u32 = u32::MAX;
 
-/// A chunk of `OwnedAst::chunks`: up to `OWNED_CHUNK` cells that fill in
-/// order. The owner pushes into the last chunk while no reader holds it
-/// (`Arc::get_mut`); a held chunk gets no new cell.
-// PERF: lsshells M3c. A plain push: a `OnceLock` cell per node cost an
-// atomic write and an out-of-line `Once::call` per node of the parse.
+/// A sealed chunk of `OwnedAst::chunks` (up to `OWNED_CHUNK` cells), or
+/// the flat table of every cell after the parse (`OwnedAst::flat`). A held
+/// read shares it (`HeldStoreNode::Owned`).
 pub type OwnedChunk = Arc<Vec<crate::astdata::Node>>;
 
 /// The number of astdata nodes that the live freeable stores own
@@ -1516,12 +1526,21 @@ pub fn owned_node_count() -> usize {
 /// the write (`StoreList`, which names the cell) still reads the old list,
 /// like a Go `*NodeList` pointer.
 pub(crate) struct OwnedAst {
-    /// The cells, in chunks whose nodes never move: a read can hold its
-    /// chunk apart from the store borrow (`HeldStoreNode`). Cell `c` is node
-    /// `c % OWNED_CHUNK` of chunk `c / OWNED_CHUNK`. A new node fills the
-    /// next cell of the last chunk, or starts a new chunk when that chunk is
-    /// full or held.
+    /// While the parser runs: the sealed chunks, whose nodes never move, so
+    /// a held read can share one apart from the store borrow
+    /// (`HeldStoreNode`). Cell `c` is node `c % OWNED_CHUNK` of chunk
+    /// `c / OWNED_CHUNK`; the open chunk (`open`) has the chunk index
+    /// `chunks.len()`.
     chunks: Vec<OwnedChunk>,
+    /// While the parser runs: the open chunk. A new node fills its next
+    /// cell (a plain push); a full chunk, or one that a held read needs, is
+    /// sealed (`seal`), and the next node starts a new chunk.
+    open: Vec<crate::astdata::Node>,
+    /// After the parse (`finish`): every cell, `flat[cell]`, in one table.
+    /// A cell that an early seal skipped holds `hole_node`.
+    // PERF: lsshells M3f. A node read of a published version is one index
+    // (after `cell_of`), not a chunk and a cell.
+    flat: OwnedChunk,
     /// The number of nodes in the chunks.
     len: usize,
     /// The part of `len` that `OWNED_NODES` counts (`count_owned_nodes`).
@@ -1550,6 +1569,8 @@ impl OwnedAst {
         cell_of.push(NO_CELL);
         Self {
             chunks: Vec::new(),
+            open: Vec::new(),
+            flat: Arc::default(),
             len: 0,
             counted: 0,
             cell_of,
@@ -1560,36 +1581,85 @@ impl OwnedAst {
     }
 
     /// The astdata node in cell `cell`.
-    #[inline]
+    #[inline(always)]
     fn node(&self, cell: u32) -> &crate::astdata::Node {
-        let cell = cell as usize;
-        &self.chunks[cell / OWNED_CHUNK][cell % OWNED_CHUNK]
+        match self.flat.get(cell as usize) {
+            Some(node) => node,
+            None => self.build_node(cell as usize),
+        }
     }
 
-    /// The node in cell `cell`, held apart from the store borrow.
-    fn held(&self, cell: u32) -> HeldStoreNode {
-        let cell = cell as usize;
-        HeldStoreNode::Owned {
-            chunk: Arc::clone(&self.chunks[cell / OWNED_CHUNK]),
-            index: cell % OWNED_CHUNK,
+    /// `node` while the parser runs.
+    #[inline]
+    fn build_node(&self, cell: usize) -> &crate::astdata::Node {
+        match self.chunks.get(cell / OWNED_CHUNK) {
+            Some(chunk) => &chunk[cell % OWNED_CHUNK],
+            None => &self.open[cell % OWNED_CHUNK],
         }
+    }
+
+    /// The node in cell `cell`, held apart from the store borrow. A cell of
+    /// the open chunk seals it first (`&mut`). `None` for a cell of the
+    /// open chunk when the caller has only a shared borrow.
+    fn held(&self, cell: u32) -> Option<HeldStoreNode> {
+        let cell = cell as usize;
+        if cell < self.flat.len() {
+            return Some(HeldStoreNode::Owned {
+                chunk: Arc::clone(&self.flat),
+                index: cell,
+            });
+        }
+        let chunk = self.chunks.get(cell / OWNED_CHUNK)?;
+        Some(HeldStoreNode::Owned {
+            chunk: Arc::clone(chunk),
+            index: cell % OWNED_CHUNK,
+        })
+    }
+
+    /// `held`, which seals the open chunk when it has the cell.
+    fn held_mut(&mut self, cell: u32) -> HeldStoreNode {
+        if self.flat.is_empty() && cell as usize / OWNED_CHUNK == self.chunks.len() {
+            self.seal();
+        }
+        self.held(cell).expect("a sealed cell")
+    }
+
+    /// Moves the open chunk to the sealed chunks.
+    fn seal(&mut self) {
+        let open = std::mem::replace(&mut self.open, Vec::with_capacity(OWNED_CHUNK));
+        self.chunks.push(Arc::new(open));
     }
 
     /// Puts `node` in the next cell and returns that cell.
+    // PERF: lsshells M3f. A plain push into the open chunk; M3c tested
+    // `Arc::get_mut` (an atomic compare-exchange) per node.
+    #[inline]
     fn push(&mut self, node: crate::astdata::Node) -> u32 {
+        debug_assert!(self.flat.is_empty(), "a node pushed after the parse");
         self.len += 1;
-        let chunk = self.chunks.len();
-        if let Some(last) = self.chunks.last_mut()
-            && last.len() < OWNED_CHUNK
-            && let Some(cells) = Arc::get_mut(last)
-        {
-            cells.push(node);
-            return owned_cell(chunk - 1, cells.len() - 1);
+        if self.open.len() == OWNED_CHUNK {
+            self.seal();
+        } else if self.open.capacity() == 0 {
+            self.open.reserve_exact(OWNED_CHUNK);
         }
-        let mut cells = Vec::with_capacity(OWNED_CHUNK);
-        cells.push(node);
-        self.chunks.push(Arc::new(cells));
-        owned_cell(chunk, 0)
+        self.open.push(node);
+        owned_cell(self.chunks.len(), self.open.len() - 1)
+    }
+
+    /// Moves every cell into `flat` (end of the parse). A sealed chunk that
+    /// a held read still shares is copied.
+    fn finish(&mut self) {
+        let chunks = std::mem::take(&mut self.chunks);
+        let mut flat = Vec::with_capacity(chunks.len() * OWNED_CHUNK + self.open.len());
+        for chunk in chunks {
+            let mut cells = Arc::try_unwrap(chunk).unwrap_or_else(|chunk| (*chunk).clone());
+            flat.append(&mut cells);
+            // An early seal (`held_mut`) leaves the rest of its chunk unused.
+            flat.resize_with(flat.len().next_multiple_of(OWNED_CHUNK), hole_node);
+        }
+        flat.append(&mut self.open);
+        self.open = Vec::new();
+        self.flat = Arc::new(flat);
     }
 
     /// Adds the nodes of this store that `OWNED_NODES` does not count yet.
@@ -1602,12 +1672,10 @@ impl OwnedAst {
 
     /// Adds pending list `list` and returns its handle in store `file`.
     fn push_pending(&mut self, file: usize, list: OwnedPending) -> StoreList {
+        let key = u32::try_from(self.pending.len()).expect("too many pending lists");
+        let handle = StoreList::new(file, key, PENDING_SEL, StoreListView::Pending(&list));
         self.pending.push(list);
-        StoreList {
-            file: file as u32,
-            key: u32::try_from(self.pending.len() - 1).expect("too many pending lists"),
-            sel: PENDING_SEL,
-        }
+        handle
     }
 }
 
@@ -1615,6 +1683,15 @@ impl Drop for OwnedAst {
     fn drop(&mut self) {
         OWNED_NODES.fetch_sub(self.counted, Ordering::Relaxed);
     }
+}
+
+/// The node in a cell that an early seal skipped (`OwnedAst::finish`). No
+/// slot names it. Its data box has no size, so it allocates nothing.
+fn hole_node() -> crate::astdata::Node {
+    ast_node(
+        SyntaxKind::Unknown,
+        NodeData::Token(Box::new(crate::astdata::TokenData)),
+    )
 }
 
 /// The cell of node `index` of chunk `chunk` (`OwnedAst::chunks`).
@@ -1654,8 +1731,9 @@ pub struct OwnedPending {
     flags: Option<crate::astdata::ModifierFlags>,
 }
 
-/// `StoreList::sel` of a pending list.
-const PENDING_SEL: u32 = u32::MAX;
+/// The selector id of a pending list (`StoreList::sel_id`). The selector
+/// ids of the list sites are below it (`ast::synthetic::SELECTOR_LIMIT`).
+pub(crate) const PENDING_SEL: u32 = (1 << StoreList::SEL_BITS) - 1;
 
 /// A list of a store that owns its astdata nodes (a freeable parse,
 /// lsshells M3c), as a `NodeList`, `ModifierList` or `NodeSlice` names it:
@@ -1663,19 +1741,99 @@ const PENDING_SEL: u32 = u32::MAX;
 /// data of cell `key` of store `file`, or pending list `key` of that store
 /// when `sel` is `PENDING_SEL`. It is read at each use (`with_store_list`),
 /// so it keeps no borrow. 12 bytes, so the list handles stay 16 bytes.
+// PERF: lsshells M3f. The handle also keeps what the hot list reads need
+// and a list never changes (`sel`: the Go nil marker, the astdata
+// `has_trailing_comma` bit and the length), so `NodeList::is_nil`,
+// `NodeList::nodes` and `NodeSlice::len` read no store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreList {
     file: u32,
     key: u32,
+    /// Bits 0 to 9: the selector id, or `PENDING_SEL`. Bit 10: the range
+    /// is the Go nil marker (`is_nil_list_range`). Bit 11: the astdata
+    /// `has_trailing_comma` bit. Bits 12 to 31: the length, or `LEN_MAX`
+    /// for a longer list (then read at each use).
     sel: u32,
 }
 
 impl StoreList {
+    const SEL_BITS: u32 = 10;
+    const NIL_BIT: u32 = 1 << 10;
+    const COMMA_BIT: u32 = 1 << 11;
+    const LEN_SHIFT: u32 = 12;
+    const LEN_MAX: u32 = u32::MAX >> Self::LEN_SHIFT;
+
+    /// The handle of list `view` of store `file`: pending list `key`
+    /// (`sel` is `PENDING_SEL`), or the list that selector `sel` finds in
+    /// the data of cell `key`.
+    fn new(file: usize, key: u32, sel: u32, view: StoreListView<'_>) -> Self {
+        debug_assert!(sel <= PENDING_SEL);
+        let mut bits = sel;
+        if is_nil_list_range(&view.range()) {
+            bits |= Self::NIL_BIT;
+        }
+        if view.has_trailing_comma() {
+            bits |= Self::COMMA_BIT;
+        }
+        let len =
+            u32::try_from(view.ids().len()).map_or(Self::LEN_MAX, |len| len.min(Self::LEN_MAX));
+        Self {
+            file: file as u32,
+            key,
+            sel: bits | (len << Self::LEN_SHIFT),
+        }
+    }
+
     /// The store id of the list.
     #[inline]
     #[must_use]
     pub fn file(self) -> usize {
         self.file as usize
+    }
+
+    /// The selector id, or `PENDING_SEL` for a pending list.
+    #[inline]
+    fn sel_id(self) -> u32 {
+        self.sel & PENDING_SEL
+    }
+
+    /// True when the list is the Go `nil` marker (`NIL_LIST_POS`): Go
+    /// `list == nil`.
+    #[inline]
+    #[must_use]
+    pub fn is_nil_marker(self) -> bool {
+        self.sel & Self::NIL_BIT != 0
+    }
+
+    /// The astdata `has_trailing_comma` bit.
+    #[inline]
+    #[must_use]
+    pub fn stored_trailing_comma(self) -> bool {
+        self.sel & Self::COMMA_BIT != 0
+    }
+
+    /// The number of nodes in the list.
+    #[inline]
+    #[must_use]
+    pub fn len(self) -> usize {
+        match self.sel >> Self::LEN_SHIFT {
+            Self::LEN_MAX => self.long_len(),
+            len => len as usize,
+        }
+    }
+
+    /// `len` of a list of `LEN_MAX` nodes or more.
+    #[cold]
+    #[inline(never)]
+    fn long_len(self) -> usize {
+        with_store_list(self, |l| l.ids().len())
+    }
+
+    /// True when the list has no nodes.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.sel >> Self::LEN_SHIFT == 0
     }
 }
 
@@ -1764,6 +1922,9 @@ impl<'a> StoreListView<'a> {
 #[inline]
 pub fn with_store_list<R>(list: StoreList, read: impl FnOnce(StoreListView<'_>) -> R) -> R {
     let file = list.file();
+    if super::file_version::is_hot(file) {
+        return super::file_version::with_hot(|version| read(version.store.list_view(list)));
+    }
     let mut read = Some(read);
     if let Some(result) = with_version_store(file, |version| {
         (read.take().expect("the list is read once"))(version.store.list_view(list))
@@ -1783,8 +1944,8 @@ pub fn same_store_list(a: StoreList, b: StoreList) -> bool {
     }
     a.file == b.file
         && a.key == b.key
-        && a.sel != PENDING_SEL
-        && b.sel != PENDING_SEL
+        && a.sel_id() != PENDING_SEL
+        && b.sel_id() != PENDING_SEL
         && with_store_list(a, |l| l.ptr()) == with_store_list(b, |l| l.ptr())
 }
 
@@ -1825,7 +1986,7 @@ pub enum HeldStoreNode {
 impl std::ops::Deref for HeldStoreNode {
     type Target = crate::astdata::Node;
 
-    #[inline]
+    #[inline(always)]
     fn deref(&self) -> &crate::astdata::Node {
         match self {
             Self::Static(node) => *node,
@@ -1860,6 +2021,11 @@ pub enum StaticNode {
 #[must_use]
 pub fn static_store_node(n: Node) -> StaticNode {
     let (file, index) = (n.file_index(), slot_index(n));
+    // A published store is never a build store. The static tiers missed,
+    // so the hot version has no node column: it owns its nodes.
+    if super::file_version::is_hot(file) {
+        return StaticNode::Scoped;
+    }
     if let Some(store) = active_store(file) {
         return store.borrow().static_node_of(index);
     }
@@ -1901,6 +2067,9 @@ fn static_store_node_slow(file: usize, index: usize) -> StaticNode {
 // the edited file (`Node::bind_field_slow`).
 pub fn with_scoped_store_node<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     let (file, index) = (n.file_index(), slot_index(n));
+    if super::file_version::is_hot(file) {
+        return super::file_version::with_hot(|version| read(version.store.slot_ast_node(index)));
+    }
     let mut read = Some(read);
     if let Some(result) = with_version_store(file, |version| {
         (read.take().expect("the node is read once"))(version.store.slot_ast_node(index))
@@ -1925,6 +2094,9 @@ pub fn with_scoped_store_node<R>(n: Node, read: impl FnOnce(&crate::astdata::Nod
 #[inline]
 pub fn read_store_node_miss<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     let (file, index) = (n.file_index(), slot_index(n));
+    if super::file_version::is_hot(file) {
+        return super::file_version::with_hot(|version| read(version.store.slot_ast_node(index)));
+    }
     if let Some(store) = active_store(file) {
         let s = store.borrow();
         if s.cell_of(index) == NO_CELL {
@@ -1952,6 +2124,38 @@ pub fn read_store_node_miss<R>(n: Node, read: impl FnOnce(&crate::astdata::Node)
     }
 }
 
+/// True when `file` is the hot file version of this thread
+/// (`ast::file_version::is_hot`, lsshells M3f).
+#[inline(always)]
+#[must_use]
+pub fn is_hot_file(file: usize) -> bool {
+    super::file_version::is_hot(file)
+}
+
+/// `read` on the `GoFile` of the hot file version (`is_hot_file`). `read`
+/// runs inside the thread-local borrow: keep it small.
+#[inline(always)]
+pub fn with_hot_go_file<R>(read: impl FnOnce(&GoFile) -> R) -> R {
+    super::file_version::with_hot(|version| read(&version.go_file))
+}
+
+/// True when store node `n` is a node of the hot file version of this
+/// thread (`ast::file_version::is_hot`, lsshells M3f).
+#[inline(always)]
+#[must_use]
+pub fn is_hot_store_node(n: Node) -> bool {
+    super::file_version::is_hot(n.file_index())
+}
+
+/// `read` on the astdata node of node `n` of the hot file version
+/// (`is_hot_store_node`). `read` can make nodes (of other stores: a
+/// published store takes no new node).
+#[inline(always)]
+pub fn with_hot_store_node<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    let index = slot_index(n);
+    super::file_version::with_hot(|version| read(version.store.slot_ast_node(index)))
+}
+
 /// The astdata node of store node `n` held apart from its store
 /// (`HeldStoreNode`), so the reader can make and change nodes of that
 /// store. For a node with no `'static` node, as `with_scoped_store_node`.
@@ -1964,20 +2168,91 @@ pub fn held_store_node(n: Node) -> HeldStoreNode {
             slot: index,
         };
     }
+    // A held read inside a scoped read of the same store (a shared borrow)
+    // cannot seal the open chunk, so it clones the node.
     match unpublished_store(file) {
-        Some(store) => store.borrow().held_slot_node(index),
+        Some(store) => match store.try_borrow_mut() {
+            Ok(mut s) => s.held_slot_node_mut(index),
+            Err(_) => store.borrow().held_slot_node(index),
+        },
         None => panic!("node {n:?} is not synthetic and has no store"),
     }
 }
 
 /// A list field that a list selector found in the data of a store node
 /// with no `'static` node (`scoped_store_list_of`).
+#[derive(Clone, Copy)]
 pub enum ScopedList {
     /// The node is static after all (a shared name node, or a freeable
     /// file version whose parse was not freeable): a `'static` list.
     Static(AnyList<'static>),
     /// A list that the store owns.
     Store(StoreList),
+}
+
+/// Entries of `HOT_LISTS`.
+const HOT_LIST_SLOTS: usize = 256;
+
+/// One entry of `HOT_LISTS`: a node, a selector id and what
+/// `scoped_store_list_of` gave for them.
+#[derive(Clone, Copy)]
+struct HotListEntry {
+    node: Node,
+    sel_id: u32,
+    found: Option<Option<ScopedList>>,
+}
+
+thread_local! {
+    /// The last `scoped_store_list_of` answers for nodes of hot file
+    /// versions (`file_version::is_hot`), by node and selector id, direct
+    /// mapped (lsshells M3f). A published version never changes and a file
+    /// id is never reused, so an entry stays true; a node of a dead
+    /// version is never hot, so its entries are not read.
+    // PERF: the checker asks for the same lists of the edited file many
+    // times (parameters, type parameters, members).
+    static HOT_LISTS: RefCell<[HotListEntry; HOT_LIST_SLOTS]> = const {
+        RefCell::new(
+            [HotListEntry {
+                node: Node::NIL,
+                sel_id: 0,
+                found: None,
+            }; HOT_LIST_SLOTS],
+        )
+    };
+}
+
+/// `scoped_store_list_of` for node `n` of the hot version: the entry of
+/// `HOT_LISTS`, or `pick` (the read), whose answer becomes the entry.
+#[inline]
+fn hot_list_of(
+    n: Node,
+    sel_id: u32,
+    pick: impl FnOnce() -> Option<Option<ScopedList>>,
+) -> Option<Option<ScopedList>> {
+    let slot = ((n.0 ^ (u64::from(sel_id) << 44)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56)
+        as usize
+        % HOT_LIST_SLOTS;
+    let hit = HOT_LISTS
+        .try_with(|lists| {
+            let entry = lists.borrow()[slot];
+            (entry.node == n && entry.sel_id == sel_id).then_some(entry.found)
+        })
+        .ok()
+        .flatten();
+    if let Some(found) = hit {
+        return found;
+    }
+    let found = pick();
+    let _ = HOT_LISTS.try_with(|lists| {
+        if let Ok(mut lists) = lists.try_borrow_mut() {
+            lists[slot] = HotListEntry {
+                node: n,
+                sel_id,
+                found,
+            };
+        }
+    });
+    found
 }
 
 /// The list field that `sel` finds in the data of store node `n`, which
@@ -1996,15 +2271,21 @@ pub fn scoped_store_list_of(n: Node, sel_id: u32, sel: ListSel) -> Option<Option
             sel(&node.data).map(|found| found.map(ScopedList::Static))
         }
         cell => sel(&s.owned_ref().node(cell).data).map(|found| {
-            found.map(|_| {
-                ScopedList::Store(StoreList {
-                    file: file as u32,
-                    key: cell,
-                    sel: sel_id,
-                })
+            found.map(|list| {
+                ScopedList::Store(StoreList::new(
+                    file,
+                    cell,
+                    sel_id,
+                    StoreListView::Data(list),
+                ))
             })
         }),
     };
+    if super::file_version::is_hot(file) {
+        return hot_list_of(n, sel_id, || {
+            super::file_version::with_hot(|version| pick(&version.store))
+        });
+    }
     if let Some(found) = with_version_store(file, |version| pick(&version.store)) {
         return found;
     }
@@ -2040,7 +2321,7 @@ impl FileStore {
 
     /// The astdata node of node slot `index`: the node that the store owns
     /// or its static node. Panics on the nil slot and alias slots.
-    #[inline]
+    #[inline(always)]
     fn slot_ast_node(&self, index: usize) -> &crate::astdata::Node {
         match self.cell_of(index) {
             NO_CELL => slot_node(self.nodes[index]),
@@ -2058,11 +2339,27 @@ impl FileStore {
         }
     }
 
-    /// `slot_ast_node`, held apart from the store borrow.
+    /// `slot_ast_node`, held apart from the store borrow. A node of the
+    /// open chunk is cloned: this borrow is shared (see `held_store_node`).
     fn held_slot_node(&self, index: usize) -> HeldStoreNode {
         match self.cell_of(index) {
             NO_CELL => HeldStoreNode::Static(slot_node(self.nodes[index])),
-            cell => self.owned_ref().held(cell),
+            cell => {
+                let owned = self.owned_ref();
+                owned.held(cell).unwrap_or_else(|| HeldStoreNode::Owned {
+                    chunk: Arc::new(vec![owned.node(cell).clone()]),
+                    index: 0,
+                })
+            }
+        }
+    }
+
+    /// `held_slot_node` with the store borrowed for a write: a node of the
+    /// open chunk seals it.
+    fn held_slot_node_mut(&mut self, index: usize) -> HeldStoreNode {
+        match self.cell_of(index) {
+            NO_CELL => HeldStoreNode::Static(slot_node(self.nodes[index])),
+            cell => self.owned_mut().held_mut(cell),
         }
     }
 
@@ -2076,10 +2373,10 @@ impl FileStore {
     #[inline]
     fn list_view(&self, list: StoreList) -> StoreListView<'_> {
         let owned = self.owned_ref();
-        if list.sel == PENDING_SEL {
+        if list.sel_id() == PENDING_SEL {
             return StoreListView::Pending(&owned.pending[list.key as usize]);
         }
-        match list_selector(list.sel)(&owned.node(list.key).data) {
+        match list_selector(list.sel_id())(&owned.node(list.key).data) {
             Some(Some(found)) => StoreListView::Data(found),
             _ => panic!("a store list handle names a list that its node data does not have"),
         }
@@ -2102,11 +2399,10 @@ impl FileStore {
         let Some(owned) = self.owned.as_deref() else {
             return;
         };
-        let chunks: &'static [OwnedChunk] = Vec::leak(owned.chunks.clone());
+        let flat: &'static OwnedChunk = Box::leak(Box::new(Arc::clone(&owned.flat)));
         for (slot, &cell) in owned.cell_of.iter().enumerate() {
             if cell != NO_CELL {
-                let cell = cell as usize;
-                self.nodes[slot] = Some(&chunks[cell / OWNED_CHUNK][cell % OWNED_CHUNK]);
+                self.nodes[slot] = Some(&flat[cell as usize]);
             }
         }
     }
@@ -2292,6 +2588,20 @@ pub fn static_go_file(file: usize) -> Option<&'static GoFile> {
 /// costs no guard: hot readers (`Node::bind`) use it.
 #[inline]
 pub fn try_with_go_file<R>(file: usize, f: impl FnOnce(&GoFile) -> R) -> Option<R> {
+    if let Some(go_file) = static_go_file(file) {
+        return Some(f(go_file));
+    }
+    try_with_go_file_slow(file, f)
+}
+
+/// `try_with_go_file` after the static tiers missed: the hot file version
+/// with no `Frozen` view (lsshells M3f), else the registry read.
+#[cold]
+#[inline(never)]
+fn try_with_go_file_slow<R>(file: usize, f: impl FnOnce(&GoFile) -> R) -> Option<R> {
+    if super::file_version::is_hot(file) {
+        return Some(super::file_version::with_hot(|version| f(&version.go_file)));
+    }
     frozen!(file, go_files, |_, _, go_file| f(go_file))
 }
 
@@ -2713,6 +3023,7 @@ impl FileStore {
             owned.cell_of.shrink_to_fit();
             owned.pending.shrink_to_fit();
             owned.count_owned_nodes();
+            owned.finish();
         }
         mark_source_file_roots(self);
     }
