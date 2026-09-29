@@ -25,7 +25,7 @@ pub struct ParseTask {
     pub package_id: PackageId,
 
     pub metadata: SourceFileMetaData,
-    pub resolutions_in_file: ModeAwareCache<Rc<ResolvedModule>>,
+    pub resolutions_in_file: ModeAwareCache<Arc<ResolvedModule>>,
     pub resolutions_trace: Vec<DiagAndArgs>,
     pub type_resolutions_in_file: ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>,
     pub type_resolutions_trace: Vec<DiagAndArgs>,
@@ -278,12 +278,26 @@ pub struct FilesParser {
 // queued before holds the task that loaded the file (`loaded_task`). When
 // files import each other, these links make an `Rc` cycle that is never
 // freed. Every task that has links is in `task_data_by_path` (only those
-// tasks load), so taking their links out lets the whole graph go. A
+// tasks load), so taking their links out lets the whole graph go
+// (`ParseTaskLinks`). On the dispatch thread of the LSP server that free
+// waits until the answer is sent (`gostd::local::drop_later`). A
 // one-program process does not drop the parser
 // (`with_loader_state_forgotten`).
 impl Drop for FilesParser {
     fn drop(&mut self) {
-        for data in self.task_data_by_path.values() {
+        crate::gostd::local::drop_later(Box::new(ParseTaskLinks(std::mem::take(
+            &mut self.task_data_by_path,
+        ))));
+    }
+}
+
+/// The parse tasks of a dropped `FilesParser`. The drop takes their links
+/// out, which frees the task graph (see the `FilesParser` drop).
+struct ParseTaskLinks(FxHashMap<Path, Rc<RefCell<ParseTaskData>>>);
+
+impl Drop for ParseTaskLinks {
+    fn drop(&mut self) {
+        for data in self.0.values() {
             for task in data.borrow().tasks.values() {
                 let mut task = task.borrow_mut();
                 task.sub_tasks = Vec::new();
@@ -638,7 +652,7 @@ impl FilesParser {
             } else {
                 None
             };
-        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>> =
+        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>> =
             FxHashMap::default();
         let mut type_resolutions_in_file: FxHashMap<
             Path,
@@ -687,7 +701,7 @@ impl FilesParser {
             tasks_seen_by_name_ignore_case: &'a mut Option<FxHashMap<String, ParseTaskRef>>,
             include_processor: &'a mut IncludeProcessor,
             output_file_to_project_reference_source: &'a mut Option<FxHashMap<Path, String>>,
-            resolved_modules: &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>,
+            resolved_modules: &'a mut FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>,
             type_resolutions_in_file:
                 &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
             source_file_meta_datas: &'a mut FxHashMap<Path, SourceFileMetaData>,
@@ -1038,7 +1052,7 @@ impl FilesParser {
                 .get(&key)
                 .cloned()
                 .expect("key from the map");
-            let mut cache: ModeAwareCache<Rc<ResolvedModule>> = ModeAwareCache::default();
+            let mut cache: ModeAwareCache<Arc<ResolvedModule>> = ModeAwareCache::default();
             cache.insert(
                 ModeAwareCacheKey {
                     name: value.library_name.clone(),
@@ -1059,7 +1073,7 @@ impl FilesParser {
             duplicate_source_files,
             files_by_path,
             project_reference_file_mapper: Some(loader.project_reference_file_mapper.clone()),
-            resolved_modules: Rc::new(resolved_modules),
+            resolved_modules: Arc::new(resolved_modules),
             type_resolutions_in_file: Rc::new(type_resolutions_in_file),
             source_file_meta_datas: Rc::new(source_file_meta_datas),
             jsx_runtime_import_specifiers: jsx_runtime_import_specifiers.map(Rc::new),

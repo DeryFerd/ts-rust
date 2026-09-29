@@ -4,7 +4,7 @@
 
 use crate::frontend::prelude::*;
 use std::fmt::Write as _;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // Go: program.go:73 packageNamesInfo
 // PORT: U21 dropped the `packageNames` field and this type. It is here
@@ -421,7 +421,7 @@ impl NewProgram {
                     || !self.processed_files.type_resolutions_in_file.is_empty()
                 {
                     known_symlinks.set_symlinks_from_resolutions(
-                        &|callback: &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+                        &|callback: &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
                           file: Option<&ParsedSourceFile>| {
                             self.for_each_resolved_module(callback, file);
                         },
@@ -511,7 +511,7 @@ impl NewProgram {
         module_name: &str,
         containing_file: &str,
         resolution_mode: ResolutionMode,
-    ) -> Rc<ResolvedModule> {
+    ) -> Arc<ResolvedModule> {
         let resolver = self
             .processed_files
             .resolver
@@ -525,7 +525,7 @@ impl NewProgram {
     // Go: program.go:2077 (*Program).ForEachResolvedModule
     pub fn for_each_resolved_module(
         &self,
-        callback: &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+        callback: &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
         file: Option<&ParsedSourceFile>,
     ) {
         for_each_resolution(&self.processed_files.resolved_modules, callback, file);
@@ -678,7 +678,7 @@ impl KnownSymlinks {
     pub fn set_symlinks_from_resolutions(
         &mut self,
         for_each_resolved_module: &dyn Fn(
-            &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+            &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
             Option<&ParsedSourceFile>,
         ),
         for_each_resolved_type_reference_directive: &dyn Fn(
@@ -687,7 +687,7 @@ impl KnownSymlinks {
         ),
     ) {
         for_each_resolved_module(
-            &mut |resolution: &Rc<ResolvedModule>,
+            &mut |resolution: &Arc<ResolvedModule>,
                   _module_name: &str,
                   _mode: ResolutionMode,
                   _file_path: &Path| {
@@ -714,7 +714,7 @@ impl NewProgram {
         file: &dyn HasFileName,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> Option<Rc<ResolvedModule>> {
+    ) -> Option<Arc<ResolvedModule>> {
         if let Some(resolutions) = self.processed_files.resolved_modules.get(&file.path()) {
             if let Some(resolved) = resolutions.get(&ModeAwareCacheKey {
                 name: module_reference.to_string(),
@@ -731,7 +731,7 @@ impl NewProgram {
         &self,
         file: &dyn HasFileName,
         module_specifier: Node,
-    ) -> Option<Rc<ResolvedModule>> {
+    ) -> Option<Arc<ResolvedModule>> {
         if !is_string_literal_like(module_specifier) {
             panic!("moduleSpecifier must be a StringLiteralLike");
         }

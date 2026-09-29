@@ -5,11 +5,15 @@
 //! freed with its last holder (lsshells M2b). A clone shares the processed
 //! files of the load it came from, as Go `UpdateProgram` does. The publish
 //! of a file keeps that file's parse, because its `GoFile` borrows it.
+//! On the LSP dispatch thread these frees wait until the answer is sent
+//! (`gostd::local::drop_later`).
 
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use ts_goport::ast::source_file_info;
-use ts_goport::frontend::compiler::NewProgram;
+use ts_goport::frontend::compiler::{FileIncludeReason, NewProgram};
+use ts_goport::gostd;
 use ts_goport::lsp::lsproto;
 use ts_goport::program::ls_program;
 use ts_goport::project::Session;
@@ -98,14 +102,14 @@ child_test! {
         let session = open_p1();
         let (load, resolutions) = {
             let p = program(&session, INDEX_URI);
-            (Rc::downgrade(&p), Rc::downgrade(&p.resolved_modules))
+            (Rc::downgrade(&p), Arc::downgrade(&p.resolved_modules))
         };
 
         body_edit(&session, 2, "2");
         let first_clone = current_program(&session);
         assert!(load.upgrade().is_none(), "the released load is not freed");
         assert!(
-            Rc::ptr_eq(
+            Arc::ptr_eq(
                 &resolutions.upgrade().expect("the clone keeps the load's resolutions"),
                 &program(&session, INDEX_URI).resolved_modules,
             ),
@@ -171,6 +175,40 @@ child_test! {
     }
 }
 
+/// Files where a.ts and b.ts import each other, so the parse tasks of a
+/// load make an `Rc` cycle.
+fn cyclic_files() -> FileMap {
+    files(&[
+        ("/home/projects/TS/p1/tsconfig.json", "{}"),
+        ("/home/projects/TS/p1/index.ts", INDEX_TEXT),
+        (
+            "/home/projects/TS/p1/a.ts",
+            "import { b } from './b';\nexport const a = 1;\nexport const c = b;",
+        ),
+        (
+            "/home/projects/TS/p1/b.ts",
+            "import { a } from './a';\nexport const b = a;",
+        ),
+    ])
+}
+
+/// A weak handle of the current program of index.ts and of its include
+/// reasons, which the program and its load's parse tasks share.
+fn program_and_reasons(session: &Rc<Session>) -> (Weak<NewProgram>, Vec<Weak<FileIncludeReason>>) {
+    let p = program(session, INDEX_URI);
+    let reasons: Vec<_> = p
+        .get_include_reasons()
+        .values()
+        .flatten()
+        .map(Rc::downgrade)
+        .collect();
+    assert!(
+        reasons.len() >= 3,
+        "index.ts, a.ts and b.ts have include reasons"
+    );
+    (Rc::downgrade(&p), reasons)
+}
+
 child_test! {
     // Files that import each other make the parse tasks of a load an `Rc`
     // cycle: a task holds its sub tasks, and a sub task of a file that is
@@ -178,27 +216,35 @@ child_test! {
     // links out when it is done, so a freed load keeps no parse task. The
     // probe is the include reasons, which the tasks and the program share.
     fn parse_tasks_of_a_freed_load_are_freed() {
-        let session = bare_session(files(&[
-            ("/home/projects/TS/p1/tsconfig.json", "{}"),
-            ("/home/projects/TS/p1/index.ts", INDEX_TEXT),
-            (
-                "/home/projects/TS/p1/a.ts",
-                "import { b } from './b';\nexport const a = 1;\nexport const c = b;",
-            ),
-            ("/home/projects/TS/p1/b.ts", "import { a } from './a';\nexport const b = a;"),
-        ]));
+        let session = bare_session(cyclic_files());
         open(&session, INDEX_URI, INDEX_TEXT);
-        let (load, reasons) = {
-            let p = program(&session, INDEX_URI);
-            let reasons: Vec<_> =
-                p.get_include_reasons().values().flatten().map(Rc::downgrade).collect();
-            (Rc::downgrade(&p), reasons)
-        };
-        assert!(reasons.len() >= 3, "index.ts, a.ts and b.ts have include reasons");
+        let (load, reasons) = program_and_reasons(&session);
 
         import_edit(&session, 2);
         assert!(load.upgrade().is_none(), "the released load is not freed");
         let kept = reasons.iter().filter(|reason| reason.upgrade().is_some()).count();
         assert_eq!(kept, 0, "the freed load keeps {kept} of {} include reasons", reasons.len());
+    }
+}
+
+child_test! {
+    // On a thread that keeps garbage (the LSP dispatch thread), the free of
+    // a released program and of the parse tasks of a load waits for
+    // `drop_garbage`, so it is not in the request that released them.
+    // `drop_garbage` keeps them while a message waits (`busy`).
+    fn frees_wait_for_drop_garbage() {
+        gostd::local::keep_garbage();
+        let session = bare_session(cyclic_files());
+        open(&session, INDEX_URI, INDEX_TEXT);
+        let (load, reasons) = program_and_reasons(&session);
+
+        import_edit(&session, 2);
+        assert!(load.upgrade().is_some(), "the released load is freed before drop_garbage");
+        gostd::local::drop_garbage(|| true);
+        assert!(load.upgrade().is_some(), "a busy drop_garbage frees the released load");
+        gostd::local::drop_garbage(|| false);
+        assert!(load.upgrade().is_none(), "drop_garbage does not free the released load");
+        let kept = reasons.iter().filter(|reason| reason.upgrade().is_some()).count();
+        assert_eq!(kept, 0, "drop_garbage keeps {kept} of {} include reasons", reasons.len());
     }
 }
