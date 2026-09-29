@@ -6352,4 +6352,48 @@ mod tests {
             Some(AncestorWalk::Next(x))
         );
     }
+
+    // AST node records, step 3: a file id from `LOW_BLOCKS` on has its
+    // block in a chunk of `HIGH_BLOCKS` (a process with many programs).
+    // This test process never gets that many file ids, so the test sets
+    // the block of the last file id, which no publish reaches, and reads
+    // its node through the node reads.
+    #[test]
+    fn high_file_ids_read_their_block_from_a_chunk() {
+        let file = FILE_ID_LIMIT - 1;
+        let mut records = vec![
+            NodeRecord::target(Node::NIL),
+            NodeRecord::node(SyntaxKind::Identifier, false),
+        ];
+        records[1].set_flags(NodeFlags::AMBIENT);
+        records[1].set_loc(TextRange::new(3, 7));
+        let block = FileBlock {
+            records: Vec::leak(records),
+            kids: Vec::leak(vec![NodeKids::unknown(), NodeKids::unknown()]),
+            nodes: &[],
+            file: Box::leak(Box::new(BlockFile {
+                facts: StoreFacts::ONLY_NIL_SLOT,
+                root: Node::NIL,
+                foreign: &[],
+                links: &[],
+                store: None,
+                go_file: None,
+            })),
+        };
+        assert!(file_block(file).is_none());
+        set_file_block(file, block);
+        let n = handle(file, 1);
+        assert_eq!(n.kind(), SyntaxKind::Identifier);
+        assert_eq!(n.flags(), NodeFlags::AMBIENT);
+        assert_eq!(n.loc(), TextRange::new(3, 7));
+        assert_eq!(n.parent(), Node::NIL);
+        assert_eq!(
+            resolve_store_id(file, crate::astdata::NodeId::new(0)),
+            Node::NIL
+        );
+        assert!(file_block(file - 1).is_none(), "the same chunk");
+        assert!(file_block(file - HIGH_CHUNK).is_none(), "another chunk");
+        assert!(file_block(LOW_BLOCKS).is_none(), "the first chunk");
+        assert!(file_block(FILE_ID_LIMIT).is_none(), "no file id");
+    }
 }
