@@ -43,9 +43,15 @@ pub fn go_string_from_os(s: impl Into<OsString>) -> String {
     }
 }
 
-// PORT: off unix an OS path is text (UTF-16 on Windows). As Go's
-// `syscall.UTF16FromString` and `UTF16ToString`, bytes that are not UTF-8
-// and unpaired surrogates become U+FFFD. Not run on such a target.
+// PORT divergence: off unix an OS path is text (UTF-16 on Windows), and the
+// port converts it lossily. Go on Windows uses WTF-8 (go1.26
+// syscall/wtf8_windows.go): `UTF16ToString` keeps an unpaired surrogate as
+// its 3-byte WTF-8 form, and `UTF16FromString` turns those 3 bytes back into
+// the surrogate, so a name read from the OS goes back to the OS unchanged.
+// The port makes an unpaired surrogate U+FFFD. For other bytes that are not
+// UTF-8, Go makes each byte U+FFFD, and `from_utf8_lossy` makes each bad
+// sequence U+FFFD. A port of Go's form would use `encode_wide` and
+// `from_wide` (`std::os::windows::ffi`). Not run on such a target.
 #[cfg(not(unix))]
 pub fn os_path(path: &str) -> Cow<'_, OsPath> {
     match crate::scanner_util::go_string_bytes(path) {

@@ -4,9 +4,17 @@
 //! `golang.org/x/sys/unix` names `syscall.Errno`.
 //!
 //! PORT: the values and the texts are Linux's (go1.26
-//! syscall/zerrors_linux_amd64.go). The portable files (walkdir.rs and
-//! watcher.rs) use only `ENOTDIR`, whose text is "not a directory" on every
-//! Go target, so the other targets use these values too.
+//! syscall/zerrors_linux_amd64.go; Linux arm64 has the same values). The
+//! portable files (walkdir.rs and watcher.rs) use only `ENOTDIR`, and the
+//! other targets use the Linux value too. On darwin that is Go's value and
+//! text (0x14, "not a directory").
+//!
+//! PORT divergence: on Windows, Go `syscall.ENOTDIR` is
+//! `ERROR_PATH_NOT_FOUND` (3), whose text is the system message ("The system
+//! cannot find the path specified.") and which `errors.Is` matches to
+//! `fs.ErrNotExist` (go1.26 syscall/zerrors_windows.go). The port uses 0x14
+//! and "not a directory" there. The Windows backend is not ported (D-W1),
+//! so no Windows watch reaches it.
 
 use crate::fswatch::prelude::*;
 
