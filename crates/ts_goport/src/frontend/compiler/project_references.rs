@@ -879,14 +879,8 @@ impl ProjectReferenceDtsFakingVfs {
     // depend on the order.
     fn directory_exists_if_project_reference_decl_dir(&self, dir: &str) -> Tristate {
         let dir_path = self.to_path(dir);
-        let dir_path_with_trailing_directory_separator = format!("{}/", dir_path.as_str());
         for decl_dir_path in &self.dts_directories {
-            if dir_path == *decl_dir_path
-                // Any parent directory of declaration dir
-                || decl_dir_path.starts_with(&dir_path_with_trailing_directory_separator)
-                // Any directory inside declaration dir
-                || dir_path.starts_with(&format!("{}/", decl_dir_path.as_str()))
-            {
+            if dir_path.contains_path(decl_dir_path) || decl_dir_path.contains_path(&dir_path) {
                 return Tristate::True;
             }
         }
