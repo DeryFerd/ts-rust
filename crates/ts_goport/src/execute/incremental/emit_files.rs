@@ -23,7 +23,9 @@ use crate::emitter::program_emit::{
 };
 use crate::frontend::prelude::*;
 use crate::program::source_file_may_be_emitted;
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 // Go: incremental/emitfileshandler.go:14 emitUpdate
 #[derive(Clone, Debug, Default)]
@@ -36,9 +38,9 @@ pub struct EmitUpdate {
 /// The Go `emitFilesHandler` SyncMaps that the `WriteFile` callback writes.
 #[derive(Debug, Default)]
 pub struct EmitFilesShared {
-    pub signatures: IndexMap<Path, String>,
-    pub emit_signatures: IndexMap<Path, EmitSignature>,
-    pub latest_changed_dts_files: IndexMap<Path, String>,
+    pub signatures: FxIndexMap<Path, String>,
+    pub emit_signatures: FxIndexMap<Path, EmitSignature>,
+    pub latest_changed_dts_files: FxIndexMap<Path, String>,
 }
 
 /// One file that `emit_files_incremental` emits: its path, its pending
@@ -50,9 +52,13 @@ pub struct EmitFilesHandler<'a> {
     program: &'a Program,
     is_for_dts_errors: bool,
     shared: Arc<Mutex<EmitFilesShared>>,
-    deleted_pending_kinds: IndexSet<Path>,
-    emit_updates: IndexMap<Path, EmitUpdate>,
+    deleted_pending_kinds: FxIndexSet<Path>,
+    emit_updates: FxIndexMap<Path, EmitUpdate>,
     has_emit_diagnostics: bool,
+    /// PORT: not in Go (perf). Where the write callbacks of
+    /// `get_emit_options` keep the writes of an early `tsc -b` emit
+    /// (`buffer_early_emit_writes`); `None` writes at once.
+    buffer: Option<WriteBuffer>,
 }
 
 /// Go `file.Path()` as a `tspath.Path`.
@@ -61,12 +67,40 @@ fn path_of(file: Node) -> Path {
 }
 
 /// Go `err.Error()` of a file system error.
-// PORT: Go prints the `*os.PathError` as "op path: err".
+// PORT: Go prints the `*os.PathError` as "op path: err", where `err` is the
+// Go `syscall.Errno` text: on Linux the text of Go's errno table
+// (`pprof::path_error`). Elsewhere it is the OS text without Rust's
+// " (os error N)": Go's other unix tables are the C texts with a lowercase
+// first letter, and Go on Windows asks FormatMessage, as Rust does. The
+// other errors are the Go `io/fs` errors.
 pub(crate) fn fs_error_text(err: &FsError) -> String {
     match err {
-        FsError::Path { op, path, err } => format!("{op} {path}: {err}"),
+        #[cfg(target_os = "linux")]
+        FsError::Path { op, path, err } => crate::pprof::path_error(op, path, err).error(),
+        #[cfg(not(target_os = "linux"))]
+        FsError::Path { op, path, err } => {
+            let text = err.to_string();
+            let text = match err.raw_os_error() {
+                Some(code) => text
+                    .strip_suffix(&format!(" (os error {code})"))
+                    .unwrap_or(&text),
+                None => &text,
+            };
+            let mut chars = text.chars();
+            let text: String = match chars.next() {
+                Some(first) if cfg!(unix) => first.to_lowercase().chain(chars).collect(),
+                _ => text.to_string(),
+            };
+            format!("{op} {path}: {text}")
+        }
+        FsError::Invalid => "invalid argument".to_string(),
+        FsError::Permission => "permission denied".to_string(),
+        FsError::Exist => "file already exists".to_string(),
+        FsError::NotExist => "file does not exist".to_string(),
+        FsError::Closed => "file already closed".to_string(),
+        FsError::SkipAll => "skip everything and stop the walk".to_string(),
+        FsError::SkipDir => "skip this directory".to_string(),
         FsError::Other(message) => message.clone(),
-        other => format!("{other:?}"),
     }
 }
 
@@ -80,6 +114,7 @@ impl<'a> EmitFilesHandler<'a> {
             deleted_pending_kinds: IndexSet::default(),
             emit_updates: IndexMap::default(),
             has_emit_diagnostics: false,
+            buffer: None,
         }
     }
 
@@ -370,10 +405,27 @@ impl<'a> EmitFilesHandler<'a> {
     // compiler host wraps. Without `options.WriteFile`, Go writes with the
     // compiler host file system; the port follows `program::EmitHost`,
     // whose write fails without a callback.
+    // PORT: perf. With `self.buffer`, the callback keeps each write (and
+    // the `differsOnlyInMap` time revert) for `flush_writes`, also without
+    // declarations, where Go passes `options` through.
     fn get_emit_options(&self, options: EmitOptions) -> EmitOptions {
+        let writer = OutputWriter {
+            write_file: options.write_file.clone(),
+            buffer: self.buffer.clone(),
+        };
         let snapshot = self.program.snapshot.borrow();
         if !snapshot.options.get_emit_declarations() {
-            return options;
+            if writer.buffer.is_none() {
+                return options;
+            }
+            return EmitOptions {
+                write_file: Some(Arc::new(
+                    move |file_name: &str, text: &str, data: &mut WriteFileData| {
+                        writer.write(file_name, text, data, false)
+                    },
+                )),
+                ..options
+            };
         }
         let can_use_incremental_state = snapshot.can_use_incremental_state();
         // Only the incremental state reads the files. The emit writes only
@@ -402,7 +454,6 @@ impl<'a> EmitFilesHandler<'a> {
             shared: Arc::clone(&self.shared),
         };
         drop(snapshot);
-        let user_write_file = options.write_file.clone();
         let write_file: WriteFile = Arc::new(
             move |file_name: &str, text: &str, data: &mut WriteFileData| {
                 let mut differs_only_in_map = false;
@@ -457,21 +508,7 @@ impl<'a> EmitFilesHandler<'a> {
                     }
                 }
 
-                let mut a_time = None;
-                if differs_only_in_map {
-                    a_time = osvfs_fs().stat(file_name).and_then(|info| info.mod_time());
-                }
-                let mut err = match &user_write_file {
-                    Some(write_file) => write_file(file_name, text, data),
-                    None => Err(format!("no WriteFile callback for {file_name}")),
-                };
-                if err.is_ok() && differs_only_in_map {
-                    // Revert the time to original one
-                    err = osvfs_fs()
-                        .chtimes(file_name, None, a_time)
-                        .map_err(|err| fs_error_text(&err));
-                }
-                err
+                writer.write(file_name, text, data, differs_only_in_map)
             },
         );
         EmitOptions {
@@ -570,6 +607,166 @@ struct DtsWriteFile {
     file_info: Option<FileInfo>,
 }
 
+/// Where the `get_emit_options` callback writes: `write_file` (Go
+/// `options.WriteFile`) at once, or into `buffer` for `flush_writes`.
+struct OutputWriter {
+    write_file: Option<WriteFile>,
+    buffer: Option<WriteBuffer>,
+}
+
+impl OutputWriter {
+    fn write(
+        &self,
+        file_name: &str,
+        text: &str,
+        data: &mut WriteFileData,
+        differs_only_in_map: bool,
+    ) -> Result<(), String> {
+        let Some(buffer) = &self.buffer else {
+            return write_output(
+                self.write_file.as_ref(),
+                file_name,
+                text,
+                data,
+                differs_only_in_map,
+            );
+        };
+        buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(BufferedWrite {
+                source: path_of(data.source_file),
+                file_name: file_name.to_string(),
+                text: text.to_string(),
+                data: data.clone(),
+                differs_only_in_map,
+            });
+        Ok(())
+    }
+}
+
+// Go: the end of the `getEmitOptions` WriteFile callback
+// (incremental/emitfileshandler.go:231): the write, and with
+// `differsOnlyInMap` the revert of the file's modified time.
+fn write_output(
+    write_file: Option<&WriteFile>,
+    file_name: &str,
+    text: &str,
+    data: &mut WriteFileData,
+    differs_only_in_map: bool,
+) -> Result<(), String> {
+    let mut a_time = None;
+    if differs_only_in_map {
+        a_time = osvfs_fs().stat(file_name).and_then(|info| info.mod_time());
+    }
+    let mut err = match write_file {
+        Some(write_file) => write_file(file_name, text, data),
+        None => Err(format!("no WriteFile callback for {file_name}")),
+    };
+    if err.is_ok() && differs_only_in_map {
+        // Revert the time to original one
+        err = osvfs_fs()
+            .chtimes(file_name, None, a_time)
+            .map_err(|err| fs_error_text(&err));
+    }
+    err
+}
+
+/// PORT: not in Go (perf). The writes of an emit that `tsc -b` starts
+/// before the task's turn to write (`buffer_early_emit_writes`).
+type WriteBuffer = Arc<Mutex<Vec<BufferedWrite>>>;
+
+/// One write in a `WriteBuffer`: the source file whose output it is, and
+/// the arguments of `write_output`.
+struct BufferedWrite {
+    source: Path,
+    file_name: String,
+    text: String,
+    data: WriteFileData,
+    differs_only_in_map: bool,
+}
+
+thread_local! {
+    /// True while `buffer_early_emit_writes` runs its `start`.
+    static BUFFER_EARLY_EMIT_WRITES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// PORT: not in Go (perf). Runs `start`, a `Program::start_emit` call, so
+/// that the emit that it starts keeps its writes in memory
+/// (`WriteBuffer`) until `finish_emit_files` writes them (`flush_writes`).
+/// `tsc -b` starts a task's emit when it makes the task's program, so each
+/// program emits right after its check, and its outputs still reach the
+/// file system when the task finishes, in build order (see
+/// `BuildTask::compile_and_emit_start`).
+pub(crate) fn buffer_early_emit_writes(start: impl FnOnce()) {
+    BUFFER_EARLY_EMIT_WRITES.set(true);
+    start();
+    BUFFER_EARLY_EMIT_WRITES.set(false);
+}
+
+/// The most threads that `flush_writes` writes on.
+const MAX_FLUSH_THREADS: usize = 8;
+
+/// Writes the `writes` of an early emit of the `queued` files with
+/// `write_file` (`write_output`). Go writes each file's outputs on the
+/// goroutine that emits it: the source map, then the JS, then the
+/// declaration map, then the declaration. Here the files' outputs go in
+/// that order, the files in `queued` order, on up to `MAX_FLUSH_THREADS`
+/// threads. False when a write failed; the later writes are left out.
+fn flush_writes(
+    mut writes: Vec<BufferedWrite>,
+    queued: &[QueuedEmit],
+    write_file: Option<&WriteFile>,
+) -> bool {
+    let order: FxHashMap<&Path, usize> = queued
+        .iter()
+        .enumerate()
+        .map(|(index, (path, ..))| (path, index))
+        .collect();
+    // A file's JS and declaration can emit on two threads, each in order.
+    writes.sort_by_key(|write| {
+        let output = write.file_name.as_str();
+        let declaration = is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output));
+        (order.get(&write.source).copied(), declaration)
+    });
+    let files: Vec<&mut [BufferedWrite]> =
+        writes.chunk_by_mut(|a, b| a.source == b.source).collect();
+    let threads = MAX_FLUSH_THREADS
+        .min(crate::program::available_cores())
+        .min(files.len().div_ceil(16))
+        .max(1);
+    let files = Mutex::new(files.into_iter());
+    let failed = AtomicBool::new(false);
+    let work = || {
+        while !failed.load(Ordering::Relaxed) {
+            let next = files.lock().unwrap_or_else(PoisonError::into_inner).next();
+            let Some(file) = next else {
+                break;
+            };
+            for write in file {
+                let written = write_output(
+                    write_file,
+                    &write.file_name,
+                    &write.text,
+                    &mut write.data,
+                    write.differs_only_in_map,
+                );
+                if written.is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(&work);
+        }
+        work();
+    });
+    !failed.load(Ordering::Relaxed)
+}
+
 // Go: incremental/emitfileshandler.go:252 skipDtsOutputOfComposite
 // Compare to existing computed signature and store it or handle the changes in d.ts map option from before
 // returning undefined means that, we dont need to emit this d.ts file since its contents didnt change
@@ -657,16 +854,21 @@ pub fn emit_files(program: &Program, options: EmitOptions, is_for_dts_errors: bo
 /// needs.
 pub(crate) struct StartedEmit {
     shared: Arc<Mutex<EmitFilesShared>>,
-    deleted_pending_kinds: IndexSet<Path>,
+    deleted_pending_kinds: FxIndexSet<Path>,
     queued: Vec<QueuedEmit>,
     batch: PendingEmitBatch,
     /// The `WriteFile` of the start. `finish_emit_files` must get the same.
     write_file: Option<WriteFile>,
+    /// The writes of the emit, with `buffer_early_emit_writes`.
+    buffer: Option<WriteBuffer>,
     /// `program::bind_thread_fingerprint` of this thread after the start.
     /// The emit pool starts from a copy of this thread's state, so between
     /// the start and the finish this thread must not change it, else the
     /// pool would start from other state than without the early start.
-    fingerprint: (usize, (u64, u64), usize),
+    /// `None` with `buffer_early_emit_writes`: `tsc -b` makes other
+    /// programs on this thread meanwhile, and their state is not the
+    /// state of this program.
+    fingerprint: Option<(usize, (u64, u64), usize)>,
 }
 
 /// PORT: not in Go (perf). The first half of `emit_files(program, options,
@@ -691,6 +893,7 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
         "start_emit_files: only the emit of all affected files starts early"
     );
     let mut handler = EmitFilesHandler::new(program, false);
+    handler.buffer = BUFFER_EARLY_EMIT_WRITES.get().then(WriteBuffer::default);
     let queued = handler.queue_affected_files(&options);
     let batch = handler.send_emit_batch(&queued, &options);
     StartedEmit {
@@ -699,7 +902,11 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
         queued,
         batch,
         write_file: options.write_file,
-        fingerprint: crate::program::bind_thread_fingerprint(),
+        fingerprint: handler
+            .buffer
+            .is_none()
+            .then(crate::program::bind_thread_fingerprint),
+        buffer: handler.buffer,
     }
 }
 
@@ -708,6 +915,13 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
 /// the emit jobs, then does the rest of `emit_files_incremental` and
 /// `emitAllAffectedFiles` (the snapshot update and the build info).
 /// `options` must be the options of the start.
+///
+/// With `buffer_early_emit_writes` it writes the emit's outputs first
+/// (`flush_writes`). When a write fails, Go's emitter sees the error at
+/// the write: the file gets a TS5033 diagnostic instead of the output in
+/// `EmittedFiles`, and the declaration signature takes the diagnostic. So
+/// then the files emit again from the start state with direct writes, and
+/// their results replace the buffered emit's.
 pub(crate) fn finish_emit_files(
     program: &Program,
     started: StartedEmit,
@@ -725,11 +939,13 @@ pub(crate) fn finish_emit_files(
             },
         "finish_emit_files: the emit options differ from the started ones"
     );
-    debug_assert_eq!(
-        crate::program::bind_thread_fingerprint(),
-        started.fingerprint,
-        "the loading thread changed its synthetic nodes, ids or lazy JSDoc during the early emit"
-    );
+    if let Some(fingerprint) = started.fingerprint {
+        debug_assert_eq!(
+            crate::program::bind_thread_fingerprint(),
+            fingerprint,
+            "the loading thread changed its synthetic nodes, ids or lazy JSDoc during the early emit"
+        );
+    }
     let mut handler = EmitFilesHandler {
         program,
         is_for_dts_errors: false,
@@ -737,8 +953,17 @@ pub(crate) fn finish_emit_files(
         deleted_pending_kinds: started.deleted_pending_kinds,
         emit_updates: IndexMap::default(),
         has_emit_diagnostics: false,
+        buffer: None,
     };
-    let results = started.batch.wait();
+    let mut results = started.batch.wait();
+    if let Some(buffer) = started.buffer {
+        let writes = std::mem::take(&mut *buffer.lock().unwrap_or_else(PoisonError::into_inner));
+        if !flush_writes(writes, &started.queued, options.write_file.as_ref()) {
+            // The callbacks of the buffered emit filled `shared`.
+            *handler.shared.lock().expect("emit files lock") = EmitFilesShared::default();
+            results = handler.send_emit_batch(&started.queued, options).wait();
+        }
+    }
     let results = handler.finish_emit_files_incremental(started.queued, results);
     handler.combine_results_and_emit_build_info(results, options)
 }

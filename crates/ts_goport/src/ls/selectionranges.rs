@@ -319,7 +319,7 @@ fn get_smart_selection_range(
         if pos1 == pos2 {
             return true;
         }
-        let line_starts = get_ecma_line_starts(source_file);
+        let line_starts = &*get_ecma_line_starts(source_file);
         compute_line_of_position(line_starts, pos1) == compute_line_of_position(line_starts, pos2)
     };
 

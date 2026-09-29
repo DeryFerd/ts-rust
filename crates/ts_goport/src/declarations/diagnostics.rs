@@ -670,7 +670,8 @@ fn add_parent_declaration_related_info(node: Node, diag: &mut Diagnostic) {
 
 // Go: transformers/declarations/diagnostics.go:585 createAccessorTypeError
 // PORT: Go reads `node.Symbol().Declarations`. The declarations module has no
-// checker, so it reads the binder symbol from `prog().bound_symbols`.
+// checker, so it reads the binder symbol from the program's binder symbols
+// (`program::bound_symbols`).
 fn create_accessor_type_error(node: Node) -> Diagnostic {
     let declarations = bound_symbol_declarations(node.symbol());
     let all_declarations = get_all_accessor_declarations_for_declaration(node, &declarations);
@@ -708,10 +709,7 @@ fn create_accessor_type_error(node: Node) -> Diagnostic {
 
 /// The declarations of a binder symbol. Go reads `symbol.Declarations`.
 pub(crate) fn bound_symbol_declarations(symbol: SymbolId) -> Vec<Node> {
-    prog()
-        .bound_symbols
-        .get()
-        .expect("program not bound")
+    crate::program::bound_symbols()
         .sym(symbol)
         .declarations
         .to_vec()

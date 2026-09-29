@@ -74,7 +74,7 @@ const USAGE: &str = "usage: goport_emit -p <tsconfig.json | project dir> --outDi
 
 /// The opt-in `jemalloc` feature makes jemalloc the global allocator
 /// (see `goport.rs` `set_malloc_tunables`).
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(windows)))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

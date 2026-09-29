@@ -871,12 +871,10 @@ impl DeclarationTransformer {
         let left = node.left();
 
         let symbol = node.symbol();
-        // PORT: `symbol.Flags` of a binder symbol, read from `prog().bound_symbols`.
+        // PORT: `symbol.Flags` of a binder symbol, read from the program's
+        // binder symbols (`program::bound_symbols`).
         if symbol.is_nil()
-            || !prog()
-                .bound_symbols
-                .get()
-                .expect("program not bound")
+            || !crate::program::bound_symbols()
                 .sym(symbol)
                 .flags
                 .intersects(SymbolFlags::ASSIGNMENT)

@@ -31,5 +31,5 @@ pub fn get_ecma_position_of_line_and_byte_offset(
     line: i32,
     byte_offset: i32,
 ) -> i32 {
-    compute_position_of_line_and_byte_offset(get_ecma_line_starts(source_file), line, byte_offset)
+    compute_position_of_line_and_byte_offset(&get_ecma_line_starts(source_file), line, byte_offset)
 }

@@ -332,7 +332,7 @@ impl Tracker {
         if full_start == start {
             return start;
         }
-        let line_starts = get_ecma_line_starts(source_file);
+        let line_starts = &*get_ecma_line_starts(source_file);
         let full_start_line_index = compute_line_of_position(line_starts, full_start);
         let full_start_line_pos = line_starts[full_start_line_index as usize];
         if start_of_line_pos == full_start_line_pos {
@@ -399,7 +399,7 @@ impl Tracker {
         if trailing_opt == TrailingTriviaOption::INCLUDE {
             // If the trailing comment is a multiline comment that extends to the next lines,
             // return the end of the comment and track it for the next nodes to adjust.
-            let line_starts = get_ecma_line_starts(source_file);
+            let line_starts = &*get_ecma_line_starts(source_file);
             let node_end_line = compute_line_of_position(line_starts, node.end());
             let text = source_file_text(source_file);
             for comment in get_trailing_comment_ranges(self.node_factory(), text, node.end()) {
@@ -569,7 +569,7 @@ impl Tracker {
         let mut first_node_line: i32 = -1;
 
         let len_statements = source_file.statements().len();
-        let line_map = get_ecma_line_starts(source_file);
+        let line_map = &*get_ecma_line_starts(source_file);
         for r in ranges {
             if r.kind == SyntaxKind::MultiLineCommentTrivia {
                 if is_pinned_comment(text, r) {

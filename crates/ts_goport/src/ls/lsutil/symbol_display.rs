@@ -243,15 +243,18 @@ pub const FILE_EXTENSION_KIND_MODIFIERS: ScriptElementKindModifier = ScriptEleme
 pub enum TypeChecker<'a> {
     Checker(&'a mut Checker),
     Nil(&'a SymbolArena),
+    /// Nil, with the current program's binder symbols
+    /// (`program::bound_symbols`), which the guard holds.
+    Bound(crate::program::BoundSymbols),
 }
 
 /// Go `typeChecker` that is a checker or nil. Nil reads the current
-/// program's binder arena (`prog().bound_symbols`).
+/// program's binder arena (`program::bound_symbols`).
 impl<'a> From<Option<&'a mut Checker>> for TypeChecker<'a> {
     fn from(type_checker: Option<&'a mut Checker>) -> Self {
         match type_checker {
             Some(c) => TypeChecker::Checker(c),
-            None => TypeChecker::Nil(prog().bound_symbols.get().expect("program is not bound")),
+            None => TypeChecker::Bound(crate::program::bound_symbols()),
         }
     }
 }
@@ -262,6 +265,7 @@ impl TypeChecker<'_> {
         match self {
             TypeChecker::Checker(c) => &c.symbols,
             TypeChecker::Nil(symbols) => *symbols,
+            TypeChecker::Bound(symbols) => &**symbols,
         }
     }
 
@@ -269,7 +273,7 @@ impl TypeChecker<'_> {
     fn checker(&mut self) -> Option<&mut Checker> {
         match self {
             TypeChecker::Checker(c) => Some(&mut **c),
-            TypeChecker::Nil(_) => None,
+            TypeChecker::Nil(_) | TypeChecker::Bound(_) => None,
         }
     }
 }

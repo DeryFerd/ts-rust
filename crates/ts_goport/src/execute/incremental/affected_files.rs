@@ -18,7 +18,7 @@ use crate::frontend::prelude::*;
 use std::sync::{Arc, Mutex};
 
 // Go: incremental/affectedfileshandler.go:18 dtsMayChange
-pub type DtsMayChange = IndexMap<Path, FileEmitKind>;
+pub type DtsMayChange = FxIndexMap<Path, FileEmitKind>;
 
 // Go: incremental/affectedfileshandler.go:24 updatedSignature
 // PORT: Go `mu` guards the parallel computation; there is none here.
@@ -33,9 +33,9 @@ pub struct UpdatedSignature {
 pub struct AffectedFilesHandler<'a> {
     program: &'a Program,
     has_all_files_excluding_default_library_file: bool,
-    updated_signatures: IndexMap<Path, UpdatedSignature>,
+    updated_signatures: FxIndexMap<Path, UpdatedSignature>,
     dts_may_change: Vec<DtsMayChange>,
-    files_to_remove_diagnostics: IndexSet<Path>,
+    files_to_remove_diagnostics: FxIndexSet<Path>,
     cleaned_diagnostics_of_lib_files: bool,
     seen_file_and_references: FxHashMap<Path, bool>,
 }
@@ -55,9 +55,9 @@ impl<'a> AffectedFilesHandler<'a> {
         AffectedFilesHandler {
             program,
             has_all_files_excluding_default_library_file: false,
-            updated_signatures: IndexMap::default(),
+            updated_signatures: FxIndexMap::default(),
             dts_may_change: Vec::new(),
-            files_to_remove_diagnostics: IndexSet::default(),
+            files_to_remove_diagnostics: FxIndexSet::default(),
             cleaned_diagnostics_of_lib_files: false,
             seen_file_and_references: FxHashMap::default(),
         }
@@ -238,11 +238,11 @@ impl<'a> AffectedFilesHandler<'a> {
         &mut self,
         file: Node,
         fn_: &mut ReferencedByCallback<'_, 'a>,
-    ) -> IndexMap<Path, Node> {
+    ) -> FxIndexMap<Path, Node> {
         // Now we need to if each file in the referencedBy list has a shape change as well.
         // Because if so, its own referencedBy files need to be saved as well to make the
         // emitting result consistent with files on disk.
-        let mut seen_file_names_map: IndexMap<Path, Node> = IndexMap::default();
+        let mut seen_file_names_map: FxIndexMap<Path, Node> = FxIndexMap::default();
         // Start with the paths this file was referenced by
         seen_file_names_map.insert(path_of(file), file);
         let mut queue = self
@@ -568,7 +568,7 @@ impl<'a> AffectedFilesHandler<'a> {
                 snapshot.add_file_to_affected_files_pending_emit(file_path.clone(), *emit_kind);
             }
         }
-        snapshot.changed_files_set = IndexSet::default();
+        snapshot.changed_files_set = FxIndexSet::default();
         snapshot.build_info_emit_pending = true;
     }
 }
@@ -580,7 +580,7 @@ pub fn collect_all_affected_files(program: &Program) {
     }
 
     let mut handler = AffectedFilesHandler::new(program);
-    let mut result: IndexSet<Node> = IndexSet::default();
+    let mut result: FxIndexSet<Node> = FxIndexSet::default();
     let changed_files: Vec<Path> = program
         .snapshot
         .borrow()

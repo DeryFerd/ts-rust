@@ -266,6 +266,10 @@ pub fn new_content_mapper_host(init: &SessionInit) -> Option<Rc<dyn contentmappe
 
 // Go: project/session.go:180 NewSession
 pub fn new_session(init: &SessionInit) -> Rc<Session> {
+    // Not in Go: a process with a session is a language server or API
+    // process, which frees the file versions it publishes again
+    // (`ast::free_file_versions`).
+    crate::ast::set_editor_process();
     let current_directory = init.options.current_directory.clone();
     let use_case_sensitive_file_names = init.fs.use_case_sensitive_file_names();
     let to_path: Rc<dyn Fn(&str) -> tspath::Path> = Rc::new(move |file_name: &str| {

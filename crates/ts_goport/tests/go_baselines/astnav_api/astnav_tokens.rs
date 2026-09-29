@@ -496,7 +496,7 @@ fn write_range_diff(
     rng: (i32, i32),
     position: i32,
 ) {
-    let lines = source_file_ecma_line_map(file);
+    let lines = &*source_file_ecma_line_map(file);
     let text = go_string_bytes(source_file_text(file));
     let text_len = text.len() as i32;
 

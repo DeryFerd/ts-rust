@@ -368,7 +368,8 @@ fn is_data_of(d: &NodeData, n: Node) -> bool {
 /// `$name(self)` reads the node like `by_data!`, and `$name_in(self, d)`
 /// reads `d`, the data of the same node, which the caller already loaded
 /// with `parsed_node_data`. `$n` names the node in the arms. The arms are
-/// those of `by_data!`.
+/// those of `by_data!`. With `d` `None` (a node that a freeable parse owns,
+/// lsshells M3c, `LoadedData`) `$name_in` is `$name`.
 ///
 /// PERF: query Q7-3. Each `$name` call repeats the `FROZEN` lookup, the
 /// kind-table test and the data load. A caller that reads several fields of
@@ -391,7 +392,10 @@ macro_rules! data_accessor {
 
         #[doc = concat!("`Node::", stringify!($name), "` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`).")]
         #[must_use]
-        $vis fn $name_in(self, d: &'static NodeData) -> $ty {
+        $vis fn $name_in(self, d: LoadedData) -> $ty {
+            let Some(d) = d else {
+                return self.$name();
+            };
             let $n: Node = self;
             debug_assert!(is_data_of(d, $n), "data of another node");
             match_data!($n.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
@@ -460,7 +464,10 @@ macro_rules! modifiers_accessor {
         /// `Node::modifiers` on `d`, the data of this node that the caller
         /// already loaded with `parsed_node_data` (see `data_accessor!`).
         #[must_use]
-        pub fn modifiers_in(self, d: &'static NodeData) -> ModifierList {
+        pub fn modifiers_in(self, d: LoadedData) -> ModifierList {
+            let Some(d) = d else {
+                return self.modifiers();
+            };
             debug_assert!(is_data_of(d, self), "data of another node");
             match_data!(
                 self.file_index(),
@@ -1014,6 +1021,10 @@ pub const BINDER_ADDED_FLAGS: NodeFlags = NodeFlags::EXPORT_CONTEXT
     .union(NodeFlags::UNREACHABLE)
     .union(NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR);
 
+/// Every `NodeFlags` bit that the binder does not add: the mask of
+/// `Node::parser_flags` for "all the parser flags".
+pub const PARSER_ONLY_FLAGS: NodeFlags = NodeFlags(!BINDER_ADDED_FLAGS.0);
+
 /// Binder data for nodes of a file that is not bound yet.
 static NO_BIND: NodeBindData = NodeBindData {
     symbol: SymbolId::NIL,
@@ -1031,6 +1042,25 @@ static NO_BIND: NodeBindData = NodeBindData {
 #[inline(never)]
 fn synthetic_bind_field<T>(n: Node, field: impl FnOnce(&NodeBindData) -> T) -> T {
     field(&synthetic_bind(n))
+}
+
+/// The flow nodes of `go_file`. Panics before its binder built them.
+#[inline]
+fn flow_nodes_of(go_file: &GoFile) -> &[FlowNode] {
+    go_file
+        .flow_nodes
+        .get()
+        .expect("flow nodes are not built for this file")
+}
+
+/// The binder data of node slot `index` of `go_file`: nil values before the
+/// file is bound.
+#[inline]
+fn node_bind_in(go_file: &GoFile, index: usize) -> &NodeBindData {
+    match go_file.node_bind.get() {
+        Some(v) => v.get(index),
+        None => &NO_BIND,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1165,6 +1195,16 @@ fn name_node_text(n: Node, text: &'static str) -> &'static str {
     store_identifier_name(n).map_or("", |name| name.as_str())
 }
 
+/// `name_node_text` for data text `text` that is not `'static` (a node that
+/// a freeable parse owns, lsshells M3c, or a factory node): a text that is
+/// not empty is interned.
+fn scoped_name_text(n: Node, text: &str) -> &'static str {
+    if !text.is_empty() {
+        return Name::from(text).as_str();
+    }
+    store_identifier_name(n).map_or("", |name| name.as_str())
+}
+
 /// The last step of Go `QuestionToken`: the postfix token when it is `?`.
 fn question_of_postfix(postfix: Node) -> Node {
     if postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken {
@@ -1194,6 +1234,16 @@ enum SliceRepr {
     Nodes(&'static [Node]),
     /// The `len` nodes of a list of this thread's synthetic arena.
     Synthetic { list: SyntheticList, len: u32 },
+    /// A list of `len` nodes of freeable file version `file` (lsshells M3b),
+    /// read at each use (`file_list_node`): Go `SourceFile.Imports()` when
+    /// `host` is nil (`NodeSlice::from_file_imports`), else the eager JSDoc
+    /// of `host` in its JSDoc cache (`NodeSlice::from_file_js_doc`; before
+    /// the publish, the cache of its store, lsshells M3c). A published list
+    /// does not change, so its length is kept here.
+    FileList { file: u32, len: u32, host: Node },
+    /// The `len` nodes of a list of a store that owns its nodes (a freeable
+    /// parse, lsshells M3c), read at each use (`with_store_list`).
+    Store { list: StoreList, len: u32 },
 }
 
 impl Default for NodeSlice {
@@ -1221,6 +1271,41 @@ impl NodeSlice {
         Self(SliceRepr::Nodes(nodes))
     }
 
+    /// Go `SourceFile.Imports()` of published file `file` (a file id), read
+    /// at each use, for a file whose info is not `'static` (a freeable file
+    /// version). A use after the version dies panics.
+    #[must_use]
+    pub fn from_file_imports(file: usize) -> Self {
+        Self::from_file_list(file, Node::NIL)
+    }
+
+    /// The JSDoc cache entry of `host` in published file `file`, read at
+    /// each use (see `from_file_imports`). `host` must be in the cache.
+    #[must_use]
+    pub fn from_file_js_doc(file: usize, host: Node) -> Self {
+        debug_assert!(host.is_some());
+        Self::from_file_list(file, host)
+    }
+
+    /// `SliceRepr::FileList` of `file` and `host`.
+    fn from_file_list(file: usize, host: Node) -> Self {
+        Self(SliceRepr::FileList {
+            file: file as u32,
+            len: file_list_len(file, host) as u32,
+            host,
+        })
+    }
+
+    /// The nodes of list `list` of a store that owns its nodes (lsshells
+    /// M3c).
+    #[must_use]
+    pub fn from_store(list: StoreList) -> Self {
+        Self(SliceRepr::Store {
+            list,
+            len: list.len() as u32,
+        })
+    }
+
     /// The nodes of a list of this thread's synthetic arena.
     #[must_use]
     pub fn from_synthetic(list: SyntheticList) -> Self {
@@ -1237,6 +1322,8 @@ impl NodeSlice {
             SliceRepr::Ids { ids, .. } => ids.len(),
             SliceRepr::Nodes(nodes) => nodes.len(),
             SliceRepr::Synthetic { len, .. } => len as usize,
+            SliceRepr::FileList { len, .. } => len as usize,
+            SliceRepr::Store { len, .. } => len as usize,
         }
     }
 
@@ -1259,6 +1346,8 @@ impl NodeSlice {
                 );
                 synthetic_list_node(list, i)
             }
+            SliceRepr::FileList { file, host, .. } => file_list_node(file as usize, host, i),
+            SliceRepr::Store { list, .. } => store_list_node(list, i),
         }
     }
 
@@ -1281,6 +1370,7 @@ impl NodeSlice {
     }
 
     #[must_use]
+    #[inline]
     pub fn iter(self) -> NodeSliceIter {
         let ids = match self.0 {
             SliceRepr::Nodes(nodes) => SliceIds::Nodes(nodes),
@@ -1290,7 +1380,15 @@ impl NodeSlice {
                 Some(frozen) => SliceIds::Frozen(ids, frozen),
                 None => SliceIds::Slow,
             },
-            SliceRepr::Synthetic { .. } => SliceIds::Slow,
+            SliceRepr::Synthetic { .. } | SliceRepr::FileList { .. } => SliceIds::Slow,
+            // An empty slice reads no node.
+            SliceRepr::Store { len: 0, .. } => SliceIds::Nodes(&[]),
+            // lsshells M3f: a short list is read once into the iterator; a
+            // longer one is read at each step. Neither copies to the heap.
+            SliceRepr::Store { list, len } if len as usize <= INLINE_NODES => {
+                SliceIds::Inline(store_list_first_nodes(list))
+            }
+            SliceRepr::Store { list, .. } => SliceIds::Store(list),
         };
         NodeSliceIter {
             slice: self,
@@ -1306,6 +1404,116 @@ impl NodeSlice {
     }
 }
 
+/// The length of the list of `SliceRepr::FileList { file, host }`.
+fn file_list_len(file: usize, host: Node) -> usize {
+    let published = crate::ast::try_with_go_file(file, |g| {
+        if host.is_nil() {
+            g.info.imports.len()
+        } else {
+            g.info.jsdoc_cache[&host].len()
+        }
+    });
+    // lsshells M3c: the JSDoc of a store that owns its nodes, before the
+    // publish.
+    published.unwrap_or_else(|| owned_store_js_doc(file, host, <[Node]>::len))
+}
+
+/// `read` on the JSDoc cache entry of `host` in unpublished store `file`,
+/// which owns its nodes (lsshells M3c). Panics as `with_go_file` for any
+/// other file.
+#[cold]
+#[inline(never)]
+fn owned_store_js_doc<R>(file: usize, host: Node, read: impl FnOnce(&[Node]) -> R) -> R {
+    match with_owned_store_js_doc(file, host, read) {
+        Some(result) => result,
+        None => panic!("file {file} is not published"),
+    }
+}
+
+/// Node `i` of `SliceRepr::FileList { file, host }`. Panics when `i` is
+/// out of range, like Go.
+// PERF: lsshells M3b. Out of line, so `NodeSlice::get` keeps the R134
+// inline code for the other variants.
+#[cold]
+#[inline(never)]
+fn file_list_node(file: usize, host: Node, i: usize) -> Node {
+    let published = crate::ast::try_with_go_file(file, |g| {
+        if host.is_nil() {
+            g.info.imports[i]
+        } else {
+            g.info.jsdoc_cache[&host][i]
+        }
+    });
+    published.unwrap_or_else(|| owned_store_js_doc(file, host, |jsdocs| jsdocs[i]))
+}
+
+/// The most nodes of a store list that `NodeSliceIter` reads once
+/// (`SliceIds::Inline`).
+const INLINE_NODES: usize = 4;
+
+/// Entries of `HOT_LIST_NODES`.
+const HOT_LIST_NODE_SLOTS: usize = 256;
+
+thread_local! {
+    /// The first nodes of short lists of hot file versions
+    /// (`store_list_first_nodes`), by list handle, direct mapped (lsshells
+    /// M3f). A published list never changes, and a handle names its file
+    /// id, which is never reused; only a list of a hot version reads it.
+    // PERF: the checker loops over the same short lists of the edited file
+    // many times (parameters, type arguments).
+    static HOT_LIST_NODES: RefCell<[(Option<StoreList>, [Node; INLINE_NODES]); HOT_LIST_NODE_SLOTS]> =
+        const { RefCell::new([(None, [Node::NIL; INLINE_NODES]); HOT_LIST_NODE_SLOTS]) };
+}
+
+/// The first `INLINE_NODES` nodes of `SliceRepr::Store { list }` (nil after
+/// its end).
+#[cold]
+#[inline(never)]
+fn store_list_first_nodes(list: StoreList) -> [Node; INLINE_NODES] {
+    if !crate::ast::is_hot_file(list.file()) {
+        return read_store_list_first_nodes(list);
+    }
+    let slot = list.hash_slot(HOT_LIST_NODE_SLOTS);
+    let hit = HOT_LIST_NODES
+        .try_with(|lists| {
+            let (key, nodes) = lists.borrow()[slot];
+            (key == Some(list)).then_some(nodes)
+        })
+        .ok()
+        .flatten();
+    if let Some(nodes) = hit {
+        return nodes;
+    }
+    let nodes = read_store_list_first_nodes(list);
+    let _ = HOT_LIST_NODES.try_with(|lists| {
+        if let Ok(mut lists) = lists.try_borrow_mut() {
+            lists[slot] = (Some(list), nodes);
+        }
+    });
+    nodes
+}
+
+/// `store_list_first_nodes`, read from the store.
+fn read_store_list_first_nodes(list: StoreList) -> [Node; INLINE_NODES] {
+    let file = list.file();
+    let mut nodes = [Node::NIL; INLINE_NODES];
+    with_store_list(list, |l| {
+        for (node, &id) in nodes.iter_mut().zip(l.ids()) {
+            *node = Node::new(file, id);
+        }
+    });
+    nodes
+}
+
+/// Node `i` of `SliceRepr::Store { list }`. Panics when `i` is out of
+/// range, like Go.
+#[cold]
+#[inline(never)]
+fn store_list_node(list: StoreList, i: usize) -> Node {
+    let id = with_store_list(list, |l| l.ids()[i]);
+    Node::new(list.file(), id)
+}
+
 // PERF: 24 bytes. The synthetic list is a variant of `SyntheticList`, whose
 // tag and index fit next to the length.
 const _: () = assert!(std::mem::size_of::<NodeSlice>() == 24);
@@ -1318,7 +1526,14 @@ enum SliceIds {
     Nodes(&'static [Node]),
     /// The ids of the slice, of a frozen store (`frozen_store_ids`).
     Frozen(&'static [crate::astdata::NodeId], FrozenIds),
-    /// `NodeSlice::get` per node: ids before freeze and synthetic lists.
+    /// A list of a store that owns its nodes, read at each step
+    /// (`store_list_node`, lsshells M3f).
+    Store(StoreList),
+    /// The nodes of a short list of a store that owns its nodes, read once
+    /// (`store_list_first_nodes`, lsshells M3f).
+    Inline([Node; INLINE_NODES]),
+    /// `NodeSlice::get` per node: ids before freeze, synthetic lists and
+    /// the file lists of freeable file versions.
     Slow,
 }
 
@@ -1338,13 +1553,15 @@ impl NodeSliceIter {
     // no table load (`FrozenIds::Direct`).
     #[inline]
     fn at(&self, i: usize) -> Node {
-        match self.ids {
+        match &self.ids {
             SliceIds::Nodes(nodes) => nodes[i],
-            SliceIds::Frozen(slice_ids, ids) => {
+            &SliceIds::Frozen(slice_ids, ids) => {
                 let n = ids.node(slice_ids[i]);
                 debug_assert_eq!(n, self.slice.get(i));
                 n
             }
+            &SliceIds::Store(list) => store_list_node(list, i),
+            SliceIds::Inline(nodes) => nodes[i],
             SliceIds::Slow => self.slice.get(i),
         }
     }
@@ -1435,6 +1652,10 @@ enum ListRef {
     Field { data: u32, sel: ListSel },
     /// A synthetic factory list (`SyntheticList::Own`).
     Own { index: u32 },
+    /// A list of a store that owns its nodes (a freeable parse, lsshells
+    /// M3c): a list field of node data or a pending list, read at each use
+    /// (`with_store_list`).
+    Store(StoreList),
 }
 
 const _: () = assert!(std::mem::size_of::<NodeList>() == 16);
@@ -1452,7 +1673,7 @@ impl ListRef {
         match self {
             Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
             Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
         }
     }
 }
@@ -1468,6 +1689,7 @@ impl PartialEq for NodeList {
                 (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
                     std::ptr::eq(a, b)
                 }
+                (ListRef::Store(a), ListRef::Store(b)) => same_store_list(a, b),
                 (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
                     (Some(a), Some(b)) => synthetic_list_eq(a, b),
                     _ => false,
@@ -1514,6 +1736,14 @@ impl NodeList {
         Self(ListRef::synthetic(list))
     }
 
+    /// The handle of list `list` of a store that owns its nodes (lsshells
+    /// M3c).
+    #[inline]
+    #[must_use]
+    pub fn store(list: StoreList) -> Self {
+        Self(ListRef::Store(list))
+    }
+
     /// The file of the list: a store id or `SYNTHETIC_NODE_FILE`. 0 for
     /// `NodeList::NIL`.
     #[inline]
@@ -1522,6 +1752,7 @@ impl NodeList {
         match self.0 {
             ListRef::Nil => 0,
             ListRef::Ts { file, .. } | ListRef::Pending { file, .. } => file as usize,
+            ListRef::Store(list) => list.file(),
             ListRef::Field { .. } | ListRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
@@ -1554,16 +1785,29 @@ impl NodeList {
         }
     }
 
+    /// The list of a store that owns its nodes (lsshells M3c), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn store_list(self) -> Option<StoreList> {
+        match self.0 {
+            ListRef::Store(list) => Some(list),
+            _ => None,
+        }
+    }
+
     /// The address of the list, for Go pointer compares and keys. `None` for
     /// `NodeList::NIL`. A Go `nil` marker list (`store::NIL_LIST_POS`) has an
     /// address. A synthetic list keeps its address while its thread's arena
-    /// lives (`synthetic_list_ptr`).
+    /// lives (`synthetic_list_ptr`), and a list of a store that owns its
+    /// nodes while that store lives (lsshells M3c): an address can repeat
+    /// after the store is freed, so keep it only for keys of one request.
     #[must_use]
     pub fn list_ptr(self) -> Option<*const ()> {
         match self.0 {
             ListRef::Nil => None,
             ListRef::Ts { list, .. } => Some(std::ptr::from_ref(list).cast()),
             ListRef::Pending { list, .. } => Some(std::ptr::from_ref(list).cast()),
+            ListRef::Store(list) => Some(with_store_list(list, |l| l.ptr())),
             repr => repr.synthetic_list().map(synthetic_list_ptr),
         }
     }
@@ -1579,6 +1823,7 @@ impl NodeList {
             ListRef::Nil => false,
             ListRef::Ts { list, .. } => list.has_trailing_comma,
             ListRef::Pending { list, .. } => list.has_trailing_comma,
+            ListRef::Store(list) => list.stored_trailing_comma(),
             repr => repr
                 .synthetic_list()
                 .is_some_and(|list| with_synthetic_list(list, |l| l.nodes().has_trailing_comma)),
@@ -1608,6 +1853,11 @@ impl NodeList {
                     has_trailing_comma: true,
                 }),
             }),
+            // lsshells M3c: the store that owns its nodes keeps the list.
+            ListRef::Store(list) => {
+                let range = with_store_list(list, |l| l.range());
+                Self(ListRef::Store(new_store_missing_list(list.file(), range)))
+            }
             // A factory parse (lazy JSDoc): the thread's arena owns the list.
             repr => match repr.synthetic_list() {
                 Some(list) => Self::synthetic(synthetic_missing_list(list)),
@@ -1626,6 +1876,7 @@ impl NodeList {
             ListRef::Nil => true,
             ListRef::Ts { list, .. } => is_nil_list_marker(list),
             ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
+            ListRef::Store(list) => list.is_nil_marker(),
             ListRef::Field { .. } | ListRef::Own { .. } => false,
         }
     }
@@ -1642,6 +1893,7 @@ impl NodeList {
             ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, &list.nodes),
             ListRef::Nil => NodeSlice::NIL,
             ListRef::Pending { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
+            ListRef::Store(list) => NodeSlice::from_store(list),
             repr => NodeSlice::from_synthetic(repr.synthetic_list().expect("synthetic list")),
         }
     }
@@ -1659,6 +1911,11 @@ impl NodeList {
             ListRef::Pending { list, .. } => {
                 assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
                 text_range_of(&list.range)
+            }
+            ListRef::Store(list) => {
+                let range = with_store_list(list, |l| l.range());
+                assert!(!is_nil_list_range(&range), "nil NodeList dereference");
+                text_range_of(&range)
             }
             // A synthetic list holds the Go `Loc`.
             repr => {
@@ -1723,6 +1980,9 @@ enum ModifiersRef {
     Field { data: u32, sel: ListSel },
     /// A synthetic factory modifier list (`SyntheticList::Own`).
     Own { index: u32 },
+    /// A modifier list of a store that owns its nodes (lsshells M3c, see
+    /// `ListRef::Store`).
+    Store(StoreList),
 }
 
 const _: () = assert!(std::mem::size_of::<ModifierList>() == 16);
@@ -1732,7 +1992,7 @@ impl ModifiersRef {
         match self {
             Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
             Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } => None,
+            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
         }
     }
 }
@@ -1747,6 +2007,7 @@ impl PartialEq for ModifierList {
             (ModifiersRef::Pending { list: a, .. }, ModifiersRef::Pending { list: b, .. }) => {
                 std::ptr::eq(a, b)
             }
+            (ModifiersRef::Store(a), ModifiersRef::Store(b)) => same_store_list(a, b),
             (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
                 (Some(a), Some(b)) => synthetic_list_eq(a, b),
                 _ => false,
@@ -1791,8 +2052,18 @@ impl ModifierList {
         Self(match ListRef::synthetic(list) {
             ListRef::Field { data, sel } => ModifiersRef::Field { data, sel },
             ListRef::Own { index } => ModifiersRef::Own { index },
-            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } => unreachable!(),
+            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } | ListRef::Store(_) => {
+                unreachable!()
+            }
         })
+    }
+
+    /// The handle of modifier list `list` of a store that owns its nodes
+    /// (lsshells M3c).
+    #[inline]
+    #[must_use]
+    pub fn store(list: StoreList) -> Self {
+        Self(ModifiersRef::Store(list))
     }
 
     /// The file of the list (see `NodeList::file`). 0 for
@@ -1803,6 +2074,7 @@ impl ModifierList {
         match self.0 {
             ModifiersRef::Nil => 0,
             ModifiersRef::Ts { file, .. } | ModifiersRef::Pending { file, .. } => file as usize,
+            ModifiersRef::Store(list) => list.file(),
             ModifiersRef::Field { .. } | ModifiersRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
@@ -1835,6 +2107,16 @@ impl ModifierList {
         }
     }
 
+    /// The list of a store that owns its nodes (lsshells M3c), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn store_list(self) -> Option<StoreList> {
+        match self.0 {
+            ModifiersRef::Store(list) => Some(list),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn is_nil(self) -> bool {
         matches!(self.0, ModifiersRef::Nil)
@@ -1860,6 +2142,7 @@ impl ModifierList {
             }),
             ModifiersRef::Field { data, sel } => NodeList(ListRef::Field { data, sel }),
             ModifiersRef::Own { index } => NodeList(ListRef::Own { index }),
+            ModifiersRef::Store(list) => NodeList(ListRef::Store(list)),
         }
     }
 
@@ -1897,6 +2180,7 @@ impl ModifierList {
             // A store list.
             ModifiersRef::Ts { list, .. } => ModifierFlags(list.flags.0),
             ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
+            ModifiersRef::Store(list) => with_store_list(list, |l| l.modifier_flags()),
             repr => with_synthetic_list(repr.synthetic_list().expect("synthetic list"), |m| {
                 ModifierFlags(m.modifiers().flags.0)
             }),
@@ -1950,11 +2234,15 @@ thread_local! {
     /// Go `Node.Decorators()` results. Go allocates a new slice on each call;
     /// we keep one per node: a leaked slice for a parsed node, a slice of the
     /// thread's synthetic arena for a factory node (see `Node::decorators`).
-    static DECORATORS: RefCell<FxHashMap<Node, NodeSlice>> = RefCell::new(FxHashMap::default());
-    /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node.
-    static SUBTREE_FACTS: RefCell<FxHashMap<Node, SubtreeFacts>> = RefCell::new(FxHashMap::default());
-    /// Go `Node.Text()` results that Go builds with string concatenation.
-    static JOINED_TEXT: RefCell<FxHashMap<Node, &'static str>> = RefCell::new(FxHashMap::default());
+    /// It forgets the nodes of dead file versions (`PerFileMap`, lsshells
+    /// M3c); their small slices stay leaked.
+    static DECORATORS: RefCell<PerFileMap<NodeSlice>> = const { RefCell::new(PerFileMap::new()) };
+    /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node. It forgets
+    /// the nodes of dead file versions (`PerFileMap`, lsshells M3a).
+    static SUBTREE_FACTS: RefCell<PerFileMap<SubtreeFacts>> = const { RefCell::new(PerFileMap::new()) };
+    /// Go `Node.Text()` results that Go builds with string concatenation. It
+    /// forgets the nodes of dead file versions (`PerFileMap`).
+    static JOINED_TEXT: RefCell<PerFileMap<&'static str>> = const { RefCell::new(PerFileMap::new()) };
 }
 
 impl Node {
@@ -2112,9 +2400,10 @@ impl Node {
         self.loc().end()
     }
 
-    /// The published file that holds this node.
+    /// The published file that holds this node. The guard pins a freeable
+    /// file version while it lives (see `ast::go_file`).
     #[must_use]
-    pub fn go_file(self) -> &'static GoFile {
+    pub fn go_file(self) -> FileRef<GoFile> {
         crate::ast::go_file(self.file_index())
     }
 
@@ -2131,16 +2420,48 @@ impl Node {
     // PERF: the program file path stays small enough to inline, and it loads
     // only the field. The synthetic path (thread-local arena and `RefCell`
     // borrow) is cold.
+    // PERF: lsshells M3b. A static file (tier 0, tier 1) is read inline with
+    // no call, as in R134. A freeable file version is read out of line
+    // (`bind_field_slow`), so it makes no `FileRef` guard.
+    // PERF: lsshells M3 repair. `field` runs in the out-of-line read too, so
+    // the inline part keeps no stack copy of the data: a copy made
+    // `bind_field` too big to inline in 9 places, and `goport -p` ran more
+    // instructions.
     #[inline]
     fn bind_field<T>(self, field: impl FnOnce(&NodeBindData) -> T) -> T {
         if is_synthetic_node(self) {
             return synthetic_bind_field(self, field);
         }
-        let bind: &NodeBindData = match self.go_file().node_bind.get() {
-            Some(v) => v.get(nid(self).index()),
-            None => &NO_BIND,
-        };
-        field(bind)
+        let index = nid(self).index();
+        match crate::ast::static_go_file(self.file_index()) {
+            Some(go_file) => field(node_bind_in(go_file, index)),
+            None => self.bind_field_slow(index, field),
+        }
+    }
+
+    /// `bind_field` of node slot `index` of a freeable file version
+    /// (lsshells M3b). Panics when the file is not published.
+    #[cold]
+    #[inline(never)]
+    fn bind_field_slow<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
+        let file = self.file_index();
+        // lsshells M3f: the hot file version first, with the rest out of
+        // line, so this path saves few registers.
+        if crate::ast::is_hot_file(file) {
+            return crate::ast::with_hot_go_file(|go_file| field(node_bind_in(go_file, index)));
+        }
+        self.bind_field_cold(index, field)
+    }
+
+    /// `bind_field_slow` for a file that is not the hot file version.
+    #[cold]
+    #[inline(never)]
+    fn bind_field_cold<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
+        let file = self.file_index();
+        match crate::ast::freeable_go_file_read(file, |go_file| *node_bind_in(go_file, index)) {
+            Some(bind) => field(&bind),
+            None => crate::ast::with_go_file(file, |go_file| field(node_bind_in(go_file, index))),
+        }
     }
 
     // Go: ast.go:198 Name
@@ -2161,7 +2482,7 @@ impl Node {
     /// `Node::name` on `d`, the data of this node that the caller already
     /// loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn name_in(self, d: &'static NodeData) -> Node {
+    pub fn name_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::Name) {
             Some(name) => {
                 debug_assert_eq!(name, self.name_data_in(d), "U4 name column");
@@ -2219,7 +2540,7 @@ impl Node {
             return facts;
         }
         let facts = compute_subtree_facts(self).without(SubtreeFacts::COMPUTED);
-        SUBTREE_FACTS.with(|c| c.borrow_mut().insert(self, facts));
+        SUBTREE_FACTS.with(|c| c.borrow_mut().write().insert(self, facts));
         facts
     }
 
@@ -2247,7 +2568,7 @@ impl Node {
         } else {
             NodeSlice::from_synthetic(new_synthetic_slice(filtered))
         };
-        DECORATORS.with(|c| c.borrow_mut().insert(self, slice));
+        DECORATORS.with(|c| c.borrow_mut().write().insert(self, slice));
         slice
     }
 
@@ -2311,32 +2632,127 @@ impl Node {
 }
 
 impl FlowNodeId {
-    /// Go `*FlowNode` dereference.
+    /// Go `*FlowNode` dereference. The guard pins a freeable file version
+    /// while it lives; copy the fields out rather than keep it.
+    // PERF: lsshells M3b. A static file (tier 0, tier 1) returns its
+    // `FileRef::Static` inline, as R134 returned the `&'static FlowNode`;
+    // the synthetic flow file and a freeable file version are out of line
+    // (`get_flow_slow`). The synthetic id is above every publish, so the
+    // static test misses it.
     #[must_use]
-    pub fn get_flow(self) -> &'static FlowNode {
-        assert!(self.is_some(), "nil flow node dereference");
-        if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
-            return crate::checker::synthetic_flow(self);
+    pub fn get_flow(self) -> FileRef<FlowNode> {
+        match self.static_flow() {
+            Some(data) => FileRef::Static(data),
+            None => self.get_flow_slow(),
         }
-        &crate::ast::go_file(self.file_index())
-            .flow_nodes
-            .get()
-            .expect("flow nodes are not built for this file")[self.local_index()]
+    }
+
+    /// Go `*FlowNode` dereference for a hot walk: the `'static` borrow of a
+    /// static file (tier 0, tier 1), with no guard, or the borrow of a guard
+    /// that `guard` keeps (a synthetic flow node or a freeable file
+    /// version). Use: `let mut guard = None; let data = flow.get_flow_in(&mut
+    /// guard);`.
+    // PERF: lsshells M3b. The checker flow walks read one flow node per
+    // step. A `FileRef` there is returned through memory, matched at each
+    // read and dropped at each step: `goport -p` ran about 0.3% more
+    // instructions in them (lsshells/m3/M3b/prof p7). This gives R134's
+    // `&'static FlowNode` for a static file.
+    #[inline]
+    pub fn get_flow_in(self, guard: &mut Option<FileRef<FlowNode>>) -> &FlowNode {
+        match self.static_flow() {
+            Some(data) => data,
+            None => self.get_flow_in_slow(guard),
+        }
+    }
+
+    /// `get_flow_in` for a synthetic flow node or a node of a freeable file
+    /// version. A guard that pins the version of this flow node already is
+    /// pointed at it, with no new `Arc`.
+    // PERF: lsshells M3 repair. A flow walk of the edited file reads one flow
+    // node per step; a new `FileRef` per step cloned and dropped the `Arc` of
+    // the version (two atomic writes per step).
+    #[cold]
+    #[inline(never)]
+    fn get_flow_in_slow(self, guard: &mut Option<FileRef<FlowNode>>) -> &FlowNode {
+        let file = self.file_index();
+        match guard {
+            Some(FileRef::Pinned { version, key, get }) if version.file() == file => {
+                *key = self.local_index();
+                *get = flow_node_in;
+            }
+            _ => *guard = Some(self.get_flow_slow()),
+        }
+        guard.as_deref().expect("the guard is set")
+    }
+
+    /// The flow node of a static file (tier 0, tier 1), or `None` for any
+    /// other flow node (synthetic, a freeable file version).
+    #[inline]
+    fn static_flow(self) -> Option<&'static FlowNode> {
+        assert!(self.is_some(), "nil flow node dereference");
+        let g = crate::ast::static_go_file(self.file_index())?;
+        Some(&flow_nodes_of(g)[self.local_index()])
+    }
+
+    /// `get_flow` for a synthetic flow node or a node of a freeable file
+    /// version.
+    #[cold]
+    #[inline(never)]
+    fn get_flow_slow(self) -> FileRef<FlowNode> {
+        if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
+            return FileRef::Static(crate::checker::synthetic_flow(self));
+        }
+        match crate::ast::go_file(self.file_index()) {
+            FileRef::Static(g) => FileRef::Static(&flow_nodes_of(g)[self.local_index()]),
+            FileRef::Pinned { version, .. } => FileRef::Pinned {
+                version,
+                key: self.local_index(),
+                get: flow_node_in,
+            },
+        }
     }
 }
 
-/// Go `file.AsSourceFile()` fields that the parser and program set.
+/// Flow node `index` of freeable file version `version` (the getter of a
+/// pinned flow node guard).
+fn flow_node_in(version: &FileVersion, index: usize) -> &FlowNode {
+    &flow_nodes_of(version.go_file())[index]
+}
+
+/// Go `file.AsSourceFile()` fields that the parser and program set. The
+/// guard pins a freeable file version while it lives (see `ast::go_file`).
 #[must_use]
-pub fn source_file_info(file: Node) -> &'static crate::program::SourceFileInfo {
-    // PORT: Go SourceFile.copyFrom copies the parsed fields onto a factory
-    // SourceFile. Here a factory SourceFile reads the parsed file with its path.
+pub fn source_file_info(file: Node) -> FileRef<crate::program::SourceFileInfo> {
+    let file = published_source_file(file);
+    crate::ast::file_version::go_file_ref!(file.file_index(), 0, |g, _key| g.info)
+}
+
+/// Runs `read` on `source_file_info(file)` with no guard: a freeable file
+/// version is pinned only while `read` runs (see `ast::with_go_file`).
+// PERF: lsshells M3 repair. A `FileRef` guard of a freeable file version
+// clones and drops its `Arc` (two atomic writes). The checker reads one
+// field of the info of the edited file many times per edit
+// (`is_external_module`, `is_declaration_file`, ...), so those readers use
+// this.
+#[inline]
+pub fn with_source_file_info<R>(
+    file: Node,
+    read: impl FnOnce(&crate::program::SourceFileInfo) -> R,
+) -> R {
+    let file = published_source_file(file);
+    crate::ast::with_go_file(file.file_index(), |g| read(&g.info))
+}
+
+/// The published SourceFile whose info `source_file_info(file)` reads:
+/// `file`, or for a factory SourceFile the parsed file with its path.
+// PORT: Go SourceFile.copyFrom copies the parsed fields onto a factory
+// SourceFile. Here a factory SourceFile reads the parsed file with its path.
+fn published_source_file(file: Node) -> Node {
     if is_synthetic_node(file) {
         let path = with_synthetic_source_file(file, |d| d.path.clone());
-        return &crate::program::get_source_file_by_path(&path)
-            .go_file()
-            .info;
+        return crate::program::get_source_file_by_path(&path);
     }
-    &file.go_file().info
+    file
 }
 
 /// Go `file.LanguageVariant`.
@@ -2347,16 +2763,17 @@ pub fn source_file_language_variant(file: Node) -> LanguageVariant {
     if !is_synthetic_node(file) && is_file_store_before_program(file.file_index()) {
         return file_store_language_variant(file.file_index());
     }
-    source_file_info(file).language_variant
+    with_source_file_info(file, |info| info.language_variant)
 }
 
-/// Go `file.AsSourceFile()` fields that the binder sets.
+/// Go `file.AsSourceFile()` fields that the binder sets. The guard pins a
+/// freeable file version while it lives (see `ast::go_file`).
 #[must_use]
-pub fn file_bind_data(file: Node) -> &'static FileBindData {
-    file.go_file()
+pub fn file_bind_data(file: Node) -> FileRef<FileBindData> {
+    crate::ast::file_version::go_file_ref!(file.file_index(), 0, |g, _key| *g
         .file_bind
         .get()
-        .expect("source file is not bound")
+        .expect("source file is not bound"))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2382,7 +2799,7 @@ fn joined_text(n: Node, build: impl FnOnce() -> String) -> &'static str {
         return s;
     }
     let s: &'static str = Name::from(build()).as_str();
-    JOINED_TEXT.with(|c| c.borrow_mut().insert(n, s));
+    JOINED_TEXT.with(|c| c.borrow_mut().write().insert(n, s));
     s
 }
 
@@ -2417,7 +2834,7 @@ impl Node {
     #[must_use]
     pub fn text(self) -> &'static str {
         let Some(node) = static_ast_node(self) else {
-            return self.synthetic_node_text();
+            return self.scoped_node_text();
         };
         match &node.data {
             NodeData::Identifier(d) => name_node_text(self, &d.text),
@@ -2450,46 +2867,62 @@ impl Node {
         }
     }
 
-    /// `text` of a factory node, whose data is read in a scope (see
-    /// `synthetic_text`).
+    /// `text` of a node with no `'static` node, whose data is read in a
+    /// scope (see `synthetic_text`): a factory node, or a node that a
+    /// freeable parse owns (lsshells M3c).
+    // PERF: lsshells M3c. The text of a node of a published freeable file
+    // version is interned once per thread and node (`JOINED_TEXT`, which
+    // forgets the nodes of dead versions), not at each read: the checker
+    // reads the texts of the edited file many times.
     #[cold]
     #[inline(never)]
-    fn synthetic_node_text(self) -> &'static str {
+    fn scoped_node_text(self) -> &'static str {
+        // An Identifier or PrivateIdentifier of a published store has its
+        // text in the name column of its node shell (`name_node_text`), with
+        // no data read.
+        if let Some(name) = frozen_store_text_name(self) {
+            return name.as_str();
+        }
+        let synthetic = is_synthetic_node(self);
+        if !synthetic && let Some(text) = JOINED_TEXT.with(|c| c.borrow().get(&self).copied()) {
+            return text;
+        }
         let file = self.file_index();
-        let joined = with_synthetic_ast_node(self, |node| match &node.data {
-            NodeData::MetaProperty(_) => Some(self.name().text()),
-            NodeData::JsxNamespacedName(d) => Some(joined_text(self, || {
+        let interned = |text: &str| -> &'static str { Name::from(text).as_str() };
+        let text = read_scoped_ast_node(self, |node| match &node.data {
+            // A store Identifier keeps its text in its name column
+            // (`name_node_text`); a synthetic one in its data.
+            NodeData::Identifier(d) => scoped_name_text(self, &d.text),
+            NodeData::PrivateIdentifier(d) => scoped_name_text(self, &d.text),
+            NodeData::StringLiteral(d) => interned(d.text.as_str()),
+            NodeData::NumericLiteral(d) => interned(d.text.as_str()),
+            NodeData::BigIntLiteral(d) => interned(d.text.as_str()),
+            NodeData::MetaProperty(_) => self.name().text(),
+            NodeData::NoSubstitutionTemplateLiteral(d) => interned(d.text.as_str()),
+            NodeData::TemplateHead(d) => interned(d.text.as_str()),
+            NodeData::TemplateMiddle(d) => interned(d.text.as_str()),
+            NodeData::TemplateTail(d) => interned(d.text.as_str()),
+            NodeData::JsxNamespacedName(d) => joined_text(self, || {
                 format!(
                     "{}:{}",
                     req(file, d.namespace).text(),
                     req(file, d.name).text()
                 )
-            })),
-            NodeData::JsDocText(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLink(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLinkCode(d) => Some(joined_text(self, || d.text.concat())),
-            NodeData::JsDocLinkPlain(d) => Some(joined_text(self, || d.text.concat())),
-            _ => None,
+            }),
+            NodeData::RegularExpressionLiteral(d) => interned(d.text.as_str()),
+            NodeData::JsDocText(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLink(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLinkCode(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsDocLinkPlain(d) => joined_text(self, || d.text.concat()),
+            NodeData::JsxText(d) => interned(d.text.as_str()),
+            _ => "",
         });
-        if let Some(text) = joined {
-            return text;
+        // A published file does not change, so its text stays. A store that
+        // is still parsed can get new node data (`replace_node_data`).
+        if !synthetic && is_published(file) {
+            JOINED_TEXT.with(|c| c.borrow_mut().write().insert(self, text));
         }
-        // A synthetic Identifier keeps its text in its data
-        // (`name_node_text`).
-        synthetic_text(self, |d| match d {
-            NodeData::Identifier(d) => Some(&d.text),
-            NodeData::PrivateIdentifier(d) => Some(&d.text),
-            NodeData::StringLiteral(d) => Some(&d.text),
-            NodeData::NumericLiteral(d) => Some(&d.text),
-            NodeData::BigIntLiteral(d) => Some(&d.text),
-            NodeData::NoSubstitutionTemplateLiteral(d) => Some(&d.text),
-            NodeData::TemplateHead(d) => Some(&d.text),
-            NodeData::TemplateMiddle(d) => Some(&d.text),
-            NodeData::TemplateTail(d) => Some(&d.text),
-            NodeData::RegularExpressionLiteral(d) => Some(&d.text),
-            NodeData::JsxText(d) => Some(&d.text),
-            _ => None,
-        })
+        text
     }
 
     /// `Name::from(self.text())`: the interned Go `node.Text()`.
@@ -2796,7 +3229,7 @@ impl Node {
     /// `Node::initializer` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn initializer_in(self, d: &'static NodeData) -> Node {
+    pub fn initializer_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::Initializer) {
             Some(initializer) => {
                 debug_assert_eq!(
@@ -3071,7 +3504,7 @@ impl Node {
     /// `Node::postfix_token` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn postfix_token_in(self, d: &'static NodeData) -> Node {
+    pub fn postfix_token_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::PostfixToken) {
             Some(token) => {
                 debug_assert_eq!(token, self.postfix_token_data_in(d), "U4 postfix column");
@@ -3101,7 +3534,7 @@ impl Node {
     /// `Node::question_token` on `d`, the data of this node that the caller
     /// already loaded with `parsed_node_data` (see `data_accessor!`).
     #[must_use]
-    pub fn question_token_in(self, d: &'static NodeData) -> Node {
+    pub fn question_token_in(self, d: LoadedData) -> Node {
         match frozen_store_child(self, StoreChild::QuestionToken) {
             Some(token) => {
                 debug_assert_eq!(token, self.question_token_data_in(d), "U4 question column");
@@ -3120,7 +3553,7 @@ impl Node {
     }
 
     /// `question_token_data` on `d` (see `data_accessor!`).
-    fn question_token_data_in(self, d: &'static NodeData) -> Node {
+    fn question_token_data_in(self, d: LoadedData) -> Node {
         match self.own_question_token_in(d) {
             Some(token) => token,
             None => question_of_postfix(self.postfix_token_data_in(d)),
@@ -3250,7 +3683,7 @@ impl Node {
 
 fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     let Some(node) = static_ast_node(n) else {
-        return for_each_synthetic_child(n, v, lists);
+        return for_each_scoped_child(n, v, lists);
     };
     let mut visit = NodeChildVisit {
         n,
@@ -3261,17 +3694,27 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<L
     walk_children(&node.data, &mut visit)
 }
 
-/// `for_each_child_impl` for a factory node, whose data is read in a scope
-/// (`SyntheticChildVisit`).
+/// `for_each_child_impl` for a node with no `'static` node (a factory node,
+/// or a node that a freeable parse owns, lsshells M3c), whose data is read
+/// in a scope (`ScopedChildVisit`). The node is held, so `v` can make and
+/// change nodes.
 #[cold]
 #[inline(never)]
-fn for_each_synthetic_child(
+fn for_each_scoped_child(
     n: Node,
     v: &mut dyn FnMut(Node) -> bool,
     lists: Option<ListHook>,
 ) -> bool {
-    with_synthetic_ast_node(n, |node| {
-        walk_children(&node.data, &mut SyntheticChildVisit { n, v, lists })
+    with_scoped_ast_node(n, |node| {
+        walk_children(
+            &node.data,
+            &mut ScopedChildVisit {
+                n,
+                file: n.file_index(),
+                v,
+                lists,
+            },
+        )
     })
 }
 
@@ -3288,7 +3731,7 @@ fn for_each_synthetic_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    node: &'static crate::astdata::Node,
+    node: &crate::astdata::Node,
     v: impl FnMut(u32) -> bool,
 ) -> bool {
     walk_children(&node.data, &mut StoreChildIds { kind, v })
@@ -3299,8 +3742,9 @@ pub(crate) fn for_each_store_child_id(
 /// generic walk (`NodeChildVisit`) turns the ids into `Node` handles; the
 /// parser's walk over a store node (`StoreChildIds`) keeps the slot
 /// indexes. One match serves both, so they visit the same fields. `'d` is
-/// the lifetime of the node data: `'static` for a parsed node, a read scope
-/// for a factory node (`SyntheticChildVisit`).
+/// the lifetime of the node data: `'static` for a parsed node of a static
+/// parse, a read scope for a factory node and for a node that a freeable
+/// parse owns (`ScopedChildVisit`, `StoreChildIds`).
 trait ChildVisit<'d> {
     /// A required child field (Go `visit`).
     fn node(&mut self, id: crate::astdata::NodeId) -> bool;
@@ -3384,22 +3828,36 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     }
 }
 
-/// The walk of `for_each_child_impl` over the data of a factory node. The
-/// data is read in a scope, so each list is read in place (`DataList`), and
-/// the list hook gets a copy of it that the thread's synthetic arena owns
-/// (`copy_synthetic_list`). Otherwise it visits like `NodeChildVisit`.
-struct SyntheticChildVisit<'a, 'b> {
+/// The walk of `for_each_child_impl` over the data of a node of `file`
+/// with no `'static` node: a factory node, or a node that a freeable parse
+/// owns (lsshells M3c). The data is read in a scope, so each list is read
+/// in place (`DataList`), and the list hook gets a copy of it that the
+/// thread's synthetic arena owns (`copy_synthetic_list`, or a factory list
+/// of the same nodes for a store list). Otherwise it visits like
+/// `NodeChildVisit`.
+struct ScopedChildVisit<'a, 'b> {
     n: Node,
+    /// `SYNTHETIC_NODE_FILE` or the store id of `n`.
+    file: usize,
     v: &'a mut dyn FnMut(Node) -> bool,
     lists: Option<ListHook<'b>>,
 }
 
-impl SyntheticChildVisit<'_, '_> {
+impl ScopedChildVisit<'_, '_> {
     /// `NodeChildVisit::report` for a list read in place.
+    // PORT: only the `astdump` tool reads the lists. The copy of a store
+    // list has the nodes and `Loc` of the list, not its missing-list bit.
     fn report(&mut self, l: DataList<'_>, is_mod: bool) {
+        let file = self.file;
         if let (Some(h), Some(list)) = (self.lists.as_mut(), l.list) {
             if l.is_some() {
-                h(copy_synthetic_list(list), is_mod);
+                let copy = if file == SYNTHETIC_NODE_FILE {
+                    copy_synthetic_list(list)
+                } else {
+                    let nodes: Vec<Node> = l.nodes().collect();
+                    new_synthetic_node_list(&nodes, text_range_of(&list.range))
+                };
+                h(copy, is_mod);
             }
         }
     }
@@ -3421,37 +3879,37 @@ impl SyntheticChildVisit<'_, '_> {
     }
 }
 
-impl<'d> ChildVisit<'d> for SyntheticChildVisit<'_, '_> {
+impl<'d> ChildVisit<'d> for ScopedChildVisit<'_, '_> {
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
-        visit(self.v, req(SYNTHETIC_NODE_FILE, id))
+        visit(self.v, req(self.file, id))
     }
 
     fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
-        visit(self.v, opt(SYNTHETIC_NODE_FILE, id))
+        visit(self.v, opt(self.file, id))
     }
 
     fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
-        self.visit_list(DataList::req(SYNTHETIC_NODE_FILE, l))
+        self.visit_list(DataList::req(self.file, l))
     }
 
     fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
-        self.visit_list(DataList::opt(SYNTHETIC_NODE_FILE, l))
+        self.visit_list(DataList::opt(self.file, l))
     }
 
     // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
     fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
-        let l = DataList::mods(SYNTHETIC_NODE_FILE, m);
+        let l = DataList::mods(self.file, m);
         self.report(l, true);
         l.list.is_some() && self.visit_nodes(l)
     }
 
     fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
-        ids.iter()
-            .any(|&id| (self.v)(Node::new(SYNTHETIC_NODE_FILE, id)))
+        let file = self.file;
+        ids.iter().any(|&id| (self.v)(Node::new(file, id)))
     }
 
     fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
-        visit(self.v, case_expression(self.n, SYNTHETIC_NODE_FILE, id))
+        visit(self.v, case_expression(self.n, self.file, id))
     }
 }
 
@@ -3464,7 +3922,7 @@ struct StoreChildIds<F> {
     v: F,
 }
 
-impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
+impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
     #[inline(always)]
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         id.index() != 0 && (self.v)(id.index() as u32)
@@ -3477,23 +3935,23 @@ impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
 
     // `NodeList::is_nil` of a store list: the nil marker list.
     #[inline(always)]
-    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+    fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
         !is_nil_list_marker(l) && self.ids(&l.nodes)
     }
 
     #[inline(always)]
-    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
+    fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
         l.as_ref().is_some_and(|l| self.list(l))
     }
 
     // `ModifierList::is_nil` is only `None`.
     #[inline(always)]
-    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
+    fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
         m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
     }
 
     #[inline(always)]
-    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
+    fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
         ids.iter().any(|id| (self.v)(id.index() as u32))
     }
 
@@ -4087,7 +4545,7 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
     }
     match static_ast_node(n) {
         Some(node) => subtree_facts_of_data(n, &node.data),
-        None => with_synthetic_ast_node(n, |node| subtree_facts_of_data(n, &node.data)),
+        None => read_scoped_ast_node(n, |node| subtree_facts_of_data(n, &node.data)),
     }
 }
 
@@ -5054,12 +5512,11 @@ impl Node {
         // the astnav tests do) the store file is not in a program; its cache
         // and lazy JSDoc inputs are in the store.
         if is_file_store_before_program(file.file_index()) {
-            return resolve_file_store_js_doc(file.file_index(), self)
-                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
+            return resolve_file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
         let info = source_file_info(file);
-        match info.jsdoc_cache.get(&self) {
-            Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
+        match cached_js_doc(file, &info, self) {
+            Some(jsdocs) => jsdocs,
             None if info.has_lazy_js_doc => match crate::program::resolve_lazy_js_doc(file, self) {
                 Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
                 None => unported!("parseJSDocForNode"),
@@ -5088,13 +5545,29 @@ impl Node {
             return NodeSlice::NIL;
         }
         if is_file_store_before_program(file.file_index()) {
-            return file_store_js_doc(file.file_index(), self)
-                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
+            return file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
-        source_file_info(file)
+        cached_js_doc(file, &source_file_info(file), self).unwrap_or(NodeSlice::NIL)
+    }
+}
+
+/// The JSDoc cache entry of `host` in published file `file`, whose info is
+/// `info`, or `None` on a miss. The slice of a freeable file version reads
+/// the cache at each use (`NodeSlice::from_file_js_doc`).
+fn cached_js_doc(
+    file: Node,
+    info: &FileRef<crate::program::SourceFileInfo>,
+    host: Node,
+) -> Option<NodeSlice> {
+    match info.as_static() {
+        Some(info) => info
             .jsdoc_cache
-            .get(&self)
-            .map_or(NodeSlice::NIL, |jsdocs| NodeSlice::from_nodes(jsdocs))
+            .get(&host)
+            .map(|jsdocs| NodeSlice::from_nodes(jsdocs)),
+        None => info
+            .jsdoc_cache
+            .contains_key(&host)
+            .then(|| NodeSlice::from_file_js_doc(file.file_index(), host)),
     }
 }
 
@@ -5161,6 +5634,13 @@ impl Node {
 // SourceFile methods. `file` is a SourceFile node.
 // ──────────────────────────────────────────────────────────────────────
 
+// PORT: the caches below are per thread and leaked, for static files
+// (tier 0, tier 1, synthetic) and files that are not published yet. A
+// published freeable file version (lsshells M3b) keeps them on its
+// `FileVersion` (`name_table`, `position_map`, `declaration_map`; see
+// `file_version_of`) and its ECMA line map in its store
+// (`frozen_file_ecma_line_starts`), as Go keeps them on the `SourceFile`,
+// so they are freed with it.
 thread_local! {
     /// Go `SourceFile.ecmaLineMap`, computed once per file.
     static ECMA_LINE_MAPS: RefCell<FxHashMap<Node, &'static [i32]>> = RefCell::new(FxHashMap::default());
@@ -5174,6 +5654,17 @@ thread_local! {
     /// Go `SourceFile.identifiers`, collected once per parsed file.
     static IDENTIFIER_SETS: RefCell<FxHashMap<Node, &'static FxHashSet<&'static str>>> =
         RefCell::new(FxHashMap::default());
+}
+
+/// The live freeable file version of `file` (a SourceFile node), or `None`
+/// for a static, unpublished or synthetic file.
+fn file_version_of(file: Node) -> Option<crate::ast::VersionPin> {
+    if is_synthetic_node(file) {
+        return None;
+    }
+    crate::ast::try_go_file(file.file_index())?
+        .version()
+        .cloned()
 }
 
 // Go: ast.go:2566 (*SourceFile).Text
@@ -5431,13 +5922,20 @@ pub fn source_file_is_content_mapper_supplemental(file: Node) -> bool {
 
 // Go: ast.go:2687 (*SourceFile).HasIdentifier
 // PORT: Go `identifiersOnce` is a per-thread cache (`IDENTIFIER_SETS`) for a
-// parsed file, whose id is never reused. A factory SourceFile collects its
-// set on each call, because a released program frees its synthetic nodes
-// and a later node can get the same handle.
+// parsed file, whose id is never reused. A freeable file version keeps its
+// set, which is freed with it (lsshells M3). A factory SourceFile collects
+// its set on each call, because a released program frees its synthetic
+// nodes and a later node can get the same handle.
 #[must_use]
 pub fn source_file_has_identifier(file: Node, name: &str) -> bool {
     if is_synthetic_node(file) {
         return collect_identifiers_for_source_file(file).contains(name);
+    }
+    if let Some(version) = file_version_of(file) {
+        return version
+            .identifiers
+            .get_or_init(|| collect_identifiers_for_source_file(file))
+            .contains(name);
     }
     if let Some(identifiers) = IDENTIFIER_SETS.with(|c| c.borrow().get(&file).copied()) {
         return identifiers.contains(name);
@@ -5480,39 +5978,77 @@ pub fn source_file_file_name(file: Node) -> &'static str {
 }
 
 // Go: ast.go:2578 (*SourceFile).Imports
+// PORT: a freeable file version (lsshells M3b) gives a handle slice
+// (`NodeSlice::from_file_imports`), which reads the imports at each use.
 #[must_use]
 pub fn source_file_imports(file: Node) -> NodeSlice {
-    NodeSlice::from_nodes(&source_file_info(file).imports)
+    let file = published_source_file(file);
+    match source_file_info(file).as_static() {
+        Some(info) => NodeSlice::from_nodes(&info.imports),
+        None => NodeSlice::from_file_imports(file.file_index()),
+    }
+}
+
+/// A diagnostic list of `SourceFileInfo`, as the key of a `FileRef`.
+#[derive(Clone, Copy)]
+enum DiagnosticList {
+    Parse,
+    Js,
+    JsDoc,
+}
+
+/// The list of `info` that `key` (a `DiagnosticList`) names.
+fn diagnostic_list(info: &crate::program::SourceFileInfo, key: usize) -> &[Diagnostic] {
+    match key {
+        k if k == DiagnosticList::Parse as usize => &*info.diagnostics,
+        k if k == DiagnosticList::Js as usize => &*info.js_diagnostics,
+        _ => &*info.jsdoc_diagnostics,
+    }
+}
+
+/// Diagnostic list `list` of the info of `file` (see `source_file_info`).
+// PORT: the part must stay a place expression, with no braces around it. A
+// block is a value, so `&{ .. }` would move the list into a temporary.
+fn source_file_list(file: Node, list: DiagnosticList) -> FileRef<[Diagnostic]> {
+    use crate::ast::file_version::go_file_ref;
+    let file = published_source_file(file);
+    go_file_ref!(file.file_index(), list as usize, |g, key| *diagnostic_list(
+        &g.info, key
+    ))
 }
 
 // Go: ast.go:2582 (*SourceFile).Diagnostics
 // PORT: a file that is not published yet reads its store (see
 // `source_file_language_variant`).
 #[must_use]
-pub fn source_file_diagnostics(file: Node) -> &'static [Diagnostic] {
+pub fn source_file_diagnostics(file: Node) -> FileRef<[Diagnostic]> {
     if !is_synthetic_node(file) && is_file_store_before_program(file.file_index()) {
-        return file_store_diagnostics(file.file_index());
+        return FileRef::Static(file_store_diagnostics(file.file_index()));
     }
-    &source_file_info(file).diagnostics
+    source_file_list(file, DiagnosticList::Parse)
 }
 
 // Go: ast.go:2590 (*SourceFile).JSDiagnostics
 #[must_use]
-pub fn source_file_js_diagnostics(file: Node) -> &'static [Diagnostic] {
-    &source_file_info(file).js_diagnostics
+pub fn source_file_js_diagnostics(file: Node) -> FileRef<[Diagnostic]> {
+    source_file_list(file, DiagnosticList::Js)
 }
 
 // Go: ast.go:2598 (*SourceFile).JSDocDiagnostics
 #[must_use]
-pub fn source_file_jsdoc_diagnostics(file: Node) -> &'static [Diagnostic] {
-    &source_file_info(file).jsdoc_diagnostics
+pub fn source_file_jsdoc_diagnostics(file: Node) -> FileRef<[Diagnostic]> {
+    source_file_list(file, DiagnosticList::JsDoc)
 }
 
 // Go: ast.go:2641 (*SourceFile).BindDiagnostics
 // PORT: panics before the file is bound. Go returns nil there.
 #[must_use]
-pub fn source_file_bind_diagnostics(file: Node) -> &'static [Diagnostic] {
-    &file_bind_data(file).bind_diagnostics
+pub fn source_file_bind_diagnostics(file: Node) -> FileRef<[Diagnostic]> {
+    crate::ast::file_version::go_file_ref!(file.file_index(), 0, |g, _key| *g
+        .file_bind
+        .get()
+        .expect("source file is not bound")
+        .bind_diagnostics)
 }
 
 // Go: ast.go:2657 (*SourceFile).IsJS
@@ -5523,28 +6059,43 @@ pub fn source_file_is_js(file: Node) -> bool {
 
 // Go: ast.go:2702 (*SourceFile).ECMALineMap
 #[must_use]
-pub fn source_file_ecma_line_map(file: Node) -> &'static [i32] {
+pub fn source_file_ecma_line_map(file: Node) -> FileRef<[i32]> {
     if !is_synthetic_node(file)
         && let Some(line_map) = crate::ast::store::frozen_file_ecma_line_starts(file.file_index())
     {
         return line_map;
     }
     if let Some(line_map) = ECMA_LINE_MAPS.with(|c| c.borrow().get(&file).copied()) {
-        return line_map;
+        return FileRef::Static(line_map);
     }
     let line_map: &'static [i32] = Vec::leak(compute_ecma_line_starts(source_file_text(file)));
     ECMA_LINE_MAPS.with(|c| c.borrow_mut().insert(file, line_map));
-    line_map
+    FileRef::Static(line_map)
 }
 
 // Go: ast.go:2720 (*SourceFile).GetNameTable
 /// All names in the file mapped to their position. A name that appears
 /// more than once maps to -1.
 #[must_use]
-pub fn source_file_get_name_table(file: Node) -> &'static FxHashMap<String, i32> {
-    if let Some(table) = NAME_TABLES.with(|c| c.borrow().get(&file).copied()) {
-        return table;
+pub fn source_file_get_name_table(file: Node) -> FileRef<FxHashMap<String, i32>> {
+    if let Some(version) = file_version_of(file) {
+        version.name_table.get_or_init(|| compute_name_table(file));
+        return FileRef::Pinned {
+            version,
+            key: 0,
+            get: |version, _| version.name_table.get().expect("the name table is made"),
+        };
     }
+    if let Some(table) = NAME_TABLES.with(|c| c.borrow().get(&file).copied()) {
+        return FileRef::Static(table);
+    }
+    let table: &'static FxHashMap<String, i32> = Box::leak(Box::new(compute_name_table(file)));
+    NAME_TABLES.with(|c| c.borrow_mut().insert(file, table));
+    FileRef::Static(table)
+}
+
+/// Go `(*SourceFile).GetNameTable` without the cache.
+fn compute_name_table(file: Node) -> FxHashMap<String, i32> {
     fn walk(file: Node, node: Node, name_table: &mut FxHashMap<String, i32>) -> bool {
         if is_identifier(node) && !is_tag_name(node) && !node.text().is_empty()
             || is_string_or_numeric_literal_like(node) && literal_is_name(node)
@@ -5565,40 +6116,72 @@ pub fn source_file_get_name_table(file: Node) -> &'static FxHashMap<String, i32>
     }
     let mut name_table = FxHashMap::default();
     file.for_each_child(|child| walk(file, child, &mut name_table));
-    let table: &'static FxHashMap<String, i32> = Box::leak(Box::new(name_table));
-    NAME_TABLES.with(|c| c.borrow_mut().insert(file, table));
-    table
+    name_table
 }
 
 // Go: ast.go:2751 (*SourceFile).IsBound
 #[must_use]
 pub fn source_file_is_bound(file: Node) -> bool {
-    file.go_file().file_bind.get().is_some()
+    crate::ast::with_go_file(file.file_index(), |g| g.file_bind.get().is_some())
 }
 
 // Go: ast.go:2756 (*SourceFile).GetPositionMap
 // PORT: Go `positionMapOnce` is a per-thread cache (`POSITION_MAPS`).
 #[must_use]
-pub fn source_file_get_position_map(file: Node) -> &'static PositionMap {
-    if let Some(map) = POSITION_MAPS.with(|c| c.borrow().get(&file).copied()) {
-        return map;
+pub fn source_file_get_position_map(file: Node) -> FileRef<PositionMap> {
+    if let Some(version) = file_version_of(file) {
+        version
+            .position_map
+            .get_or_init(|| compute_source_file_position_map(file));
+        return FileRef::Pinned {
+            version,
+            key: 0,
+            get: |version, _| {
+                version
+                    .position_map
+                    .get()
+                    .expect("the position map is made")
+            },
+        };
     }
-    let map = compute_position_map(source_file_text(file));
-    let map: &'static PositionMap = Box::leak(Box::new(map));
+    if let Some(map) = POSITION_MAPS.with(|c| c.borrow().get(&file).copied()) {
+        return FileRef::Static(map);
+    }
+    let map: &'static PositionMap = Box::leak(Box::new(compute_source_file_position_map(file)));
     POSITION_MAPS.with(|c| c.borrow_mut().insert(file, map));
-    map
+    FileRef::Static(map)
+}
+
+/// Go `(*SourceFile).GetPositionMap` without the cache.
+fn compute_source_file_position_map(file: Node) -> PositionMap {
+    compute_position_map(source_file_text(file))
 }
 
 // Go: ast.go:2840 (*SourceFile).GetDeclarationMap
 #[must_use]
-pub fn source_file_get_declaration_map(file: Node) -> &'static FxHashMap<String, Vec<Node>> {
+pub fn source_file_get_declaration_map(file: Node) -> FileRef<FxHashMap<String, Vec<Node>>> {
+    if let Some(version) = file_version_of(file) {
+        version
+            .declaration_map
+            .get_or_init(|| compute_declaration_map(file));
+        return FileRef::Pinned {
+            version,
+            key: 0,
+            get: |version, _| {
+                version
+                    .declaration_map
+                    .get()
+                    .expect("the declaration map is made")
+            },
+        };
+    }
     if let Some(map) = DECLARATION_MAPS.with(|c| c.borrow().get(&file).copied()) {
-        return map;
+        return FileRef::Static(map);
     }
     let map: &'static FxHashMap<String, Vec<Node>> =
         Box::leak(Box::new(compute_declaration_map(file)));
     DECLARATION_MAPS.with(|c| c.borrow_mut().insert(file, map));
-    map
+    FileRef::Static(map)
 }
 
 // Go: ast.go:2849 (*SourceFile).computeDeclarationMap

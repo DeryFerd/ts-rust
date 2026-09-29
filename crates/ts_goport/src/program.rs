@@ -172,15 +172,37 @@ pub struct SourceFileInfo {
     pub type_reference_directives: Vec<FileReference>,
     pub lib_reference_directives: Vec<FileReference>,
     pub comment_directives: Vec<CommentDirective>,
-    // PERF: the diagnostic lists borrow the parsed file of the Go frontend
-    // instead of copying it. The publish of the file keeps that parse for
-    // good (see `go_files_of_unpublished_stores`).
-    pub diagnostics: &'static [Diagnostic],
-    pub js_diagnostics: &'static [Diagnostic],
-    pub jsdoc_diagnostics: &'static [Diagnostic],
+    // PERF: the diagnostic lists of a static file borrow the parsed file of
+    // the Go frontend instead of copying it. The publish of the file keeps
+    // that parse for good (see `go_files_of_unpublished_stores`). A freeable
+    // file version (lsshells M3b) keeps no parse and owns copies, which are
+    // freed with it.
+    pub diagnostics: KeptData<[Diagnostic]>,
+    pub js_diagnostics: KeptData<[Diagnostic]>,
+    pub jsdoc_diagnostics: KeptData<[Diagnostic]>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
     late: OnceLock<LateSourceFileInfo>,
+}
+
+/// A parse list that a `SourceFileInfo` keeps (lsshells M3b): borrowed for
+/// good from the parse that a static publish keeps (or leaked), or owned by
+/// the `GoFile` of a freeable file version. It derefs to the list.
+pub enum KeptData<T: ?Sized + 'static> {
+    Borrowed(&'static T),
+    Owned(Box<T>),
+}
+
+impl<T: ?Sized + 'static> Deref for KeptData<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            KeptData::Borrowed(value) => value,
+            KeptData::Owned(value) => value,
+        }
+    }
 }
 
 impl Deref for SourceFileInfo {
@@ -198,15 +220,16 @@ pub struct LateSourceFileInfo {
     pub file_index: usize,
     pub external_module_indicator: Node,
     // PERF: like the diagnostic lists, `reparsed_clones` and `jsdoc_cache`
-    // borrow leaked data. The JSDoc cache has one list per host node, so a
-    // copy costs one allocation per entry.
-    pub reparsed_clones: &'static [Node],
+    // of a static file borrow the kept parse; a freeable file version owns
+    // copies. The JSDoc cache has one list per host node, so a copy costs
+    // one allocation per entry.
+    pub reparsed_clones: KeptData<[Node]>,
     pub imports: Vec<Node>,
     pub module_augmentations: Vec<Node>,
     pub ambient_module_names: Vec<String>,
     pub uses_uri_style_node_core_modules: Tristate,
     /// Go `SourceFile.jsdocCache`: parsed JSDoc nodes by host node.
-    pub jsdoc_cache: &'static FxHashMap<Node, Vec<Node>>,
+    pub jsdoc_cache: KeptData<FxHashMap<Node, Vec<Node>>>,
     post_bind: OnceLock<PostBindInfo>,
 }
 
@@ -234,12 +257,16 @@ impl Deref for LateSourceFileInfo {
         if let Some(info) = self.post_bind.get() {
             return info;
         }
-        let file = crate::ast::go_file(self.file_index);
-        let Some(file_bind) = file.file_bind.get() else {
+        let indicator = crate::ast::with_go_file(self.file_index, |file| {
+            file.file_bind
+                .get()
+                .map(|file_bind| file_bind.common_js_module_indicator)
+        });
+        let Some(common_js_module_indicator) = indicator else {
             return &NOT_BOUND;
         };
         self.post_bind.get_or_init(|| PostBindInfo {
-            common_js_module_indicator: file_bind.common_js_module_indicator,
+            common_js_module_indicator,
         })
     }
 }
@@ -535,6 +562,16 @@ pub(crate) struct VersionTables {
     /// None for an alias resolver program. The frontend program itself is
     /// in `FRONTENDS`, on the loading thread only.
     go: Option<go_frontend::GoSharedState>,
+    /// The freeable file versions of the program files (lsshells M3a). A
+    /// thread that holds the tables keeps them alive, so a worker thread can
+    /// read its program files after the frontend program is freed.
+    file_versions: Vec<Arc<crate::ast::FileVersion>>,
+    /// The binder symbols of the program (`bind_all`, `bound_symbols`): a
+    /// copy of the binder lineage after the program files are bound. Each
+    /// checker copies it. It shares the lineage chunks, so it keeps the
+    /// chunks of a dead file version until the release frees it (lsshells
+    /// M2c, M3d).
+    bound_symbols: OnceLock<SymbolArena>,
 }
 
 impl VersionTables {
@@ -546,6 +583,8 @@ impl VersionTables {
             file_associations: OnceLock::new(),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             go: None,
+            file_versions: Vec::new(),
+            bound_symbols: OnceLock::new(),
         }
     }
 
@@ -634,8 +673,37 @@ fn slot_tables(id: u32, slot: &Mutex<Option<Arc<VersionTables>>>) -> Arc<Version
 /// (`WorkerSeed`). None for the program of a one-program process.
 fn current_tables() -> Option<(u32, Arc<VersionTables>)> {
     let program = prog();
-    let TablesSlot::Version(slot) = &state_of(program).tables else {
-        return None;
+    match held_tables(program) {
+        HeldTables::Leaked(_) => None,
+        HeldTables::Version(tables) => Some((program.id, tables)),
+    }
+}
+
+/// The tables of one program version, held: the leaked tables of a
+/// one-program process, or a copy of the `Arc` of a program version.
+enum HeldTables {
+    Leaked(&'static VersionTables),
+    Version(Arc<VersionTables>),
+}
+
+impl Deref for HeldTables {
+    type Target = VersionTables;
+
+    fn deref(&self) -> &VersionTables {
+        match self {
+            HeldTables::Leaked(tables) => tables,
+            HeldTables::Version(tables) => tables,
+        }
+    }
+}
+
+/// The tables of `program`: this thread's copy when it holds one, else the
+/// ones in its slot. Panics when the program is released and this thread
+/// holds no copy, as `with_tables`.
+fn held_tables(program: &'static GoProgram) -> HeldTables {
+    let slot = match &state_of(program).tables {
+        TablesSlot::Leaked(tables) => return HeldTables::Leaked(tables),
+        TablesSlot::Version(slot) => slot,
     };
     let cached = TABLES.with(|cache| {
         cache
@@ -645,10 +713,43 @@ fn current_tables() -> Option<(u32, Arc<VersionTables>)> {
             .filter(|(id, _)| *id == program.id)
             .map(|(_, tables)| Arc::clone(tables))
     });
-    Some((
-        program.id,
-        cached.unwrap_or_else(|| slot_tables(program.id, slot)),
-    ))
+    HeldTables::Version(cached.unwrap_or_else(|| slot_tables(program.id, slot)))
+}
+
+/// The binder symbols of a program version (Go: the symbols that the bound
+/// files of the program point to): a copy of the binder lineage after the
+/// program files are bound (`bind_all`). It derefs to the arena.
+// PORT: Go symbols live with their files. Here they are in the program's
+// `VersionTables` (lsshells M2c), so a release frees the copy with the
+// tables, and the lineage chunks of a dead file version go when the last
+// copy lets go (M3d). The guard holds the tables while it lives: keep it
+// only as long as the symbols are read.
+pub struct BoundSymbols(HeldTables);
+
+impl Deref for BoundSymbols {
+    type Target = SymbolArena;
+
+    #[inline]
+    fn deref(&self) -> &SymbolArena {
+        self.0.bound_symbols.get().expect("program is not bound")
+    }
+}
+
+/// The binder symbols of the current program (`prog()`). Panics when it is
+/// not bound (`bind_all`) or released.
+#[must_use]
+pub fn bound_symbols() -> BoundSymbols {
+    bound_symbols_of(prog()).expect("program is not bound")
+}
+
+/// The binder symbols of `program`, or None when it is not bound
+/// (`bind_all`). Panics when it is released and this thread holds no copy
+/// of its tables.
+#[must_use]
+pub fn bound_symbols_of(program: &'static GoProgram) -> Option<BoundSymbols> {
+    let tables = held_tables(program);
+    tables.bound_symbols.get()?;
+    Some(BoundSymbols(tables))
 }
 
 /// Frees the tables of program `id` when no other thread holds them: takes
@@ -854,7 +955,7 @@ impl Drop for AliasResolverProgramScope {
 // later is not in its checkers' arenas. Go `GetResolvedModules` is nil, so
 // the program has no resolved modules. The program shell stays leaked like
 // other program versions (multi-program M2, M3); the scope frees its
-// tables.
+// tables, with its copy of the lineage.
 pub fn new_alias_resolver_program(
     options: CompilerOptions,
     root_files: &[Node],
@@ -871,7 +972,6 @@ pub fn new_alias_resolver_program(
         id: next_program_id(),
         source_file_order: root_files.iter().map(|file| file.file_index()).collect(),
         options,
-        bound_symbols: OnceLock::new(),
         state: OnceLock::new(),
     }));
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
@@ -880,19 +980,31 @@ pub fn new_alias_resolver_program(
         resolved_modules: OnceLock::from(IndexMap::new()),
         common_source_directory: OnceLock::new(),
         alias_resolver: true,
-        tables: TablesSlot::new(VersionTables::new(file_by_path), false),
+        // The files stay alive while the alias resolver program reads them.
+        tables: TablesSlot::new(
+            VersionTables {
+                file_versions: crate::ast::live_file_versions(
+                    files.iter().map(|file| file.file_index()),
+                ),
+                ..VersionTables::new(file_by_path)
+            },
+            false,
+        ),
     }));
     assert!(program.state.set(program_state).is_ok());
     register_program_version(program);
-    let bound_symbols = {
-        let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
-        let symbols = lineage.get_or_insert_with(SymbolArena::new);
+    let bound_symbols = with_lineage(|lineage| {
         for &file in files {
-            bind_source_file(file, symbols);
+            lineage.bind(file);
         }
-        symbols.clone()
-    };
-    assert!(program.bound_symbols.set(bound_symbols).is_ok());
+        lineage.symbols.clone()
+    });
+    assert!(
+        held_tables(program)
+            .bound_symbols
+            .set(bound_symbols)
+            .is_ok()
+    );
     ALIAS_RESOLVERS.with(|resolvers| resolvers.borrow_mut().insert(program.id, resolver));
     AliasResolverProgramScope {
         program,
@@ -938,44 +1050,143 @@ pub fn try_load_timed(
     go_frontend::try_load_with(config_path, edit_options, times)
 }
 
-/// The symbol arena of every file version bound so far, in any program
-/// version. It only grows, so the symbol ids of a file version stay valid
-/// in every program that shares the file (Go `SourceFile.BindOnce`).
-static LINEAGE: Mutex<Option<SymbolArena>> = Mutex::new(None);
+/// The binder lineage: the symbol arena of every file version bound so
+/// far, in any program version. Ids only grow and are never used again, so
+/// the symbol ids of a file version stay valid in every program that shares
+/// the file (Go `SourceFile.BindOnce`).
+///
+/// lsshells M3d: a freeable file version (`ast::FileVersion`) binds into
+/// whole chunks of its own (`add_file`), and the lineage keeps their range.
+/// After the version dies, the next use of the lineage frees those chunks
+/// (`free_dead`): its ids become holes, and a read of one panics. A static
+/// file keeps its symbols until exit. The program copies
+/// (`VersionTables::bound_symbols`) and checker arenas that share a freed
+/// chunk keep it until they drop.
+struct Lineage {
+    symbols: SymbolArena,
+    /// The arena range of each freeable file version bound here, by file
+    /// id, until the version dies.
+    freeable: FxHashMap<usize, (ArenaMark, ArenaMark)>,
+    /// `ast::dead_file_versions` when `free_dead` last looked.
+    seen_dead: usize,
+}
+
+static LINEAGE: Mutex<Option<Lineage>> = Mutex::new(None);
+
+/// Runs `f` with the binder lineage locked, after it frees the chunks of
+/// the file versions that died since its last use.
+// PORT: a dying `FileVersion` does not lock the lineage: it can drop on a
+// thread that holds the lock (the last pin of a dead version can drop in a
+// bind). So the lineage frees its chunks here, at the next bind, and they
+// stay one edit longer.
+fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
+    let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+    let lineage = lineage.get_or_insert_with(|| Lineage {
+        symbols: SymbolArena::new(),
+        freeable: FxHashMap::default(),
+        seen_dead: 0,
+    });
+    lineage.free_dead();
+    f(lineage)
+}
+
+impl Lineage {
+    /// Frees the chunks of the freeable versions that died since the last
+    /// call.
+    // PERF: one atomic load when no version died.
+    fn free_dead(&mut self) {
+        if crate::ast::dead_file_versions() == self.seen_dead {
+            return;
+        }
+        let (dead, seen) = crate::ast::dead_files_since(self.seen_dead);
+        self.seen_dead = seen;
+        for file in dead {
+            if let Some((start, end)) = self.freeable.remove(&file) {
+                self.symbols.free_range(start, end);
+            }
+        }
+    }
+
+    /// Runs `add`, which adds the symbols and tables of file `file` to the
+    /// lineage. A freeable version (`freeable`) starts and ends on chunk
+    /// starts (`SymbolArena::end_chunk`), so its chunks hold no other
+    /// symbols, and its range is kept for `free_dead`. Its ids and the ids
+    /// of the files after it move to the chunk start; a static file binds
+    /// as before.
+    fn add_file<R>(
+        &mut self,
+        file: usize,
+        freeable: bool,
+        add: impl FnOnce(&mut SymbolArena) -> R,
+    ) -> R {
+        if !freeable {
+            return add(&mut self.symbols);
+        }
+        self.symbols.end_chunk();
+        let start = self.symbols.mark();
+        let result = add(&mut self.symbols);
+        self.symbols.end_chunk();
+        self.freeable.insert(file, (start, self.symbols.mark()));
+        result
+    }
+
+    /// Go `binder.BindSourceFile` into the lineage (`bind_source_file`),
+    /// with the chunks of a freeable version kept apart (`add_file`). A
+    /// file that is bound already is skipped.
+    fn bind(&mut self, file: Node) {
+        let freeable = {
+            let go_file = crate::ast::go_file(file.file_index());
+            if go_file.file_bind.get().is_some() {
+                return;
+            }
+            go_file.version().is_some()
+        };
+        self.add_file(file.file_index(), freeable, |symbols| {
+            bind_source_file(file, symbols);
+        });
+    }
+}
+
+/// The lineage chunks that hold symbols or tables, after the chunks of the
+/// dead file versions are freed. Tests use it (lsshells M3d).
+#[must_use]
+pub fn lineage_live_chunks() -> usize {
+    with_lineage(|lineage| lineage.symbols.live_chunk_count())
+}
 
 // Go: compiler/program.go:445 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
-// file binds into the shared `LINEAGE` arena, and `prog().bound_symbols` is
-// a copy of it after the program files are bound. `Checker::new` uses the
-// same initializer, so the first of the two to run binds. Files bind in
-// parallel, each into its own arena (`bind_files_parallel`), and join the
-// lineage in file order with the ids a serial bind gives. With
-// `--singleThreaded` they bind last-queued-first
-// (`bind_files_last_queued_first`). A file that an earlier program version
-// bound is not bound again.
+// file binds into the shared `LINEAGE` arena, and the program's binder
+// symbols (`bound_symbols`, in its `VersionTables`) are a copy of it after
+// the program files are bound. `Checker::new` uses the same initializer,
+// so the first of the two to run binds. Files bind in parallel, each into
+// its own arena (`bind_files_parallel`), and join the lineage in file order
+// with the ids a serial bind gives. With `--singleThreaded` they bind
+// last-queued-first (`bind_files_last_queued_first`). A file that an
+// earlier program version bound is not bound again.
 pub fn bind_all() {
     let program = prog();
-    program.bound_symbols.get_or_init(|| {
-        let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
-        let symbols = lineage.get_or_insert_with(SymbolArena::new);
-        let mark = symbols.mark();
-        if single_threaded() {
-            bind_files_last_queued_first(symbols);
-        } else {
-            bind_files_parallel(symbols);
-        }
-        for file in program.source_files() {
-            // Go: program.go:450 traces the files that are not bound yet.
-            let _trace = if file.file_bind.get().is_none() {
-                trace_bind_source_file(file.root)
+    held_tables(program).bound_symbols.get_or_init(|| {
+        with_lineage(|lineage| {
+            let mark = lineage.symbols.mark();
+            if single_threaded() {
+                bind_files_last_queued_first(lineage);
             } else {
-                None
-            };
-            bind_source_file(file.root, symbols);
-        }
-        // Checkers clone the copy; share what this program added.
-        symbols.share_since(mark);
-        symbols.clone()
+                bind_files_parallel(lineage);
+            }
+            for file in program.source_files() {
+                // Go: program.go:450 traces the files that are not bound yet.
+                let _trace = if file.file_bind.get().is_none() {
+                    trace_bind_source_file(file.root)
+                } else {
+                    None
+                };
+                lineage.bind(file.root);
+            }
+            // Checkers clone the copy; share what this program added.
+            lineage.symbols.share_since(mark);
+            lineage.symbols.clone()
+        })
     });
 }
 
@@ -985,25 +1196,28 @@ pub fn bind_all() {
 /// file binds into its own arena, and the arenas join the lineage arena in
 /// file order, so the ids are those of a serial bind in file order (see
 /// `bind_files_parallel`). This thread keeps the state that binding makes.
-fn bind_files_last_queued_first(symbols: &mut SymbolArena) {
-    let queued: Vec<Node> = prog()
+fn bind_files_last_queued_first(lineage: &mut Lineage) {
+    let queued: Vec<(Node, bool)> = prog()
         .source_files()
         .filter(|file| file.file_bind.get().is_none())
-        .map(|file| file.root)
+        .map(|file| (file.root, file.version().is_some()))
         .collect();
-    let mut bound: Vec<(BoundFile, SymbolArena)> = queued
+    let mut bound: Vec<(BoundFile, SymbolArena, bool)> = queued
         .into_iter()
         .rev()
-        .map(|file| {
+        .map(|(file, freeable)| {
             let _trace = trace_bind_source_file(file);
             let mut file_symbols = SymbolArena::new();
             let bound = bind_source_file_detached(file, &mut file_symbols);
-            (bound, file_symbols)
+            (bound, file_symbols, freeable)
         })
         .collect();
     bound.reverse();
-    for (mut file, file_symbols) in bound {
-        file.remap(symbols.append_file_arena(file_symbols));
+    for (mut file, file_symbols, freeable) in bound {
+        let offsets = lineage.add_file(file.file.file_index(), freeable, |symbols| {
+            symbols.append_file_arena(file_symbols, freeable)
+        });
+        file.remap(offsets);
         file.install();
     }
 }
@@ -1343,19 +1557,32 @@ struct BindQueueState {
     /// earlier file is bound: each file adds its counts to the offsets of the
     /// file before it.
     offsets: Vec<ArenaOffsets>,
+    /// Whether file `i` is a freeable file version. It and the file after
+    /// it start at a chunk start (`ArenaOffsets::aligned`), as
+    /// `Lineage::add_file` joins them (lsshells M3d).
+    freeable: Vec<bool>,
     /// Bound files that wait for their offsets, by file index.
     waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)>,
 }
 
 impl BindQueue {
-    fn new(file_count: usize, first: ArenaOffsets) -> Self {
+    /// The queue of files whose freeable flags are `freeable`, the first
+    /// at the offsets `first` (or at the next chunk start when it is
+    /// freeable).
+    fn new(freeable: Vec<bool>, first: ArenaOffsets) -> Self {
+        let first = if freeable.first() == Some(&true) {
+            first.aligned()
+        } else {
+            first
+        };
         BindQueue {
             state: Mutex::new(BindQueueState {
                 next: 0,
                 binding: 0,
                 stop: false,
-                counts: vec![None; file_count],
+                counts: vec![None; freeable.len()],
                 offsets: vec![first],
+                freeable,
                 waiting: std::collections::BTreeMap::new(),
             }),
             changed: std::sync::Condvar::new(),
@@ -1382,8 +1609,12 @@ impl BindQueueState {
         self.counts[i] = Some(counts);
         let known = self.offsets.len();
         while let Some(&Some(file_counts)) = self.counts.get(self.offsets.len() - 1) {
-            let last = *self.offsets.last().expect("first offsets");
-            self.offsets.push(last.after(file_counts));
+            let file = self.offsets.len() - 1;
+            let mut next = self.offsets[file].after(file_counts);
+            if self.freeable[file] || self.freeable.get(file + 1) == Some(&true) {
+                next = next.aligned();
+            }
+            self.offsets.push(next);
         }
         self.offsets.len() > known
     }
@@ -1398,22 +1629,24 @@ impl BindQueueState {
 }
 
 /// Binds the program files that are not bound yet on several threads, each
-/// file into its own arena, and joins the arenas into `symbols` in file
-/// order. It stops at the first file that made thread-local state while
-/// binding (for example a lazy JSDoc parse) or panicked; `bind_all` binds
-/// that file and the rest serially, which gives the same result as a serial
-/// bind of every file.
+/// file into its own arena, and joins the arenas into the lineage in file
+/// order (a freeable file version on chunks of its own,
+/// `Lineage::add_file`). It stops at the first file that made thread-local
+/// state while binding (for example a lazy JSDoc parse) or panicked;
+/// `bind_all` binds that file and the rest serially, which gives the same
+/// result as a serial bind of every file.
 // PERF: a file's ids move to their program values on a bind thread, as soon
 // as every earlier file is bound, because its offsets are the sums of the
 // earlier file counts. The threads stay while files wait for offsets, so
 // when the last large file (lib.dom) is bound they move the waiting files in
 // parallel. The loading thread only appends chunks, in file order. The ids
 // are the ones that a join on the loading thread gives.
-fn bind_files_parallel(symbols: &mut SymbolArena) {
-    let files: Vec<Node> = prog()
+fn bind_files_parallel(lineage: &mut Lineage) {
+    // Each file with whether it is a freeable file version.
+    let files: Vec<(Node, bool)> = prog()
         .source_files()
         .filter(|file| file.file_bind.get().is_none())
-        .map(|file| file.root)
+        .map(|file| (file.root, file.version().is_some()))
         .collect();
     let threads = bind_thread_count(files.len()).min(files.len());
     if single_threaded() || threads < 2 {
@@ -1424,8 +1657,11 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
     // largest file (lib.dom) starts at once and the small files fill the other
     // threads while it binds. The join order stays the file order.
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(files[i].go_file().parser_flags.len()));
-    let queue = BindQueue::new(files.len(), symbols.next_file_offsets());
+    order.sort_by_key(|&i| std::cmp::Reverse(files[i].0.go_file().parser_flags.len()));
+    let queue = BindQueue::new(
+        files.iter().map(|&(_, freeable)| freeable).collect(),
+        lineage.symbols.next_file_offsets(),
+    );
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -1444,13 +1680,13 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
                         if let Some((i, mut bound, file_symbols, offsets)) = state.take_ready() {
                             drop(state);
                             bound.remap(offsets);
-                            let prepared = file_symbols.prepare_file_arena(offsets);
+                            let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
                             let _ = sender.send((i, Some((bound, prepared))));
                             state = queue.lock();
                             continue;
                         }
                         if let Some(&i) = order.get(state.next) {
-                            let file = files[i];
+                            let (file, _) = files[i];
                             state.next += 1;
                             state.binding += 1;
                             drop(state);
@@ -1504,7 +1740,9 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
                     queue.stop();
                     return false;
                 };
-                symbols.append_prepared_file_arena(prepared);
+                lineage.add_file(bound.file.file_index(), files[joined].1, |symbols| {
+                    symbols.append_prepared_file_arena(prepared)
+                });
                 bound.install();
                 joined += 1;
             }
@@ -1776,7 +2014,10 @@ pub fn try_load_version(
 /// absolute). It reads `changed_file` from disk again. When the edit keeps
 /// the imports and references, the new version shares every other file
 /// version with `old` and the second value is true. Else every file is
-/// parsed again. `old` stays usable. Loading thread only.
+/// parsed again. `old` stays usable. Loading thread only. With
+/// `GOPORT_FREE_FILE_VERSIONS=1`, each new parse of a path that was
+/// published before is a freeable file version (lsshells M3b), as in the
+/// language server.
 pub fn update_program_version(
     old: &'static GoProgram,
     changed_file: &str,
@@ -1821,8 +2062,7 @@ pub fn publish_parsed_files(cwd: &str) {
 /// includes (Go `BindOnce`: a program that includes it later does not bind
 /// it again). The file joins the binder lineage of the process.
 pub fn bind_file_outside_program(file: Node) {
-    let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
-    bind_source_file(file, lineage.get_or_insert_with(SymbolArena::new));
+    with_lineage(|lineage| lineage.bind(file));
 }
 
 /// Frees what the loading thread keeps for `program`: it stops the checker
@@ -1831,18 +2071,19 @@ pub fn bind_file_outside_program(file: Node) {
 /// program tables (`VersionTables`), which are freed when no other thread
 /// holds them. Do not use `program` after this: a read of its tables
 /// panics. The frontend program is freed with its last `Rc` holder. The
-/// `GoProgram` and the file versions stay leaked. Panics when `program` is
-/// current on this thread.
+/// `GoProgram` and the static file versions stay leaked; a freeable file
+/// version is freed with its last holder (`ast/file_version.rs`). Panics
+/// when `program` is current on this thread.
 pub fn release_program(program: &'static GoProgram) {
     drop(release_program_with(program, CheckerPool::shut_down));
 }
 
 /// `release_program` that frees the frontend program and the tables only
-/// when the result drops. Watch mode keeps the result until it reports the
-/// new build, so these frees are not in the rebuild time, and the language
-/// server until it has sent the answer (`ls_program::release_now`). The
-/// checker pool stops at once, as in `release_program`, so the old checkers
-/// do not add to the memory of the new build.
+/// when the result drops. The language server keeps the result until it
+/// has sent the answer (`ls_program::release_now`), so these frees are not
+/// in the answer time. The checker pool stops at once, as in
+/// `release_program`, so the old checkers do not add to the memory of the
+/// next program. Watch mode uses `release_program_in_background`.
 pub fn release_program_later(program: &'static GoProgram) -> ReleasedProgram {
     release_program_with(program, CheckerPool::shut_down)
 }
@@ -1857,11 +2098,22 @@ pub struct ReleasedProgram {
     tables: Option<Arc<VersionTables>>,
 }
 
+impl Drop for ReleasedProgram {
+    // lsshells M3b: this thread drops its file version pins, and the other
+    // threads drop theirs at their next pinned read, so a freeable file
+    // version of the released program dies with its other holders (the
+    // fields below, the parse cache entry). The live versions are pinned
+    // again when they are read.
+    fn drop(&mut self) {
+        crate::ast::release_file_version_pins();
+    }
+}
+
 /// `release_program` that does not wait for the checker workers: they free
 /// their checkers and synthetic nodes on their own threads while the caller
 /// goes on (Go frees a program in the background GC), and the program
-/// tables go when the last of them ends. `tsc -b` uses it, so the next
-/// project does not wait for the free.
+/// tables go when the last of them ends. `tsc -b` and watch mode use it,
+/// so the next project or rebuild does not wait for the free.
 pub fn release_program_in_background(program: &'static GoProgram) {
     drop(release_program_with(
         program,
@@ -2426,7 +2678,9 @@ thread_local! {
 /// cross-project search threads start from it too (`ls/search_thread.rs`).
 /// The thread keeps its copy of the program tables until it ends, so it can
 /// finish its work after the program is released, as a Go goroutine that
-/// holds the program does.
+/// holds the program does. The tables hold the freeable file versions of
+/// the program files (`VersionTables::file_versions`), so the thread keeps
+/// those alive too.
 pub(crate) struct WorkerSeed {
     program: &'static GoProgram,
     tables: Option<(u32, Arc<VersionTables>)>,
@@ -2880,7 +3134,7 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
         let mut diags: Vec<Diagnostic> = info
             .diagnostics
             .iter()
-            .chain(info.js_diagnostics)
+            .chain(info.js_diagnostics.iter())
             .cloned()
             .collect();
         // For JS files that won't be checked by the checker (no checkJs/ts-check), we need
@@ -3511,7 +3765,7 @@ fn get_diagnostics_with_preceding_directives(
         let line = get_ecma_line_of_position(source_file, directive.loc.pos());
         directives_by_line.insert(line, *directive);
     }
-    let line_starts = get_ecma_line_starts(source_file);
+    let line_starts = &*get_ecma_line_starts(source_file);
     let text = source_file_text(source_file);
     let mut filtered = Vec::with_capacity(diags.len());
     for diagnostic in diags {

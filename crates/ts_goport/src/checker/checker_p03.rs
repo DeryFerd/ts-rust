@@ -247,7 +247,9 @@ impl Checker {
                 self.check_external_module_exports(source_file);
                 self.register_for_unused_identifiers_check(source_file);
             }
-            if !source_file_info(source_file).is_declaration_file && !self.is_canceled() {
+            if !with_source_file_info(source_file, |info| info.is_declaration_file)
+                && !self.is_canceled()
+            {
                 self.check_unused_renamed_binding_elements();
             }
             self.produce_deferred_diagnostics();
@@ -256,7 +258,9 @@ impl Checker {
         }
         if check_unused && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed
-            if !source_file_info(source_file).is_declaration_file && !self.is_canceled() {
+            if !with_source_file_info(source_file, |info| info.is_declaration_file)
+                && !self.is_canceled()
+            {
                 let identifier_check_nodes = self
                     .source_file_links
                     .get(source_file)

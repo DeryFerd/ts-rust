@@ -1122,8 +1122,11 @@ pub fn get_reparsed_node_for_node(node: Node) -> Node {
         && !node.flags().intersects(NodeFlags::REPARSED)
     {
         let file = get_source_file_of_node(node);
-        if file.is_some() && source_file_info(file).reparsed_clones.len() != 0 {
-            let reparsed_clones = &source_file_info(file).reparsed_clones;
+        let info = file.is_some().then(|| source_file_info(file));
+        if let Some(info) = &info
+            && !info.reparsed_clones.is_empty()
+        {
+            let reparsed_clones: &[Node] = &info.reparsed_clones;
             // PORT: Go slices.BinarySearchFunc: first position whose element compares >= node.
             let mut pos = reparsed_clones.partition_point(|c| compare_node_positions(*c, node) < 0);
             let found = pos < reparsed_clones.len()

@@ -266,7 +266,20 @@ impl Checker {
         }
         let mut results: Vec<SymbolId> = Vec::new();
         let imports = source_file_info(containing_file).imports.clone();
-        if !imports.is_empty() {
+        // PERF: not in Go. Go runs the import loop again on each call whose
+        // earlier loop found nothing (it keeps only a non-empty result). For
+        // the same symbol and enclosing declaration the loop reads only
+        // cached answers (module resolution, module exports, alias targets),
+        // so it finds nothing again and has no effect: skip it. Only parsed
+        // enclosing declarations are kept: a synthetic node id is not stable.
+        let import_miss_key = (symbol, enclosing_declaration);
+        let keep_import_miss = !crate::ast::synthetic::is_synthetic_node(enclosing_declaration);
+        if !imports.is_empty()
+            && !(keep_import_miss
+                && self
+                    .alternative_module_import_misses
+                    .contains(&import_miss_key))
+        {
             // Try to make an import using an import already in the enclosing file, if possible
             for import_ref in imports {
                 if node_is_synthesized(import_ref) {
@@ -290,6 +303,10 @@ impl Checker {
                     .extended_containers_by_file
                     .insert(id, results.clone());
                 return results;
+            }
+            if keep_import_miss {
+                self.alternative_module_import_misses
+                    .insert(import_miss_key);
             }
         }
 

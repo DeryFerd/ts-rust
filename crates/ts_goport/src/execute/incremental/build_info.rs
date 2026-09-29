@@ -1636,7 +1636,8 @@ impl BuildInfo {
         let mut resolved_root_file_infos: FxHashMap<Path, BuildInfoFileInfo> =
             FxHashMap::with_capacity_and_hasher(file_count, Default::default());
         // Roots of the File
-        let mut root_to_resolved: IndexMap<Path, Path> = IndexMap::with_capacity(file_count);
+        let mut root_to_resolved: FxIndexMap<Path, Path> =
+            FxIndexMap::with_capacity_and_hasher(file_count, Default::default());
         let mut resolved_to_root: FxHashMap<Path, Path> = FxHashMap::with_capacity_and_hasher(
             self.resolved_root.as_ref().map_or(0, Vec::len),
             Default::default(),
@@ -1716,7 +1717,7 @@ fn get_normalized_paths(
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfoRootInfoReader {
     pub resolved_root_file_infos: FxHashMap<Path, BuildInfoFileInfo>,
-    pub root_to_resolved: IndexMap<Path, Path>,
+    pub root_to_resolved: FxIndexMap<Path, Path>,
 }
 
 impl BuildInfoRootInfoReader {
