@@ -20,6 +20,9 @@ num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
 ryu-js = "=1.0.2"
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
+# fswatch/canonicalize_darwin.rs: NFC for macOS watch paths (Go calls
+# CoreFoundation). Built on every target so its Go unit tests run on Linux.
+unicode-normalization = "=0.1.25"
 
 # fswatch/unix.rs (Linux only): fanotify_init/fanotify_mark and
 # name_to_handle_at, which rustix does not wrap (safe APIs; see the module
@@ -27,6 +30,16 @@ rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "te
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["fanotify"] }
 name-to-handle-at = "=0.1.0"
+
+# fswatch/unix_bsd.rs (darwin and the BSDs): kqueue(2) and kevent(2) for
+# the kqueue backend (safe API: `nix::sys::event::Kqueue`).
+[target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["event"] }
+
+# fswatch/windows.rs: ReadDirectoryChangesW through notify's safe
+# `ReadDirectoryChangesWatcher` (see the module comment).
+[target.'cfg(windows)'.dependencies]
+notify = { version = "=8.2.0", default-features = false }
 
 [features]
 # Go build tag `noembed`: the lib files are read from next to the binary, not

@@ -7,10 +7,13 @@
 //! `std::sync::Mutex` over the fields it guards (`*Locked` structs). A Go
 //! `*dirWatch` map key is the `Arc` pointer (`Arc::as_ptr(..) as usize`).
 //!
-//! PORT: D-W1 (no `libc`, no `unsafe`). The Linux backends call the
-//! `fswatch::unix` shim, whose syscalls are `unported!`. The kqueue,
-//! FSEvents and Windows backends are not ported: their package watchers keep
-//! a `None` factory, so `available()` is false, as on Linux in Go.
+//! PORT: D-W1 (no `libc`, no `unsafe`). The Linux and kqueue backends call
+//! the `fswatch::unix` shim of their targets (safe syscall crates). The
+//! Windows backend uses the `notify` crate's ReadDirectoryChangesW watcher
+//! (see windows.rs). The FSEvents backend is not ported: its package watcher
+//! keeps a `None` factory, so `available()` is false, as on Linux in Go, and
+//! `Default()` on macOS picks kqueue (Go's fallback when FSEvents is not
+//! available).
 
 use crate::fswatch::prelude::*;
 
@@ -244,9 +247,10 @@ pub type WatcherFactory = fn() -> Arc<dyn WatcherImpl>;
 // Package-level watcher instances. Platform init() functions set the factory.
 //
 // PORT: Go package vars set up by the platform `init()` functions. The
-// port builds each one on first use and calls the Linux `init` there. The
-// kqueue, FSEvents and Windows backends are not ported (D-W1): their
-// factory stays `None`, as on Linux in Go.
+// port builds each one on first use and calls the platform `init` there
+// (inotify and fanotify on Linux, kqueue on darwin and the BSDs, windows on
+// Windows). The FSEvents backend is not ported: its factory stays `None`, as
+// on Linux in Go.
 pub static INOTIFY_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("inotify", |w| {
         #[cfg(target_os = "linux")]
@@ -255,10 +259,24 @@ pub static INOTIFY_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
 });
 pub static FSEVENTS_WATCHER: LazyLock<Arc<WatcherStruct>> =
     LazyLock::new(|| new_watcher("fsevents", |_| {}));
-pub static KQUEUE_WATCHER: LazyLock<Arc<WatcherStruct>> =
-    LazyLock::new(|| new_watcher("kqueue", |_| {}));
-pub static WINDOWS_WATCHER: LazyLock<Arc<WatcherStruct>> =
-    LazyLock::new(|| new_watcher("windows", |_| {}));
+pub static KQUEUE_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
+    new_watcher("kqueue", |_w| {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        crate::fswatch::kqueue::init(_w);
+    })
+});
+pub static WINDOWS_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
+    new_watcher("windows", |_w| {
+        #[cfg(windows)]
+        crate::fswatch::windows::init(_w);
+    })
+});
 pub static FANOTIFY_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("fanotify", |w| {
         #[cfg(target_os = "linux")]
@@ -343,9 +361,8 @@ pub fn fanotify() -> Arc<dyn Watcher> {
 ///
 /// PORT: Go `runtime.GOOS` is `std::env::consts::OS` ("macos" for Go
 /// "darwin"). On Linux this returns fanotify when the `fanotify_init` probe
-/// succeeds and inotify when it fails, as Go does. On macOS and Windows Go
-/// picks a fast recursive backend; those backends are not ported, so the
-/// port diverges there.
+/// succeeds and inotify when it fails, as Go does. On macOS Go picks FSEvents,
+/// which is not ported, so the port returns kqueue there (Go's fallback).
 pub fn default() -> Arc<dyn Watcher> {
     match std::env::consts::OS {
         "linux" => {
@@ -1271,7 +1288,7 @@ impl PartialEq for DirWatchError {
 /// and a reference to the shared debouncer. Each watched directory has one.
 ///
 /// PORT: Go `mu` guards the fields in `DirWatchLocked`. `state` is only
-/// used by the fsevents, kqueue and Windows backends (not ported). Go
+/// used by the fsevents (not ported) and Windows backends. Go
 /// `sequence` is always nil here (see `WatcherStruct`), so it is not a field.
 pub struct DirWatch {
     /// dir is the caller-visible watch root used in delivered event paths.
