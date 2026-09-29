@@ -544,19 +544,25 @@ impl Orchestrator {
 
     /// PORT: not in Go (perf). Starts reading the build info files that the
     /// up-to-date checks of the tasks at `paths` will read (see
-    /// `BuildInfoPrefetch`). None when there is nothing to gain or the read
-    /// could differ from the task's own read: `--force` (no check reads the
-    /// build info), a file system other than the OS one (tests), or fewer
-    /// than two files. A task that keeps the build info of an earlier cycle
-    /// (watch) reads nothing, and a build info file that two tasks name is
-    /// left out, so no task of the build writes a prefetched file before
-    /// its task reads it.
+    /// `BuildInfoPrefetch`), on up to `num_routines` threads. None when
+    /// there is nothing to gain or the read could differ from the task's
+    /// own read: one routine (`--singleThreaded` or `--builders 1`: Go
+    /// checks one task at a time), `--force` (no check reads the build
+    /// info), a file system other than the OS one (tests), or fewer than
+    /// two files. A solution (Go `upToDateStatusTypeSolution`) and a task
+    /// that keeps the build info of an earlier cycle (watch) read nothing.
+    /// A build info file that two tasks name (by path) is left out, so no
+    /// task of the build writes a prefetched file before its task reads it.
     fn start_build_info_prefetch(&self, paths: &[Path]) -> Option<BuildInfoPrefetch> {
-        if self.opts.command.build_options.force.is_true() || !is_wrapped_os_fs(&self.opts.sys.fs())
+        let num_routines = usize::try_from(self.num_routines()).unwrap_or(0);
+        if num_routines < 2
+            || self.opts.command.build_options.force.is_true()
+            || !is_wrapped_os_fs(&self.opts.sys.fs())
         {
             return None;
         }
-        let mut names: IndexMap<String, usize> = IndexMap::default();
+        let mut named: FxHashMap<Path, usize> = FxHashMap::default();
+        let mut reads: Vec<(Path, String)> = Vec::new();
         for path in paths {
             let task = self.get_task(path);
             let task = task.borrow();
@@ -567,22 +573,25 @@ impl Orchestrator {
             if name.is_empty() {
                 continue;
             }
-            let reads = task
+            let build_info_path = self.to_path(&name);
+            *named.entry(build_info_path.clone()).or_default() += 1;
+            let solution = resolved.file_names().is_empty() && resolved.has_project_references();
+            let keeps = task
                 .build_info_entry
                 .as_ref()
-                .is_none_or(|entry| entry.path != self.to_path(&name));
-            if reads {
-                *names.entry(name).or_default() += 1;
+                .is_some_and(|entry| entry.path == build_info_path);
+            if !solution && !keeps {
+                reads.push((build_info_path, name));
             }
         }
-        let names: Vec<String> = names
+        let names: Vec<String> = reads
             .into_iter()
-            .filter_map(|(name, count)| (count == 1).then_some(name))
+            .filter_map(|(path, name)| (named[&path] == 1).then_some(name))
             .collect();
         if names.len() < 2 {
             return None;
         }
-        BuildInfoPrefetch::start(names)
+        BuildInfoPrefetch::start(names, num_routines)
     }
 
     // Go: build/buildtask.go:120 (*BuildTask).report, the orchestrator part
@@ -782,15 +791,16 @@ struct BuildInfoSlot {
 const MAX_BUILD_INFO_THREADS: usize = 8;
 
 impl BuildInfoPrefetch {
-    /// Starts the threads that read and parse `names`, in order. None when
-    /// no thread starts.
-    fn start(names: Vec<String>) -> Option<Self> {
+    /// Starts the threads that read and parse `names`, in order, at most
+    /// `num_routines` (Go `numRoutines`). None when no thread starts.
+    fn start(names: Vec<String>, num_routines: usize) -> Option<Self> {
         let slots: Vec<(String, Arc<BuildInfoSlot>)> = names
             .into_iter()
             .map(|name| (name, Arc::default()))
             .collect();
         let queue = Arc::new(Mutex::new(slots.clone().into_iter()));
         let threads = MAX_BUILD_INFO_THREADS
+            .min(num_routines)
             .min(crate::program::available_cores())
             .min(slots.len());
         let mut started = 0;
