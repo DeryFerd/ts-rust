@@ -10,11 +10,18 @@
 //! runes with `utf8_decode_rune_in_string`, which follows Go
 //! `utf8.DecodeRuneInString` also at a non-boundary position.
 
-use crate::flags_macros::go_flags;
+use crate::flags_macros::{go_enum, go_flags};
 use crate::frontend::prelude::*;
 use std::borrow::Cow;
 
 use super::regexp::{RegExpParser, RegularExpressionFlags, char_code_to_reg_exp_flag};
+
+// Go: scanner/scanner.go:21 identifierVariant (ts#63996)
+go_enum!(IdentifierVariant, i32 {
+    STANDARD = 0; // identifierVariantStandard
+    JSX = 1; // identifierVariantJSX
+    REG_EXP_GROUP_NAME = 2; // identifierVariantRegExpGroupName
+});
 
 go_flags!(EscapeSequenceScanningFlags, i32 {
     STRING = 1 << 0; // EscapeSequenceScanningFlagsString
@@ -1495,11 +1502,7 @@ impl Scanner {
                         self.scanner_state.token = SyntaxKind::AtToken;
                     }
                     Some(b'\\') => {
-                        let cp = self.peek_unicode_escape();
-                        if cp >= 0 && is_identifier_start(rune_to_char(cp)) {
-                            let escaped = rune_to_string(self.scan_unicode_escape(true));
-                            let parts = self.scan_identifier_parts();
-                            self.set_token_value(&(escaped + &parts));
+                        if self.scan_identifier(0, IdentifierVariant::STANDARD) {
                             self.scanner_state.token =
                                 get_identifier_token(self.scanner_state.token_value);
                         } else {
@@ -1523,23 +1526,11 @@ impl Scanner {
                                 2,
                                 Vec::new(),
                             );
-                            self.scanner_state.pos += 1;
+                            self.scanner_state.pos += 2;
                             self.scanner_state.token = SyntaxKind::Unknown;
                             break 'sw;
                         }
-                        if self.char_at(1) == i32::from(b'\\') {
-                            self.scanner_state.pos += 1;
-                            let cp = self.peek_unicode_escape();
-                            if cp >= 0 && is_identifier_start(rune_to_char(cp)) {
-                                let escaped = rune_to_string(self.scan_unicode_escape(true));
-                                let parts = self.scan_identifier_parts();
-                                self.set_token_value(&("#".to_string() + &escaped + &parts));
-                                self.scanner_state.token = SyntaxKind::PrivateIdentifier;
-                                break 'sw;
-                            }
-                            self.scanner_state.pos -= 1;
-                        }
-                        if !self.scan_identifier(1) {
+                        if !self.scan_identifier(1, IdentifierVariant::STANDARD) {
                             self.error_at(
                                 diag::Invalid_character,
                                 self.scanner_state.pos - 1,
@@ -1555,7 +1546,7 @@ impl Scanner {
                             self.scanner_state.token = SyntaxKind::EndOfFile;
                             break 'sw;
                         }
-                        if self.scan_identifier(0) {
+                        if self.scan_identifier(0, IdentifierVariant::STANDARD) {
                             self.scanner_state.token =
                                 get_identifier_token(self.scanner_state.token_value);
                             break 'sw;

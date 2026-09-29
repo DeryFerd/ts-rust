@@ -897,7 +897,7 @@ pub fn is_identifier_part_ex(ch: char, language_variant: LanguageVariant) -> boo
     is_word_character(ch)
         || ch == '$'
         || (ch as u32) >= 0x80 && is_unicode_identifier_part(ch)
-        || language_variant == LanguageVariant::JSX && (ch == '-' || ch == ':') // "-" and ":" are valid in JSX Identifiers
+        || language_variant == LanguageVariant::JSX && ch == '-' // ":" is part of JSXNamespacedName, but not JSXIdentifier.
 }
 
 // Go: scanner/scanner.go:2276 TokenToString
