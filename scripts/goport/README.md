@@ -84,9 +84,12 @@ retired. R132 is the last legacy revision.
    and needs a flake note for each regressed item, so skipping the refusal does not pass.
 
 `gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
-MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
-single-threaded-equal items change between MATCH and ALLOWED on the same bins). An ALLOWED item needs
-a verified allow condition, and a removed id or a new FAIL is a regression. The open editor
+MATCH, or becomes ALLOWED only by an allow entry (same id, condition and case path) that the base
+allow list has too (the single-threaded-equal items change between MATCH and ALLOWED on the same bins).
+An ALLOWED item needs a verified allow condition, and a removed id or a new FAIL is a regression. A
+corpus id names another case at another Go pin, so each `corpus-diag`, `corpus-emit` and `f1` entry of
+`gate-allow.txt` names its case path, and the gate applies it only to the item of that id with that
+case path. The open editor
 long-growth items (`editor/*/long`) may FAIL only while the batch has the open defect
 `editor-long-growth`, only on growth, and only up to a fixed cap per project: query-core 1.58 and
 hono 1.28 MiB/edit (`LONG_CAP` in `gate-compare.py`, the one place of the caps; the output lists them

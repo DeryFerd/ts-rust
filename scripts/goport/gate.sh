@@ -30,7 +30,9 @@
 # Output: target/continuation-r97-goport/compat/gate/<label>/ (never reused). It holds
 # runs/, logs/, items/ and manifest.json (binary hashes, commit, every result).
 # Exit 0 only when every result is MATCH, or ALLOWED by gate-allow.txt (next to this script).
-# An allow entry only applies when its condition verifies again in this run.
+# An allow entry only applies when its condition verifies again in this run. An entry of a corpus-diag,
+# corpus-emit or f1 id also names a case path, and applies only to the item of that id with that case path
+# (a corpus id names another case at another Go pin).
 # Project inputs and the existing scripts and oracle caches are only read.
 set -uo pipefail
 # GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
@@ -396,17 +398,37 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
 
 # ---- allow-list ----
 
+# The case path of an item whose detail names a Go test case, at its fixed place: "<class> <case path>"
+# (corpus-diag, f1) and "<class> exit <go>/<goport> <case path>" (corpus-emit). Notes can follow it.
+# gate-compare.py reads it the same way.
+CASE_PATH = {'corpus-diag': re.compile(r'^\S+ (\S+)(?: |$)'), 'corpus-emit': re.compile(r'^\S+ exit \S+/\S+ (\S+)(?: |$)'),
+             'f1': re.compile(r'^\S+ (\S+)(?: |$)')}
+
+
+def case_path(row):
+    """The case path of an item of a CASE_PATH family, else None."""
+    pattern = CASE_PATH.get(row['id'].split('/', 1)[0])
+    m = pattern.match(row['detail']) if pattern else None
+    return m[1] if m else None
+
+
 def load_allow(path):
-    """Lines: <result id> | <condition> | <reason>. '#' starts a comment."""
+    """Entries by (id, case path). Lines: <result id> | <condition> | <reason>, and for an id of a CASE_PATH family
+    <result id> | <case path> | <condition> | <reason>. '#' starts a comment."""
     entries = {}
     for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        parts = [p.strip() for p in line.split('|', 2)]
-        if len(parts) != 3 or not all(parts) or parts[1] not in CONDITIONS:
-            sys.exit(f'{path}:{n}: need "<id> | <{"|".join(CONDITIONS)}> | <reason>"')
-        entries[parts[0]] = {'id': parts[0], 'condition': parts[1], 'reason': parts[2], 'used': False}
+        has_case = line.split('|', 1)[0].strip().split('/', 1)[0] in CASE_PATH
+        parts = [p.strip() for p in line.split('|', 3 if has_case else 2)]
+        if len(parts) != (4 if has_case else 3) or not all(parts) or parts[-2] not in CONDITIONS:
+            sys.exit(f'{path}:{n}: need "<id> | {"<case path> | " if has_case else ""}<{"|".join(CONDITIONS)}> | <reason>"')
+        eid, case, condition, reason = parts if has_case else (parts[0], None, *parts[1:])
+        if (eid, case) in entries:
+            sys.exit(f'{path}:{n}: {eid} {case or ""} is in two lines')
+        entries[(eid, case)] = {'id': eid, **({'path': case} if case else {}), 'condition': condition, 'reason': reason,
+                                'used': False}
     return entries
 
 
@@ -436,7 +458,8 @@ CONDITIONS = {'single-threaded-equal': single_threaded_equal, 'same-chars': same
 
 
 def apply_allow(row, entries, evidence):
-    """Turns a FAIL row into ALLOWED when allow entries cover it and their conditions hold now."""
+    """Turns a FAIL row into ALLOWED when allow entries cover it and their conditions hold now. An entry of a
+    CASE_PATH family covers only the item of its id whose case path is the entry's path."""
     ctx = row.get('ctx', {})
     if row['stage'] == 'typesyms':
         if ctx.get('missing') or ctx.get('extra') or ctx.get('exits') != [0, 0] or not ctx.get('diffFiles'):
@@ -444,20 +467,25 @@ def apply_allow(row, entries, evidence):
         keys = [(f"{row['id']}/{f}", f) for f in ctx['diffFiles']]
     else:
         keys = [(row['id'], None)]
+    case = case_path(row)
+    if case is None and row['id'].split('/', 1)[0] in CASE_PATH:
+        return
     # An entry id may be a glob (fnmatch). An exact entry wins over a glob.
     def entry_for(k):
-        return k if k in entries else next((e for e in entries if '*' in e and fnmatch.fnmatchcase(k, e)), None)
+        return (k, case) if (k, case) in entries else next(
+            (e for e in entries if '*' in e[0] and e[1] == case and fnmatch.fnmatchcase(k, e[0])), None)
     matched = [(entry_for(k), f) for k, f in keys]
     if not all(e for e, _ in matched):
         return
     for e, f in matched:
         if not CONDITIONS[entries[e]['condition']](row, f, evidence):
-            row['detail'] += f' (allow entry {e} condition {entries[e]["condition"]} did not hold for {f})'
+            row['detail'] += f' (allow entry {e[0]} condition {entries[e]["condition"]} did not hold for {f})'
             return
     for e, _ in matched:
         entries[e]['used'] = True
     row['status'] = 'ALLOWED'
-    row['allowedBy'] = [{'id': e, 'file': f, 'condition': entries[e]['condition'], 'reason': entries[e]['reason']} for e, f in matched]
+    row['allowedBy'] = [{'id': e[0], **({'path': e[1]} if e[1] else {}), 'file': f, 'condition': entries[e]['condition'],
+                         'reason': entries[e]['reason']} for e, f in matched]
 
 
 def cmd_finish(out, meta_json):
@@ -483,7 +511,9 @@ def cmd_finish(out, meta_json):
         rows += got
     fails = sum(r['status'] == 'FAIL' for r in rows)
     meta.update(finishedUtc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), verdict='PASS' if fails == 0 else 'FAIL',
-                stages=stages, unusedAllowEntries=[k for k, e in entries.items() if not e['used']], results=rows)
+                stages=stages,
+                unusedAllowEntries=[e['id'] + (f" | {e['path']}" if 'path' in e else '') for e in entries.values() if not e['used']],
+                results=rows)
     meta['allowList']['entries'] = list(entries.values())
     (out / 'manifest.json').write_text(json.dumps(meta, indent=1) + '\n')
 

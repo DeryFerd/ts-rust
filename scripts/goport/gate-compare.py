@@ -6,13 +6,20 @@ usage: scripts/goport/gate-compare.py <base manifest.json> <new manifest.json> [
 Rules (docs/typechecker-accountability.md, "Protected set"). This file is their one implementation:
 candidate.sh side and scripts/check-typechecker-batch.mjs both run it.
 - Every base id must be in the new run. A removed id is a regression.
-- A base MATCH item must be MATCH, or ALLOWED by an allow entry (same id and condition) that the base
-  manifest's allow list has too. The single-threaded-equal entries exist because the oracle's trace order
-  changes with threads, so those items change between MATCH and ALLOWED on the same bins
+- A base MATCH item must be MATCH, or ALLOWED by an allow entry (same id, condition and case path) that
+  the base manifest's allow list has too ("reallowed"). The single-threaded-equal entries exist because the
+  oracle's trace order changes with threads, so those items change between MATCH and ALLOWED on the same bins
   (corpus-diag/04640: r130-full ALLOWED, r131-full MATCH, r131-full-2 ALLOWED, the last two on one bins
   dir). MATCH to ALLOWED by an entry the base did not have is a regression.
 - An ALLOWED item in the new run must carry allowedBy: the gate verified its gate-allow.txt
   condition again in this run.
+- Case paths of allow entries. A corpus id names another case at another Go pin, so an allow entry of a
+  CASE_PATH family (corpus-diag, corpus-emit, f1) names its case path (gate-allow.txt "<id> | <case path> |
+  <condition> | <reason>"), and gate.sh applies it only to the item of that id with that case path. The
+  case path of an entry is its path; an entry of the old form (gate.sh before case paths, which applied it
+  by id only) has the case path of the item of its id in that run, the one case it could allow there, and
+  none when that run has no such item. An ALLOWED item of such a family whose allowedBy entry names another
+  case path, or none, is a regression. An entry of such a family without a case path gives no allowance.
 - A FAIL in the new run is a regression, except an item of an open defect below.
 - A new id is listed. A new id that is FAIL is a regression.
 
@@ -57,11 +64,11 @@ differ; at one pin it has no effect (idMap.applied false), so it cannot move an 
 '#' lines, blank lines and the header line "oldId TAB newId TAB source" are skipped. Each other line is
 "<old id> TAB <new id> TAB <case path>": the case moved to a new id. The map only moves ids. It cannot
 remove one: a base case that the new run does not hold is a removed id, also when Go removed it.
-Only the corpus families (CASE_PATH) can have lines, and both ids of a line are in one family (the part
+Only the corpus families (MAP_FAMILIES) can have lines, and both ids of a line are in one family (the part
 before the first '/'). The case path of a corpus item is the source word at its fixed place in the
-detail: "<class> <case path>" (corpus-diag) and "<class> exit <go>/<goport> <case path>" (corpus-emit);
-notes can follow it. Bad input (exit 2): a line of another form (also "<old id> TAB - ..."), and two
-lines with one old id, one new id, or one case path in one family.
+detail: "<class> <case path>" (corpus-diag, and f1) and "<class> exit <go>/<goport> <case path>"
+(corpus-emit); notes can follow it. Bad input (exit 2): a line of another form (also "<old id> TAB -
+..."), and two lines with one old id, one new id, or one case path in one family.
 When the map is used:
 - A base id with a line is compared with the new item of its new id: the same item under another id.
 - The line's case path must equal the case path of the base item and of the new item. Else the line is
@@ -70,8 +77,8 @@ When the map is used:
   removed id, never compared with the new item of the same id (that id can be another case now).
   The ids of the other families are compared as before.
 - A base allow entry moves only with its own case: an entry whose id is a base item that a working
-  line moves applies to the new id of that line. Any other entry of a mapped family (an old pin's id,
-  a case without a line or a glob) gives no allowance.
+  line moves applies to the new id of that line, with its own case path. Any other entry of a mapped
+  family (an old pin's id, a case without a line or a glob) gives no allowance.
 - A line whose old id is not a base id is unused (listed in idMap.unused).
 The output has idMap {path, sha256, lines, applied, mapped, broken, unused} only when the batch
 names a map, so the output without a map stays the same.
@@ -170,14 +177,30 @@ def family(i):
     return i.split('/', 1)[0]
 
 
-# The case path of a corpus item (see the docstring): gate.sh cmd_corpus_diag and cmd_corpus_emit write it.
-CASE_PATH = {'corpus-diag': re.compile(r'^\S+ (\S+)(?: |$)'), 'corpus-emit': re.compile(r'^\S+ exit \S+/\S+ (\S+)(?: |$)')}
+# The case path of an item whose detail names a Go test case (see the docstring): gate.sh cmd_corpus_diag,
+# cmd_corpus_emit and cmd_f1 write it, and its allow step reads it the same way. Allow entries of these
+# families carry a case path. Only the corpus families (MAP_FAMILIES) can have gate id map lines.
+CASE_PATH = {'corpus-diag': re.compile(r'^\S+ (\S+)(?: |$)'), 'corpus-emit': re.compile(r'^\S+ exit \S+/\S+ (\S+)(?: |$)'),
+             'f1': re.compile(r'^\S+ (\S+)(?: |$)')}
+MAP_FAMILIES = ('corpus-diag', 'corpus-emit')
 
 
 def case_path(item):
-    """The case path of a corpus gate item, or None when its detail does not have one."""
-    m = CASE_PATH[family(item['id'])].match(item.get('detail') or '')
+    """The case path of a gate item of a CASE_PATH family, or None (another family, or a detail without one)."""
+    pattern = CASE_PATH.get(family(item['id']))
+    m = pattern.match(item.get('detail') or '') if pattern else None
     return m[1] if m else None
+
+
+def entry_path(e, items):
+    """The case path of an allow entry (a base allow list entry, or an allowedBy entry of a new item) of a
+    CASE_PATH family, by the docstring: its path, else the case path of the item of its id in items (the old
+    form, applied by id). None for other families and when neither is known."""
+    if family(str(e.get('id'))) not in CASE_PATH:
+        return None
+    if e.get('path') is not None:
+        return e['path']
+    return case_path(items[e['id']]) if e.get('id') in items else None
 
 
 def pins_differ(a, b):
@@ -209,8 +232,8 @@ def load_id_map(ref):
         if len(cells) != 3 or not all(c.strip() == c and c for c in cells) or '-' in cells:
             fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case path>" (the map cannot remove a case)')
         old, to, source = cells
-        if not all('/' in i and family(i) in CASE_PATH for i in (old, to)) or family(to) != family(old):
-            fail(f'gate id map line {n}: {old} and {to} are not ids of one corpus family ({", ".join(CASE_PATH)})')
+        if not all('/' in i and family(i) in MAP_FAMILIES for i in (old, to)) or family(to) != family(old):
+            fail(f'gate id map line {n}: {old} and {to} are not ids of one corpus family ({", ".join(MAP_FAMILIES)})')
         dup = old if old in lines else to if to in targets else source if (family(old), source) in cases else None
         if dup:
             fail(f'gate id map line {n}: {dup} is in two lines')
@@ -277,9 +300,10 @@ def main():
         mapped family only a working line gives one, so an allow entry moves only with its own case."""
         return moved.get(i) if family(i) in mapped_families else i
 
-    # Allow entries of the base allow list, by (entry id at the new pin, condition).
-    base_allow = {(new_id(e['id']), e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])
-                  if new_id(e['id']) is not None}
+    # Allow entries of the base allow list, by (entry id at the new pin, condition, case path). An entry of a CASE_PATH
+    # family without a case path gives no allowance.
+    base_allow = {(new_id(e['id']), e['condition'], entry_path(e, base)) for e in (bm.get('allowList') or {}).get('entries', [])
+                  if new_id(e['id']) is not None and (entry_path(e, base) is not None or family(e['id']) not in CASE_PATH)}
     regressions, fixed, known_open, reallowed = [], [], [], []
     # The cap of each project for this compare: LONG_CAP, or NORMAL_LIMIT once the base growth is at or under it.
     caps = {}
@@ -298,15 +322,18 @@ def main():
     for i, n in new.items():
         b = base.get(base_of.get(i))
         if n['status'] == 'ALLOWED':
-            entries = n.get('allowedBy') or []
-            fresh = [f"{e.get('id')} ({e.get('condition')})" for e in entries if (e.get('id'), e.get('condition')) not in base_allow]
+            entries = [(e.get('id'), e.get('condition'), entry_path(e, new)) for e in n.get('allowedBy') or []]
+            fresh = [f"{e} ({c}{', ' + p if p else ''})" for e, c, p in entries if (e, c, p) not in base_allow]
+            other = [f'{e} ({p})' for e, _, p in entries if family(i) in CASE_PATH and (p is None or p != case_path(n))]
             if not entries:
                 regress(i, b, n, 'ALLOWED without a verified allow-list condition')
+            elif other:
+                regress(i, b, n, f'ALLOWED by an allow entry of another case than {case_path(n)}: ' + ', '.join(other))
             elif b is not None and b['status'] == 'MATCH':
                 if fresh:
                     regress(i, b, n, 'base MATCH is ALLOWED by an allow entry the base did not have: ' + ', '.join(fresh))
                 else:
-                    reallowed.append({'id': i, 'conditions': sorted({e.get('condition') for e in entries})})
+                    reallowed.append({'id': i, 'conditions': sorted({c for _, c, _ in entries})})
             elif b is not None and b['status'] == 'FAIL':
                 fixed.append(i)
         elif n['status'] == 'FAIL':
@@ -369,7 +396,7 @@ def main():
                                 'detail': k})
 
     # Allow entries the new run used that the base allow list did not have. The reviewer checks them.
-    used = {(e['id'], e['condition']) for r in new.values() for e in r.get('allowedBy') or []}
+    used = {(e.get('id'), e.get('condition'), entry_path(e, new)) for r in new.values() for e in r.get('allowedBy') or []}
     out = {'base': bhead, 'new': nhead,
            'capRule': f'editor/<project>/long FAIL passes while openDefects has editor-long-growth (status open), the new '
                       f'failure is growth only and its Rust growth <= the fixed cap of the project (gate-compare.py LONG_CAP: '
@@ -380,7 +407,8 @@ def main():
            'pinChanged': bhead['upstreamPin'] != nhead['upstreamPin'], 'modeChanged': bhead['mode'] != nhead['mode'],
            **({'idMap': id_map} if id_map else {}),
            'allowListChanged': (nm.get('allowList') or {}).get('sha256') != (bm.get('allowList') or {}).get('sha256'),
-           'newAllowEntries': [{'id': i, 'condition': c} for i, c in sorted(used - base_allow)],
+           'newAllowEntries': [{'id': i, 'condition': c, 'path': p}
+                               for i, c, p in sorted(used - base_allow, key=lambda k: tuple(x or '' for x in k))],
            'toolChanges': tool_changes, 'newTools': sorted(k for k in nt if k not in bt),
            'regressions': regressions, 'knownOpen': known_open, 'reallowed': reallowed, 'fixed': sorted(fixed),
            'newIds': sorted(i for i in new if i not in base_of),

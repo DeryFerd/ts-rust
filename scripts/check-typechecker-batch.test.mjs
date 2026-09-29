@@ -800,10 +800,45 @@ test("gate items are judged by gate-compare.py: removed, MATCH lost, new FAIL, n
     assert.deepEqual(result.losses.gate.map(({ id, base, now }) => ({ id, base, now })), [regression]);
     assert.ok(result.losses.gate[0].why);
   }
-  // A flaky single-threaded-equal item: MATCH to ALLOWED by an entry of the base allow list.
+  // A flaky single-threaded-equal item: MATCH to ALLOWED by an entry of the base allow list (same id, condition and case path).
   const f = goportFixture();
-  Object.assign(item(f, "corpus-diag/00001"), { status: "ALLOWED", allowedBy: [{ id: "corpus-diag/00001/single", condition: "single-threaded-equal" }] });
+  f.files["gate/r131/manifest.json"].value.allowList.entries.push({ id: "corpus-diag/00001", path: "a.ts", condition: "single-threaded-equal" });
+  Object.assign(item(f, "corpus-diag/00001"), { status: "ALLOWED",
+    allowedBy: [{ id: "corpus-diag/00001", path: "a.ts", condition: "single-threaded-equal" }] });
   assert.equal(check(f).verdict, "PASS");
+});
+
+// The base allow list has one entry for corpus-diag/00001 (entry), and the new run (same pin) has corpus-diag/00001,
+// the case a.ts, ALLOWED by allowedBy. Returns the check result.
+function allowCase(entry, allowedBy) {
+  const f = goportFixture();
+  f.files["gate/r131/manifest.json"].value.allowList.entries.push({ id: "corpus-diag/00001", condition: "single-threaded-equal", ...entry });
+  Object.assign(f.gateNew.results.find(row => row.id === "corpus-diag/00001"),
+    { status: "ALLOWED", allowedBy: [{ id: "corpus-diag/00001", condition: "single-threaded-equal", ...allowedBy }] });
+  return check(f);
+}
+
+test("an allow entry with the right id and another case path does not allow (auditor: cross-pin id reuse)", () => {
+  // The base allow list has the entry of w.ts, a case that had the id corpus-diag/00001 at another pin. Here the id is a.ts,
+  // so after the first acceptance at this pin the entry cannot reallow a.ts: not with its own path, not with a.ts, and not
+  // in the old form without a path (gate.sh before case paths).
+  for (const [allowedBy, why] of [
+    [{ path: "w.ts" }, "ALLOWED by an allow entry of another case than a.ts: corpus-diag/00001 (w.ts)"],
+    [{ path: "a.ts" }, "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00001 (single-threaded-equal, a.ts)"],
+    [{}, "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00001 (single-threaded-equal, a.ts)"],
+  ]) {
+    const result = allowCase({ path: "w.ts" }, allowedBy);
+    assert.equal(result.verdict, "STOP");
+    assert.deepEqual(result.losses.gate.map(({ id, base, now, why }) => [id, base, now, why]), [["corpus-diag/00001", "MATCH", "ALLOWED", why]]);
+  }
+  // The entry of a.ts reallows a.ts. An old-form base entry (r137-full) is the entry of the case of its id in the base run.
+  for (const entry of [{ path: "a.ts" }, {}]) {
+    for (const allowedBy of [{ path: "a.ts" }, {}]) {
+      const result = allowCase(entry, allowedBy);
+      assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+      assert.equal(result.counts.gate.regressions, 0);
+    }
+  }
 });
 
 test("a gate tool change passes only when batch.gateToolChanges lists it exactly (R133)", () => {
@@ -954,10 +989,30 @@ test("a swapped gate id map cannot move an allow entry to another case (skeptic:
   withIdMap(f, "corpus-diag/00001\tcorpus-diag/00011\ta.ts\ncorpus-diag/00002\tcorpus-diag/00012\tw.ts\n");
   const result = stopped(f, /1 gate items regressed/);
   assert.deepEqual(result.losses.gate.map(({ id, base, now, why }) => [id, base, now, why]), [["corpus-diag/00011", "MATCH", "ALLOWED",
-    "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00011 (single-threaded-equal)"]]);
+    "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00011 (single-threaded-equal, a.ts)"]]);
   // One case path in two lines of one family is bad input.
   withIdMap(f, "corpus-diag/00001\tcorpus-diag/00011\ta.ts\ncorpus-diag/00002\tcorpus-diag/00012\ta.ts\n");
   stopped(f, /line 2: a.ts is in two lines/);
+});
+
+test("a gate id map moves a base allow entry only with its own case path (auditor: cross-pin id reuse)", () => {
+  // At the new pin a.ts is corpus-diag/00002 and ALLOWED. The base entry of corpus-diag/00001 moves to corpus-diag/00002
+  // with its path: the entry of a.ts reallows a.ts, and the entry of w.ts (an old pin's case at that id) does not.
+  const run = (entryPath, allowedPath) => {
+    const f = goportFixture(); renumbered(f);
+    f.files["gate/r131/manifest.json"].value.allowList.entries.push({ id: "corpus-diag/00001", path: entryPath, condition: "single-threaded-equal" });
+    Object.assign(f.gateNew.results.find(row => row.id === "corpus-diag/00002"),
+      { status: "ALLOWED", allowedBy: [{ id: "corpus-diag/00002", path: allowedPath, condition: "single-threaded-equal" }] });
+    withIdMap(f, "corpus-diag/00001\tcorpus-diag/00002\ta.ts\n");
+    return check(f);
+  };
+  const result = run("a.ts", "a.ts");
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  for (const [allowedPath, why] of [
+    ["a.ts", "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00002 (single-threaded-equal, a.ts)"],
+    ["w.ts", "ALLOWED by an allow entry of another case than a.ts: corpus-diag/00002 (w.ts)"]]) {
+    assert.deepEqual(run("w.ts", allowedPath).losses.gate.map(({ id, why }) => [id, why]), [["corpus-diag/00002", why]]);
+  }
 });
 
 test("the history row and both verdicts bind the gate id map (skeptic: unbound map)", () => {
