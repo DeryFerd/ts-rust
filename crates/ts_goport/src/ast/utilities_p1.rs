@@ -394,7 +394,7 @@ pub fn is_assignment_target(node: Node) -> bool {
 // Returns the BinaryExpression, PrefixUnaryExpression, PostfixUnaryExpression, or ForInOrOfStatement that references
 // the given node as an assignment target
 // Go: ast/utilities.go:184 GetAssignmentTarget
-// PERF: U4 (CH7). A step inside a tier 0 store reads the parent and its
+// PERF: U4 (CH7). A step inside a published store reads the parent and its
 // kind with one store lookup (`frozen_store_parent_kind`).
 pub fn get_assignment_target(node: Node) -> Node {
     let mut node = node;

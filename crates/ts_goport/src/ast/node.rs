@@ -289,7 +289,7 @@ macro_rules! variant_has_kind {
     };
 }
 
-/// True when `n` is a tier 0 store node whose kind fits none of the listed
+/// True when `n` is a published store node whose kind fits none of the listed
 /// data variants. Such a node cannot hold the field, so the accessor gives
 /// its default without loading the node data.
 // Store data always fits the header kind (`alloc_store_node`). `Unknown` is
@@ -323,7 +323,7 @@ macro_rules! match_data {
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
 ///
-/// PERF: a tier 0 store node whose kind fits no listed variant gives `$def`
+/// PERF: a published store node whose kind fits no listed variant gives `$def`
 /// from its node record (`kind_lacks_data!`), without the pointer
 /// chase to its astdata node and data.
 macro_rules! by_data {
@@ -1531,7 +1531,7 @@ pub struct NodeSliceIter {
 }
 
 impl NodeSliceIter {
-    /// `self.slice.get(i)`, without the per-node store lookup in tier 0.
+    /// `self.slice.get(i)`, without the per-node store lookup of a published store.
     // PERF: U1 (c). The store facts are read once in `NodeSlice::iter`. For
     // an alias-free store (most stores) each id then becomes its handle with
     // no table load (`FrozenIds::Direct`).
@@ -2230,7 +2230,7 @@ thread_local! {
 }
 
 impl Node {
-    /// Go `node.Kind`. Tier 0 store nodes read their node record inline;
+    /// Go `node.Kind`. Published store nodes read their node record inline;
     /// other nodes take `kind_slow`.
     #[inline]
     #[must_use]
@@ -2262,7 +2262,6 @@ impl Node {
     #[inline]
     #[must_use]
     pub fn flags(self) -> NodeFlags {
-        // Every tier 0 store file is published.
         match frozen_store_flags(self) {
             Some(flags) => flags,
             None => self.flags_slow(),
@@ -2271,8 +2270,7 @@ impl Node {
 
     /// Go `node.Flags & mask` for a `mask` without a binder-added bit
     /// (`BINDER_ADDED_FLAGS`). For such a mask the binder bits do not
-    /// matter, so a tier 0 store node reads only its header, not its binder
-    /// data.
+    /// matter, so a published store node reads only its record flags.
     // PERF: U4 (CH7). `Node::flags` loads the binder data of the file
     // (`Node::bind`) for every test, also of a parser-only bit such as
     // `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`.
@@ -2378,7 +2376,7 @@ impl Node {
     }
 
     // Go: ast.go:198 Name
-    // PERF: U4 (CH6). A tier 0 store node reads its name child from the
+    // PERF: U4 (CH6). A published store node reads its name child from the
     // store column (`frozen_store_child`), not from its node data. Debug
     // builds compare it with the data read.
     #[must_use]
@@ -2565,12 +2563,14 @@ impl Node {
     /// this node that are not in its record (`NodeBindExtra`). A published
     /// store node reads the index in its `bind` word, and only a node that
     /// has an entry reads its `GoFile` (`FileNodeBind::extra`).
+    // PERF: AST node records, step 3. The record and the `GoFile` of a
+    // static file come from one block lookup (`frozen_store_bind_and_file`).
     #[inline]
     fn bind_extra<T>(self, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
-        match frozen_store_bind_word(self) {
-            Some(word) => match (word >> 32) as u32 {
+        match frozen_store_bind_and_file(self) {
+            Some((word, go_file)) => match (word >> 32) as u32 {
                 0 => field(&NodeBindExtra::NONE),
-                extra => match crate::ast::static_go_file(self.file_index()) {
+                extra => match go_file {
                     Some(go_file) => field(node_extra_in(go_file, extra)),
                     None => self.bind_extra_slow(extra, field),
                 },
@@ -2625,7 +2625,7 @@ fn node_extra_in(go_file: &GoFile, extra: u32) -> &NodeBindExtra {
 impl FlowNodeId {
     /// Go `*FlowNode` dereference. The guard pins a freeable file version
     /// while it lives; copy the fields out rather than keep it.
-    // PERF: lsshells M3b. A static file (tier 0, tier 1) returns its
+    // PERF: lsshells M3b. A static file (a static publish) returns its
     // `FileRef::Static` inline, as R134 returned the `&'static FlowNode`;
     // the synthetic flow file and a freeable file version are out of line
     // (`get_flow_slow`). The synthetic id is above every publish, so the
@@ -2639,7 +2639,7 @@ impl FlowNodeId {
     }
 
     /// Go `*FlowNode` dereference for a hot walk: the `'static` borrow of a
-    /// static file (tier 0, tier 1), with no guard, or the borrow of a guard
+    /// static file (a static publish), with no guard, or the borrow of a guard
     /// that `guard` keeps (a synthetic flow node or a freeable file
     /// version). Use: `let mut guard = None; let data = flow.get_flow_in(&mut
     /// guard);`.
@@ -2676,7 +2676,7 @@ impl FlowNodeId {
         guard.as_deref().expect("the guard is set")
     }
 
-    /// The flow node of a static file (tier 0, tier 1), or `None` for any
+    /// The flow node of a static file (a static publish), or `None` for any
     /// other flow node (synthetic, a freeable file version).
     #[inline]
     fn static_flow(self) -> Option<&'static FlowNode> {
@@ -2965,7 +2965,7 @@ impl Node {
     }
 
     // Go: ast.go:299 Expression
-    // PERF: U4 (CH6). A tier 0 store node reads its expression child from
+    // PERF: U4 (CH6). A published store node reads its expression child from
     // the store column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
     pub fn expression(self) -> Node {
@@ -3035,7 +3035,7 @@ impl Node {
     }
 
     // Go: ast.go:483 TypeArgumentList
-    // PERF: C2. A tier 0 store node whose data has no list gives nil from
+    // PERF: C2. A published store node whose data has no list gives nil from
     // the store column (`frozen_store_lacks_type_arguments`), without its
     // node data. A node with a list reads it from the data.
     #[must_use]
@@ -3180,7 +3180,7 @@ impl Node {
     // Go: ast.go:617 Type
     // PORT: also covers JsDocVariadicType, whose Go `Type` field has no
     // generated accessor.
-    // PERF: C2. A tier 0 store node reads its type child from the store
+    // PERF: C2. A published store node reads its type child from the store
     // column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
     pub fn type_(self) -> Node {
@@ -3479,7 +3479,7 @@ impl Node {
     }
 
     // Go: ast.go:1056 PostfixToken
-    // PERF: U4 (bind A). A tier 0 store node reads the token from the store
+    // PERF: U4 (bind A). A published store node reads the token from the store
     // column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
     pub fn postfix_token(self) -> Node {
@@ -5626,7 +5626,7 @@ impl Node {
 // ──────────────────────────────────────────────────────────────────────
 
 // PORT: the caches below are per thread and leaked, for static files
-// (tier 0, tier 1, synthetic) and files that are not published yet. A
+// (static publishes, synthetic) and files that are not published yet. A
 // published freeable file version (lsshells M3b) keeps them on its
 // `FileVersion` (`name_table`, `position_map`, `declaration_map`; see
 // `file_version_of`) and its ECMA line map in its store
