@@ -1960,6 +1960,8 @@ pub struct TypeResponse {
     pub element_flags: Vec<ElementFlags>,
     pub fixed_length: Option<i32>,
     pub tuple_readonly: Option<bool>,
+    // ts#64109
+    pub labeled_element_declarations: Vec<NodeHandle>,
 
     // IndexedAccessType data
     pub object_type: TypeID,
@@ -2022,6 +2024,12 @@ impl MarshalerTo for TypeResponse {
         marshal_field_omitempty(enc, &mut first, "elementFlags", &element_flags)?;
         marshal_field_omitempty(enc, &mut first, "fixedLength", &self.fixed_length)?;
         marshal_field_omitempty(enc, &mut first, "readonly", &self.tuple_readonly)?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "labeledElementDeclarations",
+            &self.labeled_element_declarations,
+        )?;
         marshal_field_omitzero(enc, &mut first, "objectType", &self.object_type)?;
         marshal_field_omitzero(enc, &mut first, "indexType", &self.index_type)?;
         marshal_field_omitzero(enc, &mut first, "checkType", &self.check_type)?;

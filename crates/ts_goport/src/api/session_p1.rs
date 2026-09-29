@@ -281,7 +281,37 @@ impl SnapshotData {
             return None;
         }
         let id = self.register_type(project_id, checker, t);
-        Some(new_type_response(&checker.borrow(), t, id))
+        let mut resp = new_type_response(&checker.borrow(), t, id);
+        // ts#64109
+        // PORT: the labeled declarations are copied out of the checker arena
+        // before the node handles are built.
+        let labeled_declarations: Option<Vec<Node>> = {
+            let c = checker.borrow();
+            if c.is_tuple_type_target(t) {
+                Some(
+                    c.ty(t)
+                        .as_tuple_type()
+                        .element_infos()
+                        .iter()
+                        .map(|info| info.labeled_declaration())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(element_infos) = labeled_declarations {
+            for (i, &declaration) in element_infos.iter().enumerate() {
+                if declaration.is_some() {
+                    if resp.labeled_element_declarations.is_empty() {
+                        resp.labeled_element_declarations =
+                            vec![NodeHandle::default(); element_infos.len()];
+                    }
+                    resp.labeled_element_declarations[i] = self.node_handle_from(declaration);
+                }
+            }
+        }
+        Some(resp)
     }
 
     // Go: api/session.go:136 registerType
