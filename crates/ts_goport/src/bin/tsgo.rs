@@ -65,6 +65,16 @@ const WORKER_FD: &str = "GOPORT_WORKER_FD";
 #[cfg(target_os = "linux")]
 const LAUNCHER_PID: &str = "GOPORT_LAUNCHER_PID";
 
+/// A worker's link to its launcher (see `launch`).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct Worker {
+    /// The number of the pipe end that takes the exit code (`WORKER_FD`).
+    fd: u32,
+    /// The launcher (`LAUNCHER_PID`).
+    launcher: rustix::process::Pid,
+}
+
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
     // First: it must run before the first heap allocation.
@@ -74,8 +84,8 @@ fn main() {
         std::process::exit(code);
     }
     #[cfg(target_os = "linux")]
-    if std::env::var_os(WORKER_FD).is_some() {
-        end_with_launcher();
+    if let Some(worker) = worker() {
+        end_with_launcher(worker.launcher);
     }
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
@@ -169,7 +179,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
         Some(v) if v == "1" => true,
         _ => !huge_pages,
     };
-    if !wanted || std::env::var_os(WORKER_FD).is_some() {
+    if !wanted || worker().is_some() {
         return None;
     }
     let mut args = std::env::args_os();
@@ -186,9 +196,14 @@ fn launch(huge_pages: bool) -> Option<i32> {
         return None;
     }
     let exe = std::env::current_exe().ok()?;
-    // `pipe` sets no close-on-exec flag, so the worker gets `write` at the
-    // same number. THP off (`prctl`) stays off in the worker.
-    let (read, write) = rustix::pipe::pipe().ok()?;
+    // `read` keeps its close-on-exec flag, so the worker gets only `write`,
+    // at the same number. The worker's copy has no close-on-exec flag: it
+    // must stay open through the exec in `set_malloc_tunables`, and std and
+    // rustix have no safe call that sets the flag on an inherited number. A
+    // compile starts no process, and a process that a worker starts is not
+    // a worker (`worker`). THP off (`prctl`) stays off in the worker.
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::empty()).ok()?;
     let mut worker = std::process::Command::new(exe)
         .arg0(program)
         .args(args)
@@ -228,22 +243,35 @@ fn launch(huge_pages: bool) -> Option<i32> {
     })
 }
 
-/// Makes a worker (see `launch`) end when its launcher ends: it sets a
-/// parent-death SIGKILL. std and rustix have no safe way to set it between
-/// fork and exec, so the launcher can die before this runs. Then no signal
-/// comes and this process already has a new parent, so it kills itself as
-/// the signal would have.
+/// This process as a worker (see `launch`): `WORKER_FD` and `LAUNCHER_PID`
+/// are set, and the parent is that launcher. A process that a worker starts
+/// inherits the variables, but its parent is the worker, so it runs as a
+/// plain tsgo and sends no code. So does a worker whose launcher ends
+/// before the first call. The first call decides, at the start of `main`.
 #[cfg(target_os = "linux")]
-fn end_with_launcher() {
-    use rustix::process::{
-        Pid, Signal, getpid, getppid, kill_process, set_parent_process_death_signal,
-    };
+fn worker() -> Option<Worker> {
+    static WORKER: std::sync::OnceLock<Option<Worker>> = std::sync::OnceLock::new();
+    *WORKER.get_or_init(|| {
+        let fd = std::env::var(WORKER_FD).ok()?.parse().ok()?;
+        let launcher = std::env::var(LAUNCHER_PID)
+            .ok()?
+            .parse()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)?;
+        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, launcher })
+    })
+}
+
+/// Makes a worker (see `launch`) end when `launcher` ends: it sets a
+/// parent-death SIGKILL. std and rustix have no safe way to set it between
+/// fork and exec, so the launcher can die after `worker` and before this
+/// runs. Then no signal comes and this process already has a new parent,
+/// so it kills itself as the signal would have.
+#[cfg(target_os = "linux")]
+fn end_with_launcher(launcher: rustix::process::Pid) {
+    use rustix::process::{Signal, getpid, getppid, kill_process, set_parent_process_death_signal};
     let _ = set_parent_process_death_signal(Some(Signal::KILL));
-    let launcher = std::env::var(LAUNCHER_PID)
-        .ok()
-        .and_then(|pid| pid.parse().ok())
-        .and_then(Pid::from_raw);
-    if launcher.is_some() && getppid() != launcher {
+    if getppid() != Some(launcher) {
         let _ = kill_process(getpid(), Signal::KILL);
         std::process::exit(EXIT_UNPORTED);
     }
@@ -277,7 +305,7 @@ fn forward_signals(worker: &std::process::Child) {
 /// gets its end of file, and sends the code.
 fn exit(code: i32) -> ! {
     #[cfg(target_os = "linux")]
-    if let Some(fd) = std::env::var_os(WORKER_FD) {
+    if let Some(worker) = worker() {
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
@@ -285,10 +313,9 @@ fn exit(code: i32) -> ! {
             let _ = rustix::stdio::dup2_stderr(&null);
         }
         // The inherited end of the pipe, opened again by its number.
-        if let Some(fd) = fd.to_str().and_then(|fd| fd.parse::<u32>().ok())
-            && let Ok(mut pipe) = std::fs::File::options()
-                .write(true)
-                .open(format!("/proc/self/fd/{fd}"))
+        if let Ok(mut pipe) = std::fs::File::options()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", worker.fd))
         {
             let _ = pipe.write_all(&code.to_le_bytes());
         }
