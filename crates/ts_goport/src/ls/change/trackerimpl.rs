@@ -26,7 +26,10 @@ impl Tracker {
             }
             // order changes by start position
             // If the start position is the same, put the shorter range first, since an empty range (x, x) may precede (x, y) but not vice-versa.
-            changes_in_file.sort_by(|a, b| lsproto::compare_ranges(a.range, b.range).cmp(&0));
+            // Go: ls/change/trackerimpl.go:31 slices.SortStableFunc(changesInFile, lsproto.CompareRanges on the ranges)
+            crate::gostd::slices::sort_stable_func(changes_in_file, |a, b| {
+                lsproto::compare_ranges(a.range, b.range)
+            });
             // verify that change intervals do not overlap, except possibly at end points.
             for i in 0..(changes_in_file.len() as i32 - 1).max(0) as usize {
                 if lsproto::compare_positions(

@@ -459,7 +459,8 @@ impl Fs for MapFs {
             .filter(|(p, _)| **p != dir && get_directory_path(p) == dir)
             .map(|(p, is_dir)| (get_base_file_name(p), is_dir))
             .collect();
-        entries.sort_by(|a, b| compare_go_strings(&a.0, &b.0));
+        // Go: testing/fstest/mapfs.go:106 slices.SortFunc(list, strings.Compare on the names) (go1.26.8)
+        crate::gostd::slices::sort_func(&mut entries, |a, b| compare_go_strings(&a.0, &b.0) as i32);
         let mut result = Entries {
             symlinks: Some(FxHashSet::default()),
             ..Entries::default()

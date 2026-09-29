@@ -3020,9 +3020,15 @@ pub fn prog() -> &'static GoProgram {
 }
 
 // Go: core/version.go:8 version
-// PORT: Go keeps this in a var that ldflags can override. The pinned
-// reference build does not override it.
-const VERSION: &str = "7.1.0-dev";
+// This is a var so it can be overridden by ldflags.
+// PORT: Go release builds set it with `-ldflags -X ...core.version=<v>`
+// (Herebyfile.mjs getReleaseBuildFlags). The port reads the build-time env
+// var GOPORT_BUILD_VERSION instead (build-release.sh: RELEASE_VERSION).
+// Without it the value is Go's default, as in the pinned reference build.
+pub(crate) const VERSION: &str = match option_env!("GOPORT_BUILD_VERSION") {
+    Some(version) => version,
+    None => "7.1.0-dev",
+};
 
 // Go: core/version.go:10 Version
 pub fn version() -> &'static str {
@@ -3030,20 +3036,26 @@ pub fn version() -> &'static str {
 }
 
 // Go: core/version.go:14 versionMajorMinor
-// Go: core/version.go:31 VersionMajorMinor
-pub fn version_major_minor() -> &'static str {
+// PORT: a const, so a GOPORT_BUILD_VERSION with no second '.' stops the
+// build where Go panics at start.
+const VERSION_MAJOR_MINOR: &str = {
+    let bytes = VERSION.as_bytes();
     let mut seen_major = false;
-    let i = VERSION.find(|r: char| {
-        if r == '.' {
+    let mut i = 0;
+    loop {
+        assert!(i < bytes.len(), "invalid version string");
+        if bytes[i] == b'.' {
             if seen_major {
-                return true;
+                break;
             }
             seen_major = true;
         }
-        false
-    });
-    match i {
-        Some(i) => &VERSION[..i],
-        None => panic!("invalid version string: {VERSION}"),
+        i += 1;
     }
+    VERSION.split_at(i).0
+};
+
+// Go: core/version.go:31 VersionMajorMinor
+pub fn version_major_minor() -> &'static str {
+    VERSION_MAJOR_MINOR
 }

@@ -245,7 +245,7 @@ fn get_all_module_paths_worker(
 
     let use_case_sensitive_file_names = info.use_case_sensitive_file_names;
     let compare_paths = |a: &ModulePath, b: &ModulePath| {
-        compare_paths_by_redirect(a, b, use_case_sensitive_file_names).cmp(&0)
+        compare_paths_by_redirect(a, b, use_case_sensitive_file_names)
     };
 
     // Sort by paths closest to importing file Name directory
@@ -262,7 +262,8 @@ fn get_all_module_paths_worker(
             true
         });
         if !paths_in_directory.is_empty() {
-            paths_in_directory.sort_by(compare_paths);
+            // Go: modulespecifiers/specifiers.go:228 slices.SortFunc(pathsInDirectory, comparePaths)
+            crate::gostd::slices::sort_func(&mut paths_in_directory, compare_paths);
             sorted_paths.extend(paths_in_directory);
         }
         let new_directory = tspath::get_directory_path(&directory);
@@ -273,7 +274,8 @@ fn get_all_module_paths_worker(
     }
     if !all_file_names.is_empty() {
         let mut remaining_paths: Vec<ModulePath> = all_file_names.into_values().collect();
-        remaining_paths.sort_by(compare_paths);
+        // Go: modulespecifiers/specifiers.go:239 slices.SortFunc(remainingPaths, comparePaths)
+        crate::gostd::slices::sort_func(&mut remaining_paths, compare_paths);
         sorted_paths.extend(remaining_paths);
     }
     sorted_paths

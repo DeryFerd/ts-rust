@@ -1,8 +1,9 @@
 //! Go: `internal/bundled/bundled_test.go`.
 //!
-//! Blocked: `TestTestingLibPath` (Go `bundled.TestingLibPath`; the port has
-//! only the embedded build and no such function in
-//! `src/frontend/bundled.rs`).
+//! These tests run only on the default (embed) build.
+//!
+//! Blocked: `TestTestingLibPath`. Go `bundled.TestingLibPath` is for Go tests
+//! only and is not ported (see `src/frontend/bundled.rs`).
 
 use std::cell::RefCell;
 

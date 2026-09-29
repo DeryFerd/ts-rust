@@ -49,9 +49,6 @@ use ts_goport::execute::tsc::{
 use ts_goport::frontend::tspath::{normalize_path, resolve_path};
 use ts_goport::prelude::*;
 
-/// Stack size for the loading threads, as in `goport`.
-const STACK_SIZE: usize = 1 << 30;
-
 const USAGE: &str = "usage: goport_live_programs live <out-dir> <check|emit>:<tsconfig>...
        goport_live_programs release <out-dir> <tsconfig-p> <tsconfig-q>";
 
@@ -59,7 +56,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let worker = std::thread::Builder::new()
         .name("goport_live_programs".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&args));
     let code = match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(Ok(()))) => 0,
@@ -365,7 +362,7 @@ fn release(out: &Path, p_config: &str, q_config: &str) {
     // Q loads after P is loaded and bound, so the two loads do not overlap.
     let q_thread = std::thread::Builder::new()
         .name("second-loading-thread".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || {
             let q = load_check(&q_config);
             let q_first = report_check(q);

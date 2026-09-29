@@ -72,13 +72,9 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 
 const USAGE: &str = "usage: goport_emit -p <tsconfig.json | project dir> --outDir <dir> [--writeRoot <dir>] [tsc options]";
 
-/// Stack size for the worker thread. The checker recurses deeply on large
-/// projects.
-const STACK_SIZE: usize = 1 << 30;
-
 /// The opt-in `jemalloc` feature makes jemalloc the global allocator
 /// (see `goport.rs` `set_malloc_tunables`).
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -96,7 +92,7 @@ fn main() {
     install_panic_hook();
     let worker = std::thread::Builder::new()
         .name("goport_emit".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&args, write_root, start));
     let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
         code

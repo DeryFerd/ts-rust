@@ -705,6 +705,7 @@ impl DiagnosticsCollection {
     // PORT: returns positions in `diagnostics` (Go returns the pointers).
     fn get_global_diagnostics_locked(&mut self) -> Vec<usize> {
         if !self.non_file_diagnostics_sorted {
+            // Go: ast/diagnostic.go:331 slices.SortStableFunc(c.nonFileDiagnostics, CompareDiagnostics)
             sort_diagnostic_ids(&mut self.non_file_diagnostics, &self.diagnostics);
             self.non_file_diagnostics_sorted = true;
         }
@@ -724,6 +725,7 @@ impl DiagnosticsCollection {
         let path = source_file_file_name(file);
         if !self.file_diagnostics_sorted.contains(path) {
             if let Some(ids) = self.file_diagnostics.get_mut(path) {
+                // Go: ast/diagnostic.go:347 slices.SortStableFunc(c.fileDiagnostics[path], CompareDiagnostics)
                 sort_diagnostic_ids(ids, &self.diagnostics);
             }
             self.file_diagnostics_sorted.insert(path);
@@ -740,9 +742,8 @@ impl DiagnosticsCollection {
         for ids in lists {
             diagnostics.extend(ids.iter().map(|&id| self.diagnostics[id].clone()));
         }
-        // PORT: Go uses the unstable slices.SortFunc; any order of equal
-        // elements is valid there, so a stable sort is used here.
-        diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+        // Go: ast/diagnostic.go:362 slices.SortFunc(diagnostics, CompareDiagnostics)
+        crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
         diagnostics
     }
 }
@@ -750,7 +751,9 @@ impl DiagnosticsCollection {
 // Go `slices.SortStableFunc(list, CompareDiagnostics)` on a list of
 // positions in `diagnostics`.
 fn sort_diagnostic_ids(ids: &mut [usize], diagnostics: &[Diagnostic]) {
-    ids.sort_by(|&a, &b| compare_diagnostics(&diagnostics[a], &diagnostics[b]).cmp(&0));
+    crate::gostd::slices::sort_stable_func(ids, |&a, &b| {
+        compare_diagnostics(&diagnostics[a], &diagnostics[b])
+    });
 }
 
 // Go: ast/diagnostic.go:288 diagnosticLocationKey (#4825)

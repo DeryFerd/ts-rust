@@ -394,7 +394,8 @@ impl ToBuildInfo<'_> {
             let id = self.to_file_id(&Path(source_file_info(file).path.clone()));
             keys.push((file, id));
         }
-        keys.sort_by_key(|&(_, id)| id);
+        // Go: incremental/snapshottobuildinfo.go:261 slices.SortFunc(keys, ...) by file id
+        crate::gostd::slices::sort_func(&mut keys, |a, b| a.1.cmp(&b.1) as i32);
         for (file, _) in keys {
             let root_path = self.roots[&file].clone();
             let root = self.to_file_id(&root_path);

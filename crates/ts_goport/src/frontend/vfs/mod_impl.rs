@@ -609,6 +609,7 @@ pub fn io_fs_valid_path(name: &str) -> bool {
 // Go: os/stat_linux.go fillFileStatFromSys
 // PORT: Go standard library. Converts Rust metadata to the Go `FileInfo`
 // with the same mode bits.
+#[cfg(unix)]
 pub fn file_info_from_metadata(name: &str, md: &std::fs::Metadata) -> FileInfo {
     use std::os::unix::fs::MetadataExt;
     const S_IFMT: u32 = 0o170000;
@@ -649,6 +650,30 @@ pub fn file_info_from_metadata(name: &str, md: &std::fs::Metadata) -> FileInfo {
     FileInfo {
         name: name.to_string(),
         size: md.size() as i64,
+        mode,
+        mod_time: md.modified().ok(),
+    }
+}
+
+// Go: os/types_windows.go (*fileStat).mode (go1.26)
+// PORT: off unix. Go reads the file attributes and the reparse tag; the port
+// has the read-only bit, the link and the directory from `std::fs`, so a
+// pipe, a device or a socket is a plain file here. Not run on such a target.
+#[cfg(not(unix))]
+pub fn file_info_from_metadata(name: &str, md: &std::fs::Metadata) -> FileInfo {
+    let mut mode = FileMode(if md.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    });
+    if md.file_type().is_symlink() {
+        mode |= FileMode::SYMLINK;
+    } else if md.is_dir() {
+        mode |= FileMode::DIR | FileMode(0o111);
+    }
+    FileInfo {
+        name: name.to_string(),
+        size: md.len() as i64,
         mode,
         mod_time: md.modified().ok(),
     }

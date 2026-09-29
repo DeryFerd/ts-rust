@@ -42,15 +42,18 @@ pub fn print_help(sys: &dyn System, locale: &Locale, command_line: &ParsedComman
 // PORT: Go `slices.SortFunc` is pdqsort, which is not stable. The input is
 // the fixed declaration list, and its only names that are equal in lower
 // case are the two `help` options (`-h`, then `-?`). Go keeps them in that
-// order (checked against the oracle `--help --all` output), and so does the
-// stable `sort_by`.
+// order (checked against the oracle `--help --all` output).
+// `gostd::slices::sort_func` is the same pdqsort.
 fn get_options_for_help(command_line: &ParsedCommandLine) -> Vec<&'static CommandLineOption> {
     // Sort our options by their names, (e.g. "--noImplicitAny" comes before "--watch")
     let mut opts: Vec<&'static CommandLineOption> = OPTIONS_DECLARATIONS.to_vec();
     opts.push(&*TSC_BUILD_OPTION);
 
     if command_line.compiler_options().all.is_true() {
-        opts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        // Go: execute/tsc/help.go:33 slices.SortFunc(opts, strings.Compare on the lower case names)
+        crate::gostd::slices::sort_func(&mut opts, |a, b| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase()) as i32
+        });
         opts
     } else {
         opts.into_iter()

@@ -1225,8 +1225,8 @@ impl Printer {
                 && self.emit_context.has_recorded_external_helpers(source_file));
         let mut helpers = self.emit_context.get_emit_helpers(node).to_vec();
         if !helpers.is_empty() {
-            // PORT: Go `slices.SortStableFunc`; `sort_by` is stable.
-            helpers.sort_by(|x, y| compare_emit_helpers(x, y).cmp(&0));
+            // Go: printer/printer.go:4634 slices.SortStableFunc(helpers, compareEmitHelpers)
+            crate::gostd::slices::sort_stable_func(&mut helpers, |x, y| compare_emit_helpers(x, y));
             for helper in &helpers {
                 if !helper.scoped {
                     // Skip the helper if it can be skipped and the noEmitHelpers compiler

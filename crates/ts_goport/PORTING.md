@@ -395,6 +395,15 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
+- A thread that runs Go code (the work thread of a binary, and the parse,
+  bind, checker, emit, search and goroutine threads) gets the stack size of
+  `gostd::stack::max_stack_size`: 1 GiB, the Go maximum goroutine stack. A
+  Rust stack does not grow, so it is reserved at the start. Under an address
+  space or data limit (`ulimit -v`, `ulimit -d`), the size is 1/64 of the
+  limit and glibc malloc gets one arena (`ThreadBudget::glibc_tunables`),
+  so the threads start and the heap keeps room. The 1/64 share does not
+  count the threads, so with many checkers a run under a low limit can
+  still fail where Go runs (see `gostd/stack.rs`).
 - `tsc -p` with an incremental program starts its emit with the check (not
   in Go; `incremental::Program::start_check_and_emit`). Go waits for the
   whole check, reads the global diagnostics again, then emits. Here the
@@ -655,8 +664,10 @@ program version:
 | `defer f()` | a guard, or an explicit call on every return path |
 | `recover()` | `std::panic::catch_unwind(AssertUnwindSafe(..))`; `unported!` panics are recovered like Go panics |
 | `panic(x)` | `panic!` with the Go text |
-| `slices.SortFunc`, `sort.Slice` (not stable) | `gostd::slices::sort_func(&mut v, cmp)`, `gostd::slices::sort_slice(&mut v, less)` (Go pdqsort: equal elements end where Go puts them) |
-| `slices.SortStableFunc`, `sort.SliceStable` | `v.sort_by(..)` (all stable sorts agree) |
+| `slices.SortFunc`, `sort.Sort`, `sort.Slice` (not stable) | `gostd::slices::sort_func(&mut v, cmp)`, `gostd::slices::sort_slice(&mut v, less)` (Go pdqsort: equal elements end where Go puts them) |
+| `slices.SortStableFunc`, `sort.Stable`, `sort.SliceStable` | `gostd::slices::sort_stable_func(&mut v, cmp)` |
+| `slices.Sort`, `sort.Strings` (ordered values) | std `v.sort()` (equal values are the same value) |
+| any sort with a comparator | never std `sort_by`, `sort_by_key` or `sort_unstable_by`: they can panic when the comparator is not a total order, and Go's sorts do not. The `gostd::slices` sorts give Go's order for any comparator. A port-only sort on an `Ord` key can use std. |
 | `slices.BinarySearchFunc` | `gostd::slices::binary_search_func(&v, target, cmp) -> (usize, bool)` |
 | `strconv.Quote`, `%q` | `gostd::strconv::quote(s)` |
 | `net/url` (`Parse`, `PathEscape`, `QueryEscape`, `PathUnescape`), `net/netip.ParseAddr` | `gostd::url::{parse, path_escape, query_escape, path_unescape}`, `gostd::netip` |

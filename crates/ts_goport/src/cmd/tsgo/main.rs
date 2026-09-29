@@ -10,23 +10,21 @@ use crate::cmd::tsgo::lsp::run_lsp;
 use crate::gostd::context::{self, CancelFunc};
 use crate::gostd::errors;
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock};
 
-// Go: cmd/tsgo/main.go:13 main
+// Go: cmd/tsgo/main.go:14 main
 // PORT: `bin/goport.rs` `main` calls `run_main` before its own compile
 // path and exits with the status it returns.
-
-/// Stack size of the thread that runs `--lsp` and `--api` (the LSP
-/// dispatch thread). Same as the goport worker thread.
-const STACK_SIZE: usize = 1 << 30;
 
 // Go: cmd/tsgo/main.go:18 runMain
 // PORT: `args` is Go `osutil.Args()[1:]`. `None` means Go continues with
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT
-// override) becomes the 1 GiB stack of the thread that runs the command.
+// override) becomes the stack of the thread that runs the command
+// (`gostd::stack::max_stack_size`).
 // PORT: Go `signal.NotifyContext` before `execute.CommandLine` is in
 // `bin/tsgo.rs`, which runs that path; the goport compile path has none.
 pub fn run_main(args: &[String]) -> Option<i32> {
@@ -40,13 +38,14 @@ pub fn run_main(args: &[String]) -> Option<i32> {
     None
 }
 
-// PORT: runs `f` on a new thread with a 1 GiB stack and returns its status.
+// PORT: runs `f` on a new thread with the Go maximum stack
+// (`gostd::stack::max_stack_size`) and returns its status.
 // A panic that reaches the top of that thread ends Go with a crash; goport
 // returns `EXIT_UNPORTED` (70), as `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     let worker = std::thread::Builder::new()
         .name("tsgo".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || f(args));
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,
@@ -66,6 +65,7 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
 // PORT: after Go `Stop(c.ch)`, a later SIGINT or SIGTERM kills the process
 // (the Go runtime default). The signal-hook handler stays installed, so
 // the port ignores such a signal. Every caller returns right after `stop`.
+#[cfg(unix)]
 pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
     let (ctx, cancel) = context::with_cancel_cause(parent);
     // Go: c.ch = make(chan os.Signal, 1); Notify(c.ch, c.signals...)
@@ -96,6 +96,16 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
         // Go: Stop(c.ch)
         handle.close();
     });
+    (ctx, stop)
+}
+
+// PORT: off unix, signal-hook has no `Signals` iterator, so no signal
+// cancels the context: Ctrl+C ends the process (the OS default) where Go
+// cancels it. `stop` cancels it, as in Go. Not run on such a target.
+#[cfg(not(unix))]
+pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
+    let (ctx, cancel) = context::with_cancel_cause(parent);
+    let stop: CancelFunc = Arc::new(move || cancel(None));
     (ctx, stop)
 }
 
@@ -565,7 +575,8 @@ impl FlagSet {
     pub fn print_defaults(&self) {
         // Go: VisitAll visits the flags in lexicographical order.
         let mut flags: Vec<&Flag> = self.formal.values().collect();
-        flags.sort_by(|a, b| a.name.cmp(&b.name));
+        // Go: flag/flag.go:423 sortFlags: slices.SortFunc(result, strings.Compare on the names)
+        crate::gostd::slices::sort_func(&mut flags, |a, b| a.name.cmp(&b.name) as i32);
         for flag in flags {
             let mut b = String::new();
             b.push_str(&format!("  -{}", flag.name)); // Two spaces before -; see next two comments.

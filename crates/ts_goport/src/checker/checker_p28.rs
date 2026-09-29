@@ -1371,8 +1371,8 @@ impl Checker {
         }
         if types.len() >= 2 {
             // Sort and deduplicate types
-            // PORT: Go `slices.SortStableFunc`; Rust `sort_by` is stable too.
-            types.sort_by(|&a, &b| self.compare_types(a, b).cmp(&0));
+            // Go: checker/checker.go:25933 slices.SortStableFunc(types, CompareTypes)
+            crate::gostd::slices::sort_stable_func(&mut types, |&a, &b| self.compare_types(a, b));
             types.dedup();
         }
         (types, includes)

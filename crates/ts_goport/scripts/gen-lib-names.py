@@ -3,7 +3,7 @@
 
 Usage: gen-lib-names.py [libs-dir] [out.rs]
 
-With no libs-dir, the lib set is the one that `src/frontend/bundled.rs` embeds:
+With no libs-dir, the lib set is the one that `src/frontend/bundled/embed.rs` embeds:
 crates/ts_goport/libs.
 
 The output is a static table of the names that the bundled lib files give to

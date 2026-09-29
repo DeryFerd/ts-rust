@@ -1,5 +1,6 @@
-//! Go: internal/nativepath (Linux only): realpath_linux.go, eintr_unix.go
-//! and symlink_other.go.
+//! Go: internal/nativepath: realpath_linux.go, realpath_other.go,
+//! eintr_unix.go and symlink_other.go. realpath_darwin.go,
+//! realpath_windows.go and symlink_windows.go are not ported.
 //!
 //! OS path helpers that osvfs and fswatch share. Paths are OS paths in the
 //! port form (see `vfs::osvfs::os_path`).
@@ -7,16 +8,18 @@
 use crate::frontend::vfs::FsError;
 use crate::frontend::vfs::osvfs::{go_string_from_os, os_path};
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::OnceLock;
 
 // Go: realpath_linux.go:32 _procSelfFD
 const PROC_SELF_FD: &str = "/proc/self/fd/";
 
-// PORT: Linux `O_PATH` (0o10000000 on x86-64 and aarch64). The crate has no
-// libc dependency, so the value is written here.
-const O_PATH: i32 = 0o10000000;
+// PORT: Linux `O_PATH`, the value of the target (rustix).
+#[cfg(target_os = "linux")]
+const O_PATH: i32 = rustix::fs::OFlags::PATH.bits() as i32;
 
 // Go: realpath_linux.go:34 hasProcSelfFD
 fn has_proc_self_fd() -> bool {
@@ -31,6 +34,7 @@ fn has_proc_self_fd() -> bool {
 //
 // Falls back to filepath.EvalSymlinks if /proc is not available (e.g. containers
 // or chroots without procfs mounted).
+#[cfg(target_os = "linux")]
 pub fn realpath(path: &str) -> Result<String, FsError> {
     if !has_proc_self_fd() {
         // PORT: Go `filepath.EvalSymlinks`. For the rooted paths that reach
@@ -57,6 +61,18 @@ pub fn realpath(path: &str) -> Result<String, FsError> {
     let target = ignoring_eintr(|| std::fs::read_link(&proc_path))
         .map_err(|err| FsError::path("readlink", path, err))?;
     Ok(go_string_from_os(target))
+}
+
+// Go: realpath_other.go:7 Realpath
+// PORT: every target but Linux. Go has its own darwin and Windows files;
+// the port uses `std::fs::canonicalize` there too (Go
+// `filepath.EvalSymlinks`, as in the Linux fallback above). Not run on
+// such a target.
+#[cfg(not(target_os = "linux"))]
+pub fn realpath(path: &str) -> Result<String, FsError> {
+    std::fs::canonicalize(os_path(path))
+        .map(go_string_from_os)
+        .map_err(|err| FsError::path("lstat", path, err))
 }
 
 // Go: eintr_unix.go:7 ignoringEINTR

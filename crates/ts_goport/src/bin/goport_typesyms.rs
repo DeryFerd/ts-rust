@@ -33,12 +33,9 @@ use ts_goport::scanner_util::go_string_bytes;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
-/// Stack size for the worker thread. The checker recurses deeply.
-const STACK_SIZE: usize = 1 << 30;
-
 /// The opt-in `jemalloc` feature makes jemalloc the global allocator
 /// (see `goport.rs` `set_malloc_tunables`).
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -65,7 +62,7 @@ fn main() {
     // the whole run stays on it. The checkers run on their own threads.
     let worker = std::thread::Builder::new()
         .name("goport_typesyms".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || run(&project, &out_dir));
     let code = match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,

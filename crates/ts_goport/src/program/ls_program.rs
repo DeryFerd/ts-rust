@@ -774,16 +774,15 @@ pub fn get_checker_association_order(
         return None;
     }
     let mut file_order: Vec<usize> = (0..file_weights.len()).collect();
-    // Go `sort.Slice` with a total order, so any sort gives the same result.
-    file_order.sort_by(|&left, &right| {
+    // Go: compiler/checkerpool.go:245 sort.Slice(fileOrder, ...)
+    crate::gostd::slices::sort_slice(&mut file_order, |&left, &right| {
         if is_declaration_file[left] != is_declaration_file[right] {
-            // Source files (false) first.
-            return is_declaration_file[left].cmp(&is_declaration_file[right]);
+            return !is_declaration_file[left];
         }
         if file_weights[left] != file_weights[right] {
-            return file_weights[right].cmp(&file_weights[left]);
+            return file_weights[left] > file_weights[right];
         }
-        left.cmp(&right)
+        left < right
     });
     Some(file_order)
 }
