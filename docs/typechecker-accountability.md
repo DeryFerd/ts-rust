@@ -153,7 +153,8 @@ Under that delegation, root extended both rules to batch
 the pin-bump rule below), and then to batch
 `recovery-continuation-go-checker-port-14` (same Go pin as batch 13), and then to batch
 `recovery-continuation-go-checker-port-15` (same Go pin), and then to batch
-`recovery-continuation-go-checker-port-16` (same Go pin), each time with the same pins and
+`recovery-continuation-go-checker-port-16` (same Go pin), and then to batch
+`recovery-continuation-go-checker-port-17` (same Go pin), each time with the same pins and
 scope. Each extension is a separate entry in `acceptanceRuleChanges`. The
 records name root as the extender. This is not a new direct approval by Theo,
 and it does not widen the rules.

@@ -2,7 +2,11 @@
 //!
 //! `go_flags!` makes a bit set. `go_enum!` makes a plain Go enum. Both keep
 //! the Go numeric values, so tables and switches port one to one.
+//!
+//! Both are `#[macro_export]` in `goport_util`. `ts_goport` files import
+//! them from `crate::flags_macros` (an inline module in its `lib.rs`).
 
+#[macro_export]
 macro_rules! go_flags {
     ($name:ident, $repr:ty { $($(#[$meta:meta])* $konst:ident = $value:expr;)* }) => {
         #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -87,6 +91,7 @@ macro_rules! go_flags {
     };
 }
 
+#[macro_export]
 macro_rules! go_enum {
     ($name:ident, $repr:ty { $($(#[$meta:meta])* $konst:ident = $value:expr;)* }) => {
         #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -98,5 +103,3 @@ macro_rules! go_enum {
         }
     };
 }
-
-pub(crate) use {go_enum, go_flags};
