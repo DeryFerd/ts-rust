@@ -468,7 +468,12 @@ impl Checker {
             {
                 has_non_uniform_value_declaration = true;
             }
-            declarations.extend(self.sym(prop).declarations.iter().copied());
+            for &declaration in self.sym(prop).declarations.iter() {
+                // Go: core.AppendIfUnique
+                if !declarations.contains(&declaration) {
+                    declarations.push(declaration);
+                }
+            }
             let t = self.get_type_of_symbol(prop);
             if first_type.is_nil() {
                 first_type = t;
