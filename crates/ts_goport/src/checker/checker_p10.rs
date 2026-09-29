@@ -37,7 +37,7 @@ impl Checker {
         if node.expression().kind() == SyntaxKind::SuperKeyword {
             let super_type = self.check_super_expression(node.expression());
             if self.is_type_any(super_type) {
-                for arg in node.arguments().to_vec() {
+                for arg in node.arguments() {
                     // Still visit arguments so they get marked for visibility, etc
                     self.check_expression(arg);
                 }
@@ -705,8 +705,7 @@ impl Checker {
                 || is_jsx_opening_or_self_closing_element
                 || node.expression().kind() != SyntaxKind::SuperKeyword
             {
-                let type_arguments = s.type_arguments.clone();
-                self.check_source_elements(&type_arguments);
+                self.check_source_elements(node.type_arguments());
             }
         }
         s.candidates = self.reorder_candidates(signatures, call_chain_flags);

@@ -161,12 +161,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1046 getTypeAtSwitchClause
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_switch_clause(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_node: &'static FlowNode,
     ) -> FlowType {
-        let flow_node = flow.get_flow();
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
         let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
@@ -456,11 +456,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1232 getTypeAtFlowBranchLabel
-    // PORT: Go `*ast.FlowList` is the antecedent slice in list order.
+    // PORT: Go `*ast.FlowList` is the antecedent slice in list order. Go's
+    // `flow` parameter is not read, so it is left out.
     pub fn get_type_at_flow_branch_label(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
         antecedents: &[FlowNodeId],
     ) -> FlowType {
         let antecedent_start = self.antecedent_types.len();
@@ -590,10 +590,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1304 getTypeAtFlowLoopLabel
+    // PERF: `flow_data` is `flow.get_flow()`, which the caller has read.
     pub fn get_type_at_flow_loop_label(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
+        flow_data: &'static FlowNode,
     ) -> FlowType {
         if f.borrow().ref_key.is_zero() {
             let ref_key = self.get_flow_reference_key(f);
@@ -647,8 +649,7 @@ impl Checker {
             t: TypeId::NIL,
             incomplete: false,
         };
-        let antecedents = flow.get_flow().antecedents.clone();
-        for antecedent in antecedents {
+        for &antecedent in &flow_data.antecedents {
             let flow_type;
             if first_antecedent_type.t.is_nil() {
                 // The first antecedent of a loop junction is always the non-looping control
@@ -728,14 +729,14 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1383 getTypeAtFlowArrayMutation
+    // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_array_mutation(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_node: &'static FlowNode,
     ) -> FlowType {
         let declared_type = f.borrow().declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
-            let flow_node = flow.get_flow();
             let node = flow_node.node;
             let expr = if is_call_expression(node) {
                 node.expression().expression()
@@ -753,7 +754,7 @@ impl Checker {
                 {
                     let mut evolved_type = flow_type.t;
                     if is_call_expression(node) {
-                        for arg in node.arguments().to_vec() {
+                        for arg in node.arguments() {
                             evolved_type = self.add_evolving_array_element_type(evolved_type, arg);
                         }
                     } else {
@@ -1037,9 +1038,50 @@ impl Checker {
         ));
     }
 
+    /// Go `c.getResolvedSymbol(source)`, from the memo when it holds
+    /// `source`.
+    fn memo_resolved_symbol(&mut self, source: Node) -> SymbolId {
+        let memo = &self.matching_reference_memo;
+        if memo.node == source && memo.resolved.is_some() {
+            return memo.resolved;
+        }
+        let resolved = self.get_resolved_symbol(source);
+        // The first resolution can check other code, which can put another
+        // identifier in the memo. Then the answer is not stored.
+        let memo = &mut self.matching_reference_memo;
+        if memo.node == source {
+            memo.resolved = resolved;
+        }
+        resolved
+    }
+
+    /// Go `c.getExportSymbolOfValueSymbolIfExported(c.getResolvedSymbol(source))`,
+    /// from the memo when it holds `source` and no merge came after it.
+    fn memo_export_symbol(&mut self, source: Node) -> SymbolId {
+        let memo = &self.matching_reference_memo;
+        if memo.node == source
+            && memo.export.is_some()
+            && memo.export_merge_version == self.merge_version
+        {
+            return memo.export;
+        }
+        let resolved = self.memo_resolved_symbol(source);
+        let export = self.get_export_symbol_of_value_symbol_if_exported(resolved);
+        let merge_version = self.merge_version;
+        let memo = &mut self.matching_reference_memo;
+        if memo.node == source {
+            memo.export = export;
+            memo.export_merge_version = merge_version;
+        }
+        export
+    }
+
     // Go: checker/flow.go:1576 isMatchingReference
+    // PERF: the kind of `target` is read once (`target_kind`). This runs
+    // about 2.2M times on effect, mostly with an identifier `source`.
     pub fn is_matching_reference(&mut self, source: Node, target: Node) -> bool {
-        match target.kind() {
+        let target_kind = target.kind();
+        match target_kind {
             SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression => {
                 return self.is_matching_reference(source, target.expression());
             }
@@ -1059,33 +1101,68 @@ impl Checker {
                     && source.name().text() == target.name().text();
             }
             SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
-                if is_this_in_type_query(source) {
-                    return target.kind() == SyntaxKind::ThisKeyword;
+                // PERF: every answer below is false for a target of another
+                // kind, and `is_this_in_type_query` only reads the tree, so
+                // such a target returns before it.
+                if !matches!(
+                    target_kind,
+                    SyntaxKind::ThisKeyword
+                        | SyntaxKind::Identifier
+                        | SyntaxKind::VariableDeclaration
+                        | SyntaxKind::BindingElement
+                ) {
+                    return false;
                 }
-                if is_identifier(target) {
-                    let source_symbol = self.get_resolved_symbol(source);
+                // PERF: the reads of `source` come from the memo (see
+                // `MatchingReferenceMemo`). Each one is made at the same
+                // point as in Go the first time.
+                if self.matching_reference_memo.node != source {
+                    self.matching_reference_memo = MatchingReferenceMemo {
+                        node: source,
+                        this_in_type_query: is_this_in_type_query(source),
+                        ..MatchingReferenceMemo::default()
+                    };
+                }
+                if self.matching_reference_memo.this_in_type_query {
+                    return target_kind == SyntaxKind::ThisKeyword;
+                }
+                if target_kind == SyntaxKind::Identifier {
+                    let source_symbol = self.memo_resolved_symbol(source);
                     if source_symbol == self.get_resolved_symbol(target) {
                         return true;
                     }
                 }
-                if is_variable_declaration(target) || is_binding_element(target) {
-                    let resolved = self.get_resolved_symbol(source);
-                    let export_symbol =
-                        self.get_export_symbol_of_value_symbol_if_exported(resolved);
+                if target_kind == SyntaxKind::VariableDeclaration
+                    || target_kind == SyntaxKind::BindingElement
+                {
+                    let export_symbol = self.memo_export_symbol(source);
                     return export_symbol == self.get_symbol_of_declaration(target);
                 }
                 return false;
             }
             SyntaxKind::ThisKeyword => {
-                return target.kind() == SyntaxKind::ThisKeyword;
+                return target_kind == SyntaxKind::ThisKeyword;
             }
             SyntaxKind::SuperKeyword => {
-                return target.kind() == SyntaxKind::SuperKeyword;
+                return target_kind == SyntaxKind::SuperKeyword;
             }
             SyntaxKind::NonNullExpression
             | SyntaxKind::ParenthesizedExpression
             | SyntaxKind::SatisfiesExpression => {
                 return self.is_matching_reference(source.expression(), target);
+            }
+            // PERF: for a property access `source` and a target that is not
+            // an access expression, every Go test below is false, and the
+            // Go `getAccessedPropertyName(source)` only reads the name. An
+            // element access `source` keeps the Go path: its name lookup can
+            // resolve symbols and types.
+            SyntaxKind::PropertyAccessExpression
+                if !matches!(
+                    target_kind,
+                    SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+                ) =>
+            {
+                return false;
             }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                 let (source_property_name, ok) = self.get_accessed_property_name(source);
@@ -1135,6 +1212,31 @@ impl Checker {
         }
         false
     }
+}
+
+/// PERF: not in Go. What `is_matching_reference` read about its last
+/// identifier `source`. Flow analysis compares one reference with each flow
+/// node on its path, so the same `source` comes again and again.
+///
+/// Each value is stable once read: `is_this_in_type_query` only reads the
+/// tree, and `get_resolved_symbol` stores its answer in the node links, which
+/// nothing overwrites later. The export symbol depends on the merged symbol
+/// table and on the flags a merge can add, so it is read again after any
+/// merge (`Checker::merge_version`). A nested `is_matching_reference` call
+/// (during the first resolution of `node`) can replace the memo, so a value
+/// is stored only while the memo still holds its node.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MatchingReferenceMemo {
+    /// The identifier; nil when the memo is empty.
+    pub node: Node,
+    /// Go `ast.IsThisInTypeQuery(node)`.
+    pub this_in_type_query: bool,
+    /// Go `c.getResolvedSymbol(node)`; nil until read.
+    pub resolved: SymbolId,
+    /// Go `c.getExportSymbolOfValueSymbolIfExported(resolved)`; nil until read.
+    pub export: SymbolId,
+    /// `Checker::merge_version` when `export` was read.
+    pub export_merge_version: u64,
 }
 
 // Go: checker/flow.go:1634 nonDottedNameCacheKey

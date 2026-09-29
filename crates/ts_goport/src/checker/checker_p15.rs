@@ -214,13 +214,13 @@ impl Checker {
         // Spreads may cause an early bail; ensure computed names are always checked (this is cached)
         // As otherwise they may not be checked until exports for the type at this position are retrieved,
         // which may never occur.
-        let properties = node.properties().to_vec();
-        for &elem in &properties {
+        let properties = node.properties();
+        for elem in properties {
             if elem.name().is_some() && is_computed_property_name(elem.name()) {
                 self.check_computed_property_name(elem.name());
             }
         }
-        for &member_decl in &properties {
+        for member_decl in properties {
             let mut member = self.get_symbol_of_declaration(member_decl);
             let mut computed_name_type = TypeId::NIL;
             if member_decl.name().is_some()
@@ -1315,8 +1315,7 @@ impl Checker {
                             })
                             && !func
                                 .parameters()
-                                .to_vec()
-                                .into_iter()
+                                .iter()
                                 .any(|p| self.is_some_symbol_assigned(p))
                         {
                             let narrowed_type = self.get_flow_type_of_reference_ex(

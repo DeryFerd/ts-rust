@@ -1086,7 +1086,7 @@ impl Checker {
                         type_arguments = vec![self.get_type_from_type_node(node.element_type())];
                     }
                     SyntaxKind::TupleType => {
-                        for e in node.elements().to_vec() {
+                        for e in node.elements() {
                             let et = self.get_type_from_type_node(e);
                             type_arguments.push(et);
                         }
@@ -1151,7 +1151,7 @@ impl Checker {
         type_parameters: &[TypeId],
     ) -> Vec<TypeId> {
         let mut type_arguments: Vec<TypeId> = Vec::new();
-        for a in node.type_arguments().to_vec() {
+        for a in node.type_arguments() {
             let at = self.get_type_from_type_node(a);
             type_arguments.push(at);
         }

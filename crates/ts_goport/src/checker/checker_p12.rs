@@ -565,8 +565,7 @@ impl Checker {
     // Go: checker/checker.go:10609 checkExpressionWithTypeArguments
     pub fn check_expression_with_type_arguments(&mut self, node: Node) -> TypeId {
         self.check_grammar_expression_with_type_arguments(node);
-        let type_arguments = node.type_arguments().to_vec();
-        self.check_source_elements(&type_arguments);
+        self.check_source_elements(node.type_arguments());
         if is_expression_with_type_arguments(node) {
             let parent = walk_up_parenthesized_expressions(node.parent());
             if is_binary_expression(parent)
