@@ -2976,9 +2976,9 @@ pub mod internal_language {
     /// It also trims scan.b to remove excess parts accordingly.
     /// PORT: Go keeps the extensions as slices of the scan buffer; they are
     /// copied here. Go `sort.Sort` compares only the first byte and is not
-    /// stable for more than 12 extensions; a stable sort is used. The order
-    /// only changes the tag text, never its language, script, region or
-    /// variants.
+    /// stable for more than 12 extensions. `sort_slice` is Go's pdqsort, so
+    /// equal extensions keep Go's order. The order only changes the tag text,
+    /// never its language, script, region or variants.
     fn parse_extensions(scan: &mut Scanner) -> Result<usize, GoPanic> {
         let start = scan.start;
         let mut exts: Vec<Vec<u8>> = Vec::new();
@@ -3029,8 +3029,8 @@ pub mod internal_language {
     /// PORT: Go keeps attributes, keys and the previous key as slices of the
     /// scan buffer; they are copied here. Nothing writes to those bytes
     /// before Go reads them. Go `sort.Sort` of the attributes compares only
-    /// the first 3 bytes and is not stable for more than 12 attributes; a
-    /// stable sort is used (only the tag text can differ).
+    /// the first 3 bytes and is not stable for more than 12 attributes.
+    /// `sort_slice` is Go's pdqsort, so equal attributes keep Go's order.
     fn parse_extension(scan: &mut Scanner) -> Result<usize, GoPanic> {
         let (start, mut end) = (scan.start, scan.end);
         match scan.token()[0] {

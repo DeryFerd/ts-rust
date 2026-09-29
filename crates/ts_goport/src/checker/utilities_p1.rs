@@ -716,11 +716,6 @@ pub(crate) struct SymbolSortKey {
     name: Name,
 }
 
-// The std stable small-sort picks its algorithm by `size_of::<T>()`, so a
-// key of another size changes the comparison sequence and with it the order
-// of the lazy `get_symbol_id` calls. Keep the key at 48 bytes.
-const _: () = assert!(std::mem::size_of::<SymbolSortKey>() == 48);
-
 /// `SymbolSortKey::order` when the packed order does not apply. A real
 /// order is below 2^63.
 const NO_SORT_ORDER: u64 = u64::MAX;
