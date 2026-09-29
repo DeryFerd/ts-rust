@@ -37,7 +37,9 @@
 //! (`program::Lineage`), and each program copy of the lineage lets go of
 //! them when its release frees its tables (M2c, `program::bound_symbols`).
 //! When the last holder lets go, the version is dead: its store and
-//! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
+//! `GoFile` are freed (M3g: in a language server, later, in the idle time
+//! of the dispatch loop, `free_dead_file_versions`), its id goes to
+//! `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
 //! is next written. A later read of the id panics with "file version N is
 //! released": ids are never reused, so a missed holder panics and never
@@ -58,6 +60,7 @@
 use super::store::VersionStore;
 use crate::prelude::*;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -146,7 +149,9 @@ impl FileVersion {
 
 impl Drop for FileVersion {
     // The store and `GoFile` (`published`) are freed after this, with the
-    // fields.
+    // fields, or, while a dispatch loop frees dead versions in its idle
+    // time (`defer_file_version_frees`), they and the caches wait in
+    // `DEAD_VERSIONS`. Nothing reads them after the count is 0.
     //
     // This runs after the strong count is 0, so a reader on another thread
     // can fail to upgrade the registry entry before the id is in
@@ -162,7 +167,123 @@ impl Drop for FileVersion {
         }
         // File ids are never reused, so the entry is this version's.
         lock(&VERSIONS).remove(&self.file);
+        if DEFERRERS.load(Ordering::Acquire) > 0
+            && let Some(store) = self.published.take()
+        {
+            let caches: Box<dyn Send> = Box::new((
+                self.name_table.take(),
+                self.position_map.take(),
+                self.declaration_map.take(),
+                self.identifiers.take(),
+            ));
+            lock(&DEAD_VERSIONS).push_back(DeadVersion {
+                caches: Some(caches),
+                store,
+            });
+        }
     }
+}
+
+/// The data of a dead file version that waits for
+/// `free_dead_file_versions` (lsshells M3g): its store and `GoFile`, and
+/// its caches (name table, position map, declaration map, identifiers).
+struct DeadVersion {
+    caches: Option<Box<dyn Send>>,
+    store: VersionStore,
+}
+
+impl DeadVersion {
+    /// Frees one part: the caches, then `FREE_STEP_NODES` owned nodes at a
+    /// time. True when only the rest of the store is left, which the drop
+    /// frees.
+    fn free_step(&mut self) -> bool {
+        if self.caches.take().is_some() {
+            return false;
+        }
+        self.store.free_owned_nodes(FREE_STEP_NODES)
+    }
+}
+
+/// The owned nodes that one step of `free_dead_file_versions` frees (about
+/// 20 us), so a message that arrives waits for one step at most.
+const FREE_STEP_NODES: usize = 2048;
+
+/// The most dead versions that wait while a message waits. More are freed
+/// at once, whole, so a stream of messages with no gap between them keeps
+/// at most this many (like `gostd::local::GARBAGE_LIMIT` for programs).
+const DEAD_VERSION_LIMIT: usize = 4;
+
+/// The number of live `defer_file_version_frees` guards.
+static DEFERRERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The dead versions that `free_dead_file_versions` has not freed yet,
+/// oldest first.
+static DEAD_VERSIONS: Mutex<VecDeque<DeadVersion>> = Mutex::new(VecDeque::new());
+
+/// The guard of `defer_file_version_frees`.
+pub struct DeferFileVersionFrees(());
+
+/// Makes each file version that dies leave its store, `GoFile` and caches
+/// to `free_dead_file_versions`, while the guard lives. The language server
+/// dispatch loop takes it before its first message. When the last guard
+/// drops, the dead versions are freed.
+// PORT: Go's garbage collector frees a dead `*ast.SourceFile` in the
+// background. Here the last holder of a version is usually a released
+// program that `gostd::local::drop_garbage` drops after an answer; freeing
+// its nodes there (0.06 ms on query-core, 0.2 ms on effect, owned nodes
+// on) delays a message that arrives meanwhile.
+#[must_use]
+pub fn defer_file_version_frees() -> DeferFileVersionFrees {
+    DEFERRERS.fetch_add(1, Ordering::AcqRel);
+    DeferFileVersionFrees(())
+}
+
+impl Drop for DeferFileVersionFrees {
+    fn drop(&mut self) {
+        if DEFERRERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            free_dead_file_versions(|| false);
+        }
+    }
+}
+
+/// Frees the dead file versions of `defer_file_version_frees`, oldest
+/// first, a step at a time, until none is left or `busy()` is true (a
+/// message waits). A version that `busy` interrupts keeps its place. While
+/// more than `DEAD_VERSION_LIMIT` versions wait, it frees them even when
+/// busy. The dispatch loop calls it after `gostd::local::drop_garbage`.
+pub fn free_dead_file_versions(busy: impl Fn() -> bool) {
+    loop {
+        let over = {
+            let dead = lock(&DEAD_VERSIONS);
+            if dead.is_empty() {
+                return;
+            }
+            dead.len() > DEAD_VERSION_LIMIT
+        };
+        if !over && busy() {
+            return;
+        }
+        let Some(mut dead) = lock(&DEAD_VERSIONS).pop_front() else {
+            return;
+        };
+        if !over {
+            while !dead.free_step() {
+                if busy() {
+                    lock(&DEAD_VERSIONS).push_front(dead);
+                    return;
+                }
+            }
+        }
+        // Dropped after the lock ends.
+        drop(dead);
+    }
+}
+
+/// The number of dead file versions that wait for
+/// `free_dead_file_versions`.
+#[must_use]
+pub fn dead_versions_waiting() -> usize {
+    lock(&DEAD_VERSIONS).len()
 }
 
 /// The live file versions by file id. A `Weak`, so the registry does not

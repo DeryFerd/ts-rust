@@ -13,9 +13,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 
 use ts_goport::ast::{
-    dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
-    owned_node_count, source_file_ecma_line_map, source_file_get_declaration_map,
-    source_file_get_name_table, source_file_imports, source_file_info,
+    dead_file_versions, dead_versions_waiting, defer_file_version_frees, file_version_probe,
+    file_versions_made, free_dead_file_versions, free_file_versions, owned_node_count,
+    source_file_ecma_line_map, source_file_get_declaration_map, source_file_get_name_table,
+    source_file_imports, source_file_info,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -147,6 +148,42 @@ child_test! {
         assert!(owned_node_count() > one_version, "the added import has nodes");
         assert_eq!(edited.statements().len(), 3);
         assert_eq!(sem_diag_count(&p5, INDEX_FILE), 0);
+    }
+}
+
+child_test! {
+    env OWNED_NODES;
+    // While a dispatch loop frees dead versions in its idle time
+    // (`defer_file_version_frees`, lsshells M3g), the nodes of a dead
+    // version wait for `free_dead_file_versions`, which frees nothing while
+    // a message waits (`busy`) unless more than 4 versions wait. The last
+    // guard frees what is left.
+    fn dead_version_nodes_wait_for_the_idle_free() {
+        let session = open_p1();
+        body_edit(&session, 2, "2");
+        let one_version = owned_node_count();
+        assert!(one_version > 0, "the edited version owns its nodes");
+        let defer = defer_file_version_frees();
+
+        body_edit(&session, 3, "3");
+        assert_eq!(dead_file_versions(), 1);
+        assert_eq!((dead_versions_waiting(), owned_node_count()), (1, 2 * one_version));
+        free_dead_file_versions(|| true);
+        assert_eq!(dead_versions_waiting(), 1, "a busy loop frees a dead version");
+        free_dead_file_versions(|| false);
+        assert_eq!((dead_versions_waiting(), owned_node_count()), (0, one_version));
+
+        for (version, digit) in [(4, "4"), (5, "5"), (6, "6"), (7, "7"), (8, "8")] {
+            body_edit(&session, version, digit);
+        }
+        assert_eq!(dead_versions_waiting(), 5);
+        free_dead_file_versions(|| true);
+        assert_eq!(dead_versions_waiting(), 4, "a busy loop keeps more than 4");
+        assert_eq!(owned_node_count(), 5 * one_version);
+
+        drop(defer);
+        assert_eq!((dead_versions_waiting(), owned_node_count()), (0, one_version));
+        assert_eq!(sem_diag_count(&program(&session, INDEX_URI), INDEX_FILE), 0);
     }
 }
 

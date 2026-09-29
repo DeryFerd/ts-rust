@@ -71,7 +71,9 @@
 //! Large frees (`gostd::local::drop_later`: a released program, the parse
 //! tasks of a load) wait until the message is done, and then run only
 //! while no message waits. Go's garbage collector does them in the
-//! background.
+//! background. The nodes of a dead file version
+//! (`ast::free_dead_file_versions`) are freed after them, a step at a
+//! time, so a message that arrives waits for one step at most.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -1896,12 +1898,17 @@ impl Server {
         // `IDLE_QUIET_PERIOD`).
         let mut free_since = Instant::now();
         gostd::local::keep_garbage();
+        let _dead_versions = crate::ast::defer_file_version_frees();
         let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
+        let collect = || {
+            gostd::local::drop_garbage(busy);
+            crate::ast::free_dead_file_versions(busy);
+        };
         loop {
             // PORT: the frees that the last message or wake-up left
-            // (`gostd::local::drop_later`) run after its answer, while no
-            // message waits.
-            gostd::local::drop_garbage(busy);
+            // (`gostd::local::drop_later`, then the dead file versions)
+            // run after its answer, while no message waits.
+            collect();
             // PORT: idle work (the auto-import warm) runs only after a
             // quiet period with no message, so it does not delay a request
             // that has arrived or that comes right after an answer. Work it
@@ -1913,7 +1920,7 @@ impl Server {
                 && gostd::local::run_idle()
             {
                 gostd::local::run_pending();
-                gostd::local::drop_garbage(busy);
+                collect();
             }
 
             let item = self.shared.request_queue.get(&ctx)?;
