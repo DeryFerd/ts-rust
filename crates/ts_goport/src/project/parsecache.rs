@@ -218,6 +218,12 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             TEXT_HASHES.with_borrow_mut(|hashes| {
                 hashes.insert(text_id(file.text), hash);
             });
+            // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
+            // binder binds each program version into one arena on the
+            // dispatch thread (`program::bind_all`), not a parse on its own,
+            // so the Go race (two programs binding one shared file at once)
+            // does not exist here. Binding is idempotent in Go, so binding at
+            // program load gives the same result.
             HashedSourceFile { file, hash }
         },
     )

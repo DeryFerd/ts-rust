@@ -129,6 +129,12 @@ fn test_content_mapped_parse_cache_key_reconstruction() {
     );
 }
 
+// Go: refcountcache_test.go:72 TestParseCacheBindsBeforePublishing (ts#63952)
+// PORT: not ported. Go binds a parse in the parse cache so programs that share
+// it do not race to bind it. The Rust binder binds each program version into
+// one arena on the dispatch thread (`program::bind_all`); a parse on its own
+// has no bound state (`IsBound`) or `CommonJSModuleIndicator` to check.
+
 // Go: refcountcache_test.go:23 setup
 fn setup(files: FileMap) -> Rc<Session> {
     bare_session(files)

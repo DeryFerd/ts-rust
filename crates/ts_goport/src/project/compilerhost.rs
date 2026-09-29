@@ -263,6 +263,10 @@ impl compiler::CompilerHost for CompilerHost {
                     mapper,
                     &*project,
                 )?;
+                // Go: binder.BindSourceFile on the canonical file and on each
+                // supplemental file (ts#63952). PORT: not ported; the Rust
+                // binder binds each program version in one arena
+                // (`program::bind_all`), see `new_parse_cache`.
                 if let Some(canonical) = &files.canonical {
                     set_source_file_hash(canonical, key.hash);
                 }
