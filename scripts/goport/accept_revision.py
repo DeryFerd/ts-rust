@@ -6,13 +6,22 @@ Run after `candidate.sh side` finished (SIDE DONE) and both independent agents r
 verdict request. It reads the side evidence in --evidence (the cache dir that `candidate.sh
 verdict-request` prints): tests.json, gate.json, gate-compare.json, bound.json, lsp.json, api.json
 and quality.json. The LSP and API records must compare with the base results of protectedBase and
-show no lost, unrun or absent request. Every failed gate run of the source that side kept
-(gate-compare-fail-<label>.json) needs a flake note for each regressed item (failed_gate_runs), or
+show no lost, unrun or absent request. With batch.oracleRebase (a pin-bump batch only, reviewer ruling
+10) the base is its runs of each kind instead: the compares must name them (with their resultsSha256,
+binsSha256 as their only tsgo, the tsgo of the base gate manifest, and oracleSha256 as their only oracle,
+upstreamPin.oracleSha256), and show no parity problem (oracle-compare.py --parity with the API
+knownDiffs). The compares must use the answer sets of the base (protectedBase.oracleAnswers) and of the
+batch (batch.oracleAnswers) of their kind. The batch keeps in oracleAnswers the base's answer sets at the
+batch pin and its own; only a pin-bump batch can add answer sets, at the batch pin. Every failed gate
+run of the source that side kept (gate-compare-fail-<label>.json) needs a flake note for each regressed
+item (failed_gate_runs), or
 the acceptance is refused. The batch keeps every gate run of the source in gateRuns (the failed runs
 with their regressions and flake notes, then the batch gate), and the check requires the same flake
 notes, so a failed run stays in the state after the acceptance. The history row and both verdicts
-carry goportTestsSha256, gateSha256, nameMapSha256 (null without a name map) and gateIdMapSha256 (the
-sha256 of batch.gateIdMap, null without a gate id map). It sets the state to ready/PASS, runs the local
+carry goportTestsSha256, gateSha256, nameMapSha256 (null without a name map), gateIdMapSha256 (the
+sha256 of batch.gateIdMap, null without a gate id map), oracleRebaseSha256 (the sha256 of the canonical
+JSON of batch.oracleRebase, null without it) and oracleAnswersSha256 (the sorted sha256 values of
+batch.oracleAnswers). It sets the state to ready/PASS, runs the local
 check, and records the acceptance only when the check passes.
 
 Usage:
@@ -67,6 +76,75 @@ def failed_gate_runs(state, rev, cache, used=None):
     return runs
 
 
+def same_pin(a, b):
+    """Two abbreviated or full Go pins name the same commit."""
+    a, b = (a or '').lower(), (b or '').lower()
+    return bool(re.fullmatch(r'[0-9a-f]{7,64}', a) and re.fullmatch(r'[0-9a-f]{7,64}', b)) and (a.startswith(b) or b.startswith(a))
+
+
+def canonical_sha(value):
+    """sha256 of the canonical JSON of a value (keys sorted, no spaces), as the check computes oracleRebaseSha256."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+
+
+def oracle_problems(b, base, base_pin, outputs, records):
+    """The oracle rebase and answer set problems of the batch (the check refuses the same), and batch.oracleAnswers:
+    the base's answer sets at the batch pin and the batch's own, each once."""
+    problems, pin = [], (b.get('upstreamPin') or {}).get('to')
+    bump = not same_pin(base_pin, pin)
+    key = lambda ref: (ref['kind'], ref['sha256'])
+    base_sets, own = base.get('oracleAnswers') or [], b.get('oracleAnswers') or []
+    for where, refs in (('protectedBase.oracleAnswers', base_sets), ('batch.oracleAnswers', own)):
+        for ref in refs:
+            path = ref['path'] if os.path.isabs(ref['path']) else os.path.join(ROOT, ref['path'])
+            if not os.path.isfile(path) or sha(path) != ref['sha256']:
+                problems.append(f"{where} {path} does not have the sha256 {ref['sha256']}")
+    in_base = {key(r) for r in base_sets}
+    for ref in own:
+        if not same_pin(ref['pin'], pin):
+            problems.append(f"batch.oracleAnswers {ref['path']} is at the Go pin {ref['pin']}, not the batch pin {pin}")
+        if key(ref) not in in_base and not bump:
+            problems.append(f"batch.oracleAnswers {ref['path']} is not an answer set of the base: only a pin-bump batch can add one")
+    kept = {}
+    for ref in [r for r in base_sets if same_pin(r['pin'], pin)] + own:
+        kept.setdefault(key(ref), {k: (rel(ref[k]) if k == 'path' else ref[k]) for k in ('kind', 'path', 'sha256', 'pin')})
+    compare_sets = {key(r) for r in base_sets} | {key(r) for r in own}
+    rebase = b.get('oracleRebase')
+    if rebase and not bump:
+        problems.append(f'batch.oracleRebase is only for a pin-bump batch; the base batch is at the batch pin {pin}')
+    gate = json.load(open(os.path.join(ROOT, base['gate']['path']))) if rebase else {}
+    tsgo = ((gate.get('binaries') or {}).get('tsgo') or {}).get('sha256')
+    for kind in ('lsp', 'api'):
+        out, x = outputs[kind], records[kind]
+        want = [r['dir'] for r in rebase[kind]['runs']] if rebase else [(base.get(kind) or {}).get('dir')]
+        heads = out.get('bases') or [out['base']]
+        if [os.path.realpath(h['dir']) for h in heads] != [os.path.realpath(d or '') for d in want]:
+            problems.append(f"{kind} compare {x['compareOutput']} has the base runs {[h['dir'] for h in heads]}, not {want}")
+        if sorted(r['sha256'] for r in out.get('answers') or []) != sorted(s for k, s in compare_sets if k == kind):
+            problems.append(f"{kind} compare {x['compareOutput']} did not use the answer sets of the base and the batch")
+        if not rebase:
+            continue
+        e = rebase[kind]
+        if e.get('binsSha256') != tsgo:
+            problems.append(f"batch.oracleRebase.{kind}.binsSha256 is not the tsgo {tsgo} of the base gate manifest")
+        if e.get('oracleSha256') != (b.get('upstreamPin') or {}).get('oracleSha256'):
+            problems.append(f"batch.oracleRebase.{kind}.oracleSha256 is not upstreamPin.oracleSha256")
+        for run, h in zip(e['runs'], heads):
+            got = (h.get('resultsSha256'), h.get('goportSha256'), h.get('oracleSha256'))
+            if got != (run.get('resultsSha256'), [e.get('binsSha256')], [e.get('oracleSha256')]):
+                problems.append(f"{kind} rebase run {run['dir']}: resultsSha256, tsgo or oracle differ from batch.oracleRebase ({x['compareOutput']})")
+        if out['new'].get('oracleSha256') != [e.get('oracleSha256')]:
+            problems.append(f"{kind} new run {out['new']['dir']} is not at the batch pin's oracle only")
+        known = [d['key'] for d in e.get('knownDiffs') or []]
+        if kind == 'lsp' and known:
+            problems.append('batch.oracleRebase.lsp.knownDiffs must be empty: the LSP has no known diffs')
+        parity = out.get('parity')
+        if not parity or parity['knownDiffs'] != len(known) or parity['bad']:
+            problems.append(f"{kind} compare {x['compareOutput']}: no parity with the {len(known)} known diffs, or {(parity or {}).get('bad')} "
+                            f"parity problems (ruling 10 condition 3)")
+    return problems, sorted(kept.values(), key=lambda r: (r['kind'], r['path'], r['sha256']))
+
+
 def export():
     return json.loads(subprocess.check_output(['node', 'scripts/state.mjs', 'export']))
 
@@ -112,11 +190,18 @@ def main():
         problems.append(f"gate-compare base {gc['base']['manifest']} is not the protected base {base['gate']['path']}")
     if any(tests['compare'][k] for k in ('lost', 'absent', 'unrun')) or gc['counts']['regressions']:
         problems.append('tests.json or gate-compare.json reports a loss or a regression')
+    rebase = b.get('oracleRebase')
     for name, x, ref in (('lsp', lsp, base.get('lsp')), ('api', api, base.get('api'))):
-        if not ref or os.path.realpath(x['base']['dir']) != os.path.realpath(ref['dir']):
-            problems.append(f"{name}.json base {x['base']['dir']} is not the protected base {(ref or {}).get('dir')}")
+        first = rebase[name]['runs'][0] if rebase else ref
+        if not first or os.path.realpath(x['base']['dir']) != os.path.realpath(first['dir']):
+            problems.append(f"{name}.json base {x['base']['dir']} is not the {'first oracleRebase run' if rebase else 'protected base'} {(first or {}).get('dir')}")
         if any(x['compare'][k] for k in ('lost', 'absent', 'unrun')):
             problems.append(f'{name}.json reports lost, unrun or absent requests')
+    # The oracle rebase runs and the answer sets (reviewer ruling 10): the check refuses the same.
+    base_pin = json.load(open(os.path.join(ROOT, b['previousBatch']['archive']['path']))).get('upstreamPin', {}).get('to')
+    outputs = {k: json.load(open(x['compareOutput'])) for k, x in (('lsp', lsp), ('api', api))}
+    more, oracle_answers = oracle_problems(b, base, base_pin, outputs, {'lsp': lsp, 'api': api})
+    problems += more
     # gate-compare.json must be the compare with the batch's gate id map (the check requires it too).
     id_map = (b.get('gateIdMap') or {}).get('sha256')
     if (gc.get('idMap') or {}).get('sha256') != id_map:
@@ -166,8 +251,11 @@ def main():
                         'result': f"{x['requests']:,} requests: {x['same']:,} same, {x['diff']} diff, {x['crash']} crash, "
                                   f"{x['timeout']} timeout, {x['goportError']} goport_error",
                         'base': {'label': x['base']['label'], 'dir': rel(x['base']['dir'])}, 'compare': x['compare'],
+                        **({'bases': [{'label': r['label'], 'dir': rel(r['dir'])} for r in x['bases']]} if rebase else {}),
                         'output': {'path': rel(x['compareOutput']), 'sha256': sha(x['compareOutput'])}}
     b['languageServerOracle'], b['apiOracle'] = oracle(lsp), oracle(api)
+    # The answer sets that keep the flake requests of a pin bump protected at this pin (the check requires this list).
+    b['oracleAnswers'] = oracle_answers
     b['quality'] = {'record': rel(f'{C}/quality.json'),
                     'result': f"rustfmt {quality['rustfmtExit']}, clippy {quality['clippyExit']}, {quality['tsGoportWarnings']} "
                               f"ts_goport warnings, {quality.get('keptCrateWarnings', 0)} kept crate warnings, "
@@ -175,9 +263,11 @@ def main():
     b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': rel(C)}
     if a.extra:
         b.update(json.load(open(a.extra)))
-    # The four evidence hashes that the check binds in the history row and both verdicts.
+    # The evidence hashes that the check binds in the history row and both verdicts.
     hashes = {'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'],
-              'nameMapSha256': (tests.get('nameMap') or {}).get('sha256'), 'gateIdMapSha256': id_map}
+              'nameMapSha256': (tests.get('nameMap') or {}).get('sha256'), 'gateIdMapSha256': id_map,
+              'oracleRebaseSha256': canonical_sha(b['oracleRebase']) if b.get('oracleRebase') else None,
+              'oracleAnswersSha256': sorted(r['sha256'] for r in b['oracleAnswers'])}
     verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'], 'sourceFingerprint': fp,
                                    **hashes, 'utc': now}
     b['auditor'] = verdict('audit_accepted_roster', AUDITOR)

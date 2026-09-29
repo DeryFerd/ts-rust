@@ -6,7 +6,8 @@ adds it to batchRecords and opens the new batch with protectedSet "goport": gopo
 the gate items are the protected set (docs/typechecker-accountability.md, "Protected set"). That needs
 Theo's standing rule goport-protected-set (batchId "*") in acceptanceRuleChanges. Nothing is extended
 per batch. The new batch records protectedBase: the accepted batch whose goport test results and gate
-manifest (and LSP and API oracle results) the candidate is compared with (see protected_base).
+manifest (and LSP and API oracle results, with its oracle answer sets) the candidate is compared with
+(see protected_base).
 Without --new-batch it adds the revision to the current goport batch (refused when that batch is
 already accepted).
 
@@ -105,9 +106,10 @@ def oracle_base(record):
 
 def protected_base(state):
     """The base of the next candidate: the last accepted batch, with {path, sha256} of its goport test
-    results (the rule's baseline when that batch used the legacy roster) and of its gate manifest, and
+    results (the rule's baseline when that batch used the legacy roster) and of its gate manifest,
     {label, dir} of its LSP and API oracle results (the rule's apiBaseline for a legacy batch, which
-    had no API run). An open goport batch keeps the base that open recorded."""
+    had no API run), and its oracleAnswers (the answer sets that keep the flake requests of a pin bump
+    protected; oracle-compare.py --answers). An open goport batch keeps the base that open recorded."""
     b = state['batch']
     if b.get('compilerAccepted') is not True:
         if not b.get('protectedBase'):
@@ -119,7 +121,8 @@ def protected_base(state):
     return {'batch': b['id'], 'revision': b['recoveryRevision'], 'tests': tests,
             'gate': {'path': b['gate']['manifest'], 'sha256': b['gate']['sha256']},
             'lsp': oracle_base(b.get('languageServerOracle')),
-            'api': oracle_base(b.get('apiOracle') if goport else goport_rule(state).get('apiBaseline'))}
+            'api': oracle_base(b.get('apiOracle') if goport else goport_rule(state).get('apiBaseline')),
+            'oracleAnswers': b.get('oracleAnswers') or []}
 
 
 def unformatted(checkout, base):
