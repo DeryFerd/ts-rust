@@ -326,6 +326,13 @@ impl Checker {
         self.is_tuple_type(t)
     }
 
+    // Go: checker/exports.go:228 IsTupleTypeTarget
+    // PORT: a Go package function; a `Checker` method here because it reads
+    // the type arena.
+    pub fn is_tuple_type_target(&self, t: TypeId) -> bool {
+        self.is_tuple_type(t) && self.ty(t).target() == t
+    }
+
     // Go: checker/exports.go:196 IsArrayType
     pub fn is_array_type_exported(&self, t: TypeId) -> bool {
         self.is_array_type(t)
