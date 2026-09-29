@@ -29,7 +29,9 @@ use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,12 +65,13 @@ pub struct ProfileSession {
 // PORT: Go `panic(err)` panics with the Go error text.
 #[must_use]
 pub fn begin_profiling(profile_dir: &str, log_writer: Writer) -> ProfileSession {
-    // Go: os.MkdirAll(profileDir, 0o755)
-    if let Err(err) = DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(os_path(profile_dir))
-    {
+    // Go: os.MkdirAll(profileDir, 0o755). Off unix the mode does not
+    // apply, as in Go.
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o755);
+    if let Err(err) = builder.create(os_path(profile_dir)) {
         panic!("mkdir {profile_dir}: {err}");
     }
 
@@ -346,7 +349,11 @@ fn mkdir_all(path: &str, perm: u32) -> Result<(), GoError> {
     }
 
     // Parent now exists; invoke Mkdir and use its result.
-    if let Err(err) = DirBuilder::new().mode(perm).create(os_path(path)) {
+    // PORT: off unix `perm` does not apply, as in Go.
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(perm);
+    if let Err(err) = builder.create(os_path(path)) {
         // Handle arguments like "foo/." by
         // double-checking that directory doesn't exist.
         if std::fs::symlink_metadata(os_path(path)).is_ok_and(|dir| dir.is_dir()) {
@@ -837,7 +844,12 @@ fn unix_milli(t: SystemTime) -> i64 {
 // that error.
 fn elf_build_id(file: &[u8]) -> Option<String> {
     let mut buf = [0u8; 256];
+    #[cfg(unix)]
     let f = File::open(OsStr::from_bytes(file)).ok()?;
+    // PORT: off unix a path must be UTF-8. No caller gets here: there is no
+    // /proc/self/maps.
+    #[cfg(not(unix))]
+    let f = File::open(std::str::from_utf8(file).ok()?).ok()?;
 
     read_at(&f, &mut buf[..64], 0)?;
 
@@ -936,8 +948,18 @@ fn elf_build_id(file: &[u8]) -> Option<String> {
 
 // Go: (*os.File).ReadAt, which fails on a negative offset and on a short
 // read.
+#[cfg(unix)]
 fn read_at(f: &File, buf: &mut [u8], off: i64) -> Option<()> {
     f.read_exact_at(buf, u64::try_from(off).ok()?).ok()
+}
+
+// PORT: off unix, a seek and a read (the only caller reads one file on one
+// thread).
+#[cfg(not(unix))]
+fn read_at(mut f: &File, buf: &mut [u8], off: i64) -> Option<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(u64::try_from(off).ok()?)).ok()?;
+    f.read_exact(buf).ok()
 }
 
 // Go: runtime/pprof/protobuf.go:8 protobuf

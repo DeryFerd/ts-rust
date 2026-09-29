@@ -1,6 +1,8 @@
 //! Go package `internal/fswatch`. Linux and unix files are reached by
 //! explicit path (`fswatch::unix`, `fswatch::walkdir_unix::walk_dir`,
 //! `fswatch::{inotify_linux, fanotify_linux}::init`); they are not globbed.
+//! In the port they are Linux only: Go also builds walkdir_unix.go on darwin
+//! and the BSDs, for the kqueue and FSEvents backends, which are not ported.
 
 pub mod canonicalize_other;
 pub mod debounce;
@@ -9,10 +11,11 @@ pub mod event;
 pub mod fanotify_linux;
 #[cfg(target_os = "linux")]
 pub mod inotify_linux;
-#[cfg(unix)]
+pub mod syscall;
+#[cfg(target_os = "linux")]
 pub mod unix;
 pub mod walkdir;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod walkdir_unix;
 pub mod watcher;
 

@@ -419,8 +419,10 @@ pub(crate) fn create_external_helpers_import_declaration_if_needed(
                 }
             }
             if !helper_names.is_empty() {
+                // Go: transformers/moduletransforms/externalmoduleinfo.go:290
+                // slices.SortFunc(helperNames, stringutil.CompareStringsCaseSensitive)
                 // PORT: Go `stringutil.CompareStringsCaseSensitive` is an ordinal compare.
-                helper_names.sort_unstable();
+                crate::gostd::slices::sort_func(&mut helper_names, |a, b| a.cmp(b) as i32);
                 // Alias the imports if the names are used somewhere in the file.
                 // NOTE: We don't need to care about global import collisions as this is a module.
 

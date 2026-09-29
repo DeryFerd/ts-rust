@@ -1531,10 +1531,9 @@ fn new_collator(t: Rc<dyn Weighter>) -> Collator {
 
 impl Options {
     // Go: collate/option.go:86 (*options).setOptions
-    // PORT: Go's `sort.Sort` is an insertion sort (stable) for up to 12
-    // options; `sort_by_key` is stable.
     fn set_options(&mut self, mut opts: Vec<CollateOption>) {
-        opts.sort_by_key(|o| o.priority);
+        // Go: collate/option.go:87 sort.Sort(prioritizedOptions(opts))
+        crate::gostd::slices::sort_slice(&mut opts, |a, b| a.priority < b.priority);
         for x in &opts {
             (x.f)(self);
         }

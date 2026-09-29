@@ -1820,9 +1820,11 @@ pub mod internal_language {
             let mut t = self.tag.clone();
 
             if !self.extensions.is_empty() || !self.variants.is_empty() {
-                // Go: sort.Sort(sortVariants(b.variants)) (an insertion sort
-                // for 12 or fewer elements, so stable).
-                self.variants.sort_by_key(|v| variant_index(v));
+                // Go: internal/language/compose.go:27 sort.Sort(sortVariants(b.variants))
+                crate::gostd::slices::sort_slice(&mut self.variants, |a, b| {
+                    variant_index(a) < variant_index(b)
+                });
+                // Go: internal/language/compose.go:28 sort.Strings(b.extensions)
                 self.extensions.sort();
 
                 if !self.private.is_empty() {
@@ -2936,10 +2938,10 @@ pub mod internal_language {
             scan.scan();
         }
         if need_sort {
-            // PORT: Go `sort.Sort(variantsSort{varID, variant})`. Variant ids are
-            // unique per variant string, so a stable sort gives the same order.
+            // Go: internal/language/parse.go:387 sort.Sort(variantsSort{varID, variant})
+            // PORT: the two Go slices are one slice of pairs here.
             let mut pairs: Vec<(u8, Vec<u8>)> = var_id.into_iter().zip(variant).collect();
-            pairs.sort_by_key(|p| p.0);
+            crate::gostd::slices::sort_slice(&mut pairs, |a, b| a.0 < b.0);
             let mut k = 0;
             let mut l: i32 = -1;
             for i in 0..pairs.len() {
@@ -2974,9 +2976,9 @@ pub mod internal_language {
     /// It also trims scan.b to remove excess parts accordingly.
     /// PORT: Go keeps the extensions as slices of the scan buffer; they are
     /// copied here. Go `sort.Sort` compares only the first byte and is not
-    /// stable for more than 12 extensions; a stable sort is used. The order
-    /// only changes the tag text, never its language, script, region or
-    /// variants.
+    /// stable for more than 12 extensions. `sort_slice` is Go's pdqsort, so
+    /// equal extensions keep Go's order. The order only changes the tag text,
+    /// never its language, script, region or variants.
     fn parse_extensions(scan: &mut Scanner) -> Result<usize, GoPanic> {
         let start = scan.start;
         let mut exts: Vec<Vec<u8>> = Vec::new();
@@ -3003,7 +3005,8 @@ pub mod internal_language {
             }
             exts.push(extension);
         }
-        exts.sort_by(|a, b| a[..1].cmp(&b[..1]));
+        // Go: internal/language/parse.go:478 sort.Sort(bytesSort{exts, 1})
+        crate::gostd::slices::sort_slice(&mut exts, |a, b| a[..1] < b[..1]);
         if !private.is_empty() {
             exts.push(private);
         }
@@ -3026,8 +3029,8 @@ pub mod internal_language {
     /// PORT: Go keeps attributes, keys and the previous key as slices of the
     /// scan buffer; they are copied here. Nothing writes to those bytes
     /// before Go reads them. Go `sort.Sort` of the attributes compares only
-    /// the first 3 bytes and is not stable for more than 12 attributes; a
-    /// stable sort is used (only the tag text can differ).
+    /// the first 3 bytes and is not stable for more than 12 attributes.
+    /// `sort_slice` is Go's pdqsort, so equal attributes keep Go's order.
     fn parse_extension(scan: &mut Scanner) -> Result<usize, GoPanic> {
         let (start, mut end) = (scan.start, scan.end);
         match scan.token()[0] {
@@ -3048,7 +3051,8 @@ pub mod internal_language {
                             end = scan.end;
                             scan.scan();
                         }
-                        attrs.sort_by(|a, b| a[..3].cmp(&b[..3]));
+                        // Go: internal/language/parse.go:510 sort.Sort(bytesSort{attrs, 3})
+                        crate::gostd::slices::sort_slice(&mut attrs, |a, b| a[..3] < b[..3]);
                         let joined = attrs.join(&b'-');
                         copy_into(scan, p, &joined)?;
                         break;
@@ -3092,8 +3096,10 @@ pub mod internal_language {
                             }
                             keys.push(scan.buf[key_start..end].to_vec());
                         }
-                        // Go `sort.Stable(bytesSort{keys, 2})`.
-                        keys.sort_by(|a, b| a[..2].cmp(&b[..2]));
+                        // Go: internal/language/parse.go:541 sort.Stable(bytesSort{keys, 2})
+                        crate::gostd::slices::sort_stable_func(&mut keys, |a, b| {
+                            a[..2].cmp(&b[..2]) as i32
+                        });
                         let n = keys.len();
                         if n > 0 {
                             let mut k = 0;

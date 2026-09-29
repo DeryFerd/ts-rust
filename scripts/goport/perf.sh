@@ -10,6 +10,9 @@
 # Output: target/continuation-r97-goport/perf/<label>/ (per-run .time files, load.txt).
 set -uo pipefail
 cd /home/theo/Code/sandbox/ts-rust
+# tsgo on 4 KiB pages hands the work to a worker (R137), so wait4 RSS and CPU would show only the
+# launcher. Measure the process that does the work.
+export GOPORT_LAUNCH=0
 if [[ $# -eq 2 && -x $1 && ! -x $2 ]]; then set -- "$2" "$1"; fi
 [[ $# -ge 2 ]] || { sed -n '2,10p' "$0"; exit 2; }
 L=$1; shift; BINS=("$@")

@@ -267,13 +267,19 @@ impl System for OsSystem {
     // stdout, and gives width 0 on error (golang.org/x/term v0.44.0
     // term_unix.go:59 getSize).
     // PORT: `rustix::termios::tcgetwinsize` makes the same ioctl, so this
-    // crate needs no unsafe code. This is the Unix path; the port targets
-    // Linux.
+    // crate needs no unsafe code. Off unix (Go: the Windows console call in
+    // term_windows.go) the port has no size call and gives 0, as Go does on
+    // an error.
+    #[cfg(unix)]
     fn get_width_of_terminal(&self) -> i32 {
         match rustix::termios::tcgetwinsize(std::io::stdout()) {
             Ok(ws) => i32::from(ws.ws_col),
             Err(_) => 0,
         }
+    }
+    #[cfg(not(unix))]
+    fn get_width_of_terminal(&self) -> i32 {
+        0
     }
     // Go: cmd/tsgo/sys.go:58 GetEnvironmentVariable
     fn get_environment_variable(&self, name: &str) -> String {

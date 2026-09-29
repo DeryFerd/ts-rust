@@ -1740,19 +1740,18 @@ impl<P: ProgramView> LanguageService<P> {
                 let reference = Rc::clone(&result[ref_index]);
                 let mut sorted_refs = reference.borrow().references.clone();
                 sorted_refs.extend(entry.borrow().references.iter().cloned());
-                // Go: slices.SortStableFunc (all stable sorts agree)
-                sorted_refs.sort_by(|entry1, entry2| {
+                // Go: ls/findallreferences.go:1074 slices.SortStableFunc(sortedRefs, ...)
+                crate::gostd::slices::sort_stable_func(&mut sorted_refs, |entry1, entry2| {
                     let entry1_file = get_source_file_index_of_entry(program, entry1);
                     let entry2_file = get_source_file_index_of_entry(program, entry2);
                     if entry1_file != entry2_file {
-                        return entry1_file.cmp(&entry2_file);
+                        return entry1_file.cmp(&entry2_file) as i32;
                     }
 
                     lsproto::compare_ranges(
                         self.get_range_of_entry(entry1),
                         self.get_range_of_entry(entry2),
                     )
-                    .cmp(&0)
                 });
                 let definition = reference.borrow().definition.clone();
                 result[ref_index] = Rc::new(RefCell::new(SymbolAndEntries {

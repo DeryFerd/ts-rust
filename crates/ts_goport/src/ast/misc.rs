@@ -503,8 +503,11 @@ impl DiagnosticsCollection {
     // Go: ast/diagnostic.go:214 getGlobalDiagnosticsLocked
     fn get_global_diagnostics_locked(&mut self) -> Vec<Diagnostic> {
         if !self.non_file_diagnostics_sorted {
-            self.non_file_diagnostics
-                .sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+            // Go: ast/diagnostic.go:216 slices.SortStableFunc(c.nonFileDiagnostics, CompareDiagnostics)
+            crate::gostd::slices::sort_stable_func(
+                &mut self.non_file_diagnostics,
+                compare_diagnostics,
+            );
             self.non_file_diagnostics_sorted = true;
         }
         self.non_file_diagnostics.clone()
@@ -519,7 +522,8 @@ impl DiagnosticsCollection {
     fn get_diagnostics_for_file_locked(&mut self, file_name: &str) -> Vec<Diagnostic> {
         if !self.file_diagnostics_sorted.contains(file_name) {
             if let Some(diagnostics) = self.file_diagnostics.get_mut(file_name) {
-                diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+                // Go: ast/diagnostic.go:231 slices.SortStableFunc(c.fileDiagnostics[fileName], CompareDiagnostics)
+                crate::gostd::slices::sort_stable_func(diagnostics, compare_diagnostics);
             }
             self.file_diagnostics_sorted.insert(file_name.to_string());
         }
@@ -537,9 +541,8 @@ impl DiagnosticsCollection {
         for diags in self.file_diagnostics.values() {
             diagnostics.extend(diags.iter().cloned());
         }
-        // PORT: Go uses the unstable slices.SortFunc; any order of equal
-        // elements is valid there, so a stable sort is used here.
-        diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+        // Go: ast/diagnostic.go:246 slices.SortFunc(diagnostics, CompareDiagnostics)
+        crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
         diagnostics
     }
 }

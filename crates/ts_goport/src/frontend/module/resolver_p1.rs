@@ -317,8 +317,48 @@ impl Resolver {
     }
 
     // Go: module/resolver.go:215 PackageJsonCacheEntries (tsgo#4301)
+    // PORT: the entries include the package.json lookups of the parse
+    // worker answers that this resolver took (`add_worker_package_jsons`).
     pub fn package_json_cache_entries(&self, f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+        self.add_worker_package_jsons();
         self.caches.package_json_info_cache.range(f);
+    }
+
+    /// Adds to the package.json cache the lookups of the parse worker
+    /// answers that this resolver took (`Caches::worker_package_jsons`), so
+    /// that it holds what the one Go cache of all parse tasks holds. An
+    /// entry with no package.json is stored as the worker saw it. A
+    /// package.json that exists is read again, as the lookup reads it.
+    // PORT: not in Go. Go's parse tasks share one package.json cache.
+    fn add_worker_package_jsons(&self) {
+        let worker_package_jsons =
+            std::mem::take(&mut *self.caches.worker_package_jsons.borrow_mut());
+        if worker_package_jsons.is_empty() {
+            return;
+        }
+        let cache = &self.caches.package_json_info_cache;
+        let mut state = ResolutionState::zero(self, self.compiler_options.clone());
+        for lookup in worker_package_jsons
+            .iter()
+            .flat_map(|lookups| lookups.iter())
+        {
+            let package_json_path = combine_paths(&lookup.package_directory, &["package.json"]);
+            if cache.get(&package_json_path).is_some() {
+                continue;
+            }
+            if lookup.exists {
+                let _ = state.get_package_json_info(&lookup.package_directory);
+            } else {
+                let _ = cache.set(
+                    &package_json_path,
+                    Rc::new(InfoCacheEntry {
+                        package_directory: lookup.package_directory.clone(),
+                        directory_exists: lookup.directory_exists,
+                        contents: None,
+                    }),
+                );
+            }
+        }
     }
 }
 
@@ -376,7 +416,8 @@ impl Resolver {
             if let Some(shared) = &self.caches.shared
                 && let Some(found) = shared.cache.get_type_ref_directive(&cache_key)
             {
-                let found = Rc::new((*found).clone());
+                self.caches.note_worker_package_jsons(&found.package_jsons);
+                let found = Rc::new((*found.value).clone());
                 self.caches
                     .type_ref_directive_resolution_cache
                     .set(cache_key, found.clone());
@@ -384,6 +425,7 @@ impl Resolver {
             }
         }
 
+        self.caches.start_package_json_log();
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
 
@@ -425,9 +467,13 @@ impl Resolver {
         }
 
         if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
-            shared
-                .cache
-                .set_type_ref_directive(cache_key.clone(), std::sync::Arc::new((*result).clone()));
+            shared.cache.set_type_ref_directive(
+                cache_key.clone(),
+                SharedResolution {
+                    value: Arc::new((*result).clone()),
+                    package_jsons: self.caches.take_package_json_log(),
+                },
+            );
         }
         self.caches
             .type_ref_directive_resolution_cache
@@ -463,13 +509,15 @@ impl Resolver {
             if let Some(shared) = &self.caches.shared
                 && let Some(found) = shared.cache.get_module(&cache_key)
             {
+                self.caches.note_worker_package_jsons(&found.package_jsons);
                 self.caches
                     .module_resolution_cache
-                    .set(cache_key, found.clone());
-                return (found, Vec::new());
+                    .set(cache_key, found.value.clone());
+                return (found.value, Vec::new());
             }
         }
 
+        self.caches.start_package_json_log();
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
         if let Some(trace_builder) = &trace_builder {
@@ -545,9 +593,13 @@ impl Resolver {
             &trace_builder,
         ));
         if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
-            shared
-                .cache
-                .set_module(cache_key.clone(), Arc::clone(&final_result));
+            shared.cache.set_module(
+                cache_key.clone(),
+                SharedResolution {
+                    value: Arc::clone(&final_result),
+                    package_jsons: self.caches.take_package_json_log(),
+                },
+            );
         }
         self.caches
             .module_resolution_cache
@@ -1225,9 +1277,8 @@ impl ResolutionState<'_> {
                 expanding_keys.push(key);
             }
         }
-        // PORT: Go `slices.SortFunc` (pdqsort) is not stable; Rust `sort_by`
-        // is. Both use insertion sort (stable) for up to 12 keys.
-        expanding_keys.sort_by(|a, b| compare_pattern_keys(a, b).cmp(&0));
+        // Go: module/resolver.go:721 slices.SortFunc(expandingKeys, ComparePatternKeys)
+        crate::gostd::slices::sort_func(&mut expanding_keys, |a, b| compare_pattern_keys(a, b));
 
         // PORT: Go matches and slices bytes. The names are port forms, so
         // this works on their Go bytes (see `scanner_util::GO_STRING_MARKER`).

@@ -11,6 +11,11 @@
 # Ubuntu 20.04 and later).
 # RELEASE_STATIC=1: static glibc with glibc malloc, for comparison.
 #
+# Lib files: a shipped release (RELEASE_VERSION set) is Go's noembed build, as
+# Go's release builds and npm packages are. The lib files are not in the bins;
+# they are next to them. A dev build (no RELEASE_VERSION) embeds them, as the
+# pinned oracle does.
+#
 # Usage: build-release.sh [out-dir]
 #   out-dir  default: <data-root>/target/goport-release
 #
@@ -29,7 +34,8 @@
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
-#   The binaries land in <out-dir>/bin, with BUILD.txt.
+#   The binaries land in <out-dir>/bin, with BUILD.txt (and the lib files
+#   in a noembed build).
 #
 # Measured on R121 source, against the plain goport profile and build-pgo.sh:
 #   - zbook (glibc 2.44), paired perf stat: 14 to 15% fewer cycles than plain
@@ -65,6 +71,22 @@
 #                     --no-default-features).
 #   RELEASE_FEATURES  more cargo features of ts_goport for both builds
 #                     (default none). "jemalloc" there sets RELEASE_JEMALLOC=1.
+#                     "noembed" builds Go's noembed mode, as Go's release builds
+#                     and npm packages: the lib files are not in the bins, which
+#                     read them from their own dir and print their real paths.
+#                     The script copies them (scripts/copy-libs.sh) next to the
+#                     bins in each dir that runs them and in <out-dir>/bin.
+#                     RELEASE_VERSION adds "noembed".
+#   RELEASE_VERSION   the version the bins report (tsc -v, .tsbuildinfo,
+#                     typesVersions matching, ATA), for example 7.0.2. It is
+#                     passed to the build as the build-time env var
+#                     GOPORT_BUILD_VERSION (core.rs VERSION), as Go's release
+#                     build sets core.version with -ldflags -X. Default:
+#                     $GOPORT_BUILD_VERSION, else none, and then the bins report
+#                     the source default 7.1.0-dev, as a Go build without -X.
+#                     RELEASE_VERSION also adds the feature "noembed" (a
+#                     shipped release). For a version with embedded libs, set
+#                     GOPORT_BUILD_VERSION and not RELEASE_VERSION.
 #   RELEASE_GLIBC_FLOOR  dynamic build: the newest GLIBC_ symbol version a
 #                     bin may need (default 2.28). Change it together with
 #                     RELEASE_SYSROOT.
@@ -127,7 +149,15 @@ out="${1:-$data_root/target/goport-release}"
 static="${RELEASE_STATIC:-0}"
 jemalloc="${RELEASE_JEMALLOC:-$((static == 1 ? 0 : 1))}"
 features="${RELEASE_FEATURES:-}"
+# A shipped release is the noembed build (see the header).
+if [[ -n ${RELEASE_VERSION:-} && ",${features// /,}," != *,noembed,* ]]; then
+  features="${features:+$features,}noembed"
+fi
 [[ ",${features// /,}," == *,jemalloc,* ]] && jemalloc=1
+noembed=0
+[[ ",${features// /,}," == *,noembed,* ]] && noembed=1
+version="${RELEASE_VERSION:-${GOPORT_BUILD_VERSION:-}}"
+if [[ -n $version ]]; then export GOPORT_BUILD_VERSION="$version"; else unset GOPORT_BUILD_VERSION; fi
 glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
@@ -265,6 +295,12 @@ if [[ $jemalloc == 1 ]]; then
   [[ -n $JEMALLOC_SYS_WITH_MALLOC_CONF ]] || { echo "error: no JEMALLOC_CONF line in bin/tsgo.rs" >&2; exit 1; }
 fi
 
+# libs_to <dir>: a noembed bin reads the lib files next to it, so each dir
+# that runs one gets them.
+libs_to() {
+  if [[ $noembed == 1 ]]; then "$script_dir/copy-libs.sh" "$1"; fi
+}
+
 # build <target-subdir> <rustflags> <bin>...: goport profile, own target dir.
 # sccache is off: it could reuse an object built with an older profile.
 build() {
@@ -295,6 +331,7 @@ rm -rf "$profiles"
 mkdir -p "$profiles"
 build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
 gen="$out/target-gen/$host/goport"
+libs_to "$gen"
 
 # 2. PGO training. Exit codes 1 and 2 are expected: some inputs have diagnostics on
 # purpose. A run killed by a signal (a crash, a stack overflow) writes no profile, so
@@ -350,6 +387,11 @@ if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; th
   exit 1
 fi
 use="$out/target-use/$host/goport"
+libs_to "$use"
+if [[ -n $version && $("$use/tsgo" -v) != "Version $version" ]]; then
+  echo "error: $use/tsgo reports $("$use/tsgo" -v), not Version $version (RELEASE_VERSION)" >&2
+  exit 1
+fi
 # jemalloc: the bins do not exec themselves at start when jemalloc has their
 # JEMALLOC_CONF built in (set above). jemalloc prints the built-in
 # value (config.malloc_conf) with its exit stats.
@@ -400,6 +442,7 @@ if [[ $static == 1 || $jemalloc == 1 ]]; then
 fi
 rm -rf "${out:?}/bin"
 mkdir -p "$out/bin"
+libs_to "$out/bin"
 if [[ $bolt != 1 ]]; then
   for b in "${shipped[@]}"; do cp "$use/$b" "$out/bin/$b"; done
 fi
@@ -464,6 +507,7 @@ bolt_train() {
 if [[ $bolt == 1 ]]; then
   rm -rf "$bolt_dir"
   mkdir -p "$bolt_dir/input" "$bolt_dir/data"
+  libs_to "$bolt_dir/input"
   for b in "${shipped[@]}"; do
     # BOLT reads a symbol with ".cold" or ".warm" in it as a split fragment and
     # stops ("parent function not found"). Rust paths make such names
@@ -571,6 +615,8 @@ done
   fi
   echo "allocator: $([[ $jemalloc == 1 ]] && echo "jemalloc, built-in $(malloc_env tsgo)" || echo "glibc malloc")"
   echo "cargo feature args: ${feature_args[*]:-none}"
+  echo "version: $("$out/bin/tsgo" -v) (RELEASE_VERSION ${version:-unset})"
+  echo "lib files: $([[ $noembed == 1 ]] && echo "next to the bins (noembed)" || echo "embedded")"
   if [[ $bolt == 1 ]]; then
     echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
   else
