@@ -15,10 +15,6 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 
-// PORT: Go stacks grow to 1 GB; errgroup goroutines get the same maximum
-// stack as the crate's checker threads.
-const GOROUTINE_STACK_SIZE: usize = 1 << 30;
-
 // PORT: Go mutexes do not poison.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -248,7 +244,7 @@ impl Group {
         let g = self.clone();
         std::thread::Builder::new()
             .name("errgroup".to_string())
-            .stack_size(GOROUTINE_STACK_SIZE)
+            .stack_size(crate::gostd::stack::max_stack_size())
             .spawn(move || {
                 // It is tempting to propagate panics from f()
                 // up to the goroutine that calls Wait, but

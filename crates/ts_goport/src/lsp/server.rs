@@ -5,12 +5,13 @@
 //! each handler, the progress loop and the parent watchdog on goroutines.
 //! Language-service state (`Rc`/`RefCell`) must stay on one thread, so:
 //!
-//! - The dispatch thread (the thread that calls `Server::run`, 1 GiB stack)
-//!   owns `Server`: the session, the file system, the handler table and the
-//!   API sessions. It runs the sync part of each handler and then its async
-//!   part inline (Go starts the async part on a goroutine, so Go can answer
-//!   requests out of order; the port answers them in order). Between the
-//!   two parts, after each message and after each wake-up it runs
+//! - The dispatch thread (the thread that calls `Server::run`, with the
+//!   stack size of `gostd::stack::max_stack_size`) owns `Server`: the
+//!   session, the file system, the handler table and the API sessions. It
+//!   runs the sync part of each handler and then its async part inline (Go
+//!   starts the async part on a goroutine, so Go can answer requests out of
+//!   order; the port answers them in order). Between the two parts, after
+//!   each message and after each wake-up it runs
 //!   `gostd::local::run_pending()`. After a quiet period with no message,
 //!   it runs `gostd::local::run_idle()`.
 //! - The reader thread owns the `Reader`. It routes responses to

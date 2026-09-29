@@ -910,10 +910,14 @@ impl FileLoader {
 
     // Go: fileloader.go:315 (*fileLoader).sortLibs
     // PORT: Go `slices.SortFunc` is pdqsort. It is not stable for more than
-    // 12 items. The port uses a stable sort. Libs with the same priority keep
-    // their load order here; Go can reorder them when there are more than 12.
+    // 12 items, so libs with the same priority can change places there.
+    // `gostd::slices::sort_func` is the same pdqsort, so they move as in Go.
     pub fn sort_libs(&self, lib_files: &mut [Rc<ParsedSourceFile>]) {
-        lib_files.sort_by_key(|f| self.get_default_lib_file_priority(f));
+        // Go: fileloader.go:345 slices.SortFunc(libFiles, cmp.Compare on the priorities)
+        crate::gostd::slices::sort_func(lib_files, |f1, f2| {
+            self.get_default_lib_file_priority(f1)
+                .cmp(&self.get_default_lib_file_priority(f2)) as i32
+        });
     }
 
     // Go: fileloader.go:321 (*fileLoader).getDefaultLibFilePriority

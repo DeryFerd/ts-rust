@@ -18,10 +18,11 @@ signature is gone).
 | `lib.es5.d.ts` | `6388847232654d7fcbed7fe89ea511a65ad1f5104b41e905c43f90910e1408b6` |
 
 `crates/ts_bundled/libs` is still at the old pin. ts_goport takes these 7 names
-from here and every other lib from `crates/ts_bundled/libs` (`src/frontend/bundled.rs`,
-`bundled_lib!(goport ...)`). With these overrides the lib set equals
-`internal/bundled/libs` at the pin byte for byte.
+from here and every other lib from `crates/ts_bundled/libs` (`src/frontend/bundled/embed.rs`,
+`bundled_lib!(goport ...)`; `scripts/copy-libs.sh` for a noembed build). With
+these overrides the lib set equals `internal/bundled/libs` at the pin byte for
+byte.
 
 When a later pin changes a lib, copy it here from that pin, update this table
-and the `bundled.rs` entry, then run `scripts/gen-lib-names.py` and regenerate
+and the `embed.rs` entry, then run `scripts/gen-lib-names.py` and regenerate
 the lib parse and bind snapshots.

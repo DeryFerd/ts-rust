@@ -1,5 +1,6 @@
-//! The subset of Go `golang.org/x/sys/unix` (v0.46.0, linux/amd64) that
-//! fswatch uses. There is no Go file for this module in typescript-go.
+//! The subset of Go `golang.org/x/sys/unix` (v0.46.0, linux) that fswatch
+//! uses. There is no Go file for this module in typescript-go. Linux only:
+//! the fswatch backends that use it (inotify, fanotify) are Linux only.
 //!
 //! PORT: D-W1 allows a safe syscall crate. The inotify, pipe, poll, read,
 //! write, close, open, getdents, lstat and statfs calls go through `rustix`
@@ -8,92 +9,38 @@
 //! the `name-to-handle-at` crate (both safe APIs). No `libc`, no `unsafe`.
 //! Every syscall keeps its Go name, parameters and result. Types, constants
 //! and errno values are the Go values (zerrors_linux.go,
-//! zerrors_linux_amd64.go, ztypes_linux.go, ztypes_linux_amd64.go). A Go
-//! untyped constant gets the Rust type of the place fswatch uses it. Go `int`
-//! is `i32`, Go `uint` is `u32`. A syscall error is a `GoError` made from an
-//! `Errno` (`errors::from_value`), so
+//! zerrors_linux_<arch>.go, ztypes_linux.go, ztypes_linux_<arch>.go). The
+//! open(2) and inotify_init1(2) flags differ between targets (O_DIRECTORY
+//! and O_NOFOLLOW on arm64 are the amd64 O_DIRECT and O_LARGEFILE bits), so
+//! they are rustix's values for the target. A Go untyped constant gets the
+//! Rust type of the place fswatch uses it. Go `int` is `i32`, Go `uint` is
+//! `u32`. A syscall error is a `GoError` made from an `Errno`
+//! (`errors::from_value`, see `fswatch::syscall`), so
 //! `errors::is(&err, &errors::from_value(unix::EINTR))` works as in Go.
 //! The `from_ne_bytes` readers replace fswatch's `unsafe.Pointer` casts of
-//! kernel records.
+//! kernel records. Those records (inotify_event, fanotify_event_metadata,
+//! linux_dirent64) have one layout on every Linux target. `Stat_t` and
+//! `Statfs_t` are filled from `std` and rustix, not cast, so the amd64
+//! field types hold the values of any target.
 
 use crate::fswatch::prelude::*;
+pub use crate::fswatch::syscall::*;
 use crate::gostd::errors;
+use rustix::fs::OFlags;
+use rustix::fs::inotify::CreateFlags;
 use std::os::fd::AsFd;
-
-// ---------------------------------------------------------------------------
-// Errno (Go syscall.Errno)
-// ---------------------------------------------------------------------------
-
-/// Go `syscall.Errno` (`uintptr`), the error type of every syscall.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Errno(pub usize);
-
-pub const ENOENT: Errno = Errno(0x2);
-pub const EINTR: Errno = Errno(0x4);
-pub const EBADF: Errno = Errno(0x9);
-pub const EAGAIN: Errno = Errno(0xb);
-pub const EACCES: Errno = Errno(0xd);
-pub const ENODEV: Errno = Errno(0x13);
-pub const ENOTDIR: Errno = Errno(0x14);
-pub const EINVAL: Errno = Errno(0x16);
-pub const EOPNOTSUPP: Errno = Errno(0x5f);
-pub const ENOTSUP: Errno = Errno(0x5f);
-pub const EWOULDBLOCK: Errno = Errno(0xb);
-
-impl Errno {
-    // Go: syscall/syscall_unix.go Errno.Error (go1.26)
-    // PORT: Go's table has every errno; the port lists the ones fswatch
-    // names and the ones fanotify_init, fanotify_mark, name_to_handle_at and
-    // statfs can return (go1.26 syscall/zerrors_linux_amd64.go `errors`).
-    pub fn error(&self) -> String {
-        let s = match self.0 {
-            0x1 => "operation not permitted",
-            0x2 => "no such file or directory",
-            0x4 => "interrupted system call",
-            0x5 => "input/output error",
-            0x9 => "bad file descriptor",
-            0xb => "resource temporarily unavailable",
-            0xc => "cannot allocate memory",
-            0xd => "permission denied",
-            0xe => "bad address",
-            0x11 => "file exists",
-            0x12 => "invalid cross-device link",
-            0x13 => "no such device",
-            0x14 => "not a directory",
-            0x16 => "invalid argument",
-            0x18 => "too many open files",
-            0x1c => "no space left on device",
-            0x24 => "file name too long",
-            0x26 => "function not implemented",
-            0x28 => "too many levels of symbolic links",
-            0x4b => "value too large for defined data type",
-            0x5f => "operation not supported",
-            _ => "",
-        };
-        if !s.is_empty() {
-            return s.to_string();
-        }
-        format!("errno {}", self.0)
-    }
-}
-
-impl std::fmt::Display for Errno {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.error())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-// open(2) flags (Go int).
-pub const O_RDONLY: i32 = 0x0;
-pub const O_CLOEXEC: i32 = 0x80000;
-pub const O_NONBLOCK: i32 = 0x800;
-pub const O_DIRECTORY: i32 = 0x10000;
-pub const O_NOCTTY: i32 = 0x100;
-pub const O_NOFOLLOW: i32 = 0x20000;
+// open(2) flags (Go int), the target's values.
+pub const O_RDONLY: i32 = OFlags::RDONLY.bits() as i32;
+pub const O_CLOEXEC: i32 = OFlags::CLOEXEC.bits() as i32;
+pub const O_NONBLOCK: i32 = OFlags::NONBLOCK.bits() as i32;
+pub const O_DIRECTORY: i32 = OFlags::DIRECTORY.bits() as i32;
+pub const O_NOCTTY: i32 = OFlags::NOCTTY.bits() as i32;
+pub const O_NOFOLLOW: i32 = OFlags::NOFOLLOW.bits() as i32;
 
 // poll(2) (Go PollFd.Events is int16).
 pub const POLLIN: i16 = 0x1;
@@ -109,9 +56,26 @@ pub const DT_DIR: u8 = 0x4;
 pub const S_IFMT: u32 = 0xf000;
 pub const S_IFDIR: u32 = 0x4000;
 
-// inotify_init1(2) flags (Go int).
-pub const IN_NONBLOCK: i32 = 0x800;
-pub const IN_CLOEXEC: i32 = 0x80000;
+// inotify_init1(2) flags (Go int), the target's values.
+pub const IN_NONBLOCK: i32 = CreateFlags::NONBLOCK.bits() as i32;
+pub const IN_CLOEXEC: i32 = CreateFlags::CLOEXEC.bits() as i32;
+
+// The flags above against the Go values (x/sys v0.46.0 zerrors_linux.go,
+// zerrors_linux_amd64.go and zerrors_linux_arm64.go). Only O_DIRECTORY and
+// O_NOFOLLOW differ between the two.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const _: () = assert!(
+    O_RDONLY == 0x0
+        && O_CLOEXEC == 0x80000
+        && O_NONBLOCK == 0x800
+        && O_NOCTTY == 0x100
+        && IN_NONBLOCK == 0x800
+        && IN_CLOEXEC == 0x80000
+);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(O_DIRECTORY == 0x10000 && O_NOFOLLOW == 0x20000);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(O_DIRECTORY == 0x4000 && O_NOFOLLOW == 0x8000);
 
 // inotify event and watch mask bits (Go uint32).
 pub const IN_MODIFY: u32 = 0x2;
@@ -240,7 +204,8 @@ pub struct Dirent {
     pub type_: u8,
 }
 
-/// Go `unsafe.Offsetof(unix.Dirent{}.Name)` on linux/amd64.
+/// Go `unsafe.Offsetof(unix.Dirent{}.Name)`: 19 on every Linux target
+/// (linux_dirent64).
 pub const DIRENT_NAME_OFFSET: usize = 19;
 
 impl Dirent {

@@ -61,7 +61,7 @@ fn main() {
         let (output, watches) = (output.clone(), watches.clone());
         let changed = changed.clone();
         std::thread::Builder::new()
-            .stack_size(1 << 30)
+            .stack_size(ts_goport::gostd::stack::max_stack_size())
             .spawn(move || run(&tsc_args, output, watches, &changed, edits))
             .expect("start the work thread")
     };

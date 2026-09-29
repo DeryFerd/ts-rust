@@ -11,8 +11,9 @@ show no lost, unrun or absent request. Every failed gate run of the source that 
 the acceptance is refused. The batch keeps every gate run of the source in gateRuns (the failed runs
 with their regressions and flake notes, then the batch gate), and the check requires the same flake
 notes, so a failed run stays in the state after the acceptance. The history row and both verdicts
-carry goportTestsSha256, gateSha256 and nameMapSha256 (null without a name map). It sets the state to ready/PASS, runs the local check, and
-records the acceptance only when the check passes.
+carry goportTestsSha256, gateSha256, nameMapSha256 (null without a name map) and gateIdMapSha256 (the
+sha256 of batch.gateIdMap, null without a gate id map). It sets the state to ready/PASS, runs the local
+check, and records the acceptance only when the check passes.
 
 Usage:
   scripts/goport/accept_revision.py --revision 132 --evidence <cache dir>
@@ -116,6 +117,10 @@ def main():
             problems.append(f"{name}.json base {x['base']['dir']} is not the protected base {(ref or {}).get('dir')}")
         if any(x['compare'][k] for k in ('lost', 'absent', 'unrun')):
             problems.append(f'{name}.json reports lost, unrun or absent requests')
+    # gate-compare.json must be the compare with the batch's gate id map (the check requires it too).
+    id_map = (b.get('gateIdMap') or {}).get('sha256')
+    if (gc.get('idMap') or {}).get('sha256') != id_map:
+        problems.append(f"gate-compare.json names gate id map {(gc.get('idMap') or {}).get('sha256')}, batch.gateIdMap is {id_map}")
     if quality.get('keptCrateWarnings', 0) or quality['tsGoportWarnings']:
         problems.append('quality.json reports clippy warnings')
     if bound.get('sourceFingerprint') != fp or quality.get('sourceFingerprint') != fp:
@@ -170,9 +175,9 @@ def main():
     b['qualityEvidence'] = {'sourceFingerprint': fp, 'dir': rel(C)}
     if a.extra:
         b.update(json.load(open(a.extra)))
-    # The three evidence hashes that the check binds in the history row and both verdicts.
+    # The four evidence hashes that the check binds in the history row and both verdicts.
     hashes = {'goportTestsSha256': tests['sha256'], 'gateSha256': gate['sha256'],
-              'nameMapSha256': (tests.get('nameMap') or {}).get('sha256')}
+              'nameMapSha256': (tests.get('nameMap') or {}).get('sha256'), 'gateIdMapSha256': id_map}
     verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'], 'sourceFingerprint': fp,
                                    **hashes, 'utc': now}
     b['auditor'] = verdict('audit_accepted_roster', AUDITOR)

@@ -1144,12 +1144,24 @@ pub(crate) fn snapshot_libs() -> Vec<&'static str> {
     let mut libs: Vec<(&'static str, usize)> = bundled::LIB_NAMES
         .iter()
         .filter_map(|&name| {
-            let text = bundled::bundled_text(&format!("{}/{name}", bundled::lib_path()))?;
+            let text = lib_text(name)?;
             (text.len() >= MIN_TEXT_LEN).then_some((name, text.len()))
         })
         .collect();
     libs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
     libs.into_iter().map(|(name, _)| name).collect()
+}
+
+/// The text of bundled lib `name`: the embedded text, or in a `noembed`
+/// build the file in `bundled::lib_path()` (read and leaked on each call).
+/// The lib snapshot tests use it, so they run on both builds.
+#[cfg(test)]
+pub(crate) fn lib_text(name: &str) -> Option<&'static str> {
+    let path = format!("{}/{name}", bundled::lib_path());
+    bundled::bundled_text(&path).or_else(|| {
+        let text = std::fs::read_to_string(&path).ok()?;
+        Some(Box::leak(text.into_boxed_str()))
+    })
 }
 
 #[cfg(test)]

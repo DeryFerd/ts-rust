@@ -404,9 +404,16 @@ const MAX_FILE_SIZE: usize = 10 << 20;
 // Go: time/zoneinfo_read.go:575 readFile
 // PORT: the path is raw bytes, as in Go. Go stops reading past
 // `maxFileSize` and fails; this reads the file and then checks the size.
+// Off unix a path must be UTF-8; another path fails, as a missing file.
 fn read_file(name: &[u8]) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    let data = std::fs::read(std::ffi::OsStr::from_bytes(name)).ok()?;
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(name)
+    };
+    #[cfg(not(unix))]
+    let path = std::str::from_utf8(name).ok()?;
+    let data = std::fs::read(path).ok()?;
     if data.len() > MAX_FILE_SIZE {
         return None;
     }
@@ -1062,11 +1069,14 @@ fn get_error_summary(diags: &[Diagnostic]) -> ErrorSummary<'_> {
 
     // !!!
     // Need an ordered map here, but sorting for consistency.
+    // Go: diagnosticwriter/diagnosticwriter.go:488 slices.SortedFunc(maps.Keys(errorsByFile), ...)
     // PORT: Go compares the bytes of the names (see `compare_go_bytes`). Go
     // sorts the keys in map order, so the entries of one content-mapped file
-    // (same name) come in any order. The stable sort here keeps them in
-    // diagnostic order.
-    sorted_files.sort_by(|a, b| compare_go_bytes(a.file_name(), b.file_name()));
+    // (same name) come in any order. Here the sort starts from diagnostic
+    // order.
+    crate::gostd::slices::sort_func(&mut sorted_files, |a, b| {
+        compare_go_bytes(a.file_name(), b.file_name()) as i32
+    });
 
     ErrorSummary {
         total_error_count,

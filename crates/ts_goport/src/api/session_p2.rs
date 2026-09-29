@@ -150,11 +150,15 @@ impl Session {
         for sub in subs {
             symbols.push(checker_symbol(&setup.checker, &checker, sub));
         }
-        // PORT: Go `slices.SortFunc` is not stable; `compareSymbols` gives
-        // distinct symbols distinct places, so the order is the same.
+        // Go: api/session.go:2196 slices.SortFunc(symbols, setup.checker.CompareSymbols)
+        // PORT: `CompareSymbols` is not a total order (see
+        // `sort_symbol_sort_keys`), so this is Go's pdqsort, not std `sort_by`,
+        // which can panic.
         {
             let mut c = setup.checker.borrow_mut();
-            symbols.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+            crate::gostd::slices::sort_func(&mut symbols, |&a, &b| {
+                c.compare_symbols_exported(a, b)
+            });
         }
 
         let mut results = Vec::with_capacity(symbols.len());
@@ -790,8 +794,11 @@ fn emit_to_output(
     let result = emit_program(ctx, program, options)?;
     let mut output_files =
         std::mem::take(&mut *output_files.lock().unwrap_or_else(PoisonError::into_inner));
-    // Go `strings.Compare`: byte order, as `String` compares.
-    output_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    // Go: api/session.go:2698 slices.SortFunc(outputFiles, strings.Compare on the names)
+    // PORT: `String` compares in byte order, as Go `strings.Compare`.
+    crate::gostd::slices::sort_func(&mut output_files, |a, b| {
+        a.file_name.cmp(&b.file_name) as i32
+    });
     Ok(EmitOutputResponse {
         emit_skipped: result.emit_skipped,
         diagnostics: non_nil_diagnostics(&result.diagnostics),
@@ -1536,9 +1543,12 @@ impl Session {
         if exports.is_empty() {
             return Ok(Vec::new());
         }
+        // Go: api/session.go:3326 slices.SortFunc(exports, setup.checker.CompareSymbols)
         {
             let mut c = setup.checker.borrow_mut();
-            exports.sort_by(|&a, &b| c.compare_symbols_exported(a, b).cmp(&0));
+            crate::gostd::slices::sort_func(&mut exports, |&a, &b| {
+                c.compare_symbols_exported(a, b)
+            });
         }
 
         let mut results = Vec::with_capacity(exports.len());
