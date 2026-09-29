@@ -1252,6 +1252,10 @@ impl ipc::Handler for Session {
             m if m == Method::GET_APPARENT_TYPE.0 => self
                 .handle_get_apparent_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#63899
+            m if m == Method::GET_REDUCED_TYPE.0 => self
+                .handle_get_reduced_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_PROPERTY_OF_TYPE.0 => self
                 .handle_get_property_of_type(ctx, assert_params(&parsed))
                 .map(to_any),

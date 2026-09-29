@@ -1269,6 +1269,22 @@ impl Session {
         Ok(setup.new_type_response(apparent))
     }
 
+    // Go: api/session.go:3068 handleGetReducedType (ts#63899)
+    // handleGetReducedType returns the reduced type of a type.
+    pub fn handle_get_reduced_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let reduced = setup.checker.borrow_mut().get_reduced_type_exported(t);
+        Ok(setup.new_type_response(reduced))
+    }
+
     // Go: api/session.go:1974 handleGetIndexInfosOfType
     // handleGetIndexInfosOfType returns the index infos of a type.
     pub fn handle_get_index_infos_of_type(

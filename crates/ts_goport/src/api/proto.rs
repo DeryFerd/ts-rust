@@ -317,6 +317,8 @@ impl Method {
     pub const GET_APPARENT_PROPERTIES_OF_TYPE: Method =
         Method(Cow::Borrowed("getApparentPropertiesOfType"));
     pub const GET_APPARENT_TYPE: Method = Method(Cow::Borrowed("getApparentType"));
+    // ts#63899
+    pub const GET_REDUCED_TYPE: Method = Method(Cow::Borrowed("getReducedType"));
     pub const GET_PROPERTY_OF_TYPE: Method = Method(Cow::Borrowed("getPropertyOfType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
@@ -1079,6 +1081,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_APPARENT_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    // ts#63899
+    m.insert(
+        Method::GET_REDUCED_TYPE,
         unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
