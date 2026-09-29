@@ -1,8 +1,8 @@
 //! Go package `transpile` (#4849): single-file JavaScript and declaration
 //! emit.
 //!
-//! PORT: Go makes a program of one file over a `vfstest.FromMap` file
-//! system and emits it. Here that program is a program version of the
+//! PORT: Go makes a program of one file over a `transpileFS` file system
+//! (fs.go, ts#64009) and emits it. Here that program is a program version of the
 //! process (`program::new_program_version`, as the compiler runner makes
 //! its programs). It is read inside `core::enter_program`, and its checker
 //! and emit pools are freed after the emit (`program::release_program`).
@@ -19,12 +19,11 @@ use crate::emitter::program_emit::{self, EmitOptions, WriteFile, WriteFileData};
 use crate::frontend::compiler::{NewProgram, ProgramOptions, new_compiler_host};
 use crate::frontend::tsoptions::{ParsedCommandLine, ParsedOptions, get_default_lib_file_name};
 use crate::frontend::tspath::{
-    combine_paths, get_base_file_name, get_directory_path, get_normalized_absolute_path,
-    is_rooted_disk_path, normalize_path, remove_trailing_directory_separator,
+    ComparePathsOptions, combine_paths, contains_path, get_directory_path,
+    get_normalized_absolute_path,
 };
-use crate::frontend::vfs::{Entries, FileInfo, FileMode, Fs, FsError, WalkDirFunc, split_path};
+use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
 use crate::gostd::Context;
-use crate::gostd::strconv::quote;
 use crate::program;
 
 // Go: transpile/transpile.go:18 Options
@@ -231,7 +230,7 @@ fn transpile_worker(
         );
     }
 
-    let fs: Rc<dyn Fs> = Rc::new(MapFs::from_map(files));
+    let fs: Rc<dyn Fs> = Rc::new(TranspileFs { files });
     // tsgo#4712: the 6th argument is the content mapper project (Go nil).
     let host = new_compiler_host(INPUT_DIRECTORY, fs, LIB_DIRECTORY, None, None, None);
 
@@ -334,102 +333,44 @@ fn transpile_worker(
     output
 }
 
-// Go: vfs/vfstest/vfstest.go:70 FromMap (useCaseSensitiveFileNames true),
-// behind vfs/iovfs/iofs.go:43 From
-// PORT: the port's `vfstest` is test code. This is the read side of a Go
-// `vfstest.MapFS` with no symlinks, behind `iovfs.From`: the parent
-// directories of each file exist, and a read decodes the Go bytes of the
-// map value. Nothing writes to it or walks it: emit writes through the
-// `WriteFile` callback, and a program with no config file does not walk
-// its directories.
-struct MapFs {
-    /// File text by path.
+// Go: transpile/fs.go:10 transpileFS
+// transpileFS embeds unsupported operations so unexpected filesystem access
+// panics.
+// PORT: Go embeds a nil `vfs.FS`, so any other method dereferences nil
+// (`go_nil_dereference`).
+struct TranspileFs {
     files: FxHashMap<String, String>,
-    /// The root and the parent directories of each file.
-    directories: FxHashSet<String>,
-    /// Go `clock.Now()` when the map is made.
-    mod_time: SystemTime,
 }
 
-impl MapFs {
-    // Go: vfs/vfstest/vfstest.go:80 FromMapWithClock
-    // PORT: Go checks the paths in sorted order. Only the input file name
-    // can fail a check here, so the order does not change the panic.
-    fn from_map(files: FxHashMap<String, String>) -> MapFs {
-        let mut posix = false;
-        let mut windows = false;
-        // The `fstest.MapFS` root always exists.
-        let mut directories = FxHashSet::default();
-        directories.insert("/".to_string());
-        for p in files.keys() {
-            if !is_rooted_disk_path(p) {
-                go_panic(format!("non-rooted path {}", quote(p)));
-            }
-            if remove_trailing_directory_separator(&normalize_path(p)) != p.as_str() {
-                go_panic(format!("non-normalized path {}", quote(p)));
-            }
-            if p.starts_with('/') {
-                posix = true;
-            } else {
-                windows = true;
-            }
-            // Go `convertMapFS` makes the missing parent directories.
-            let mut dir = get_directory_path(p);
-            while directories.insert(dir.clone()) {
-                let parent = get_directory_path(&dir);
-                if parent == dir {
-                    break;
-                }
-                dir = parent;
-            }
-        }
-        if posix && windows {
-            go_panic("mixed posix and windows paths".to_string());
-        }
-        MapFs {
-            files,
-            directories,
-            mod_time: SystemTime::now(),
-        }
-    }
-}
-
-/// The map key of `path`: the root and the rest of Go `internal.SplitPath`.
-/// It panics like Go when `path` is not absolute.
-fn map_key(path: &str) -> String {
-    let (root, rest) = split_path(path);
-    root + &rest
-}
-
-impl Fs for MapFs {
-    // Go: vfs/iovfs/iofs.go:151 UseCaseSensitiveFileNames
+impl Fs for TranspileFs {
+    // Go: transpile/fs.go:17 transpileFS.UseCaseSensitiveFileNames
     fn use_case_sensitive_file_names(&self) -> bool {
         true
     }
 
-    // Go: vfs/iovfs/iofs.go:159 FileExists
+    // Go: transpile/fs.go:21 transpileFS.FileExists
     fn file_exists(&self, path: &str) -> bool {
-        self.stat(path).is_some_and(|stat| !stat.is_dir())
+        self.files.contains_key(path)
     }
 
-    // Go: vfs/iovfs/iofs.go:172 ReadFile
+    // Go: transpile/fs.go:26 transpileFS.ReadFile
     fn read_file(&self, path: &str) -> (String, bool) {
-        match self.files.get(&map_key(path)) {
-            Some(text) => (decode_bytes(text), true),
+        match self.files.get(path) {
+            Some(content) => (content.clone(), true),
             None => (String::new(), false),
         }
     }
 
     fn write_file(&self, _path: &str, _data: &str) -> Result<(), FsError> {
-        unported!("vfstest.MapFS.WriteFile in transpile")
+        go_nil_dereference()
     }
 
     fn append_file(&self, _path: &str, _data: &str) -> Result<(), FsError> {
-        unported!("vfstest.MapFS.AppendFile in transpile")
+        go_nil_dereference()
     }
 
     fn remove(&self, _path: &str) -> Result<(), FsError> {
-        unported!("vfstest.MapFS.Remove in transpile")
+        go_nil_dereference()
     }
 
     fn chtimes(
@@ -438,115 +379,59 @@ impl Fs for MapFs {
         _a_time: Option<SystemTime>,
         _m_time: Option<SystemTime>,
     ) -> Result<(), FsError> {
-        unported!("vfstest.MapFS.Chtimes in transpile")
+        go_nil_dereference()
     }
 
-    // Go: vfs/iovfs/iofs.go:155 DirectoryExists
+    // Go: transpile/fs.go:31 transpileFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
-        self.stat(path).is_some_and(|stat| stat.is_dir())
+        self.files.keys().any(|file| {
+            contains_path(
+                path,
+                &get_directory_path(file),
+                &ComparePathsOptions {
+                    use_case_sensitive_file_names: true,
+                    ..ComparePathsOptions::default()
+                },
+            )
+        })
     }
 
-    // Go: vfs/iovfs/iofs.go:163 GetAccessibleEntries
-    // PORT: with no symlinks each entry is a file or a directory. Go
-    // `fs.ReadDir` sorts the entries by name.
-    fn get_accessible_entries(&self, path: &str) -> Entries {
-        let dir = map_key(path);
-        let mut entries: Vec<(String, bool)> = self
-            .files
-            .keys()
-            .map(|p| (p, false))
-            .chain(self.directories.iter().map(|p| (p, true)))
-            .filter(|(p, _)| **p != dir && get_directory_path(p) == dir)
-            .map(|(p, is_dir)| (get_base_file_name(p), is_dir))
-            .collect();
-        // Go: testing/fstest/mapfs.go:106 slices.SortFunc(list, strings.Compare on the names) (go1.26.8)
-        crate::gostd::slices::sort_func(&mut entries, |a, b| compare_go_strings(&a.0, &b.0) as i32);
-        let mut result = Entries {
-            symlinks: Some(FxHashSet::default()),
-            ..Entries::default()
-        };
-        for (name, is_dir) in entries {
-            if is_dir {
-                result.directories.push(name);
-            } else {
-                result.files.push(name);
-            }
-        }
-        result
+    fn get_accessible_entries(&self, _path: &str) -> Entries {
+        go_nil_dereference()
     }
 
-    // Go: vfs/iovfs/iofs.go:167 Stat
-    // PORT: only `is_dir` of the mode is read. A file has the `fstest`
-    // mode 0; a directory has the mode of vfstest `mkdirAll`.
-    fn stat(&self, path: &str) -> Option<FileInfo> {
-        let (root, rest) = split_path(path);
-        let name = match rest.rsplit('/').next() {
-            Some(name) if !name.is_empty() => name.to_string(),
-            _ => ".".to_string(),
-        };
-        let key = root + &rest;
-        if let Some(text) = self.files.get(&key) {
-            return Some(FileInfo {
-                name,
-                size: go_string_bytes(text).len() as i64,
-                mode: FileMode(0),
-                mod_time: Some(self.mod_time),
-            });
-        }
-        if self.directories.contains(&key) {
-            return Some(FileInfo {
-                name,
-                size: 0,
-                mode: FileMode::DIR | FileMode(0o755),
-                mod_time: Some(self.mod_time),
-            });
-        }
-        None
+    fn stat(&self, _path: &str) -> Option<FileInfo> {
+        go_nil_dereference()
     }
 
     fn walk_dir(&self, _root: &str, _walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        unported!("vfstest.MapFS.WalkDir in transpile")
+        go_nil_dereference()
     }
 
-    // Go: vfs/iovfs/iofs.go:190 Realpath
-    // PORT: with no symlinks the real path of an entry is its own path. The
-    // root is no entry of the Go map, so it keeps `path`, as a missing
-    // path does.
+    // Go: transpile/fs.go:40 transpileFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        let (root, rest) = split_path(path);
-        let key = root + &rest;
-        if !rest.is_empty() && (self.files.contains_key(&key) || self.directories.contains(&key)) {
-            return key;
-        }
         path.to_string()
     }
 }
 
-// Go: vfs/internal/internal.go:170 decodeBytes
-// PORT: the port's copy in `frontend/vfs` is private. This one takes the
-// map value, whose Go bytes (`[]byte(content)`) the Go map holds, and
-// returns the port form (see `scanner_util::GO_STRING_MARKER`). Go reads
-// `len/2` UTF-16 units and ignores an odd last byte; `utf16.Decode` makes
-// each unpaired surrogate U+FFFD.
-fn decode_bytes(text: &str) -> String {
-    let utf16 = |s: &[u8], big_endian: bool| {
-        let units = s.chunks_exact(2).map(|pair| {
-            if big_endian {
-                u16::from_be_bytes([pair[0], pair[1]])
-            } else {
-                u16::from_le_bytes([pair[0], pair[1]])
-            }
-        });
-        go_string_from_utf8(
-            char::decode_utf16(units)
-                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect(),
-        )
-    };
-    match &*go_string_bytes(text) {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
-        // The UTF-8 BOM (EF BB BF) is U+FEFF in the port form too.
-        _ => text.strip_prefix('\u{FEFF}').unwrap_or(text).to_string(),
+#[cfg(test)]
+mod tests {
+    // Go: transpile/fs_test.go
+    use super::*;
+
+    // Go: fs_test.go:7 TestTranspileFSDirectoryExists
+    #[test]
+    fn test_transpile_fs_directory_exists() {
+        let mut files = FxHashMap::default();
+        files.insert("/src/module.ts".to_string(), String::new());
+        let fs = TranspileFs { files };
+        assert!(
+            !fs.directory_exists("/src/module.ts"),
+            "file reported as directory"
+        );
+        assert!(
+            fs.directory_exists("/src"),
+            "containing directory not found"
+        );
     }
 }
