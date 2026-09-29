@@ -21,10 +21,17 @@
 #   and not on arm64 is LOST. Each arm64 run is bounded (XTEST_TIMEOUT seconds, default 1800).
 #   Writes <out-dir>/<suite>.<n>.{arm64,x86_64}.log and <out-dir>/tests.tsv (name, x86_64, arm64).
 #
-# qemu-user cannot exec another arm64 binary (no binfmt_misc entry on zbook), so the arm64 side runs with
-# GOPORT_LAUNCH=0 (no worker process) and with _RJEM_MALLOC_CONF and GLIBC_TUNABLES set (tsgo and goport
-# exec themselves once to set them). Neither changes the output. A test that starts an arm64 child process
-# fails under qemu; the tests step lists those as LOST, so read the log before you call one a port bug.
+# arm64 binaries run in one of two modes:
+# - binfmt (default when it works): the command runs in a user and mount namespace with its own
+#   binfmt_misc (Linux 6.7 and later) that hands arm64 ELF files to qemu-aarch64, then in a nested user
+#   namespace as the calling uid (no capabilities, so read-only project inputs stay read-only). arm64
+#   binaries then exec other arm64 binaries (tsgo's worker and its malloc-tunables exec, tests that start
+#   a child), as on an arm64 host. QEMU_LD_PREFIX is the sysroot.
+# - qemu (XTEST_BINFMT=0, or when the namespace fails): `qemu-aarch64 -L <sysroot>` runs each binary, and it
+#   cannot exec another arm64 binary. So tsgo runs with GOPORT_LAUNCH=0 (no worker process) and with
+#   _RJEM_MALLOC_CONF and GLIBC_TUNABLES set (tsgo and goport exec themselves once to set them). Neither
+#   changes the output. A test that starts an arm64 child process fails; the tests step lists those as
+#   LOST, so read the log before you call one a port bug.
 # Big runs belong under systemd-run --user --collect -p MemoryMax=24G -p MemorySwapMax=0.
 # Last stdout line: DONE, or FAIL rc=<N>.
 set -uo pipefail
@@ -52,10 +59,33 @@ DEFAULT_TESTS=(
 fail() { echo "xtest-arm64.sh: $2" >&2; echo "FAIL rc=$1"; exit "$1"; }
 usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d'; echo "FAIL rc=2"; exit 2; }
 
-# qemu command for an arm64 binary. A static (musl) binary needs no sysroot.
+# binfmt_misc entry for arm64 ELF executables (the qemu-binfmt-conf.sh magic and mask), flags F and P.
+BINFMT_ENTRY=':qemu-aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:'
+
+# Runs "$@" in the binfmt namespaces (see the header), as the calling uid and gid.
+binfmt_run() {
+  local qemu
+  qemu=$(command -v "$QEMU") || return 97
+  unshare --user --map-root-user --mount bash -c '
+    mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null &&
+      printf "%s" "$1" >/proc/sys/fs/binfmt_misc/register || exit 97
+    shift
+    exec unshare --user --map-user="$1" --map-group="$2" env QEMU_LD_PREFIX="$3" "${@:4}"
+  ' _ "$BINFMT_ENTRY$qemu:FP" "$(id -u)" "$(id -g)" "$SYSROOT" "$@"
+}
+
+# The arm64 runner of this run: binfmt when it works, else qemu (see the header).
+MODE=qemu
+if [[ ${XTEST_BINFMT:-1} != 0 ]] && binfmt_run true 2>/dev/null; then MODE=binfmt; fi
+
+# Runs the arm64 binary "$1" with the arguments "${@:2}".
 arm() {
-  env GOPORT_LAUNCH=0 _RJEM_MALLOC_CONF="$JEMALLOC_CONF" GLIBC_TUNABLES=glibc.malloc.arena_max=8 \
-    "$QEMU" -L "$SYSROOT" "$@"
+  if [[ $MODE == binfmt ]]; then
+    binfmt_run "$@"
+  else
+    env GOPORT_LAUNCH=0 _RJEM_MALLOC_CONF="$JEMALLOC_CONF" GLIBC_TUNABLES=glibc.malloc.arena_max=8 \
+      "$QEMU" -L "$SYSROOT" "$@"
+  fi
 }
 
 cmd_identity() {
@@ -69,6 +99,7 @@ cmd_identity() {
   command -v "$QEMU" >/dev/null || fail 2 "$QEMU is not installed"
   rm -rf "$OUT"
   mkdir -p "$OUT"
+  echo "arm64 mode $MODE" | tee -a "$OUT/summary.txt"
   # name|cwd|emit config|emit flags (as in bin-identity.sh)
   local -A projects=(
     [query]="$P/query/source/packages/query-core|tsconfig.prod.json|--emitDeclarationOnly false --sourceMap --declarationMap"
@@ -161,6 +192,7 @@ cmd_tests() {
   local specs=("$@")
   ((${#specs[@]})) || specs=("${DEFAULT_TESTS[@]}")
   mkdir -p "$OUT"
+  echo "arm64 mode $MODE" | tee -a "$OUT/summary.txt"
   local timeout_s=${XTEST_TIMEOUT:-1800} threads=${XTEST_THREADS:-8}
   local n=0 spec suite filter dir side log rc
   for spec in "${specs[@]}"; do
@@ -171,7 +203,10 @@ cmd_tests() {
     dir=$(awk -F'\t' -v s="$suite" '$1 == s { print $2 }' "$A/SUITES")
     for side in arm64 x86_64; do
       log=$OUT/$suite.$n.$side.log
-      if [[ $side == arm64 ]]; then
+      if [[ $side == arm64 && $MODE == binfmt ]]; then
+        (cd "$CO/$dir" && RUST_TEST_THREADS=$threads binfmt_run timeout "$timeout_s" \
+          "$A/$suite" ${filter:+"$filter"} >"$log" 2>&1)
+      elif [[ $side == arm64 ]]; then
         (cd "$CO/$dir" && RUST_TEST_THREADS=$threads timeout "$timeout_s" \
           env GOPORT_LAUNCH=0 _RJEM_MALLOC_CONF="$JEMALLOC_CONF" GLIBC_TUNABLES=glibc.malloc.arena_max=8 \
           "$QEMU" -L "$SYSROOT" "$A/$suite" ${filter:+"$filter"} >"$log" 2>&1)
