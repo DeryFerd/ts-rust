@@ -248,6 +248,10 @@ impl LanguageService {
             data: Some(lsproto::CodeLensData {
                 kind,
                 uri: file_uri.clone(),
+                position: pos,
+                // PORT: Go `supplementalFileIndex(file)` (#63936, ls lane). The
+                // port has no supplemental projections here yet: `nil`.
+                supplemental_file_index: None,
             }),
             ..Default::default()
         })

@@ -3840,8 +3840,8 @@ impl Server {
             }
             let rename_files_params = lsproto::RenameFilesParams {
                 files: vec![lsproto::FileRename {
-                    old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename).0,
-                    new_uri: lsconv::file_name_to_document_uri(&info.new_file_name).0,
+                    old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename),
+                    new_uri: lsconv::file_name_to_document_uri(&info.new_file_name),
                 }],
             };
             return self.handle_will_rename_files_worker(
@@ -3887,7 +3887,7 @@ impl Server {
 
         let mut uris: Vec<lsproto::DocumentUri> = Vec::with_capacity(params.files.len());
         for file in &params.files {
-            uris.push(lsproto::DocumentUri(file.old_uri.clone()));
+            uris.push(file.old_uri.clone());
         }
 
         if uris.is_empty() {
@@ -3911,11 +3911,8 @@ impl Server {
             // current while it runs (ls::LanguageService::enter_program).
             let _program = language_service.enter_program();
             for file in &params.files {
-                let changes = language_service.get_edits_for_file_rename(
-                    ctx,
-                    &lsproto::DocumentUri(file.old_uri.clone()),
-                    &lsproto::DocumentUri(file.new_uri.clone()),
-                );
+                let changes =
+                    language_service.get_edits_for_file_rename(ctx, &file.old_uri, &file.new_uri);
                 for change in changes {
                     if let Some(rename_file) = &change.rename_file {
                         if !seen_renames.contains(&rename_file.old_uri) {
@@ -3962,8 +3959,8 @@ impl Server {
                     lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
                         rename_file: Some(lsproto::RenameFile {
                             kind: lsproto::StringLiteralRename,
-                            old_uri: lsproto::DocumentUri(file.old_uri.clone()),
-                            new_uri: lsproto::DocumentUri(file.new_uri.clone()),
+                            old_uri: file.old_uri.clone(),
+                            new_uri: file.new_uri.clone(),
                             ..Default::default()
                         }),
                         ..Default::default()

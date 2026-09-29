@@ -65,9 +65,9 @@ impl DocumentUri {
 // Go: lsp.go:57 fixWindowsURIPath
 pub fn fix_windows_uri_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix('/') {
-        let (volume, rest, ok) = tspath::split_volume_path(rest);
-        if ok {
-            return volume + rest;
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && tspath::is_volume_character(bytes[0]) && bytes[1] == b':' {
+            return rest.to_string();
         }
     }
     path.to_string()
@@ -714,8 +714,36 @@ pub fn preferred_markup_kind(formats: &[MarkupKind]) -> MarkupKind {
     MarkupKind::PLAIN_TEXT
 }
 
-// Go: lsp.go:312
 impl CodeActionKind {
+    // Go: lsp.go:310 (CodeActionKind).Contains
+    // Contains reports whether other is this code action kind or one of its children.
+    #[must_use]
+    pub fn contains(&self, other: &CodeActionKind) -> bool {
+        *self == *other
+            || *self == CodeActionKind::EMPTY
+            || other
+                .0
+                .strip_prefix(self.0.as_ref())
+                .is_some_and(|rest| rest.starts_with('.'))
+    }
+}
+
+// Go: lsp.go:316
+impl CodeActionKind {
+    // Go: CodeActionKindSourceFixAll + ".ts"
+    pub const SOURCE_FIX_ALL_TS: CodeActionKind = CodeActionKind(Cow::Borrowed("source.fixAll.ts"));
+    // Go: CodeActionKindSourceOrganizeImports + ".ts"
+    pub const SOURCE_ORGANIZE_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.organizeImports.ts"));
+    // Go: CodeActionKindSource + ".removeUnusedImports.ts"
+    pub const SOURCE_REMOVE_UNUSED_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.removeUnusedImports.ts"));
+    // Go: CodeActionKindSource + ".sortImports.ts"
+    pub const SOURCE_SORT_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.sortImports.ts"));
+
+    // PORT: Go removed these two with #63951. The ls and server lanes still
+    // use them until they port #63951; remove them with their last user.
     pub const SOURCE_REMOVE_UNUSED_IMPORTS: CodeActionKind =
         CodeActionKind(Cow::Borrowed("source.removeUnusedImports"));
     pub const SOURCE_SORT_IMPORTS: CodeActionKind =
