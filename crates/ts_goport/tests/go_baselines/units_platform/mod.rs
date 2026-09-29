@@ -10,10 +10,17 @@
 //! A test that shows a port bug is `#[ignore = "bug: S2-NNN ..."]`; the bug
 //! list is `target/continuation-r97-goport/tests2/bugs/S2.md`. A Go test that
 //! needs a private Rust item is listed there as blocked.
+//!
+//! Go tests whose files build only on other platforms are not ported, since
+//! the port has no code for those platforms and they never run on Linux:
+//! `fswatch/fsevents_darwin_{ffi_arm64,nfd,shared}_test.go` (13 tests,
+//! `darwin`) and `nativepath/symlink_windows_test.go` (4 tests, `windows`).
 
 mod bundled;
 mod cachedvfs;
+mod collections;
 mod core;
+mod debug;
 mod diagnostics;
 mod fswatch_eventlist;
 mod fswatch_fallback;

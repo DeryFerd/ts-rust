@@ -1,17 +1,18 @@
 //! Port of Go `internal/project/checkerpool_test.go`.
 //!
 //! PORT: the Rust pool lives on one thread (see `project::checkerpool`):
-//! a second request for a full slot is `unreachable!` there, so the Go
-//! contention tests (`QueryContention`, `DiagnosticsContention`, the 4th
-//! request of `MultipleConcurrentQueryCheckers`) are not ported. Go runs
-//! the timer tests in `synctest` bubbles; the idle-cleanup timer here is a
-//! `gostd::local` timer that only fires in `run_pending`, so the tests
-//! that wait for it (`IdleCleanup`, `FileAssociationCleanup`,
-//! `StaggeredIdleCleanup`, `DiagnosticsRecreatedAfterIdleDisposal`,
-//! `CrossReleaseAffinityWithContention`) are not ported, and the long fake
-//! sleeps of the other tests are left out. `DoubleReleaseSafe` can not be
-//! written: `Release::call` takes `self`. Go `synctest.Wait()` has nothing
-//! to wait for on one thread.
+//! a second request for a full slot is `unreachable!` there, so the
+//! blocked goroutines of the Go contention tests (`QueryContention`,
+//! `DiagnosticsContention`, `CrossReleaseAffinityWithContention`, the 4th
+//! request of `MultipleConcurrentQueryCheckers`) have no port; those tests
+//! check the rest. Go runs the timer tests in `synctest` bubbles with fake
+//! time; the idle-cleanup timer here is a `gostd::local` timer that waits
+//! in real time and fires in `run_pending`, so the timer tests
+//! (`IdleCleanup`, `FileAssociationCleanup`, `StaggeredIdleCleanup`,
+//! `DiagnosticsRecreatedAfterIdleDisposal`) use a short real timeout (see
+//! `IDLE` at the end of the file), and the long fake sleeps of the other
+//! tests are left out. `DoubleReleaseSafe` can not call a release twice:
+//! `Release::call` takes `self`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -795,5 +796,298 @@ child_test! {
         );
         let has_checker = pool.checkers.borrow().iter().any(Option::is_some);
         assert!(has_checker, "idle checkers must survive cleanup on a discarded pool");
+    }
+}
+
+// The Go tests below run in `synctest` bubbles with fake time. The port's
+// idle-cleanup timer is a `gostd::local` timer: it waits in real time and
+// its callback runs only in `local::run_pending` on this thread. So the
+// tests use real time with a short idle timeout (`IDLE`), Go
+// `synctest.Wait()` is `run_pending()`, and Go `time.Sleep(d);
+// synctest.Wait()` is `sleep_then_run(d)`.
+
+/// The idle timeout of the timer tests. Go uses 5 s and 10 s of fake time.
+/// It is long enough that a loaded host does not reach it between a release
+/// and the next check.
+const IDLE: Duration = Duration::from_millis(1000);
+
+fn idle_opts(max_checkers: i32, idle_timeout: Duration) -> CheckerPoolOptions {
+    CheckerPoolOptions {
+        max_checkers,
+        idle_timeout,
+    }
+}
+
+/// Go `synctest.Wait()`: runs the ready timer callbacks of this thread.
+fn run_pending() {
+    ts_goport::gostd::local::run_pending();
+}
+
+/// Go `time.Sleep(d); synctest.Wait()`: sleeps `d` in real time, then runs
+/// the timer callbacks that became due. `wait_pending` waits for a due timer
+/// whose thread has not queued it yet.
+fn sleep_then_run(d: Duration) {
+    std::thread::sleep(d);
+    ts_goport::gostd::local::wait_pending();
+    run_pending();
+}
+
+child_test! {
+    // Go: checkerpool_test.go:113 TestCheckerPoolIdleCleanup
+    // PORT: real time (see above); Go IdleTimeout 5s is `IDLE`.
+    fn idle_cleanup() {
+        let (_session, pool) = test_pool(opts(2, 10), idle_opts(4, IDLE));
+
+        // Create a checker via a diagnostics request.
+        let ctx = req(&bg(), "diag-cleanup", CheckerLifetime::DIAGNOSTICS);
+        let (_c, release) = pool.get_checker(&ctx, NIL);
+        release.call();
+        run_pending();
+
+        // Create a query checker as well.
+        let ctx2 = req(&bg(), "query-cleanup", CheckerLifetime::TEMPORARY);
+        let (_c2, release2) = pool.get_checker(&ctx2, NIL);
+        release2.call();
+        run_pending();
+
+        // Both checkers should exist.
+        pool.mu_lock();
+        assert!(checker_at(&pool, 0).is_some(), "diagnostics checker should exist");
+        let len = pool.checkers.borrow().len();
+        let query_idx = (1..len).find(|&i| checker_at(&pool, i).is_some()).unwrap_or(0);
+        assert!(query_idx > 0, "query checker should exist");
+
+        // Advance past idle timeout.
+        sleep_then_run(IDLE);
+
+        // After cleanup, both checkers should be disposed.
+        pool.mu_lock();
+        assert!(checker_at(&pool, 0).is_none(), "diagnostics checker should be disposed after idle timeout");
+        assert!(checker_at(&pool, query_idx).is_none(), "query checker should be disposed after idle timeout");
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:166 TestCheckerPoolFileAssociationCleanup
+    // PORT: real time (see above); Go IdleTimeout 5s is `IDLE`.
+    fn file_association_cleanup() {
+        let (session, pool) = test_pool(opts(2, 10), idle_opts(4, IDLE));
+        let source_file = program(&session, "file:///src/index.ts")
+            .get_source_file("/src/index.ts")
+            .expect("source file")
+            .root;
+
+        // Create a query checker with file affinity.
+        let ctx = req(&bg(), "file-assoc-req", CheckerLifetime::TEMPORARY);
+        let (_c, release) = pool.get_checker(&ctx, source_file);
+        release.call();
+        run_pending();
+
+        // File association should exist.
+        pool.mu_lock();
+        let has_assoc = pool.file_associations.borrow().contains_key(&source_file);
+        assert!(has_assoc, "file should have a checker association");
+
+        // Advance past idle timeout.
+        sleep_then_run(IDLE);
+
+        // File association should be cleared.
+        pool.mu_lock();
+        let has_assoc = pool.file_associations.borrow().contains_key(&source_file);
+        assert!(!has_assoc, "file association should be cleared after checker disposal");
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:219 TestCheckerPoolQueryContention
+    // PORT: on the dispatch thread a request can not wait for a slot that
+    // another request holds (see the module comment), so the blocked
+    // goroutine has no port. The test checks what the Go wait depends on:
+    // the only query slot is held by the first request, and after its
+    // release the second request gets a checker.
+    fn query_contention() {
+        // maxCheckers=2 means 1 diagnostics + 1 query checker slot.
+        let (_session, pool) = test_pool(opts(2, 10), opts(2, 30));
+
+        // Acquire the only query checker slot.
+        let ctx1 = req(&bg(), "query-hold", CheckerLifetime::TEMPORARY);
+        let (c1, release1) = pool.get_checker(&ctx1, NIL);
+        run_pending();
+        assert_eq!(pool.checkers.borrow().len(), 2);
+        assert!(checker_at(&pool, 1).is_some_and(|x| same(&x, &c1)));
+        assert_eq!(
+            pool.held_by.borrow()[1],
+            project::checkerpool::CHECKER_HELD_ANONYMOUS,
+            "the only query slot should be held while the first request runs"
+        );
+
+        // Release the first checker — second should acquire it.
+        release1.call();
+        run_pending();
+        let ctx2 = req(&bg(), "query-wait", CheckerLifetime::TEMPORARY);
+        let (_c2, release2) = pool.get_checker(&ctx2, NIL);
+        release2.call();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:258 TestCheckerPoolDiagnosticsContention
+    // PORT: the blocked second diagnostics request has no port (see
+    // TestCheckerPoolQueryContention above); the concurrent query request
+    // and the acquire after release are checked.
+    fn diagnostics_contention() {
+        let (_session, pool) = test_pool(opts(2, 10), opts(2, 30));
+
+        // Acquire the diagnostics checker.
+        let ctx1 = req(&bg(), "diag-hold", CheckerLifetime::DIAGNOSTICS);
+        let (c1, release1) = pool.get_checker(&ctx1, NIL);
+        run_pending();
+        assert!(
+            !pool.held_by.borrow()[0].is_empty(),
+            "the diagnostics checker should be held while the first request runs"
+        );
+
+        // A query request should NOT be blocked (separate slot).
+        let ctx3 = req(&bg(), "query-concurrent", CheckerLifetime::TEMPORARY);
+        let (c3, release3) = pool.get_checker(&ctx3, NIL);
+        assert!(!same(&c3, &c1), "query checker should be different from diagnostics checker");
+        release3.call();
+
+        // Release the diagnostics checker — second diag request should acquire it.
+        release1.call();
+        run_pending();
+        let ctx2 = req(&bg(), "diag-wait", CheckerLifetime::DIAGNOSTICS);
+        let (_c2, release2) = pool.get_checker(&ctx2, NIL);
+        release2.call();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:412 TestCheckerPoolDiagnosticsRecreatedAfterIdleDisposal
+    // PORT: real time (see above); Go IdleTimeout 5s is `IDLE`.
+    fn diagnostics_recreated_after_idle_disposal() {
+        let (_session, pool) = test_pool(opts(2, 10), idle_opts(4, IDLE));
+
+        // Create and release diagnostics checker.
+        let ctx = req(&bg(), "diag-recreate-1", CheckerLifetime::DIAGNOSTICS);
+        let (c1, release1) = pool.get_checker(&ctx, NIL);
+        release1.call();
+        run_pending();
+
+        // Advance past idle timeout — diagnostics checker should be disposed.
+        sleep_then_run(IDLE);
+
+        pool.mu_lock();
+        assert!(checker_at(&pool, 0).is_none(), "diagnostics checker should be disposed");
+
+        // Request diagnostics checker again — should get a fresh one.
+        let ctx2 = req(&bg(), "diag-recreate-2", CheckerLifetime::DIAGNOSTICS);
+        let (c2, release2) = pool.get_checker(&ctx2, NIL);
+        assert!(!same(&c2, &c1), "should be a new checker instance");
+        release2.call();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:448 TestCheckerPoolCrossReleaseAffinityWithContention
+    // PORT: request A's blocked reacquire has no port (see
+    // TestCheckerPoolQueryContention above). A reacquires after B releases,
+    // and must get its own checker back.
+    fn cross_release_affinity_with_contention() {
+        // maxCheckers=2: 1 diagnostics + 1 query slot.
+        let (_session, pool) = test_pool(opts(2, 10), opts(2, 30));
+
+        let (req_ctx, req_cancel) = context::with_cancel(&bg());
+
+        // Request A acquires the only query slot.
+        let ctx_a = req(&req_ctx, "req-A", CheckerLifetime::TEMPORARY);
+        let (c_a, release_a) = pool.get_checker(&ctx_a, NIL);
+        release_a.call();
+        run_pending();
+
+        // Request B takes the query slot while A is released.
+        let ctx_b = req(&bg(), "req-B", CheckerLifetime::TEMPORARY);
+        let (_c_b, release_b) = pool.get_checker(&ctx_b, NIL);
+        assert!(
+            !pool.held_by.borrow()[1].is_empty(),
+            "request B should hold the only query slot"
+        );
+
+        // Release B — A should get the same checker.
+        release_b.call();
+        run_pending();
+        let (c_a2, release) = pool.get_checker(&ctx_a, NIL);
+        assert!(same(&c_a2, &c_a), "request A should get the same checker on reacquire");
+        release.call();
+        // Go: defer reqCancel()
+        req_cancel();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:1010 TestCheckerPoolDoubleReleaseSafe
+    // PORT: Go `release` is `sync.OnceFunc`. `Release::call` takes `self`,
+    // so a second call does not compile and the drop after the call does
+    // nothing. The test checks that the pool works after the release.
+    fn double_release_safe() {
+        let (_session, pool) = setup_checker_pool_session(opts(4, 10));
+
+        let ctx = req(&bg(), "double-release", CheckerLifetime::TEMPORARY);
+        let (_c, release) = pool.get_checker(&ctx, NIL);
+
+        // First release should work normally.
+        release.call();
+
+        // Pool should still be functional after the release.
+        let ctx2 = req(&bg(), "after-double", CheckerLifetime::TEMPORARY);
+        let (_c2, release2) = pool.get_checker(&ctx2, NIL);
+        release2.call();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:1041 TestCheckerPoolStaggeredIdleCleanup
+    // PORT: real time (see above). Go times scale by `IDLE` / 10 s: A is
+    // released at 0, B at 0.6 * IDLE, the check is before A's deadline, and
+    // the last check is at 1.7 * IDLE, after both deadlines.
+    fn staggered_idle_cleanup() {
+        let (_session, pool) = test_pool(opts(4, 10), idle_opts(4, IDLE));
+
+        // Acquire checker A and hold it.
+        let ctx_a = req(&bg(), "stagger-A", CheckerLifetime::TEMPORARY);
+        let (c_a, release_a) = pool.get_checker(&ctx_a, NIL);
+
+        // While A is held, acquire a second checker B.
+        let ctx_b = req(&bg(), "stagger-B", CheckerLifetime::TEMPORARY);
+        let (c_b, release_b) = pool.get_checker(&ctx_b, NIL);
+        assert!(!same(&c_b, &c_a), "B should be a different checker since A is held");
+
+        // Find their indices.
+        pool.mu_lock();
+        let idx_a = query_index(&pool, &c_a);
+        let idx_b = query_index(&pool, &c_b);
+        assert!(idx_a > 0);
+        assert!(idx_b > 0);
+
+        // Release A first. Timer is set for t=IDLE.
+        release_a.call();
+        run_pending();
+
+        // Release B 0.6 * IDLE later.
+        std::thread::sleep(IDLE * 6 / 10);
+        release_b.call();
+        run_pending();
+
+        // Before A's deadline, both should still exist (timer hasn't fired).
+        pool.mu_lock();
+        assert!(checker_at(&pool, idx_a).is_some(), "checker A should still exist before timer fires");
+        assert!(checker_at(&pool, idx_b).is_some(), "checker B should still exist before timer fires");
+
+        // Advance past both deadlines. Both should be disposed.
+        sleep_then_run(IDLE * 11 / 10);
+
+        pool.mu_lock();
+        assert!(checker_at(&pool, idx_a).is_none(), "checker A should be disposed after timer fires");
+        assert!(checker_at(&pool, idx_b).is_none(), "checker B should be disposed after timer fires");
     }
 }
